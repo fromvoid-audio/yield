@@ -4082,9 +4082,6 @@ fn request_audit(
         };
     }
     if let Some(source) = sources.get_mut(&source_id) {
-        if matches!(trigger, AuditTrigger::Explicit) {
-            source.watcher_schedule.initial_audit_complete();
-        }
         // An audit is an independent revision authority. A later compound command must not
         // implicitly chain across it, even if this audit ultimately gets canceled or fails.
         source.curation_lineage = None;
@@ -4120,6 +4117,12 @@ fn request_audit(
                 CatalogEvent::AuditCommitted { snapshot },
             );
             if published {
+                if matches!(trigger, AuditTrigger::Explicit) {
+                    source.watcher_schedule.initial_audit_complete();
+                    source
+                        .watcher_schedule
+                        .audit_succeeded(source.watcher.is_some(), Instant::now());
+                }
                 AuditDisposition::Committed
             } else {
                 AuditDisposition::Canceled
@@ -11492,6 +11495,73 @@ mod tests {
             .map(|entry| entry.relative_path.as_path())
             .collect::<Vec<_>>();
         assert_eq!(paths, vec![Path::new("one.wav"), Path::new("two.wav")]);
+        service.shutdown();
+    }
+
+    #[test]
+    fn failed_initial_audit_keeps_watcher_hints_pending_until_explicit_recovery() {
+        let fixture = Fixture::new("catalog-watcher-initial-audit-retry");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-watcher-initial-audit-retry");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 1,
+            })
+            .expect("register source");
+        let _ = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::Registered { .. })
+        });
+
+        let moved_root = fixture
+            .root
+            .path()
+            .with_extension("temporarily-unavailable");
+        fs::rename(fixture.root.path(), &moved_root).expect("hide source root");
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("request initial audit");
+        let failed = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Failed {
+                    operation: CatalogOperation::Audit,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(failed, CatalogEvent::Failed { .. }));
+        fs::rename(&moved_root, fixture.root.path()).expect("restore source root");
+
+        assert!(test_gate.record_watcher_evidence(
+            &source_id,
+            1,
+            WatchHintEvidence::DESCENDANT_CHANGED,
+        ));
+        thread::sleep(Duration::from_millis(650));
+        assert!(
+            matches!(service.try_recv_event(), Err(TryRecvError::Empty)),
+            "a failed initial audit must not let watcher hints publish an audit"
+        );
+
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("retry initial audit");
+        assert!(matches!(
+            receive_until(&service, |event| {
+                matches!(event, CatalogEvent::AuditCommitted { .. })
+            }),
+            CatalogEvent::AuditCommitted { .. }
+        ));
         service.shutdown();
     }
 

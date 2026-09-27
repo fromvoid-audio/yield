@@ -31,6 +31,7 @@ pub(super) struct WatcherSchedule {
     watcher_retry_delay: Duration,
     audit_retry_after: Option<Instant>,
     audit_retry_delay: Duration,
+    audit_blocked: bool,
     fallback_audit_after: Option<Instant>,
     next_root_probe: Instant,
     root_issue: Option<RootProbeIssue>,
@@ -59,6 +60,7 @@ impl WatcherSchedule {
             watcher_retry_delay: WATCHER_RETRY_MIN,
             audit_retry_after: None,
             audit_retry_delay: WATCHER_RETRY_MIN,
+            audit_blocked: false,
             fallback_audit_after: None,
             next_root_probe: Instant::now(),
             root_issue: None,
@@ -151,6 +153,9 @@ impl WatcherSchedule {
     }
 
     fn pending_is_due(&self, now: Instant) -> bool {
+        if self.audit_blocked {
+            return false;
+        }
         let Some(pending) = &self.pending else {
             return false;
         };
@@ -170,7 +175,8 @@ impl WatcherSchedule {
     }
 
     fn fallback_audit_due(&self, now: Instant) -> bool {
-        self.watcher_continuity_lost
+        !self.audit_blocked
+            && self.watcher_continuity_lost
             && self
                 .fallback_audit_after
                 .is_some_and(|fallback_after| now >= fallback_after)
@@ -235,7 +241,8 @@ impl WatcherSchedule {
             .min(WATCHER_RETRY_MAX);
     }
 
-    fn audit_succeeded(&mut self, watcher_active: bool, completed_at: Instant) {
+    pub(super) fn audit_succeeded(&mut self, watcher_active: bool, completed_at: Instant) {
+        self.audit_blocked = false;
         self.audit_retry_after = None;
         self.audit_retry_delay = WATCHER_RETRY_MIN;
         if watcher_active {
@@ -256,6 +263,13 @@ impl WatcherSchedule {
             .audit_retry_delay
             .saturating_mul(2)
             .min(WATCHER_RETRY_MAX);
+    }
+
+    fn audit_blocked(&mut self, pending: PendingWatcherHint) {
+        self.merge_pending(pending);
+        self.audit_blocked = true;
+        self.audit_retry_after = None;
+        self.fallback_audit_after = None;
     }
 
     fn audit_canceled(&mut self, pending: PendingWatcherHint, now: Instant) {
@@ -343,9 +357,7 @@ pub(super) fn run_watcher_idle_work(
                 retryable: false,
                 root_stale: false,
             } => {
-                source
-                    .watcher_schedule
-                    .audit_succeeded(source.watcher.is_some(), completed_at);
+                source.watcher_schedule.audit_blocked(pending);
             }
             AuditDisposition::Canceled => {
                 if publication_is_current(admission, &source_id, lifecycle_generation, None) {
@@ -528,6 +540,32 @@ mod tests {
         assert!(!schedule.pending_is_due(completed + WATCHER_RETRY_MIN - Duration::from_nanos(1)));
         assert!(schedule.pending_is_due(completed + WATCHER_RETRY_MIN));
         assert_eq!(schedule.audit_retry_delay, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn terminal_audit_failure_retains_hint_until_explicit_recovery() {
+        let start = Instant::now();
+        let mut schedule = WatcherSchedule::new(false);
+        schedule.merge_pending(PendingWatcherHint {
+            first_observed: start,
+            last_observed: start,
+            evidence: WatchHintEvidence::DESCENDANT_CHANGED,
+        });
+        let pending = schedule.pending.take().expect("claimed hint");
+        schedule.audit_blocked(pending);
+        assert!(schedule.pending.is_some());
+        assert!(schedule.audit_blocked);
+        assert!(!schedule.pending_is_due(start + WATCHER_RETRY_MAX));
+
+        schedule.audit_succeeded(true, start + WATCHER_RETRY_MAX);
+        assert!(!schedule.audit_blocked);
+        assert!(schedule.pending_is_due(start + WATCHER_RETRY_MAX));
+        assert!(
+            schedule
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.evidence.has_descendant_change())
+        );
     }
 
     #[test]
