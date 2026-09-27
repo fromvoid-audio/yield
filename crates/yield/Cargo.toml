@@ -10,3 +10,9 @@ workspace = true
 
 [dependencies]
 yield-ui.workspace = true
+yield-library.workspace = true
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile.workspace = true

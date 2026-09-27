@@ -45,6 +45,11 @@ scroll-edge feedback immediately.
 
 ## Run
 
+Runtime diagnostics go to stdout and to the active profile's `logs/` directory.
+Yield keeps at most ten log segments, rotating at 10 MiB before each complete
+event (one oversized event stays intact). See [troubleshooting](docs/TROUBLESHOOTING.md)
+for debug and support-bundle commands.
+
 ```sh
 cargo run -- /path/to/samples
 # Or open the folder picker:

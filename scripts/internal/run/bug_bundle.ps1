@@ -160,10 +160,20 @@ if (Test-Path -LiteralPath $configPath -PathType Leaf) {
 
 if (Test-Path -LiteralPath $logsDir -PathType Container) {
   New-Item -ItemType Directory -Path (Join-Path $bundleDir "logs") -Force | Out-Null
-  $logFiles =
-    Get-ChildItem -LiteralPath $logsDir -File -Filter "*.log" -ErrorAction SilentlyContinue |
+  $logFiles = @(
+    Get-ChildItem -LiteralPath $logsDir -File -Filter "yield_*.log" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^yield_[0-9a-f]{16}_[0-9a-f]{8}_[0-9a-f]{8}_[0-9a-f]{8}\.log$' -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } |
     Sort-Object -Property LastWriteTime -Descending |
     Select-Object -First $Logs
+  )
+  if ($logFiles.Count -eq 0) {
+    $logFiles = @(
+      Get-ChildItem -LiteralPath $logsDir -File -Filter "*.log" -ErrorAction SilentlyContinue |
+      Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } |
+      Sort-Object -Property LastWriteTime -Descending |
+      Select-Object -First $Logs
+    )
+  }
   foreach ($log in $logFiles) {
     Copy-Item -LiteralPath $log.FullName -Destination (Join-Path $bundleDir ("logs\\" + $log.Name)) -Force
   }
