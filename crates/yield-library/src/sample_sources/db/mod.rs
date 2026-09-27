@@ -104,7 +104,7 @@ pub use write::{
     ManifestCommitResult, SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite, SourceCommandId,
     SourceContentHashWrite, SourceCurationCommitReceipt, SourceCurationUpdate,
     SourceDirectoryTruthCommitResult, SourceFileWrite, SourceIndexCommitResult, SourceRevision,
-    SourceSnapshotPage, SourceTagWrite, SourceWriteCommand, SourceWriter,
+    SourceSnapshotOwner, SourceSnapshotPage, SourceTagWrite, SourceWriteCommand, SourceWriter,
     SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 

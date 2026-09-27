@@ -20,7 +20,8 @@ use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
     Rating, SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SampleCollection,
     SourceCommandId, SourceCurationUpdate, SourceDatabase, SourceDbError, SourceId,
-    SourcePlaybackType, SourceSnapshotPage, SourceWriter, SourceWriterError, SourceWriterRequest,
+    SourcePlaybackType, SourceSnapshotOwner, SourceSnapshotPage, SourceWriter, SourceWriterError,
+    SourceWriterRequest,
 };
 
 struct CurationFixture {
@@ -1515,8 +1516,18 @@ fn source_owner_page_is_bounded_read_only_and_rejects_stale_continuation() {
     let mut writer = SourceWriter::new(fixture.database, source_id, 7).expect("source owner");
     let expected = writer.current_revision().expect("current revision");
     let changes_before = writer.database_for_tests().connection.total_changes();
+    let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
+    assert!(matches!(
+        writer.read_browser_metadata_page_with_deadline(&expected, None, 1, expired),
+        Err(SourceWriterError::SnapshotBudgetExceeded)
+    ));
     let first = writer
-        .read_browser_metadata_page(&expected, None, 1)
+        .read_browser_metadata_page_with_deadline(
+            &expected,
+            None,
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
         .expect("first page");
     let SourceSnapshotPage::FreshAsOf { revision, page } = first else {
         panic!("current source page must be fresh")
@@ -1541,17 +1552,98 @@ fn source_owner_page_is_bounded_read_only_and_rejects_stale_continuation() {
     )
     .expect("curation request");
     writer.commit_curation(request).expect("commit");
+    assert!(matches!(
+        writer.read_browser_metadata_page_with_deadline(&expected, Some(&cursor), 1, expired),
+        Err(SourceWriterError::SnapshotBudgetExceeded)
+    ));
     let stale = writer
-        .read_browser_metadata_page(&expected, Some(&cursor), 1)
+        .read_browser_metadata_page_with_deadline(
+            &expected,
+            Some(&cursor),
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
         .expect("stale page result");
     let SourceSnapshotPage::Stale { current } = stale else {
         panic!("old continuation must be stale")
     };
     assert!(current.revision() > expected.revision());
     let second = writer
-        .read_browser_metadata_page(&current, Some(&cursor), 1)
+        .read_browser_metadata_page_with_deadline(
+            &current,
+            Some(&cursor),
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
         .expect("new revision page");
     assert!(matches!(second, SourceSnapshotPage::FreshAsOf { .. }));
+}
+
+#[test]
+fn snapshot_owner_times_out_while_worker_is_blocked_and_retains_writer() {
+    let fixture = CurationFixture::new_profile_bound();
+    let writer = SourceWriter::new(
+        fixture.database,
+        SourceId::from_string("source-snapshot-worker-test"),
+        7,
+    )
+    .expect("source owner");
+    let expected = writer.current_revision().expect("current revision");
+    let owner = SourceSnapshotOwner::start(writer).expect("snapshot worker");
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    owner.block_for_tests(entered_tx, release_rx);
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("worker entered blocking operation");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    assert!(matches!(
+        owner.read_browser_metadata_page_with_deadline(&expected, None, 1, deadline),
+        Err(SourceWriterError::SnapshotBudgetExceeded)
+    ));
+    assert!(std::time::Instant::now() < deadline + std::time::Duration::from_millis(250));
+
+    release_tx.send(()).expect("release worker");
+    owner.wait_idle_for_tests();
+    assert!(matches!(
+        owner
+            .read_browser_metadata_page(&expected, None, 1)
+            .expect("fresh page after blocked operation"),
+        SourceSnapshotPage::FreshAsOf { .. }
+    ));
+    let mut writer = owner
+        .begin_retirement()
+        .join()
+        .expect("retired snapshot worker");
+    assert_eq!(
+        writer.current_revision().expect("retained authority"),
+        expected
+    );
+    let request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::new(),
+        crate::operation_journal::ParticipantId::new(),
+        SourceCommandId::new(),
+        expected.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("curation request");
+    writer.commit_curation(request).expect("commit");
+    let owner = SourceSnapshotOwner::start(writer).expect("restarted snapshot worker");
+    assert!(matches!(
+        owner
+            .read_browser_metadata_page(&expected, None, 1)
+            .expect("stale page after curation"),
+        SourceSnapshotPage::Stale { .. }
+    ));
+    let writer = owner
+        .begin_retirement()
+        .join()
+        .expect("retired restarted worker");
+    writer.close().expect("close source owner");
 }
 
 #[test]
