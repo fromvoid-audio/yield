@@ -147,23 +147,28 @@ pub(super) fn curation_queue_choice_id(index: usize) -> String {
     format!("browser-curation-queue-choice-{index}")
 }
 
-fn visible_sort_columns(window: &Window, cx: &Context<Browser>) -> Vec<(SortColumn, &'static str)> {
+fn visible_sort_columns(
+    view: &Browser,
+    window: &Window,
+    cx: &Context<Browser>,
+) -> Vec<(SortColumn, &'static str)> {
     let theme = crate::theme::active(cx);
     let visibility =
         super::view::browser_column_visibility(f32::from(window.bounds().size.width), &theme);
-    let mut columns = vec![(SortColumn::Name, "Name"), (SortColumn::Rating, "Rating")];
-    if visibility.playback_type {
-        columns.push((SortColumn::PlaybackType, "Type"));
-    }
-    columns.extend([
-        (SortColumn::Collection, "Collection"),
-        (SortColumn::Extension, "Extension"),
-        (SortColumn::Size, "Size"),
-    ]);
-    if visibility.last_played {
-        columns.push((SortColumn::LastPlayed, "Last Played"));
-    }
-    columns
+    view.column_layout
+        .visible_order(visibility)
+        .into_iter()
+        .filter_map(|column| {
+            column.sort_column().map(|sort| {
+                let label = match column {
+                    super::column_layout::BrowserColumn::Collection => "Collection",
+                    super::column_layout::BrowserColumn::Extension => "Extension",
+                    _ => column.label(),
+                };
+                (sort, label)
+            })
+        })
+        .collect()
 }
 
 pub(super) fn source_id(root: &Path) -> String {
@@ -378,11 +383,9 @@ impl BrowserAccessibility {
                             .then_some(row.entry_index)
                         });
                         let sort_action =
-                            visible_sort_columns(window, cx)
-                                .into_iter()
-                                .find_map(|(column, _)| {
-                                    (event.id == sort_id(column)).then_some(column)
-                                });
+                            visible_sort_columns(view, window, cx).into_iter().find_map(
+                                |(column, _)| (event.id == sort_id(column)).then_some(column),
+                            );
                         let collection_action = (0..COLLECTION_COUNT)
                             .find(|&slot| event.id == collection_filter_id(slot));
                         let playback_type_action = PLAYBACK_TYPE_FILTERS
@@ -1514,7 +1517,7 @@ impl Browser {
                 value: Some(self.tag_filter_input.read(cx).content().to_owned()),
                 enabled: true,
             });
-            for (column, label) in visible_sort_columns(window, cx) {
+            for (column, label) in visible_sort_columns(self, window, cx) {
                 let sort = self.view_model.sort();
                 controls.push(AxChild {
                     id: sort_id(column).into(),
