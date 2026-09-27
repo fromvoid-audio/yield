@@ -28,9 +28,12 @@ pub(super) const CURATION_QUEUE_TOGGLE: &str = "browser-curation-queue-toggle";
 pub(super) const CURATION_QUEUE_SCOPE: &str = "browser-curation-queue-scope";
 pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
 pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
+pub(super) const JOB_DETAILS: &str = "status-job-details";
+const JOB_DETAILS_PANEL: &str = "status-job-details-panel";
 const PLAY: &str = "transport-play";
 const STOP: &str = "transport-stop";
 const LOOP: &str = "transport-loop";
+const FOCUS_LOADED: &str = "transport-focus-loaded";
 const SIMILAR: &str = "transport-similar-sections";
 const BPM_SNAP: &str = "transport-bpm-snap";
 const ZERO_CROSSING: &str = "transport-zero-crossing";
@@ -145,23 +148,28 @@ pub(super) fn curation_queue_choice_id(index: usize) -> String {
     format!("browser-curation-queue-choice-{index}")
 }
 
-fn visible_sort_columns(window: &Window, cx: &Context<Browser>) -> Vec<(SortColumn, &'static str)> {
+fn visible_sort_columns(
+    view: &Browser,
+    window: &Window,
+    cx: &Context<Browser>,
+) -> Vec<(SortColumn, &'static str)> {
     let theme = crate::theme::active(cx);
     let visibility =
         super::view::browser_column_visibility(f32::from(window.bounds().size.width), &theme);
-    let mut columns = vec![(SortColumn::Name, "Name"), (SortColumn::Rating, "Rating")];
-    if visibility.playback_type {
-        columns.push((SortColumn::PlaybackType, "Type"));
-    }
-    columns.extend([
-        (SortColumn::Collection, "Collection"),
-        (SortColumn::Extension, "Extension"),
-        (SortColumn::Size, "Size"),
-    ]);
-    if visibility.last_played {
-        columns.push((SortColumn::LastPlayed, "Last Played"));
-    }
-    columns
+    view.column_layout
+        .visible_order(visibility)
+        .into_iter()
+        .filter_map(|column| {
+            column.sort_column().map(|sort| {
+                let label = match column {
+                    super::column_layout::BrowserColumn::Collection => "Collection",
+                    super::column_layout::BrowserColumn::Extension => "Extension",
+                    _ => column.label(),
+                };
+                (sort, label)
+            })
+        })
+        .collect()
 }
 
 pub(super) fn source_id(root: &Path) -> String {
@@ -210,7 +218,11 @@ pub(super) struct BrowserAccessibility {
 }
 
 impl BrowserAccessibility {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Browser>) -> Option<Self> {
+    pub(super) fn new(
+        window: &mut Window,
+        cx: &mut Context<Browser>,
+        job_details_focus: FocusHandle,
+    ) -> Option<Self> {
         let handle = match window.window_handle() {
             Ok(handle) => handle,
             Err(error) => {
@@ -240,6 +252,7 @@ impl BrowserAccessibility {
             PLAY,
             STOP,
             LOOP,
+            FOCUS_LOADED,
             SIMILAR,
             BPM_SNAP,
             ZERO_CROSSING,
@@ -251,6 +264,7 @@ impl BrowserAccessibility {
         ] {
             control_focus.insert(id.to_owned(), cx.focus_handle());
         }
+        control_focus.insert(JOB_DETAILS.to_owned(), job_details_focus);
         for id in SETTINGS_ORDER.iter().copied().chain([SETTINGS_OPEN]) {
             control_focus.insert(id.to_owned(), cx.focus_handle());
         }
@@ -371,11 +385,9 @@ impl BrowserAccessibility {
                             .then_some(row.entry_index)
                         });
                         let sort_action =
-                            visible_sort_columns(window, cx)
-                                .into_iter()
-                                .find_map(|(column, _)| {
-                                    (event.id == sort_id(column)).then_some(column)
-                                });
+                            visible_sort_columns(view, window, cx).into_iter().find_map(
+                                |(column, _)| (event.id == sort_id(column)).then_some(column),
+                            );
                         let collection_action = (0..COLLECTION_COUNT)
                             .find(|&slot| event.id == collection_filter_id(slot));
                         let playback_type_action = PLAYBACK_TYPE_FILTERS
@@ -420,6 +432,7 @@ impl BrowserAccessibility {
                                 | CURATION_QUEUE_SCOPE
                                 | RANDOM_NAVIGATION
                                 | NAME_VIEW_MODE
+                                | JOB_DETAILS
                         ) || sort_action.is_some()
                             || collection_action.is_some()
                             || playback_type_action.is_some()
@@ -430,6 +443,7 @@ impl BrowserAccessibility {
                             event.id.as_str(),
                             PLAY | STOP
                                 | LOOP
+                                | FOCUS_LOADED
                                 | SIMILAR
                                 | BPM_SNAP
                                 | ZERO_CROSSING
@@ -591,6 +605,7 @@ impl BrowserAccessibility {
                                     cx.notify();
                                 }
                                 LOOP => view.toggle_loop(cx),
+                                FOCUS_LOADED => view.focus_loaded_sample_in_browser(window, cx),
                                 SIMILAR => super::similar_sections::toggle(view, cx),
                                 BPM_SNAP => view.toggle_bpm_snap(cx),
                                 ZERO_CROSSING => super::zero_crossing::toggle_from_accessibility(
@@ -614,6 +629,10 @@ impl BrowserAccessibility {
                                 }
                                 RANDOM_NAVIGATION => view.toggle_random_navigation(cx),
                                 NAME_VIEW_MODE => view.toggle_sample_name_view_mode(cx),
+                                JOB_DETAILS => {
+                                    view.job_details_open = !view.job_details_open;
+                                    cx.notify();
+                                }
                                 _ => match source_action {
                                     Some((index, true)) => {
                                         view.forget_source(index, window, cx);
@@ -1003,6 +1022,7 @@ impl Browser {
                     self.loop_toolbar_enabled(),
                     self.preferences_editable(),
                 ),
+                button(FOCUS_LOADED, "Focus loaded sample in browser", None, true),
                 toggle(
                     SIMILAR,
                     "Find similar sections",
@@ -1109,6 +1129,50 @@ impl Browser {
                 ),
                 true,
             ));
+            let jobs = super::job_details::snapshot(self);
+            controls.push(button(
+                JOB_DETAILS,
+                "Job Details",
+                Some(format!(
+                    "{}, {}",
+                    if self.job_details_open {
+                        "Open"
+                    } else {
+                        "Closed"
+                    },
+                    jobs.status_label()
+                )),
+                true,
+            ));
+            if self.job_details_open {
+                let details = if jobs.rows.is_empty() {
+                    "No active jobs".to_string()
+                } else {
+                    jobs.rows
+                        .iter()
+                        .map(|row| {
+                            format!(
+                                "{} for {}: {}, {}{}",
+                                row.kind.label(),
+                                row.source_label(),
+                                row.state_label(),
+                                row.work,
+                                row.blocked_label()
+                                    .map(|error| format!(", {error}"))
+                                    .unwrap_or_default()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                };
+                controls.push(AxChild {
+                    id: JOB_DETAILS_PANEL.into(),
+                    role: AxRole::Group,
+                    label: "Job Details panel".into(),
+                    value: Some(details),
+                    enabled: true,
+                });
+            }
             if self.theme_settings_open {
                 let editable = self.preferences_editable();
                 let busy = self.general_settings.maintenance_busy();
@@ -1458,7 +1522,7 @@ impl Browser {
                 value: Some(self.tag_filter_input.read(cx).content().to_owned()),
                 enabled: true,
             });
-            for (column, label) in visible_sort_columns(window, cx) {
+            for (column, label) in visible_sort_columns(self, window, cx) {
                 let sort = self.view_model.sort();
                 controls.push(AxChild {
                     id: sort_id(column).into(),

@@ -73,6 +73,7 @@ mod accessibility {
 mod audio_output;
 mod catalog;
 mod catalog_metadata;
+mod column_layout;
 mod compare_anchor;
 mod context_menu;
 mod curation;
@@ -84,6 +85,7 @@ mod file_drag;
 mod general_settings;
 mod handoff;
 mod history;
+mod job_details;
 mod metronome;
 mod motion;
 mod normalized_audition;
@@ -322,6 +324,10 @@ pub(crate) struct Browser {
     restore_selection_id: Option<AudioFileId>,
     restore_selection_position: Option<usize>,
     view_model: BrowserViewModel,
+    column_layout: column_layout::ColumnLayout,
+    column_gesture: Option<column_layout::ColumnGesture>,
+    column_header_bounds: Rc<RefCell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    suppress_column_sort_click: bool,
     sample_name_view_mode: yield_core::SampleNameViewMode,
     selected: Option<usize>,
     selection: BrowserSelection,
@@ -352,6 +358,9 @@ pub(crate) struct Browser {
     playback_metronome_grid_path: Option<PathBuf>,
     normalized_audition: normalized_audition::NormalizedAuditionState,
     waveform_viewport: WaveformViewport,
+    preferred_sidebar_width: Option<f32>,
+    preferred_waveform_height: Option<f32>,
+    pane_resize_drag: Option<view::PaneResizeDrag>,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
     waveform_edit_region: Option<WaveformEditRegion>,
@@ -362,6 +371,8 @@ pub(crate) struct Browser {
     waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
     played_ranges: played_ranges::PlayedRanges,
     scan_status: String,
+    job_details_open: bool,
+    job_details_focus_handle: FocusHandle,
     status_log: status_log::StatusLog,
     playback_status: String,
     volume: f32,
@@ -527,7 +538,11 @@ impl Browser {
         let mut browser = Self::new(cx);
         #[cfg(target_os = "macos")]
         {
-            browser.accessibility = accessibility::BrowserAccessibility::new(window, cx);
+            browser.accessibility = accessibility::BrowserAccessibility::new(
+                window,
+                cx,
+                browser.job_details_focus_handle.clone(),
+            );
         }
         #[cfg(not(target_os = "macos"))]
         let _ = window;
@@ -630,6 +645,10 @@ impl Browser {
             restore_selection_id: None,
             restore_selection_position: None,
             view_model: BrowserViewModel::new(&[]),
+            column_layout: column_layout::ColumnLayout::default(),
+            column_gesture: None,
+            column_header_bounds: Rc::new(RefCell::new(None)),
+            suppress_column_sort_click: false,
             sample_name_view_mode: yield_core::SampleNameViewMode::default(),
             selected: None,
             selection: BrowserSelection::new(),
@@ -660,6 +679,9 @@ impl Browser {
             playback_metronome_grid_path: None,
             normalized_audition: normalized_audition::NormalizedAuditionState::default(),
             waveform_viewport: WaveformViewport::full(),
+            preferred_sidebar_width: None,
+            preferred_waveform_height: None,
+            pane_resize_drag: None,
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
             waveform_edit_region: None,
@@ -670,6 +692,8 @@ impl Browser {
             waveform_scrollbar_drag: None,
             played_ranges: played_ranges::PlayedRanges::default(),
             scan_status: "Choose a folder or pass one on the command line".to_string(),
+            job_details_open: false,
+            job_details_focus_handle: cx.focus_handle(),
             status_log: status_log::StatusLog::default(),
             playback_status: "Ready".to_string(),
             volume: volume::DEFAULT_VOLUME,
@@ -2555,11 +2579,26 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+        if key == "escape" && self.pane_resize_drag.is_some() {
+            self.cancel_pane_resize(cx);
+            cx.stop_propagation();
+            return;
+        }
         let secondary = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
         let alt = event.keystroke.modifiers.alt;
         let function = event.keystroke.modifiers.function;
         let navigation_suppresses_autoplay = secondary || alt || function;
         let shift = event.keystroke.modifiers.shift;
+        if self.job_details_open
+            && self.job_details_focus_handle.is_focused(window)
+            && key == "escape"
+            && !event.is_held
+        {
+            self.job_details_open = false;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if self.shortcut_help.is_open()
             || self.theme_settings_open
             || self.audio_settings_open
@@ -2783,6 +2822,26 @@ impl Browser {
         {
             return;
         }
+        if !secondary && !shift && !alt && !function && key.eq_ignore_ascii_case("x") {
+            if !event.is_held
+                && !self.theme_settings_open
+                && !self.audio_settings_open
+                && self.context_menu.is_none()
+            {
+                if self.waveform.is_some()
+                    && !self
+                        .waveform_viewport
+                        .is_effectively_equal(WaveformViewport::full())
+                {
+                    if self.reset_waveform_viewport() {
+                        cx.notify();
+                    }
+                } else {
+                    self.toggle_focused_selection(cx);
+                }
+            }
+            return;
+        }
         if self.waveform_focus_handle.is_focused(window)
             && !secondary
             && !function
@@ -2802,12 +2861,6 @@ impl Browser {
             }
             if !shift && !alt && key.eq_ignore_ascii_case("z") {
                 if self.zoom_waveform_to_selection() {
-                    cx.notify();
-                }
-                return;
-            }
-            if !shift && !alt && key.eq_ignore_ascii_case("x") {
-                if self.reset_waveform_viewport() {
                     cx.notify();
                 }
                 return;
@@ -2920,7 +2973,6 @@ impl Browser {
             "l" | "L" if !shift && !secondary && !alt && !function && !event.is_held => {
                 self.toggle_loop(cx)
             }
-            "x" if !shift && !secondary => self.toggle_focused_selection(cx),
             "up" | "arrowup" | "down" | "arrowdown" => {
                 let follow_row = self.browser_surface_focused(window)
                     && !self.theme_settings_open
@@ -2944,6 +2996,7 @@ impl Browser {
                 }
             }
             "escape" => {
+                self.cancel_column_gesture(cx);
                 self.cancel_file_drag_with_window(window, cx);
                 self.cancel_waveform_region_drag(window, cx);
                 self.cancel_waveform_scrollbar_drag(window, cx);

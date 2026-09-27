@@ -277,7 +277,7 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
     },
     ShortcutRow {
         keys: "X",
-        description: "Toggle the focused sample in the selection",
+        description: "Toggle the focused sample when the waveform is fully zoomed out",
     },
     ShortcutRow {
         keys: "Cmd/Ctrl-A",
@@ -371,7 +371,7 @@ const WAVEFORM_ROWS: &[ShortcutRow] = &[
     },
     ShortcutRow {
         keys: "X",
-        description: "Reset the waveform viewport",
+        description: "Reset the waveform viewport when zoomed in",
     },
     ShortcutRow {
         keys: "Left / Right",

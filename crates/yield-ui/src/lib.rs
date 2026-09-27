@@ -59,7 +59,21 @@ pub fn run(initial_root: Option<PathBuf>) {
         search_input::install_keybindings(cx);
         browser::install_source_registry(cx);
         let initial_root = initial_root.clone();
-        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
+        // Keep isolated debug QA windows off the primary work display when requested.
+        // Release builds and ordinary launches retain the normal primary placement.
+        #[cfg(debug_assertions)]
+        let qa_display = (std::env::var("YIELD_DEV_DISPLAY").ok().as_deref() == Some("secondary"))
+            .then(|| {
+                let primary = cx.primary_display()?.id();
+                cx.displays()
+                    .into_iter()
+                    .find(|display| display.id() != primary)
+                    .map(|display| display.id())
+            })
+            .flatten();
+        #[cfg(not(debug_assertions))]
+        let qa_display = None;
+        let bounds = Bounds::centered(qa_display, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         cx.open_window(
             WindowOptions {
                 titlebar: Some(TitlebarOptions {
@@ -69,6 +83,7 @@ pub fn run(initial_root: Option<PathBuf>) {
                     ..Default::default()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                display_id: qa_display,
                 window_min_size: Some(size(px(960.0), px(560.0))),
                 ..Default::default()
             },

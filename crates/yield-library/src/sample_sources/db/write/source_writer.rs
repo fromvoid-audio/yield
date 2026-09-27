@@ -7,6 +7,9 @@
 
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, SyncSender};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use rusqlite::{Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -20,8 +23,8 @@ use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
-    BrowserFileMetadata, Rating, SampleCollection, SourceDatabase, SourceDbError,
-    SourcePlaybackType,
+    BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, Rating, SampleCollection,
+    SourceDatabase, SourceDbError, SourcePlaybackType,
 };
 use super::curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
@@ -85,6 +88,193 @@ pub struct SourceRevision {
     lifecycle_generation: u64,
     lease_epoch: u64,
     revision: u64,
+}
+
+/// One bounded read result from the retained source owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceSnapshotPage {
+    /// The page was read at the named source and lifecycle revision.
+    FreshAsOf {
+        /// Exact owner-issued revision represented by the rows.
+        revision: SourceRevision,
+        /// At most 64 metadata rows and an opaque continuation.
+        page: BrowserMetadataPage,
+    },
+    /// The requested revision or lifecycle no longer names the current source.
+    Stale {
+        /// Fresh owner-issued observation for restarting the read.
+        current: SourceRevision,
+    },
+}
+
+struct SnapshotRequest {
+    expected: SourceRevision,
+    after_cursor: Option<BrowserMetadataCursor>,
+    requested_limit: usize,
+    deadline: Instant,
+    reply: mpsc::Sender<Result<SourceSnapshotPage, SourceWriterError>>,
+}
+
+enum SnapshotCommand {
+    Page(SnapshotRequest),
+    #[cfg(test)]
+    BlockForTest {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    },
+    #[cfg(test)]
+    BarrierForTest(mpsc::Sender<()>),
+}
+
+/// A bounded snapshot entrypoint that owns the source writer on one worker thread.
+///
+/// A timed-out request does not release or duplicate source authority. The worker keeps the
+/// writer until its current OS operation finishes; subsequent requests cannot overtake it.
+pub struct SourceSnapshotOwner {
+    requests: Option<SyncSender<SnapshotCommand>>,
+    worker: Option<JoinHandle<SourceWriter>>,
+}
+
+impl SourceSnapshotOwner {
+    /// Transfer the existing source writer to a single snapshot worker.
+    pub fn start(writer: SourceWriter) -> io::Result<Self> {
+        let (requests, receiver) = mpsc::sync_channel::<SnapshotCommand>(1);
+        let worker = thread::Builder::new()
+            .name("yield-source-snapshot".to_owned())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        SnapshotCommand::Page(request) => {
+                            if Instant::now() >= request.deadline {
+                                let _ = request
+                                    .reply
+                                    .send(Err(SourceWriterError::SnapshotBudgetExceeded));
+                                continue;
+                            }
+                            let result = writer.read_browser_metadata_page_with_deadline(
+                                &request.expected,
+                                request.after_cursor.as_ref(),
+                                request.requested_limit,
+                                request.deadline,
+                            );
+                            let _ = request.reply.send(result);
+                        }
+                        #[cfg(test)]
+                        SnapshotCommand::BlockForTest { entered, release } => {
+                            let _ = entered.send(());
+                            let _ = release.recv();
+                        }
+                        #[cfg(test)]
+                        SnapshotCommand::BarrierForTest(reply) => {
+                            let _ = reply.send(());
+                        }
+                    }
+                }
+                writer
+            })?;
+        Ok(Self {
+            requests: Some(requests),
+            worker: Some(worker),
+        })
+    }
+
+    /// Return within the two-second request budget even if an OS identity check blocks.
+    pub fn read_browser_metadata_page(
+        &self,
+        expected: &SourceRevision,
+        after_cursor: Option<&BrowserMetadataCursor>,
+        requested_limit: usize,
+    ) -> Result<SourceSnapshotPage, SourceWriterError> {
+        self.read_browser_metadata_page_with_deadline(
+            expected,
+            after_cursor,
+            requested_limit,
+            Instant::now() + Duration::from_secs(2),
+        )
+    }
+
+    pub(super) fn read_browser_metadata_page_with_deadline(
+        &self,
+        expected: &SourceRevision,
+        after_cursor: Option<&BrowserMetadataCursor>,
+        requested_limit: usize,
+        deadline: Instant,
+    ) -> Result<SourceSnapshotPage, SourceWriterError> {
+        if after_cursor.is_some_and(|cursor| cursor.as_str().len() > 16 * 1024 * 1024) {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        let (reply, receiver) = mpsc::channel();
+        let request = SnapshotRequest {
+            expected: expected.clone(),
+            after_cursor: after_cursor.cloned(),
+            requested_limit,
+            deadline,
+            reply,
+        };
+        self.requests
+            .as_ref()
+            .ok_or(SourceWriterError::SnapshotOwnerUnavailable)?
+            .try_send(SnapshotCommand::Page(request))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => SourceWriterError::SnapshotBudgetExceeded,
+                mpsc::TrySendError::Disconnected(_) => SourceWriterError::SnapshotOwnerUnavailable,
+            })?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = receiver
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => SourceWriterError::SnapshotBudgetExceeded,
+                mpsc::RecvTimeoutError::Disconnected => SourceWriterError::SnapshotOwnerUnavailable,
+            })?;
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        result
+    }
+
+    /// Stop accepting requests and return a join handle for orderly owner retirement.
+    /// Joining may block while an OS operation finishes; never join on the UI thread.
+    pub fn begin_retirement(mut self) -> JoinHandle<SourceWriter> {
+        self.requests.take();
+        self.worker.take().expect("snapshot worker exists")
+    }
+
+    #[cfg(test)]
+    pub(super) fn block_for_tests(&self, entered: mpsc::Sender<()>, release: mpsc::Receiver<()>) {
+        self.requests
+            .as_ref()
+            .expect("snapshot request channel exists")
+            .try_send(SnapshotCommand::BlockForTest { entered, release })
+            .unwrap_or_else(|_| panic!("snapshot worker accepts test gate"));
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_idle_for_tests(&self) {
+        let (reply, receiver) = mpsc::channel();
+        self.requests
+            .as_ref()
+            .expect("snapshot request channel exists")
+            .send(SnapshotCommand::BarrierForTest(reply))
+            .unwrap_or_else(|_| panic!("snapshot worker accepts test barrier"));
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot worker reaches test barrier");
+    }
+}
+
+struct SnapshotProgressGuard<'a>(&'a rusqlite::Connection);
+
+impl<'a> SnapshotProgressGuard<'a> {
+    fn install(connection: &'a rusqlite::Connection, deadline: std::time::Instant) -> Self {
+        connection.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline));
+        Self(connection)
+    }
+}
+
+impl Drop for SnapshotProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.progress_handler(0, None::<fn() -> bool>);
+    }
 }
 
 impl SourceRevision {
@@ -295,6 +485,12 @@ pub enum SourceWriterError {
     /// The source receipt relation reached its bounded retained-history budget.
     #[error("source writer receipt capacity is exhausted")]
     CapacityExceeded,
+    /// A bounded owner read exceeded its row, byte, or elapsed-time budget.
+    #[error("source snapshot read exceeded its bounded budget")]
+    SnapshotBudgetExceeded,
+    /// The sole snapshot worker exited before completing the request.
+    #[error("source snapshot owner is unavailable")]
+    SnapshotOwnerUnavailable,
     /// Commit acknowledgement or readback became uncertain after durable work could have run.
     #[error("source writer commit outcome is uncertain")]
     Uncertain {
@@ -401,6 +597,77 @@ impl SourceWriter {
             lifecycle_generation: self.lifecycle_generation,
             lease_epoch,
             revision,
+        })
+    }
+
+    /// Synchronous worker primitive; the owned worker bounds the caller's response time.
+    pub(super) fn read_browser_metadata_page_with_deadline(
+        &self,
+        expected: &SourceRevision,
+        after_cursor: Option<&BrowserMetadataCursor>,
+        requested_limit: usize,
+        deadline: std::time::Instant,
+    ) -> Result<SourceSnapshotPage, SourceWriterError> {
+        const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+        if after_cursor.is_some_and(|cursor| cursor.as_str().len() > MAX_INPUT_BYTES) {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        let _progress = SnapshotProgressGuard::install(&self.database.connection, deadline);
+        let before = self.current_revision();
+        if std::time::Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        let before = before?;
+        if expected != &before {
+            return Ok(SourceSnapshotPage::Stale { current: before });
+        }
+        let page = self
+            .database
+            .browser_metadata_page_bounded(
+                expected.revision(),
+                after_cursor,
+                requested_limit,
+                MAX_INPUT_BYTES,
+            )
+            .map_err(|error| {
+                if matches!(error, SourceDbError::SnapshotBudgetExceeded)
+                    || std::time::Instant::now() >= deadline
+                {
+                    SourceWriterError::SnapshotBudgetExceeded
+                } else {
+                    SourceWriterError::Database(error)
+                }
+            })?;
+        if std::time::Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        let after = self.current_revision();
+        if std::time::Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        let after = after?;
+        if expected != &after || page.revision != expected.revision() {
+            return Ok(SourceSnapshotPage::Stale { current: after });
+        }
+        let bytes = page.files.iter().try_fold(0usize, |total, file| {
+            total
+                .checked_add(std::mem::size_of::<BrowserFileMetadata>())?
+                .checked_add(file.relative_path.as_os_str().len())?
+                .checked_add(
+                    file.collections
+                        .len()
+                        .checked_mul(std::mem::size_of::<SampleCollection>())?,
+                )
+        });
+        if std::time::Instant::now() >= deadline
+            || page.files.len() > 64
+            || !bytes.is_some_and(|bytes| bytes <= 16 * 1024 * 1024)
+        {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        Ok(SourceSnapshotPage::FreshAsOf {
+            revision: after,
+            page,
         })
     }
 
