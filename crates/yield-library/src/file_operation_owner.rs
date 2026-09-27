@@ -1,14 +1,15 @@
 //! Bounded ownership for future file-operation effects.
 //!
-//! This module owns only an isolated command queue, root-registration observations, and
-//! bounded effect receipts.  It deliberately does not open files, hold SQLite connections,
-//! retain source leases, or manufacture live authority.  Until the producer and backend
-//! adapters land, accepted commands finish as typed [`EffectOutcome::Unsupported`] results.
+//! This module owns an isolated command queue, registered descriptor-bound roots, and bounded
+//! effect receipts. It does not hold SQLite connections, retain source leases, or manufacture
+//! live write authority. Until the producer and backend adapters land, accepted commands finish
+//! as typed [`EffectOutcome::Unsupported`] results.
 //! The test-only fixtures exercise the owner boundary without pretending to qualify a
 //! filesystem effect.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Component, Path};
 #[cfg(test)]
@@ -23,9 +24,12 @@ use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::app_dirs::WritableProfileGuard;
+use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use crate::operation_journal::owner::LiveChunkEffectGrant;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use crate::sample_sources::SourceId;
+use crate::sample_sources::db::{BoundDatabaseRoot, SourceAuthorityRequest};
 
 /// Maximum number of effect commands waiting for the file owner.
 pub const FILE_OPERATION_OWNER_COMMAND_CAPACITY: usize = 32;
@@ -37,6 +41,8 @@ pub const FILE_OPERATION_OWNER_MAX_INPUT_BYTES: usize = MAX_RECORD_BYTES * 4;
 pub const FILE_OPERATION_OWNER_MAX_RECEIPTS: usize = 64;
 /// Maximum number of roots used by one primitive.
 pub const FILE_OPERATION_OWNER_MAX_ROOTS: usize = 2;
+/// Maximum retained live root capabilities in one owner.
+pub const FILE_OPERATION_OWNER_MAX_REGISTERED_ROOTS: usize = 128;
 /// Maximum number of source fences used by one primitive.
 pub const FILE_OPERATION_OWNER_MAX_SOURCE_FENCES: usize = 2;
 /// Maximum byte length of one relative locator.
@@ -51,6 +57,13 @@ pub const FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES: usize = 512;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct OwnerIdentity(Uuid);
+
+impl OwnerIdentity {
+    /// Return the opaque owner UUID as an observation only.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
 
 /// Stable identity for one file-owner effect.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -332,6 +345,11 @@ impl OwnedObjectIdentity {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Return the logical object UUID without granting access to a physical file.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
 }
 
 impl Default for OwnedObjectIdentity {
@@ -581,6 +599,17 @@ pub struct RestoreProof {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct StagingValidation {
     expected_bytes: u64,
+    expected_content_hash: [u8; 32],
+}
+
+impl StagingValidation {
+    /// Require exact content, including for an empty staged file.
+    pub const fn new(expected_bytes: u64, expected_content_hash: [u8; 32]) -> Self {
+        Self {
+            expected_bytes,
+            expected_content_hash,
+        }
+    }
 }
 
 /// All effect payloads understood by the owner boundary.
@@ -634,8 +663,12 @@ pub enum EffectRequest {
     ValidateStaging {
         /// Retained staging root.
         staging: StagingRoot,
+        /// Live source root required when the validated output carries a source fence.
+        source_root: Option<RootRegistrationRef>,
         /// Exact staged object identity.
         object: OwnedObjectIdentity,
+        /// Output bound to the validated staged object.
+        output: OutputIdentity,
         /// Bounded validation requirement.
         expected: StagingValidation,
     },
@@ -794,6 +827,54 @@ struct AuthorityFreeCommandView<'a> {
 }
 
 impl FileOperationCommand {
+    /// Build one read-only staged-file validation against a live owner registration.
+    /// The caller's root reference and fence are observations checked on the worker.
+    #[allow(dead_code)] // The journal checkpoint producer is added in OPT-1884.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_staging_validation(
+        operation_id: OperationId,
+        participant_id: ParticipantId,
+        effect_id: EffectId,
+        output: OutputIdentity,
+        registration: RootRegistrationRef,
+        authority: AuthorityFence,
+        locator: BoundedRelativeLocator,
+        object: OwnedObjectIdentity,
+        expected: StagingValidation,
+        source_fences: Vec<SourceFence>,
+        source_root: Option<RootRegistrationRef>,
+    ) -> Result<Self, FileOperationValidationError> {
+        let staging = StagingRoot {
+            binding: RootRoleBinding {
+                registration,
+                authority,
+                locator,
+                expected: ExpectedObject::Exact(object),
+            },
+        };
+        let command = Self {
+            operation_id,
+            participant_id,
+            effect_id,
+            target_registration: registration,
+            expected: ExpectedObject::Exact(object),
+            effect: EffectRequest::ValidateStaging {
+                staging,
+                source_root,
+                object,
+                output,
+                expected,
+            },
+            authorization: EffectAuthorization::ObservationOnly {
+                live_root_registration: registration,
+                source_fences: source_fences.clone(),
+            },
+            source_fences,
+        };
+        command.validate_shape()?;
+        Ok(command)
+    }
+
     #[allow(dead_code)] // Private OPT-1857 producer adapter has no ordinary-family caller yet.
     pub(crate) fn for_live_chunk(
         grant: &LiveChunkEffectGrant,
@@ -980,9 +1061,13 @@ impl FileOperationCommand {
                 live_root_registration,
                 source_fences,
             } => {
-                if !matches!(self.effect, EffectRequest::InspectOwnedObject { .. }) {
+                if !matches!(
+                    self.effect,
+                    EffectRequest::InspectOwnedObject { .. }
+                        | EffectRequest::ValidateStaging { .. }
+                ) {
                     return Err(FileOperationValidationError::new(
-                        "observation-only authorization is valid only for inspection",
+                        "observation-only authorization is valid only for inspection or staging validation",
                     ));
                 }
                 if source_fences.len() > FILE_OPERATION_OWNER_MAX_SOURCE_FENCES {
@@ -1007,12 +1092,13 @@ impl FileOperationCommand {
                 }
             }
         }
-        if !matches!(self.effect, EffectRequest::InspectOwnedObject { .. })
-            && matches!(
-                self.authorization,
-                EffectAuthorization::ObservationOnly { .. }
-            )
-        {
+        if !matches!(
+            self.effect,
+            EffectRequest::InspectOwnedObject { .. } | EffectRequest::ValidateStaging { .. }
+        ) && matches!(
+            self.authorization,
+            EffectAuthorization::ObservationOnly { .. }
+        ) {
             return Err(FileOperationValidationError::new(
                 "mutating effect requires live intent and capacity authorization",
             ));
@@ -1240,10 +1326,24 @@ impl EffectRequest {
                 require_present(&staging.binding)?;
                 let object = match self {
                     Self::FlushStaging { object, .. } => *object,
-                    Self::ValidateStaging { object, .. } => *object,
+                    Self::ValidateStaging { object, output, .. } => {
+                        if output.as_uuid().is_nil() {
+                            return Err(FileOperationValidationError::new(
+                                "staging validation output identity is nil",
+                            ));
+                        }
+                        *object
+                    }
                     _ => unreachable!("matched staging validation effect"),
                 };
                 require_binding_object(&staging.binding, object, "staging")?;
+                if let Self::ValidateStaging { source_root, .. } = self {
+                    if source_root.is_some() != (command_fences.len() == 1) {
+                        return Err(FileOperationValidationError::new(
+                            "staging source registration must match its one source fence",
+                        ));
+                    }
+                }
             }
             Self::PublishNoReplace {
                 staging,
@@ -1324,8 +1424,8 @@ impl EffectRequest {
 /// Typed outcome of an accepted effect request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EffectOutcome {
-    /// The owner applied an effect and returned observations.  Current production has no
-    /// backend, so this variant is reserved for a future qualified adapter and test fixtures.
+    /// The owner completed a qualified effect or read-only staging validation and returned
+    /// observations. A validation result alone does not authorize publication.
     Applied {
         /// Effect observations.
         evidence: EffectEvidence,
@@ -1372,6 +1472,45 @@ pub enum EffectOutcome {
 pub struct EffectEvidence {
     observed_identity: Option<OwnedObjectIdentity>,
     bytes: Option<u64>,
+    validated_staging: Option<ValidatedStagingEvidence>,
+}
+
+/// Physical staged-file proof produced by the file owner from a no-follow descriptor.
+/// This remains an observation; a journal checkpoint must be committed before publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedStagingEvidence {
+    output: OutputIdentity,
+    source_root: Option<RootRegistrationRef>,
+    stable_identity: String,
+    bytes: u64,
+    content_hash: [u8; 32],
+}
+
+impl ValidatedStagingEvidence {
+    /// Return the exact output bound to this validation.
+    pub const fn output(&self) -> OutputIdentity {
+        self.output
+    }
+
+    /// Return the source root checked for liveness, when the output has a source fence.
+    pub const fn source_root(&self) -> Option<RootRegistrationRef> {
+        self.source_root
+    }
+
+    /// Return the stable identity observed from the opened staged-file descriptor.
+    pub fn stable_identity(&self) -> &str {
+        &self.stable_identity
+    }
+
+    /// Return the exact byte length observed during validation.
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Return the BLAKE3 hash of the complete staged content.
+    pub const fn content_hash(&self) -> [u8; 32] {
+        self.content_hash
+    }
 }
 
 impl EffectEvidence {
@@ -1383,6 +1522,11 @@ impl EffectEvidence {
     /// Return the observed byte count, if any.
     pub const fn bytes(&self) -> Option<u64> {
         self.bytes
+    }
+
+    /// Return descriptor-derived staging proof, if this was a validation result.
+    pub fn validated_staging(&self) -> Option<&ValidatedStagingEvidence> {
+        self.validated_staging.as_ref()
     }
 }
 
@@ -2044,6 +2188,112 @@ impl FileOperationOwner {
         })
     }
 
+    /// Register the currently owned profile root for a future profile-scoped effect.
+    ///
+    /// The returned reference is only an observation. The worker retains a cloned profile
+    /// lock and a descriptor-bound root; it revalidates both before accepting an effect.
+    #[allow(dead_code)] // Production effect producers are added in later owner slices.
+    pub(crate) fn register_profile_root(
+        &self,
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<RootRegistrationRef, String> {
+        let retained_guard = profile_guard
+            .try_clone()
+            .map_err(|error| error.to_string())?;
+        let root = BoundDatabaseRoot::for_profile_guard(&retained_guard)
+            .map_err(|error| error.to_string())?;
+        let capability = ProductionRootCapability {
+            root,
+            profile_guard: retained_guard,
+            source: None,
+        };
+        let registration = RootRegistrationRef {
+            owner: self.shared.owner,
+            registration_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let authority = AuthorityFence::Profile(ProfileAuthorityFence {
+            owner: self.shared.owner,
+            generation: registration.generation,
+            lease_epoch: 1,
+        });
+        self.register_root(registration, authority, "profile root", Some(capability))?;
+        Ok(registration)
+    }
+
+    /// Register the live media root from a source authority already accepted by the journal.
+    ///
+    /// The source request is sealed by the source owner and its registered lifecycle is checked
+    /// here and again before every effect. A caller-provided fence remains an observation; it
+    /// must match the retained root and lease epoch and will still need an exact journal grant.
+    #[allow(dead_code)] // Production publication handoff is added after this root slice.
+    pub(crate) fn register_source_root(
+        &self,
+        request: Arc<SourceAuthorityRequest>,
+        profile_guard: &WritableProfileGuard,
+        fence: SourceFence,
+    ) -> Result<RootRegistrationRef, String> {
+        fence.validate().map_err(|error| error.to_string())?;
+        if fence.root_identity != request.media_root().identity()
+            || fence.database_identity != request.database_file_identity()
+            || i64::try_from(fence.lease_epoch).ok() != Some(request.lease_identity().epoch())
+        {
+            return Err(String::from(
+                "source fence does not match retained source authority",
+            ));
+        }
+        let retained_guard = profile_guard
+            .try_clone()
+            .map_err(|error| error.to_string())?;
+        request
+            .validate_registered_boundary(&retained_guard)
+            .map_err(|error| error.to_string())?;
+        let root = request
+            .media_root()
+            .try_clone_for_owned_capability()
+            .map_err(|error| error.to_string())?;
+        let capability = ProductionRootCapability {
+            root,
+            profile_guard: retained_guard,
+            source: Some(request),
+        };
+        let registration = RootRegistrationRef {
+            owner: self.shared.owner,
+            registration_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        self.register_root(
+            registration,
+            AuthorityFence::Source(fence),
+            "source media root",
+            Some(capability),
+        )?;
+        Ok(registration)
+    }
+
+    fn register_root(
+        &self,
+        registration: RootRegistrationRef,
+        authority: AuthorityFence,
+        label: &str,
+        capability: Option<ProductionRootCapability>,
+    ) -> Result<(), String> {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.shared
+            .try_control(OwnerCommand::RegisterRoot {
+                registration,
+                authority,
+                label: bounded_diagnostic(label.to_owned()),
+                capability,
+                input: None,
+                result: result_tx,
+            })
+            .map_err(|error| error.to_string())?;
+        result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| String::from("root registration timed out"))?
+    }
+
     #[cfg(test)]
     fn register_root_for_test(
         &self,
@@ -2065,20 +2315,7 @@ impl FileOperationOwner {
             registration_id: Uuid::new_v4(),
             generation,
         };
-        let label = bounded_diagnostic(label.to_owned());
-        let (result_tx, result_rx) = mpsc::sync_channel(1);
-        self.shared
-            .try_control(OwnerCommand::RegisterRoot {
-                registration,
-                authority,
-                label,
-                input: None,
-                result: result_tx,
-            })
-            .map_err(|error| error.to_string())?;
-        result_rx
-            .recv_timeout(Duration::from_secs(1))
-            .map_err(|_| String::from("root registration timed out"))??;
+        self.register_root(registration, authority, label, None)?;
         Ok(registration)
     }
 
@@ -2123,11 +2360,9 @@ impl FileOperationOwner {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn retire_root_for_test(
-        &self,
-        registration: RootRegistrationRef,
-    ) -> Result<(), String> {
+    /// Retire a registered root and release its worker-owned descriptor custody.
+    #[allow(dead_code)] // Production effect producers are added in later owner slices.
+    pub(crate) fn retire_root(&self, registration: RootRegistrationRef) -> Result<(), String> {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.shared
             .try_control(OwnerCommand::RetireRoot {
@@ -2140,6 +2375,14 @@ impl FileOperationOwner {
             .recv_timeout(Duration::from_secs(1))
             .map_err(|_| String::from("root retirement timed out"))??;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_root_for_test(
+        &self,
+        registration: RootRegistrationRef,
+    ) -> Result<(), String> {
+        self.retire_root(registration)
     }
 
     #[cfg(test)]
@@ -2458,7 +2701,27 @@ struct AdmissionRecord {
 struct RootRegistrationState {
     authority: AuthorityFence,
     _label: String,
-    active: bool,
+    capability: Option<ProductionRootCapability>,
+}
+
+/// Descriptor-bound custody retained by the worker, never reconstructed from a root reference.
+struct ProductionRootCapability {
+    root: BoundDatabaseRoot,
+    profile_guard: WritableProfileGuard,
+    source: Option<Arc<SourceAuthorityRequest>>,
+}
+
+impl ProductionRootCapability {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(source) = self.source.as_ref() {
+            source
+                .validate_registered_boundary(&self.profile_guard)
+                .map_err(|error| error.to_string())?;
+        }
+        self.root
+            .validate_profile_guard(&self.profile_guard)
+            .map_err(|error| error.to_string())
+    }
 }
 
 struct WorkerState {
@@ -2525,11 +2788,11 @@ impl WorkerState {
             } => {
                 self.take_unused_live_chunk_grant(key, fingerprint, result);
             }
-            #[cfg(test)]
             OwnerCommand::RegisterRoot {
                 registration,
                 authority,
                 label,
+                capability,
                 input,
                 result,
             } => {
@@ -2539,40 +2802,52 @@ impl WorkerState {
                     return;
                 }
                 let response = match self.registrations.get(&registration) {
-                    Some(existing)
-                        if existing.authority == authority && existing._label == label =>
-                    {
-                        Ok(())
-                    }
-                    Some(_) => Err(String::from("conflicting root registration")),
+                    Some(_) => Err(String::from(
+                        "root registration identity is already retained",
+                    )),
                     None => {
+                        if self.registrations.len() >= FILE_OPERATION_OWNER_MAX_REGISTERED_ROOTS {
+                            let _ =
+                                result.send(Err(String::from("registered root capacity is full")));
+                            drop(input);
+                            return;
+                        }
+                        if let Some(capability) = capability.as_ref() {
+                            if let Err(error) = capability.validate() {
+                                let _ = result.send(Err(error));
+                                drop(input);
+                                return;
+                            }
+                        }
                         self.registrations.insert(
                             registration,
                             RootRegistrationState {
                                 authority,
                                 _label: label,
-                                active: true,
+                                capability,
                             },
                         );
                         Ok(())
                     }
                 };
-                let _ = result.send(response);
+                let accepted = response.is_ok();
+                if result.send(response).is_err() && accepted {
+                    // The caller lost the registration reference before it could observe
+                    // success. No effect can name this fresh UUID, so release its custody.
+                    self.registrations.remove(&registration);
+                }
                 drop(input);
             }
-            #[cfg(test)]
             OwnerCommand::RetireRoot {
                 registration,
                 input,
                 result,
             } => {
-                let response = match self.registrations.get_mut(&registration) {
-                    Some(existing) => {
-                        existing.active = false;
-                        Ok(())
-                    }
-                    None => Err(String::from("root registration is not retained")),
-                };
+                let response = self
+                    .registrations
+                    .remove(&registration)
+                    .map(|_| ())
+                    .ok_or_else(|| String::from("root registration is not retained"));
                 let _ = result.send(response);
                 drop(input);
             }
@@ -2677,10 +2952,15 @@ impl WorkerState {
                                 Ok(_source_permit) => {
                                     #[cfg(test)]
                                     shared.execution_count.fetch_add(1, Ordering::AcqRel);
-                                    EffectOutcome::Unsupported {
-                                        reason: String::from(
-                                            "no production file-effect producer or qualified backend is available",
-                                        ),
+                                    match &command.effect {
+                                        EffectRequest::ValidateStaging { .. } => {
+                                            validate_staging_effect(&command, &self.registrations)
+                                        }
+                                        _ => EffectOutcome::Unsupported {
+                                            reason: String::from(
+                                                "no production file-effect producer or qualified backend is available",
+                                            ),
+                                        },
                                     }
                                 }
                             },
@@ -2844,15 +3124,14 @@ enum OwnerCommand {
         fingerprint: RequestFingerprint,
         result: SyncSender<Option<LiveChunkEffectGrant>>,
     },
-    #[cfg(test)]
     RegisterRoot {
         registration: RootRegistrationRef,
         authority: AuthorityFence,
         label: String,
+        capability: Option<ProductionRootCapability>,
         input: Option<InputPermit>,
         result: SyncSender<Result<(), String>>,
     },
-    #[cfg(test)]
     RetireRoot {
         registration: RootRegistrationRef,
         input: Option<InputPermit>,
@@ -3361,7 +3640,6 @@ impl OwnerShared {
         }
     }
 
-    #[cfg(test)]
     fn try_control(&self, command: OwnerCommand) -> Result<(), FileOperationOwnerQueueError> {
         let _gate = self
             .admission_gate
@@ -3537,6 +3815,9 @@ fn worker_main(
             let _ = ready.send(Err(String::from(
                 "owner panicked during startup or execution",
             )));
+            // No effect can continue after the worker exits. Keep receipt evidence without
+            // retaining profile locks or source-root descriptors across uncertain shutdown.
+            state.registrations.clear();
             shared.retain_worker_state(state);
             shared.mark_unavailable("owner worker panicked");
             let outcome = FileOperationOwnerShutdown::RetirementUncertain {
@@ -3552,6 +3833,9 @@ fn worker_main(
 }
 
 fn finish_worker(shared: Arc<OwnerShared>, mut state: WorkerState) {
+    // Root capabilities are execution custody, while receipts are recovery evidence. The
+    // worker has stopped accepting effects, so release descriptors on every shutdown path.
+    state.registrations.clear();
     let unavailable = OwnerLifecycle::from_u8(shared.lifecycle.load(Ordering::Acquire))
         == OwnerLifecycle::Unavailable;
     if shared.implicit_drop.load(Ordering::Acquire) || unavailable {
@@ -3619,6 +3903,159 @@ fn finish_worker(shared: Arc<OwnerShared>, mut state: WorkerState) {
     }
 }
 
+/// Validate staged bytes through the registered directory descriptor. This is a read-only
+/// observation; the journal must bind and commit it before any final namespace claim.
+fn validate_staging_effect(
+    command: &FileOperationCommand,
+    registrations: &BTreeMap<RootRegistrationRef, RootRegistrationState>,
+) -> EffectOutcome {
+    let EffectRequest::ValidateStaging {
+        staging,
+        source_root,
+        object,
+        output,
+        expected,
+    } = &command.effect
+    else {
+        unreachable!("staging validation dispatch requires its exact effect")
+    };
+    let Some(capability) = registrations
+        .get(&staging.binding.registration)
+        .and_then(|registration| registration.capability.as_ref())
+    else {
+        return EffectOutcome::Unsupported {
+            reason: String::from("staging validation requires a production root capability"),
+        };
+    };
+    if let Err(reason) = capability.validate() {
+        return EffectOutcome::SupersededBeforeEffect {
+            reason: bounded_diagnostic(reason),
+        };
+    }
+    let mut file = match capability
+        .root
+        .open_file_read_nofollow(Path::new(staging.binding.locator.as_str()))
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return EffectOutcome::Collision {
+                reason: bounded_diagnostic(format!(
+                    "staging entry cannot be opened without following links: {error}"
+                )),
+            };
+        }
+    };
+    let (before, stable_identity) = match (
+        file.metadata(),
+        stable_filesystem_identity_from_open_file(&file),
+    ) {
+        (Ok(metadata), Some(identity)) => (metadata, identity),
+        _ => {
+            return EffectOutcome::RetainedUncertain {
+                reason: String::from("staging descriptor identity is unavailable"),
+            };
+        }
+    };
+    if !before.is_file() || before.len() != expected.expected_bytes {
+        return EffectOutcome::Collision {
+            reason: String::from("staging kind or length differs from the required content"),
+        };
+    }
+    #[cfg(unix)]
+    if std::os::unix::fs::MetadataExt::nlink(&before) != 1 {
+        return EffectOutcome::Collision {
+            reason: String::from("staging file has another hard link"),
+        };
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut bytes = 0u64;
+    loop {
+        let count = match file.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) => {
+                return EffectOutcome::RetainedUncertain {
+                    reason: bounded_diagnostic(format!("staging content read failed: {error}")),
+                };
+            }
+        };
+        if count == 0 {
+            break;
+        }
+        bytes = match bytes.checked_add(count as u64) {
+            Some(bytes) if bytes <= expected.expected_bytes => bytes,
+            _ => {
+                return EffectOutcome::Collision {
+                    reason: String::from("staging content exceeds its required length"),
+                };
+            }
+        };
+        hasher.update(&buffer[..count]);
+    }
+    let content_hash = *hasher.finalize().as_bytes();
+    let after_identity = stable_filesystem_identity_from_open_file(&file);
+    let after = file.metadata();
+    if bytes != expected.expected_bytes
+        || content_hash != expected.expected_content_hash
+        || after_identity.as_deref() != Some(stable_identity.as_str())
+        || !after
+            .as_ref()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes)
+    {
+        return EffectOutcome::Collision {
+            reason: String::from("staging identity, length, or content changed during validation"),
+        };
+    }
+    #[cfg(unix)]
+    if after
+        .as_ref()
+        .is_ok_and(|metadata| std::os::unix::fs::MetadataExt::nlink(metadata) != 1)
+    {
+        return EffectOutcome::Collision {
+            reason: String::from("staging file gained another hard link"),
+        };
+    }
+    if let Err(reason) = capability.validate() {
+        return EffectOutcome::SupersededBeforeEffect {
+            reason: bounded_diagnostic(reason),
+        };
+    }
+    if let EffectRequest::ValidateStaging {
+        source_root: Some(source_root),
+        ..
+    } = &command.effect
+    {
+        let Some(source) = registrations
+            .get(source_root)
+            .and_then(|registration| registration.capability.as_ref())
+        else {
+            return EffectOutcome::SupersededBeforeEffect {
+                reason: String::from("staging source was retired during validation"),
+            };
+        };
+        if let Err(reason) = source.validate() {
+            return EffectOutcome::SupersededBeforeEffect {
+                reason: bounded_diagnostic(format!(
+                    "staging source closed during validation: {reason}"
+                )),
+            };
+        }
+    }
+    EffectOutcome::Applied {
+        evidence: EffectEvidence {
+            observed_identity: Some(*object),
+            bytes: Some(bytes),
+            validated_staging: Some(ValidatedStagingEvidence {
+                output: *output,
+                source_root: *source_root,
+                stable_identity,
+                bytes,
+                content_hash,
+            }),
+        },
+    }
+}
+
 fn validate_for_owner(
     command: &FileOperationCommand,
     grant: Option<&LiveChunkEffectGrant>,
@@ -3636,11 +4073,49 @@ fn validate_for_owner(
                 reason: String::from("root registration is not retained by this owner"),
             });
         };
-        if !registration.active || registration.authority != binding.authority {
+        if registration.authority != binding.authority {
             return Err(EffectOutcome::SupersededBeforeEffect {
                 reason: String::from("root authority fence is stale or mismatched"),
             });
         }
+        if let Some(capability) = registration.capability.as_ref() {
+            capability
+                .validate()
+                .map_err(|reason| EffectOutcome::SupersededBeforeEffect {
+                    reason: bounded_diagnostic(format!(
+                        "registered root is no longer live: {reason}"
+                    )),
+                })?;
+        }
+    }
+    if let EffectRequest::ValidateStaging {
+        source_root: Some(source_root),
+        ..
+    } = &command.effect
+    {
+        let fence = &command.source_fences[0];
+        let Some(source) = registrations.get(source_root) else {
+            return Err(EffectOutcome::SupersededBeforeEffect {
+                reason: String::from("staging source registration is not retained"),
+            });
+        };
+        if source_root.owner != shared.owner
+            || source.authority != AuthorityFence::Source(fence.clone())
+        {
+            return Err(EffectOutcome::SupersededBeforeEffect {
+                reason: String::from("staging source authority fence is stale or mismatched"),
+            });
+        }
+        let Some(capability) = source.capability.as_ref() else {
+            return Err(EffectOutcome::Unsupported {
+                reason: String::from("staging source requires a production root capability"),
+            });
+        };
+        capability
+            .validate()
+            .map_err(|reason| EffectOutcome::SupersededBeforeEffect {
+                reason: bounded_diagnostic(format!("staging source is no longer live: {reason}")),
+            })?;
     }
     match &command.authorization {
         EffectAuthorization::Mutating {
@@ -3834,7 +4309,11 @@ impl fmt::Display for OwnerIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
     use crate::operation_journal::ParticipantId;
+    #[cfg(target_os = "macos")]
+    use crate::test_runtime::TestRuntimeGuard;
 
     fn test_object() -> OwnedObjectIdentity {
         OwnedObjectIdentity(Uuid::from_u128(1))
@@ -3980,6 +4459,402 @@ mod tests {
         )
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn production_profile_registration_rejects_replaced_root_before_effect() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("temporary root");
+        let base = tempfile::tempdir_in(temp_root).expect("isolated profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("file-owner-root");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let owner = FileOperationOwner::start().expect("file owner");
+        let registration = owner.register_profile_root(&guard).expect("live root");
+
+        let mut valid = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("valid command queues");
+        assert!(matches!(
+            valid
+                .recv_timeout(Duration::from_secs(1))
+                .expect("valid result")
+                .outcome(),
+            EffectOutcome::Unsupported { .. }
+        ));
+        valid.acknowledge().expect("acknowledge valid result");
+
+        let root = guard.profile_root().to_path_buf();
+        let displaced = root.with_extension("displaced");
+        std::fs::rename(&root, &displaced).expect("displace profile root");
+        std::fs::create_dir(&root).expect("replace profile root");
+        let mut stale = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("stale command queues");
+        assert!(matches!(
+            stale
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stale result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale.acknowledge().expect("acknowledge stale result");
+        let replacement = root.with_extension("replacement");
+        std::fs::rename(&root, &replacement).expect("move replacement aside");
+        std::os::unix::fs::symlink(&displaced, &root).expect("substitute root symlink");
+        let mut linked = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("symlink-substituted command queues");
+        assert!(matches!(
+            linked
+                .recv_timeout(Duration::from_secs(1))
+                .expect("symlink-substituted result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        linked
+            .acknowledge()
+            .expect("acknowledge symlink-substituted result");
+        std::fs::remove_file(&root).expect("remove substituted symlink");
+        std::fs::rename(&displaced, &root).expect("restore original profile root");
+        drop(valid);
+        drop(stale);
+        drop(linked);
+        owner.retire_root(registration).expect("retire root");
+        owner.acknowledge_custody_for_test();
+        let shutdown = owner.shutdown();
+        assert!(
+            matches!(shutdown, FileOperationOwnerShutdown::DrainedAck),
+            "unexpected shutdown: {shutdown:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staged_validation_uses_no_follow_file_identity_and_exact_content() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("temporary root");
+        let base = tempfile::tempdir_in(temp_root).expect("isolated profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("file-owner-staging-validation");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let owner = FileOperationOwner::start().expect("file owner");
+        let registration = owner.register_profile_root(&guard).expect("live root");
+        let staged = guard.profile_root().join("staging.bin");
+        std::fs::write(&staged, b"abc").expect("staged content");
+        let object = OwnedObjectIdentity::new();
+        let output = OutputIdentity::new();
+        let expected = StagingValidation::new(3, *blake3::hash(b"abc").as_bytes());
+        let make_command = || {
+            FileOperationCommand::for_staging_validation(
+                OperationId::new(),
+                ParticipantId::new(),
+                EffectId::new(),
+                output,
+                registration,
+                profile_fence(owner.owner_identity()),
+                BoundedRelativeLocator::new("staging.bin").expect("staging locator"),
+                object,
+                expected,
+                vec![],
+                None,
+            )
+            .expect("bounded validation command")
+        };
+        let mut valid = owner.submit(make_command()).expect("validation queues");
+        let result = valid
+            .recv_timeout(Duration::from_secs(1))
+            .expect("validation result");
+        let EffectOutcome::Applied { evidence } = result.outcome() else {
+            panic!("expected validated staging, got {:?}", result.outcome());
+        };
+        let proof = evidence
+            .validated_staging()
+            .expect("physical staging proof");
+        assert_eq!(proof.output(), output);
+        assert_eq!(proof.source_root(), None);
+        assert_eq!(proof.bytes(), 3);
+        assert_eq!(proof.content_hash(), *blake3::hash(b"abc").as_bytes());
+        assert_eq!(
+            proof.stable_identity(),
+            stable_filesystem_identity_from_open_file(
+                &std::fs::File::open(&staged).expect("reopen staged file")
+            )
+            .expect("stable staged identity")
+        );
+        valid.acknowledge().expect("acknowledge valid result");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&staged)
+            .expect("staged metadata")
+            .permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&staged, permissions).expect("make staging read only");
+        let mut read_only = owner
+            .submit(make_command())
+            .expect("read-only validation queues");
+        assert!(matches!(
+            read_only
+                .recv_timeout(Duration::from_secs(1))
+                .expect("read-only validation result")
+                .outcome(),
+            EffectOutcome::Applied { .. }
+        ));
+        read_only
+            .acknowledge()
+            .expect("acknowledge read-only result");
+        let mut permissions = std::fs::metadata(&staged)
+            .expect("staged metadata")
+            .permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&staged, permissions).expect("restore staging permissions");
+
+        assert!(
+            FileOperationCommand::for_staging_validation(
+                OperationId::new(),
+                ParticipantId::new(),
+                EffectId::new(),
+                output,
+                registration,
+                profile_fence(owner.owner_identity()),
+                BoundedRelativeLocator::new("staging.bin").expect("staging locator"),
+                object,
+                expected,
+                vec![source_fence()],
+                None,
+            )
+            .is_err()
+        );
+        let wrong_source = FileOperationCommand::for_staging_validation(
+            OperationId::new(),
+            ParticipantId::new(),
+            EffectId::new(),
+            output,
+            registration,
+            profile_fence(owner.owner_identity()),
+            BoundedRelativeLocator::new("staging.bin").expect("staging locator"),
+            object,
+            expected,
+            vec![source_fence()],
+            Some(registration),
+        )
+        .expect("bounded wrong-source command");
+        let mut denied = owner.submit(wrong_source).expect("wrong source queues");
+        assert!(matches!(
+            denied
+                .recv_timeout(Duration::from_secs(1))
+                .expect("wrong source result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        denied
+            .acknowledge()
+            .expect("acknowledge wrong source result");
+
+        std::fs::write(&staged, b"abd").expect("change staged content");
+        let mut changed = owner
+            .submit(make_command())
+            .expect("changed validation queues");
+        assert!(matches!(
+            changed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("changed validation result")
+                .outcome(),
+            EffectOutcome::Collision { .. }
+        ));
+        changed.acknowledge().expect("acknowledge changed result");
+        std::fs::write(&staged, b"abc").expect("restore staged content");
+
+        let hardlink = guard.profile_root().join("staging-hardlink.bin");
+        std::fs::hard_link(&staged, &hardlink).expect("substitute hard-linked staging");
+        let mut linked = owner
+            .submit(make_command())
+            .expect("hard-link validation queues");
+        assert!(matches!(
+            linked
+                .recv_timeout(Duration::from_secs(1))
+                .expect("hard-link validation result")
+                .outcome(),
+            EffectOutcome::Collision { .. }
+        ));
+        linked.acknowledge().expect("acknowledge hard-link result");
+        std::fs::remove_file(&hardlink).expect("remove hard link");
+
+        let target = guard.profile_root().join("staging-target.bin");
+        std::fs::rename(&staged, &target).expect("move original staging");
+        std::os::unix::fs::symlink(&target, &staged).expect("substitute staging symlink");
+        let mut symlinked = owner
+            .submit(make_command())
+            .expect("symlink validation queues");
+        assert!(matches!(
+            symlinked
+                .recv_timeout(Duration::from_secs(1))
+                .expect("symlink validation result")
+                .outcome(),
+            EffectOutcome::Collision { .. }
+        ));
+        symlinked.acknowledge().expect("acknowledge symlink result");
+        std::fs::remove_file(&staged).expect("remove symlink");
+        std::fs::rename(&target, &staged).expect("restore staged file");
+        owner.retire_root(registration).expect("retire root");
+        owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn old_owner_root_reference_cannot_resurrect_after_restart() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("temporary root");
+        let base = tempfile::tempdir_in(temp_root).expect("isolated profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("file-owner-restart");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let old_owner = FileOperationOwner::start().expect("first file owner");
+        let registration = old_owner.register_profile_root(&guard).expect("live root");
+        old_owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            old_owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
+
+        let new_owner = FileOperationOwner::start().expect("replacement file owner");
+        let mut stale = new_owner
+            .submit(unsupported_effect(
+                &new_owner,
+                registration,
+                EffectId::new(),
+            ))
+            .expect("old registration queues for rejection");
+        assert!(matches!(
+            stale
+                .recv_timeout(Duration::from_secs(1))
+                .expect("old registration result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale.acknowledge().expect("acknowledge rejected result");
+        new_owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            new_owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deferred_shutdown_retains_receipt_without_profile_root_capability() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("temporary root");
+        let base = tempfile::tempdir_in(temp_root).expect("isolated profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("file-owner-deferred");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let owner = FileOperationOwner::start().expect("file owner");
+        let registration = owner.register_profile_root(&guard).expect("live root");
+        let mut request = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("effect queues");
+        request
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retained result");
+        assert!(matches!(
+            owner.shutdown(),
+            FileOperationOwnerShutdown::RetirementDeferred { .. }
+        ));
+        let retained = owner
+            .shared
+            .retained_state
+            .lock()
+            .expect("retained state lock");
+        let retained = retained.as_ref().expect("retained evidence");
+        assert!(retained.registrations.is_empty());
+        assert_eq!(retained.receipts.len(), 1);
+    }
+
+    #[test]
+    fn retired_roots_release_registration_capacity_and_cannot_be_reused() {
+        let owner = FileOperationOwner::start().expect("file owner");
+        let mut registrations = Vec::new();
+        for _ in 0..FILE_OPERATION_OWNER_MAX_REGISTERED_ROOTS {
+            registrations.push(
+                owner
+                    .register_root_for_test(profile_fence(owner.owner_identity()), "bounded root")
+                    .expect("registration within bound"),
+            );
+        }
+        assert!(
+            owner
+                .register_root(
+                    registrations[0],
+                    profile_fence(owner.owner_identity()),
+                    "bounded root",
+                    None,
+                )
+                .is_err()
+        );
+        assert!(
+            owner
+                .register_root_for_test(profile_fence(owner.owner_identity()), "overflow")
+                .is_err()
+        );
+        let retired = registrations.pop().expect("registered root");
+        owner.retire_root(retired).expect("retire one root");
+        owner
+            .register_root_for_test(profile_fence(owner.owner_identity()), "replacement")
+            .expect("freed capacity");
+        let mut stale = owner
+            .submit(unsupported_effect(&owner, retired, EffectId::new()))
+            .expect("stale reference queues");
+        assert!(matches!(
+            stale
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stale result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale.acknowledge().expect("acknowledge stale result");
+    }
+
+    #[test]
+    fn dropped_registration_reply_does_not_leave_addressable_root() {
+        let owner = FileOperationOwner::start().expect("file owner");
+        let registration = RootRegistrationRef {
+            owner: owner.owner_identity(),
+            registration_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let (reply, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        owner
+            .shared
+            .try_control(OwnerCommand::RegisterRoot {
+                registration,
+                authority: profile_fence(owner.owner_identity()),
+                label: String::from("lost reply"),
+                capability: None,
+                input: None,
+                result: reply,
+            })
+            .expect("registration queues");
+        owner
+            .register_root_for_test(profile_fence(owner.owner_identity()), "barrier")
+            .expect("prior registration processed");
+        let mut stale = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("stale command queues");
+        assert!(matches!(
+            stale
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stale result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale.acknowledge().expect("acknowledge stale result");
+    }
+
     #[test]
     fn all_effects_are_typed_and_mutating_effects_fail_closed_without_backend() {
         let owner = FileOperationOwner::start().expect("owner starts");
@@ -4041,8 +4916,10 @@ mod tests {
             },
             EffectRequest::ValidateStaging {
                 staging: stage_present.clone(),
+                source_root: None,
                 object: test_object(),
-                expected: StagingValidation { expected_bytes: 1 },
+                output: OutputIdentity::new(),
+                expected: StagingValidation::new(1, [0; 32]),
             },
             EffectRequest::PublishNoReplace {
                 staging: stage_present.clone(),

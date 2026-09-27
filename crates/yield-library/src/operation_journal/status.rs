@@ -113,7 +113,8 @@ impl ObservedOperationStatus {
         self.phase
     }
 
-    /// Return the last observed disposition overlay.
+    /// Return the observed disposition, projecting a capacity retry with validated durable
+    /// incomplete chunk staging as PartialNeedsRetry.
     pub const fn disposition(&self) -> OperationDisposition {
         self.disposition
     }
@@ -227,7 +228,11 @@ pub(crate) fn from_recovery_entry(entry: &RecoveryEntry) -> JournalStatusSnapsho
                 operation_id: record.operation_id,
                 schema_version: record.schema_version,
                 phase: record.phase,
-                disposition: record.disposition,
+                disposition: if entry.capacity_partial() {
+                    OperationDisposition::PartialNeedsRetry
+                } else {
+                    record.disposition
+                },
                 command_kind: record
                     .universal_intent
                     .as_ref()

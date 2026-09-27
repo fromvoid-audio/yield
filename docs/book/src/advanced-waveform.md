@@ -56,6 +56,6 @@ The random toolbar button supports several audition styles.
 - Click random to play a random section.
 - Shift-click random to play a random listed sample range.
 - Command-click random to toggle sticky random playback.
-- `Option-Space` or `Control-Space` plays a random sample section.
+- `R` plays a random section of the selected sample.
 
 Sticky random playback makes `Space` keep choosing random sections until you turn sticky random off.

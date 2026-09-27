@@ -169,7 +169,11 @@ impl Browser {
         }
     }
 
-    fn focus_loaded_sample_in_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_loaded_sample_in_browser(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.waveform.is_none() {
             self.playback_status = "Load a sample to focus it".into();
             cx.notify();
@@ -283,20 +287,34 @@ impl Browser {
         cx.notify();
     }
 
-    fn focus_folder_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_folder_path(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(position) = self.folder_rows().iter().position(|row| row.path == path) else {
             return;
         };
+        self.mark_folder_keyboard_focus(path.clone());
         let root = self.root.clone();
         let scan_generation = self.scan_generation;
-        let origin_focus = window.focused(cx);
         self.folder_scroll_handle
             .scroll_to_item(position, ScrollStrategy::Center);
         cx.notify();
+        let ax_id = self.ax_folder_ids(&path).0;
+        if ax_id.as_deref().and_then(|id| self.ax_focus(id)).is_some() {
+            self.focus_ax_row(ax_id, window, cx);
+        }
+        let origin_focus = window.focused(cx);
         cx.on_next_frame(window, move |view, window, cx| {
             if window.focused(cx) != origin_focus
                 || view.root != root
                 || view.scan_generation != scan_generation
+                || view
+                    .folder_keyboard
+                    .as_ref()
+                    .is_none_or(|state| state.focused() != path)
                 || !view.folder_rows().iter().any(|row| row.path == path)
             {
                 return;
@@ -358,6 +376,7 @@ mod tests {
     use super::*;
     use gpui::{Keystroke, TestAppContext};
     use yield_core::{AudioFile, BrowserViewModel};
+    use yield_media::WaveformPreview;
 
     fn fixture(root: &PathBuf, name: &str) -> AudioFile {
         AudioFile {
@@ -405,6 +424,50 @@ mod tests {
             browser_target(ids.iter(), None, None, &HashSet::new(), Some(&hidden)),
             Some(ids[0].clone())
         );
+    }
+
+    #[gpui::test]
+    fn focus_loaded_without_a_sample_reports_a_truthful_status(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                view.focus_loaded_sample_in_browser(window, cx);
+                assert_eq!(view.playback_status, "Load a sample to focus it");
+                assert!(view.browser_focus_override.is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn focus_loaded_hidden_by_filter_keeps_focus_and_reports_unavailable(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                let root = PathBuf::from("/tmp/yield-focus-hidden");
+                view.root = Some(root.clone());
+                view.entries = vec![fixture(&root, "hidden.wav")];
+                view.selected = Some(0);
+                view.view_model = BrowserViewModel::new(&[]);
+                view.waveform = Some(WaveformPreview {
+                    peaks: vec![0.5; 8],
+                    bands: Vec::new(),
+                    duration_seconds: 1.0,
+                    sample_rate: 48_000,
+                    total_frames: 48_000,
+                    detail_context: None,
+                });
+                let focus = window.focused(cx);
+                view.focus_loaded_sample_in_browser(window, cx);
+                assert_eq!(
+                    view.playback_status,
+                    "Loaded sample is not visible in the browser"
+                );
+                assert_eq!(window.focused(cx), focus);
+                assert!(view.browser_focus_override.is_none());
+            });
+        });
     }
 
     #[gpui::test]

@@ -20,6 +20,20 @@ struct BrowserMetadataCapabilities {
     playback_type_catalog: bool,
 }
 
+fn charge_browser_page_input(
+    used: &mut usize,
+    bytes: usize,
+    max_input_bytes: Option<usize>,
+) -> Result<(), SourceDbError> {
+    if let Some(max) = max_input_bytes {
+        *used = used
+            .checked_add(bytes)
+            .filter(|total| *total <= max)
+            .ok_or(SourceDbError::SnapshotBudgetExceeded)?;
+    }
+    Ok(())
+}
+
 fn playback_type_select_expr(available: bool, path_expr: &str) -> String {
     if !available {
         return String::from("NULL AS playback_type");
@@ -448,8 +462,40 @@ impl SourceDatabase {
         after_cursor: Option<&BrowserMetadataCursor>,
         requested_limit: usize,
     ) -> Result<BrowserMetadataPage, SourceDbError> {
+        self.browser_metadata_page_with_budget(
+            expected_revision,
+            after_cursor,
+            requested_limit,
+            None,
+        )
+    }
+
+    /// Owner-held page read with an input budget checked before copying SQLite text rows.
+    pub(crate) fn browser_metadata_page_bounded(
+        &self,
+        expected_revision: u64,
+        after_cursor: Option<&BrowserMetadataCursor>,
+        requested_limit: usize,
+        max_input_bytes: usize,
+    ) -> Result<BrowserMetadataPage, SourceDbError> {
+        self.browser_metadata_page_with_budget(
+            expected_revision,
+            after_cursor,
+            requested_limit,
+            Some(max_input_bytes),
+        )
+    }
+
+    fn browser_metadata_page_with_budget(
+        &self,
+        expected_revision: u64,
+        after_cursor: Option<&BrowserMetadataCursor>,
+        requested_limit: usize,
+        max_input_bytes: Option<usize>,
+    ) -> Result<BrowserMetadataPage, SourceDbError> {
         const MAX_PAGE_SIZE: usize = 64;
         let limit = requested_limit.clamp(1, MAX_PAGE_SIZE);
+        let mut input_bytes = 0usize;
         let transaction = self
             .connection
             .unchecked_transaction()
@@ -510,49 +556,54 @@ impl SourceDatabase {
         );
         let raw_rows = {
             let mut statement = transaction.prepare(&sql).map_err(map_sql_error)?;
-            statement
-                .query_map(
-                    rusqlite::params![
-                        after_cursor.map(BrowserMetadataCursor::as_str),
-                        limit as i64
-                    ],
-                    |row| {
-                        let raw_path: String = row.get(0)?;
-                        let Some(relative_path) = decode_relative_path(
-                            raw_path.clone(),
-                            "Skipping browser metadata row with invalid relative path",
-                        )?
-                        else {
-                            return Ok((raw_path, None));
-                        };
-                        let legacy_collection = if memberships_available {
-                            Vec::new()
-                        } else {
-                            row.get::<_, Option<i64>>(5)?
-                                .and_then(SampleCollection::from_i64)
-                                .into_iter()
-                                .collect()
-                        };
-                        Ok((
-                            raw_path,
-                            Some(BrowserFileMetadata {
-                                relative_path,
-                                file_size: u64::try_from(row.get::<_, i64>(6)?).unwrap_or_default(),
-                                modified_ns: row.get(7)?,
-                                missing: row.get::<_, i64>(8)? != 0,
-                                rating: Rating::from_i64(row.get(1)?),
-                                locked: row.get::<_, i64>(2)? != 0,
-                                collections: legacy_collection,
-                                last_played_at: row.get(3)?,
-                                last_curated_at: row.get(4)?,
-                                playback_type: decode_playback_type(row.get(9)?),
-                            }),
-                        ))
-                    },
+            let mut rows = statement
+                .query(rusqlite::params![
+                    after_cursor.map(BrowserMetadataCursor::as_str),
+                    limit as i64
+                ])
+                .map_err(map_sql_error)?;
+            let mut raw_rows = Vec::with_capacity(limit);
+            while let Some(row) = rows.next().map_err(map_sql_error)? {
+                let path = row.get_ref(0).map_err(map_sql_error)?;
+                let path = path.as_str().map_err(|_| SourceDbError::Unexpected)?;
+                charge_browser_page_input(&mut input_bytes, path.len(), max_input_bytes)?;
+                let raw_path = path.to_owned();
+                let Some(relative_path) = decode_relative_path(
+                    raw_path.clone(),
+                    "Skipping browser metadata row with invalid relative path",
                 )
                 .map_err(map_sql_error)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(map_sql_error)?
+                else {
+                    raw_rows.push((raw_path, None));
+                    continue;
+                };
+                let legacy_collection = if memberships_available {
+                    Vec::new()
+                } else {
+                    row.get::<_, Option<i64>>(5)
+                        .map_err(map_sql_error)?
+                        .and_then(SampleCollection::from_i64)
+                        .into_iter()
+                        .collect()
+                };
+                raw_rows.push((
+                    raw_path,
+                    Some(BrowserFileMetadata {
+                        relative_path,
+                        file_size: u64::try_from(row.get::<_, i64>(6).map_err(map_sql_error)?)
+                            .unwrap_or_default(),
+                        modified_ns: row.get(7).map_err(map_sql_error)?,
+                        missing: row.get::<_, i64>(8).map_err(map_sql_error)? != 0,
+                        rating: Rating::from_i64(row.get(1).map_err(map_sql_error)?),
+                        locked: row.get::<_, i64>(2).map_err(map_sql_error)? != 0,
+                        collections: legacy_collection,
+                        last_played_at: row.get(3).map_err(map_sql_error)?,
+                        last_curated_at: row.get(4).map_err(map_sql_error)?,
+                        playback_type: decode_playback_type(row.get(9).map_err(map_sql_error)?),
+                    }),
+                ));
+            }
+            raw_rows
         };
         let next_cursor = (raw_rows.len() == limit)
             .then(|| {
@@ -566,29 +617,39 @@ impl SourceDatabase {
             .filter_map(|(_, file)| file)
             .collect::<Vec<_>>();
         if memberships_available && !files.is_empty() {
-            let first = super::super::normalize_relative_path(&files[0].relative_path)?;
-            let last = super::super::normalize_relative_path(
-                &files[files.len().saturating_sub(1)].relative_path,
-            )?;
+            let paths = files
+                .iter()
+                .map(|file| super::super::normalize_relative_path(&file.relative_path))
+                .collect::<Result<Vec<_>, _>>()?;
+            let placeholders = vec!["?"; paths.len()].join(",");
             let mut statement = transaction
-                .prepare(
+                .prepare(&format!(
                     "SELECT path, collection FROM wav_file_collections
-                     WHERE path >= ?1 AND path <= ?2 ORDER BY path ASC, collection ASC",
-                )
+                     WHERE path IN ({placeholders}) ORDER BY path ASC, collection ASC"
+                ))
                 .map_err(map_sql_error)?;
-            let memberships = statement
-                .query_map(rusqlite::params![first, last], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })
-                .map_err(map_sql_error)?
-                .collect::<Result<Vec<_>, _>>()
+            let mut memberships = statement
+                .query(rusqlite::params_from_iter(paths.iter()))
                 .map_err(map_sql_error)?;
-            for (path, collection) in memberships {
+            let mut membership_count = 0usize;
+            while let Some(row) = memberships.next().map_err(map_sql_error)? {
+                membership_count += 1;
+                if max_input_bytes.is_some() && membership_count > 100_000 {
+                    return Err(SourceDbError::SnapshotBudgetExceeded);
+                }
+                let path = row.get_ref(0).map_err(map_sql_error)?;
+                let path = path.as_str().map_err(|_| SourceDbError::Unexpected)?;
+                charge_browser_page_input(
+                    &mut input_bytes,
+                    path.len() + std::mem::size_of::<i64>(),
+                    max_input_bytes,
+                )?;
+                let collection = row.get::<_, i64>(1).map_err(map_sql_error)?;
                 if let (Some(file), Some(collection)) = (
-                    files.iter_mut().find(|file| {
-                        super::super::normalize_relative_path(&file.relative_path)
-                            .is_ok_and(|candidate| candidate == path)
-                    }),
+                    paths
+                        .iter()
+                        .position(|candidate| candidate == path)
+                        .map(|index| &mut files[index]),
                     SampleCollection::from_i64(collection),
                 ) {
                     file.collections.push(collection);

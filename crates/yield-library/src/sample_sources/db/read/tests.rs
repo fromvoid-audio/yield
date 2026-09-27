@@ -4,7 +4,8 @@ use rusqlite::{Connection, params};
 use tempfile::tempdir;
 
 use super::super::{
-    DB_FILE_NAME, Rating, SampleCollection, SampleSoundType, SourceDatabase, SourcePlaybackType,
+    DB_FILE_NAME, Rating, SampleCollection, SampleSoundType, SourceDatabase, SourceDbError,
+    SourcePlaybackType,
 };
 
 use super::super::util::{EXACT_SUBTREE_PATH_PREDICATE, exact_subtree_path_bounds};
@@ -159,6 +160,38 @@ fn browser_metadata_page_is_keyset_paged_and_revision_fenced() {
     assert!(
         db.browser_metadata_page(revision, second.next_cursor.as_ref(), 2)
             .is_err()
+    );
+}
+
+#[test]
+fn bounded_browser_page_rejects_row_and_membership_input_before_returning_a_page() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_source_write(dir.path()).unwrap();
+    for name in ["a.wav", "b.wav"] {
+        db.upsert_file(Path::new(name), 10, 5).unwrap();
+    }
+    db.connection
+        .execute(
+            "INSERT INTO wav_file_collections (path, collection) VALUES ('a.wav', 1)",
+            [],
+        )
+        .unwrap();
+    let revision = db.get_revision().unwrap();
+    assert!(matches!(
+        db.browser_metadata_page_bounded(revision, None, 2, 4),
+        Err(SourceDbError::SnapshotBudgetExceeded)
+    ));
+    assert!(matches!(
+        db.browser_metadata_page_bounded(revision, None, 2, 12),
+        Err(SourceDbError::SnapshotBudgetExceeded)
+    ));
+    let page = db
+        .browser_metadata_page_bounded(revision, None, 2, 64)
+        .unwrap();
+    assert_eq!(page.files.len(), 2);
+    assert_eq!(
+        page.files[0].collections,
+        vec![SampleCollection::new(1).unwrap()]
     );
 }
 

@@ -1,8 +1,8 @@
 //! Profile-owned SQLite storage for durable operation intents.
 //!
 //! This store is deliberately smaller than either the source catalog or the global library
-//! database. It owns only an operation id, a monotonic journal-observation sequence, and one bounded
-//! encoded record. A successful insert proves that these bytes reached this SQLite database; it
+//! database. It owns bounded operation records and staging checkpoints under monotonic
+//! journal-observation sequences. A successful insert proves that these bytes reached this SQLite database; it
 //! does not admit the operation to filesystem execution or grant any other capability. The store
 //! uses one exclusive connection, DELETE rollback journaling, and synchronous EXTRA (the
 //! strongest rollback-journal mode) and flushes the already-owned profile/child directories on
@@ -67,20 +67,24 @@ use super::selection_output_commands::{
 use super::validation::{RecordConsistency, classify_record};
 
 mod chunk_claims;
+mod chunk_staging;
 #[allow(dead_code)]
 mod full_progress;
 #[allow(dead_code)]
 mod ordinary_claims;
 mod recovery_reserve;
 mod recovery_reserve_binding;
+mod staging_checkpoints;
 pub(crate) use chunk_claims::{
     ChunkClaimRecord, ChunkClaimRequest, ChunkClaimState, ChunkId, ChunkIssueReceipt,
     ChunkWriteIdentity,
 };
+pub(crate) use chunk_staging::ChunkStagingReceipt;
 pub(crate) use full_progress::FullProgressWriteOutcome;
 #[cfg(test)]
 pub(crate) use ordinary_claims::MAX_PAGE_ROWS;
 pub(crate) use ordinary_claims::{OrdinaryClaimCursor, OrdinaryClaimPage, OrdinaryClaimReadError};
+pub(crate) use staging_checkpoints::StagingCheckpointAck;
 /// Read-only, bounded recovery paging for the profile-owned operation journal.
 pub mod recovery;
 
@@ -94,7 +98,7 @@ pub const JOURNAL_DATABASE_ROOT_NAME: &str = "operation_journal";
 /// The SQLite application id reserved for the operation journal.
 pub const JOURNAL_APPLICATION_ID: u32 = u32::from_be_bytes(*b"WCJ1");
 /// The SQLite user-version written by this journal schema.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 7;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 9;
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -112,7 +116,9 @@ const RECOVERY_RESERVE_SCHEMA_VERSION: u32 = 3;
 const RECOVERY_RESERVE_BINDING_SCHEMA_VERSION: u32 = 4;
 const ORDINARY_CLAIM_SCHEMA_VERSION: u32 = 5;
 const ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION: u32 = 6;
-const MAX_SCHEMA_OBJECTS: i64 = 8;
+const CHUNK_CLAIM_SCHEMA_VERSION: u32 = 7;
+const STAGING_CHECKPOINT_SCHEMA_VERSION: u32 = 8;
+const MAX_SCHEMA_OBJECTS: i64 = 10;
 const MAX_SCHEMA_COLUMNS: usize = 16;
 const MAX_SCHEMA_INDEXES: usize = 8;
 const MAX_REBUILD_DIAGNOSTICS: usize = 32;
@@ -229,6 +235,18 @@ pub enum OperationJournalStoreError {
     #[error("operation journal chunk claim error: {reason}")]
     ChunkClaim {
         /// Bounded chunk claim diagnostic.
+        reason: String,
+    },
+    /// A staging checkpoint could not be acknowledged or conflicts with retained evidence.
+    #[error("operation journal staging checkpoint error: {reason}")]
+    StagingCheckpoint {
+        /// Bounded checkpoint diagnostic.
+        reason: String,
+    },
+    /// A capability-bound incomplete chunk checkpoint failed closed.
+    #[error("operation journal chunk staging error: {reason}")]
+    ChunkStaging {
+        /// Bounded checkpoint diagnostic.
         reason: String,
     },
     /// The requested operation id is not present in the journal.
@@ -1995,6 +2013,16 @@ impl OperationJournalStore {
                     reason: String::from("chunk claim belongs to a different operation"),
                 });
             }
+            let has_checkpoint: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_journal_chunk_staging WHERE chunk_id = ?1)",
+                params![chunk_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if has_checkpoint {
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: String::from("incomplete chunk staging checkpoint retains its charge"),
+                });
+            }
             let claim = ordinary_claims::read_claim(&self.connection, current.claim_id())
                 .map_err(|error| OperationJournalStoreError::ChunkClaim {
                     reason: error.to_string(),
@@ -2168,6 +2196,18 @@ impl OperationJournalStore {
                     format!("recovery reserve history is not durably zero: {error}"),
                 )
             })?;
+            let staging_rows: i64 = self.connection.query_row(
+                "SELECT (SELECT COUNT(*) FROM operation_journal_staging_checkpoints)
+                      + (SELECT COUNT(*) FROM operation_journal_chunk_staging)",
+                [],
+                |row| row.get(0),
+            )?;
+            if staging_rows != 0 {
+                return Err(audit_error(
+                    &self.database_path,
+                    "staging checkpoint evidence remains unresolved",
+                ));
+            }
             self.validate_namespace_for_precommit()?;
             Ok(())
         })();
@@ -3129,6 +3169,50 @@ impl OperationJournalStore {
                     ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION,
                 )?;
                 migrate_chunk_claim_schema(
+                    &connection,
+                    &database_root,
+                    &database_path,
+                    &database_identity,
+                    profile_guard,
+                    rollback_journal.as_ref(),
+                )?;
+            } else if header_version == CHUNK_CLAIM_SCHEMA_VERSION {
+                if let Some(rollback_journal) = rollback_journal.as_ref() {
+                    validate_rollback_journal_identity(
+                        &database_root,
+                        &database_path,
+                        &rollback_journal.identity,
+                    )?;
+                }
+                configure_connection(&connection)?;
+                verify_connection_configuration(
+                    &connection,
+                    &database_path,
+                    CHUNK_CLAIM_SCHEMA_VERSION,
+                )?;
+                migrate_staging_checkpoint_schema(
+                    &connection,
+                    &database_root,
+                    &database_path,
+                    &database_identity,
+                    profile_guard,
+                    rollback_journal.as_ref(),
+                )?;
+            } else if header_version == STAGING_CHECKPOINT_SCHEMA_VERSION {
+                if let Some(rollback_journal) = rollback_journal.as_ref() {
+                    validate_rollback_journal_identity(
+                        &database_root,
+                        &database_path,
+                        &rollback_journal.identity,
+                    )?;
+                }
+                configure_connection(&connection)?;
+                verify_connection_configuration(
+                    &connection,
+                    &database_path,
+                    STAGING_CHECKPOINT_SCHEMA_VERSION,
+                )?;
+                migrate_chunk_staging_schema(
                     &connection,
                     &database_root,
                     &database_path,
@@ -5393,6 +5477,44 @@ impl OperationJournalStore {
         }
     }
 
+    /// Persist a post-intent capacity retry and classify the resulting status from positive,
+    /// durable incomplete staging evidence. The V1-V16 operation codec keeps its RetryPending
+    /// retry lease; a validated chunk checkpoint projects PartialNeedsRetry on recovery.
+    pub(crate) fn record_post_intent_chunk_exhaustion(
+        &self,
+        operation_id: OperationId,
+        expected_sequence: i64,
+        observation: RetryObservation,
+    ) -> Result<(JournalRetryReceipt, OperationDisposition), OperationJournalStoreError> {
+        if observation.error_class() != super::coordinator::RetryErrorClass::CapacityUnavailable {
+            return Err(OperationJournalStoreError::InvalidRetryObservation {
+                reason: String::from("chunk exhaustion requires CapacityUnavailable"),
+            });
+        }
+        // Validate every bounded checkpoint before changing the operation. A malformed row is
+        // retained for audit; it must not be interpreted as a clean RetryPending operation.
+        let partial = self.has_valid_chunk_staging(operation_id)?;
+        let receipt = self.record_retry_pending(operation_id, expected_sequence, observation)?;
+        let persisted = self
+            .get(operation_id)?
+            .ok_or_else(|| OperationJournalStoreError::OperationNotFound { operation_id })?;
+        if persisted.disposition != OperationDisposition::RetryPending
+            || self.has_valid_chunk_staging(operation_id)? != partial
+        {
+            return Err(OperationJournalStoreError::ChunkStaging {
+                reason: String::from("chunk exhaustion status changed during readback"),
+            });
+        }
+        Ok((
+            receipt,
+            if partial {
+                OperationDisposition::PartialNeedsRetry
+            } else {
+                OperationDisposition::RetryPending
+            },
+        ))
+    }
+
     fn record_retry_inside_transaction(
         &self,
         operation_id: OperationId,
@@ -6199,6 +6321,10 @@ impl OperationJournalStore {
                  SELECT sequence FROM operation_journal
                  UNION ALL
                  SELECT sequence FROM operation_journal_full_progress
+                 UNION ALL
+                 SELECT sequence FROM operation_journal_staging_checkpoints
+                 UNION ALL
+                 SELECT sequence FROM operation_journal_chunk_staging
              )",
             [],
             |row| row.get::<_, Option<i64>>(0),
@@ -6712,6 +6838,12 @@ impl OperationJournalStore {
                  UNION ALL
                  SELECT sequence FROM operation_journal_full_progress
                  WHERE typeof(sequence) = 'integer' AND sequence = ?1
+                 UNION ALL
+                 SELECT sequence FROM operation_journal_staging_checkpoints
+                 WHERE typeof(sequence) = 'integer' AND sequence = ?1
+                 UNION ALL
+                 SELECT sequence FROM operation_journal_chunk_staging
+                 WHERE typeof(sequence) = 'integer' AND sequence = ?1
              )",
             params![sequence],
             |row| row.get(0),
@@ -7188,6 +7320,8 @@ fn validate_sqlite_header(file: &mut File, path: &Path) -> Result<u32, Operation
             | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
             | ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
+            | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -7220,6 +7354,8 @@ fn read_sqlite_user_version(
             | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
             | ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
+            | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -7350,37 +7486,58 @@ fn validate_existing_schema(
                 String::from("table"),
             ),
         ],
-        JOURNAL_SCHEMA_VERSION => vec![
-            (String::from(JOURNAL_TABLE_NAME), String::from("table")),
-            (
-                String::from(chunk_claims::TABLE_NAME),
-                String::from("table"),
-            ),
-            (
-                String::from(FULL_PROGRESS_TABLE_NAME),
-                String::from("table"),
-            ),
-            (
-                String::from(ordinary_claims::TABLE_NAME),
-                String::from("table"),
-            ),
-            (
-                String::from(ordinary_claims::RELEASE_TABLE_NAME),
-                String::from("table"),
-            ),
-            (
-                String::from(recovery_reserve::CHARGE_TABLE_NAME),
-                String::from("table"),
-            ),
-            (
-                String::from(recovery_reserve_binding::TABLE_NAME),
-                String::from("table"),
-            ),
-            (
-                String::from(recovery_reserve::TRANSITION_TABLE_NAME),
-                String::from("table"),
-            ),
-        ],
+        CHUNK_CLAIM_SCHEMA_VERSION | STAGING_CHECKPOINT_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION => {
+            let mut expected = vec![
+                (String::from(JOURNAL_TABLE_NAME), String::from("table")),
+                (
+                    String::from(chunk_claims::TABLE_NAME),
+                    String::from("table"),
+                ),
+                (
+                    String::from(FULL_PROGRESS_TABLE_NAME),
+                    String::from("table"),
+                ),
+                (
+                    String::from(ordinary_claims::TABLE_NAME),
+                    String::from("table"),
+                ),
+                (
+                    String::from(ordinary_claims::RELEASE_TABLE_NAME),
+                    String::from("table"),
+                ),
+                (
+                    String::from(recovery_reserve::CHARGE_TABLE_NAME),
+                    String::from("table"),
+                ),
+                (
+                    String::from(recovery_reserve_binding::TABLE_NAME),
+                    String::from("table"),
+                ),
+                (
+                    String::from(recovery_reserve::TRANSITION_TABLE_NAME),
+                    String::from("table"),
+                ),
+            ];
+            if schema_version >= STAGING_CHECKPOINT_SCHEMA_VERSION {
+                expected.insert(
+                    8,
+                    (
+                        String::from(staging_checkpoints::TABLE_NAME),
+                        String::from("table"),
+                    ),
+                );
+            }
+            if schema_version == JOURNAL_SCHEMA_VERSION {
+                expected.insert(
+                    2,
+                    (
+                        String::from(chunk_staging::TABLE_NAME),
+                        String::from("table"),
+                    ),
+                );
+            }
+            expected
+        }
         _ => {
             return Err(audit_error(
                 path,
@@ -7403,6 +7560,8 @@ fn validate_existing_schema(
             | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
             | ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
+            | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7418,6 +7577,8 @@ fn validate_existing_schema(
             | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
             | ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
+            | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7438,6 +7599,8 @@ fn validate_existing_schema(
         RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
             | ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
+            | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7451,6 +7614,8 @@ fn validate_existing_schema(
         schema_version,
         ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
+            | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7462,7 +7627,10 @@ fn validate_existing_schema(
     }
     if matches!(
         schema_version,
-        ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
+            | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
+            | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
             connection,
@@ -7471,12 +7639,34 @@ fn validate_existing_schema(
             ordinary_claims::CREATE_RELEASE_TABLE,
         )?;
     }
-    if schema_version == JOURNAL_SCHEMA_VERSION {
+    if matches!(
+        schema_version,
+        CHUNK_CLAIM_SCHEMA_VERSION | STAGING_CHECKPOINT_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+    ) {
         validate_table_schema(
             connection,
             path,
             chunk_claims::TABLE_NAME,
             chunk_claims::CREATE_TABLE,
+        )?;
+    }
+    if matches!(
+        schema_version,
+        STAGING_CHECKPOINT_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+    ) {
+        validate_table_schema(
+            connection,
+            path,
+            staging_checkpoints::TABLE_NAME,
+            staging_checkpoints::CREATE_TABLE,
+        )?;
+    }
+    if schema_version == JOURNAL_SCHEMA_VERSION {
+        validate_table_schema(
+            connection,
+            path,
+            chunk_staging::TABLE_NAME,
+            chunk_staging::CREATE_TABLE,
         )?;
     }
     Ok(())
@@ -7655,6 +7845,22 @@ fn validate_table_schema(
             (String::from("issue_id"), String::from("TEXT"), 0, 0),
             (String::from("release_id"), String::from("TEXT"), 0, 0),
         ],
+        staging_checkpoints::TABLE_NAME => vec![
+            (String::from("output_id"), String::from("TEXT"), 1, 1),
+            (String::from("sequence"), String::from("INTEGER"), 1, 0),
+            (String::from("record"), String::from("BLOB"), 1, 0),
+            (
+                String::from("grant_reserved"),
+                String::from("INTEGER"),
+                1,
+                0,
+            ),
+        ],
+        chunk_staging::TABLE_NAME => vec![
+            (String::from("chunk_id"), String::from("TEXT"), 1, 1),
+            (String::from("sequence"), String::from("INTEGER"), 1, 0),
+            (String::from("record"), String::from("BLOB"), 1, 0),
+        ],
         _ => {
             return Err(audit_error(path, format!("unsupported table {table_name}")));
         }
@@ -7763,6 +7969,8 @@ fn migrate_legacy_schema(
         connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
         connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
+        connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         if let Some(error) =
             migration_failure.and_then(|hook| hook(MigrationTestBoundary::BeforeCommit, connection))
@@ -7832,6 +8040,8 @@ fn migrate_previous_schema(
         connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
         connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
+        connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -7894,6 +8104,8 @@ fn migrate_recovery_reserve_schema(
         connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
         connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
+        connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -7959,6 +8171,8 @@ fn migrate_ordinary_claim_schema(
         connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
         connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
+        connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8019,6 +8233,8 @@ fn migrate_ordinary_claim_release_schema(
         validate_existing_schema(connection, database_path, ORDINARY_CLAIM_SCHEMA_VERSION)?;
         connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
+        connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8082,6 +8298,127 @@ fn migrate_chunk_claim_schema(
             ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION,
         )?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
+        connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
+        connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
+        validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            JOURNAL_SCHEMA_VERSION,
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn migrate_staging_checkpoint_schema(
+    connection: &Connection,
+    database_root: &BoundDatabaseRoot,
+    database_path: &Path,
+    database_identity: &str,
+    profile_guard: &WritableProfileGuard,
+    rollback_journal: Option<&PreexistingRollbackJournal>,
+) -> Result<(), OperationJournalStoreError> {
+    validate_migration_guards(
+        connection,
+        database_root,
+        database_path,
+        database_identity,
+        profile_guard,
+        rollback_journal,
+        CHUNK_CLAIM_SCHEMA_VERSION,
+    )?;
+    connection.execute_batch("BEGIN EXCLUSIVE")?;
+    let result = (|| {
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            CHUNK_CLAIM_SCHEMA_VERSION,
+        )?;
+        validate_existing_schema(connection, database_path, CHUNK_CLAIM_SCHEMA_VERSION)?;
+        connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
+        connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
+        validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            JOURNAL_SCHEMA_VERSION,
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn migrate_chunk_staging_schema(
+    connection: &Connection,
+    database_root: &BoundDatabaseRoot,
+    database_path: &Path,
+    database_identity: &str,
+    profile_guard: &WritableProfileGuard,
+    rollback_journal: Option<&PreexistingRollbackJournal>,
+) -> Result<(), OperationJournalStoreError> {
+    validate_migration_guards(
+        connection,
+        database_root,
+        database_path,
+        database_identity,
+        profile_guard,
+        rollback_journal,
+        STAGING_CHECKPOINT_SCHEMA_VERSION,
+    )?;
+    connection.execute_batch("BEGIN EXCLUSIVE")?;
+    let result = (|| {
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            STAGING_CHECKPOINT_SCHEMA_VERSION,
+        )?;
+        validate_existing_schema(connection, database_path, STAGING_CHECKPOINT_SCHEMA_VERSION)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8164,13 +8501,17 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
              {binding_table};
              {ordinary_claim_table};
              {ordinary_claim_release_table};
-             {chunk_claim_table};",
+             {chunk_claim_table};
+             {staging_checkpoint_table};
+             {chunk_staging_table};",
             charge_table = recovery_reserve::CREATE_CHARGE_TABLE,
             transition_table = recovery_reserve::CREATE_TRANSITION_TABLE,
             binding_table = recovery_reserve_binding::CREATE_TABLE,
             ordinary_claim_table = ordinary_claims::CREATE_TABLE,
             ordinary_claim_release_table = ordinary_claims::CREATE_RELEASE_TABLE,
             chunk_claim_table = chunk_claims::CREATE_TABLE,
+            staging_checkpoint_table = staging_checkpoints::CREATE_TABLE,
+            chunk_staging_table = chunk_staging::CREATE_TABLE,
         ))
         .map(|_| ());
     match result {
@@ -11814,6 +12155,639 @@ mod tests {
     }
 
     #[test]
+    fn staging_checkpoint_requires_exact_durable_v16_participant_and_acknowledgement() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal_intent, command_args, legacy_plan) = v5_copy_inputs();
+        let participant_id = universal_intent
+            .participants()
+            .descriptors()
+            .iter()
+            .find(|participant| participant.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem participant")
+            .id();
+        let full_plan = FullCapacityPlan::from_legacy(&legacy_plan).expect("full plan");
+        let operation = StoredOperationRecord::new_v16_command(
+            operation_id,
+            intent,
+            universal_intent,
+            UniversalCommandArgs::Copy(command_args),
+            full_plan,
+            50,
+        );
+        let inserted = store.insert_intent(&operation).expect("persist V16 intent");
+        let output_id = Uuid::new_v4();
+        let make_record = |hash: u8| {
+            staging_checkpoints::StagingCheckpointRecord::decode(
+                &serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1,
+                    "operation_id": operation_id,
+                    "participant_id": participant_id,
+                    "effect_id": Uuid::new_v4(),
+                    "output_id": output_id,
+                    "staging_root": {
+                        "owner": Uuid::new_v4(),
+                        "registration_id": Uuid::new_v4(),
+                        "generation": 1
+                    },
+                    "source_root": null,
+                    "source_fence": null,
+                    "locator": "staged.wav",
+                    "logical_object_id": Uuid::new_v4(),
+                    "physical_object_id": "physical-staged-file",
+                    "bytes": 4,
+                    "content_hash": vec![hash; 32],
+                    "request_fingerprint": vec![1; 32]
+                }))
+                .expect("encode checkpoint fixture"),
+            )
+            .expect("decode checkpoint fixture")
+        };
+        let checkpoint = make_record(2);
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("injected precommit failure"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        assert!(store.checkpoint_staging(&checkpoint).is_err());
+        assert!(
+            store
+                .read_staging_checkpoint_row(output_id)
+                .expect("read rolled-back checkpoint")
+                .is_none()
+        );
+
+        let first = store
+            .checkpoint_staging(&checkpoint)
+            .expect("checkpoint exact staging");
+        let checkpoint_sequence = match first {
+            staging_checkpoints::StagingCheckpointReceipt::Committed { sequence } => sequence,
+            staging_checkpoints::StagingCheckpointReceipt::Replay { .. } => {
+                panic!("new checkpoint cannot replay")
+            }
+        };
+        assert!(matches!(
+            first,
+            staging_checkpoints::StagingCheckpointReceipt::Committed { .. }
+        ));
+        assert!(matches!(
+            store
+                .checkpoint_staging(&checkpoint)
+                .expect("read-only replay"),
+            staging_checkpoints::StagingCheckpointReceipt::Replay { .. }
+        ));
+        assert!(store.checkpoint_staging(&make_record(3)).is_err());
+        assert!(store.prove_clean_handoff_durable().is_err());
+        assert_eq!(journal_sequence(&store, operation_id), inserted.sequence());
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen journal");
+        assert!(matches!(
+            reopened
+                .checkpoint_staging(&checkpoint)
+                .expect("replay after restart"),
+            staging_checkpoints::StagingCheckpointReceipt::Replay { .. }
+        ));
+        reopened.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("injected grant precommit failure"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        assert!(
+            reopened
+                .reserve_staging_grant_record(&checkpoint, checkpoint_sequence)
+                .is_err()
+        );
+
+        assert!(
+            !reopened
+                .read_staging_checkpoint_row(output_id)
+                .expect("read unreserved row")
+                .expect("retained checkpoint")
+                .2
+        );
+        reopened.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::AfterCommit {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("injected grant postcommit uncertainty"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        assert!(
+            reopened
+                .reserve_staging_grant_record(&checkpoint, checkpoint_sequence)
+                .is_err()
+        );
+
+        let uncertain_output = Uuid::new_v4();
+        let mut uncertain_value = serde_json::to_value(&checkpoint).expect("checkpoint value");
+        uncertain_value["output_id"] = serde_json::json!(uncertain_output);
+        uncertain_value["effect_id"] = serde_json::json!(Uuid::new_v4());
+        let uncertain = staging_checkpoints::StagingCheckpointRecord::decode(
+            &serde_json::to_vec(&uncertain_value).expect("encode uncertain checkpoint"),
+        )
+        .expect("decode uncertain checkpoint");
+        reopened.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::AfterCommit {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("injected checkpoint postcommit uncertainty"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        assert!(reopened.checkpoint_staging(&uncertain).is_err());
+        assert!(matches!(
+            reopened
+                .checkpoint_staging(&uncertain)
+                .expect("retained replay"),
+            staging_checkpoints::StagingCheckpointReceipt::Replay { .. }
+        ));
+        let cancellation = CancellationRequestObservation::new(51).expect("cancel observation");
+        reopened
+            .request_cancel_before_publish(operation_id, inserted.sequence(), cancellation)
+            .expect("durable cancellation");
+        let uncertain_sequence = reopened
+            .read_staging_checkpoint_row(uncertain_output)
+            .expect("uncertain checkpoint read")
+            .expect("uncertain row retained")
+            .0;
+        assert!(
+            reopened
+                .reserve_staging_grant_record(&uncertain, uncertain_sequence)
+                .is_err()
+        );
+        assert!(
+            reopened
+                .read_staging_checkpoint_row(output_id)
+                .expect("read reserved row")
+                .expect("retained checkpoint")
+                .2
+        );
+        assert!(
+            reopened
+                .reserve_staging_grant_record(&checkpoint, checkpoint_sequence)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn chunk_staging_checkpoint_retains_charge_across_faults_replay_and_restart() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal, args, legacy_plan) = v5_copy_inputs();
+        let filesystem = universal
+            .participants()
+            .descriptors()
+            .iter()
+            .find(|participant| participant.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem participant")
+            .id();
+        let source_fence = universal
+            .participants()
+            .descriptors()
+            .iter()
+            .find_map(|participant| participant.source_fence())
+            .expect("source participant fence")
+            .clone();
+        let operation = StoredOperationRecord::new_v16_command(
+            operation_id,
+            intent,
+            universal,
+            UniversalCommandArgs::Copy(args),
+            FullCapacityPlan::from_legacy(&legacy_plan).expect("full plan"),
+            50,
+        );
+        let operation_receipt = store.insert_intent(&operation).expect("persist operation");
+        let row = &legacy_plan.volumes[0];
+        let chunk_id = ChunkId::new();
+        let request = ChunkClaimRequest::new(
+            chunk_id,
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                row.identity.clone(),
+                row.allocation_class.into(),
+                row.allocated_bytes,
+            )
+            .expect("admission claim"),
+            filesystem,
+            String::from("partial.wav"),
+            0,
+            row.logical_bytes,
+            row.allocation_unit,
+            row.protected_free_bytes,
+        )
+        .expect("chunk request");
+        let mut facts = BTreeMap::new();
+        facts.insert(
+            row.identity.clone(),
+            VolumeFacts {
+                identity: row.identity.clone(),
+                free_bytes: PROTECTED_FREE_SPACE_FLOOR + 1024,
+                allocation_unit: row.allocation_unit,
+            },
+        );
+        let provider = CapacityProvider::qualified_fixture(facts);
+        let lease = provider
+            .admit(
+                &request.plan().expect("plan"),
+                &request.inventory().expect("inventory"),
+            )
+            .expect("admit chunk");
+        store
+            .persist_chunk_claim_with_lease(&request, &provider, lease)
+            .expect("persist chunk claim");
+        let issue_id = Uuid::new_v4();
+        store
+            .issue_chunk_claim(chunk_id, operation_id, issue_id)
+            .expect("issue chunk");
+        let checkpoint = chunk_staging::ChunkStagingRecord::decode(
+            &serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "chunk_id": chunk_id.as_uuid(),
+                "operation_id": operation_id,
+                "issue_id": issue_id,
+                "participant_id": filesystem,
+                "output_key": "partial.wav",
+                "logical_offset": 0,
+                "logical_length": row.logical_bytes,
+                "status": "PartialNeedsRetry",
+                "staging": {
+                    "schema_version": 1,
+                    "operation_id": operation_id,
+                    "participant_id": filesystem,
+                    "effect_id": Uuid::new_v4(),
+                    "output_id": Uuid::new_v4(),
+                    "staging_root": {
+                        "owner": Uuid::new_v4(),
+                        "registration_id": Uuid::new_v4(),
+                        "generation": 1
+                    },
+                    "source_root": {
+                        "owner": Uuid::new_v4(),
+                        "registration_id": Uuid::new_v4(),
+                        "generation": 1
+                    },
+                    "source_fence": {
+                        "source_id": source_fence.source_id(),
+                        "root_identity": source_fence.root_identity(),
+                        "database_identity": source_fence.database_identity(),
+                        "lifecycle_generation": source_fence.lifecycle_generation(),
+                        "source_revision": source_fence.source_revision(),
+                        "lease_epoch": source_fence.lease_epoch()
+                    },
+                    "locator": "partial.wav",
+                    "logical_object_id": Uuid::new_v4(),
+                    "physical_object_id": "physical-partial-file",
+                    "bytes": 1,
+                    "content_hash": vec![7; 32],
+                    "request_fingerprint": vec![8; 32]
+                }
+            }))
+            .expect("encode checkpoint fixture"),
+        )
+        .expect("decode checkpoint fixture");
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced checkpoint precommit failure"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        assert!(store.checkpoint_chunk_staging_record(&checkpoint).is_err());
+        assert!(
+            store
+                .read_chunk_staging_row(chunk_id)
+                .expect("read rollback")
+                .is_none()
+        );
+        assert_eq!(provider.claim_count(), 1);
+
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::AfterCommit {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced checkpoint postcommit uncertainty"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        assert!(store.checkpoint_chunk_staging_record(&checkpoint).is_err());
+        let (sequence, retained) = store
+            .read_chunk_staging_row(chunk_id)
+            .expect("read uncertain checkpoint")
+            .expect("retained checkpoint");
+        assert_eq!(retained, checkpoint);
+        assert!(matches!(
+            store.checkpoint_chunk_staging_record(&checkpoint).expect("exact replay"),
+            chunk_staging::ChunkStagingReceipt::Replay { sequence: replayed }
+                if replayed == sequence
+        ));
+        let mut conflicting = serde_json::to_value(&checkpoint).expect("checkpoint JSON");
+        conflicting["staging"]["physical_object_id"] = serde_json::json!("other-file");
+        let conflicting = chunk_staging::ChunkStagingRecord::decode(
+            &serde_json::to_vec(&conflicting).expect("encode conflicting checkpoint"),
+        )
+        .expect("decode conflicting checkpoint");
+        assert!(store.checkpoint_chunk_staging_record(&conflicting).is_err());
+        let release_id = Uuid::new_v4();
+        assert!(
+            store
+                .release_chunk_claim(
+                    chunk_id,
+                    operation_id,
+                    Some(ChunkUnusedReleaseAuthorization::for_test(
+                        chunk_id,
+                        operation_id,
+                        issue_id,
+                        release_id,
+                    )),
+                    release_id,
+                )
+                .is_err()
+        );
+        assert_eq!(provider.claim_count(), 1);
+        assert!(store.prove_clean_handoff_durable().is_err());
+        assert_eq!(
+            journal_sequence(&store, operation_id),
+            operation_receipt.sequence()
+        );
+        // A separate unused chunk can be released, but a failed release must leave its exact
+        // claim charged and retryable while the staged chunk remains protected.
+        let unused_chunk = ChunkId::new();
+        let unused_request = ChunkClaimRequest::new(
+            unused_chunk,
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                row.identity.clone(),
+                row.allocation_class.into(),
+                row.allocated_bytes,
+            )
+            .expect("unused chunk claim"),
+            filesystem,
+            String::from("unused-partial.wav"),
+            1,
+            row.logical_bytes,
+            row.allocation_unit,
+            row.protected_free_bytes,
+        )
+        .expect("unused chunk request");
+        let unused_lease = provider
+            .admit(
+                &unused_request.plan().expect("unused plan"),
+                &unused_request.inventory().expect("unused inventory"),
+            )
+            .expect("admit unused chunk");
+        store
+            .persist_chunk_claim_with_lease(&unused_request, &provider, unused_lease)
+            .expect("persist unused chunk claim");
+        let unused_issue_id = Uuid::new_v4();
+        store
+            .issue_chunk_claim(unused_chunk, operation_id, unused_issue_id)
+            .expect("issue unused chunk");
+        let unused_release_id = Uuid::new_v4();
+        store.set_release_test_hook(|boundary| {
+            if boundary == ReleaseTestBoundary::BeforePrecommitValidation {
+                ReleaseTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("injected unused chunk release failure"),
+                })
+            } else {
+                ReleaseTestDirective::Continue
+            }
+        });
+        assert!(
+            store
+                .release_chunk_claim(
+                    unused_chunk,
+                    operation_id,
+                    Some(ChunkUnusedReleaseAuthorization::for_test(
+                        unused_chunk,
+                        operation_id,
+                        unused_issue_id,
+                        unused_release_id,
+                    )),
+                    unused_release_id,
+                )
+                .is_err()
+        );
+        assert_eq!(provider.claim_count(), 2);
+        assert_eq!(
+            store
+                .read_chunk_claim(unused_chunk)
+                .expect("unused chunk after failed release")
+                .expect("unused chunk retained")
+                .state(),
+            ChunkClaimState::Issued
+        );
+        drop(store);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen journal");
+        assert_eq!(
+            reopened
+                .read_chunk_staging_row(chunk_id)
+                .expect("read restarted row"),
+            Some((sequence, checkpoint.clone()))
+        );
+        let restart_snapshot = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild exact retained claims");
+        assert_eq!(restart_snapshot.claims().len(), 2);
+        assert_eq!(
+            restart_snapshot.readiness(),
+            &CapacityRebuildReadiness::Ready
+        );
+        let rebuilt = CapacityProvider::unavailable();
+        rebuilt
+            .install_rebuilt_claims(&restart_snapshot)
+            .expect("install exact restart claims");
+        assert_eq!(
+            rebuilt.outstanding(&row.identity, row.allocation_class.into()),
+            2
+        );
+        let unused_release = reopened
+            .release_chunk_claim(
+                unused_chunk,
+                operation_id,
+                Some(ChunkUnusedReleaseAuthorization::for_test(
+                    unused_chunk,
+                    operation_id,
+                    unused_issue_id,
+                    unused_release_id,
+                )),
+                unused_release_id,
+            )
+            .expect("retry failed unused release");
+        assert_eq!(unused_release.release_id(), unused_release_id);
+        assert_eq!(
+            reopened
+                .release_chunk_claim(unused_chunk, operation_id, None, unused_release_id)
+                .expect("exact duplicate release"),
+            unused_release
+        );
+        let after_release = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild after one release");
+        let rebuilt_after_release = CapacityProvider::unavailable();
+        rebuilt_after_release
+            .install_rebuilt_claims(&after_release)
+            .expect("install one-charge restart state");
+        assert_eq!(
+            rebuilt_after_release.outstanding(&row.identity, row.allocation_class.into()),
+            1
+        );
+        assert!(matches!(
+            reopened
+                .checkpoint_chunk_staging_record(&checkpoint)
+                .expect("restart replay"),
+            chunk_staging::ChunkStagingReceipt::Replay { .. }
+        ));
+        let exhausted_request = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                row.identity.clone(),
+                row.allocation_class.into(),
+                2048,
+            )
+            .expect("next chunk claim"),
+            filesystem,
+            String::from("next-partial.wav"),
+            1,
+            2048,
+            row.allocation_unit,
+            row.protected_free_bytes,
+        )
+        .expect("next chunk request");
+        assert!(matches!(
+            provider.admit(
+                &exhausted_request.plan().expect("next plan"),
+                &exhausted_request.inventory().expect("next inventory"),
+            ),
+            Err(CapacityProviderError::DiskPressureRecoveryOnly { .. })
+        ));
+        // This direct store test does not perform the owner-side provider reconciliation.
+        // The fresh rebuilt provider above is the restart accounting assertion.
+        assert_eq!(provider.claim_count(), 2);
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("chunk-capacity-retry").expect("retry lease"),
+            53,
+            RetryErrorClass::CapacityUnavailable,
+            "disk_pressure_recovery_only",
+            None,
+        )
+        .expect("capacity retry");
+        let (retry_receipt, status) = reopened
+            .record_post_intent_chunk_exhaustion(
+                operation_id,
+                operation_receipt.sequence(),
+                retry.clone(),
+            )
+            .expect("classify positive incomplete chunk");
+        assert_eq!(status, OperationDisposition::PartialNeedsRetry);
+        assert_eq!(
+            reopened
+                .record_post_intent_chunk_exhaustion(
+                    operation_id,
+                    operation_receipt.sequence(),
+                    retry,
+                )
+                .expect("duplicate exhaustion completion"),
+            (retry_receipt, OperationDisposition::PartialNeedsRetry)
+        );
+        let recovered = reopened
+            .scan_recovery_page(None)
+            .expect("recover retry row");
+        assert_eq!(recovered.entries().len(), 1);
+        assert_eq!(
+            recovered.entries()[0]
+                .status_snapshot()
+                .observed()
+                .expect("observed capacity status")
+                .disposition(),
+            OperationDisposition::PartialNeedsRetry
+        );
+        assert_eq!(
+            reopened
+                .get(operation_id)
+                .expect("read persisted V16 operation")
+                .expect("operation retained")
+                .disposition,
+            OperationDisposition::RetryPending
+        );
+        let cancel = CancellationRequestObservation::new(54).expect("cancel observation");
+        reopened
+            .request_cancel_before_publish(operation_id, retry_receipt.sequence(), cancel)
+            .expect("cancel operation");
+        assert!(
+            reopened
+                .checkpoint_chunk_staging_record(&checkpoint)
+                .is_err()
+        );
+        assert_eq!(provider.claim_count(), 2);
+    }
+
+    #[test]
+    fn post_intent_capacity_exhaustion_without_positive_checkpoint_stays_retry_pending() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal, args, legacy_plan) = v5_copy_inputs();
+        let operation = StoredOperationRecord::new_v16_command(
+            operation_id,
+            intent,
+            universal,
+            UniversalCommandArgs::Copy(args),
+            FullCapacityPlan::from_legacy(&legacy_plan).expect("full plan"),
+            50,
+        );
+        let inserted = store.insert_intent(&operation).expect("persist intent");
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("no-staging-capacity-retry").expect("retry lease"),
+            53,
+            RetryErrorClass::CapacityUnavailable,
+            "recovery_reserve_low",
+            None,
+        )
+        .expect("capacity observation");
+        let (_, disposition) = store
+            .record_post_intent_chunk_exhaustion(operation_id, inserted.sequence(), retry)
+            .expect("classify exhausted chunk without staging");
+        assert_eq!(disposition, OperationDisposition::RetryPending);
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        assert_eq!(
+            reopened
+                .scan_recovery_page(None)
+                .expect("recover capacity retry")
+                .entries()[0]
+                .status_snapshot()
+                .observed()
+                .expect("observed status")
+                .disposition(),
+            OperationDisposition::RetryPending
+        );
+    }
+
+    #[test]
     fn v16_copy_retry_and_cancel_preserve_full_plan_through_store_cas_and_restart() {
         let fixture = fixture();
         let store = OperationJournalStore::open(&fixture.owner).expect("open store");
@@ -12972,9 +13946,9 @@ mod tests {
     }
 
     #[test]
-    fn new_database_bootstraps_exact_v3_schema() {
+    fn new_database_bootstraps_exact_latest_schema() {
         let fixture = fixture();
-        let store = OperationJournalStore::open(&fixture.owner).expect("open v3 store");
+        let store = OperationJournalStore::open(&fixture.owner).expect("open journal store");
         let user_version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -12997,6 +13971,10 @@ mod tests {
                 (String::from(JOURNAL_TABLE_NAME), String::from("table")),
                 (
                     String::from(chunk_claims::TABLE_NAME),
+                    String::from("table")
+                ),
+                (
+                    String::from(chunk_staging::TABLE_NAME),
                     String::from("table")
                 ),
                 (
@@ -13023,6 +14001,10 @@ mod tests {
                     String::from(recovery_reserve::TRANSITION_TABLE_NAME),
                     String::from("table")
                 ),
+                (
+                    String::from(staging_checkpoints::TABLE_NAME),
+                    String::from("table")
+                ),
             ]
         );
         let full_progress_rows: i64 = store
@@ -13034,6 +14016,88 @@ mod tests {
             )
             .expect("count empty full-progress table");
         assert_eq!(full_progress_rows, 0);
+    }
+
+    #[test]
+    fn existing_v7_journal_adds_empty_staging_checkpoint_table_without_rewriting_progress() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open journal");
+        let (initial, _) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        store
+            .persist_full(&initial, None)
+            .expect("persist progress");
+        let previous = full_progress_raw_row(&store, operation_id);
+        drop(store);
+
+        let path = database_path(&fixture.owner);
+        let connection = Connection::open(&path).expect("open old schema fixture");
+        connection
+            .execute_batch(&format!(
+                "DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
+                staging_checkpoints::TABLE_NAME,
+                chunk_staging::TABLE_NAME,
+                CHUNK_CLAIM_SCHEMA_VERSION
+            ))
+            .expect("make exact v7 schema");
+        drop(connection);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("migrate v7 journal");
+        assert_eq!(full_progress_raw_row(&reopened, operation_id), previous);
+        let version: i64 = reopened
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, i64::from(JOURNAL_SCHEMA_VERSION));
+        let rows: i64 = reopened
+            .connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}", staging_checkpoints::TABLE_NAME),
+                [],
+                |row| row.get(0),
+            )
+            .expect("read empty staging checkpoint table");
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn existing_v8_journal_adds_chunk_staging_without_rewriting_progress() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open journal");
+        let (initial, _) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        store
+            .persist_full(&initial, None)
+            .expect("persist progress");
+        let previous = full_progress_raw_row(&store, operation_id);
+        drop(store);
+
+        let connection = Connection::open(database_path(&fixture.owner)).expect("open v8 fixture");
+        connection
+            .execute_batch(&format!(
+                "DROP TABLE {}; PRAGMA user_version = {};",
+                chunk_staging::TABLE_NAME,
+                STAGING_CHECKPOINT_SCHEMA_VERSION
+            ))
+            .expect("make exact v8 schema");
+        drop(connection);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("migrate v8 journal");
+        assert_eq!(full_progress_raw_row(&reopened, operation_id), previous);
+        let version: i64 = reopened
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, i64::from(JOURNAL_SCHEMA_VERSION));
+        let rows: i64 = reopened
+            .connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}", chunk_staging::TABLE_NAME),
+                [],
+                |row| row.get(0),
+            )
+            .expect("read empty chunk staging table");
+        assert_eq!(rows, 0);
     }
 
     #[test]
