@@ -362,6 +362,7 @@ mod tests {
     use super::*;
     use gpui::{Keystroke, TestAppContext};
     use yield_core::{AudioFile, BrowserViewModel};
+    use yield_media::WaveformPreview;
 
     fn fixture(root: &PathBuf, name: &str) -> AudioFile {
         AudioFile {
@@ -419,6 +420,37 @@ mod tests {
             browser.update(app, |view, cx| {
                 view.focus_loaded_sample_in_browser(window, cx);
                 assert_eq!(view.playback_status, "Load a sample to focus it");
+                assert!(view.browser_focus_override.is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn focus_loaded_hidden_by_filter_keeps_focus_and_reports_unavailable(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                let root = PathBuf::from("/tmp/yield-focus-hidden");
+                view.root = Some(root.clone());
+                view.entries = vec![fixture(&root, "hidden.wav")];
+                view.selected = Some(0);
+                view.view_model = BrowserViewModel::new(&[]);
+                view.waveform = Some(WaveformPreview {
+                    peaks: vec![0.5; 8],
+                    bands: Vec::new(),
+                    duration_seconds: 1.0,
+                    sample_rate: 48_000,
+                    total_frames: 48_000,
+                    detail_context: None,
+                });
+                let focus = window.focused(cx);
+                view.focus_loaded_sample_in_browser(window, cx);
+                assert_eq!(
+                    view.playback_status,
+                    "Loaded sample is not visible in the browser"
+                );
+                assert_eq!(window.focused(cx), focus);
                 assert!(view.browser_focus_override.is_none());
             });
         });
