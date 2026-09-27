@@ -9782,14 +9782,30 @@ mod tests {
                 lifecycle_generation: 1,
             })
             .expect("later audit");
-        assert!(matches!(
-            receive_until(&service, |event| matches!(
-                event,
-                CatalogEvent::AuditCommitted { .. }
-            )),
-            CatalogEvent::AuditCommitted { .. }
-        ));
+        let committed = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::AuditCommitted { .. })
+        });
+        let CatalogEvent::AuditCommitted { snapshot } = committed else {
+            unreachable!();
+        };
         service.shutdown();
+        let reopened = CatalogService::start(&fixture.guard).expect("reopen catalog service");
+        reopened
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 2,
+            })
+            .expect("register reopened source");
+        let event = receive_until(&reopened, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        });
+        let CatalogEvent::SnapshotReady { snapshot: restored } = event else {
+            unreachable!();
+        };
+        assert_eq!(restored.committed_revision, snapshot.committed_revision);
+        assert_eq!(restored.manifest, snapshot.manifest);
+        reopened.shutdown();
     }
 
     #[test]
