@@ -291,9 +291,15 @@ impl Browser {
             return;
         };
         let sampled_at = Instant::now();
-        let interpolation = self
-            .playback_cursor_sample
-            .and_then(|previous| cursor_interpolation(previous.ratio, ratio, sampled_at));
+        // Retarget acknowledgements can arrive before the previous 80 ms
+        // interpolation ends. Start from the position currently drawn, not
+        // the older authoritative sample, or the cursor steps backwards.
+        let interpolation = cursor_interpolation_from_visible(
+            self.playback_cursor_sample.map(|sample| sample.ratio),
+            self.playback_cursor_interpolation,
+            ratio,
+            sampled_at,
+        );
         self.playback_cursor_pending = None;
         self.playback_cursor_sample = Some(PlaybackCursorSample { ratio });
         self.playback_cursor_interpolation = interpolation;
@@ -2135,6 +2141,18 @@ fn cursor_interpolation(
     })
 }
 
+fn cursor_interpolation_from_visible(
+    previous: Option<f32>,
+    active: Option<PlaybackCursorInterpolation>,
+    to: f32,
+    now: Instant,
+) -> Option<PlaybackCursorInterpolation> {
+    let from = active
+        .map(|interpolation| interpolation.value_at(now))
+        .or(previous)?;
+    cursor_interpolation(from, to, now)
+}
+
 fn playback_request_is_current(
     latest: Option<PlaybackRequestId>,
     event: PlaybackRequestId,
@@ -2163,16 +2181,17 @@ mod tests {
         PlaybackRetargetRequest, accepted_resume_intent, admit_loop_retarget,
         apply_pending_loop_retarget_to_resume, audio_output_resume_is_current,
         authoritative_cursor_progress, captured_metronome_grid_or_source, current_playhead_start,
-        cursor_interpolation, fallback_metronome_target, metronome_target_is_pending,
-        normalized_playback_start, pending_resume_intent, playback_mode_for_intent,
-        playback_progress_disposition, playback_request_number_is_current,
-        playback_retarget_anchor_matches, playback_span_for_intent,
-        playback_span_matches_preparation, preferred_metronome_grid, preview_cursor_ratio,
-        progress_poll_has_expired, progress_poll_is_current, reconcile_playback_intent_mode,
-        reduce_loop_retarget_progress, reduce_playback_retarget_progress,
-        resolve_queued_playback_intent, retain_pending_loop_retarget_after_failed_admission,
-        should_cancel_pending_autoplay, should_queue_initialized_playback,
-        should_record_last_played, should_record_playback_history,
+        cursor_interpolation, cursor_interpolation_from_visible, fallback_metronome_target,
+        metronome_target_is_pending, normalized_playback_start, pending_resume_intent,
+        playback_mode_for_intent, playback_progress_disposition,
+        playback_request_number_is_current, playback_retarget_anchor_matches,
+        playback_span_for_intent, playback_span_matches_preparation, preferred_metronome_grid,
+        preview_cursor_ratio, progress_poll_has_expired, progress_poll_is_current,
+        reconcile_playback_intent_mode, reduce_loop_retarget_progress,
+        reduce_playback_retarget_progress, resolve_queued_playback_intent,
+        retain_pending_loop_retarget_after_failed_admission, should_cancel_pending_autoplay,
+        should_queue_initialized_playback, should_record_last_played,
+        should_record_playback_history,
     };
     use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
     use std::path::{Path, PathBuf};
@@ -3006,6 +3025,20 @@ mod tests {
 
         assert!(cursor_interpolation(0.9, 0.1, started_at).is_none());
         assert!(cursor_interpolation(0.2, 0.4, started_at).is_some());
+    }
+
+    #[test]
+    fn retarget_progress_during_cursor_motion_keeps_the_drawn_position() {
+        let started_at = Instant::now();
+        let first = cursor_interpolation(0.2, 0.3, started_at).unwrap();
+        let next_at = started_at + Duration::from_millis(40);
+        let visible = first.value_at(next_at);
+        let next = cursor_interpolation_from_visible(Some(0.3), Some(first), 0.4, next_at)
+            .expect("forward cursor update");
+
+        assert!((visible - 0.25).abs() < 0.001);
+        assert!((next.value_at(next_at) - visible).abs() < f32::EPSILON);
+        assert!(next.value_at(next_at) > 0.2);
     }
 
     #[test]
