@@ -4,13 +4,14 @@
 
 use std::path::PathBuf;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, MAIN_DB};
 use tempfile::{TempDir, tempdir};
 use yield_library::sample_sources::db::file_ops_journal;
 use yield_library::{
     app_dirs::{AppRootGuard, ProfileOwnershipError, WritableProfileGuard},
     sample_sources::{
-        DB_FILE_NAME, LibraryError, SourceDatabase, SourceDatabaseConnectionRole, SourceDbError,
+        DB_FILE_NAME, LibraryError, SampleSource, SourceDatabase, SourceDatabaseConnectionRole,
+        SourceDbError,
         library::{self, LibraryState},
         readiness::{
             ReadinessClassification, ReadinessDeficit, ReadinessError, ReadinessStage,
@@ -81,6 +82,7 @@ fn path_only_writable_source_entrypoints_fail_before_filesystem_side_effects() {
     expect_source_profile_required(SourceDatabase::open_for_source_write(source_root.path()));
     expect_source_profile_required(SourceDatabase::open_for_background_job(source_root.path()));
     expect_source_profile_required(SourceDatabase::open_for_scan(source_root.path()));
+    expect_source_profile_required(SampleSource::new(source_root.path().to_path_buf()).open_db());
     expect_source_profile_required(SourceDatabase::open_for_maintenance(source_root.path()));
     expect_source_profile_required(SourceDatabase::open_for_user_metadata_write(
         source_root.path(),
@@ -355,6 +357,66 @@ fn readonly_open_reports_missing_database_without_creating_one() {
             if path == source_root.path().join(DB_FILE_NAME)
     ));
     assert_no_source_database_files(&source_root);
+}
+
+#[test]
+fn legacy_read_roles_leave_source_schema_and_rows_unchanged() {
+    let source_root = tempdir().expect("source root");
+    let db_path = source_root.path().join(DB_FILE_NAME);
+    let seed = Connection::open(&db_path).expect("legacy source database");
+    seed.execute_batch(
+        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO metadata (key, value) VALUES ('revision', '7');
+         PRAGMA user_version = 0;",
+    )
+    .expect("seed legacy schema");
+    drop(seed);
+
+    for role in [
+        SourceDatabaseConnectionRole::UiRead,
+        SourceDatabaseConnectionRole::BackgroundRead,
+    ] {
+        let connection = SourceDatabase::open_connection_with_role(source_root.path(), role)
+            .expect("legacy read role must open without maintenance");
+        assert!(connection.is_readonly(MAIN_DB).expect("read-only mode"));
+        assert_eq!(
+            connection
+                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .expect("connection changes"),
+            0
+        );
+        assert!(
+            connection
+                .execute("CREATE TABLE unexpected_write (id INTEGER)", [])
+                .is_err()
+        );
+    }
+
+    let check = Connection::open(&db_path).expect("inspect legacy source database");
+    assert_eq!(
+        check
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("schema stamp"),
+        0
+    );
+    let schema: Vec<String> = check
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+        .expect("inspect tables")
+        .query_map([], |row| row.get(0))
+        .expect("table names")
+        .collect::<Result<_, _>>()
+        .expect("collect names");
+    assert_eq!(schema, ["metadata"]);
+    assert_eq!(
+        check
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'revision'",
+                [],
+                |row| { row.get::<_, String>(0) }
+            )
+            .expect("retained row"),
+        "7"
+    );
 }
 
 #[test]

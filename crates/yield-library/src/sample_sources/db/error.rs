@@ -161,6 +161,13 @@ pub enum SourceDbError {
     /// Writable source database access requires an already-acquired profile ownership capability.
     #[error("profile ownership is required for writable source database access")]
     ProfileOwnershipRequired,
+    /// An operational role found a missing, legacy, or incompatible schema; owned maintenance
+    /// must prepare it before this role can open the database.
+    #[error("source database requires owner-held maintenance before operational access")]
+    MaintenanceRequired,
+    /// A bounded source read exceeded its input or row budget before materializing more rows.
+    #[error("source snapshot read exceeded its bounded budget")]
+    SnapshotBudgetExceeded,
     /// The provided root path is not a directory.
     #[error("Source folder is not a directory: {0}")]
     InvalidRoot(PathBuf),
