@@ -195,8 +195,17 @@ continuation. A response includes the exact source identity, lifecycle generatio
 revision, bounded rows/deltas, and an outcome. It does not include a write capability or
 an inferred “latest” promise.
 
-The source owner or a read owner uses the existing snapshot budget: two seconds, 100,000
-rows, or 16 MiB of bounded result/input data, whichever is reached first. Existing
+The source owner or a read owner applies a two-second response deadline, 100,000 rows,
+and 16 MiB of bounded result/input data. `SourceSnapshotOwner` moves the retained
+`SourceWriter` into one worker and bounds the complete page request, including queue wait,
+revision validation, and SQLite work. A blocked filesystem identity check cannot delay
+the caller past its response deadline. The worker retains the same database and source
+authority until that operation finishes; an expired queued request is skipped, and no
+second writer is started. SQLite progress handling interrupts database work, while the
+owner checks the deadline after each retained revision validation and after materializing
+the page. Orderly retirement returns a join handle; joining can block on OS I/O and must
+not occur on the UI thread. Dropping the handle stops new requests and leaves the worker
+to release its authority when the current operation ends. Existing
 metadata queries use a keyset page of 64 rows. A continuation starts a fresh bounded
 snapshot and revalidates the expected source identity, lifecycle generation, and
 revision; it never concatenates pages from different epochs or silently blends a stale

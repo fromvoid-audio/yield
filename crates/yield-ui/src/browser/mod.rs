@@ -73,6 +73,7 @@ mod accessibility {
 mod audio_output;
 mod catalog;
 mod catalog_metadata;
+mod column_layout;
 mod compare_anchor;
 mod context_menu;
 mod curation;
@@ -323,6 +324,10 @@ pub(crate) struct Browser {
     restore_selection_id: Option<AudioFileId>,
     restore_selection_position: Option<usize>,
     view_model: BrowserViewModel,
+    column_layout: column_layout::ColumnLayout,
+    column_gesture: Option<column_layout::ColumnGesture>,
+    column_header_bounds: Rc<RefCell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    suppress_column_sort_click: bool,
     sample_name_view_mode: yield_core::SampleNameViewMode,
     selected: Option<usize>,
     selection: BrowserSelection,
@@ -640,6 +645,10 @@ impl Browser {
             restore_selection_id: None,
             restore_selection_position: None,
             view_model: BrowserViewModel::new(&[]),
+            column_layout: column_layout::ColumnLayout::default(),
+            column_gesture: None,
+            column_header_bounds: Rc::new(RefCell::new(None)),
+            suppress_column_sort_click: false,
             sample_name_view_mode: yield_core::SampleNameViewMode::default(),
             selected: None,
             selection: BrowserSelection::new(),
@@ -2980,6 +2989,7 @@ impl Browser {
                 }
             }
             "escape" => {
+                self.cancel_column_gesture(cx);
                 self.cancel_file_drag_with_window(window, cx);
                 self.cancel_waveform_region_drag(window, cx);
                 self.cancel_waveform_scrollbar_drag(window, cx);
