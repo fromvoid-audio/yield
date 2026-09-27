@@ -292,6 +292,13 @@ struct PlaymarkTimingEditorState {
     error: Option<String>,
 }
 
+#[derive(Clone)]
+struct SourceReorderDrag {
+    source_id: SourceId,
+    revision: RegistryRevision,
+    target: Option<(SourceId, bool)>,
+}
+
 pub(crate) struct Browser {
     #[cfg(target_os = "macos")]
     accessibility: Option<accessibility::BrowserAccessibility>,
@@ -422,6 +429,8 @@ pub(crate) struct Browser {
     source_registry_known_roots: BTreeSet<PathBuf>,
     source_registry_pending_adds: HashMap<RequestId, PendingRegistryMutation>,
     source_registry_pending_removes: HashMap<RequestId, PendingRegistryMutation>,
+    source_registry_pending_reorder: Option<(RequestId, Option<RegistryRevision>)>,
+    source_reorder_drag: Option<SourceReorderDrag>,
     source_registry_removed_roots: BTreeSet<PathBuf>,
     source_registry_status: String,
     catalog_next_generation: u64,
@@ -758,6 +767,8 @@ impl Browser {
             source_registry_known_roots: BTreeSet::new(),
             source_registry_pending_adds: HashMap::new(),
             source_registry_pending_removes: HashMap::new(),
+            source_registry_pending_reorder: None,
+            source_reorder_drag: None,
             source_registry_removed_roots: BTreeSet::new(),
             source_registry_status: "Loading sources…".to_string(),
             catalog_next_generation: 0,
@@ -2624,6 +2635,11 @@ impl Browser {
     ) {
         let key = event.keystroke.key.as_str();
         self.suppress_collection_keyboard_click = None;
+        if key == "escape" && self.source_reorder_drag.take().is_some() {
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if key == "escape" && self.pane_resize_drag.is_some() {
             self.cancel_pane_resize(cx);
             cx.stop_propagation();
