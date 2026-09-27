@@ -682,6 +682,7 @@ impl Browser {
         tag_completion::cancel_for_source_change(self, cx);
         tag_filter::cancel_for_source_change(self);
         curation_queue::cancel_for_source_change(self);
+        self.collection_rename_editor = None;
         self.display_labels.cancel_for_source_change();
         super::source_recovery::cancel_for_source_change(self);
         self.reset_browser_focus_state();

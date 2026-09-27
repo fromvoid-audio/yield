@@ -45,6 +45,7 @@ mod accessibility {
     pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
     pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
     pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
+    pub(super) const COLLECTION_RENAME: &str = "browser-collection-rename-input";
 
     pub(super) fn sort_id(column: SortColumn) -> &'static str {
         match column {
@@ -73,6 +74,7 @@ mod accessibility {
 mod audio_output;
 mod catalog;
 mod catalog_metadata;
+mod collection_rename;
 mod column_layout;
 mod compare_anchor;
 mod context_menu;
@@ -302,6 +304,10 @@ pub(crate) struct Browser {
     _playmark_timing_subscription: gpui::Subscription,
     playmark_timing_editor: Option<PlaymarkTimingEditorState>,
     playmark_timing_blur_subscription: Option<gpui::Subscription>,
+    collection_rename_input: gpui::Entity<SearchInput>,
+    _collection_rename_subscription: gpui::Subscription,
+    collection_rename_editor: Option<collection_rename::CollectionRenameEditor>,
+    suppress_collection_keyboard_click: Option<usize>,
     beat_count_input: gpui::Entity<BeatCountInput>,
     _beat_count_subscription: gpui::Subscription,
     tag_input: gpui::Entity<SearchInput>,
@@ -578,6 +584,16 @@ impl Browser {
                 }
             },
         );
+        let collection_rename_input =
+            cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::collection_name()));
+        let collection_rename_subscription = cx.subscribe(
+            &collection_rename_input,
+            |view, _input, _: &SearchChanged, cx| {
+                if view.collection_rename_editor.is_some() {
+                    cx.notify();
+                }
+            },
+        );
         let beat_count_input = cx.new(BeatCountInput::new);
         let beat_count_subscription = cx.subscribe(
             &beat_count_input,
@@ -624,6 +640,10 @@ impl Browser {
             _playmark_timing_subscription: playmark_timing_subscription,
             playmark_timing_editor: None,
             playmark_timing_blur_subscription: None,
+            collection_rename_input,
+            _collection_rename_subscription: collection_rename_subscription,
+            collection_rename_editor: None,
+            suppress_collection_keyboard_click: None,
             beat_count_input,
             _beat_count_subscription: beat_count_subscription,
             tag_input,
@@ -912,6 +932,8 @@ impl Browser {
         self.search_input
             .update(cx, |input, cx| input.theme_changed(cx));
         self.playmark_timing_input
+            .update(cx, |input, cx| input.theme_changed(cx));
+        self.collection_rename_input
             .update(cx, |input, cx| input.theme_changed(cx));
     }
 
@@ -1236,6 +1258,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         self.invalidate_file_handoff();
+        self.collection_rename_editor = None;
         self.reset_browser_focus_state();
         self.context_menu = None;
         self.deactivate_catalog_source(cx);
@@ -2600,9 +2623,39 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+        self.suppress_collection_keyboard_click = None;
         if key == "escape" && self.pane_resize_drag.is_some() {
             self.cancel_pane_resize(cx);
             cx.stop_propagation();
+            return;
+        }
+        if self
+            .collection_rename_input
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+        {
+            if !self
+                .collection_rename_editor
+                .as_ref()
+                .is_some_and(|editor| self.collection_rename_is_current(editor.slot))
+            {
+                self.collection_rename_editor = None;
+                window.focus(&self.focus_handle);
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+            self.focus_chord_started = None;
+            if key == "escape" {
+                self.cancel_collection_rename(window, cx);
+                cx.stop_propagation();
+            } else if key == "enter" {
+                if !event.is_held && !self.collection_rename_input.read(cx).is_composing() {
+                    self.commit_collection_rename(window, cx);
+                }
+                cx.stop_propagation();
+            }
             return;
         }
         let secondary = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;

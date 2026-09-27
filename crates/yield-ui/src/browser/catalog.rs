@@ -174,6 +174,7 @@ impl Browser {
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
         super::curation_queue::cancel_for_source_change(self);
+        self.collection_rename_editor = None;
         self.display_labels.cancel_for_source_change();
         self.reset_browser_focus_state();
         self.context_menu = None;
