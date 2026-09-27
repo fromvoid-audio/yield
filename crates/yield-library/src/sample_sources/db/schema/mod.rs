@@ -29,6 +29,24 @@ pub(super) fn apply_schema_fast(
     apply_schema_with_mode(connection, SchemaApplyMode::Fast)
 }
 
+/// Reject an operational open until owned maintenance has installed the current schema.
+/// This path is read-only and never performs current-stamp repairs or migrations.
+pub(super) fn require_current_schema(connection: &Connection) -> Result<(), SourceDbError> {
+    if !schema_is_current(connection)? {
+        return Err(SourceDbError::MaintenanceRequired);
+    }
+    for table in [
+        "metadata",
+        "wav_files",
+        "source_participant_curation_receipts",
+    ] {
+        if table_columns(connection, table)?.is_empty() {
+            return Err(SourceDbError::MaintenanceRequired);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SchemaApplyMode {
     Fast,

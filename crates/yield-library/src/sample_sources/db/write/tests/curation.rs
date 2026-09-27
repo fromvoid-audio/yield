@@ -20,7 +20,7 @@ use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
     Rating, SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SampleCollection,
     SourceCommandId, SourceCurationUpdate, SourceDatabase, SourceDbError, SourceId,
-    SourcePlaybackType, SourceWriter, SourceWriterError, SourceWriterRequest,
+    SourcePlaybackType, SourceSnapshotPage, SourceWriter, SourceWriterError, SourceWriterRequest,
 };
 
 struct CurationFixture {
@@ -1506,6 +1506,52 @@ fn source_writer_replays_durable_receipts_and_reopens_as_observation_only() {
         Err(SourceWriterError::StaleFence)
     ));
     reopened.close().expect("close reopened source writer");
+}
+
+#[test]
+fn source_owner_page_is_bounded_read_only_and_rejects_stale_continuation() {
+    let fixture = CurationFixture::new_profile_bound();
+    let source_id = SourceId::from_string("source-page-test");
+    let mut writer = SourceWriter::new(fixture.database, source_id, 7).expect("source owner");
+    let expected = writer.current_revision().expect("current revision");
+    let changes_before = writer.database_for_tests().connection.total_changes();
+    let first = writer
+        .read_browser_metadata_page(&expected, None, 1)
+        .expect("first page");
+    let SourceSnapshotPage::FreshAsOf { revision, page } = first else {
+        panic!("current source page must be fresh")
+    };
+    assert_eq!(revision, expected);
+    assert_eq!(page.files.len(), 1);
+    let cursor = page.next_cursor.expect("continuation");
+    assert_eq!(
+        writer.database_for_tests().connection.total_changes(),
+        changes_before
+    );
+
+    let request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::new(),
+        crate::operation_journal::ParticipantId::new(),
+        SourceCommandId::new(),
+        expected.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("curation request");
+    writer.commit_curation(request).expect("commit");
+    let stale = writer
+        .read_browser_metadata_page(&expected, Some(&cursor), 1)
+        .expect("stale page result");
+    let SourceSnapshotPage::Stale { current } = stale else {
+        panic!("old continuation must be stale")
+    };
+    assert!(current.revision() > expected.revision());
+    let second = writer
+        .read_browser_metadata_page(&current, Some(&cursor), 1)
+        .expect("new revision page");
+    assert!(matches!(second, SourceSnapshotPage::FreshAsOf { .. }));
 }
 
 #[test]

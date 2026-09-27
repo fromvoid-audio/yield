@@ -20,8 +20,8 @@ pub use curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
 };
 pub use source_writer::{
-    SourceCommandId, SourceRevision, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
-    SourceWriterReceipt, SourceWriterRequest,
+    SourceCommandId, SourceRevision, SourceSnapshotPage, SourceWriter, SourceWriterCommandIdentity,
+    SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 pub use transaction::{
     ManifestCommitResult, SourceDirectoryTruthCommitResult, SourceIndexCommitResult,

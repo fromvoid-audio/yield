@@ -35,9 +35,9 @@ pub use db::{
     SourceDbError, SourceDisplayLabelEntry, SourceDisplayLabelResult, SourceFileWrite,
     SourceIndexClassification, SourceIndexCommitResult, SourceIndexDiagnostic, SourceIndexEntry,
     SourceIndexSnapshot, SourceLeaseError, SourceManifestEntry, SourcePlaybackType,
-    SourcePublicationFence, SourcePublicationFenceError, SourceRevision, SourceTag,
-    SourceTagFilterResult, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
-    SourceTagWrite, SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity,
+    SourcePublicationFence, SourcePublicationFenceError, SourceRevision, SourceSnapshotPage,
+    SourceTag, SourceTagFilterResult, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
+    SourceTagUsage, SourceTagWrite, SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity,
     SourceWriterError, SourceWriterReceipt, SourceWriterRequest, WavEntry,
 };
 pub use finalization::{

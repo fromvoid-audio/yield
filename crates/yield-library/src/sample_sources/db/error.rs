@@ -161,6 +161,10 @@ pub enum SourceDbError {
     /// Writable source database access requires an already-acquired profile ownership capability.
     #[error("profile ownership is required for writable source database access")]
     ProfileOwnershipRequired,
+    /// An operational role found a missing, legacy, or incompatible schema; owned maintenance
+    /// must prepare it before this role can open the database.
+    #[error("source database requires owner-held maintenance before operational access")]
+    MaintenanceRequired,
     /// The provided root path is not a directory.
     #[error("Source folder is not a directory: {0}")]
     InvalidRoot(PathBuf),

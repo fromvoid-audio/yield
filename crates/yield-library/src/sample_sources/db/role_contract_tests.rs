@@ -2,7 +2,59 @@ use std::path::Path;
 
 use tempfile::tempdir;
 
-use super::{SourceDatabase, SourceDatabaseConnectionRole};
+use super::{DB_FILE_NAME, SourceDatabase, SourceDatabaseConnectionRole, SourceDbError};
+
+#[test]
+fn operational_roles_require_owned_maintenance_without_creating_or_migrating() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join(DB_FILE_NAME);
+    assert!(matches!(
+        SourceDatabase::open_with_role(dir.path(), SourceDatabaseConnectionRole::JobWorker),
+        Err(SourceDbError::MaintenanceRequired)
+    ));
+    assert!(!db_path.exists());
+
+    let maintained = SourceDatabase::open_for_maintenance(dir.path()).expect("maintenance open");
+    drop(maintained);
+    let connection = rusqlite::Connection::open(&db_path).expect("schema stamp");
+    connection.pragma_update(None, "user_version", 0).unwrap();
+    drop(connection);
+    let mut entries_before = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries_before.sort();
+    assert!(matches!(
+        SourceDatabase::open_with_role(dir.path(), SourceDatabaseConnectionRole::JobWorker),
+        Err(SourceDbError::MaintenanceRequired)
+    ));
+    let mut entries_after = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries_after.sort();
+    assert_eq!(entries_after, entries_before);
+    let connection = rusqlite::Connection::open(&db_path).expect("schema unchanged");
+    let stamp: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stamp, 0);
+    drop(connection);
+
+    drop(SourceDatabase::open_for_maintenance(dir.path()).expect("repair schema"));
+    let connection = rusqlite::Connection::open(&db_path).expect("stamped database");
+    connection
+        .execute("DROP TABLE source_participant_curation_receipts", [])
+        .expect("remove repairable relation");
+    drop(connection);
+    assert!(matches!(
+        SourceDatabase::open_with_role(dir.path(), SourceDatabaseConnectionRole::JobWorker),
+        Err(SourceDbError::MaintenanceRequired)
+    ));
+    drop(SourceDatabase::open_for_maintenance(dir.path()).expect("repair relation"));
+    SourceDatabase::open_with_role(dir.path(), SourceDatabaseConnectionRole::JobWorker)
+        .expect("compatible operational open");
+}
 
 #[test]
 fn role_scoped_entrypoints_preserve_read_write_contracts() {

@@ -104,8 +104,8 @@ pub use write::{
     ManifestCommitResult, SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite, SourceCommandId,
     SourceContentHashWrite, SourceCurationCommitReceipt, SourceCurationUpdate,
     SourceDirectoryTruthCommitResult, SourceFileWrite, SourceIndexCommitResult, SourceRevision,
-    SourceTagWrite, SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity,
-    SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
+    SourceSnapshotPage, SourceTagWrite, SourceWriteCommand, SourceWriter,
+    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 
 /// Hidden filename used for per-source databases.

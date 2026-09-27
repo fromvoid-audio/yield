@@ -20,8 +20,8 @@ use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
-    BrowserFileMetadata, Rating, SampleCollection, SourceDatabase, SourceDbError,
-    SourcePlaybackType,
+    BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, Rating, SampleCollection,
+    SourceDatabase, SourceDbError, SourcePlaybackType,
 };
 use super::curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
@@ -85,6 +85,23 @@ pub struct SourceRevision {
     lifecycle_generation: u64,
     lease_epoch: u64,
     revision: u64,
+}
+
+/// One bounded read result from the retained source owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceSnapshotPage {
+    /// The page was read at the named source and lifecycle revision.
+    FreshAsOf {
+        /// Exact owner-issued revision represented by the rows.
+        revision: SourceRevision,
+        /// At most 64 metadata rows and an opaque continuation.
+        page: BrowserMetadataPage,
+    },
+    /// The requested revision or lifecycle no longer names the current source.
+    Stale {
+        /// Fresh owner-issued observation for restarting the read.
+        current: SourceRevision,
+    },
 }
 
 impl SourceRevision {
@@ -295,6 +312,9 @@ pub enum SourceWriterError {
     /// The source receipt relation reached its bounded retained-history budget.
     #[error("source writer receipt capacity is exhausted")]
     CapacityExceeded,
+    /// A bounded owner read exceeded its row, byte, or elapsed-time budget.
+    #[error("source snapshot read exceeded its bounded budget")]
+    SnapshotBudgetExceeded,
     /// Commit acknowledgement or readback became uncertain after durable work could have run.
     #[error("source writer commit outcome is uncertain")]
     Uncertain {
@@ -401,6 +421,50 @@ impl SourceWriter {
             lifecycle_generation: self.lifecycle_generation,
             lease_epoch,
             revision,
+        })
+    }
+
+    /// Read one keyset page without opening a second connection or mutating source state.
+    /// Each continuation must supply the original owner-issued revision again.
+    pub fn read_browser_metadata_page(
+        &self,
+        expected: &SourceRevision,
+        after_cursor: Option<&BrowserMetadataCursor>,
+        requested_limit: usize,
+    ) -> Result<SourceSnapshotPage, SourceWriterError> {
+        let started = std::time::Instant::now();
+        let before = self.current_revision()?;
+        if expected != &before {
+            return Ok(SourceSnapshotPage::Stale { current: before });
+        }
+        let page = self.database.browser_metadata_page(
+            expected.revision(),
+            after_cursor,
+            requested_limit,
+        )?;
+        let after = self.current_revision()?;
+        if expected != &after || page.revision != expected.revision() {
+            return Ok(SourceSnapshotPage::Stale { current: after });
+        }
+        let bytes = page.files.iter().try_fold(0usize, |total, file| {
+            total
+                .checked_add(std::mem::size_of::<BrowserFileMetadata>())?
+                .checked_add(file.relative_path.as_os_str().len())?
+                .checked_add(
+                    file.collections
+                        .len()
+                        .checked_mul(std::mem::size_of::<SampleCollection>())?,
+                )
+        });
+        if started.elapsed() > std::time::Duration::from_secs(2)
+            || page.files.len() > 64
+            || !bytes.is_some_and(|bytes| bytes <= 16 * 1024 * 1024)
+        {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        Ok(SourceSnapshotPage::FreshAsOf {
+            revision: after,
+            page,
         })
     }
 
