@@ -16,6 +16,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use yield_core::{MAX_PLAYMARK_TIMING_CHARACTERS, MAX_TAG_FILTER_INPUT_BYTES, MAX_TAG_INPUT_BYTES};
+use yield_session::MAX_COLLECTION_NAME_BYTES;
 
 use crate::theme::{active, color};
 
@@ -82,6 +83,7 @@ pub(crate) struct SearchInputOptions {
     underlined: bool,
     ascii_digits_only: bool,
     compact_height: Option<u16>,
+    use_row_height: bool,
 }
 
 impl SearchInputOptions {
@@ -94,6 +96,7 @@ impl SearchInputOptions {
             underlined: false,
             ascii_digits_only: false,
             compact_height: None,
+            use_row_height: false,
         }
     }
 
@@ -106,6 +109,7 @@ impl SearchInputOptions {
             underlined: true,
             ascii_digits_only: false,
             compact_height: None,
+            use_row_height: false,
         }
     }
 
@@ -118,6 +122,7 @@ impl SearchInputOptions {
             underlined: true,
             ascii_digits_only: false,
             compact_height: None,
+            use_row_height: false,
         }
     }
 
@@ -130,6 +135,7 @@ impl SearchInputOptions {
             underlined: false,
             ascii_digits_only: true,
             compact_height: None,
+            use_row_height: false,
         }
     }
 
@@ -143,6 +149,21 @@ impl SearchInputOptions {
             underlined: false,
             ascii_digits_only: false,
             compact_height: Some(18),
+            use_row_height: false,
+        }
+    }
+
+    /// Options for one inline collection display-name editor.
+    pub(crate) const fn collection_name() -> Self {
+        Self {
+            placeholder: "Collection name",
+            max_bytes: Some(MAX_COLLECTION_NAME_BYTES),
+            max_characters: None,
+            paste_newlines: PasteNewlines::AsSpaces,
+            underlined: false,
+            ascii_digits_only: false,
+            compact_height: None,
+            use_row_height: true,
         }
     }
 }
@@ -887,7 +908,11 @@ impl Render for SearchInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = active(cx);
         let underlined = self.options.underlined;
-        let compact_height = self.options.compact_height.map(f32::from);
+        let compact_height = self.options.compact_height.map(f32::from).or_else(|| {
+            self.options
+                .use_row_height
+                .then_some(theme.spacing.row_height)
+        });
         let border_edges = if underlined { 1.0 } else { 2.0 };
         let border_width = compact_height.map_or(theme.spacing.border_width, |height| {
             theme

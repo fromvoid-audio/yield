@@ -63,9 +63,9 @@ pub use maintenance::{
 
 pub use preferences::{
     AudioOutputPreferences, DEFAULT_RATING_DECAY_WEEKS, DEFAULT_TEXT_SCALE_PERCENT,
-    ENLARGED_TEXT_SCALE_PERCENT, MAX_RATING_DECAY_WEEKS, MIN_RATING_DECAY_WEEKS, PreferenceError,
-    PreferenceEvent, PreferencePatch, PreferenceRequestId, PreferenceRevision,
-    UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
+    ENLARGED_TEXT_SCALE_PERCENT, MAX_COLLECTION_NAME_BYTES, MAX_RATING_DECAY_WEEKS,
+    MIN_RATING_DECAY_WEEKS, PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
+    PreferenceRevision, UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
 };
 use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};
 
@@ -4163,6 +4163,62 @@ mod tests {
         );
         assert_eq!(restored.theme_source_path, Some(source_path));
         reopened.shutdown().expect("reopen preference shutdown");
+    }
+
+    #[test]
+    fn collection_slot_name_survives_profile_restart_without_leaking_to_another_profile() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let first_profile = profile_root(&temp);
+        let second_profile = temp
+            .path()
+            .join(".yield")
+            .join(PROFILE_DIR_NAME)
+            .join("other-profile");
+        fs::create_dir_all(&second_profile).expect("other profile root");
+        let second_profile = fs::canonicalize(second_profile).expect("canonical other profile");
+        let mut service =
+            SourceRegistryService::start_inner(Some(first_profile.clone())).expect("first start");
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        let request = service
+            .patch_preferences(PreferencePatch::SetCollectionName {
+                slot: 4,
+                name: String::from("Textures"),
+            })
+            .expect("rename request");
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::RequestApplied { request: applied, .. } if *applied == request),
+        );
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() > 0),
+        );
+        service.shutdown().expect("first shutdown");
+
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(first_profile)).expect("reopen first");
+        let restored = wait_for_preference_snapshot(&reopened, |preferences| {
+            preferences.collection_names[4].as_deref() == Some("Textures")
+        });
+        assert!(
+            restored
+                .collection_names
+                .iter()
+                .enumerate()
+                .all(|(slot, name)| slot == 4 || name.is_none())
+        );
+        reopened.shutdown().expect("reopen shutdown");
+
+        let mut other =
+            SourceRegistryService::start_inner(Some(second_profile)).expect("other profile start");
+        let isolated = wait_for_preference_snapshot(&other, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        assert!(isolated.collection_names.iter().all(Option::is_none));
+        other.shutdown().expect("other shutdown");
     }
 
     #[test]

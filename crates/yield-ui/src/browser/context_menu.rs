@@ -32,6 +32,7 @@ enum ContextMenuAction {
     Unlock,
     RemoveFromCollection { slot: usize },
     OpenDirectory,
+    RenameCollection,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +83,13 @@ struct SampleContextMenuTarget {
 enum ContextMenuTarget {
     Sample(SampleContextMenuTarget),
     Directory(super::directory_open::DirectoryOpenTarget),
+    Collection {
+        slot: usize,
+        name: String,
+        source_id: SourceId,
+        root: PathBuf,
+        anchor: Point<Pixels>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +166,16 @@ impl ContextMenuTarget {
             Self::Directory(target) => {
                 super::directory_open::directory_target_is_current(browser, target)
             }
+            Self::Collection {
+                slot,
+                source_id,
+                root,
+                ..
+            } => {
+                *slot < yield_core::COLLECTION_COUNT
+                    && browser.active_source_id().as_ref() == Some(source_id)
+                    && browser.root.as_ref() == Some(root)
+            }
         }
     }
 
@@ -165,6 +183,7 @@ impl ContextMenuTarget {
         match self {
             Self::Sample(target) => target.anchor,
             Self::Directory(target) => target.anchor,
+            Self::Collection { anchor, .. } => *anchor,
         }
     }
 
@@ -175,13 +194,18 @@ impl ContextMenuTarget {
                 super::directory_open::DirectoryOpenKind::Source => "SOURCE",
                 super::directory_open::DirectoryOpenKind::Folder => "FOLDER",
             },
+            Self::Collection { .. } => "COLLECTION",
         }
     }
 
     fn label(&self) -> String {
+        if let Self::Collection { name, .. } = self {
+            return name.clone();
+        }
         let path = match self {
             Self::Sample(target) => &target.relative_path,
             Self::Directory(target) => target.folder.as_ref().unwrap_or(&target.root),
+            Self::Collection { .. } => unreachable!(),
         };
         path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -190,6 +214,35 @@ impl ContextMenuTarget {
 }
 
 impl Browser {
+    pub(super) fn open_collection_context_menu(
+        &mut self,
+        slot: usize,
+        anchor: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(source_id), Some(root)) = (self.active_source_id(), self.root.clone()) else {
+            return;
+        };
+        if slot >= yield_core::COLLECTION_COUNT {
+            return;
+        }
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::Collection {
+                slot,
+                name: self.collection_name(slot),
+                source_id,
+                root,
+                anchor,
+            },
+            actions: vec![ContextMenuAction::RenameCollection],
+            selected_action: 0,
+        });
+        window.focus(&self.focus_handle);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     /// Open a sample row menu without changing the loaded waveform or transport selection.
     pub(super) fn open_context_menu(
         &mut self,
@@ -364,7 +417,7 @@ impl Browser {
         true
     }
 
-    fn activate_context_menu_action(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn activate_context_menu_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = self.context_menu.as_ref() else {
             return;
         };
@@ -405,6 +458,9 @@ impl Browser {
             }
             (ContextMenuAction::OpenDirectory, ContextMenuTarget::Directory(target)) => {
                 self.start_directory_open(target, cx)
+            }
+            (ContextMenuAction::RenameCollection, ContextMenuTarget::Collection { slot, .. }) => {
+                self.begin_collection_rename(slot, window, cx);
             }
             _ => {
                 self.set_playback_status(String::from("Context menu action is unavailable"));
@@ -657,6 +713,7 @@ fn context_menu_action_label(action: ContextMenuAction) -> &'static str {
         ContextMenuAction::Unlock => "Unlock",
         ContextMenuAction::RemoveFromCollection { .. } => "Remove from collection",
         ContextMenuAction::OpenDirectory => directory_open_label(),
+        ContextMenuAction::RenameCollection => "Rename collection",
     }
 }
 

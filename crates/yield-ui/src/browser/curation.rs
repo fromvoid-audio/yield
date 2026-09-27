@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use gpui::{ClickEvent, Context, ScrollStrategy, div, prelude::*, px};
+use gpui::{ClickEvent, Context, MouseButton, MouseDownEvent, ScrollStrategy, div, prelude::*, px};
 use yield_core::{
     AudioFile, AudioFileCuration, AudioFileId, BrowserViewModel, COLLECTION_COUNT, CurationAction,
     CurationTransition, MAX_TAGS_PER_COMMIT, PLAYBACK_AGE_CHIPS, PLAYBACK_TYPE_FILTERS,
@@ -1269,7 +1269,32 @@ pub(super) fn render_collection_filters(
             let slot_color = color(theme.colors.collection_slots[slot]);
             let hover_fill = color(theme.colors.selection_hover_fill);
             let pressed_fill = color(theme.interaction.pressed_fill);
-            let label = format!("Collection {}", slot + 1);
+            let editing = browser.collection_rename_is_current(slot);
+            let label = browser.collection_name(slot);
+            let label_element = if editing {
+                div()
+                    .w_full()
+                    .h_full()
+                    .when_some(
+                        browser.ax_marker(super::accessibility::COLLECTION_RENAME),
+                        |element, marker| element.child(marker),
+                    )
+                    .child(browser.collection_rename_input.clone())
+                    .into_any_element()
+            } else {
+                div()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(theme.typography.small_size))
+                    .text_color(if selected {
+                        color(theme.colors.text_primary)
+                    } else {
+                        color(theme.colors.text_muted)
+                    })
+                    .child(label)
+                    .into_any_element()
+            };
             div()
                 .id(("collection-filter", slot))
                 .when_some(
@@ -1294,11 +1319,27 @@ pub(super) fn render_collection_filters(
                     browser.ax_marker(super::accessibility::collection_filter_id(slot)),
                     |element, marker| element.child(marker),
                 )
-                .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                    if active_source {
+                .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
+                    if !active_source
+                        || !event.standard_click()
+                        || view.collection_rename_is_current(slot)
+                    {
+                        return;
+                    }
+                    if matches!(event, ClickEvent::Mouse(click) if click.up.click_count >= 2) {
+                        view.begin_collection_rename(slot, window, cx);
+                    } else {
                         view.toggle_collection_filter(slot, cx);
                     }
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                        if active_source {
+                            view.open_collection_context_menu(slot, event.position, window, cx);
+                        }
+                    }),
+                )
                 .child(
                     div()
                         .flex_none()
@@ -1308,20 +1349,7 @@ pub(super) fn render_collection_filters(
                         .h(px(8.0))
                         .bg(slot_color),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_size(px(theme.typography.small_size))
-                        .text_color(if selected {
-                            color(theme.colors.text_primary)
-                        } else {
-                            color(theme.colors.text_muted)
-                        })
-                        .child(label),
-                )
+                .child(div().flex_1().overflow_hidden().child(label_element))
                 .child(
                     div()
                         .flex_none()
