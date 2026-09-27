@@ -228,6 +228,35 @@ path-only `UiRead` or `BackgroundRead` connection does not carry that ownership 
 and cannot satisfy the new snapshot contract. Those preexisting readers are legacy
 exceptions until they are routed or separately qualified.
 
+### OPT-1794 direct-open inventory
+
+`python3 scripts/internal/check/check_source_db_competing_writers.py --inventory`
+prints the reviewed production open sites with source locations and roles. At this
+revision it reports 15 direct open calls:
+
+| Boundary | Direct calls | Disposition |
+| --- | ---: | --- |
+| Catalog source registration | 2 | Profile-guarded source owner; retained source lease and database binding. |
+| Path-only source compatibility | 4 | `SampleSource::open_db`, source-local recovery `open`, `scan_in_background`, and their low-level SQLite opener fail with `ProfileOwnershipRequired` before filesystem work in normal builds. Their callers still need typed owner routing. |
+| Low-level source writable open | 1 | Guarded owner connection with retained source authority. |
+| Source lease bootstrap | 1 | Lease control connection, not a second source-data writer. |
+| Snapshot destination | 1 | Creates a new snapshot file under the source writer fence; not a second live-source connection. |
+| Source read-only opener | 1 | Legacy path-only read connection; lacks the owner-held no-sidecar-write proof. |
+| Global library and operation journal | 3 | Separate database owners, outside the physical source-data writer. |
+| Global-library read-only opener | 1 | Legacy observation outside the physical source-data writer. |
+| In-memory schema probe | 1 | In-memory connection only. |
+
+The scanner rejects any new direct production `SourceDatabase::open*` or
+`Connection::open*` site outside its narrow allowlist. This is a lexical tripwire,
+not a proof that an indirect helper cannot open a connection. It excludes test
+fixtures deliberately and reports the source and global-library read-only openers
+as explicit exceptions. The normal-build role test opens a legacy database through
+both `UiRead` and `BackgroundRead`, verifies read-only SQLite connections and zero
+connection changes, then checks that the schema stamp, tables, and row survive
+unchanged. These checks prove no content migration from those role opens; SQLite
+WAL/SHM sidecar activity remains possible for path-only readers, so they are not
+equivalent to the owner-held `SourceWriter` page.
+
 ## Connection roles and migration boundary
 
 The current source connection profiles map to the proposed authority boundary as follows:
