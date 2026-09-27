@@ -37,3 +37,14 @@ pub use scan_paths::{
 };
 pub use scan_writer::{ScanWritePhase, ScanWriter, UncoordinatedScanWriter};
 pub use wav_metadata::{WavDisplayMetadata, read_wav_display_metadata_for_manifest};
+
+#[cfg(test)]
+pub(crate) fn open_maintained_scan_database(
+    root: impl AsRef<std::path::Path>,
+) -> Result<crate::sample_sources::SourceDatabase, crate::sample_sources::SourceDbError> {
+    let root = root.as_ref();
+    drop(crate::sample_sources::SourceDatabase::open_for_maintenance(
+        root,
+    )?);
+    crate::sample_sources::SourceDatabase::open_for_scan(root)
+}

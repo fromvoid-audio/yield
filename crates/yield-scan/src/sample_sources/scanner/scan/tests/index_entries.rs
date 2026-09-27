@@ -19,7 +19,7 @@ fn full_scan_persists_typed_index_only_entries_across_restart() {
     std::fs::write(directory.path().join("notes.txt"), b"notes").unwrap();
     std::fs::write(directory.path().join("._sidecar.flac"), b"sidecar").unwrap();
 
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
     assert_eq!(database.list_files().unwrap().len(), 1);
     assert_eq!(
@@ -42,7 +42,7 @@ fn full_scan_persists_typed_index_only_entries_across_restart() {
     );
     drop(database);
 
-    let reopened = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let reopened = open_maintained_scan_database(directory.path()).unwrap();
     assert_eq!(
         typed_paths(&reopened),
         vec![
@@ -71,7 +71,7 @@ fn non_unicode_supported_paths_are_isolated_and_converge_in_full_and_targeted_sc
     let renamed_path = PathBuf::from(&renamed_name);
     std::fs::write(directory.path().join("ordinary.wav"), b"ordinary").unwrap();
 
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
     assert_eq!(database.list_files().unwrap().len(), 1);
     assert!(database.list_source_index_entries().unwrap().is_empty());
@@ -134,7 +134,7 @@ fn targeted_sync_preserves_non_unicode_unsupported_classifications() {
     let unsupported_non_audio = PathBuf::from(OsString::from_vec(b"notes-\xFE.txt".to_vec()));
     std::fs::write(directory.path().join("ordinary.wav"), b"ordinary").unwrap();
 
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
     std::fs::write(directory.path().join(&unsupported_audio), b"audio").unwrap();
     std::fs::write(directory.path().join(&unsupported_non_audio), b"notes").unwrap();
@@ -183,7 +183,7 @@ fn lossless_raw_path_key_does_not_alias_a_unicode_sample_path() {
     std::fs::write(directory.path().join(&raw_path), b"raw").unwrap();
     std::fs::write(directory.path().join(&unicode_path), b"unicode").unwrap();
 
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
 
     let manifest = database.list_manifest_entries().unwrap();
@@ -203,7 +203,7 @@ fn full_scan_reconciles_index_only_change_move_and_delete() {
     let directory = tempdir().unwrap();
     let original = directory.path().join("notes.txt");
     std::fs::write(&original, b"one").unwrap();
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
     let first = database.list_source_index_entries().unwrap().remove(0);
 
@@ -234,7 +234,7 @@ fn targeted_sync_uses_the_same_index_only_classification_and_reconciliation() {
     let directory = tempdir().unwrap();
     let nested = directory.path().join("nested");
     std::fs::create_dir(&nested).unwrap();
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
 
     std::fs::write(nested.join("loop.mp3"), b"mp3").unwrap();
@@ -274,7 +274,7 @@ fn targeted_sync_uses_the_same_index_only_classification_and_reconciliation() {
 #[test]
 fn targeted_index_delta_is_bound_to_the_next_source_revision() {
     let directory = tempdir().unwrap();
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
     let initial_revision = database.get_revision().unwrap();
 
@@ -344,7 +344,7 @@ fn uncertain_subtree_does_not_false_delete_index_only_rows() {
     let protected = directory.path().join("protected");
     std::fs::create_dir(&protected).unwrap();
     std::fs::write(protected.join("notes.txt"), b"notes").unwrap();
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
 
     std::fs::remove_file(protected.join("notes.txt")).unwrap();
@@ -368,7 +368,7 @@ fn inaccessible_observation_is_typed_without_deleting_a_prior_index_row() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("notes.txt");
     std::fs::write(&path, b"notes").unwrap();
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
     assert_eq!(
         database.list_source_index_entries().unwrap()[0].classification,
@@ -405,7 +405,7 @@ fn full_scan_moves_an_inaccessible_supported_file_out_of_the_live_manifest_until
     let relative = Path::new("supported.wav");
     let path = directory.path().join(relative);
     std::fs::write(&path, b"wav").unwrap();
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
     database.set_tag(relative, Rating::KEEP_1).unwrap();
 
@@ -443,7 +443,7 @@ fn targeted_sync_persists_and_recovers_a_supported_file_availability_diagnostic(
     let relative = Path::new("supported.wav");
     let path = directory.path().join(relative);
     std::fs::write(&path, b"wav").unwrap();
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
 
     let failure = force_file_metadata_failure(&path);
@@ -472,7 +472,7 @@ fn failed_type_probes_never_persist_internal_database_or_appledouble_paths() {
     let sidecar = directory.path().join(&sidecar_relative);
     let database_path = directory.path().join(&database_relative);
     std::fs::write(&sidecar, b"sidecar").unwrap();
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
 
     let full_sidecar_failure = force_file_type_failure(&sidecar);
     let full_database_failure = force_file_type_failure(&database_path);
@@ -505,7 +505,7 @@ fn failed_type_probes_preserve_descendants_below_reserved_name_directories() {
         std::fs::write(directory.path().join(reserved).join("sample.wav"), b"wav").unwrap();
         std::fs::write(directory.path().join(reserved).join("notes.txt"), b"notes").unwrap();
     }
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
     let expected_manifest = database.list_manifest_entries().unwrap();
     let expected_index = database.list_source_index_entries().unwrap();
@@ -546,7 +546,7 @@ fn supported_scan_promotes_a_legacy_index_only_row_without_metadata_inheritance(
     let directory = tempdir().unwrap();
     let path = Path::new("promoted.wav");
     std::fs::write(directory.path().join(path), b"sample").unwrap();
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     let mut batch = database.write_batch().unwrap();
     batch
         .upsert_source_index_entry(&SourceIndexEntry {

@@ -1,5 +1,6 @@
 use super::*;
 use crate::sample_sources::db::ExistingFileMetadataUpdate;
+use crate::sample_sources::scanner::open_maintained_scan_database;
 use crate::sample_sources::{Rating, SourceDatabase};
 use std::path::Path;
 use std::time::Duration;

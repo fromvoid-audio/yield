@@ -19,7 +19,7 @@ fn targeted_sync_updates_only_requested_file() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("one.wav"), b"one").unwrap();
     std::fs::write(dir.path().join("two.wav"), b"two").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::write(dir.path().join("one.wav"), b"changed").unwrap();
@@ -40,7 +40,7 @@ fn exact_sync_updates_one_live_entry_with_an_exact_manifest_snapshot() {
     std::fs::write(dir.path().join("target/inside.wav"), b"before").unwrap();
     std::fs::write(dir.path().join("target/inside/deep.wav"), b"deep").unwrap();
     std::fs::write(dir.path().join("unrelated.wav"), b"unrelated").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::write(dir.path().join("target/inside.wav"), b"after").unwrap();
@@ -72,7 +72,7 @@ fn exact_sync_indexes_one_live_unsupported_entry_without_subtree_rows() {
     std::fs::create_dir_all(dir.path().join("target/inside")).unwrap();
     std::fs::write(dir.path().join("target/inside.txt"), b"inside").unwrap();
     std::fs::write(dir.path().join("target/inside/deep.txt"), b"deep").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
 
     let target = exact_path("target/inside.txt");
     let stats = sync_exact_paths_with_progress_and_writer(
@@ -102,7 +102,7 @@ fn exact_sync_rejects_missing_or_directory_entries_without_retirement() {
     std::fs::write(dir.path().join("tracked.wav"), b"tracked").unwrap();
     std::fs::create_dir_all(dir.path().join("folder/child")).unwrap();
     std::fs::write(dir.path().join("folder/child.wav"), b"child").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let before = db
         .entry_for_path(Path::new("tracked.wav"))
@@ -151,7 +151,7 @@ fn targeted_sync_manifest_work_is_bounded_to_the_changed_subtree() {
         )
         .unwrap();
     }
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::write(target.join("changed.wav"), b"after").unwrap();
@@ -186,7 +186,7 @@ fn targeted_sync_collapses_parent_and_descendant_targets() {
     std::fs::create_dir(&nested).unwrap();
     std::fs::write(nested.join("one.wav"), b"one").unwrap();
     std::fs::write(nested.join("two.wav"), b"two").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     let stats = sync_paths(
@@ -212,7 +212,7 @@ fn targeted_sync_does_not_reconcile_wildcard_sibling_subtrees() {
     std::fs::write(target.join("removed.wav"), b"removed").unwrap();
     std::fs::write(sibling.join("unrelated.wav"), b"unrelated").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     std::fs::remove_file(target.join("removed.wav")).unwrap();
 
@@ -235,7 +235,7 @@ fn targeted_sync_rejects_a_root_swap_before_commit() {
     std::fs::create_dir(&root).unwrap();
     let path = root.join("one.wav");
     std::fs::write(&path, b"old").unwrap();
-    let db = SourceDatabase::open_for_scan(&root).unwrap();
+    let db = open_maintained_scan_database(&root).unwrap();
     scan_once(&db).unwrap();
     let before = db.entry_for_path(Path::new("one.wav")).unwrap().unwrap();
 
@@ -263,7 +263,7 @@ fn targeted_sync_detects_same_size_edit_with_restored_mtime() {
     let path = dir.path().join("same.wav");
     std::fs::write(&path, b"one").unwrap();
     let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let original_hash = db
         .entry_for_path(Path::new("same.wav"))
@@ -296,7 +296,7 @@ fn targeted_sync_exactly_hashes_an_existing_large_file_edit() {
     let path = dir.path().join("large.wav");
     std::fs::write(&path, vec![1_u8; 9 * 1024 * 1024]).unwrap();
     let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     complete_pending_deep_hash_for_path(&db, Path::new("large.wav"), None).unwrap();
     let original_hash = db
@@ -328,7 +328,7 @@ fn targeted_sync_hides_confirmed_missing_file() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("one.wav"), b"one").unwrap();
     std::fs::write(dir.path().join("two.wav"), b"two").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::remove_file(dir.path().join("one.wav")).unwrap();
@@ -351,7 +351,7 @@ fn targeted_sync_prunes_removed_folder_prefix() {
     std::fs::write(drums.join("one.wav"), b"one").unwrap();
     std::fs::write(drums.join("two.wav"), b"two").unwrap();
     std::fs::write(dir.path().join("keep.wav"), b"keep").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::remove_dir_all(&drums).unwrap();
@@ -370,7 +370,7 @@ fn targeted_sync_reconciles_hidden_directory_policy_changes() {
     let hidden = dir.path().join(".hidden");
     std::fs::create_dir_all(&hidden).unwrap();
     std::fs::write(hidden.join("kick.wav"), b"kick").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
 
     assert_eq!(scan_once(&db).unwrap().added, 1);
     db.set_source_traversal_policy(
@@ -414,7 +414,7 @@ fn targeted_sync_preserves_an_unreadable_directory_until_recovery() {
     let protected = dir.path().join("protected");
     std::fs::create_dir(&protected).unwrap();
     std::fs::write(protected.join("kick.wav"), b"kick").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     db.set_tag(Path::new("protected/kick.wav"), Rating::KEEP_1)
         .unwrap();
@@ -451,7 +451,7 @@ fn targeted_sync_normalizes_dot_prefixed_uncertainty_boundaries() {
     let protected = dir.path().join("protected");
     std::fs::create_dir(&protected).unwrap();
     std::fs::write(protected.join("kick.wav"), b"kick").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::remove_file(protected.join("kick.wav")).unwrap();
@@ -477,7 +477,7 @@ fn targeted_sync_adds_new_file_inside_requested_folder() {
     let dir = tempdir().unwrap();
     let drums = dir.path().join("drums");
     std::fs::create_dir_all(&drums).unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::write(drums.join("kick.wav"), b"kick").unwrap();
@@ -496,7 +496,7 @@ fn targeted_sync_does_not_claim_unrelated_missing_rename_source() {
     let dir = tempdir().unwrap();
     let unrelated = dir.path().join("unrelated.wav");
     std::fs::write(&unrelated, b"same").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     db.set_tag(Path::new("unrelated.wav"), Rating::KEEP_1)
         .unwrap();
@@ -526,7 +526,7 @@ fn targeted_sync_ignores_appledouble_sidecars() {
     let dir = tempdir().unwrap();
     let drums = dir.path().join("drums");
     std::fs::create_dir_all(&drums).unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::write(drums.join("kick.wav"), b"kick").unwrap();
@@ -549,7 +549,7 @@ fn targeted_sync_cancels_after_a_committed_batch_and_resumes_safely() {
     for index in 0..70 {
         std::fs::write(drums.join(format!("sample-{index:03}.wav")), b"x").unwrap();
     }
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let cancel = AtomicBool::new(false);
     let targets = [PathBuf::from("drums")];
 
@@ -588,7 +588,7 @@ fn targeted_sync_reconciles_each_directory_identity_once() {
 
     let _first_identity = force_directory_identity(&first, Some("repeated-target"));
     let _second_identity = force_directory_identity(&second, Some("repeated-target"));
-    let db = SourceDatabase::open_for_scan(source.path()).unwrap();
+    let db = open_maintained_scan_database(source.path()).unwrap();
     let ScanError::Incomplete { committed, .. } =
         sync_paths(&db, &[PathBuf::from("parent")]).unwrap_err()
     else {
@@ -618,7 +618,7 @@ fn targeted_sync_processes_sibling_files_sharing_a_parent_target() {
     std::fs::create_dir(&nested).unwrap();
     std::fs::write(nested.join("first.wav"), b"first").unwrap();
     std::fs::write(nested.join("second.wav"), b"second").unwrap();
-    let db = SourceDatabase::open_for_scan(source.path()).unwrap();
+    let db = open_maintained_scan_database(source.path()).unwrap();
 
     let stats = sync_paths(
         &db,
@@ -641,7 +641,7 @@ fn targeted_sync_rejects_a_file_below_a_repeated_ancestor() {
     std::fs::create_dir(&alias).unwrap();
     let target = alias.join("keep.wav");
     std::fs::write(&target, b"keep").unwrap();
-    let db = SourceDatabase::open_for_scan(source.path()).unwrap();
+    let db = open_maintained_scan_database(source.path()).unwrap();
     scan_once(&db).unwrap();
 
     let _root_identity = force_directory_identity(source.path(), Some("root-identity"));
@@ -668,7 +668,7 @@ fn targeted_sync_skips_directory_symlink_targets() {
     unix_fs::symlink(outside.path(), source.path().join("outside-link")).unwrap();
     unix_fs::symlink(source.path(), source.path().join("ancestor-loop")).unwrap();
 
-    let db = SourceDatabase::open_for_scan(source.path()).unwrap();
+    let db = open_maintained_scan_database(source.path()).unwrap();
     scan_once(&db).unwrap();
     let stats = sync_paths(
         &db,
@@ -698,7 +698,7 @@ fn targeted_sync_retires_a_file_replaced_by_a_symlink() {
     std::fs::write(&tracked, b"tracked").unwrap();
     std::fs::write(outside.path().join("outside.wav"), b"outside").unwrap();
 
-    let db = SourceDatabase::open_for_scan(source.path()).unwrap();
+    let db = open_maintained_scan_database(source.path()).unwrap();
     scan_once(&db).unwrap();
     std::fs::remove_file(&tracked).unwrap();
     unix_fs::symlink(outside.path().join("outside.wav"), &tracked).unwrap();

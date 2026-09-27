@@ -17,7 +17,7 @@ fn pre_epoch_timestamps_persist_for_full_rescan_and_targeted_sync() {
     filetime::set_file_mtime(&supported_path, initial_mtime).unwrap();
     filetime::set_file_mtime(&index_only_path, initial_mtime).unwrap();
 
-    let database = SourceDatabase::open_for_scan(directory.path()).unwrap();
+    let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
     assert_persisted_timestamp(&database, supported, index_only, -1_000_000_000);
 
