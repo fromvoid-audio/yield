@@ -218,6 +218,16 @@ receipt, raw revision, or `SourcePublicationFence` cannot authorize a later writ
 An observation from a process that lost profile or source ownership cannot migrate,
 repair, recover, or own a writable source connection.
 
+The implemented owner-held browser page reads through the retained `SourceWriter`
+connection after validating its profile guard, source lease, root binding, database
+identity, lifecycle generation, and revision. The page uses a SQLite read transaction,
+rolls it back, and issues no source mutation command; the targeted test verifies that
+the connection's change count is unchanged. It opens no second source connection, so
+any SQLite WAL/SHM activity remains under the same authorized physical owner. A
+path-only `UiRead` or `BackgroundRead` connection does not carry that ownership proof
+and cannot satisfy the new snapshot contract. Those preexisting readers are legacy
+exceptions until they are routed or separately qualified.
+
 ## Connection roles and migration boundary
 
 The current source connection profiles map to the proposed authority boundary as follows:
