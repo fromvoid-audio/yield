@@ -11565,6 +11565,86 @@ mod tests {
         service.shutdown();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn incomplete_watcher_audit_retains_last_snapshot_and_retries_after_unreadable_subtree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions {
+            path: PathBuf,
+            original: fs::Permissions,
+        }
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                fs::set_permissions(&self.path, self.original.clone())
+                    .expect("restore source permissions");
+            }
+        }
+
+        let fixture = Fixture::new("catalog-watcher-incomplete-retry");
+        let protected = fixture.root.path().join("protected");
+        fs::create_dir(&protected).expect("protected source directory");
+        write_test_wav(&protected.join("kick.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-watcher-incomplete-retry");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let initial = register_and_audit(&service, fixture.root.path(), &source_id);
+        assert!(
+            initial
+                .manifest
+                .iter()
+                .any(|entry| entry.relative_path == Path::new("protected/kick.wav"))
+        );
+
+        fs::remove_file(protected.join("kick.wav")).expect("remove source sample");
+        let permissions = RestorePermissions {
+            path: protected.clone(),
+            original: fs::metadata(&protected)
+                .expect("directory metadata")
+                .permissions(),
+        };
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0))
+            .expect("make subtree unreadable");
+        assert!(test_gate.record_watcher_evidence(
+            &source_id,
+            1,
+            WatchHintEvidence::DESCENDANT_CHANGED,
+        ));
+
+        let failed = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Failed {
+                    operation: CatalogOperation::Audit,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            failed,
+            CatalogEvent::Failed {
+                error: CatalogError::Audit(message),
+                ..
+            } if message.contains("retry required")
+        ));
+        drop(permissions);
+
+        let recovered = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::AuditCommitted { .. })
+        });
+        let CatalogEvent::AuditCommitted { snapshot } = recovered else {
+            unreachable!();
+        };
+        assert!(
+            snapshot
+                .manifest
+                .iter()
+                .all(|entry| entry.relative_path != Path::new("protected/kick.wav")),
+            "the later complete audit must publish the real deletion"
+        );
+        service.shutdown();
+    }
+
     #[test]
     fn unchanged_root_metadata_hint_does_not_trigger_audit() {
         let fixture = Fixture::new("catalog-watcher-root-ambiguity");
