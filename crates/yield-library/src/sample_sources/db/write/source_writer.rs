@@ -6,6 +6,7 @@
 //! owner; their persisted DTOs never construct or reacquire an authority.
 
 use std::io::{self, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 
 use rusqlite::{Transaction, params};
@@ -340,13 +341,41 @@ pub enum SourceWriterError {
     },
 }
 
-/// Owner of one already-profile-bound source database.
-pub struct SourceWriter {
-    database: SourceDatabase,
+/// Owner facade over one already-profile-bound source database.
+///
+/// A borrowed facade lets the existing serialized catalog owner submit a fenced
+/// command without opening or transferring its retained SQLite connection.
+pub struct SourceWriter<'a> {
+    database: SourceWriterDatabase<'a>,
     source_id: SourceId,
     lifecycle_generation: u64,
     #[cfg(test)]
     fault: Option<SourceWriterFault>,
+}
+
+enum SourceWriterDatabase<'a> {
+    Owned(SourceDatabase),
+    Borrowed(&'a mut SourceDatabase),
+}
+
+impl Deref for SourceWriterDatabase<'_> {
+    type Target = SourceDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(database) => database,
+            Self::Borrowed(database) => database,
+        }
+    }
+}
+
+impl DerefMut for SourceWriterDatabase<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Owned(database) => database,
+            Self::Borrowed(database) => database,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -359,10 +388,38 @@ enum SourceWriterFault {
     AfterCommit,
 }
 
-impl SourceWriter {
+impl SourceWriter<'static> {
     /// Retain one existing profile/source-lease-bound database as the sole writer owner.
     pub fn new(
         database: SourceDatabase,
+        source_id: SourceId,
+        lifecycle_generation: u64,
+    ) -> Result<Self, SourceWriterError> {
+        Self::from_database(
+            SourceWriterDatabase::Owned(database),
+            source_id,
+            lifecycle_generation,
+        )
+    }
+}
+
+impl<'a> SourceWriter<'a> {
+    /// Borrow the catalog owner's retained source database for one fenced command.
+    /// The borrow cannot outlive that database and creates no second SQLite connection.
+    pub fn borrowed(
+        database: &'a mut SourceDatabase,
+        source_id: SourceId,
+        lifecycle_generation: u64,
+    ) -> Result<Self, SourceWriterError> {
+        Self::from_database(
+            SourceWriterDatabase::Borrowed(database),
+            source_id,
+            lifecycle_generation,
+        )
+    }
+
+    fn from_database(
+        database: SourceWriterDatabase<'a>,
         source_id: SourceId,
         lifecycle_generation: u64,
     ) -> Result<Self, SourceWriterError> {
@@ -377,6 +434,14 @@ impl SourceWriter {
         let current = writer.current_revision()?;
         writer.ensure_stored_source_id(&current.source_id)?;
         Ok(writer)
+    }
+
+    /// Close an owned database. A borrowed facade cannot close its catalog owner's connection.
+    pub fn close(self) -> Result<(), SourceDbError> {
+        match self.database {
+            SourceWriterDatabase::Owned(database) => database.close(),
+            SourceWriterDatabase::Borrowed(_) => Err(SourceDbError::ProfileOwnershipRequired),
+        }
     }
 
     /// Return a fresh revision only after revalidating the retained source authority.
@@ -499,11 +564,6 @@ impl SourceWriter {
             revision: after,
             page,
         })
-    }
-
-    /// Close the retained source database and release its existing source lease.
-    pub fn close(self) -> Result<(), SourceDbError> {
-        self.database.close()
     }
 
     /// Read one retained source receipt as a historical observation after revalidating the

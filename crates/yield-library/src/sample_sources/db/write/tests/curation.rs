@@ -1509,6 +1509,57 @@ fn source_writer_replays_durable_receipts_and_reopens_as_observation_only() {
 }
 
 #[test]
+fn borrowed_source_writer_commits_collection_without_reopening_catalog_database() {
+    let mut fixture = CurationFixture::new_profile_bound();
+    let source_id = SourceId::from_string("borrowed-source-writer");
+    let collection = SampleCollection::new(2).expect("collection slot");
+    let request = {
+        let mut writer = SourceWriter::borrowed(&mut fixture.database, source_id.clone(), 7)
+            .expect("borrowed source writer");
+        let request = SourceWriterRequest::new(
+            crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(71)),
+            crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(72)),
+            SourceCommandId::from_uuid(uuid::Uuid::from_u128(73)),
+            writer.current_revision().expect("owner-issued revision"),
+            vec![SourceCurationUpdate::AddCollection {
+                path: CurationFixture::path("one.wav"),
+                collection,
+            }],
+        )
+        .expect("bounded collection command");
+        writer
+            .commit_curation(request.clone())
+            .expect("collection commit");
+        request
+    };
+
+    let committed_revision = fixture
+        .database
+        .get_revision()
+        .expect("catalog database remains live");
+    assert_eq!(
+        fixture
+            .database
+            .collection_for_path(Path::new("one.wav"))
+            .expect("catalog collection read"),
+        Some(collection)
+    );
+    let mut borrowed_again = SourceWriter::borrowed(&mut fixture.database, source_id, 7)
+        .expect("reborrow retained source database");
+    borrowed_again
+        .commit_curation(request)
+        .expect("exact durable replay");
+    drop(borrowed_again);
+    assert_eq!(
+        fixture
+            .database
+            .get_revision()
+            .expect("revision after replay"),
+        committed_revision
+    );
+}
+
+#[test]
 fn source_owner_page_is_bounded_read_only_and_rejects_stale_continuation() {
     let fixture = CurationFixture::new_profile_bound();
     let source_id = SourceId::from_string("source-page-test");
