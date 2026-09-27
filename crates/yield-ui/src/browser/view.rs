@@ -1228,7 +1228,7 @@ impl Render for Browser {
             &theme,
         );
         let motion_frame = self.motion_frame(theme.motion, window);
-        let jobs = super::job_details::snapshot(self);
+        let jobs = super::job_details::snapshot(self, cx);
         let jobs_status = jobs.status_label();
         let jobs_running = jobs.active_count() > 0;
         let playback_cursor_ratio = self.playback_cursor_ratio(theme.motion.enabled);
@@ -2539,6 +2539,9 @@ impl Render for Browser {
                 if jobs.rows.is_empty() {
                     panel = panel.child("No active jobs");
                 }
+                if let Some(error) = self.job_action_error.as_ref() {
+                    panel = panel.child(error.clone());
+                }
                 for row in &jobs.rows {
                     let source = row.source_label();
                     panel = panel.child(
@@ -2548,7 +2551,33 @@ impl Render for Browser {
                             .child(format!("{} · {source}", row.kind.label()))
                             .child(row.state_label())
                             .child(row.work)
-                            .when_some(row.blocked_label(), |element, error| element.child(error)),
+                            .when_some(row.blocked_label(), |element, error| element.child(error))
+                            .when(row.can_retry, |element| {
+                                element.child(
+                                    div()
+                                        .id("status-job-retry")
+                                        .debug_selector(|| "status-job-retry".into())
+                                        .cursor_pointer()
+                                        .child("Retry")
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            view.retry_job_audit(cx);
+                                            window.focus(&view.job_details_focus_handle);
+                                        })),
+                                )
+                            })
+                            .when(row.can_cancel, |element| {
+                                element.child(
+                                    div()
+                                        .id("status-job-cancel")
+                                        .debug_selector(|| "status-job-cancel".into())
+                                        .cursor_pointer()
+                                        .child("Cancel")
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            view.cancel_job_audit(cx);
+                                            window.focus(&view.job_details_focus_handle);
+                                        })),
+                                )
+                            }),
                     );
                 }
                 element.child(panel)

@@ -867,6 +867,23 @@ pub enum CatalogSubmitError {
     InvalidRatingDecayRequest(#[from] CatalogRatingDecayRequestError),
 }
 
+/// Result of trying to cancel one currently executing source audit.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CatalogAuditCancelError {
+    /// The worker has closed or is shutting down.
+    #[error("catalog worker is closed")]
+    Closed,
+    /// The source or lifecycle generation is no longer current.
+    #[error("source audit lifecycle is stale")]
+    Stale,
+    /// No audit is currently executing for this source.
+    #[error("source audit is not running")]
+    NotRunning,
+    /// Cancellation has already been requested for this audit.
+    #[error("source audit cancellation is already requested")]
+    AlreadyRequested,
+}
+
 /// Startup failures for the profile-owned catalog worker.
 #[derive(Debug, Error)]
 pub enum CatalogStartError {
@@ -1090,6 +1107,13 @@ pub enum CatalogEvent {
     AuditCommitted {
         /// Revision-fenced catalog snapshot.
         snapshot: CatalogSnapshot,
+    },
+    /// An explicit cancellation stopped the current audit before publication.
+    AuditCanceled {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation whose audit was canceled.
+        lifecycle_generation: u64,
     },
     /// A bounded exact-path WAV metadata request completed.
     ///
@@ -1488,6 +1512,7 @@ struct AdmissionState {
     tag_page_input_bytes: usize,
     tag_read_payload_bytes: usize,
     sources: HashMap<SourceId, DesiredSource>,
+    active_audits: HashMap<SourceId, (u64, Arc<AtomicBool>)>,
 }
 
 impl AdmissionState {
@@ -1501,10 +1526,12 @@ impl AdmissionState {
             tag_page_input_bytes: 0,
             tag_read_payload_bytes: 0,
             sources: HashMap::new(),
+            active_audits: HashMap::new(),
         }
     }
 
     fn invalidate_all(&mut self) {
+        self.active_audits.clear();
         for source in self.sources.values_mut() {
             if let Some(token) = source.attempt_token.take() {
                 token.store(true, Ordering::Release);
@@ -2280,6 +2307,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .get(&source_id)
                 .is_none_or(|source| lifecycle_generation > source.lifecycle_generation);
             if replace {
+                state.active_audits.remove(&source_id);
                 if let Some(previous) = state.sources.get_mut(&source_id)
                     && let Some(token) = previous.attempt_token.take()
                 {
@@ -2305,6 +2333,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .get(&source_id)
                 .is_none_or(|source| lifecycle_generation >= source.lifecycle_generation);
             if replace {
+                state.active_audits.remove(&source_id);
                 if let Some(previous) = state.sources.get_mut(&source_id)
                     && let Some(token) = previous.attempt_token.take()
                 {
@@ -2376,6 +2405,26 @@ fn begin_source_attempt(
     let token = Arc::new(AtomicBool::new(false));
     source.attempt_token = Some(Arc::clone(&token));
     Some(token)
+}
+
+fn finish_audit_attempt(
+    admission: &Arc<Mutex<AdmissionState>>,
+    source_id: &SourceId,
+    token: &Arc<AtomicBool>,
+) -> bool {
+    let mut state = admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state
+        .active_audits
+        .get(source_id)
+        .is_some_and(|(_, active)| Arc::ptr_eq(active, token))
+    {
+        state.active_audits.remove(source_id);
+        token.load(Ordering::Acquire)
+    } else {
+        false
+    }
 }
 
 fn publication_is_current(
@@ -2683,6 +2732,56 @@ impl CatalogService {
                 Err(CatalogSubmitError::Closed)
             }
         }
+    }
+
+    /// Request cancellation of only the currently executing audit for this lifecycle.
+    /// Acceptance flips the worker-owned token; `AuditCanceled` is the terminal acknowledgment.
+    pub fn cancel_audit(
+        &self,
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+    ) -> Result<(), CatalogAuditCancelError> {
+        let state = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutdown || state.closed {
+            return Err(CatalogAuditCancelError::Closed);
+        }
+        if !state.sources.get(source_id).is_some_and(|source| {
+            source.active && source.lifecycle_generation == lifecycle_generation
+        }) {
+            return Err(CatalogAuditCancelError::Stale);
+        }
+        let Some((generation, token)) = state.active_audits.get(source_id) else {
+            return Err(CatalogAuditCancelError::NotRunning);
+        };
+        if *generation != lifecycle_generation {
+            return Err(CatalogAuditCancelError::Stale);
+        }
+        if token.swap(true, Ordering::AcqRel) {
+            return Err(CatalogAuditCancelError::AlreadyRequested);
+        }
+        Ok(())
+    }
+
+    /// Report whether this exact source lifecycle currently owns a cancelable audit token.
+    pub fn audit_is_running(&self, source_id: &SourceId, lifecycle_generation: u64) -> bool {
+        let state = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        !state.shutdown
+            && !state.closed
+            && state.sources.get(source_id).is_some_and(|source| {
+                source.active && source.lifecycle_generation == lifecycle_generation
+            })
+            && state
+                .active_audits
+                .get(source_id)
+                .is_some_and(|(generation, token)| {
+                    *generation == lifecycle_generation && !token.load(Ordering::Acquire)
+                })
     }
 
     /// Read the next queued worker delivery without blocking.
@@ -4089,7 +4188,16 @@ fn request_audit(
     let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
         return AuditDisposition::Canceled;
     };
+    admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .active_audits
+        .insert(
+            source_id.clone(),
+            (lifecycle_generation, Arc::clone(&token)),
+        );
     let Some(source) = sources.get_mut(&source_id) else {
+        finish_audit_attempt(admission, &source_id, &token);
         return AuditDisposition::Canceled;
     };
     source.attempt_token = Some(Arc::clone(&token));
@@ -4103,7 +4211,7 @@ fn request_audit(
             })
         })
         .and_then(|()| audit_source(source, profile_guard, &source_id, &token));
-    match result {
+    let disposition = match result {
         Ok(snapshot) => {
             source.known_root_identity = Some(snapshot.root_identity.clone());
             source.snapshot = Some(snapshot.clone());
@@ -4152,7 +4260,23 @@ fn request_audit(
                 AuditDisposition::Canceled
             }
         }
+    };
+    if finish_audit_attempt(admission, &source_id, &token)
+        && matches!(disposition, AuditDisposition::Canceled)
+    {
+        let _ = publish_if_current(
+            admission,
+            reservation,
+            &source_id,
+            lifecycle_generation,
+            None,
+            CatalogEvent::AuditCanceled {
+                source_id: source_id.clone(),
+                lifecycle_generation,
+            },
+        );
     }
+    disposition
 }
 
 fn audit_error_policy(error: &CatalogError) -> (bool, bool) {
@@ -4170,6 +4294,13 @@ fn audit_error_policy(error: &CatalogError) -> (bool, bool) {
                 | CatalogError::DatabaseIntegrityUncertain(_)
         );
     (retryable, root_stale)
+}
+
+impl CatalogError {
+    /// Whether an audit failure can be retried against the current source owner.
+    pub fn audit_retryable(&self) -> bool {
+        audit_error_policy(self).0
+    }
 }
 
 fn request_wav_metadata(
@@ -9594,6 +9725,87 @@ mod tests {
                 .expect("recovered staging generations")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn explicit_audit_cancel_acknowledges_only_the_active_generation() {
+        let fixture = Fixture::new("catalog-explicit-audit-cancel");
+        let (service, gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let source_id = SourceId::from_string("source-a");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 1,
+            })
+            .expect("register");
+        let _ = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::Registered { .. })
+        });
+        assert_eq!(
+            service.cancel_audit(&source_id, 1),
+            Err(CatalogAuditCancelError::NotRunning)
+        );
+        let pause = gate.arm_next_audit();
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("audit");
+        gate.wait_until_audit_entered();
+        assert!(service.audit_is_running(&source_id, 1));
+        assert!(!service.audit_is_running(&source_id, 2));
+        assert_eq!(
+            service.cancel_audit(&source_id, 2),
+            Err(CatalogAuditCancelError::Stale)
+        );
+        assert_eq!(service.cancel_audit(&source_id, 1), Ok(()));
+        assert!(!service.audit_is_running(&source_id, 1));
+        assert_eq!(
+            service.cancel_audit(&source_id, 1),
+            Err(CatalogAuditCancelError::AlreadyRequested)
+        );
+        drop(pause);
+        assert!(matches!(
+            receive_until(&service, |event| matches!(event, CatalogEvent::AuditCanceled { .. })),
+            CatalogEvent::AuditCanceled {
+                source_id: canceled,
+                lifecycle_generation: 1
+            } if canceled == source_id
+        ));
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("later audit");
+        let committed = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::AuditCommitted { .. })
+        });
+        let CatalogEvent::AuditCommitted { snapshot } = committed else {
+            unreachable!();
+        };
+        service.shutdown();
+        let reopened = CatalogService::start(&fixture.guard).expect("reopen catalog service");
+        reopened
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 2,
+            })
+            .expect("register reopened source");
+        let event = receive_until(&reopened, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        });
+        let CatalogEvent::SnapshotReady { snapshot: restored } = event else {
+            unreachable!();
+        };
+        assert_eq!(restored.committed_revision, snapshot.committed_revision);
+        assert_eq!(restored.manifest, snapshot.manifest);
+        reopened.shutdown();
     }
 
     #[test]
