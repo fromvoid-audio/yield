@@ -645,7 +645,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn control_and_option_space_request_selected_sample_sections(cx: &mut TestAppContext) {
+    fn plain_r_requests_selected_sample_section(cx: &mut TestAppContext) {
         let path = PathBuf::from("/tmp/random-section-shortcut.wav");
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
@@ -655,36 +655,34 @@ mod tests {
             view.waveform_generation = 7;
             view.waveform = Some(preview_for(&path));
         });
-        for chord in ["ctrl-space", "alt-space"] {
-            cx.update(|window, app| {
-                browser.update(app, |view, cx| {
-                    window.focus(&view.focus_handle);
-                    view.playback_init_intent = None;
-                    view.handle_key_down(
-                        &KeyDownEvent {
-                            keystroke: Keystroke::parse(chord).expect("random-section chord"),
-                            is_held: false,
-                        },
-                        window,
-                        cx,
-                    );
-                    let intent = view
-                        .playback_init_intent
-                        .as_ref()
-                        .expect("random section schedules playback");
-                    assert_eq!(intent.path, path);
-                    assert!(intent.region.is_some(), "{chord} must audition a section");
-                    assert!(!view.random_audition_sticky);
-                });
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                window.focus(&view.focus_handle);
+                view.playback_init_intent = None;
+                view.handle_key_down(
+                    &KeyDownEvent {
+                        keystroke: Keystroke::parse("r").expect("random-section key"),
+                        is_held: false,
+                    },
+                    window,
+                    cx,
+                );
+                let intent = view
+                    .playback_init_intent
+                    .as_ref()
+                    .expect("random section schedules playback");
+                assert_eq!(intent.path, path);
+                assert!(intent.region.is_some(), "R must audition a section");
+                assert!(!view.random_audition_sticky);
             });
-        }
+        });
         cx.update(|window, app| {
             browser.update(app, |view, cx| {
                 view.playback_init_intent = None;
                 window.focus(&view.search_input.read(cx).focus_handle());
                 view.handle_key_down(
                     &KeyDownEvent {
-                        keystroke: Keystroke::parse("ctrl-space").expect("Control-Space"),
+                        keystroke: Keystroke::parse("r").expect("R"),
                         is_held: false,
                     },
                     window,
@@ -696,7 +694,7 @@ mod tests {
                 view.toggle_shortcut_help(window, cx);
                 view.handle_key_down(
                     &KeyDownEvent {
-                        keystroke: Keystroke::parse("alt-space").expect("Option-Space"),
+                        keystroke: Keystroke::parse("r").expect("R"),
                         is_held: false,
                     },
                     window,

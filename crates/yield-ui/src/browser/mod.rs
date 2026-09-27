@@ -3177,7 +3177,7 @@ fn random_section_shortcut(
     function: bool,
     held: bool,
 ) -> bool {
-    key == "space" && !command && !shift && !function && !held && (control ^ alt)
+    key.eq_ignore_ascii_case("r") && !command && !control && !shift && !alt && !function && !held
 }
 
 #[cfg(test)]
@@ -3247,21 +3247,25 @@ mod tests {
     }
 
     #[test]
-    fn random_section_shortcut_accepts_only_control_or_option_space() {
+    fn random_section_shortcut_accepts_only_plain_r() {
         assert!(random_section_shortcut(
-            "space", false, true, false, false, false, false
-        ));
-        assert!(random_section_shortcut(
-            "space", false, false, false, true, false, false
+            "r", false, false, false, false, false, false
         ));
         for (key, command, control, shift, alt, function, held) in [
             ("space", false, false, false, false, false, false),
+            ("space", false, true, false, false, false, false),
+            ("space", false, false, false, true, false, false),
             ("space", false, true, false, true, false, false),
             ("space", true, true, false, false, false, false),
             ("space", false, true, true, false, false, false),
             ("space", false, false, false, true, true, false),
             ("space", false, false, false, true, false, true),
             ("r", false, true, false, false, false, false),
+            ("r", true, false, false, false, false, false),
+            ("r", false, false, true, false, false, false),
+            ("r", false, false, false, true, false, false),
+            ("r", false, false, false, false, true, false),
+            ("r", false, false, false, false, false, true),
         ] {
             assert!(!random_section_shortcut(
                 key, command, control, shift, alt, function, held
