@@ -104,6 +104,21 @@ pub enum SourceSnapshotPage {
     },
 }
 
+struct SnapshotProgressGuard<'a>(&'a rusqlite::Connection);
+
+impl<'a> SnapshotProgressGuard<'a> {
+    fn install(connection: &'a rusqlite::Connection, deadline: std::time::Instant) -> Self {
+        connection.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline));
+        Self(connection)
+    }
+}
+
+impl Drop for SnapshotProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
 impl SourceRevision {
     /// Borrow the source identity named by the owner.
     pub fn source_id(&self) -> &SourceId {
@@ -433,15 +448,33 @@ impl SourceWriter {
         requested_limit: usize,
     ) -> Result<SourceSnapshotPage, SourceWriterError> {
         let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(2);
+        const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+        if after_cursor.is_some_and(|cursor| cursor.as_str().len() > MAX_INPUT_BYTES) {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        let _progress = SnapshotProgressGuard::install(&self.database.connection, deadline);
         let before = self.current_revision()?;
         if expected != &before {
             return Ok(SourceSnapshotPage::Stale { current: before });
         }
-        let page = self.database.browser_metadata_page(
-            expected.revision(),
-            after_cursor,
-            requested_limit,
-        )?;
+        let page = self
+            .database
+            .browser_metadata_page_bounded(
+                expected.revision(),
+                after_cursor,
+                requested_limit,
+                MAX_INPUT_BYTES,
+            )
+            .map_err(|error| {
+                if matches!(error, SourceDbError::SnapshotBudgetExceeded)
+                    || std::time::Instant::now() >= deadline
+                {
+                    SourceWriterError::SnapshotBudgetExceeded
+                } else {
+                    SourceWriterError::Database(error)
+                }
+            })?;
         let after = self.current_revision()?;
         if expected != &after || page.revision != expected.revision() {
             return Ok(SourceSnapshotPage::Stale { current: after });

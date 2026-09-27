@@ -254,8 +254,11 @@ startup phase may create, migrate, or repair schema while it holds source owners
 Operational writable roles require a currently compatible schema and return a typed
 `MaintenanceRequired` result instead of opportunistically repairing it. The same owned
 connection may perform that maintenance before entering the operational queue; no
-competing writer is introduced. Current Fast migration/repair behavior is an explicit
-OPT-1639 compatibility exception, and OPT-1637 does not change it.
+competing writer is introduced. Operational writer roles now reject a missing or stale schema
+without creating the database or running additive repairs. The owner-held browser page reads
+through its retained connection with revision fencing, a 64-row keyset limit, a 16 MiB
+materialized path/membership budget, and a two-second SQLite progress cutoff. Path-only
+read roles remain explicit legacy exceptions pending the WAL/SHM no-hidden-write proof.
 
 ## Current callers and migration exceptions
 
