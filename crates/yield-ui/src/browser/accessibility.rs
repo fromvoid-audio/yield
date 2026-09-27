@@ -33,6 +33,7 @@ const JOB_DETAILS_PANEL: &str = "status-job-details-panel";
 const PLAY: &str = "transport-play";
 const STOP: &str = "transport-stop";
 const LOOP: &str = "transport-loop";
+const FOCUS_LOADED: &str = "transport-focus-loaded";
 const SIMILAR: &str = "transport-similar-sections";
 const BPM_SNAP: &str = "transport-bpm-snap";
 const ZERO_CROSSING: &str = "transport-zero-crossing";
@@ -246,6 +247,7 @@ impl BrowserAccessibility {
             PLAY,
             STOP,
             LOOP,
+            FOCUS_LOADED,
             SIMILAR,
             BPM_SNAP,
             ZERO_CROSSING,
@@ -438,6 +440,7 @@ impl BrowserAccessibility {
                             event.id.as_str(),
                             PLAY | STOP
                                 | LOOP
+                                | FOCUS_LOADED
                                 | SIMILAR
                                 | BPM_SNAP
                                 | ZERO_CROSSING
@@ -599,6 +602,7 @@ impl BrowserAccessibility {
                                     cx.notify();
                                 }
                                 LOOP => view.toggle_loop(cx),
+                                FOCUS_LOADED => view.focus_loaded_sample_in_browser(window, cx),
                                 SIMILAR => super::similar_sections::toggle(view, cx),
                                 BPM_SNAP => view.toggle_bpm_snap(cx),
                                 ZERO_CROSSING => super::zero_crossing::toggle_from_accessibility(
@@ -1015,6 +1019,7 @@ impl Browser {
                     self.loop_toolbar_enabled(),
                     self.preferences_editable(),
                 ),
+                button(FOCUS_LOADED, "Focus loaded sample in browser", None, true),
                 toggle(
                     SIMILAR,
                     "Find similar sections",

@@ -169,7 +169,11 @@ impl Browser {
         }
     }
 
-    fn focus_loaded_sample_in_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_loaded_sample_in_browser(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.waveform.is_none() {
             self.playback_status = "Load a sample to focus it".into();
             cx.notify();
@@ -405,6 +409,19 @@ mod tests {
             browser_target(ids.iter(), None, None, &HashSet::new(), Some(&hidden)),
             Some(ids[0].clone())
         );
+    }
+
+    #[gpui::test]
+    fn focus_loaded_without_a_sample_reports_a_truthful_status(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                view.focus_loaded_sample_in_browser(window, cx);
+                assert_eq!(view.playback_status, "Load a sample to focus it");
+                assert!(view.browser_focus_override.is_none());
+            });
+        });
     }
 
     #[gpui::test]

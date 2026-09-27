@@ -31,6 +31,25 @@ use super::zero_crossing;
 
 struct RandomNavigationTooltip;
 
+struct FocusLoadedTooltip;
+
+impl Render for FocusLoadedTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = active(cx);
+        div()
+            .px(px(theme.spacing.control_gap))
+            .py(px(theme.spacing.control_gap))
+            .bg(color(theme.colors.surface_raised))
+            .text_size(px(theme.typography.small_size))
+            .text_color(color(theme.colors.text_primary))
+            .child("Focus the loaded sample in the browser")
+    }
+}
+
+fn focus_loaded_tooltip(_: &mut Window, cx: &mut gpui::App) -> gpui::AnyView {
+    cx.new(|_| FocusLoadedTooltip).into()
+}
+
 impl Render for RandomNavigationTooltip {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = active(cx);
@@ -1549,6 +1568,39 @@ impl Render for Browser {
                                 theme.colors.text_muted
                             }))
                             .child(loop_label),
+                    )
+                    .child(
+                        div()
+                            .id("focus-loaded-toolbar")
+                            .relative()
+                            .when_some(self.ax_focus("transport-focus-loaded"), |element, focus| {
+                                element.track_focus(&focus)
+                            })
+                            .when_some(
+                                self.ax_marker("transport-focus-loaded"),
+                                |element, marker| element.child(marker),
+                            )
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .when(self.hover_help_visible(), |control| {
+                                control.tooltip(focus_loaded_tooltip)
+                            })
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.focus_loaded_sample_in_browser(window, cx)
+                            }))
+                            .text_size(px(theme.typography.small_size))
+                            .text_color(color(theme.colors.text_muted))
+                            .child("◎"),
                     )
                     .child(
                         div()
