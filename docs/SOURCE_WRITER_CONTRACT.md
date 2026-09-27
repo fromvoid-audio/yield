@@ -195,8 +195,17 @@ continuation. A response includes the exact source identity, lifecycle generatio
 revision, bounded rows/deltas, and an outcome. It does not include a write capability or
 an inferred “latest” promise.
 
-The source owner or a read owner uses the existing snapshot budget: two seconds, 100,000
-rows, or 16 MiB of bounded result/input data, whichever is reached first. Existing
+The source owner or a read owner applies a two-second response deadline, 100,000 rows,
+and 16 MiB of bounded result/input data. `SourceSnapshotOwner` moves the retained
+`SourceWriter` into one worker and bounds the complete page request, including queue wait,
+revision validation, and SQLite work. A blocked filesystem identity check cannot delay
+the caller past its response deadline. The worker retains the same database and source
+authority until that operation finishes; an expired queued request is skipped, and no
+second writer is started. SQLite progress handling interrupts database work, while the
+owner checks the deadline after each retained revision validation and after materializing
+the page. Orderly retirement returns a join handle; joining can block on OS I/O and must
+not occur on the UI thread. Dropping the handle stops new requests and leaves the worker
+to release its authority when the current operation ends. Existing
 metadata queries use a keyset page of 64 rows. A continuation starts a fresh bounded
 snapshot and revalidates the expected source identity, lifecycle generation, and
 revision; it never concatenates pages from different epochs or silently blends a stale
@@ -217,6 +226,16 @@ perpetually current after the response returns. A `CatalogSnapshot`, copied row,
 receipt, raw revision, or `SourcePublicationFence` cannot authorize a later write.
 An observation from a process that lost profile or source ownership cannot migrate,
 repair, recover, or own a writable source connection.
+
+The implemented owner-held browser page reads through the retained `SourceWriter`
+connection after validating its profile guard, source lease, root binding, database
+identity, lifecycle generation, and revision. The page uses a SQLite read transaction,
+rolls it back, and issues no source mutation command; the targeted test verifies that
+the connection's change count is unchanged. It opens no second source connection, so
+any SQLite WAL/SHM activity remains under the same authorized physical owner. A
+path-only `UiRead` or `BackgroundRead` connection does not carry that ownership proof
+and cannot satisfy the new snapshot contract. Those preexisting readers are legacy
+exceptions until they are routed or separately qualified.
 
 ## Connection roles and migration boundary
 
@@ -254,8 +273,13 @@ startup phase may create, migrate, or repair schema while it holds source owners
 Operational writable roles require a currently compatible schema and return a typed
 `MaintenanceRequired` result instead of opportunistically repairing it. The same owned
 connection may perform that maintenance before entering the operational queue; no
-competing writer is introduced. Current Fast migration/repair behavior is an explicit
-OPT-1639 compatibility exception, and OPT-1637 does not change it.
+competing writer is introduced. Operational writer roles now reject a missing or stale schema
+without creating the database or running additive repairs. They compare table and column
+shape against a cached, in-memory current-schema reference so a current version stamp cannot
+hide a repairable omission. The owner-held browser page reads
+through its retained connection with revision fencing, a 64-row keyset limit, a 16 MiB
+materialized path/membership budget, and a two-second SQLite progress cutoff. Path-only
+read roles remain explicit legacy exceptions pending the WAL/SHM no-hidden-write proof.
 
 ## Current callers and migration exceptions
 
