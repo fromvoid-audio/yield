@@ -33,6 +33,7 @@ const JOB_DETAILS_PANEL: &str = "status-job-details-panel";
 const PLAY: &str = "transport-play";
 const STOP: &str = "transport-stop";
 const LOOP: &str = "transport-loop";
+const FOCUS_LOADED: &str = "transport-focus-loaded";
 const SIMILAR: &str = "transport-similar-sections";
 const BPM_SNAP: &str = "transport-bpm-snap";
 const ZERO_CROSSING: &str = "transport-zero-crossing";
@@ -148,23 +149,28 @@ pub(super) fn curation_queue_choice_id(index: usize) -> String {
     format!("browser-curation-queue-choice-{index}")
 }
 
-fn visible_sort_columns(window: &Window, cx: &Context<Browser>) -> Vec<(SortColumn, &'static str)> {
+fn visible_sort_columns(
+    view: &Browser,
+    window: &Window,
+    cx: &Context<Browser>,
+) -> Vec<(SortColumn, &'static str)> {
     let theme = crate::theme::active(cx);
     let visibility =
         super::view::browser_column_visibility(f32::from(window.bounds().size.width), &theme);
-    let mut columns = vec![(SortColumn::Name, "Name"), (SortColumn::Rating, "Rating")];
-    if visibility.playback_type {
-        columns.push((SortColumn::PlaybackType, "Type"));
-    }
-    columns.extend([
-        (SortColumn::Collection, "Collection"),
-        (SortColumn::Extension, "Extension"),
-        (SortColumn::Size, "Size"),
-    ]);
-    if visibility.last_played {
-        columns.push((SortColumn::LastPlayed, "Last Played"));
-    }
-    columns
+    view.column_layout
+        .visible_order(visibility)
+        .into_iter()
+        .filter_map(|column| {
+            column.sort_column().map(|sort| {
+                let label = match column {
+                    super::column_layout::BrowserColumn::Collection => "Collection",
+                    super::column_layout::BrowserColumn::Extension => "Extension",
+                    _ => column.label(),
+                };
+                (sort, label)
+            })
+        })
+        .collect()
 }
 
 pub(super) fn source_id(root: &Path) -> String {
@@ -247,6 +253,7 @@ impl BrowserAccessibility {
             PLAY,
             STOP,
             LOOP,
+            FOCUS_LOADED,
             SIMILAR,
             BPM_SNAP,
             ZERO_CROSSING,
@@ -381,11 +388,9 @@ impl BrowserAccessibility {
                             .then_some(row.entry_index)
                         });
                         let sort_action =
-                            visible_sort_columns(window, cx)
-                                .into_iter()
-                                .find_map(|(column, _)| {
-                                    (event.id == sort_id(column)).then_some(column)
-                                });
+                            visible_sort_columns(view, window, cx).into_iter().find_map(
+                                |(column, _)| (event.id == sort_id(column)).then_some(column),
+                            );
                         let collection_action = (0..COLLECTION_COUNT)
                             .find(|&slot| event.id == collection_filter_id(slot));
                         let playback_type_action = PLAYBACK_TYPE_FILTERS
@@ -442,6 +447,7 @@ impl BrowserAccessibility {
                             event.id.as_str(),
                             PLAY | STOP
                                 | LOOP
+                                | FOCUS_LOADED
                                 | SIMILAR
                                 | BPM_SNAP
                                 | ZERO_CROSSING
@@ -540,6 +546,11 @@ impl BrowserAccessibility {
                         cx.activate(true);
                         window.activate_window();
                         window.focus(&focus);
+                        if event.action == AxAction::Focus
+                            && let Some((path, false)) = folder_action.as_ref()
+                        {
+                            view.mark_folder_keyboard_focus(path.clone());
+                        }
                         if settings_action {
                             match event.action {
                                 AxAction::Focus => {}
@@ -616,6 +627,7 @@ impl BrowserAccessibility {
                                     cx.notify();
                                 }
                                 LOOP => view.toggle_loop(cx),
+                                FOCUS_LOADED => view.focus_loaded_sample_in_browser(window, cx),
                                 SIMILAR => super::similar_sections::toggle(view, cx),
                                 BPM_SNAP => view.toggle_bpm_snap(cx),
                                 ZERO_CROSSING => super::zero_crossing::toggle_from_accessibility(
@@ -897,6 +909,10 @@ impl Browser {
         let visible_folders = range
             .filter_map(|position| rows.get(position).map(|row| row.path.clone()))
             .collect::<Vec<_>>();
+        let focused_folder = self.folder_keyboard.as_ref().and_then(|state| {
+            (state.root() == root && rows.iter().any(|row| row.path == state.focused()))
+                .then(|| state.focused().to_path_buf())
+        });
         let mut visible_ids = HashSet::new();
         for folder in &visible_folders {
             let has_toggle = rows
@@ -914,6 +930,14 @@ impl Browser {
                     .entry(id)
                     .or_insert_with(|| cx.focus_handle());
             }
+        }
+        // A transient empty virtual-list range must not retire the keyboard target's handle.
+        if let Some(path) = focused_folder {
+            let id = folder_id(root, &path);
+            visible_ids.insert(id.clone());
+            ax.control_focus
+                .entry(id)
+                .or_insert_with(|| cx.focus_handle());
         }
         ax.control_focus.retain(|id, _| {
             (!id.starts_with("browser-folder:") && !id.starts_with("browser-folder-toggle:"))
@@ -1032,6 +1056,7 @@ impl Browser {
                     self.loop_toolbar_enabled(),
                     self.preferences_editable(),
                 ),
+                button(FOCUS_LOADED, "Focus loaded sample in browser", None, true),
                 toggle(
                     SIMILAR,
                     "Find similar sections",
@@ -1339,7 +1364,7 @@ impl Browser {
                         label: label.clone(),
                         value: Some(format!(
                             "{}, {} audio {}",
-                            if self.selected_folder == row.path {
+                            if self.folder_is_selected(&row.path) {
                                 "Selected"
                             } else {
                                 "Not selected"
@@ -1540,7 +1565,7 @@ impl Browser {
                 value: Some(self.tag_filter_input.read(cx).content().to_owned()),
                 enabled: true,
             });
-            for (column, label) in visible_sort_columns(window, cx) {
+            for (column, label) in visible_sort_columns(self, window, cx) {
                 let sort = self.view_model.sort();
                 controls.push(AxChild {
                     id: sort_id(column).into(),

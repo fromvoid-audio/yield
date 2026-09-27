@@ -11,6 +11,7 @@ const SOURCE_ID: &str = "source-a";
 
 fn open_fixture() -> (tempfile::TempDir, Connection) {
     let root = tempfile::tempdir().expect("source root");
+    SourceDatabase::open_for_maintenance(root.path()).expect("prepare source schema");
     let connection =
         SourceDatabase::open_connection_for_background_job(root.path()).expect("source db");
     (root, connection)

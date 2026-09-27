@@ -56,6 +56,7 @@ fn job_worker_role_allows_configured_user_library_roots_by_default() {
         panic!("create fake user library dir failed: {err}");
     }
     with_home_env_override(&user_home, || {
+        drop(SourceDatabase::open_for_maintenance(&user_documents).unwrap());
         let db = SourceDatabase::open_with_role(
             &user_documents,
             SourceDatabaseConnectionRole::JobWorker,
@@ -81,6 +82,7 @@ fn user_metadata_write_role_allows_configured_user_library_roots() {
         panic!("create fake user library dir failed: {err}");
     }
     with_home_env_override(&user_home, || {
+        drop(SourceDatabase::open_for_maintenance(&user_documents).unwrap());
         let db = SourceDatabase::open_for_user_metadata_write(&user_documents);
         assert!(db.is_ok());
         let opened = match db {
