@@ -10,6 +10,7 @@ members = [
     "crates/yield-library",
     "crates/yield-source-watcher",
     "crates/yield-platform",
+    "crates/yield-issue-gateway",
     "crates/yield-catalog",
     "crates/yield-session",
     "crates/yield-scan",
