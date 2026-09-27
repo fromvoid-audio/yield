@@ -16,8 +16,11 @@ use lazy_sources::{
     LazySpanSource, PcmWavFileRepeatingSpanSource, PcmWavFileSpanSource,
 };
 mod lazy_sources;
+mod loop_mode;
 mod span_edge_fade;
 mod span_samples;
+use loop_mode::LiveLoopModeSource;
+pub(super) use loop_mode::LoopModeHandle;
 use span_edge_fade::StaticSpanEdgeFadeSource;
 use span_samples::{SpanSamplesMode, SpanSamplesSource};
 #[cfg(test)]
@@ -245,6 +248,31 @@ impl AudioPlayer {
         );
 
         if self.looping != looped {
+            // A mode-only change keeps the same decoded stream and audible
+            // frame. The outer source stops at the next cycle end when the
+            // loop is disabled; no second decoder or sink is started.
+            if !seek_to_offset
+                && self.play_span_frames
+                    == Some((requested_plan.start_frame(), requested_plan.end_frame()))
+                && self.is_playing()
+                && self.active_metronome == metronome
+                && let Some(mode) = self.active_loop_mode.as_ref()
+                && mode.set_looped(looped)
+            {
+                if let Some(span) = self.active_playback_span.as_ref() {
+                    span.update_from_plan(&requested_plan, None, metronome);
+                }
+                if self.active_playback_span.is_some()
+                    && let Some(frame) = current_frame
+                {
+                    self.started_at = Some(std::time::Instant::now());
+                    let offset = frame.saturating_sub(requested_plan.start_frame());
+                    self.loop_offset_frames = Some(offset);
+                    self.loop_offset = Some(frames_to_seconds(offset, sample_rate));
+                }
+                self.looping = looped;
+                return Ok(());
+            }
             return if looped {
                 self.start_with_looped_span_offset_frames(
                     bounded_start,
@@ -290,6 +318,7 @@ impl AudioPlayer {
         playback_span.update_from_plan(&plan, seek_frame, metronome);
         self.finish_span_playback(&plan, Some(progress_offset_frames));
         self.active_playback_span = Some(playback_span);
+        self.active_metronome = metronome;
         Ok(())
     }
 
@@ -354,6 +383,8 @@ impl AudioPlayer {
             self.build_sink_with_fade(diagnostic, PlaybackRuntimeReplacePolicy::FadeOutPrevious)?;
         self.finish_span_playback(&plan, Some(plan.seek_offset_frames()));
         self.active_playback_span = None;
+        self.active_loop_mode = None;
+        self.active_metronome = None;
         self.fade_out = Some(handle);
         self.sink_format = Some(format);
         Ok(())
@@ -411,6 +442,7 @@ impl AudioPlayer {
 
         let source_started_at = playback_stage_started();
         let mut active_playback_span = None;
+        let mode = LoopModeHandle::new(looped, plan.frame_count(), plan.seek_offset_frames());
         let final_source: Box<dyn Source<Item = f32> + Send> = if looped {
             let diagnostic: Box<dyn Source<Item = f32> + Send> = if let Some(samples) =
                 self.playback_samples.as_ref().cloned()
@@ -424,7 +456,8 @@ impl AudioPlayer {
                     SpanSamplesMode::Looped,
                     plan.start_sample(),
                 )
-                .with_edge_fade(self.anti_clip_fade());
+                .with_edge_fade(self.anti_clip_fade())
+                .with_live_loop_mode(mode.clone());
                 active_playback_span = Some(playback_span);
                 Box::new(crate::loop_diagnostic::LoopDiagnostic::new(
                     source,
@@ -468,11 +501,12 @@ impl AudioPlayer {
                     SpanSamplesMode::OneShot,
                     plan.seek_sample(),
                 )
-                .with_edge_fade(self.anti_clip_fade());
+                .with_edge_fade(self.anti_clip_fade())
+                .with_live_loop_mode(mode.clone());
                 active_playback_span = Some(playback_span);
                 Box::new(source)
             } else {
-                let lazy_source = span_source_for_audio_source(self.audio_source()?, &plan)?;
+                let lazy_source = repeating_source_for_audio_source(self.audio_source()?, &plan)?;
                 let mut async_source = AsyncSource::with_buffer_seconds(
                     lazy_source,
                     self.stream_policy.buffer_seconds,
@@ -481,25 +515,28 @@ impl AudioPlayer {
                     self.stream_policy.prefill_duration,
                     self.stream_policy.prefill_timeout,
                 );
-                let source = async_source
-                    .take_samples(plan.sample_count() as usize)
-                    .buffered();
                 Box::new(StaticSpanEdgeFadeSource::new(
-                    source,
+                    async_source,
                     &plan,
                     self.anti_clip_fade(),
                 ))
             };
-            let editable = EditFadeSource::new_with_frame_offset(
+            let editable = EditFadeSource::new_looped(
                 source,
                 self.edit_fade_handle.clone(),
                 plan.start_seconds(),
+                plan.frame_count(),
                 plan.seek_offset_frames(),
             );
             Box::new(editable)
         };
         let final_source =
             source_with_metronome(final_source, metronome, &plan, active_playback_span.clone());
+        let final_source: Box<dyn Source<Item = f32> + Send> = if self.playback_samples.is_none() {
+            Box::new(LiveLoopModeSource::new(final_source, mode.clone()))
+        } else {
+            final_source
+        };
         // A live retarget may restart from the current frame. The span-edge fade is
         // already behind that frame, so ramp the new source in as the old one
         // fades out instead of briefly summing two full-level streams.
@@ -530,6 +567,8 @@ impl AudioPlayer {
         let initial_offset = (!looped).then_some(plan.seek_offset_frames());
         self.finish_span_playback(&plan, initial_offset);
         self.active_playback_span = active_playback_span;
+        self.active_loop_mode = Some(mode);
+        self.active_metronome = metronome;
         self.fade_out = Some(handle);
         self.sink_format = Some(format);
         log_playback_stage("finish_span_state", finish_started_at, source_kind, looped);
@@ -623,6 +662,7 @@ impl AudioPlayer {
 
         let source_started_at = playback_stage_started();
         let mut active_playback_span = None;
+        let mode = LoopModeHandle::new(true, plan.frame_count(), plan.seek_offset_frames());
         let diagnostic: Box<dyn Source<Item = f32> + Send> = if let Some(samples) =
             self.playback_samples.as_ref().cloned()
         {
@@ -635,7 +675,8 @@ impl AudioPlayer {
                 SpanSamplesMode::Looped,
                 plan.seek_sample(),
             )
-            .with_edge_fade(self.anti_clip_fade());
+            .with_edge_fade(self.anti_clip_fade())
+            .with_live_loop_mode(mode.clone());
             let editable = EditFadeSource::new_looped(
                 source,
                 self.edit_fade_handle.clone(),
@@ -671,12 +712,19 @@ impl AudioPlayer {
         };
         let diagnostic =
             source_with_metronome(diagnostic, metronome, &plan, active_playback_span.clone());
+        let diagnostic: Box<dyn Source<Item = f32> + Send> = if self.playback_samples.is_none() {
+            Box::new(LiveLoopModeSource::new(diagnostic, mode.clone()))
+        } else {
+            diagnostic
+        };
         log_playback_stage("source_construction", source_started_at, source_kind, true);
 
         let (handle, format) = self.build_sink_with_fade(diagnostic, replace_policy)?;
         let finish_started_at = playback_stage_started();
         self.finish_span_playback(&plan, Some(plan.seek_offset_frames()));
         self.active_playback_span = active_playback_span;
+        self.active_loop_mode = Some(mode);
+        self.active_metronome = metronome;
         self.fade_out = Some(handle);
         self.sink_format = Some(format);
         log_playback_stage("finish_span_state", finish_started_at, source_kind, true);
