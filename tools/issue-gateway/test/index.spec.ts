@@ -29,8 +29,8 @@ function fixture(fetcher: typeof fetch = async () => { throw new Error('unexpect
     GITHUB_CLIENT_ID: 'public-client',
     GITHUB_CLIENT_SECRET: 'private-secret-never-show',
     GITHUB_OWNER: 'PORTALSURFER',
-    GITHUB_REPO: 'yield-feedback',
-    GITHUB_OAUTH_SCOPE: 'public_repo',
+    GITHUB_REPO: 'yield',
+    GITHUB_OAUTH_SCOPE: 'repo',
     SESSIONS: sessions,
   };
   const worker = createWorker(fetcher);
@@ -46,7 +46,7 @@ async function connect(call: ReturnType<typeof fixture>['call'], sessions: Memor
   expect(start.status).toBe(302);
   const authorize = new URL(start.headers.get('location')!);
   expect(authorize.origin).toBe('https://github.com');
-  expect(authorize.searchParams.get('scope')).toBe('public_repo');
+  expect(authorize.searchParams.get('scope')).toBe('repo');
   const state = authorize.searchParams.get('state')!;
   expect(sessions.values.get(`state:${state}`)).toBe(requestId);
   return state;
@@ -115,7 +115,7 @@ describe('Yield issue gateway', () => {
     const { call, sessions } = fixture(async (input) =>
       String(input).endsWith('/login/oauth/access_token')
         ? Response.json({ access_token: 'github-private-token' })
-        : Response.json({ number: 7, html_url: 'https://github.com/PORTALSURFER/yield-feedback/issues/7' }));
+        : Response.json({ number: 7, html_url: 'https://github.com/PORTALSURFER/yield/issues/7' }));
     const expiredState = await connect(call, sessions);
     sessions.advance(601);
     expect((await call(`/auth/callback?code=late&state=${expiredState}`)).status).toBe(400);
@@ -155,10 +155,10 @@ describe('Yield issue gateway', () => {
     let calls = 0;
     const { call, sessions } = fixture(async (input, init) => {
       calls += 1;
-      expect(String(input)).toBe('https://api.github.com/repos/PORTALSURFER/yield-feedback/issues');
+      expect(String(input)).toBe('https://api.github.com/repos/PORTALSURFER/yield/issues');
       expect(init?.method).toBe('POST');
       expect(new Headers(init?.headers).get('authorization')).toBe('Bearer github-private-token');
-      return Response.json({ number: 42, html_url: 'https://github.com/PORTALSURFER/yield-feedback/issues/42' });
+      return Response.json({ number: 42, html_url: 'https://github.com/PORTALSURFER/yield/issues/42' });
     });
     sessions.values.set(`sess:${sessionId}`, 'github-private-token');
     const response = await call('/issue', {
@@ -167,7 +167,7 @@ describe('Yield issue gateway', () => {
       body: JSON.stringify({ title: '  Bug: sample  ', body: 'Details' }),
     });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, issue_url: 'https://github.com/PORTALSURFER/yield-feedback/issues/42', number: 42 });
+    expect(await response.json()).toEqual({ ok: true, issue_url: 'https://github.com/PORTALSURFER/yield/issues/42', number: 42 });
     expect(calls).toBe(1);
   });
 

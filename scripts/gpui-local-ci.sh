@@ -24,9 +24,9 @@ run() {
 echo "[gpui-local-ci] host=$(uname -s) head=$(git rev-parse HEAD) scope=$scope"
 run cargo fmt --all --check
 if [[ "$scope" == "session" ]]; then
-  # Each integration-style session test starts several SQLite-backed owners. Keep their
-  # startup I/O bounded so the existing five-second event deadlines remain meaningful.
-  run cargo test --locked -p yield-session --lib -- --test-threads=4
+  # Integration-style session tests each start several SQLite-backed owners. Serializing
+  # these tests keeps catalog event deadlines reliable under other macOS I/O load.
+  run cargo test --locked -p yield-session --lib -- --test-threads=1
   echo "[gpui-local-ci] PASS head=$(git rev-parse HEAD) scope=$scope host=$(uname -s)"
   exit 0
 fi
@@ -48,7 +48,7 @@ run cargo test --locked -p yield-library --lib sqlite_wal --no-default-features
 run cargo test --locked -p yield-library --lib app_dirs::storage_usage --no-default-features
 run cargo test --locked -p yield-scan --lib -- --test-threads=4
 run cargo test --locked -p yield-catalog --lib
-run cargo test --locked -p yield-session --lib -- --test-threads=4
+run cargo test --locked -p yield-session --lib -- --test-threads=1
 
 if [[ "$scope" == "storage" ]]; then
   run cargo test --locked -p yield-core --lib waveform_edit_effects
