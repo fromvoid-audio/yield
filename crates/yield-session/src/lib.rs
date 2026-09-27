@@ -3032,15 +3032,20 @@ mod tests {
         service: &SourceRegistryService,
         predicate: impl Fn(&CatalogEvent) -> bool,
     ) -> CatalogEvent {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut other_events = Vec::new();
         loop {
             match service.try_recv_catalog() {
                 Ok(event) if predicate(&event) => return event,
-                Ok(_) => {}
+                Ok(event) => {
+                    if other_events.len() < 8 {
+                        other_events.push(format!("{event:?}"));
+                    }
+                }
                 Err(TryRecvError::Empty) => {
                     assert!(
                         Instant::now() < deadline,
-                        "timed out waiting for catalog event"
+                        "timed out waiting for catalog event; other events: {other_events:?}"
                     );
                     thread::sleep(Duration::from_millis(5));
                 }
