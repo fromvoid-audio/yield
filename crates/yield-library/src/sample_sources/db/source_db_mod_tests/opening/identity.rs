@@ -77,7 +77,7 @@ fn spawn_source_lease_helper(
             let mut line = String::new();
             match reader.read_line(&mut line) {
                 Ok(0) => break Err(String::from("source lease helper exited before handshake")),
-                Ok(_) if line.trim_end() == "READY" => break Ok(()),
+                Ok(_) if line.trim_end().ends_with("YIELD_SOURCE_LEASE_READY") => break Ok(()),
                 Ok(_) => continue,
                 Err(error) => break Err(format!("source lease helper handshake failed: {error}")),
             }
@@ -1257,7 +1257,7 @@ fn source_lease_process_helper() {
         &database_root,
     )
     .expect("helper source database");
-    println!("READY");
+    println!("YIELD_SOURCE_LEASE_READY");
     io::stdout()
         .flush()
         .expect("flush source lease helper handshake");

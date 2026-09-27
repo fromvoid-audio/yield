@@ -2646,8 +2646,6 @@ dependencies = [
  "naga",
  "num_cpus",
  "objc",
- "objc2",
- "objc2-metal",
  "oo7",
  "open",
  "parking",
@@ -3558,6 +3556,20 @@ checksum = "0f0a0e9f770b65bac9aad00f97a67ab5c5319effed07f6da385da3c2115e47ba"
 dependencies = [
  "num-traits",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "keyring"
+version = "3.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
+dependencies = [
+ "byteorder",
+ "log",
+ "security-framework 2.11.1",
+ "security-framework 3.7.0",
+ "windows-sys 0.60.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -4634,9 +4646,7 @@ checksum = "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794"
 dependencies = [
  "bitflags 2.13.1",
  "block2",
- "dispatch2",
  "objc2",
- "objc2-core-foundation",
  "objc2-foundation",
 ]
 
@@ -5768,6 +5778,7 @@ version = "0.23.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -5785,7 +5796,7 @@ dependencies = [
  "openssl-probe",
  "rustls-pki-types",
  "schannel",
- "security-framework",
+ "security-framework 3.7.0",
 ]
 
 [[package]]
@@ -5949,6 +5960,19 @@ name = "seahash"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
+
+[[package]]
+name = "security-framework"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
+dependencies = [
+ "bitflags 2.13.1",
+ "core-foundation 0.9.4",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
+]
 
 [[package]]
 name = "security-framework"
@@ -7287,6 +7311,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64",
+ "flate2",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "url",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7545,174 +7587,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yield-analysis"
-version = "0.19.1"
-dependencies = [
- "blake3",
- "directories",
- "hdbscan",
- "hnsw_rs",
- "hound",
- "linfa",
- "linfa-reduction",
- "linfa-tsne",
- "ndarray",
- "rand 0.8.8",
- "rayon",
- "rusqlite",
- "rustfft",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "symphonia",
- "tempfile",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "yield-catalog"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "hound",
- "tempfile",
- "thiserror 2.0.20",
- "yield-library",
- "yield-scan",
- "yield-source-watcher",
-]
-
-[[package]]
-name = "yield-core"
-version = "0.1.0"
-
-[[package]]
-name = "yield-design"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "yield"
-version = "0.1.0"
-dependencies = [
- "yield-ui",
-]
-
-[[package]]
-name = "yield-library"
-version = "0.19.1"
-dependencies = [
- "blake3",
- "cap-fs-ext",
- "cap-primitives",
- "cap-std",
- "directories",
- "filetime",
- "libc",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "toml 0.8.23",
- "tracing",
- "uuid",
- "windows 0.62.2",
-]
-
-[[package]]
-name = "yield-media"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "hound",
- "tempfile",
- "yield-analysis",
- "yield-core",
- "yield-library",
- "windows 0.62.2",
-]
-
-[[package]]
-name = "yield-platform"
-version = "0.1.0"
-dependencies = [
- "async-channel 2.5.0",
- "gpui",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "raw-window-handle",
- "windows 0.62.2",
- "windows-core 0.62.2",
-]
-
-[[package]]
-name = "yield-scan"
-version = "0.19.1"
-dependencies = [
- "blake3",
- "cap-fs-ext",
- "cap-std",
- "filetime",
- "hound",
- "libc",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "yield-library",
- "windows 0.62.2",
-]
-
-[[package]]
-name = "yield-session"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "yield-catalog",
- "yield-design",
- "yield-library",
-]
-
-[[package]]
-name = "yield-source-watcher"
-version = "0.1.0"
-dependencies = [
- "notify",
- "tempfile",
- "yield-library",
-]
-
-[[package]]
-name = "yield-ui"
-version = "0.1.0"
-dependencies = [
- "async-channel 2.5.0",
- "gpui",
- "rand 0.9.5",
- "raw-window-handle",
- "reson",
- "tempfile",
- "unicode-segmentation",
- "yield-catalog",
- "yield-core",
- "yield-design",
- "yield-library",
- "yield-media",
- "yield-platform",
- "yield-session",
- "windows 0.62.2",
-]
-
-[[package]]
 name = "wayland-backend"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7827,6 +7701,24 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -8681,6 +8573,188 @@ dependencies = [
  "dlib",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "yield"
+version = "0.1.0"
+dependencies = [
+ "yield-ui",
+]
+
+[[package]]
+name = "yield-analysis"
+version = "0.19.1"
+dependencies = [
+ "blake3",
+ "directories",
+ "hdbscan",
+ "hnsw_rs",
+ "hound",
+ "linfa",
+ "linfa-reduction",
+ "linfa-tsne",
+ "ndarray",
+ "rand 0.8.8",
+ "rayon",
+ "rusqlite",
+ "rustfft",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "symphonia",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "yield-catalog"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hound",
+ "tempfile",
+ "thiserror 2.0.20",
+ "yield-library",
+ "yield-scan",
+ "yield-source-watcher",
+]
+
+[[package]]
+name = "yield-core"
+version = "0.1.0"
+
+[[package]]
+name = "yield-design"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "yield-issue-gateway"
+version = "0.1.0"
+dependencies = [
+ "keyring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "ureq",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "yield-library"
+version = "0.19.1"
+dependencies = [
+ "blake3",
+ "cap-fs-ext",
+ "cap-primitives",
+ "cap-std",
+ "directories",
+ "filetime",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml 0.8.23",
+ "tracing",
+ "uuid",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "yield-media"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hound",
+ "tempfile",
+ "windows 0.62.2",
+ "yield-analysis",
+ "yield-core",
+ "yield-library",
+]
+
+[[package]]
+name = "yield-platform"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "gpui",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "raw-window-handle",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
+name = "yield-scan"
+version = "0.19.1"
+dependencies = [
+ "blake3",
+ "cap-fs-ext",
+ "cap-std",
+ "filetime",
+ "hound",
+ "libc",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "windows 0.62.2",
+ "yield-library",
+]
+
+[[package]]
+name = "yield-session"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "yield-catalog",
+ "yield-core",
+ "yield-design",
+ "yield-library",
+]
+
+[[package]]
+name = "yield-source-watcher"
+version = "0.1.0"
+dependencies = [
+ "notify",
+ "tempfile",
+ "yield-library",
+]
+
+[[package]]
+name = "yield-ui"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "gpui",
+ "rand 0.9.5",
+ "raw-window-handle",
+ "reson",
+ "tempfile",
+ "unicode-segmentation",
+ "windows 0.62.2",
+ "yield-catalog",
+ "yield-core",
+ "yield-design",
+ "yield-library",
+ "yield-media",
+ "yield-platform",
+ "yield-session",
 ]
 
 [[package]]

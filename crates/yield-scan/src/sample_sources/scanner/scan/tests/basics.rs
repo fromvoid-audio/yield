@@ -10,7 +10,7 @@ fn scan_add_update_and_prune_missing() {
     let file_path = dir.path().join("one.wav");
     std::fs::write(&file_path, b"one").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let first = scan_once(&db).unwrap();
     assert_eq!(first.added, 1);
     assert_eq!(first.content_changed, 1);
@@ -50,7 +50,7 @@ fn full_scan_preserves_an_unreadable_subtree_and_recovers_its_real_deletion() {
     let protected = dir.path().join("protected");
     std::fs::create_dir(&protected).unwrap();
     std::fs::write(protected.join("kick.wav"), b"kick").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     db.set_tag(Path::new("protected/kick.wav"), Rating::KEEP_1)
         .unwrap();
@@ -96,7 +96,7 @@ fn full_scan_preserves_an_unenumerated_subtree_after_a_directory_entry_failure()
     // Keep one entry so the injected iterator failure is exercised after the
     // indexed audio file disappears during the simulated outage.
     std::fs::write(protected.join("notes.txt"), b"notes").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     db.set_tag(Path::new("protected/kick.wav"), Rating::KEEP_1)
         .unwrap();
@@ -126,7 +126,7 @@ fn full_scan_preserves_descendants_after_an_entry_type_failure() {
     let protected = dir.path().join("protected");
     std::fs::create_dir(&protected).unwrap();
     std::fs::write(protected.join("snare.wav"), b"snare").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::remove_file(protected.join("snare.wav")).unwrap();
@@ -152,7 +152,7 @@ fn scan_skips_analysis_when_hash_unchanged() {
     let file_path = dir.path().join("one.wav");
     std::fs::write(&file_path, b"one").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let first = scan_once(&db).unwrap();
     assert_eq!(first.content_changed, 1);
 
@@ -170,7 +170,7 @@ fn scan_backfills_missing_identity_for_unchanged_row() {
     let dir = tempdir().unwrap();
     let relative = Path::new("missing-identity.wav");
     std::fs::write(dir.path().join(relative), b"sample").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let original = db.list_manifest_entries().unwrap().remove(0);
     assert!(original.file_identity.is_some());
@@ -195,7 +195,7 @@ fn scan_adds_duplicate_content_when_original_path_still_exists() {
     let duplicate_path = dir.path().join("two.wav");
     std::fs::write(&first_path, b"same-content").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let first = scan_once(&db).unwrap();
     assert_eq!(first.added, 1);
 
@@ -227,7 +227,7 @@ fn scan_ignores_non_wav_and_counts_nested() {
     std::fs::write(dir.path().join("unsupported.mp3"), b"mp3").unwrap();
     std::fs::write(dir.path().join("ignore.txt"), b"text").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let stats = scan_once(&db).unwrap();
     assert_eq!(stats.added, 2);
     assert_eq!(stats.total_files, 2);
@@ -243,7 +243,7 @@ fn scan_includes_dot_prefixed_files_and_nested_hidden_audio_by_default() {
     std::fs::write(dir.path().join(".kick.wav"), b"kick").unwrap();
     std::fs::write(hidden.join("ignored.wav"), b"ignored").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let stats = scan_once(&db).unwrap();
 
     assert_eq!(stats.added, 2);
@@ -259,6 +259,7 @@ fn scan_includes_dot_prefixed_files_and_nested_hidden_audio_by_default() {
 fn scan_in_background_finishes() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("one.wav"), b"one").unwrap();
+    drop(open_maintained_scan_database(dir.path()).unwrap());
     let handle = scan_in_background(dir.path().to_path_buf());
     let stats = handle.join().unwrap().unwrap();
     assert_eq!(stats.added, 1);
@@ -270,7 +271,7 @@ fn scan_with_progress_respects_cancel_flag() {
 
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("one.wav"), b"one").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
 
     let cancel = AtomicBool::new(true);
     let mut progress_called = false;
@@ -287,7 +288,7 @@ fn scan_detects_missing_paths_without_double_counting() {
     let file_path = dir.path().join("one.wav");
     std::fs::write(&file_path, b"one").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::remove_file(&file_path).unwrap();
@@ -304,7 +305,7 @@ fn scan_detects_changed_content_hash() {
     let file_path = dir.path().join("one.wav");
     std::fs::write(&file_path, b"one").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::write(&file_path, b"two").unwrap();
@@ -317,7 +318,7 @@ fn scan_detects_changed_content_hash() {
 fn scan_discovery_does_not_hold_the_source_writer() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("one.wav"), b"one").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let mut concurrent_write = None;
 
     scan_with_progress(&db, ScanMode::Quick, None, &mut |_, _| {
@@ -344,7 +345,7 @@ fn scan_revalidation_rejects_file_mutation_after_discovery() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("one.wav");
     std::fs::write(&file_path, b"original").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let before = db.list_files().unwrap().remove(0);
     let mut mutated = false;
@@ -375,7 +376,7 @@ fn scan_refreshes_noop_row_after_concurrent_removal() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("one.wav");
     std::fs::write(&file_path, b"one").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let mut removed = false;
 
@@ -383,7 +384,7 @@ fn scan_refreshes_noop_row_after_concurrent_removal() {
         if removed {
             return;
         }
-        let writer = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let writer = open_maintained_scan_database(dir.path()).unwrap();
         let mut batch = writer.write_batch().unwrap();
         batch.remove_file(Path::new("one.wav")).unwrap();
         batch.commit().unwrap();
@@ -400,7 +401,7 @@ fn missing_stage_keeps_concurrently_restored_live_row() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("restored.wav");
     std::fs::write(&file_path, b"old").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let stale = db
         .entry_for_path(Path::new("restored.wav"))
@@ -439,7 +440,7 @@ fn missing_stage_prunes_path_replaced_by_directory() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("replaced.wav");
     std::fs::write(&file_path, b"old").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     std::fs::remove_file(&file_path).unwrap();
     std::fs::create_dir(&file_path).unwrap();
@@ -460,7 +461,7 @@ fn configured_hidden_directory_exclusion_prunes_tracked_files() {
     let hidden = dir.path().join(".hidden");
     std::fs::create_dir(&hidden).unwrap();
     std::fs::write(hidden.join("one.wav"), b"hidden").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     db.upsert_file(Path::new(".hidden/one.wav"), 6, 1).unwrap();
     db.set_source_traversal_policy(
         yield_library::sample_sources::SourceTraversalPolicy::exclude_hidden_directories(),
@@ -482,7 +483,7 @@ fn unsupported_replacement_after_discovery_remains_eligible_for_pruning() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("one.wav");
     std::fs::write(&file_path, b"old").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     std::fs::write(&file_path, b"changed-size").unwrap();
     let mut replaced = false;
@@ -507,7 +508,7 @@ fn scan_rebases_noop_when_concurrent_writer_clears_hash() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("one.wav");
     std::fs::write(&file_path, b"one").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let row = db.entry_for_path(Path::new("one.wav")).unwrap().unwrap();
     let mut cleared = false;
@@ -516,7 +517,7 @@ fn scan_rebases_noop_when_concurrent_writer_clears_hash() {
         if cleared {
             return;
         }
-        let writer = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let writer = open_maintained_scan_database(dir.path()).unwrap();
         let mut batch = writer.write_batch().unwrap();
         batch
             .upsert_file_without_hash(Path::new("one.wav"), row.file_size, row.modified_ns)
@@ -542,7 +543,7 @@ fn missing_repair_survives_concurrent_hash_clear() {
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("one.wav");
     std::fs::write(&file_path, b"one").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let row = db.entry_for_path(Path::new("one.wav")).unwrap().unwrap();
     db.set_missing(Path::new("one.wav"), true).unwrap();
@@ -552,7 +553,7 @@ fn missing_repair_survives_concurrent_hash_clear() {
         if cleared {
             return;
         }
-        let writer = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let writer = open_maintained_scan_database(dir.path()).unwrap();
         let mut batch = writer.write_batch().unwrap();
         batch
             .upsert_file_without_hash(Path::new("one.wav"), row.file_size, row.modified_ns)
@@ -577,7 +578,7 @@ fn scan_hashes_current_bytes_when_facts_are_preserved_after_discovery() {
     std::fs::write(&file_path, b"old!").unwrap();
     let timestamp = 1_700_000_000;
     set_file_times(&file_path, timestamp, 0);
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let mut replaced = false;
 
     scan_with_progress(&db, ScanMode::Quick, None, &mut |_, _| {
@@ -604,7 +605,7 @@ fn cancellation_after_first_committed_batch_stops_at_a_resumable_checkpoint() {
     for index in 0..70 {
         std::fs::write(dir.path().join(format!("sample-{index:03}.wav")), b"x").unwrap();
     }
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let cancel = AtomicBool::new(false);
 
     let result = scan_with_progress(&db, ScanMode::Quick, Some(&cancel), &mut |count, _| {
@@ -637,7 +638,7 @@ fn interrupted_manifest_audit_resumes_checked_paths_and_finishes_deletion_reconc
     for index in 0..70 {
         std::fs::write(dir.path().join(format!("sample-{index:03}.wav")), b"x").unwrap();
     }
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let cancel = AtomicBool::new(false);
 
     let first =
@@ -686,7 +687,7 @@ fn manifest_audit_progress_is_published_after_durable_checkpoint() {
     let dir = tempdir().unwrap();
     let relative = Path::new("missed.wav");
     std::fs::write(dir.path().join(relative), b"missed watcher file").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let mut progress = Vec::new();
 
     audit_source_and_record_with_progress(&db, None, 0, 100, &mut |checked, path| {
@@ -718,7 +719,7 @@ fn interrupted_manifest_audit_revalidates_a_checkpointed_file() {
     for index in 0..70 {
         std::fs::write(dir.path().join(format!("sample-{index:03}.wav")), b"x").unwrap();
     }
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let cancel = AtomicBool::new(false);
 
     let first =
@@ -785,7 +786,7 @@ fn interrupted_manifest_audit_revalidates_checkpointed_paths_in_bounded_slices()
     for index in 0..128 {
         std::fs::write(dir.path().join(format!("sample-{index:03}.wav")), b"x").unwrap();
     }
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let cancel = AtomicBool::new(false);
     let first =
         audit_source_and_record_with_progress(&db, Some(&cancel), 0, 100, &mut |checked, _| {
@@ -849,7 +850,7 @@ fn cancellation_after_walk_skips_missing_reconciliation_and_completion_publish()
     for index in 0..70 {
         std::fs::write(dir.path().join(format!("sample-{index:03}.wav")), b"x").unwrap();
     }
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     std::fs::remove_file(dir.path().join("sample-000.wav")).unwrap();
     let cancel = AtomicBool::new(false);
@@ -884,7 +885,7 @@ fn unchanged_large_scan_only_commits_completion_metadata() {
     for index in 0..130 {
         std::fs::write(dir.path().join(format!("sample-{index:03}.wav")), b"x").unwrap();
     }
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let revision_before = db
         .get_metadata("revision")
@@ -912,7 +913,7 @@ fn catalog_manifest_audit_commits_before_deferred_content_hashing() {
     let path = dir.path().join("large.wav");
     let file = std::fs::File::create(&path).unwrap();
     file.set_len(8 * 1024 * 1024 + 1).unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
 
     let audit = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
         &db,
@@ -943,7 +944,7 @@ fn bounded_manifest_audit_repairs_same_size_closed_app_edit() {
     let path = dir.path().join("same.wav");
     std::fs::write(&path, b"one").unwrap();
     let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let original_hash = db
         .entry_for_path(Path::new("same.wav"))
@@ -982,7 +983,7 @@ fn manifest_audit_keeps_an_unreadable_subtree_due_for_retry() {
     let protected = dir.path().join("protected");
     std::fs::create_dir(&protected).unwrap();
     std::fs::write(protected.join("kick.wav"), b"kick").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let scan_completion_before = db
         .get_metadata(crate::sample_sources::db::META_LAST_SCAN_COMPLETED_AT)
@@ -1025,7 +1026,7 @@ fn typed_manifest_audit_outcome_retains_coverage_barrier_for_unreadable_traversa
     let protected = dir.path().join("protected");
     std::fs::create_dir(&protected).unwrap();
     std::fs::write(protected.join("kick.wav"), b"kick").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     std::fs::remove_file(protected.join("kick.wav")).unwrap();
@@ -1060,7 +1061,7 @@ fn typed_manifest_audit_outcome_retains_coverage_barrier_for_unreadable_traversa
 #[test]
 fn manifest_audit_publishes_scan_repair_when_content_verification_is_cancelled() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     std::fs::write(dir.path().join("missed.wav"), b"missed watcher event").unwrap();
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let generation_before = db
@@ -1104,7 +1105,7 @@ fn manifest_audit_publishes_scan_repair_when_content_verification_is_cancelled()
 #[test]
 fn typed_manifest_audit_outcome_keeps_coverage_complete_when_content_pauses() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     std::fs::write(dir.path().join("missed.wav"), b"missed watcher event").unwrap();
     let cancel = std::sync::atomic::AtomicBool::new(false);
 
@@ -1135,7 +1136,7 @@ fn typed_manifest_audit_outcome_keeps_coverage_complete_when_content_pauses() {
 #[test]
 fn typed_manifest_audit_outcome_retains_barrier_for_noncheckpoint_verification_error() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     std::fs::write(dir.path().join("missed.wav"), b"missed watcher event").unwrap();
     let displaced_parent = tempdir().unwrap();
     let displaced = displaced_parent.path().join("displaced-root");
@@ -1172,7 +1173,7 @@ fn typed_manifest_audit_outcome_retains_barrier_for_noncheckpoint_verification_e
 fn manifest_audit_publishes_unchanged_committed_revision_when_verification_is_cancelled() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("known.wav"), b"known").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let generation_before = db
@@ -1209,7 +1210,7 @@ fn manifest_audit_root_swap_after_scan_returns_committed_checkpoint() {
     let root = parent.path().join("source");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("known.wav"), b"known").unwrap();
-    let db = SourceDatabase::open_for_scan(&root).unwrap();
+    let db = open_maintained_scan_database(&root).unwrap();
 
     let old_root = parent.path().join("old-source");
     let result = audit_source_and_record_with_pre_record_hook(&db, None, 0, 1_234, || {
@@ -1237,7 +1238,7 @@ fn skipped_existing_file_is_not_used_as_a_rename_source() {
     std::fs::create_dir(&hidden).unwrap();
     std::fs::write(hidden.join("old.wav"), b"same").unwrap();
     std::fs::write(dir.path().join("new.wav"), b"same").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let facts =
         super::super::super::scan_fs::read_facts(dir.path(), &hidden.join("old.wav")).unwrap();
     let hash = blake3::hash(b"same").to_hex().to_string();

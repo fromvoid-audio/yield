@@ -39,8 +39,9 @@ fn analysis_target() -> ReadinessTarget {
 }
 
 fn seed_readiness_work(root: &Path) {
+    drop(SourceDatabase::open_for_maintenance(root).expect("prepare source schema"));
     let mut connection =
-        SourceDatabase::open_connection_for_background_job(root).expect("create source database");
+        SourceDatabase::open_connection_for_background_job(root).expect("open source database");
     connection
         .execute(
             "INSERT INTO wav_files (

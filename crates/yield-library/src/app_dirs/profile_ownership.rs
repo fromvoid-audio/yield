@@ -845,6 +845,7 @@ mod tests {
     const CONFIG_HOME_ENV: &str = "YIELD_CONFIG_HOME";
     const CONFIG_PROFILE_ENV: &str = "YIELD_CONFIG_PROFILE";
     const OWNER_HELPER_MODE_ENV: &str = "YIELD_PROFILE_OWNER_HELPER_MODE";
+    const OWNER_HELPER_READY_LINE: &str = "YIELD_PROFILE_OWNER_READY";
 
     fn test_runtime() -> TestRuntimeGuard {
         TestRuntimeGuard::acquire()
@@ -939,7 +940,7 @@ mod tests {
                     Ok(0) => {
                         break Err(String::from("profile owner helper exited before handshake"));
                     }
-                    Ok(_) if line.trim_end() == "READY" => break Ok(()),
+                    Ok(_) if line.trim_end().ends_with(OWNER_HELPER_READY_LINE) => break Ok(()),
                     Ok(_) => continue,
                     Err(error) => {
                         break Err(format!(
@@ -1091,7 +1092,7 @@ mod tests {
     fn profile_owner_process_helper() {
         let mode = std::env::var(OWNER_HELPER_MODE_ENV).expect("profile owner helper mode");
         let _guard = WritableProfileGuard::acquire_current().expect("profile owner helper lock");
-        println!("READY");
+        println!("{OWNER_HELPER_READY_LINE}");
         io::stdout()
             .flush()
             .expect("flush profile owner helper handshake");

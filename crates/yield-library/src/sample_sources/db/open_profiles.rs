@@ -38,22 +38,19 @@ impl SourceDatabaseConnectionRole {
     pub(super) fn open_flags(self) -> OpenFlags {
         match self {
             Self::UiRead | Self::BackgroundRead => OpenFlags::SQLITE_OPEN_READ_ONLY,
-            Self::JobWorker
-            | Self::UserMetadataWrite
-            | Self::PlaybackHistoryWrite
-            | Self::Maintenance => {
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+            Self::JobWorker | Self::UserMetadataWrite | Self::PlaybackHistoryWrite => {
+                OpenFlags::SQLITE_OPEN_READ_WRITE
             }
+            Self::Maintenance => OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         }
     }
 
     pub(super) fn open_mode(self) -> SourceDatabaseOpenMode {
         match self {
-            Self::UiRead
-            | Self::BackgroundRead
-            | Self::JobWorker
-            | Self::UserMetadataWrite
-            | Self::PlaybackHistoryWrite => SourceDatabaseOpenMode::Fast,
+            Self::UiRead | Self::BackgroundRead => SourceDatabaseOpenMode::Fast,
+            Self::JobWorker | Self::UserMetadataWrite | Self::PlaybackHistoryWrite => {
+                SourceDatabaseOpenMode::Operational
+            }
             Self::Maintenance => SourceDatabaseOpenMode::Full,
         }
     }
