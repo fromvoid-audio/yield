@@ -1320,6 +1320,12 @@ pub(super) fn render_collection_filters(
                     |element, marker| element.child(marker),
                 )
                 .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
+                    if matches!(event, ClickEvent::Keyboard(_))
+                        && view.suppress_collection_keyboard_click == Some(slot)
+                    {
+                        view.suppress_collection_keyboard_click = None;
+                        return;
+                    }
                     if !active_source
                         || !event.standard_click()
                         || view.collection_rename_is_current(slot)

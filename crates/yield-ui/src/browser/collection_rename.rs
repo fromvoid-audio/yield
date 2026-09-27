@@ -74,6 +74,20 @@ impl Browser {
         }
     }
 
+    /// Return can synthesize a keyboard click on the row after focus is restored. Suppress only
+    /// that click; the next real keydown clears the fence for ordinary keyboard activation.
+    fn finish_collection_rename_submission(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(slot) = self
+            .collection_rename_editor
+            .as_ref()
+            .map(|editor| editor.slot)
+        else {
+            return;
+        };
+        self.suppress_collection_keyboard_click = Some(slot);
+        self.cancel_collection_rename(window, cx);
+    }
+
     pub(super) fn commit_collection_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(slot) = self
             .collection_rename_editor
@@ -83,7 +97,7 @@ impl Browser {
             return;
         };
         if !self.collection_rename_is_current(slot) {
-            self.cancel_collection_rename(window, cx);
+            self.finish_collection_rename_submission(window, cx);
             return;
         }
         let draft = self
@@ -93,7 +107,7 @@ impl Browser {
             .trim()
             .to_string();
         if draft.is_empty() {
-            self.cancel_collection_rename(window, cx);
+            self.finish_collection_rename_submission(window, cx);
             return;
         }
         if draft.len() > MAX_COLLECTION_NAME_BYTES || draft.chars().any(char::is_control) {
@@ -104,7 +118,7 @@ impl Browser {
         if self
             .submit_preference_patch(PreferencePatch::SetCollectionName { slot, name: draft }, cx)
         {
-            self.cancel_collection_rename(window, cx);
+            self.finish_collection_rename_submission(window, cx);
         }
     }
 }

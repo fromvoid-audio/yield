@@ -307,6 +307,7 @@ pub(crate) struct Browser {
     collection_rename_input: gpui::Entity<SearchInput>,
     _collection_rename_subscription: gpui::Subscription,
     collection_rename_editor: Option<collection_rename::CollectionRenameEditor>,
+    suppress_collection_keyboard_click: Option<usize>,
     beat_count_input: gpui::Entity<BeatCountInput>,
     _beat_count_subscription: gpui::Subscription,
     tag_input: gpui::Entity<SearchInput>,
@@ -642,6 +643,7 @@ impl Browser {
             collection_rename_input,
             _collection_rename_subscription: collection_rename_subscription,
             collection_rename_editor: None,
+            suppress_collection_keyboard_click: None,
             beat_count_input,
             _beat_count_subscription: beat_count_subscription,
             tag_input,
@@ -2621,6 +2623,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+        self.suppress_collection_keyboard_click = None;
         if key == "escape" && self.pane_resize_drag.is_some() {
             self.cancel_pane_resize(cx);
             cx.stop_propagation();
