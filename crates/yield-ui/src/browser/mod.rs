@@ -2938,7 +2938,7 @@ impl Browser {
             return;
         }
         if !secondary && !alt && !function && shift && key == "space" {
-            self.play_compare_anchor(cx);
+            self.play_from_current_play_start(cx);
             return;
         }
         if current_playhead_shortcut(
@@ -2957,9 +2957,16 @@ impl Browser {
             self.set_compare_anchor_from_focus(cx);
             return;
         }
+        if !secondary && !alt && !function && shift && key.eq_ignore_ascii_case("c") {
+            self.play_compare_anchor(cx);
+            return;
+        }
         match key {
-            "space" if self.random_audition_sticky => self.request_random_audition(false, cx),
-            "space" => self.toggle_playback(cx),
+            "space" if !secondary && !alt && !function && !shift && self.random_audition_sticky => {
+                self.request_random_audition(false, cx)
+            }
+            "space" if !secondary && !alt && !function && !shift => self.play_selected_sample(cx),
+            "space" => return,
             "l" | "L" if shift && !secondary && !alt && !function && !event.is_held => {
                 self.toggle_loop_lock(cx)
             }

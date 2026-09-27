@@ -241,7 +241,11 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
     },
     ShortcutRow {
         keys: "Space",
-        description: "Play/stop; random section in sticky mode",
+        description: "Replay the selected sample or span; random section in sticky mode",
+    },
+    ShortcutRow {
+        keys: "Shift-Space",
+        description: "Play from the current play mark to the sample end",
     },
     ShortcutRow {
         keys: "Cmd-Space",
@@ -260,7 +264,7 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
         description: "Set the focused sample as compare anchor",
     },
     ShortcutRow {
-        keys: "Shift-Space",
+        keys: "Shift-C",
         description: "Replay the compare anchor without changing focus",
     },
     ShortcutRow {
