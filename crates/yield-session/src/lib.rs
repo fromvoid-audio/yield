@@ -25,7 +25,7 @@ use yield_library::operation_journal::{
 };
 use yield_library::sample_sources::{
     GlobalLibraryWriter, GlobalLibraryWriterQueueError, GlobalLibraryWriterStartError,
-    GlobalLibraryWriterStatus, LibraryError, SampleSource, SourceRegistrySnapshot,
+    GlobalLibraryWriterStatus, LibraryError, SampleSource, SourceId, SourceRegistrySnapshot,
 };
 
 mod catalog;
@@ -302,6 +302,26 @@ impl SourceRegistryService {
     /// cannot resurrect the source.
     pub fn remove_root(&self, root: CanonicalSourceRoot) -> Result<RequestId, SubmitError> {
         self.submit(|request| Command::RemoveRoot { request, root })
+    }
+
+    /// Reorder one configured source relative to another at an exact registry revision.
+    ///
+    /// This changes only the persisted source-list order. The worker rejects stale revisions
+    /// and unknown IDs before producing a replacement snapshot.
+    pub fn reorder_source(
+        &self,
+        source_id: SourceId,
+        target_id: SourceId,
+        after: bool,
+        expected_revision: RegistryRevision,
+    ) -> Result<RequestId, SubmitError> {
+        self.submit(|request| Command::ReorderSource {
+            request,
+            source_id,
+            target_id,
+            after,
+            expected_revision,
+        })
     }
 
     /// Submit a typed preference patch to the shared session owner.
@@ -611,6 +631,13 @@ enum Command {
         request: RequestId,
         root: CanonicalSourceRoot,
     },
+    ReorderSource {
+        request: RequestId,
+        source_id: SourceId,
+        target_id: SourceId,
+        after: bool,
+        expected_revision: RegistryRevision,
+    },
     PatchPreferences {
         request: PreferenceRequestId,
         patch: PreferencePatch,
@@ -643,6 +670,12 @@ enum Edit {
     Remove {
         request: RequestId,
         root: CanonicalSourceRoot,
+    },
+    Reorder {
+        request: RequestId,
+        source_id: SourceId,
+        target_id: SourceId,
+        after: bool,
     },
 }
 
@@ -712,6 +745,21 @@ impl Coordinator {
         self.edits.push(Edit::Remove { request, root });
     }
 
+    fn reorder_edit(
+        &mut self,
+        request: RequestId,
+        source_id: SourceId,
+        target_id: SourceId,
+        after: bool,
+    ) {
+        self.edits.push(Edit::Reorder {
+            request,
+            source_id,
+            target_id,
+            after,
+        });
+    }
+
     fn resolve_add(
         &mut self,
         request: RequestId,
@@ -772,6 +820,12 @@ impl Coordinator {
                 Edit::Remove { root, .. } => {
                     next.retain(|source| source.root != root.as_path());
                 }
+                Edit::Reorder {
+                    source_id,
+                    target_id,
+                    after,
+                    ..
+                } => reorder_sources(&mut next, source_id, target_id, *after)?,
             }
         }
         let changed = !sources_equal(&previous, &next);
@@ -803,7 +857,7 @@ impl Coordinator {
             Edit::Add {
                 root, source: None, ..
             } => Some(root.as_path().to_path_buf()),
-            Edit::Add { .. } | Edit::Remove { .. } => None,
+            Edit::Add { .. } | Edit::Remove { .. } | Edit::Reorder { .. } => None,
         }));
         roots.sort();
         roots.dedup();
@@ -833,14 +887,14 @@ impl Coordinator {
                 source: Some(_),
                 ..
             } => Some(*request),
-            Edit::Add { source: None, .. } | Edit::Remove { .. } => None,
+            Edit::Add { source: None, .. } | Edit::Remove { .. } | Edit::Reorder { .. } => None,
         })
     }
 
     fn remove_requests(&self) -> impl Iterator<Item = RequestId> + '_ {
         self.edits.iter().filter_map(|edit| match edit {
             Edit::Remove { request, .. } => Some(*request),
-            Edit::Add { .. } => None,
+            Edit::Add { .. } | Edit::Reorder { .. } => None,
         })
     }
 
@@ -850,7 +904,9 @@ impl Coordinator {
         }
         self.edits.retain(|edit| {
             let request = match edit {
-                Edit::Add { request, .. } | Edit::Remove { request, .. } => request,
+                Edit::Add { request, .. }
+                | Edit::Remove { request, .. }
+                | Edit::Reorder { request, .. } => request,
             };
             !requests.contains(request)
         });
@@ -879,6 +935,39 @@ fn add_source(
         )));
     }
     sources.push(source);
+    Ok(())
+}
+
+fn reorder_sources(
+    sources: &mut Vec<SampleSource>,
+    source_id: &SourceId,
+    target_id: &SourceId,
+    after: bool,
+) -> Result<(), SessionError> {
+    let source_matches = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| (&source.id == source_id).then_some(index))
+        .collect::<Vec<_>>();
+    let target_matches = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| (&source.id == target_id).then_some(index))
+        .collect::<Vec<_>>();
+    if source_matches.len() != 1 || target_matches.len() != 1 {
+        return Err(SessionError::Library(String::from(
+            "source reorder requires two current unique source IDs",
+        )));
+    }
+    if source_id == target_id {
+        return Ok(());
+    }
+    let moved = sources.remove(source_matches[0]);
+    let target = sources
+        .iter()
+        .position(|source| &source.id == target_id)
+        .expect("validated target source remains after removing a different ID");
+    sources.insert(target + usize::from(after), moved);
     Ok(())
 }
 
@@ -1368,6 +1457,51 @@ fn run_worker(
                 }
                 coordinator.compact_if_resolved(!persistence.pending_adds.is_empty());
             }
+            Command::ReorderSource {
+                request,
+                source_id,
+                target_id,
+                after,
+                expected_revision,
+            } => {
+                if !coordinator.loaded
+                    || !persistence.pending_adds.is_empty()
+                    || coordinator.revision() != expected_revision
+                {
+                    fail_request(
+                        &event_tx,
+                        &mut unfinalized_requests,
+                        request,
+                        SessionError::Library(String::from(
+                            "source reorder rejected because the registry changed or is still loading",
+                        )),
+                    );
+                    continue;
+                }
+                coordinator.reorder_edit(request, source_id, target_id, after);
+                match coordinator.rebuild() {
+                    Ok(changed) => {
+                        if changed {
+                            let _ = event_tx.send(RegistryEvent::Snapshot {
+                                revision: coordinator.revision(),
+                                snapshot: coordinator.snapshot(),
+                            });
+                        }
+                        announce_request(
+                            &event_tx,
+                            &mut applied_requests,
+                            &mut unfinalized_requests,
+                            request,
+                            coordinator.revision(),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = coordinator.discard_requests(&HashSet::from([request]));
+                        fail_request(&event_tx, &mut unfinalized_requests, request, error);
+                    }
+                }
+                coordinator.compact_if_resolved(false);
+            }
             Command::PatchPreferences { request, patch } => {
                 if matches!(&patch, PreferencePatch::SetTrashFolder(_))
                     && persistence.maintenance.clear_reserved()
@@ -1492,7 +1626,9 @@ fn can_block_on_command(
 
 fn command_request(command: &Command) -> Option<RequestId> {
     match command {
-        Command::AddRoot { request, .. } | Command::RemoveRoot { request, .. } => Some(*request),
+        Command::AddRoot { request, .. }
+        | Command::RemoveRoot { request, .. }
+        | Command::ReorderSource { request, .. } => Some(*request),
         Command::PatchPreferences { .. }
         | Command::StorageUsage { .. }
         | Command::ClearRebuildableCache { .. }
@@ -1505,6 +1641,7 @@ fn preference_command_request(command: &Command) -> Option<PreferenceRequestId> 
         Command::PatchPreferences { request, .. } => Some(*request),
         Command::AddRoot { .. }
         | Command::RemoveRoot { .. }
+        | Command::ReorderSource { .. }
         | Command::StorageUsage { .. }
         | Command::ClearRebuildableCache { .. }
         | Command::Shutdown { .. } => None,
@@ -2752,12 +2889,15 @@ mod tests {
         fs::write(path, bytes).expect("test WAV");
     }
 
-    fn wait_for_event(service: &SourceRegistryService, predicate: impl Fn(&RegistryEvent) -> bool) {
+    fn wait_for_event(
+        service: &SourceRegistryService,
+        predicate: impl Fn(&RegistryEvent) -> bool,
+    ) -> RegistryEvent {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut observed = Vec::new();
         loop {
             match service.try_recv() {
-                Ok(event) if predicate(&event) => return,
+                Ok(event) if predicate(&event) => return event,
                 Ok(event) => observed.push(format!("{event:?}")),
                 Err(TryRecvError::Empty) => {
                     assert!(
@@ -2989,6 +3129,124 @@ mod tests {
                 .any(|source| source.root == source_root.as_path())
         });
         assert_eq!(restored.len(), 1);
+        reopened.shutdown().expect("reopen shutdown");
+    }
+
+    #[test]
+    fn source_reorder_persists_identity_and_rejects_stale_revision() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile = profile_root(&temp);
+        let mut service = SourceRegistryService::start_inner(Some(profile.clone())).expect("start");
+        wait_for_event(&service, |event| {
+            matches!(event, RegistryEvent::Snapshot { .. })
+        });
+
+        let roots = [
+            root(&temp, "first"),
+            root(&temp, "second"),
+            root(&temp, "third"),
+        ];
+        let mut revision = RegistryRevision::default();
+        let mut before = None;
+        for (index, source_root) in roots.iter().enumerate() {
+            let request = service.add_root(source_root.clone()).expect("add source");
+            if index == roots.len() - 1 {
+                before = Some(wait_for_snapshot(&service, |snapshot| {
+                    snapshot.len() == roots.len()
+                }));
+            }
+            let event = wait_for_event(
+                &service,
+                |event| matches!(event, RegistryEvent::RequestApplied { request: applied, .. } if *applied == request),
+            );
+            let RegistryEvent::RequestApplied {
+                revision: applied, ..
+            } = event
+            else {
+                unreachable!()
+            };
+            revision = applied;
+        }
+        let before = before.expect("complete source snapshot");
+        let ids = before
+            .as_slice()
+            .iter()
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
+        let request = service
+            .reorder_source(ids[0].clone(), ids[2].clone(), true, revision)
+            .expect("reorder");
+        let reordered = wait_for_snapshot(&service, |snapshot| {
+            snapshot
+                .as_slice()
+                .iter()
+                .map(|source| &source.id)
+                .collect::<Vec<_>>()
+                == vec![&ids[1], &ids[2], &ids[0]]
+        });
+        assert_eq!(
+            reordered
+                .as_slice()
+                .iter()
+                .map(|source| source.root.as_path())
+                .collect::<Vec<_>>(),
+            vec![roots[1].as_path(), roots[2].as_path(), roots[0].as_path()]
+        );
+        assert!(sources_equal(
+            reordered.as_slice(),
+            &[
+                before.as_slice()[1].clone(),
+                before.as_slice()[2].clone(),
+                before.as_slice()[0].clone(),
+            ]
+        ));
+        let applied = wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::RequestApplied { request: actual, .. } if *actual == request),
+        );
+        let RegistryEvent::RequestApplied {
+            revision: reordered_revision,
+            ..
+        } = applied
+        else {
+            unreachable!()
+        };
+        wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::Persisted { revision } if *revision == reordered_revision),
+        );
+        let stale = service
+            .reorder_source(ids[0].clone(), ids[1].clone(), false, revision)
+            .expect("submit stale reorder");
+        wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::RequestFailed { request, .. } if *request == stale),
+        );
+        let missing = service
+            .reorder_source(
+                SourceId::from_string("missing-source"),
+                ids[1].clone(),
+                false,
+                reordered_revision,
+            )
+            .expect("submit removed source reorder");
+        wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::RequestFailed { request, .. } if *request == missing),
+        );
+        service.shutdown().expect("shutdown");
+
+        let mut reopened = SourceRegistryService::start_inner(Some(profile)).expect("reopen");
+        let restored = wait_for_snapshot(&reopened, |snapshot| snapshot.len() == roots.len());
+        assert_eq!(
+            restored
+                .as_slice()
+                .iter()
+                .map(|source| &source.id)
+                .collect::<Vec<_>>(),
+            vec![&ids[1], &ids[2], &ids[0]]
+        );
         reopened.shutdown().expect("reopen shutdown");
     }
 

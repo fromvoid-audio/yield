@@ -5,12 +5,16 @@
 
 use std::path::PathBuf;
 
-use gpui::{ClickEvent, Context, MouseButton, MouseDownEvent, div, prelude::*, px, uniform_list};
+use gpui::{
+    ClickEvent, Context, DragMoveEvent, Entity, MouseButton, MouseDownEvent, MouseUpEvent, Render,
+    Window, div, prelude::*, px, uniform_list,
+};
 use yield_design::Theme;
+use yield_library::sample_sources::SourceId;
+use yield_session::RegistryRevision;
 
 use crate::theme::{color, transparent};
 
-use super::Browser;
 use super::curation;
 use super::motion::{self, MotionFrame};
 use super::tag_chips;
@@ -18,6 +22,130 @@ use super::tag_completion;
 use super::tag_filter;
 use super::tag_library;
 use super::tags;
+use super::{Browser, SourceReorderDrag};
+
+#[derive(Clone)]
+struct SourceDragPayload {
+    browser: Entity<Browser>,
+    source_id: SourceId,
+    revision: RegistryRevision,
+    label: String,
+}
+
+struct SourceDragGhost(String);
+
+impl Render for SourceDragGhost {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let theme = crate::theme::active(cx);
+        div()
+            .px(px(8.0))
+            .py(px(4.0))
+            .bg(color(theme.colors.surface_raised))
+            .text_color(color(theme.colors.text_primary))
+            .child(self.0.clone())
+    }
+}
+
+impl Browser {
+    fn begin_source_reorder_drag(&mut self, payload: &SourceDragPayload, cx: &mut Context<Self>) {
+        if payload.browser.entity_id() != cx.entity().entity_id()
+            || !self.source_registry_loaded
+            || self.source_registry_revision != payload.revision
+            || self.source_registry_pending_reorder.is_some()
+            || !self.source_registry_pending_adds.is_empty()
+            || !self.source_registry_pending_removes.is_empty()
+            || !self
+                .source_sessions
+                .iter()
+                .any(|session| session.source_id.as_ref() == Some(&payload.source_id))
+        {
+            self.source_reorder_drag = None;
+            return;
+        }
+        self.source_reorder_drag = Some(SourceReorderDrag {
+            source_id: payload.source_id.clone(),
+            revision: payload.revision,
+            target: None,
+        });
+        cx.notify();
+    }
+
+    fn update_source_reorder_drag(
+        &mut self,
+        payload: &SourceDragPayload,
+        target_id: &SourceId,
+        event: &DragMoveEvent<SourceDragPayload>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.source_reorder_drag.as_mut() else {
+            return;
+        };
+        if drag.source_id != payload.source_id
+            || payload.browser.entity_id() != cx.entity().entity_id()
+            || drag.revision != self.source_registry_revision
+            || drag.revision != payload.revision
+            || !event.bounds.contains(&window.mouse_position())
+        {
+            return;
+        }
+        let target = (
+            target_id.clone(),
+            window.mouse_position().y >= event.bounds.center().y,
+        );
+        if drag.target.as_ref() != Some(&target) {
+            drag.target = Some(target);
+            cx.notify();
+        }
+    }
+
+    fn drop_source_reorder(
+        &mut self,
+        payload: &SourceDragPayload,
+        target_id: &SourceId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.source_reorder_drag.take() else {
+            return;
+        };
+        let Some((hovered_id, after)) = drag.target else {
+            cx.notify();
+            return;
+        };
+        if drag.source_id != payload.source_id
+            || payload.browser.entity_id() != cx.entity().entity_id()
+            || drag.revision != payload.revision
+            || drag.revision != self.source_registry_revision
+            || hovered_id != *target_id
+            || drag.source_id == hovered_id
+            || !self
+                .source_sessions
+                .iter()
+                .any(|session| session.source_id.as_ref() == Some(&hovered_id))
+        {
+            cx.notify();
+            return;
+        }
+        let result = if cx.has_global::<super::source_registry::SourceRegistryGlobal>() {
+            cx.update_global::<super::source_registry::SourceRegistryGlobal, _>(|global, _| {
+                global.reorder_source(drag.source_id, hovered_id, after, drag.revision)
+            })
+        } else {
+            Err(yield_session::SubmitError::Closed)
+        };
+        match result {
+            Ok(request) => {
+                self.source_registry_pending_reorder = Some((request, None));
+                self.set_source_registry_status("Saving source order…".to_string());
+                self.start_source_registry_poll(cx);
+            }
+            Err(error) => {
+                self.set_source_registry_status(format!("Source reorder error: {error}"));
+            }
+        }
+        cx.notify();
+    }
+}
 
 fn hover_rail(group: String, theme: &Theme) -> impl gpui::IntoElement {
     div()
@@ -125,6 +253,14 @@ pub(super) fn render(
             .flex_col()
             .flex_none()
             .h(px(source_height.max(theme.spacing.row_height)))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _, cx| {
+                    if view.source_reorder_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(
                 div()
                     .relative()
@@ -156,6 +292,16 @@ pub(super) fn render(
                                             let scanning = view.source_scan_is_pending(&root);
                                             let focused = motion_frame.focus_alpha > 0
                                                 && view.focus_matches_source(&root);
+                                            let source_id = view.source_sessions[index].source_id.clone();
+                                            let drag_payload = source_id.as_ref().map(|source_id| SourceDragPayload {
+                                                browser: cx.entity(),
+                                                source_id: source_id.clone(),
+                                                revision: view.source_registry_revision,
+                                                label: label.clone(),
+                                            });
+                                            let drop_marker = view.source_reorder_drag.as_ref().and_then(|drag| {
+                                                drag.target.as_ref().filter(|(target, _)| Some(target) == source_id.as_ref() && drag.source_id != *target)
+                                            }).cloned();
                                             let source_row = div()
                                                 .group(row_group.clone())
                                                 .id(("source-row", index))
@@ -192,6 +338,17 @@ pub(super) fn render(
                                                         },
                                                     ),
                                                 )
+                                                .when_some(source_id, |row, target_id| {
+                                                    let move_id = target_id.clone();
+                                                    row.on_drag_move::<SourceDragPayload>(cx.listener(
+                                                        move |view, event: &DragMoveEvent<SourceDragPayload>, window, cx| {
+                                                            view.update_source_reorder_drag(event.dragged_item().downcast_ref::<SourceDragPayload>().expect("source drag payload"), &move_id, event, window, cx);
+                                                        },
+                                                    ))
+                                                    .on_drop(cx.listener(move |view, payload: &SourceDragPayload, _, cx| {
+                                                        view.drop_source_reorder(payload, &target_id, cx);
+                                                    }))
+                                                })
                                                 .child(
                                                     div()
                                                         .flex_none()
@@ -207,6 +364,7 @@ pub(super) fn render(
                                                 )
                                                 .child(
                                                     div()
+                                                        .id(("source-drag-label", index))
                                                         .flex_1()
                                                         .overflow_hidden()
                                                         .whitespace_nowrap()
@@ -218,7 +376,15 @@ pub(super) fn render(
                                                         } else {
                                                             color(list_theme.colors.text_muted)
                                                         })
-                                                        .child(label),
+                                                        .child(label)
+                                                        .when_some(drag_payload, |element, drag| {
+                                                            element.on_drag(drag, |drag, _, _, cx| {
+                                                                let _ = drag.browser.update(cx, |view, cx| {
+                                                                    view.begin_source_reorder_drag(drag, cx);
+                                                                });
+                                                                cx.new(|_| SourceDragGhost(drag.label.clone()))
+                                                            })
+                                                        }),
                                                 )
                                                 .child(
                                                     div()
@@ -245,6 +411,20 @@ pub(super) fn render(
                                                 )
                                                 .child(hover_rail(row_group, &list_theme))
                                                 .when_some(source_ax_id.and_then(|id| view.ax_marker(id)), |element, marker| element.child(marker));
+                                            let source_row = if let Some((_, after)) = drop_marker {
+                                                source_row.child(
+                                                    div()
+                                                        .absolute()
+                                                        .left_0()
+                                                        .right_0()
+                                                        .h(px(2.0))
+                                                        .when(after, |marker| marker.bottom_0())
+                                                        .when(!after, |marker| marker.top_0())
+                                                        .bg(color(list_theme.colors.accent)),
+                                                )
+                                            } else {
+                                                source_row
+                                            };
                                             let source_row = if focused {
                                                 source_row.child(
                                                     div()
