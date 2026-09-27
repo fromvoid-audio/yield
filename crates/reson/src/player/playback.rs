@@ -376,6 +376,7 @@ impl AudioPlayer {
             replace_policy,
             metronome,
             None,
+            false,
         )
     }
 
@@ -388,21 +389,13 @@ impl AudioPlayer {
         replace_policy: PlaybackRuntimeReplacePolicy,
         metronome: Option<PlaybackMetronomeConfig>,
         planned: Option<PlaybackSpanPlan>,
+        transition_fade_in: bool,
     ) -> Result<(), String> {
         let total_started_at = playback_stage_started();
         let source_kind = self.current_source_kind();
         if duration <= 0.0 {
             return Err("Load a .wav file first".into());
         }
-
-        let clear_started_at = playback_stage_started();
-        self.prepare_previous_sink_for_new_source(self.anti_clip_fade(), replace_policy);
-        log_playback_stage(
-            "clear_or_fade_current",
-            clear_started_at,
-            source_kind,
-            looped,
-        );
 
         let plan_started_at = playback_stage_started();
         let plan = planned.unwrap_or(self.playback_span_plan(
@@ -507,6 +500,14 @@ impl AudioPlayer {
         };
         let final_source =
             source_with_metronome(final_source, metronome, &plan, active_playback_span.clone());
+        // A live retarget may restart from the current frame. The span-edge fade is
+        // already behind that frame, so ramp the new source in as the old one
+        // fades out instead of briefly summing two full-level streams.
+        let final_source: Box<dyn Source<Item = f32> + Send> = if transition_fade_in {
+            Box::new(final_source.fade_in(self.anti_clip_fade()))
+        } else {
+            final_source
+        };
         log_playback_stage(
             "source_construction",
             source_started_at,
@@ -514,6 +515,16 @@ impl AudioPlayer {
             looped,
         );
 
+        // File-backed sources may block while preparing. Keep the old source
+        // audible until the replacement is ready to append.
+        let clear_started_at = playback_stage_started();
+        self.prepare_previous_sink_for_new_source(self.anti_clip_fade(), replace_policy);
+        log_playback_stage(
+            "clear_or_fade_current",
+            clear_started_at,
+            source_kind,
+            looped,
+        );
         let (handle, format) = self.build_sink_with_fade(final_source, replace_policy)?;
         let finish_started_at = playback_stage_started();
         let initial_offset = (!looped).then_some(plan.seek_offset_frames());
@@ -554,6 +565,7 @@ impl AudioPlayer {
             PlaybackRuntimeReplacePolicy::FadeOutPrevious,
             metronome,
             Some(plan),
+            true,
         )
     }
 
