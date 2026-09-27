@@ -30,7 +30,9 @@ warnings = "deny"
 missing_docs = "deny"
 
 [workspace.dependencies]
-gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
+# OPT-1917: pinned Blade crashes in CoreAnimation on cross-display window moves.
+# The pinned Metal renderer uses runtime shaders so Command Line Tools builds work.
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
 hound = "3.5.1"
 notify = "6.1.1"
 unicode-segmentation = "1.12.0"

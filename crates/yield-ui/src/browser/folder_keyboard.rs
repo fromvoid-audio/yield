@@ -405,6 +405,7 @@ mod tests {
                 ],
                 &[],
             ));
+            view.show_empty_folders = true;
             view.expanded_folders.insert(PathBuf::from("a"));
             view.rebuild_folder_rows_cache();
         });

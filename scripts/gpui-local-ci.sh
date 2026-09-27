@@ -46,6 +46,7 @@ run cargo test --locked -p yield-library --lib readiness --no-default-features
 run cargo test --locked -p yield-library --lib source_database_identity --no-default-features
 run cargo test --locked -p yield-library --lib sqlite_wal --no-default-features
 run cargo test --locked -p yield-library --lib app_dirs::storage_usage --no-default-features
+run cargo test --locked -p yield-scan --lib -- --test-threads=4
 run cargo test --locked -p yield-catalog --lib
 run cargo test --locked -p yield-session --lib -- --test-threads=4
 

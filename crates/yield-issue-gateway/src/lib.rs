@@ -321,9 +321,32 @@ mod tests {
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("bounded test read");
-            let mut bytes = [0u8; 8192];
-            let size = socket.read(&mut bytes).expect("request bytes");
-            let request = String::from_utf8_lossy(&bytes[..size]).into_owned();
+            let mut request_bytes = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                let size = socket.read(&mut chunk).expect("request bytes");
+                assert!(size > 0, "request ended before its body");
+                request_bytes.extend_from_slice(&chunk[..size]);
+                assert!(request_bytes.len() <= 70_000, "test request exceeded bound");
+                if let Some(header_end) = request_bytes
+                    .windows(4)
+                    .position(|bytes| bytes == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request_bytes[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        })
+                        .map(|(_, value)| value.trim().parse::<usize>().expect("content length"))
+                        .unwrap_or(0);
+                    if request_bytes.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&request_bytes).into_owned();
             write!(
                 socket,
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

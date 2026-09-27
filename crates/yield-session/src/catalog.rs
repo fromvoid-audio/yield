@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 pub(crate) use yield_catalog::CatalogService;
-use yield_catalog::CatalogSubmitError as CatalogWorkerSubmitError;
+use yield_catalog::{CatalogAuditCancelError, CatalogSubmitError as CatalogWorkerSubmitError};
 
 pub use yield_catalog::{
     CatalogCommand, CatalogCurationRequestError, CatalogCurationTagFactsRequestError,
@@ -78,6 +78,29 @@ pub enum CatalogSubmitError {
     InvalidRatingDecayRequest(CatalogRatingDecayRequestError),
 }
 
+/// Failure to submit a lifecycle-scoped audit cancellation.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CatalogCancelError {
+    /// Catalog startup has not completed.
+    #[error("source catalog is still loading")]
+    NotReady,
+    /// Catalog startup failed.
+    #[error("source catalog is unavailable: {0}")]
+    Unavailable(String),
+    /// Catalog admission has closed.
+    #[error("source catalog is closed")]
+    Closed,
+    /// The source lifecycle no longer matches.
+    #[error("source audit lifecycle is stale")]
+    Stale,
+    /// No audit is currently executing.
+    #[error("source audit is not running")]
+    NotRunning,
+    /// Cancellation was already requested.
+    #[error("source audit cancellation is already requested")]
+    AlreadyRequested,
+}
+
 pub(crate) struct CatalogSlot {
     status: CatalogStatus,
     service: Option<Arc<CatalogService>>,
@@ -125,6 +148,45 @@ pub(crate) fn submit(
             result
         }
     }
+}
+
+pub(crate) fn cancel_audit(
+    slot: &Arc<Mutex<CatalogSlot>>,
+    source_id: &yield_library::sample_sources::SourceId,
+    lifecycle_generation: u64,
+) -> Result<(), CatalogCancelError> {
+    let slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match &slot.status {
+        CatalogStatus::Loading => Err(CatalogCancelError::NotReady),
+        CatalogStatus::Unavailable { reason } => {
+            Err(CatalogCancelError::Unavailable(reason.clone()))
+        }
+        CatalogStatus::Closed => Err(CatalogCancelError::Closed),
+        CatalogStatus::Ready => slot
+            .service
+            .as_ref()
+            .ok_or(CatalogCancelError::Closed)?
+            .cancel_audit(source_id, lifecycle_generation)
+            .map_err(|error| match error {
+                CatalogAuditCancelError::Closed => CatalogCancelError::Closed,
+                CatalogAuditCancelError::Stale => CatalogCancelError::Stale,
+                CatalogAuditCancelError::NotRunning => CatalogCancelError::NotRunning,
+                CatalogAuditCancelError::AlreadyRequested => CatalogCancelError::AlreadyRequested,
+            }),
+    }
+}
+
+pub(crate) fn audit_is_running(
+    slot: &Arc<Mutex<CatalogSlot>>,
+    source_id: &yield_library::sample_sources::SourceId,
+    lifecycle_generation: u64,
+) -> bool {
+    let slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    matches!(slot.status, CatalogStatus::Ready)
+        && slot
+            .service
+            .as_ref()
+            .is_some_and(|service| service.audit_is_running(source_id, lifecycle_generation))
 }
 
 pub(crate) fn try_recv_event(slot: &Arc<Mutex<CatalogSlot>>) -> Result<CatalogEvent, TryRecvError> {

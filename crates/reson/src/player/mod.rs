@@ -78,6 +78,8 @@ pub struct AudioPlayer {
     play_span_frames: Option<(u64, u64)>,
     looping: bool,
     active_playback_span: Option<PlaybackSpanHandle>,
+    active_loop_mode: Option<playback::LoopModeHandle>,
+    active_metronome: Option<PlaybackMetronomeConfig>,
     loop_offset: Option<f32>,
     loop_offset_frames: Option<u64>,
     volume: f32,

@@ -46,6 +46,12 @@ impl AudioPlayer {
         let track_frames = self.track_total_frames?;
         let (span_start, span_end) = self.play_span_frames?;
         let span_frames = span_end.saturating_sub(span_start).max(1);
+        if self.active_playback_span.is_none()
+            && let Some(mode) = self.active_loop_mode.as_ref()
+        {
+            let within_span = mode.progress_offset();
+            return Some(span_start.saturating_add(within_span).min(track_frames));
+        }
         let elapsed_frames = duration_to_frames_floor(self.elapsed_since(started_at), sample_rate);
         let base_offset = self.loop_offset_frames.unwrap_or(0).min(span_frames);
         let within_span = if self.looping {
