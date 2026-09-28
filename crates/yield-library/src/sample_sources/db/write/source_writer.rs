@@ -20,6 +20,11 @@ use crate::app_dirs::WritableProfileGuard;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use crate::sample_sources::SourceId;
 use crate::sample_sources::db::read::browser_metadata_rows_for_paths;
+use crate::sample_sources::readiness::{
+    ArtifactPublishOutcome, ClaimedReadinessWork, ReadinessError, ReadinessFailureClassification,
+    ReadinessFailureOutcome, ReadinessLeaseRenewalOutcome, ReadinessRetryPolicy, ReadinessTarget,
+    ReadinessWorkMutationOutcome,
+};
 use crate::sample_sources::reconciliation::{
     RootIdentity, RootRelativePath, SourceAuditCommit, SourceAuditRequest,
 };
@@ -499,6 +504,9 @@ pub enum SourceWriterError {
     /// Existing source-database validation or transaction failure.
     #[error(transparent)]
     Database(#[from] SourceDbError),
+    /// The retained source's typed readiness store rejected a work transition.
+    #[error(transparent)]
+    Readiness(#[from] ReadinessError),
     /// The request could not be represented by the bounded source codec.
     #[error("invalid source writer request: {0}")]
     InvalidRequest(&'static str),
@@ -567,6 +575,131 @@ enum SourceWriterFault {
 }
 
 impl SourceWriter {
+    fn validate_readiness_command(
+        &self,
+        expected: &SourceRevision,
+        target: &ReadinessTarget,
+    ) -> Result<(), SourceWriterError> {
+        let current = self.current_revision()?;
+        if expected.source_id != current.source_id
+            || expected.root_identity != current.root_identity
+            || expected.root_binding_identity != current.root_binding_identity
+            || expected.database_identity != current.database_identity
+            || expected.lifecycle_generation != current.lifecycle_generation
+            || expected.lease_epoch != current.lease_epoch
+            || target.source_id != current.source_id.as_str()
+        {
+            return Err(SourceWriterError::StaleFence);
+        }
+        if expected.revision != current.revision {
+            return Err(SourceWriterError::StaleRevision {
+                expected: expected.revision,
+                actual: current.revision,
+            });
+        }
+        Ok(())
+    }
+
+    /// Claim one published readiness target under the retained source owner.
+    pub fn claim_readiness_target(
+        &mut self,
+        expected: &SourceRevision,
+        target: &ReadinessTarget,
+        now: i64,
+        lease_duration_seconds: i64,
+    ) -> Result<Option<ClaimedReadinessWork>, SourceWriterError> {
+        self.validate_readiness_command(expected, target)?;
+        Ok(self
+            .database
+            .readiness_store()?
+            .claim(target, now, lease_duration_seconds)?)
+    }
+
+    /// Renew an exact claimed readiness lease without changing its claim generation.
+    pub fn renew_readiness_lease(
+        &mut self,
+        expected: &SourceRevision,
+        claim: &ClaimedReadinessWork,
+        now: i64,
+        lease_duration_seconds: i64,
+    ) -> Result<ReadinessLeaseRenewalOutcome, SourceWriterError> {
+        self.validate_readiness_command(expected, claim.target())?;
+        Ok(self
+            .database
+            .readiness_store()?
+            .renew_lease(claim, now, lease_duration_seconds)?)
+    }
+
+    /// Publish completion of the exact claimed target through the typed readiness store.
+    pub fn complete_readiness_work(
+        &mut self,
+        expected: &SourceRevision,
+        claim: &ClaimedReadinessWork,
+        completed_at: i64,
+        artifact_ref: Option<&str>,
+    ) -> Result<ArtifactPublishOutcome, SourceWriterError> {
+        self.validate_readiness_command(expected, claim.target())?;
+        let mut store = self.database.readiness_store()?;
+        Ok(match artifact_ref {
+            Some(artifact_ref) => {
+                store.complete_with_artifact_ref(claim, completed_at, artifact_ref)?
+            }
+            None => store.complete(claim, completed_at)?,
+        })
+    }
+
+    /// Record a classified failure for the exact claimed readiness target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fail_readiness_work(
+        &mut self,
+        expected: &SourceRevision,
+        claim: &ClaimedReadinessWork,
+        classification: ReadinessFailureClassification,
+        code: &str,
+        reason: &str,
+        failed_at: i64,
+        retry_policy: ReadinessRetryPolicy,
+    ) -> Result<ReadinessFailureOutcome, SourceWriterError> {
+        self.validate_readiness_command(expected, claim.target())?;
+        Ok(self.database.readiness_store()?.fail(
+            claim,
+            classification,
+            code,
+            reason,
+            failed_at,
+            retry_policy,
+        )?)
+    }
+
+    /// Return a current claim to pending without consuming its retry allowance.
+    pub fn release_readiness_work(
+        &mut self,
+        expected: &SourceRevision,
+        claim: &ClaimedReadinessWork,
+        released_at: i64,
+    ) -> Result<ReadinessWorkMutationOutcome, SourceWriterError> {
+        self.validate_readiness_command(expected, claim.target())?;
+        Ok(self
+            .database
+            .readiness_store()?
+            .release(claim, released_at)?)
+    }
+
+    /// Return a current claim to pending with a cancellation diagnostic.
+    pub fn cancel_readiness_work(
+        &mut self,
+        expected: &SourceRevision,
+        claim: &ClaimedReadinessWork,
+        reason: &str,
+        cancelled_at: i64,
+    ) -> Result<ReadinessWorkMutationOutcome, SourceWriterError> {
+        self.validate_readiness_command(expected, claim.target())?;
+        Ok(self
+            .database
+            .readiness_store()?
+            .cancel(claim, reason, cancelled_at)?)
+    }
+
     /// Borrow the retained database for catalog paths that have not yet been
     /// migrated to typed source-writer commands. The borrow cannot outlive this
     /// owner and must not be used to construct a second writable connection.
