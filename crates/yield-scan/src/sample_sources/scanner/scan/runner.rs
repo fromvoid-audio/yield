@@ -81,6 +81,7 @@ pub fn audit_source(
         db,
         &mut stats,
         ScanMode::Quick,
+        db.get_revision()?,
         &UncoordinatedScanWriter,
         Some(&source_root),
     )?;
@@ -122,6 +123,7 @@ pub fn audit_source_with_budget(
         db,
         &mut stats,
         ScanMode::Quick,
+        db.get_revision()?,
         &UncoordinatedScanWriter,
         Some(&source_root),
     )?;
@@ -541,6 +543,7 @@ fn audit_source_and_record_after_scan_outcome(
         db,
         &mut stats,
         ScanMode::Quick,
+        db.get_revision()?,
         writer,
         Some(&source_root),
     )?;
@@ -992,6 +995,7 @@ fn scan_with_writer_using_root_and_committed_batch(
                 db,
                 &mut context.stats,
                 mode,
+                committed_snapshot.0,
                 writer,
                 Some(source_root),
             )?;
@@ -1179,6 +1183,7 @@ fn finalize_pending_rename_completion(
     db: &SourceDatabase,
     stats: &mut ScanStats,
     mode: ScanMode,
+    expected_revision: u64,
     writer: &impl ScanWriter,
     source_root: Option<&SourceRootCapability>,
 ) -> Result<(), ScanError> {
@@ -1188,6 +1193,12 @@ fn finalize_pending_rename_completion(
     }
     let _writer = writer.try_lock(super::super::scan_writer::ScanWritePhase::Manifest)?;
     let mut batch = db.write_batch()?;
+    if !batch.matches_revision(expected_revision)? {
+        return Err(ScanError::StaleRevision {
+            expected: expected_revision,
+            actual: batch.get_revision()?,
+        });
+    }
     if mode == ScanMode::Hard {
         batch.prune_invalid_retained_rename_destinations()?;
     }
@@ -1198,7 +1209,7 @@ fn finalize_pending_rename_completion(
     if let Some(source_root) = source_root {
         source_root.ensure_current_generation()?;
     }
-    batch.commit_auxiliary_state()?;
+    writer.commit_pending_rename_scan_completion(batch, expected_revision)?;
     stats.pending_renames_pruned = stats
         .pending_renames_pruned
         .saturating_add(report.candidates_pruned);

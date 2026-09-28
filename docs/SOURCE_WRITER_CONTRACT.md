@@ -86,6 +86,14 @@ snapshot publish. An incomplete outcome retains the pending watcher hint for
 retry and leaves the prior browser snapshot authoritative; it does not treat
 safe partial source rows as complete coverage.
 
+OPT-1790 routes authoritative pending-rename retention completion through a
+typed scan-writer method. The retained source writer validates the physical
+source lease, database binding, lifecycle, and observed manifest revision before
+the revision-neutral auxiliary transaction commits. The catalog wrapper also
+holds its scan lifecycle admission guard. Rename staging and reconciliation in
+manifest batches continue through their existing revision-fenced writer route;
+an incomplete audit does not advance rename retention.
+
 ## Boundary and authority
 
 One physical source has one serialized writable SQL owner. The owner retains the
