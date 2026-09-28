@@ -337,6 +337,17 @@ impl Browser {
 
     /// Queue removal of the browser's current catalog projection.
     pub(super) fn deactivate_catalog_source(&mut self, cx: &mut Context<Self>) {
+        if let Some(activation) = self.catalog_activation.as_ref() {
+            let key = super::curation::CurationLifecycleKey {
+                source_id: activation.source_id.clone(),
+                lifecycle_generation: activation.lifecycle_generation,
+            };
+            if !self.flush_latest_curation(&key, cx) {
+                self.set_scan_status(String::from(
+                    "Latest rating or listen value was not saved before changing source",
+                ));
+            }
+        }
         self.job_action = None;
         self.job_action_error = None;
         super::source_recovery::cancel_for_source_change(self);
