@@ -10725,6 +10725,60 @@ mod tests {
     }
 
     #[test]
+    fn curation_after_idle_expiry_renews_retained_source_owner() {
+        let fixture = Fixture::new("catalog-curation-idle-renewal");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-idle-renewal");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let database_path = fixture
+            .guard
+            .profile_root()
+            .join(catalog_profile_child(&source_id))
+            .join(".yield.db");
+        let connection = rusqlite::Connection::open_with_flags(
+            database_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .expect("existing source database");
+        connection
+            .execute(
+                "UPDATE source_lease SET expires_at = acquired_at WHERE singleton = 1",
+                [],
+            )
+            .expect("expire idle lease while the source owner remains live");
+        drop(connection);
+
+        service
+            .submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity,
+                request_id: 1,
+                updates: vec![SourceCurationUpdate::SetRating {
+                    path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+                        .expect("relative sample path"),
+                    rating: yield_library::sample_sources::Rating::KEEP_1,
+                }],
+            })
+            .expect("curation admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationCommitted { request_id: 1, .. }
+                    | CatalogEvent::CurationFailed { request_id: 1, .. }
+            )
+        });
+        let CatalogEvent::CurationCommitted { receipt, .. } = event else {
+            panic!("live source owner failed to renew for curation: {event:?}");
+        };
+        assert_eq!(receipt.source_revision(), snapshot.committed_revision + 1);
+        assert_eq!(receipt.files()[0].rating.val(), 1);
+        service.shutdown();
+    }
+
+    #[test]
     fn catalog_metadata_commands_do_not_exhaust_operation_receipt_history() {
         let fixture = Fixture::new("catalog-curation-long-session");
         write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);

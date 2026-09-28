@@ -8689,6 +8689,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "hound",
+ "rusqlite",
  "tempfile",
  "thiserror 2.0.20",
  "yield-library",
