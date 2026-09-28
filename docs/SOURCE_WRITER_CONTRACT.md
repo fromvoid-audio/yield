@@ -70,6 +70,15 @@ and index rows everywhere, leaving deletion for a complete retry. The catalog
 publishes the terminal audit snapshot only after the complete staged activation;
 its structured delta and SourceRevision name the same committed revision.
 
+OPT-1783's exact-entry and bounded subtree scanner entrypoints accept a
+retained `SourceWriter` directly and derive their database from that same
+owner. Every revision-advancing targeted batch uses its scan fence and typed
+commit, while exact-path and subtree reads stay limited to the supplied
+scope. A catalog-owned targeted operation must use `CatalogScanWriter` to add
+the active lifecycle and attempt-token check; the direct owner route checks
+physical profile, root, lease, database, and revision authority. The existing
+catalog watcher still requests full audits from pathless hints.
+
 ## Boundary and authority
 
 One physical source has one serialized writable SQL owner. The owner retains the
