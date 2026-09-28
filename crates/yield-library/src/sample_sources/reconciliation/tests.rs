@@ -1999,6 +1999,42 @@ fn adjacent_valid_replays_preserve_fifo_and_raw_order() {
 }
 
 #[test]
+fn global_fsevents_id_leaps_do_not_imply_missing_source_events() {
+    let source = SourceId::from_string("source-a");
+    let root = RootIdentity::from_bytes(b"root-a".to_vec());
+    let mut supervisor = ReconciliationAdmissionSupervisor::new(adapter_admission_limits(2, 4));
+    adapter_registered(&mut supervisor, &source, &root);
+    let prior = replay_prior("source-a", b"root-a", b"stream-a", 1, 10);
+    let observations = vec![
+        adapter_observation(RawEventKind::Modify, "first.wav")
+            .with_metadata(RawObservationMetadata::new().with_event_id(17)),
+        adapter_observation(RawEventKind::Modify, "second.wav")
+            .with_metadata(RawObservationMetadata::new().with_event_id(25)),
+    ];
+    let admitted = ReconciliationAdapter::new(&mut supervisor)
+        .admit_replay(
+            adapter_batch(
+                adapter_capture_provenance(
+                    "source-a",
+                    Some(b"root-a".to_vec()),
+                    Some(b"stream-a".to_vec()),
+                    1,
+                    Some(11),
+                    Some(25),
+                ),
+                observations,
+            ),
+            Some(&prior),
+            true,
+        )
+        .expect("covered history with global ID leaps");
+    assert_eq!(
+        admitted.disposition(),
+        AdapterDisposition::AdmittedWithContinuity
+    );
+}
+
+#[test]
 fn adapter_error_preserves_original_batch_and_capacity_is_atomic() {
     let invalid_batch = adapter_batch(
         adapter_capture_provenance(

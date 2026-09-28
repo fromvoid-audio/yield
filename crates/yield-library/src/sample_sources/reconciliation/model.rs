@@ -204,17 +204,19 @@ impl BackendStreamIdentity {
         Self(bytes)
     }
 
-    /// Construct the canonical opaque identity for one durable FSEvents device stream.
+    /// Construct the canonical opaque identity for one durable FSEvents volume stream.
     ///
-    /// The discriminator prevents a process-local notify stream id from being treated as
-    /// durable FSEvents authority. A zero device is unavailable and cannot identify a stream.
-    pub fn from_fsevents_device(device: u64) -> Option<Self> {
-        if device == 0 {
+    /// Device numbers can change or be reused after reboot. The volume UUID must come from the
+    /// native device stream, so a numeric device alone cannot authorize replay. A nil UUID or
+    /// zero device is unavailable and fails closed.
+    pub fn from_fsevents_volume(device: u64, volume_uuid: [u8; 16]) -> Option<Self> {
+        if device == 0 || volume_uuid == [0; 16] {
             return None;
         }
-        let mut bytes = Vec::with_capacity(9 + std::mem::size_of::<u64>());
-        bytes.extend_from_slice(b"fsevents:");
+        let mut bytes = Vec::with_capacity(16 + std::mem::size_of::<u64>() + volume_uuid.len());
+        bytes.extend_from_slice(b"fsevents-volume:");
         bytes.extend_from_slice(&device.to_be_bytes());
+        bytes.extend_from_slice(&volume_uuid);
         Some(Self::from_bytes(bytes))
     }
 
