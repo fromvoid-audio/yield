@@ -117,8 +117,11 @@ before optional content verification, which may advance the source revision.
 
 Directory generations are staged in bounded, revision-neutral transactions;
 the final transaction activates the complete generation and records the audit
-identity at the committed manifest revision. Catalog maintenance reclaims
-abandoned staging and inactive generations under its exclusive child lease.
+identity at the committed manifest revision. Production audit staging, aborted
+staging discard, and catalog maintenance cleanup run through the retained
+source writer under the catalog's lifecycle guard. Bounded directory pages
+remain reads. Catalog maintenance reclaims abandoned staging and inactive
+generations under its exclusive child lease.
 The general scanner does not reclaim other scanners' staging generations.
 Commands and completion events both have bounded admission; rejected commands
 do not invalidate accepted work. Session access exposes loading, ready,

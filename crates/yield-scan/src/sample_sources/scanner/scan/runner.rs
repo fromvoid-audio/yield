@@ -597,7 +597,8 @@ fn record_staged_manifest_audit_completion(
         }
         source_root.ensure_current_generation()?;
         let _writer = writer.try_lock(super::super::scan_writer::ScanWritePhase::Manifest)?;
-        let generation = db.begin_next_source_directory_truth_generation(
+        let generation = writer.begin_directory_truth_generation(
+            db,
             u64::try_from(directory_entries.len())
                 .map_err(|_| ScanError::Db(SourceDbError::Unexpected))?,
         )?;
@@ -612,7 +613,7 @@ fn record_staged_manifest_audit_completion(
                 source_root.ensure_current_generation()?;
                 let _writer =
                     writer.try_lock(super::super::scan_writer::ScanWritePhase::Manifest)?;
-                db.stage_source_directory_truth_entries(generation, chunk)?;
+                writer.stage_directory_truth_entries(db, generation, chunk)?;
             }
 
             if cancel_requested(cancel) {
@@ -685,7 +686,8 @@ fn discard_staged_directory_generation(
     loop {
         source_root.ensure_current_generation()?;
         let _writer = writer.try_lock_cleanup()?;
-        let cleanup = db.discard_source_directory_truth_generation_batch(
+        let cleanup = writer.discard_directory_truth_generation_batch(
+            db,
             generation,
             yield_library::sample_sources::db::SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT,
         )?;
