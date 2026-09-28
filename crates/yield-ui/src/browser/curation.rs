@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui::{ClickEvent, Context, MouseButton, MouseDownEvent, ScrollStrategy, div, prelude::*, px};
 use yield_core::{
@@ -22,9 +23,10 @@ use yield_library::sample_sources::{
     reconciliation::{RootIdentity, RootRelativePath},
 };
 use yield_session::{
-    CatalogPublicationStatus, MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
-    MAX_CURATION_OPERATION_RECEIPT_BYTES, MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES,
-    SourceCurationCommitReceipt, SourceCurationOperationFence, SourceCurationOperationOutcome,
+    CatalogPublicationStatus, CatalogSubmitError, MAX_CURATION_OPERATION_BATCHES,
+    MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
+    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, SourceCurationCommitReceipt,
+    SourceCurationOperationFence, SourceCurationOperationOutcome,
 };
 
 use crate::theme::{color, transparent};
@@ -32,6 +34,7 @@ use crate::theme::{color, transparent};
 use super::{Browser, catalog, tag_chips, tag_filter};
 
 const COMPACT_FILTER_LABEL_WIDTH: f32 = 82.0;
+const LATEST_CURATION_WINDOW: Duration = Duration::from_millis(40);
 
 fn compact_filter_chip_width(theme: &Theme, count: usize) -> f32 {
     let count = count.max(1) as f32;
@@ -104,6 +107,21 @@ struct PendingCurationOperation {
     trash_required: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum LatestValueField {
+    Rating,
+    Locked,
+    LastPlayedAt,
+}
+
+#[derive(Clone, Debug)]
+struct StagedLatestCuration {
+    path: PathBuf,
+    updates: BTreeMap<LatestValueField, SourceCurationUpdate>,
+    overlay: AudioFileCuration,
+    trash_required: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TagMutation {
     Add,
@@ -119,6 +137,7 @@ struct CurationLineage {
     revision: u64,
     confirmed: BTreeMap<PathBuf, AudioFileCuration>,
     pending: Vec<PendingCurationOperation>,
+    staged_latest: Option<StagedLatestCuration>,
     failed: Option<String>,
     /// A committed receipt was drained after its source fence became stale.
     invalidated: Option<String>,
@@ -244,6 +263,7 @@ impl CurationState {
                 revision,
                 confirmed,
                 pending: Vec::new(),
+                staged_latest: None,
                 failed: None,
                 invalidated: None,
                 message: None,
@@ -326,6 +346,9 @@ impl CurationState {
                 trash_suffix.unwrap_or_default()
             ));
         }
+        if lineage.staged_latest.is_some() {
+            return Some(String::from("Saving latest curation…"));
+        }
         lineage.message.clone()
     }
 
@@ -334,6 +357,111 @@ impl CurationState {
         if let Some(lineage) = self.lineages.get_mut(key) {
             lineage.message = Some(message);
         }
+    }
+
+    /// Stage one single-row rating or listen value before assigning a durable request ID.
+    /// Distinct paths and non-latest updates must first flush the previous stage.
+    fn stage_latest(&mut self, key: &CurationLifecycleKey, plan: &CurationOperationPlan) -> bool {
+        let next_request_id = self.next_request_id();
+        let Some(lineage) = self.lineages.get_mut(key) else {
+            return false;
+        };
+        if lineage.failed.is_some()
+            || lineage.invalidated.is_some()
+            || lineage.root_identity != plan.root_identity
+            || plan.request_id != next_request_id
+            || plan.overlays.len() != 1
+            || plan.batches.len() != 1
+        {
+            return false;
+        }
+        let Some((path, overlay)) = plan.overlays.first_key_value() else {
+            return false;
+        };
+        if lineage
+            .staged_latest
+            .as_ref()
+            .is_some_and(|staged| staged.path != *path)
+        {
+            return false;
+        }
+        let mut replacement = BTreeMap::new();
+        for update in &plan.batches[0] {
+            let Some((field, update_path)) = latest_value_field(update) else {
+                return false;
+            };
+            if update_path != path.as_path() {
+                return false;
+            }
+            replacement.insert(field, update.clone());
+        }
+        if replacement.is_empty() {
+            return false;
+        }
+        let staged = lineage
+            .staged_latest
+            .get_or_insert_with(|| StagedLatestCuration {
+                path: path.clone(),
+                updates: BTreeMap::new(),
+                overlay: *overlay,
+                trash_required: 0,
+            });
+        staged.updates.extend(replacement);
+        staged.overlay = *overlay;
+        staged.trash_required = staged.trash_required.saturating_add(plan.trash_required);
+        lineage.message = None;
+        true
+    }
+
+    /// Build the sole durable operation for the current latest-value stage without consuming it.
+    fn latest_plan(&self, key: &CurationLifecycleKey) -> Option<CurationOperationPlan> {
+        let lineage = self.lineages.get(key)?;
+        if lineage.failed.is_some() || lineage.invalidated.is_some() {
+            return None;
+        }
+        let staged = lineage.staged_latest.as_ref()?;
+        let fence = lineage
+            .pending
+            .last()
+            .map(|pending| SourceCurationOperationFence::AfterOperation {
+                request_id: pending.request_id,
+            })
+            .unwrap_or(SourceCurationOperationFence::ExactRevision(
+                lineage.revision,
+            ));
+        Some(CurationOperationPlan {
+            request_id: self.next_request_id(),
+            fence,
+            root_identity: lineage.root_identity.clone(),
+            batches: vec![staged.updates.values().cloned().collect()],
+            overlays: BTreeMap::from([(staged.path.clone(), staged.overlay)]),
+            trash_required: staged.trash_required,
+        })
+    }
+
+    fn staged_path(&self, key: &CurationLifecycleKey) -> Option<&Path> {
+        self.lineages
+            .get(key)?
+            .staged_latest
+            .as_ref()
+            .map(|staged| staged.path.as_path())
+    }
+
+    fn visible_for_path(
+        &self,
+        key: &CurationLifecycleKey,
+        path: &PathBuf,
+    ) -> Option<AudioFileCuration> {
+        effective_curation(self.lineages.get(key)?, path)
+    }
+
+    /// Remove a pre-admission stage after acceptance or a terminal admission error.
+    fn clear_latest(&mut self, key: &CurationLifecycleKey) -> Option<PathBuf> {
+        self.lineages
+            .get_mut(key)?
+            .staged_latest
+            .take()
+            .map(|staged| staged.path)
     }
 
     /// Drop completed inactive lifecycle mappings while retaining accepted outcomes still in
@@ -970,6 +1098,9 @@ impl CurationState {
         lineage.pending.remove(operation_index);
         if let Some(error) = failed.as_ref() {
             lineage.failed = Some(error.clone());
+            if let Some(staged) = lineage.staged_latest.take() {
+                affected.insert(staged.path);
+            }
             for operation in &mut lineage.pending {
                 operation.active_overlay = false;
                 affected.extend(operation.overlays.keys().cloned());
@@ -1029,6 +1160,7 @@ impl CurationState {
         };
         let revision = lineage.revision;
         lineage.pending.remove(operation_index);
+        lineage.staged_latest = None;
         for operation in &mut lineage.pending {
             operation.active_overlay = false;
         }
@@ -1105,12 +1237,34 @@ impl CurationReceipt {
 
 fn effective_curation(lineage: &CurationLineage, path: &PathBuf) -> Option<AudioFileCuration> {
     lineage
-        .pending
-        .iter()
-        .rev()
-        .filter(|operation| operation.active_overlay)
-        .find_map(|operation| operation.overlays.get(path).copied())
+        .staged_latest
+        .as_ref()
+        .filter(|staged| staged.path == *path)
+        .map(|staged| staged.overlay)
+        .or_else(|| {
+            lineage
+                .pending
+                .iter()
+                .rev()
+                .filter(|operation| operation.active_overlay)
+                .find_map(|operation| operation.overlays.get(path).copied())
+        })
         .or_else(|| lineage.confirmed.get(path).copied())
+}
+
+fn latest_value_field(update: &SourceCurationUpdate) -> Option<(LatestValueField, &Path)> {
+    match update {
+        SourceCurationUpdate::SetRating { path, .. } => {
+            Some((LatestValueField::Rating, path.as_path()))
+        }
+        SourceCurationUpdate::SetLocked { path, .. } => {
+            Some((LatestValueField::Locked, path.as_path()))
+        }
+        SourceCurationUpdate::SetLastPlayedAt { path, .. } => {
+            Some((LatestValueField::LastPlayedAt, path.as_path()))
+        }
+        _ => None,
+    }
 }
 
 fn source_update_may_change_tags(update: &SourceCurationUpdate) -> bool {
@@ -1921,6 +2075,22 @@ impl Browser {
             return;
         }
         let target_paths = explicit_paths.unwrap_or_else(|| self.curation_target_paths());
+        let latest_value = matches!(
+            action,
+            CurationAction::AdjustRating { .. } | CurationAction::RecordPlayback { .. }
+        ) && target_paths.len() == 1;
+        if self
+            .curation_state
+            .staged_path(&key)
+            .is_some_and(|path| !latest_value || path != target_paths[0].as_path())
+            && !self.flush_latest_curation(&key, cx)
+        {
+            self.set_scan_status(String::from(
+                "Curation is busy; retry the latest action after the pending value saves",
+            ));
+            cx.notify();
+            return;
+        }
         match self.curation_state.plan_action(&key, action, &target_paths) {
             CurationPlan::Rejected(message) => {
                 self.curation_state.set_message(&key, message);
@@ -1940,70 +2110,159 @@ impl Browser {
                 self.curation_state.set_message(&key, message);
             }
             CurationPlan::Ready(plan) => {
-                let request_id = plan.request_id;
-                let tags_may_change = plan.tags_may_change();
-                let reusable_tag_mask = (!tags_may_change)
-                    .then(|| tag_filter::capture_ready_mask(self))
-                    .flatten();
-                let optimistic = plan.overlays.clone();
-                let command = yield_session::CatalogCommand::ApplyCurationOperation {
-                    source_id: key.source_id.clone(),
-                    lifecycle_generation: key.lifecycle_generation,
-                    fence: plan.fence,
-                    root_identity: plan.root_identity.clone(),
-                    request_id,
-                    batches: plan.batches.clone(),
-                };
-                match catalog::submit_catalog_command(command, cx) {
-                    Ok(()) => {
-                        if !self.curation_state.accept_operation(&key, plan) {
-                            self.curation_state.set_message(
-                                &key,
-                                if is_playback_record_action(action) {
-                                    String::from("Playback history unavailable: metadata changed")
-                                } else {
-                                    String::from(
-                                        "Curation admission changed; refresh the catalog before editing",
-                                    )
-                                },
-                            );
-                        } else {
-                            self.catalog_metadata.pause_for_curation();
-                            self.display_labels.pause_for_curation(tags_may_change);
-                            tag_chips::invalidate_after_curation(self);
-                            if tags_may_change
-                                || (reusable_tag_mask.is_none()
-                                    && self.view_model.tag_filter().is_enabled())
-                            {
-                                tag_filter::invalidate_after_curation(
-                                    self,
-                                    tag_filter::FilterOrigin::PassiveMetadata,
-                                    cx,
-                                );
-                            }
-                            self.apply_visible_curation(
-                                &key,
-                                &optimistic,
-                                &BTreeMap::new(),
-                                reusable_tag_mask,
-                                cx,
-                            );
-                            self.start_source_registry_poll(cx);
-                        }
-                    }
-                    Err(error) => {
-                        let label = if is_playback_record_action(action) {
-                            "Playback history"
-                        } else {
-                            "Curation"
-                        };
-                        self.curation_state
-                            .set_message(&key, format!("{label} not saved: {error}"));
-                    }
+                if latest_value && self.curation_state.stage_latest(&key, &plan) {
+                    self.catalog_metadata.pause_for_curation();
+                    self.apply_visible_curation(
+                        &key,
+                        &plan.overlays,
+                        &BTreeMap::new(),
+                        tag_filter::capture_ready_mask(self),
+                        cx,
+                    );
+                    self.schedule_latest_curation_flush(key.clone(), 0, cx);
+                } else if self.curation_state.staged_path(&key).is_some() {
+                    self.set_scan_status(String::from(
+                        "Latest curation value is pending; retry this action after it saves",
+                    ));
+                } else if let Err(error) =
+                    self.submit_planned_curation(&key, plan, is_playback_record_action(action), cx)
+                {
+                    let label = if is_playback_record_action(action) {
+                        "Playback history"
+                    } else {
+                        "Curation"
+                    };
+                    self.curation_state
+                        .set_message(&key, format!("{label} not saved: {error}"));
                 }
             }
         }
         cx.notify();
+    }
+
+    fn schedule_latest_curation_flush(
+        &mut self,
+        key: CurationLifecycleKey,
+        retry_count: u8,
+        cx: &mut Context<Self>,
+    ) {
+        self.latest_curation_task = Some(cx.spawn(async move |this, cx| {
+            gpui::Timer::after(LATEST_CURATION_WINDOW).await;
+            let _ = this.update(cx, |browser, cx| {
+                browser.flush_latest_curation_with_retry(&key, retry_count, cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    pub(super) fn flush_latest_curation(
+        &mut self,
+        key: &CurationLifecycleKey,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.flush_latest_curation_with_retry(key, 0, cx)
+    }
+
+    fn flush_latest_curation_with_retry(
+        &mut self,
+        key: &CurationLifecycleKey,
+        retry_count: u8,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(plan) = self.curation_state.latest_plan(key) else {
+            return true;
+        };
+        match self.submit_planned_curation(key, plan, false, cx) {
+            Ok(true) => {
+                self.curation_state.clear_latest(key);
+                true
+            }
+            Ok(false) => {
+                self.reject_latest_curation(key, "curation admission changed", cx);
+                false
+            }
+            Err(CatalogSubmitError::Full) if retry_count < 10 => {
+                self.schedule_latest_curation_flush(key.clone(), retry_count + 1, cx);
+                false
+            }
+            Err(error) => {
+                self.reject_latest_curation(key, &format!("curation not saved: {error}"), cx);
+                false
+            }
+        }
+    }
+
+    fn reject_latest_curation(
+        &mut self,
+        key: &CurationLifecycleKey,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.curation_state.clear_latest(key) {
+            if let Some(visible) = self.curation_state.visible_for_path(key, &path) {
+                self.apply_visible_curation(
+                    key,
+                    &BTreeMap::from([(path, visible)]),
+                    &BTreeMap::new(),
+                    tag_filter::capture_ready_mask(self),
+                    cx,
+                );
+            }
+        }
+        if !self.curation_state.has_pending(key) {
+            self.catalog_metadata.resume_after_rejected_curation();
+        }
+        self.curation_state.set_message(key, reason.to_owned());
+    }
+
+    fn submit_planned_curation(
+        &mut self,
+        key: &CurationLifecycleKey,
+        plan: CurationOperationPlan,
+        playback_history: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, CatalogSubmitError> {
+        let request_id = plan.request_id;
+        let tags_may_change = plan.tags_may_change();
+        let reusable_tag_mask = (!tags_may_change)
+            .then(|| tag_filter::capture_ready_mask(self))
+            .flatten();
+        let optimistic = plan.overlays.clone();
+        let command = yield_session::CatalogCommand::ApplyCurationOperation {
+            source_id: key.source_id.clone(),
+            lifecycle_generation: key.lifecycle_generation,
+            fence: plan.fence,
+            root_identity: plan.root_identity.clone(),
+            request_id,
+            batches: plan.batches.clone(),
+        };
+        catalog::submit_catalog_command(command, cx)?;
+        if !self.curation_state.accept_operation(key, plan) {
+            self.curation_state.set_message(
+                key,
+                if playback_history {
+                    String::from("Playback history unavailable: metadata changed")
+                } else {
+                    String::from("Curation admission changed; refresh the catalog before editing")
+                },
+            );
+            return Ok(false);
+        }
+        self.catalog_metadata.pause_for_curation();
+        self.display_labels.pause_for_curation(tags_may_change);
+        tag_chips::invalidate_after_curation(self);
+        if tags_may_change
+            || (reusable_tag_mask.is_none() && self.view_model.tag_filter().is_enabled())
+        {
+            tag_filter::invalidate_after_curation(
+                self,
+                tag_filter::FilterOrigin::PassiveMetadata,
+                cx,
+            );
+        }
+        self.apply_visible_curation(key, &optimistic, &BTreeMap::new(), reusable_tag_mask, cx);
+        self.start_source_registry_poll(cx);
+        Ok(true)
     }
 
     pub(super) fn submit_add_tags(
@@ -2112,6 +2371,13 @@ impl Browser {
         if tag_filter::scope_pending(self) {
             let message =
                 String::from("Tag filtering is still loading; wait for the visible scope");
+            self.curation_state.set_message(&key, message.clone());
+            cx.notify();
+            return TagAdmissionResult::Rejected(message);
+        }
+        if !self.flush_latest_curation(&key, cx) {
+            let message =
+                String::from("Save the pending rating or listen value before editing tags");
             self.curation_state.set_message(&key, message.clone());
             cx.notify();
             return TagAdmissionResult::Rejected(message);
@@ -3525,6 +3791,172 @@ mod tests {
             ),
             CurationPlan::NoChange { trash_required: 0 }
         ));
+    }
+
+    #[test]
+    fn staged_rating_burst_and_listen_use_one_latest_value_operation() {
+        let path = PathBuf::from("kick.wav");
+        let mut state = install(&[entry("kick.wav", 0, false, 0)]);
+        for _ in 0..2 {
+            let plan = ready_plan(
+                &state,
+                CurationAction::AdjustRating { delta: 1 },
+                std::slice::from_ref(&path),
+            );
+            assert!(state.stage_latest(&key(), &plan));
+        }
+        let plan = ready_plan(
+            &state,
+            CurationAction::RecordPlayback { played_at: 33 },
+            std::slice::from_ref(&path),
+        );
+        assert!(state.stage_latest(&key(), &plan));
+        assert!(!state.has_pending(&key()));
+        assert_eq!(state.next_request_id, 0);
+        assert_eq!(
+            effective_curation(&state.lineages[&key()], &path),
+            Some(curation_with_last_played(2, false, 0, Some(33)))
+        );
+        let coalesced = state.latest_plan(&key()).expect("staged operation");
+        assert_eq!(coalesced.request_id, 1);
+        assert_eq!(coalesced.batches.len(), 1);
+        assert!(matches!(
+            coalesced.batches[0].as_slice(),
+            [SourceCurationUpdate::SetRating { rating, .. }, SourceCurationUpdate::SetLastPlayedAt { played_at: Some(33), .. }]
+                if rating.val() == 2
+        ));
+        assert!(state.accept_operation(&key(), coalesced));
+        state.clear_latest(&key());
+        assert!(state.has_pending(&key()));
+
+        let membership = ready_plan(
+            &state,
+            CurationAction::ToggleCollection { slot: 0 },
+            std::slice::from_ref(&path),
+        );
+        assert_eq!(membership.request_id, 2);
+        assert!(matches!(
+            membership.fence,
+            SourceCurationOperationFence::AfterOperation { request_id: 1 }
+        ));
+        assert!(matches!(
+            membership.batches[0].as_slice(),
+            [SourceCurationUpdate::AddCollection { .. }]
+        ));
+
+        let committed = curation_with_last_played(2, false, 0, Some(33));
+        let application = state
+            .apply_outcome(
+                key(),
+                1,
+                CurationOutcome {
+                    initial_revision: Some(10),
+                    final_revision: Some(11),
+                    committed_batches: vec![receipt(11, "kick.wav", committed)],
+                    failure: None,
+                },
+            )
+            .expect("coalesced operation receipt");
+        assert_eq!(application.revision, 11);
+        let mut reopened = entry("kick.wav", 2, false, 0);
+        reopened.curation = Some(committed);
+        state.install_projection(
+            key(),
+            RootIdentity::from_bytes(b"root".to_vec()),
+            2,
+            11,
+            &[reopened],
+        );
+        assert_eq!(state.visible_for_path(&key(), &path), Some(committed));
+        assert!(!state.has_pending(&key()));
+    }
+
+    #[test]
+    fn preadmission_latest_stage_cancels_without_consuming_id_or_surviving_reprojection() {
+        let path = PathBuf::from("kick.wav");
+        let mut state = install(&[
+            entry("kick.wav", 0, false, 0),
+            entry("other.wav", 0, false, 0),
+        ]);
+        let plan = ready_plan(
+            &state,
+            CurationAction::AdjustRating { delta: 1 },
+            std::slice::from_ref(&path),
+        );
+        assert!(state.stage_latest(&key(), &plan));
+        assert!(!state.stage_latest(
+            &key(),
+            &ready_plan(
+                &state,
+                CurationAction::RecordPlayback { played_at: 44 },
+                &[PathBuf::from("other.wav")],
+            ),
+        ));
+        assert_eq!(state.clear_latest(&key()), Some(path.clone()));
+        assert_eq!(state.next_request_id, 0);
+        assert_eq!(
+            state.visible_for_path(&key(), &path),
+            Some(curation(0, false, 0))
+        );
+
+        let plan = ready_plan(
+            &state,
+            CurationAction::AdjustRating { delta: 1 },
+            std::slice::from_ref(&path),
+        );
+        assert!(state.stage_latest(&key(), &plan));
+        state.install_projection(
+            key(),
+            RootIdentity::from_bytes(b"replacement".to_vec()),
+            3,
+            20,
+            &[entry("kick.wav", 0, false, 0)],
+        );
+        assert!(state.latest_plan(&key()).is_none());
+        assert_eq!(
+            state.visible_for_path(&key(), &path),
+            Some(curation(0, false, 0))
+        );
+    }
+
+    #[test]
+    fn failed_predecessor_discards_staged_latest_value() {
+        let path = PathBuf::from("kick.wav");
+        let mut state = install(&[entry("kick.wav", 0, false, 0)]);
+        let accepted = ready_plan(
+            &state,
+            CurationAction::ToggleCollection { slot: 0 },
+            std::slice::from_ref(&path),
+        );
+        assert!(state.accept_operation(&key(), accepted));
+        let staged = ready_plan(
+            &state,
+            CurationAction::AdjustRating { delta: 1 },
+            std::slice::from_ref(&path),
+        );
+        assert!(state.stage_latest(&key(), &staged));
+        assert!(matches!(
+            state.latest_plan(&key()).expect("latest stage").fence,
+            SourceCurationOperationFence::AfterOperation { request_id: 1 }
+        ));
+        let application = state
+            .apply_outcome(
+                key(),
+                1,
+                CurationOutcome {
+                    initial_revision: Some(10),
+                    final_revision: Some(10),
+                    committed_batches: Vec::new(),
+                    failure: Some(String::from("source revision changed")),
+                },
+            )
+            .expect("accepted predecessor has a terminal outcome");
+        assert!(application.failed);
+        assert!(state.latest_plan(&key()).is_none());
+        assert_eq!(
+            state.visible_for_path(&key(), &path),
+            Some(curation(0, false, 0))
+        );
     }
 
     #[test]

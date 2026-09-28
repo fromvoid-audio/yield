@@ -447,6 +447,7 @@ pub(crate) struct Browser {
     display_labels: display_labels::DisplayLabelsState,
     source_recovery: source_recovery::SourceRecoveryState,
     curation_state: curation::CurationState,
+    latest_curation_task: Option<Task<()>>,
     curation_queue: curation_queue::CurationQueueState,
     tag_editor: tags::TagEditorState,
     tag_completion: tag_completion::TagCompletionState,
@@ -788,6 +789,7 @@ impl Browser {
             display_labels: display_labels::DisplayLabelsState::default(),
             source_recovery: source_recovery::SourceRecoveryState::default(),
             curation_state: curation::CurationState::default(),
+            latest_curation_task: None,
             curation_queue: curation_queue::CurationQueueState::default(),
             tag_editor: tags::TagEditorState::default(),
             tag_completion: tag_completion::TagCompletionState::default(),
@@ -3222,6 +3224,7 @@ impl Browser {
 
 impl Drop for Browser {
     fn drop(&mut self) {
+        self.latest_curation_task.take();
         if let Some(cancellation) = self.scan_cancel.take() {
             cancellation.store(true, Ordering::Release);
         }

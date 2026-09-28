@@ -93,6 +93,11 @@ impl CatalogMetadataState {
         self.debounce_task.take();
     }
 
+    /// Resume lazy reads when a staged edit was rejected before catalog admission.
+    pub(super) fn resume_after_rejected_curation(&mut self) {
+        self.paused = false;
+    }
+
     /// Reinstall the same audited metadata mapping at a newly committed revision.
     pub(super) fn advance_projection_revision(&mut self, revision: u64) -> bool {
         let Some(mut context) = self.context.clone() else {
@@ -630,6 +635,21 @@ mod tests {
         let advanced = state.context().expect("advanced projection context");
         assert_eq!(advanced.revision, 8);
         assert!(state.observe_visible_demand(advanced, vec![PathBuf::from("sample.wav")]));
+    }
+
+    #[test]
+    fn rejected_staged_curation_resumes_demand_at_unchanged_revision() {
+        let context = context(&["sample.wav"]);
+        let mut state = CatalogMetadataState::default();
+        state.install_projection(context.clone());
+        state.pause_for_curation();
+        assert!(!state.observe_visible_demand(context.clone(), vec![PathBuf::from("sample.wav")]));
+        state.resume_after_rejected_curation();
+        assert_eq!(
+            state.context().expect("retained context").revision,
+            context.revision
+        );
+        assert!(state.observe_visible_demand(context, vec![PathBuf::from("sample.wav")]));
     }
 
     #[test]
