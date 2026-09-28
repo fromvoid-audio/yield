@@ -21,9 +21,9 @@ use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use crate::sample_sources::SourceId;
 use crate::sample_sources::db::read::browser_metadata_rows_for_paths;
 use crate::sample_sources::readiness::{
-    ArtifactPublishOutcome, ClaimedReadinessWork, ReadinessError, ReadinessFailureClassification,
-    ReadinessFailureOutcome, ReadinessLeaseRenewalOutcome, ReadinessRetryPolicy, ReadinessTarget,
-    ReadinessWorkMutationOutcome,
+    ArtifactPublishOutcome, ClaimedReadinessWork, ReadinessDeficit, ReadinessError,
+    ReadinessFailureClassification, ReadinessFailureOutcome, ReadinessLeaseRenewalOutcome,
+    ReadinessRetryPolicy, ReadinessTarget, ReadinessWorkMutationOutcome,
 };
 use crate::sample_sources::reconciliation::{
     RootIdentity, RootRelativePath, SourceAuditCommit, SourceAuditRequest,
@@ -46,6 +46,8 @@ use super::transaction::CurationCommitOutcome;
 pub const SOURCE_WRITER_RECEIPT_LIMIT: usize = 256;
 /// Maximum combined request and receipt bytes retained by one source database.
 pub const SOURCE_WRITER_RECEIPT_BYTES_LIMIT: usize = 16 * 1024 * 1024;
+/// Maximum readiness work rows admitted in one retained-writer transaction.
+const SOURCE_READINESS_JOB_BATCH_LIMIT: usize = 64;
 const SOURCE_WRITER_CODEC_VERSION: u8 = 1;
 const SOURCE_ID_MAX_BYTES: usize = 256;
 
@@ -575,10 +577,9 @@ enum SourceWriterFault {
 }
 
 impl SourceWriter {
-    fn validate_readiness_command(
+    fn validate_readiness_revision(
         &self,
         expected: &SourceRevision,
-        target: &ReadinessTarget,
     ) -> Result<(), SourceWriterError> {
         let current = self.current_revision()?;
         if expected.source_id != current.source_id
@@ -587,7 +588,6 @@ impl SourceWriter {
             || expected.database_identity != current.database_identity
             || expected.lifecycle_generation != current.lifecycle_generation
             || expected.lease_epoch != current.lease_epoch
-            || target.source_id != current.source_id.as_str()
         {
             return Err(SourceWriterError::StaleFence);
         }
@@ -598,6 +598,58 @@ impl SourceWriter {
             });
         }
         Ok(())
+    }
+
+    fn validate_readiness_command(
+        &self,
+        expected: &SourceRevision,
+        target: &ReadinessTarget,
+    ) -> Result<(), SourceWriterError> {
+        self.validate_readiness_revision(expected)?;
+        if target.source_id != self.source_id.as_str() {
+            return Err(SourceWriterError::StaleFence);
+        }
+        Ok(())
+    }
+
+    /// Persist at most one bounded batch of current source-owned readiness jobs.
+    /// Reconciliation and feature computation must finish before this transaction begins.
+    pub fn enqueue_readiness_jobs(
+        &mut self,
+        expected: &SourceRevision,
+        deficits: &[ReadinessDeficit],
+        created_at: i64,
+    ) -> Result<usize, SourceWriterError> {
+        if deficits.len() > SOURCE_READINESS_JOB_BATCH_LIMIT {
+            return Err(SourceWriterError::InvalidRequest(
+                "readiness job batch exceeds the source writer limit",
+            ));
+        }
+        let input_bytes = deficits.iter().try_fold(0usize, |total, deficit| {
+            let target = &deficit.target;
+            total
+                .checked_add(target.source_id.len())?
+                .checked_add(target.scope_id.len())?
+                .checked_add(target.relative_path.as_ref().map_or(0, String::len))?
+                .checked_add(target.required_version.len())?
+                .checked_add(target.content_generation.len())
+        });
+        if !input_bytes.is_some_and(|bytes| bytes <= MAX_RECORD_BYTES) {
+            return Err(SourceWriterError::InvalidRequest(
+                "readiness job batch exceeds the source writer byte budget",
+            ));
+        }
+        self.validate_readiness_revision(expected)?;
+        if deficits
+            .iter()
+            .any(|deficit| deficit.target.source_id != self.source_id.as_str())
+        {
+            return Err(SourceWriterError::StaleFence);
+        }
+        Ok(self
+            .database
+            .readiness_store()?
+            .persist_deficits(deficits, created_at)?)
     }
 
     /// Claim one published readiness target under the retained source owner.
