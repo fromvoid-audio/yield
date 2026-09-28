@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use fsevent_sys as fs;
 
-use super::{MAX_REPLAY_EVENTS, ReplayEventCondition, ReplayIngress, ReplayUncertainty};
+use super::{
+    MAX_REPLAY_EVENTS, ReplayEventCondition, ReplayIngress, ReplayPathKind, ReplayUncertainty,
+};
 
 mod native;
 
@@ -101,7 +103,17 @@ pub(super) fn record_callback_event(
         );
         return;
     }
-    ingress.record(Some(event.event_id), &absolute, condition);
+    let kind_flags = flags
+        & (fs::kFSEventStreamEventFlagItemIsFile
+            | fs::kFSEventStreamEventFlagItemIsDir
+            | fs::kFSEventStreamEventFlagItemIsSymlink);
+    let kind = match kind_flags {
+        fs::kFSEventStreamEventFlagItemIsFile => ReplayPathKind::File,
+        fs::kFSEventStreamEventFlagItemIsDir => ReplayPathKind::Directory,
+        fs::kFSEventStreamEventFlagItemIsSymlink => ReplayPathKind::Symlink,
+        _ => ReplayPathKind::Unknown,
+    };
+    ingress.record_with_kind(Some(event.event_id), &absolute, condition, kind);
 }
 
 fn source_absolute_path(volume_root: &Path, volume_relative_path: &Path) -> Option<PathBuf> {

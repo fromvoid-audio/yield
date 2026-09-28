@@ -15,6 +15,10 @@ use crate::SourceWatchSpec;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+mod batch;
+
+pub use batch::ReplayObservationBatch;
+
 /// Maximum number of native paths retained for one replay candidate.
 pub const MAX_REPLAY_EVENTS: usize = 256;
 /// Maximum native path-spelling bytes retained for one replay candidate.
@@ -32,6 +36,19 @@ pub enum ReplayEventCondition {
     /// The watched source root was replaced or removed.
     RootChanged,
     /// The backend delivered an event shape which is not qualified for replay.
+    Unknown,
+}
+
+/// Conservative entry type supplied by the native watcher for a changed path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayPathKind {
+    /// The native event identifies a regular file.
+    File,
+    /// The native event identifies a directory, including a removed directory.
+    Directory,
+    /// The native event identifies a symlink entry.
+    Symlink,
+    /// The backend did not provide one unambiguous entry type.
     Unknown,
 }
 
@@ -81,6 +98,7 @@ impl ReplayUncertainty {
 pub struct ReplayPathEvent {
     event_id: u64,
     relative_path: PathBuf,
+    kind: ReplayPathKind,
 }
 
 impl ReplayPathEvent {
@@ -92,6 +110,11 @@ impl ReplayPathEvent {
     /// Borrow the lexically source-relative path.
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
+    }
+
+    /// Return the conservative native entry type.
+    pub const fn kind(&self) -> ReplayPathKind {
+        self.kind
     }
 }
 
@@ -247,6 +270,17 @@ impl ReplayIngress {
     /// Numeric gaps between delivered FSEvents IDs are normal because IDs come from a global
     /// source. Only missing/regressing IDs or explicit backend loss make this candidate uncertain.
     pub fn record(&self, event_id: Option<u64>, path: &Path, condition: ReplayEventCondition) {
+        self.record_with_kind(event_id, path, condition, ReplayPathKind::Unknown);
+    }
+
+    /// Record a native event with a conservative entry type for later scan-scope selection.
+    pub fn record_with_kind(
+        &self,
+        event_id: Option<u64>,
+        path: &Path,
+        condition: ReplayEventCondition,
+        kind: ReplayPathKind,
+    ) {
         let mut state = lock_unpoisoned(&self.state);
         if state.closed {
             return;
@@ -298,6 +332,7 @@ impl ReplayIngress {
         state.events.push(ReplayPathEvent {
             event_id,
             relative_path: relative_path.to_path_buf(),
+            kind,
         });
     }
 
