@@ -12,7 +12,7 @@ use crate::sample_sources::{SourceDatabase, SourceId};
 
 use super::{META_SOURCE_WATCHER_CHECKPOINT, SourceDbError};
 
-const CHECKPOINT_FORMAT_VERSION: u64 = 3;
+const CHECKPOINT_FORMAT_VERSION: u64 = 4;
 const CHECKPOINT_FIELDS: [&str; 8] = [
     "root_identity",
     "event_id",
@@ -23,10 +23,11 @@ const CHECKPOINT_FIELDS: [&str; 8] = [
     "cause",
     "continuity_proof",
 ];
-const CONTINUITY_PROOF_FIELDS: [&str; 7] = [
+const CONTINUITY_PROOF_FIELDS: [&str; 8] = [
     "root_identity",
     "backend",
     "backend_device",
+    "backend_volume_uuid",
     "watcher_generation",
     "replay_coverage_start_event_id",
     "replay_coverage_end_event_id",
@@ -139,6 +140,7 @@ fn parse_durable_replay_prior(
     let proof_root_identity = string_field(proof, "root_identity")?;
     let backend = string_field(proof, "backend")?;
     let backend_device = u64_field(proof, "backend_device")?;
+    let volume_uuid = uuid::Uuid::parse_str(string_field(proof, "backend_volume_uuid")?).ok()?;
     let replay_start = u64_field(proof, "replay_coverage_start_event_id")?;
     let replay_end = u64_field(proof, "replay_coverage_end_event_id")?;
     let acknowledged_end = u64_field(proof, "acknowledged_end_event_id")?;
@@ -153,9 +155,10 @@ fn parse_durable_replay_prior(
         return None;
     }
 
-    // Keep the backend discriminator in the opaque identity so a future native replay adapter
-    // cannot accidentally treat a notify/process-local stream id as FSEvents authority.
-    let stream_identity = BackendStreamIdentity::from_fsevents_device(backend_device)?;
+    // A numeric macOS device ID is not stable across reboot or volume replacement. The native
+    // replay stream must supply the same volume UUID; a stale or absent UUID cannot authorize it.
+    let stream_identity =
+        BackendStreamIdentity::from_fsevents_volume(backend_device, *volume_uuid.as_bytes())?;
     Some(ReplayPriorToken::from_validated_durable_authority(
         ValidatedReplayAuthority::new(
             expected_source_id.clone(),
@@ -316,7 +319,7 @@ mod tests {
         serde_json::json!({
             "root_identity": "root-a",
             "event_id": 17,
-            "format_version": 3,
+            "format_version": 4,
             "source_id": "source-a",
             "lifecycle_generation": 4,
             "source_revision": 12,
@@ -325,6 +328,7 @@ mod tests {
                 "root_identity": "root-a",
                 "backend": "fsevents",
                 "backend_device": 99,
+                "backend_volume_uuid": "550e8400-e29b-41d4-a716-446655440000",
                 "watcher_generation": 23,
                 "replay_coverage_start_event_id": 7,
                 "replay_coverage_end_event_id": 17,
@@ -366,9 +370,12 @@ mod tests {
         assert_eq!(token.root_identity(), &root());
         assert_eq!(token.watcher_generation(), WatcherGeneration::new(9));
         assert_eq!(token.acknowledged_sequence(), 17);
+        let uuid =
+            uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("fixture UUID");
         assert_eq!(
-            token.backend_stream_identity().as_bytes(),
-            b"fsevents:\0\0\0\0\0\0\0c"
+            token.backend_stream_identity(),
+            &BackendStreamIdentity::from_fsevents_volume(99, *uuid.as_bytes())
+                .expect("volume stream")
         );
     }
 
@@ -397,11 +404,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v2_proofless_and_invalid_checkpoints_fail_closed() {
+    fn same_numeric_device_with_another_volume_uuid_is_a_different_stream() {
+        let original = read(&checkpoint()).expect("original volume token");
+        let replacement = checkpoint().replace(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "550e8400-e29b-41d4-a716-446655440001",
+        );
+        let replacement = read(&replacement).expect("replacement volume token");
+        assert_ne!(
+            original.backend_stream_identity(),
+            replacement.backend_stream_identity()
+        );
+    }
+
+    #[test]
+    fn legacy_v3_proofless_and_invalid_checkpoints_fail_closed() {
+        let old_proof = checkpoint().replace("\"format_version\":4", "\"format_version\":3");
         let values = [
             r#"{"root_identity":"root-a","event_id":17}"#,
             r#"{"root_identity":"root-a","event_id":17,"format_version":2,"source_id":"source-a","lifecycle_generation":4,"source_revision":12,"cause":"targeted_replay"}"#,
             r#"{"root_identity":"root-a","event_id":17,"format_version":3,"source_id":"source-a","lifecycle_generation":4,"source_revision":12,"cause":"targeted_replay","continuity_proof":null}"#,
+            old_proof.as_str(),
             "not-json",
         ];
         for value in values {
@@ -423,6 +446,18 @@ mod tests {
             ),
             checkpoint().replace("\"backend\":\"fsevents\"", "\"backend\":\"notify\""),
             checkpoint().replace("\"backend_device\":99", "\"backend_device\":0"),
+            checkpoint().replace(
+                ",\"backend_volume_uuid\":\"550e8400-e29b-41d4-a716-446655440000\"",
+                "",
+            ),
+            checkpoint().replace(
+                "\"backend_volume_uuid\":\"550e8400-e29b-41d4-a716-446655440000\"",
+                "\"backend_volume_uuid\":\"00000000-0000-0000-0000-000000000000\"",
+            ),
+            checkpoint().replace(
+                "\"backend_volume_uuid\":\"550e8400-e29b-41d4-a716-446655440000\"",
+                "\"backend_volume_uuid\":\"malformed\"",
+            ),
             checkpoint().replace(
                 "\"replay_coverage_start_event_id\":7",
                 "\"replay_coverage_start_event_id\":18",
