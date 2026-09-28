@@ -9495,7 +9495,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn missing_legacy_register_preserves_existing_profile_handle() {
+    fn missing_register_retains_handle_and_restored_root_reconnects_same_source() {
         let fixture = Fixture::new("catalog-register-missing-root");
         let source_id = SourceId::from_string("source-register-missing-root");
         let service = CatalogService::start(&fixture.guard).expect("catalog service");
@@ -9543,6 +9543,41 @@ mod tests {
             SourceDbError::ProfileOwnership(
                 ProfileOwnershipError::ProfileChildAlreadyLeased { .. }
             )
+        ));
+        let restored_proof = resolve_source_root(fixture.root.path()).expect("restored root");
+        service
+            .submit(CatalogCommand::RegisterVerified {
+                source_id: source_id.clone(),
+                root: restored_proof,
+                lifecycle_generation: 3,
+            })
+            .expect("restored source register admission");
+        let registered = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Registered { source_id: observed, lifecycle_generation: 3 }
+                    if observed == &source_id
+            )
+        });
+        assert!(matches!(registered, CatalogEvent::Registered { .. }));
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id: source_id.clone(),
+                lifecycle_generation: 3,
+            })
+            .expect("restored source audit admission");
+        let restored = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::AuditCommitted { snapshot }
+                    if snapshot.source_id == source_id
+                        && snapshot.lifecycle_generation == 3
+            )
+        });
+        assert!(matches!(
+            restored,
+            CatalogEvent::AuditCommitted { snapshot }
+                if snapshot.source_id == source_id && snapshot.lifecycle_generation == 3
         ));
         service.shutdown();
     }
