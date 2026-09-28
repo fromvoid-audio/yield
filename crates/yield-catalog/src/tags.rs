@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -5,11 +6,16 @@ use std::sync::{Arc, Mutex};
 use yield_library::app_dirs::WritableProfileGuard;
 use yield_library::sample_sources::db::normalize_relative_path;
 use yield_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
-use yield_library::sample_sources::{SourceId, SourceTagPage, SourceTagPageCursor};
+use yield_library::sample_sources::{
+    SourceId, SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage,
+    SourceTagPageCursor,
+};
 
 use super::{
-    AdmissionState, CatalogError, CatalogSnapshot, CatalogTagPageQuery, RegisteredSource,
-    publication_is_current, source_root_identity,
+    AdmissionState, CatalogError, CatalogSnapshot, CatalogTagAssignmentPreview,
+    CatalogTagAssignmentPreviewSource, CatalogTagPageQuery, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
+    MAX_TAG_ASSIGNMENT_PREVIEW_PATHS, MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES, RegisteredSource,
+    begin_source_attempt, publication_is_current, source_root_identity,
 };
 
 /// A completed bounded tag read before it is published to the catalog event queue.
@@ -17,6 +23,12 @@ pub(crate) struct TagPagePatch {
     pub(crate) root_identity: RootIdentity,
     pub(crate) revision: u64,
     pub(crate) page: SourceTagPage,
+}
+
+pub(crate) struct AssignmentPagePatch {
+    pub(crate) root_identity: RootIdentity,
+    pub(crate) revision: u64,
+    pub(crate) page: SourceTagAssignmentPage,
 }
 
 /// A completed bounded tag-filter read before it is published to the catalog event queue.
@@ -189,6 +201,258 @@ pub(crate) fn read_page(
         root_identity: expected_root_identity,
         revision: expected_revision,
         page,
+    })
+}
+
+pub(crate) fn read_assignment_page(
+    source: &RegisteredSource,
+    source_id: &SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    label: &str,
+    after_cursor: Option<&SourceTagAssignmentCursor>,
+    page_limit: usize,
+    token: &Arc<AtomicBool>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    profile_guard: &WritableProfileGuard,
+) -> Result<AssignmentPagePatch, CatalogError> {
+    ensure_current(admission, source_id, lifecycle_generation, token)?;
+    profile_guard.validate_current().map_err(|error| {
+        super::catalog_error_from_db_for_source(
+            source_id,
+            yield_library::sample_sources::SourceDbError::ProfileOwnership(error),
+        )
+    })?;
+    source
+        .database
+        .validate_profile_guard(profile_guard)
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+    let snapshot = source
+        .snapshot
+        .as_ref()
+        .ok_or(CatalogError::SnapshotUnavailable)?;
+    ensure_snapshot_identity(snapshot, source, source_id, lifecycle_generation)?;
+    if snapshot.committed_revision != expected_revision {
+        return Err(CatalogError::StaleRevision {
+            expected: expected_revision,
+            actual: snapshot.committed_revision,
+        });
+    }
+    let expected_root_identity = source
+        .known_root_identity
+        .clone()
+        .unwrap_or_else(|| snapshot.root_identity.clone());
+    if expected_root_identity != snapshot.root_identity {
+        return Err(CatalogError::StaleRootGeneration {
+            source_id: source_id.clone(),
+            detail: String::from("retained source root identity differs from snapshot identity"),
+        });
+    }
+    if checked_source_root_identity(source_id, &source.root)? != expected_root_identity {
+        return Err(CatalogError::StaleRootGeneration {
+            source_id: source_id.clone(),
+            detail: String::from("source root identity differs from the retained snapshot"),
+        });
+    }
+    let before_revision = source
+        .database
+        .get_revision()
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+    if before_revision != expected_revision {
+        return Err(CatalogError::StaleRevision {
+            expected: expected_revision,
+            actual: before_revision,
+        });
+    }
+    ensure_current(admission, source_id, lifecycle_generation, token)?;
+    let page = source
+        .database
+        .tag_assignments_page_at_revision(expected_revision, label, after_cursor, page_limit, token)
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+    if page.revision != expected_revision || page.paths.len() > super::SOURCE_TAG_PAGE_MAX_PAGE_SIZE
+    {
+        return Err(CatalogError::Database(String::from(
+            "tag assignment page violated its revision or size bound",
+        )));
+    }
+    ensure_current(admission, source_id, lifecycle_generation, token)?;
+    profile_guard.validate_current().map_err(|error| {
+        super::catalog_error_from_db_for_source(
+            source_id,
+            yield_library::sample_sources::SourceDbError::ProfileOwnership(error),
+        )
+    })?;
+    source
+        .database
+        .validate_profile_guard(profile_guard)
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+    if checked_source_root_identity(source_id, &source.root)? != expected_root_identity {
+        return Err(CatalogError::StaleRootGeneration {
+            source_id: source_id.clone(),
+            detail: String::from("source root identity changed during tag assignment read"),
+        });
+    }
+    let after_revision = source
+        .database
+        .get_revision()
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+    if after_revision != expected_revision {
+        return Err(CatalogError::StaleRevision {
+            expected: expected_revision,
+            actual: after_revision,
+        });
+    }
+    let retained_revision = source
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.committed_revision)
+        .ok_or(CatalogError::SnapshotUnavailable)?;
+    if retained_revision != expected_revision {
+        return Err(CatalogError::StaleRevision {
+            expected: expected_revision,
+            actual: retained_revision,
+        });
+    }
+    ensure_current(admission, source_id, lifecycle_generation, token)?;
+    Ok(AssignmentPagePatch {
+        root_identity: expected_root_identity,
+        revision: expected_revision,
+        page,
+    })
+}
+
+pub(crate) fn read_assignment_preview(
+    label: &str,
+    profile_guard: &WritableProfileGuard,
+    admission: &Arc<Mutex<AdmissionState>>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) -> Result<CatalogTagAssignmentPreview, CatalogError> {
+    if sources.len() > MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES {
+        return Err(CatalogError::TagAssignmentPreviewTooManySources {
+            max: MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES,
+            actual: sources.len(),
+        });
+    }
+    let mut ids = sources.keys().cloned().collect::<Vec<_>>();
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let mut captured = Vec::with_capacity(ids.len());
+    let mut affected_sources = Vec::new();
+    let mut total_assignments = 0usize;
+    let mut total_bytes = 0usize;
+    for source_id in &ids {
+        let source = sources
+            .get_mut(source_id)
+            .expect("captured source remains in worker map");
+        let lifecycle_generation = source.lifecycle_generation;
+        let expected_revision = source
+            .snapshot
+            .as_ref()
+            .ok_or(CatalogError::SnapshotUnavailable)?
+            .committed_revision;
+        let token = begin_source_attempt(admission, source_id, lifecycle_generation)
+            .ok_or(CatalogError::Canceled)?;
+        source.attempt_token = Some(Arc::clone(&token));
+        let mut cursor = None;
+        let mut paths = Vec::new();
+        let root_identity = loop {
+            let patch = read_assignment_page(
+                source,
+                source_id,
+                lifecycle_generation,
+                expected_revision,
+                label,
+                cursor.as_ref(),
+                super::SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
+                &token,
+                admission,
+                profile_guard,
+            )?;
+            for path in patch.page.paths {
+                total_assignments = total_assignments.saturating_add(1);
+                total_bytes = total_bytes.saturating_add(super::encoded_path_len(&path));
+                if total_assignments > MAX_TAG_ASSIGNMENT_PREVIEW_PATHS {
+                    return Err(CatalogError::TagAssignmentPreviewTooLarge {
+                        limit: "assignment count",
+                        max: MAX_TAG_ASSIGNMENT_PREVIEW_PATHS,
+                    });
+                }
+                if total_bytes > MAX_TAG_ASSIGNMENT_PREVIEW_BYTES {
+                    return Err(CatalogError::TagAssignmentPreviewTooLarge {
+                        limit: "path bytes",
+                        max: MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
+                    });
+                }
+                paths.push(path);
+            }
+            cursor = patch.page.next_cursor;
+            if cursor.is_none() {
+                break patch.root_identity;
+            }
+        };
+        captured.push((
+            source_id.clone(),
+            lifecycle_generation,
+            expected_revision,
+            root_identity.clone(),
+            token,
+        ));
+        if !paths.is_empty() {
+            affected_sources.push(CatalogTagAssignmentPreviewSource {
+                source_id: source_id.clone(),
+                lifecycle_generation,
+                root_identity,
+                revision: expected_revision,
+                paths,
+            });
+        }
+    }
+    // The preview must represent one complete source set, even when a registry command is
+    // admitted concurrently with this worker read.
+    let current_ids = super::admission_state(admission, |state| {
+        let mut current = state
+            .sources
+            .iter()
+            .filter(|(_, source)| source.active)
+            .map(|(source_id, _)| source_id.clone())
+            .collect::<Vec<_>>();
+        current.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        current
+    });
+    if current_ids != ids {
+        return Err(CatalogError::Canceled);
+    }
+    profile_guard
+        .validate_current()
+        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    for (source_id, generation, revision, root_identity, token) in &captured {
+        ensure_current(admission, source_id, *generation, token)?;
+        let source = sources.get(source_id).ok_or(CatalogError::Canceled)?;
+        source
+            .database
+            .validate_profile_guard(profile_guard)
+            .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+        if checked_source_root_identity(source_id, &source.root)? != *root_identity {
+            return Err(CatalogError::StaleRootGeneration {
+                source_id: source_id.clone(),
+                detail: String::from("source root changed during assignment preview"),
+            });
+        }
+        let actual = source
+            .database
+            .get_revision()
+            .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+        if actual != *revision {
+            return Err(CatalogError::StaleRevision {
+                expected: *revision,
+                actual,
+            });
+        }
+    }
+    Ok(CatalogTagAssignmentPreview {
+        label: label.to_owned(),
+        checked_sources: ids.len(),
+        affected_sources,
+        total_assignments,
     })
 }
 

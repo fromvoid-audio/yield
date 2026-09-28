@@ -9,10 +9,12 @@ pub use yield_catalog::{
     CatalogCommand, CatalogCurationRequestError, CatalogCurationTagFactsRequestError,
     CatalogDelivery, CatalogDisplayLabelsRequestError, CatalogError, CatalogEvent,
     CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError,
-    CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
-    CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
-    MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
-    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES,
+    CatalogTagAssignmentPreview, CatalogTagAssignmentPreviewSource, CatalogTagFilterRequestError,
+    CatalogTagPageQuery, CatalogTagPageRequestError, CatalogWavMetadataRequestError,
+    MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
+    MAX_CURATION_OPERATION_RECEIPT_BYTES, MAX_CURATION_OPERATION_UPDATES,
+    MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
+    MAX_TAG_ASSIGNMENT_PREVIEW_PATHS, MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES,
     MAX_TAG_FILTER_MASK_BYTES, MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES,
     MAX_WAV_METADATA_REQUEST_PATHS, SOURCE_CURATION_TAG_FACTS_MAX_PATHS,
     SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
@@ -20,8 +22,8 @@ pub use yield_catalog::{
     SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS,
     SourceCurationCommitReceipt, SourceCurationOperationFailure, SourceCurationOperationFence,
     SourceCurationOperationOutcome, SourceCurationTagFacts, SourceCurationUpdate,
-    SourceDisplayLabelEntry, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
-    VerifiedSourceRoot, resolve_source_root,
+    SourceDisplayLabelEntry, SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage,
+    SourceTagPageCursor, SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
 };
 
 /// Lifecycle state of the independently-owned source catalog worker.
