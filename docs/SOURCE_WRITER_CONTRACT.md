@@ -230,6 +230,14 @@ duplicate from a different request. This contract does not add a second journal 
 silently route curation-family callers; those migrations belong to OPT-1782 through
 OPT-1794.
 
+The GPUI catalog's ordinary metadata and collection edits now enter the retained
+`SourceWriter::commit_catalog_curation_command` with an owner-issued `SourceRevision`.
+They retain the catalog's one-terminal-response and stale-revision retry behavior;
+volatile UI request IDs are not substituted for durable operation-journal identities.
+The durable `SourceWriterRequest` receipt table remains reserved for commands that
+carry a stable operation/participant/command identity, so a long UI editing session
+does not exhaust its finite history budget.
+
 ## Read-only snapshots
 
 The read contract is a bounded observation of a source revision. A snapshot request names
