@@ -484,6 +484,57 @@ impl CurationFixture {
     }
 }
 
+#[test]
+fn catalog_curation_command_renews_live_source_lease_after_idle() {
+    let fixture = CurationFixture::new_profile_bound();
+    let writer = SourceWriter::new(
+        fixture.database,
+        SourceId::from_string("idle-curation-writer"),
+        1,
+    )
+    .expect("source writer");
+    let expected = writer.current_revision().expect("current revision");
+    writer
+        .database_for_tests()
+        .connection
+        .execute(
+            "UPDATE source_lease SET expires_at = acquired_at WHERE singleton = 1",
+            [],
+        )
+        .expect("expire retained source lease");
+    assert!(matches!(
+        writer.current_revision(),
+        Err(SourceWriterError::Database(SourceDbError::SourceLease(
+            crate::sample_sources::db::SourceLeaseError::Expired { .. }
+        )))
+    ));
+
+    let renewed = writer
+        .current_revision_for_command()
+        .expect("live owner renews before command qualification");
+    assert_eq!(renewed.revision(), expected.revision());
+    let receipt = writer
+        .commit_catalog_curation_command(
+            &renewed,
+            &fixture.profile_guard,
+            &[SourceCurationUpdate::SetRating {
+                path: CurationFixture::path("one.wav"),
+                rating: Rating::KEEP_1,
+            }],
+        )
+        .expect("curation after idle");
+    assert_eq!(receipt.source_revision(), expected.revision() + 1);
+    assert_eq!(
+        writer
+            .database_for_tests()
+            .entry_for_path(Path::new("one.wav"))
+            .expect("entry after curation")
+            .expect("rated entry")
+            .tag,
+        Rating::KEEP_1
+    );
+}
+
 /// Test-only binding whose retained identity can be invalidated on every host.
 ///
 /// Unix tests below exercise actual profile-child replacement. This seam keeps the same

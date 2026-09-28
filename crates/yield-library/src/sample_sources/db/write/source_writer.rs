@@ -1107,6 +1107,16 @@ impl SourceWriter {
         })
     }
 
+    /// Renew this retained writer's lease before qualifying a catalog mutation.
+    ///
+    /// Read-only revision and publication checks remain strict and do not renew ownership.
+    /// A live writer may have been idle past the durable lease expiry while still holding its
+    /// source lock; mutation admission revalidates that authority before reading its revision.
+    pub fn current_revision_for_command(&self) -> Result<SourceRevision, SourceWriterError> {
+        self.database.validate_profile_owned_mutation()?;
+        self.current_revision()
+    }
+
     /// Commit one bounded catalog metadata/collection command on the retained source.
     ///
     /// Catalog requests have a revision fence and one terminal response, rather than a durable
@@ -1118,7 +1128,7 @@ impl SourceWriter {
         profile_guard: &WritableProfileGuard,
         updates: &[SourceCurationUpdate],
     ) -> Result<SourceCurationCommitReceipt, SourceWriterError> {
-        let current = self.current_revision()?;
+        let current = self.current_revision_for_command()?;
         if expected.source_id != current.source_id
             || expected.root_identity != current.root_identity
             || expected.root_binding_identity != current.root_binding_identity
