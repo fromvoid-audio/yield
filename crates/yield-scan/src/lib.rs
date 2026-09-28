@@ -15,5 +15,6 @@ pub use sample_sources::scanner::{
     complete_deferred_hashes, complete_deferred_rename_candidates,
     complete_deferred_rename_candidates_with_cancel, complete_pending_deep_hash_for_path,
     complete_pending_deep_hashes, hard_rescan, scan_in_background, scan_once, scan_with_progress,
-    scan_with_progress_and_writer_and_committed_batch, sync_paths, sync_paths_with_progress,
+    scan_with_progress_and_writer_and_committed_batch, sync_exact_paths_with_source_writer,
+    sync_paths, sync_paths_with_progress, sync_paths_with_source_writer,
 };

@@ -11,7 +11,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use yield_library::sample_sources::reconciliation::RootRelativePath;
 use yield_library::sample_sources::{
     SourceEntryClassification, SourceEntryFileType, SourceFileClassification,
-    SourceIndexDiagnostic, SourceIndexEntry, SourceTraversalPolicy,
+    SourceIndexDiagnostic, SourceIndexEntry, SourceTraversalPolicy, SourceWriter,
     classify_source_entry_with_policy, is_rejected_source_file_path,
 };
 
@@ -37,6 +37,34 @@ const TARGET_PREPARE_BATCH_SIZE: usize = 64;
 /// pending-rename rules used by a normal quick scan.
 pub fn sync_paths(db: &SourceDatabase, paths: &[PathBuf]) -> Result<ScanStats, ScanError> {
     sync_paths_with_progress(db, paths, None, &mut |_, _| {})
+}
+
+/// Reconcile exact live entries through a retained profile-bound source writer.
+/// The owner supplies both the database and every bounded commit fence.
+pub fn sync_exact_paths_with_source_writer(
+    owner: &SourceWriter,
+    paths: &[RootRelativePath],
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut impl FnMut(usize, &Path),
+) -> Result<ScanStats, ScanError> {
+    sync_exact_paths_with_progress_and_writer(
+        owner.catalog_database(),
+        paths,
+        cancel,
+        on_progress,
+        owner,
+    )
+}
+
+/// Reconcile a bounded set of exact or subtree targets through one retained
+/// profile-bound source writer, preserving the target scopes on every read.
+pub fn sync_paths_with_source_writer(
+    owner: &SourceWriter,
+    paths: &[PathBuf],
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut impl FnMut(usize, &Path),
+) -> Result<ScanStats, ScanError> {
+    sync_paths_with_progress_and_writer(owner.catalog_database(), paths, cancel, on_progress, owner)
 }
 
 /// Validate exact-entry paths without following any path component.

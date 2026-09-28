@@ -4,6 +4,7 @@ use yield_library::sample_sources::db::{ManifestCommitResult, SourceWriteBatch};
 use yield_library::sample_sources::reconciliation::{
     RootIdentity, SourceAuditCommit, SourceAuditRequest,
 };
+use yield_library::sample_sources::{SourceWriter, SourceWriterError};
 
 /// Database mutation phases exposed by the scanner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,4 +86,74 @@ impl ScanWriter for UncoordinatedScanWriter {
     type Guard = ();
 
     fn lock(&self, _phase: ScanWritePhase) -> Self::Guard {}
+}
+
+/// A retained source owner can coordinate targeted scanner writes directly.
+/// The catalog's own scan writer adds lifecycle admission on top of this
+/// physical source check when a catalog operation owns the scan.
+impl ScanWriter for SourceWriter {
+    type Guard = ();
+
+    fn lock(&self, phase: ScanWritePhase) -> Self::Guard {
+        self.try_lock(phase)
+            .expect("source scan writer lock must retain physical authority")
+    }
+
+    fn try_lock(&self, _phase: ScanWritePhase) -> Result<Self::Guard, ScanError> {
+        self.current_scan_fence().map_err(source_writer_error)?;
+        Ok(())
+    }
+
+    fn commit_bounded_manifest_batch(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        expected_revision: u64,
+    ) -> Result<ManifestCommitResult, ScanError> {
+        let fence = self.current_scan_fence().map_err(source_writer_error)?;
+        if fence.revision() != expected_revision {
+            return Err(ScanError::StaleRevision {
+                expected: expected_revision,
+                actual: fence.revision(),
+            });
+        }
+        self.commit_scan_manifest_batch(&fence, batch)
+            .map_err(source_writer_error)
+    }
+
+    fn commit_scan_audit_completion(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        generation: u64,
+        expected_revision: u64,
+        completed_at: i64,
+        root_identity: RootIdentity,
+        audit_request: Option<&SourceAuditRequest>,
+    ) -> Result<(SourceAuditCommit, Vec<SourceManifestEntry>), ScanError> {
+        let fence = self.current_scan_fence().map_err(source_writer_error)?;
+        if fence.revision() != expected_revision {
+            return Err(ScanError::StaleRevision {
+                expected: expected_revision,
+                actual: fence.revision(),
+            });
+        }
+        self.commit_scan_audit_completion(
+            &fence,
+            batch,
+            generation,
+            completed_at,
+            root_identity,
+            audit_request,
+        )
+        .map_err(source_writer_error)
+    }
+}
+
+fn source_writer_error(error: SourceWriterError) -> ScanError {
+    match error {
+        SourceWriterError::Database(error) => ScanError::Db(error),
+        SourceWriterError::StaleRevision { expected, actual } => {
+            ScanError::StaleRevision { expected, actual }
+        }
+        error => ScanError::SourceOwner(error.to_string()),
+    }
 }

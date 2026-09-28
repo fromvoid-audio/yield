@@ -9792,6 +9792,188 @@ mod tests {
     }
 
     #[test]
+    fn retained_writer_routes_exact_and_overlapping_subtree_scans() {
+        use yield_scan::sample_sources::scanner::{
+            sync_exact_paths_with_source_writer, sync_paths_with_progress_and_writer,
+            sync_paths_with_source_writer,
+        };
+
+        let fixture = Fixture::new("catalog-targeted-source-writer");
+        let source_id = SourceId::from_string("source-targeted-source-writer");
+        fs::create_dir(fixture.root.path().join("group")).unwrap();
+        write_test_wav(&fixture.root.path().join("one.wav"), 44_100, 128);
+        write_test_wav(&fixture.root.path().join("group/two.wav"), 44_100, 128);
+        write_test_wav(&fixture.root.path().join("outside.wav"), 44_100, 128);
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .unwrap();
+        let retained = CatalogSourceDatabase::new(database, source_id.clone(), 1).unwrap();
+        let token = Arc::new(AtomicBool::new(false));
+        let admission = Mutex::new(AdmissionState::new());
+        admission.lock().unwrap().sources.insert(
+            source_id.clone(),
+            DesiredSource {
+                lifecycle_generation: 1,
+                active: true,
+                attempt_token: Some(Arc::clone(&token)),
+                last_curation_request_id: None,
+            },
+        );
+        let catalog_writer = CatalogScanWriter {
+            profile_guard: &fixture.guard,
+            database: &retained,
+            cancel: Some(token.as_ref()),
+            owner: Some(&retained.writer),
+            lifecycle: Some(CatalogScanLifecycle {
+                admission: &admission,
+                source_id: &source_id,
+                generation: 1,
+                token: &token,
+            }),
+        };
+        audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+            &retained,
+            None,
+            now_epoch_seconds(),
+            &mut |_, _| {},
+            &catalog_writer,
+            None,
+        )
+        .unwrap();
+
+        write_test_wav(&fixture.root.path().join("one.wav"), 44_100, 256);
+        let exact = RootRelativePath::try_from_path(PathBuf::from("one.wav")).unwrap();
+        let exact_stats =
+            sync_exact_paths_with_source_writer(&retained.writer, &[exact], None, &mut |_, _| {})
+                .unwrap();
+        assert_eq!(exact_stats.targeted_manifest_scope_count, 1);
+        assert_eq!(exact_stats.committed_delta.changed.len(), 1);
+        assert_eq!(
+            exact_stats.committed_delta.revision,
+            retained.writer.current_scan_fence().unwrap().revision()
+        );
+
+        write_test_wav(&fixture.root.path().join("group/two.wav"), 44_100, 256);
+        let subtree_stats = sync_paths_with_source_writer(
+            &retained.writer,
+            &[PathBuf::from("group"), PathBuf::from("group/two.wav")],
+            None,
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(subtree_stats.targeted_manifest_scope_count, 1);
+        assert_eq!(subtree_stats.committed_delta.changed.len(), 1);
+        assert_eq!(
+            subtree_stats.committed_delta.changed[0].relative_path,
+            PathBuf::from("group/two.wav")
+        );
+        assert_eq!(
+            subtree_stats.committed_delta.revision,
+            retained.writer.current_scan_fence().unwrap().revision()
+        );
+        assert!(
+            retained
+                .entry_for_path(Path::new("outside.wav"))
+                .unwrap()
+                .is_some()
+        );
+
+        token.store(true, Ordering::Release);
+        let revision = retained.get_revision().unwrap();
+        assert!(matches!(
+            sync_paths_with_source_writer(
+                &retained.writer,
+                &[PathBuf::from("group")],
+                Some(token.as_ref()),
+                &mut |_, _| {},
+            ),
+            Err(ScanError::Canceled)
+        ));
+        assert_eq!(retained.get_revision().unwrap(), revision);
+        token.store(false, Ordering::Release);
+
+        write_test_wav(&fixture.root.path().join("one.wav"), 44_100, 512);
+        let mut retired_during_targeted_traversal = false;
+        assert!(matches!(
+            sync_paths_with_progress_and_writer(
+                &retained,
+                &[PathBuf::from("one.wav")],
+                None,
+                &mut |_, _| {
+                    apply_admission_action(
+                        &mut admission.lock().unwrap(),
+                        AdmissionAction::Remove {
+                            source_id: source_id.clone(),
+                            lifecycle_generation: 2,
+                        },
+                    );
+                    retired_during_targeted_traversal = true;
+                },
+                &catalog_writer,
+            ),
+            Err(ScanError::StaleLifecycle { .. })
+        ));
+        assert!(retired_during_targeted_traversal);
+        assert_eq!(retained.get_revision().unwrap(), revision);
+    }
+
+    #[test]
+    fn targeted_source_writer_rejects_root_replacement_before_commit() {
+        use yield_scan::sample_sources::scanner::sync_paths_with_source_writer;
+
+        let fixture = Fixture::new("catalog-targeted-root-replacement");
+        let root = fixture.root.path().join("source");
+        let moved_root = fixture.root.path().join("retired-source");
+        fs::create_dir(&root).unwrap();
+        write_test_wav(&root.join("one.wav"), 44_100, 128);
+        let source_id = SourceId::from_string("source-targeted-root-replacement");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            &root,
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .unwrap();
+        let retained = CatalogSourceDatabase::new(database, source_id, 1).unwrap();
+        sync_paths_with_source_writer(
+            &retained.writer,
+            &[PathBuf::from("one.wav")],
+            None,
+            &mut |_, _| {},
+        )
+        .unwrap();
+        let before = retained
+            .entry_for_path(Path::new("one.wav"))
+            .unwrap()
+            .expect("initial live row");
+        let revision = retained.get_revision().unwrap();
+        write_test_wav(&root.join("one.wav"), 44_100, 256);
+        let mut replaced = false;
+        let result = sync_paths_with_source_writer(
+            &retained.writer,
+            &[PathBuf::from("one.wav")],
+            None,
+            &mut |_, _| {
+                fs::rename(&root, &moved_root).unwrap();
+                fs::create_dir(&root).unwrap();
+                write_test_wav(&root.join("one.wav"), 44_100, 256);
+                replaced = true;
+            },
+        );
+        assert!(replaced);
+        assert!(result.is_err());
+        assert_eq!(retained.get_revision().unwrap(), revision);
+        let after = retained
+            .entry_for_path(Path::new("one.wav"))
+            .unwrap()
+            .expect("last-good live row");
+        assert_eq!(after.file_size, before.file_size);
+        assert_eq!(after.content_hash, before.content_hash);
+    }
+
+    #[test]
     fn registration_reclaims_restart_abandoned_staging() {
         let fixture = Fixture::new("catalog-restart-orphan");
         let source_id = SourceId::from_string("source-a");

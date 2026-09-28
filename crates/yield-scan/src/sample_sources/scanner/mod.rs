@@ -32,8 +32,9 @@ pub use scan::{
     scan_with_progress_and_writer_and_committed_batch,
 };
 pub use scan_paths::{
-    sync_exact_paths_with_progress_and_writer, sync_paths, sync_paths_with_progress,
-    sync_paths_with_progress_and_writer, validate_exact_regular_paths,
+    sync_exact_paths_with_progress_and_writer, sync_exact_paths_with_source_writer, sync_paths,
+    sync_paths_with_progress, sync_paths_with_progress_and_writer, sync_paths_with_source_writer,
+    validate_exact_regular_paths,
 };
 pub use scan_writer::{ScanWritePhase, ScanWriter, UncoordinatedScanWriter};
 pub use wav_metadata::{WavDisplayMetadata, read_wav_display_metadata_for_manifest};
