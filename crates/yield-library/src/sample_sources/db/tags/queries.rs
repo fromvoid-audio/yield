@@ -1326,10 +1326,15 @@ mod plan_tests {
         tag_prefix_upper_bound, tag_vocabulary_sql,
     };
 
+    fn open_tag_test_db(root: &Path) -> SourceDatabase {
+        drop(SourceDatabase::open_for_maintenance(root).expect("prepare source schema"));
+        SourceDatabase::open_for_user_metadata_write(root).expect("operational metadata open")
+    }
+
     #[test]
     fn vocabulary_prefix_range_plans_include_an_index_seek() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
         for label in ["alpha", "atom", "beta"] {
             database
@@ -1356,7 +1361,7 @@ mod plan_tests {
     #[test]
     fn selected_tag_page_plan_uses_wav_file_tag_primary_key_lookup() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
         database
             .assign_tag_to_path(Path::new("one.wav"), "shared")
@@ -1394,7 +1399,7 @@ mod plan_tests {
     #[test]
     fn selected_tag_ids_page_plan_uses_bounded_path_and_id_lookups() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
         let tag = database
             .assign_tag_to_path(Path::new("one.wav"), "shared")
@@ -1446,7 +1451,7 @@ mod plan_tests {
     #[test]
     fn selected_tag_ids_page_cancels_during_grouped_query_and_cleans_temp_scope() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         let paths = (0..4096)
             .map(|index| PathBuf::from(format!("sample-{index:04}.wav")))
             .collect::<Vec<_>>();
@@ -1505,7 +1510,7 @@ mod plan_tests {
     #[test]
     fn curation_facts_keep_each_live_path_and_empty_tag_set_distinct() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         for name in ["empty.wav", "complete.wav", "playback.wav"] {
             database.upsert_file(Path::new(name), 10, 5).unwrap();
         }
@@ -1550,7 +1555,7 @@ mod plan_tests {
     #[test]
     fn curation_facts_reject_missing_stale_canceled_and_legacy_rows() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
         let tag = database
             .assign_tag_to_path(Path::new("one.wav"), "kick")
@@ -1613,7 +1618,7 @@ mod plan_tests {
     #[test]
     fn curation_facts_cancel_during_sql_and_recover_connection() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         let paths = (0..64)
             .map(|index| PathBuf::from(format!("sample-{index:02}.wav")))
             .collect::<Vec<_>>();

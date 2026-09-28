@@ -4,7 +4,7 @@ use fixtures::{assert_source_db_schema_contract, with_legacy_db};
 #[test]
 fn fresh_source_database_satisfies_schema_contract() {
     let dir = tempfile::tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = SourceDatabase::open_for_maintenance(dir.path()).unwrap();
 
     assert_source_db_schema_contract(&db.connection);
     assert_eq!(
@@ -90,7 +90,7 @@ fn current_stamped_source_database_repairs_schema_contract() {
         schema::SOURCE_DB_SCHEMA_VERSION
     ));
 
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = SourceDatabase::open_for_maintenance(dir.path()).unwrap();
 
     assert_source_db_schema_contract(&db.connection);
     assert_eq!(
