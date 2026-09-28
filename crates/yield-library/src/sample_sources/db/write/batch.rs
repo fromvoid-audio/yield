@@ -33,6 +33,16 @@ const CLEAR_LAST_CURATED_AT_SQL: &str =
     "UPDATE wav_files SET last_curated_at = NULL WHERE path = ?1";
 
 impl<'conn> SourceWriteBatch<'conn> {
+    /// Read coordination metadata under this batch's immediate writer reservation.
+    pub(super) fn coordination_metadata(&self, key: &str) -> Result<Option<String>, SourceDbError> {
+        self.tx
+            .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(map_sql_error)
+    }
+
     /// Check that an existing live row is present without changing scanner-owned facts.
     ///
     /// Auxiliary metadata writers use this guard in their own transaction so a stale file

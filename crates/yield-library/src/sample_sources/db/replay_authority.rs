@@ -6,7 +6,8 @@ use serde_json::{Map, Value};
 use std::fmt;
 
 use crate::sample_sources::reconciliation::{
-    BackendStreamIdentity, ReplayPriorToken, RootIdentity, WatcherGeneration,
+    BackendStreamIdentity, ReplayPriorToken, RootIdentity, WatcherContinuityProof,
+    WatcherGeneration,
 };
 use crate::sample_sources::{SourceDatabase, SourceId};
 
@@ -109,7 +110,7 @@ impl SourceDatabase {
     }
 }
 
-fn parse_durable_replay_prior(
+pub(super) fn parse_durable_replay_prior(
     value: &str,
     expected_source_id: &SourceId,
     expected_root_identity: &RootIdentity,
@@ -168,6 +169,48 @@ fn parse_durable_replay_prior(
             event_id,
         ),
     ))
+}
+
+/// Encode only a continuity proof admitted by reconciliation for the retained source writer.
+pub(super) fn encode_replay_checkpoint(
+    proof: &WatcherContinuityProof,
+    source_revision: u64,
+    lifecycle_generation: u64,
+) -> Option<String> {
+    let stream = proof.backend_stream_identity().as_bytes();
+    let payload = stream.strip_prefix(b"fsevents-volume:")?;
+    if payload.len() != 24 {
+        return None;
+    }
+    let device = u64::from_be_bytes(payload[..8].try_into().ok()?);
+    let uuid = uuid::Uuid::from_slice(&payload[8..]).ok()?;
+    let root = std::str::from_utf8(proof.root_identity().as_bytes()).ok()?;
+    let coverage = proof.replay_coverage();
+    if device == 0 || uuid.is_nil() || lifecycle_generation == 0 {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "root_identity": root,
+            "event_id": coverage.through_sequence(),
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "source_id": proof.source_id().as_str(),
+            "lifecycle_generation": lifecycle_generation,
+            "source_revision": source_revision,
+            "cause": "targeted_replay",
+            "continuity_proof": {
+                "root_identity": root,
+                "backend": "fsevents",
+                "backend_device": device,
+                "backend_volume_uuid": uuid.to_string(),
+                "watcher_generation": proof.watcher_generation().get(),
+                "replay_coverage_start_event_id": coverage.after_sequence().checked_add(1)?,
+                "replay_coverage_end_event_id": coverage.through_sequence(),
+                "acknowledged_end_event_id": coverage.through_sequence(),
+            }
+        })
+        .to_string(),
+    )
 }
 
 struct StrictJsonValue(Value);

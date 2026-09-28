@@ -21,6 +21,12 @@ use crate::sample_sources::readiness::{
     ReadinessRetryPolicy, ReadinessStage, ReadinessTarget, ReadinessTargetPublication,
     SourceAvailability,
 };
+use crate::sample_sources::reconciliation::{
+    AdapterDisposition, AdmissionOutcome, BackendStreamIdentity, CaptureBoundary, RawEventKind,
+    RawObservation, RawObservationLimits, RawObservationProvenance, RawObservedPath, RawPathRole,
+    ReconciliationAdmissionLimits, ReconciliationAdmissionOwner, ReconciliationAdmissionSupervisor,
+    SyntheticObservationBatch,
+};
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
     Rating, SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SampleCollection,
@@ -41,6 +47,159 @@ struct CurationFixture {
     profile_guard: WritableProfileGuard,
     root_identity: RootIdentity,
     revision: u64,
+}
+
+#[test]
+fn source_writer_commits_only_exact_replay_proof_and_keeps_duplicate_idempotent() {
+    let fixture = CurationFixture::new_profile_bound();
+    let source = SourceId::from_string("replay-checkpoint-writer");
+    let root = fixture.root_identity.clone();
+    let stream =
+        BackendStreamIdentity::from_fsevents_volume(99, [2; 16]).expect("native volume identity");
+    let root_text = std::str::from_utf8(root.as_bytes()).expect("fixture root identity");
+    let seed = serde_json::json!({
+        "root_identity": root_text,
+        "event_id": 10,
+        "format_version": 4,
+        "source_id": source.as_str(),
+        "lifecycle_generation": 7,
+        "source_revision": fixture.revision,
+        "cause": "targeted_replay",
+        "continuity_proof": {
+            "root_identity": root_text,
+            "backend": "fsevents",
+            "backend_device": 99,
+            "backend_volume_uuid": uuid::Uuid::from_bytes([2; 16]).to_string(),
+            "watcher_generation": 1,
+            "replay_coverage_start_event_id": 10,
+            "replay_coverage_end_event_id": 10,
+            "acknowledged_end_event_id": 10
+        }
+    })
+    .to_string();
+    let mut seed_batch = fixture.database.write_batch().expect("seed batch");
+    seed_batch
+        .set_metadata(
+            crate::sample_sources::db::META_SOURCE_WATCHER_CHECKPOINT,
+            &seed,
+        )
+        .expect("seed checkpoint");
+    seed_batch.commit_auxiliary_state().expect("seed commit");
+    let writer = SourceWriter::new(fixture.database, source.clone(), 7).expect("source writer");
+    let before_replay = writer.current_scan_fence().expect("source revision");
+    let mut manifest = writer
+        .catalog_database()
+        .write_batch()
+        .expect("targeted batch");
+    manifest
+        .upsert_file(Path::new("three.wav"), 30, 3)
+        .expect("targeted scan fact");
+    writer
+        .commit_scan_manifest_batch(&before_replay, manifest)
+        .expect("targeted manifest commit");
+    let expected = writer.current_scan_fence().expect("post-scan revision");
+    assert!(
+        writer.current_revision().is_err(),
+        "targeted scan is not a full audit"
+    );
+
+    let lane_limits = RawObservationLimits::new(8, 4096, 4096).expect("lane limits");
+    let limits = ReconciliationAdmissionLimits::new(
+        1,
+        lane_limits,
+        RawObservationLimits::new(32, 16384, 16384).expect("global limits"),
+        2,
+        8,
+        8,
+    )
+    .expect("admission limits");
+    let mut owner =
+        ReconciliationAdmissionOwner::new(ReconciliationAdmissionSupervisor::new(limits));
+    let lane = owner
+        .begin_source(source.clone(), root.clone())
+        .expect("capture lane");
+    let prior = writer
+        .catalog_database()
+        .read_durable_replay_prior(
+            &source,
+            &root,
+            crate::sample_sources::reconciliation::WatcherGeneration::new(7),
+            lane.generation(),
+        )
+        .expect("read prior")
+        .expect("valid prior");
+    let batch = SyntheticObservationBatch::new(
+        RawObservationProvenance::new(
+            source.clone(),
+            Some(root.clone()),
+            Some(stream.clone()),
+            lane.generation(),
+            CaptureBoundary::try_new(20, Some(11), Some(12)).expect("capture interval"),
+        ),
+        vec![RawObservation::new(
+            RawEventKind::Modify,
+            vec![RawObservedPath::new("one.wav".into(), RawPathRole::Subject)],
+        )],
+        lane_limits,
+    );
+    let admission = owner
+        .admit_replay_with_durable_prior(batch, Some(&prior), true)
+        .expect("admit replay");
+    assert_eq!(
+        admission.admission().disposition(),
+        AdapterDisposition::AdmittedWithContinuity
+    );
+    let ticket = match admission.admission().outcome() {
+        AdmissionOutcome::Accepted(ticket) => *ticket,
+        outcome => panic!("expected replay ticket, got {outcome:?}"),
+    };
+    let dispatched = owner.dispatch_next().expect("dispatch replay");
+    assert_eq!(dispatched.ticket(), ticket);
+    let proof = dispatched
+        .normalized()
+        .proof()
+        .watcher_continuity()
+        .expect("admitted proof")
+        .clone();
+    owner.mark_dispatched(ticket).expect("replay handed off");
+    owner.mark_applied(ticket).expect("replay applied");
+    let committed = writer
+        .commit_watcher_replay_checkpoint(&expected, &prior, &proof)
+        .expect("checkpoint commit");
+    assert_eq!(committed.acknowledged_sequence(), 12);
+    owner
+        .mark_replay_checkpointed(ticket, &committed)
+        .expect("retire with persisted checkpoint");
+    assert_eq!(
+        writer
+            .current_scan_fence()
+            .expect("revision after checkpoint"),
+        expected
+    );
+    assert_eq!(
+        writer
+            .commit_watcher_replay_checkpoint(&expected, &prior, &proof)
+            .expect("duplicate checkpoint"),
+        committed
+    );
+    assert!(matches!(
+        writer.commit_watcher_replay_checkpoint(&expected, &committed, &proof),
+        Err(SourceWriterError::ReplayCheckpointMismatch)
+    ));
+    let mut later = writer
+        .catalog_database()
+        .write_batch()
+        .expect("later scan batch");
+    later
+        .upsert_file(Path::new("four.wav"), 40, 4)
+        .expect("later scan fact");
+    writer
+        .commit_scan_manifest_batch(&expected, later)
+        .expect("advance source revision");
+    assert!(matches!(
+        writer.commit_watcher_replay_checkpoint(&expected, &prior, &proof),
+        Err(SourceWriterError::StaleRevision { .. })
+    ));
 }
 
 #[test]
