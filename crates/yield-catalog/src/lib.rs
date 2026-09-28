@@ -4024,9 +4024,13 @@ fn register_source(
         source_authority_receipt: None,
         source_authority_pending: None,
     };
-    if let Err(error) = maintain_catalog_database(&source.database, profile_guard, None, || {
-        !publication_is_current(admission, &source_id, lifecycle_generation, None)
-    }) {
+    if let Err(error) = maintain_catalog_database(
+        &source.database,
+        profile_guard,
+        None,
+        Some(&source.database.writer),
+        || !publication_is_current(admission, &source_id, lifecycle_generation, None),
+    ) {
         emit_failure(
             reservation,
             admission,
@@ -4270,9 +4274,13 @@ fn request_audit(
     }
     let result = preflight_audit_root(source, &source_id)
         .and_then(|()| {
-            maintain_catalog_database(&source.database, profile_guard, Some(&token), || {
-                token.load(Ordering::Acquire)
-            })
+            maintain_catalog_database(
+                &source.database,
+                profile_guard,
+                Some(&token),
+                Some(&source.database.writer),
+                || token.load(Ordering::Acquire),
+            )
         })
         .and_then(|()| audit_source(source, profile_guard, &source_id, &token, admission));
     let disposition = match result {
@@ -5176,6 +5184,64 @@ impl<'a> ScanWriter for CatalogScanWriter<'a> {
         self.lock_lifecycle(false)
     }
 
+    fn begin_directory_truth_generation(
+        &self,
+        db: &SourceDatabase,
+        expected_entry_count: u64,
+    ) -> Result<u64, ScanError> {
+        let owner = self.owner.ok_or_else(|| {
+            ScanError::SourceOwner(String::from("catalog audit has no retained source writer"))
+        })?;
+        if !std::ptr::eq(db, owner.catalog_database()) {
+            return Err(ScanError::SourceOwner(String::from(
+                "directory staging belongs to another source database",
+            )));
+        }
+        owner
+            .begin_scan_directory_truth_generation(expected_entry_count)
+            .map_err(scan_writer_error)
+    }
+
+    fn stage_directory_truth_entries(
+        &self,
+        db: &SourceDatabase,
+        generation: u64,
+        entries: &[SourceDirectoryEntry],
+    ) -> Result<(), ScanError> {
+        let owner = self.owner.ok_or_else(|| {
+            ScanError::SourceOwner(String::from("catalog audit has no retained source writer"))
+        })?;
+        if !std::ptr::eq(db, owner.catalog_database()) {
+            return Err(ScanError::SourceOwner(String::from(
+                "directory staging belongs to another source database",
+            )));
+        }
+        owner
+            .stage_scan_directory_truth_entries(generation, entries)
+            .map_err(scan_writer_error)
+    }
+
+    fn discard_directory_truth_generation_batch(
+        &self,
+        db: &SourceDatabase,
+        generation: u64,
+        requested_limit: usize,
+    ) -> Result<yield_library::sample_sources::db::SourceDirectoryTruthCleanup, ScanError> {
+        if let Some(owner) = self.owner {
+            if !std::ptr::eq(db, owner.catalog_database()) {
+                return Err(ScanError::SourceOwner(String::from(
+                    "directory staging belongs to another source database",
+                )));
+            }
+            owner
+                .discard_scan_directory_truth_generation_batch(generation, requested_limit)
+                .map_err(scan_writer_error)
+        } else {
+            // Legacy direct-database maintenance fixtures retain the profile guard.
+            Ok(db.discard_source_directory_truth_generation_batch(generation, requested_limit)?)
+        }
+    }
+
     fn commit_bounded_manifest_batch(
         &self,
         batch: SourceWriteBatch<'_>,
@@ -5288,13 +5354,14 @@ fn maintain_catalog_database(
     database: &SourceDatabase,
     profile_guard: &WritableProfileGuard,
     cancel: Option<&AtomicBool>,
+    owner: Option<&SourceWriter>,
     should_cancel: impl Fn() -> bool,
 ) -> Result<(), CatalogError> {
     let writer = CatalogScanWriter {
         profile_guard,
         database,
         cancel,
-        owner: None,
+        owner,
         lifecycle: None,
     };
 
@@ -5322,12 +5389,13 @@ fn maintain_catalog_database(
                     let _guard = writer
                         .try_lock_cleanup()
                         .map_err(catalog_maintenance_error)?;
-                    database
-                        .discard_source_directory_truth_generation_batch(
+                    writer
+                        .discard_directory_truth_generation_batch(
+                            database,
                             generation,
                             SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT,
                         )
-                        .map_err(catalog_error_from_db)?
+                        .map_err(catalog_maintenance_error)?
                 };
                 if !cleanup.more_work {
                     break;
@@ -5344,9 +5412,16 @@ fn maintain_catalog_database(
             let _guard = writer
                 .try_lock_cleanup()
                 .map_err(catalog_maintenance_error)?;
-            database
-                .cleanup_source_directory_truth(SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT)
-                .map_err(catalog_error_from_db)?
+            if let Some(owner) = owner {
+                owner
+                    .cleanup_scan_directory_truth(SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT)
+                    .map_err(scan_writer_error)
+                    .map_err(catalog_maintenance_error)?
+            } else {
+                database
+                    .cleanup_source_directory_truth(SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT)
+                    .map_err(catalog_error_from_db)?
+            }
         };
         if !cleanup.more_work {
             return Ok(());
@@ -9743,6 +9818,25 @@ mod tests {
                 token: &token,
             }),
         };
+        let other_root = fixture.root.path().join("other-directory-source");
+        fs::create_dir(&other_root).expect("other source root");
+        let other_id = SourceId::from_string("other-directory-source");
+        let other_database = SourceDatabase::open_for_catalog_with_profile_guard(
+            &other_root,
+            &fixture.guard,
+            catalog_profile_child(&other_id),
+        )
+        .expect("other profile catalog database");
+        assert!(matches!(
+            writer.begin_directory_truth_generation(&other_database, 1),
+            Err(ScanError::SourceOwner(_))
+        ));
+        assert!(
+            retained
+                .staged_source_directory_truth_generations(1)
+                .expect("no staged generation on either source")
+                .is_empty()
+        );
         assert!(writer.try_lock(ScanWritePhase::Manifest).is_ok());
         let mut progress_count = 0;
         let audit = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
@@ -10138,7 +10232,7 @@ mod tests {
         fs::write(child_path.join("sentinel"), b"untouched").expect("replacement sentinel");
 
         assert!(matches!(
-            maintain_catalog_database(&database, &fixture.guard, None, || false),
+            maintain_catalog_database(&database, &fixture.guard, None, None, || false),
             Err(CatalogError::DatabaseIntegrityUncertain(_))
         ));
         assert!(child_path.join("sentinel").is_file());
@@ -10189,7 +10283,7 @@ mod tests {
         let predicate_admission = Arc::clone(&admission);
         let predicate_source_id = source_id.clone();
         let checks = AtomicUsize::new(0);
-        let result = maintain_catalog_database(&database, &fixture.guard, None, || {
+        let result = maintain_catalog_database(&database, &fixture.guard, None, None, || {
             if checks.fetch_add(1, Ordering::SeqCst) == 2 {
                 predicate_admission
                     .lock()
@@ -10217,7 +10311,7 @@ mod tests {
             vec![1]
         );
 
-        maintain_catalog_database(&database, &fixture.guard, None, || false)
+        maintain_catalog_database(&database, &fixture.guard, None, None, || false)
             .expect("later registration recovery");
         assert!(
             database

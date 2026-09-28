@@ -26,8 +26,8 @@ use crate::sample_sources::reconciliation::{
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
     BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, ManifestCommitResult, Rating,
-    SampleCollection, SourceDatabase, SourceDbError, SourceManifestEntry, SourcePlaybackType,
-    SourceWriteBatch,
+    SampleCollection, SourceDatabase, SourceDbError, SourceDirectoryEntry,
+    SourceDirectoryTruthCleanup, SourceManifestEntry, SourcePlaybackType, SourceWriteBatch,
 };
 use super::curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
@@ -709,6 +709,53 @@ impl SourceWriter {
         }
         self.validate_scan_fence(expected)?;
         Ok(batch.commit_with_bounded_manifest_changes(expected.revision)?)
+    }
+
+    /// Allocate private directory-truth staging under the retained source owner.
+    /// Staging is revision-neutral; the final audit commit fences its publication.
+    pub fn begin_scan_directory_truth_generation(
+        &self,
+        expected_entry_count: u64,
+    ) -> Result<u64, SourceWriterError> {
+        self.current_scan_fence()?;
+        Ok(self
+            .database
+            .begin_next_source_directory_truth_generation(expected_entry_count)?)
+    }
+
+    /// Stage one bounded batch of directory evidence on the retained database.
+    pub fn stage_scan_directory_truth_entries(
+        &self,
+        generation: u64,
+        entries: &[SourceDirectoryEntry],
+    ) -> Result<(), SourceWriterError> {
+        self.current_scan_fence()?;
+        Ok(self
+            .database
+            .stage_source_directory_truth_entries(generation, entries)?)
+    }
+
+    /// Remove only private staging rows from an aborted audit, in bounded batches.
+    pub fn discard_scan_directory_truth_generation_batch(
+        &self,
+        generation: u64,
+        requested_limit: usize,
+    ) -> Result<SourceDirectoryTruthCleanup, SourceWriterError> {
+        self.current_scan_fence()?;
+        Ok(self
+            .database
+            .discard_source_directory_truth_generation_batch(generation, requested_limit)?)
+    }
+
+    /// Reclaim inactive directory generations in bounded source-owned steps.
+    pub fn cleanup_scan_directory_truth(
+        &self,
+        requested_limit: usize,
+    ) -> Result<SourceDirectoryTruthCleanup, SourceWriterError> {
+        self.current_scan_fence()?;
+        Ok(self
+            .database
+            .cleanup_source_directory_truth(requested_limit)?)
     }
 
     /// Atomically activate complete staged directory truth and its manifest

@@ -1,6 +1,9 @@
 use super::scan::ScanError;
 use yield_library::sample_sources::SourceManifestEntry;
-use yield_library::sample_sources::db::{ManifestCommitResult, SourceWriteBatch};
+use yield_library::sample_sources::db::{
+    ManifestCommitResult, SourceDatabase, SourceDirectoryEntry, SourceDirectoryTruthCleanup,
+    SourceWriteBatch,
+};
 use yield_library::sample_sources::reconciliation::{
     RootIdentity, SourceAuditCommit, SourceAuditRequest,
 };
@@ -44,6 +47,35 @@ pub trait ScanWriter {
     /// by the failed audit and never for active or inactive directory generations.
     fn try_lock_cleanup(&self) -> Result<Self::Guard, ScanError> {
         self.try_lock(ScanWritePhase::Manifest)
+    }
+
+    /// Start private, revision-neutral directory staging for a full audit.
+    fn begin_directory_truth_generation(
+        &self,
+        db: &SourceDatabase,
+        expected_entry_count: u64,
+    ) -> Result<u64, ScanError> {
+        Ok(db.begin_next_source_directory_truth_generation(expected_entry_count)?)
+    }
+
+    /// Stage a bounded set of observed directories without publishing it.
+    fn stage_directory_truth_entries(
+        &self,
+        db: &SourceDatabase,
+        generation: u64,
+        entries: &[SourceDirectoryEntry],
+    ) -> Result<(), ScanError> {
+        Ok(db.stage_source_directory_truth_entries(generation, entries)?)
+    }
+
+    /// Discard only private staging after an aborted audit.
+    fn discard_directory_truth_generation_batch(
+        &self,
+        db: &SourceDatabase,
+        generation: u64,
+        requested_limit: usize,
+    ) -> Result<SourceDirectoryTruthCleanup, ScanError> {
+        Ok(db.discard_source_directory_truth_generation_batch(generation, requested_limit)?)
     }
 
     /// Commit a prepared, revision-fenced manifest batch through the active
@@ -102,6 +134,50 @@ impl ScanWriter for SourceWriter {
     fn try_lock(&self, _phase: ScanWritePhase) -> Result<Self::Guard, ScanError> {
         self.current_scan_fence().map_err(source_writer_error)?;
         Ok(())
+    }
+
+    fn begin_directory_truth_generation(
+        &self,
+        db: &SourceDatabase,
+        expected_entry_count: u64,
+    ) -> Result<u64, ScanError> {
+        if !std::ptr::eq(db, self.catalog_database()) {
+            return Err(ScanError::SourceOwner(String::from(
+                "directory staging belongs to another source database",
+            )));
+        }
+        self.begin_scan_directory_truth_generation(expected_entry_count)
+            .map_err(source_writer_error)
+    }
+
+    fn stage_directory_truth_entries(
+        &self,
+        db: &SourceDatabase,
+        generation: u64,
+        entries: &[SourceDirectoryEntry],
+    ) -> Result<(), ScanError> {
+        if !std::ptr::eq(db, self.catalog_database()) {
+            return Err(ScanError::SourceOwner(String::from(
+                "directory staging belongs to another source database",
+            )));
+        }
+        self.stage_scan_directory_truth_entries(generation, entries)
+            .map_err(source_writer_error)
+    }
+
+    fn discard_directory_truth_generation_batch(
+        &self,
+        db: &SourceDatabase,
+        generation: u64,
+        requested_limit: usize,
+    ) -> Result<SourceDirectoryTruthCleanup, ScanError> {
+        if !std::ptr::eq(db, self.catalog_database()) {
+            return Err(ScanError::SourceOwner(String::from(
+                "directory staging belongs to another source database",
+            )));
+        }
+        self.discard_scan_directory_truth_generation_batch(generation, requested_limit)
+            .map_err(source_writer_error)
     }
 
     fn commit_bounded_manifest_batch(
