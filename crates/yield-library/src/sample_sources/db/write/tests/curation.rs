@@ -229,6 +229,107 @@ fn source_writer_state_snapshot(database: &SourceDatabase) -> SourceWriterStateS
 }
 
 #[test]
+fn scan_fence_bootstraps_before_audit_without_weakening_curation_fence() {
+    let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
+    let temporary_root =
+        std::fs::canonicalize(std::env::temp_dir()).expect("canonical temporary root");
+    let config_base_dir = tempfile::tempdir_in(temporary_root).expect("config base");
+    let _config_base = ConfigBaseGuard::set(config_base_dir.path().to_path_buf());
+    let _profile = PersistenceProfileGuard::named("source-scan-fence-test");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile guard");
+    let source = tempfile::tempdir().expect("source root");
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source.path(),
+        &profile_guard,
+        Path::new("scan-fence-profile-bound"),
+    )
+    .expect("profile-bound source db");
+    assert!(
+        database
+            .last_authoritative_audit_metadata()
+            .expect("audit metadata")
+            .is_none()
+    );
+
+    let writer =
+        SourceWriter::new_for_scan(database, SourceId::from_string("source-scan-fence-test"), 7)
+            .expect("scan owner before audit");
+    let initial = writer.current_scan_fence().expect("initial scan fence");
+    assert_eq!(initial.lifecycle_generation(), 7);
+    assert!(initial.lease_epoch() > 0);
+    assert_eq!(initial.revision(), 0);
+    assert_eq!(
+        writer
+            .validate_scan_fence(&initial)
+            .expect("same owner and revision"),
+        initial
+    );
+    assert!(matches!(
+        writer.current_revision(),
+        Err(SourceWriterError::InvalidRequest(
+            "source writer requires a complete authoritative audit"
+        ))
+    ));
+
+    writer
+        .database_for_tests()
+        .upsert_file(Path::new("one.wav"), 10, 1)
+        .expect("advance scan revision");
+    assert!(matches!(
+        writer.validate_scan_fence(&initial),
+        Err(SourceWriterError::StaleRevision {
+            expected: 0,
+            actual: 1
+        })
+    ));
+    assert!(matches!(
+        writer.current_revision(),
+        Err(SourceWriterError::InvalidRequest(
+            "source writer requires a complete authoritative audit"
+        ))
+    ));
+
+    writer
+        .database_for_tests()
+        .begin_source_directory_truth_generation(1, 0)
+        .expect("directory generation");
+    writer
+        .database_for_tests()
+        .write_batch()
+        .expect("audit batch")
+        .commit_manifest_audit_with_staged_directory_truth(
+            1,
+            1,
+            10,
+            initial.root_identity().clone(),
+            None,
+        )
+        .expect("complete audit");
+    assert_eq!(
+        writer
+            .current_revision()
+            .expect("curation fence after completed audit")
+            .revision(),
+        2
+    );
+}
+
+#[test]
+fn scan_fence_requires_retained_profile_owned_source() {
+    let fixture = CurationFixture::new();
+    assert!(matches!(
+        SourceWriter::new_for_scan(
+            fixture.database,
+            SourceId::from_string("unbound-scan-source"),
+            1,
+        ),
+        Err(SourceWriterError::Database(
+            SourceDbError::ProfileOwnershipRequired
+        ))
+    ));
+}
+
+#[test]
 fn playback_history_commits_preserve_curation_and_reject_stale_writers() {
     let mut fixture = CurationFixture::new();
     let initial = fixture

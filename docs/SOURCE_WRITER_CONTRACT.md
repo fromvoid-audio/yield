@@ -43,6 +43,17 @@ filesystem effects, or turn receipts/snapshots into operation or filesystem auth
 The broader lifecycle and snapshot proposal below remains the OPT-1637 decision
 boundary; later work must add caller routing and any cross-owner lease pin explicitly.
 
+OPT-1782's scan bootstrap adds a separate `SourceScanFence` from the retained
+`SourceWriter`. `new_for_scan` and `current_scan_fence` can validate the profile,
+physical source root, database binding, positive lease epoch, and numeric
+revision before the first complete manifest audit. It carries the catalog
+generation supplied at construction; only a catalog lifecycle guard can verify
+that this generation has not since retired. This observation
+is not a scan commit, a durable receipt, or an authoritative browser snapshot.
+`current_revision` remains audit-gated for curation and browser reads. The scanner
+still needs a typed, bounded commit route under the same retained owner and a
+catalog lifecycle guard before the full-scan migration can pass.
+
 ## Boundary and authority
 
 One physical source has one serialized writable SQL owner. The owner retains the
