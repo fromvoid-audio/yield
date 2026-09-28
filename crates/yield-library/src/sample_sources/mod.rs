@@ -26,6 +26,7 @@ pub use db::{
     SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES,
     SOURCE_CURATION_TAG_FACTS_MAX_PATHS, SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES,
     SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATHS,
+    SOURCE_TAG_ASSIGNMENT_MAX_PAGE_BYTES, SOURCE_TAG_ASSIGNMENT_MAX_PATH_BYTES,
     SOURCE_TAG_FILTER_MAX_INPUT_BYTES, SOURCE_TAG_FILTER_MAX_TAGS,
     SOURCE_TAG_FILTER_MAX_TOKEN_BYTES, SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
     SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
@@ -36,10 +37,11 @@ pub use db::{
     SourceIndexClassification, SourceIndexCommitResult, SourceIndexDiagnostic, SourceIndexEntry,
     SourceIndexSnapshot, SourceLeaseError, SourceManifestEntry, SourcePlaybackType,
     SourcePublicationFence, SourcePublicationFenceError, SourceRevision, SourceScanFence,
-    SourceSnapshotOwner, SourceSnapshotPage, SourceTag, SourceTagFilterResult, SourceTagPage,
-    SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage, SourceTagWrite, SourceWriteCommand,
-    SourceWriter, SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt,
-    SourceWriterRequest, WavEntry,
+    SourceSnapshotOwner, SourceSnapshotPage, SourceTag, SourceTagAssignmentCursor,
+    SourceTagAssignmentPage, SourceTagFilterResult, SourceTagPage, SourceTagPageCursor,
+    SourceTagPageEntry, SourceTagUsage, SourceTagWrite, SourceWriteCommand, SourceWriter,
+    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
+    WavEntry,
 };
 pub use finalization::{
     StagedFileFinalizationCapabilities, StagedFinalizationAvailability,

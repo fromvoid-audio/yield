@@ -20,6 +20,178 @@ fn open_tag_test_db(root: &Path) -> SourceDatabase {
 }
 
 #[test]
+fn tag_assignment_pages_cover_live_supported_paths_once() {
+    let dir = tempdir().unwrap();
+    let db = open_tag_test_db(dir.path());
+    for number in 0..137 {
+        let path = format!("samples/{number:03}.wav");
+        db.upsert_file(Path::new(&path), 10, 5).unwrap();
+        db.assign_tag_to_path(Path::new(&path), "  Deep   Kick ")
+            .unwrap();
+    }
+    for path in ["missing.wav", "notes.txt", "._sidecar.wav"] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+        db.assign_tag_to_path(Path::new(path), "deep kick").unwrap();
+    }
+    db.set_missing(Path::new("missing.wav"), true).unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut cursor = None;
+    let mut paths = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = db
+            .tag_assignments_page_at_revision(
+                revision,
+                "DEEP KICK",
+                cursor.as_ref(),
+                40,
+                &cancellation,
+            )
+            .unwrap();
+        assert!(page.tag_id.is_some());
+        assert!(page.paths.len() <= 40);
+        paths.extend(page.paths);
+        pages += 1;
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(pages, 4);
+    assert_eq!(paths.len(), 137);
+    assert_eq!(paths[0], PathBuf::from("samples/000.wav"));
+    assert_eq!(paths[136], PathBuf::from("samples/136.wav"));
+    assert!(paths.windows(2).all(|window| window[0] < window[1]));
+}
+
+#[test]
+fn tag_assignment_pages_reject_stale_and_foreign_cursors_and_cancellation() {
+    let dir = tempdir().unwrap();
+    let db = open_tag_test_db(dir.path());
+    for path in ["a.wav", "b.wav"] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+        db.assign_tag_to_path(Path::new(path), "shared").unwrap();
+    }
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let first = db
+        .tag_assignments_page_at_revision(revision, "shared", None, 1, &cancellation)
+        .unwrap();
+    let cursor = first.next_cursor.as_ref().unwrap();
+    let mut malformed_cursor = cursor.clone();
+    malformed_cursor.last_path = "missing.wav".to_owned();
+    assert!(
+        db.tag_assignments_page_at_revision(
+            revision,
+            "shared",
+            Some(&malformed_cursor),
+            1,
+            &cancellation
+        )
+        .is_err()
+    );
+    assert!(
+        db.tag_assignments_page_at_revision(revision, "other", Some(cursor), 1, &cancellation)
+            .is_err()
+    );
+    let other_dir = tempdir().unwrap();
+    let other_db = open_tag_test_db(other_dir.path());
+    assert!(
+        other_db
+            .tag_assignments_page_at_revision(revision, "shared", Some(cursor), 1, &cancellation)
+            .is_err()
+    );
+    db.assign_tag_to_path(Path::new("a.wav"), "later").unwrap();
+    assert!(
+        db.tag_assignments_page_at_revision(revision, "shared", Some(cursor), 1, &cancellation)
+            .is_err()
+    );
+    cancellation.store(true, Ordering::Release);
+    assert!(matches!(
+        db.tag_assignments_page_at_revision(
+            db.get_revision().unwrap(),
+            "shared",
+            None,
+            1,
+            &cancellation
+        ),
+        Err(SourceDbError::Canceled)
+    ));
+}
+
+#[test]
+fn tag_assignment_pages_reject_bad_input_and_return_explicit_empty() {
+    let dir = tempdir().unwrap();
+    let db = open_tag_test_db(dir.path());
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    for label in ["", "unknown"] {
+        let page = db
+            .tag_assignments_page_at_revision(revision, label, None, 999, &cancellation)
+            .unwrap();
+        assert_eq!(page.revision, revision);
+        assert_eq!(page.tag_id, None);
+        assert!(page.paths.is_empty());
+        assert!(page.next_cursor.is_none());
+    }
+    assert!(matches!(
+        db.tag_assignments_page_at_revision(
+            revision,
+            &"a".repeat(SOURCE_TAG_PAGE_MAX_PREFIX_BYTES + 1),
+            None,
+            1,
+            &cancellation
+        ),
+        Err(SourceDbError::TagPagePrefixTooLong { .. })
+    ));
+    assert!(matches!(
+        db.tag_assignments_page_at_revision(revision, "bad\0tag", None, 1, &cancellation),
+        Err(SourceDbError::TagPagePrefixContainsNul)
+    ));
+}
+
+#[test]
+fn tag_assignment_pages_fail_closed_on_oversized_path_and_page() {
+    let dir = tempdir().unwrap();
+    let db = open_tag_test_db(dir.path());
+    let long_path = format!(
+        "{}.wav",
+        "a".repeat(super::super::SOURCE_TAG_ASSIGNMENT_MAX_PATH_BYTES)
+    );
+    db.upsert_file(Path::new(&long_path), 10, 5).unwrap();
+    db.assign_tag_to_path(Path::new(&long_path), "long")
+        .unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    assert!(matches!(
+        db.tag_assignments_page_at_revision(
+            db.get_revision().unwrap(),
+            "long",
+            None,
+            1,
+            &cancellation
+        ),
+        Err(SourceDbError::TagAssignmentPageBytesTooLarge { .. })
+    ));
+
+    for number in 0..25 {
+        let path = format!("{number:03}-{}.wav", "b".repeat(3000));
+        db.upsert_file(Path::new(&path), 10, 5).unwrap();
+        db.assign_tag_to_path(Path::new(&path), "many").unwrap();
+    }
+    assert!(matches!(
+        db.tag_assignments_page_at_revision(
+            db.get_revision().unwrap(),
+            "many",
+            None,
+            64,
+            &cancellation
+        ),
+        Err(SourceDbError::TagAssignmentPageBytesTooLarge { .. })
+    ));
+}
+
+#[test]
 fn normalization_prevents_case_and_spacing_duplicates() {
     let dir = tempdir().unwrap();
     let db = open_tag_test_db(dir.path());
