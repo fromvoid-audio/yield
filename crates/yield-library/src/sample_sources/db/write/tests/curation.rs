@@ -271,10 +271,40 @@ fn scan_fence_bootstraps_before_audit_without_weakening_curation_fence() {
         ))
     ));
 
-    writer
-        .database_for_tests()
+    let mut scan_batch = writer
+        .catalog_database()
+        .write_batch()
+        .expect("bounded scan batch");
+    scan_batch
         .upsert_file(Path::new("one.wav"), 10, 1)
-        .expect("advance scan revision");
+        .expect("prepared scan row");
+    let committed = writer
+        .commit_scan_manifest_batch(&initial, scan_batch)
+        .expect("owner commits bounded scan row");
+    assert_eq!(committed.revision, 1);
+    assert_eq!(committed.touched_path_changes.len(), 1);
+    assert_eq!(committed.touched_path_changes[0].0, Path::new("one.wav"));
+    let mut stale_batch = writer
+        .catalog_database()
+        .write_batch()
+        .expect("stale bounded batch");
+    stale_batch
+        .upsert_file(Path::new("stale.wav"), 20, 2)
+        .expect("prepared stale row");
+    assert!(matches!(
+        writer.commit_scan_manifest_batch(&initial, stale_batch),
+        Err(SourceWriterError::StaleRevision {
+            expected: 0,
+            actual: 1
+        })
+    ));
+    assert!(
+        writer
+            .catalog_database()
+            .entry_for_path(Path::new("stale.wav"))
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
         writer.validate_scan_fence(&initial),
         Err(SourceWriterError::StaleRevision {

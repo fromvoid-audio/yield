@@ -19,12 +19,15 @@ use uuid::Uuid;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use crate::sample_sources::SourceId;
 use crate::sample_sources::db::read::browser_metadata_rows_for_paths;
-use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
+use crate::sample_sources::reconciliation::{
+    RootIdentity, RootRelativePath, SourceAuditCommit, SourceAuditRequest,
+};
 
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
-    BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, Rating, SampleCollection,
-    SourceDatabase, SourceDbError, SourcePlaybackType,
+    BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, ManifestCommitResult, Rating,
+    SampleCollection, SourceDatabase, SourceDbError, SourceManifestEntry, SourcePlaybackType,
+    SourceWriteBatch,
 };
 use super::curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
@@ -563,6 +566,18 @@ enum SourceWriterFault {
 }
 
 impl SourceWriter {
+    /// Borrow the retained database for catalog paths that have not yet been
+    /// migrated to typed source-writer commands. The borrow cannot outlive this
+    /// owner and must not be used to construct a second writable connection.
+    pub fn catalog_database(&self) -> &SourceDatabase {
+        &self.database
+    }
+
+    /// Return the database to the catalog's explicit drained-close boundary.
+    pub fn into_catalog_database(self) -> SourceDatabase {
+        self.database
+    }
+
     /// Retain one existing profile/source-lease-bound database as the sole writer owner.
     pub fn new(
         database: SourceDatabase,
@@ -676,6 +691,51 @@ impl SourceWriter {
             });
         }
         Ok(current)
+    }
+
+    /// Commit one already-prepared bounded scan batch on this retained database.
+    /// Filesystem traversal, file reads, and hashing must finish before the
+    /// batch is constructed. The catalog holds its lifecycle guard for this
+    /// call; the writer revalidates the physical lease and exact revision.
+    pub fn commit_scan_manifest_batch(
+        &self,
+        expected: &SourceScanFence,
+        batch: SourceWriteBatch<'_>,
+    ) -> Result<ManifestCommitResult, SourceWriterError> {
+        if !std::ptr::eq(batch.owner, &self.database) {
+            return Err(SourceWriterError::InvalidRequest(
+                "scan batch belongs to another source database",
+            ));
+        }
+        self.validate_scan_fence(expected)?;
+        Ok(batch.commit_with_bounded_manifest_changes(expected.revision)?)
+    }
+
+    /// Atomically activate complete staged directory truth and its manifest
+    /// audit at the owner's exact scan revision. Staging and traversal remain
+    /// outside this final bounded transaction.
+    pub fn commit_scan_audit_completion(
+        &self,
+        expected: &SourceScanFence,
+        batch: SourceWriteBatch<'_>,
+        generation: u64,
+        completed_at: i64,
+        root_identity: RootIdentity,
+        audit_request: Option<&SourceAuditRequest>,
+    ) -> Result<(SourceAuditCommit, Vec<SourceManifestEntry>), SourceWriterError> {
+        if !std::ptr::eq(batch.owner, &self.database) {
+            return Err(SourceWriterError::InvalidRequest(
+                "scan audit batch belongs to another source database",
+            ));
+        }
+        self.validate_scan_fence(expected)?;
+        Ok(batch.commit_manifest_audit_with_staged_directory_truth(
+            generation,
+            expected.revision,
+            completed_at,
+            root_identity,
+            audit_request,
+        )?)
     }
 
     /// Return a fresh revision only after revalidating authoritative audit coverage.

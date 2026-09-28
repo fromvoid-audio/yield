@@ -1,4 +1,9 @@
 use super::scan::ScanError;
+use yield_library::sample_sources::SourceManifestEntry;
+use yield_library::sample_sources::db::{ManifestCommitResult, SourceWriteBatch};
+use yield_library::sample_sources::reconciliation::{
+    RootIdentity, SourceAuditCommit, SourceAuditRequest,
+};
 
 /// Database mutation phases exposed by the scanner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +43,36 @@ pub trait ScanWriter {
     /// by the failed audit and never for active or inactive directory generations.
     fn try_lock_cleanup(&self) -> Result<Self::Guard, ScanError> {
         self.try_lock(ScanWritePhase::Manifest)
+    }
+
+    /// Commit a prepared, revision-fenced manifest batch through the active
+    /// source owner. Callers must hold this writer's bounded mutation guard.
+    fn commit_bounded_manifest_batch(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        expected_revision: u64,
+    ) -> Result<ManifestCommitResult, ScanError> {
+        Ok(batch.commit_with_bounded_manifest_changes(expected_revision)?)
+    }
+
+    /// Activate a complete staged audit and return the committed manifest on
+    /// the same owner that admitted its bounded scan batches.
+    fn commit_scan_audit_completion(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        generation: u64,
+        expected_revision: u64,
+        completed_at: i64,
+        root_identity: RootIdentity,
+        audit_request: Option<&SourceAuditRequest>,
+    ) -> Result<(SourceAuditCommit, Vec<SourceManifestEntry>), ScanError> {
+        Ok(batch.commit_manifest_audit_with_staged_directory_truth(
+            generation,
+            expected_revision,
+            completed_at,
+            root_identity,
+            audit_request,
+        )?)
     }
 }
 

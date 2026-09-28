@@ -282,7 +282,7 @@ pub fn audit_manifest_for_catalog_with_budget_and_progress_and_writer(
         false,
         false,
         false,
-        false,
+        true,
         &mut |_| {},
         writer,
     ) {
@@ -646,14 +646,14 @@ fn record_staged_manifest_audit_completion(
             }
             let root_identity =
                 RootIdentity::from_bytes(source_root.generation().as_bytes().to_vec());
-            let (audit_commit, committed_manifest) = batch
-                .commit_manifest_audit_with_staged_directory_truth(
-                    generation,
-                    expected_revision,
-                    completed_at,
-                    root_identity,
-                    audit_request,
-                )?;
+            let (audit_commit, committed_manifest) = writer.commit_scan_audit_completion(
+                batch,
+                generation,
+                expected_revision,
+                completed_at,
+                root_identity,
+                audit_request,
+            )?;
             Ok((audit_commit, committed_manifest))
         })();
         (generation, result)

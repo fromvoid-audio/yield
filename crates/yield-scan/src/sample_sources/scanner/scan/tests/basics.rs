@@ -493,16 +493,14 @@ fn missing_stage_keeps_concurrently_restored_live_row() {
     db.upsert_file(Path::new("restored.wav"), facts.size, facts.modified_ns)
         .unwrap();
     let mut stats = ScanStats::default();
+    let absent = super::super::super::scan_diff::absent_missing_candidates(
+        db.root(),
+        db.source_traversal_policy().unwrap(),
+        [stale],
+    );
     let mut batch = db.write_batch().unwrap();
 
-    super::super::super::scan_diff::mark_missing(
-        &db,
-        db.source_traversal_policy().unwrap(),
-        &mut batch,
-        [stale],
-        &mut stats,
-    )
-    .unwrap();
+    super::super::super::scan_diff::mark_missing(&db, &mut batch, absent, &mut stats).unwrap();
     batch.commit().unwrap();
 
     assert_eq!(stats.missing, 0);

@@ -5,6 +5,7 @@ use crate::sample_sources::SourceDatabase;
 use crate::sample_sources::db::{SourceIndexEntry, SourceWriteBatch, WavEntry};
 use yield_library::sample_sources::{SourceManifestEntry, SourceTraversalPolicy};
 
+use super::super::scan_writer::ScanWriter;
 use super::{CommittedSourceDelta, ScanError, ScanMode, ScanStats};
 
 const MANIFEST_AUDIT_CHECKPOINT_SIZE: usize = 64;
@@ -400,16 +401,18 @@ impl ScanContext {
         &mut self,
         db: &SourceDatabase,
         batch: SourceWriteBatch<'_>,
+        writer: &impl ScanWriter,
     ) -> Result<u64, ScanError> {
-        self.commit_batch_with_post_commit_hook(db, batch, || {})
+        self.commit_batch_with_post_commit_hook(db, batch, writer, || {})
     }
 
     pub(in crate::sample_sources::scanner) fn commit_batch_with_delta(
         &mut self,
         db: &SourceDatabase,
         batch: SourceWriteBatch<'_>,
+        writer: &impl ScanWriter,
     ) -> Result<CommittedSourceDelta, ScanError> {
-        let (_, delta) = self.commit_batch_inner(db, batch, true, || {})?;
+        let (_, delta) = self.commit_batch_inner(db, batch, writer, true, || {})?;
         Ok(delta.expect("exact scan commit always produces a delta"))
     }
 
@@ -417,16 +420,24 @@ impl ScanContext {
         &mut self,
         db: &SourceDatabase,
         batch: SourceWriteBatch<'_>,
+        writer: &impl ScanWriter,
         post_commit_hook: impl FnOnce(),
     ) -> Result<u64, ScanError> {
-        self.commit_batch_inner(db, batch, false, post_commit_hook)
-            .map(|(revision, _)| revision)
+        self.commit_batch_inner(
+            db,
+            batch,
+            writer,
+            self.exact_committed_batches,
+            post_commit_hook,
+        )
+        .map(|(revision, _)| revision)
     }
 
     fn commit_batch_inner(
         &mut self,
         db: &SourceDatabase,
         batch: SourceWriteBatch<'_>,
+        writer: &impl ScanWriter,
         exact_delta: bool,
         post_commit_hook: impl FnOnce(),
     ) -> Result<(u64, Option<CommittedSourceDelta>), ScanError> {
@@ -442,7 +453,7 @@ impl ScanContext {
                     actual: db.get_revision()?,
                 });
             }
-            batch.commit_with_bounded_manifest_changes(expected_revision)?
+            writer.commit_bounded_manifest_batch(batch, expected_revision)?
         } else {
             batch.commit_with_manifest_changes(expected_revision)?
         };
@@ -518,6 +529,7 @@ mod tests {
 
     use super::*;
     use crate::sample_sources::scanner::open_maintained_scan_database;
+    use crate::sample_sources::scanner::scan_writer::UncoordinatedScanWriter;
 
     #[test]
     fn interleaved_manifest_writer_forces_exact_committed_resnapshot() {
@@ -545,13 +557,18 @@ mod tests {
             .upsert_file_with_hash(Path::new("scan.wav"), 3, 3, "scan")
             .expect("scan row");
         let revision = context
-            .commit_batch_with_post_commit_hook(&database, scan_batch, || {
-                let mut later_batch = database.write_batch().expect("later batch");
-                later_batch
-                    .upsert_file_with_hash(Path::new("later.wav"), 4, 4, "later")
-                    .expect("later row");
-                later_batch.commit().expect("commit later writer");
-            })
+            .commit_batch_with_post_commit_hook(
+                &database,
+                scan_batch,
+                &UncoordinatedScanWriter,
+                || {
+                    let mut later_batch = database.write_batch().expect("later batch");
+                    later_batch
+                        .upsert_file_with_hash(Path::new("later.wav"), 4, 4, "later")
+                        .expect("later row");
+                    later_batch.commit().expect("commit later writer");
+                },
+            )
             .expect("commit scan batch");
         let (_revision, snapshot) = context.committed_snapshot(revision);
         let paths = snapshot
@@ -591,18 +608,23 @@ mod tests {
             .upsert_file_with_hash(Path::new("scan.wav"), 2, 2, "scan")
             .expect("scan row");
         context
-            .commit_batch_with_post_commit_hook(&database, first_batch, || {
-                database
-                    .upsert_file(Path::new("external.wav"), 3, 3)
-                    .expect("interleaved writer");
-            })
+            .commit_batch_with_post_commit_hook(
+                &database,
+                first_batch,
+                &UncoordinatedScanWriter,
+                || {
+                    database
+                        .upsert_file(Path::new("external.wav"), 3, 3)
+                        .expect("interleaved writer");
+                },
+            )
             .expect("first scan commit");
 
         let mut second_batch = database.write_batch().expect("second scan batch");
         second_batch
             .upsert_file_with_hash(Path::new("later.wav"), 4, 4, "later")
             .expect("later scan row");
-        let result = context.commit_batch(&database, second_batch);
+        let result = context.commit_batch(&database, second_batch, &UncoordinatedScanWriter);
 
         assert!(matches!(result, Err(ScanError::StaleRevision { .. })));
     }
@@ -625,7 +647,7 @@ mod tests {
             .upsert_file_with_hash(Path::new("scan.wav"), 3, 3, "scan")
             .expect("scan row");
         assert!(matches!(
-            context.commit_batch_with_delta(&database, scan_batch),
+            context.commit_batch_with_delta(&database, scan_batch, &UncoordinatedScanWriter),
             Err(ScanError::StaleRevision { .. })
         ));
         assert!(

@@ -9,10 +9,11 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
+use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,12 +25,14 @@ use yield_library::operation_journal::{
     OperationJournalRequestError,
 };
 use yield_library::sample_sources::db::{
-    SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT, SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT,
+    ManifestCommitResult, SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT, SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT,
     SourceAuthorityRegistration, SourceAuthorityRegistrationReceipt, SourceAuthorityRetirementAck,
     SourceDirectoryEntry, SourceDirectoryTruthPage, SourceDirectoryTruthState, SourceLeaseError,
-    SourceManifestEntry,
+    SourceManifestEntry, SourceWriteBatch,
 };
-use yield_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
+use yield_library::sample_sources::reconciliation::{
+    RootIdentity, RootRelativePath, SourceAuditCommit, SourceAuditRequest,
+};
 pub use yield_library::sample_sources::{
     BrowserFileMetadata, BrowserMetadataCursor, SOURCE_CURATION_TAG_FACTS_MAX_PATHS,
     SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
@@ -39,7 +42,8 @@ pub use yield_library::sample_sources::{
     SourceDisplayLabelEntry, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
 };
 use yield_library::sample_sources::{
-    SourceDatabase, SourceDbError, SourceId, SourcePublicationFence,
+    SourceDatabase, SourceDbError, SourceId, SourcePublicationFence, SourceWriter,
+    SourceWriterError,
 };
 use yield_scan::sample_sources::scanner::{
     ScanError, ScanWritePhase, ScanWriter,
@@ -1445,7 +1449,7 @@ impl CatalogDelivery {
 struct RegisteredSource {
     root: PathBuf,
     lifecycle_generation: u64,
-    database: SourceDatabase,
+    database: CatalogSourceDatabase,
     publication_fence: SourcePublicationFence,
     known_root_identity: Option<RootIdentity>,
     snapshot: Option<CatalogSnapshot>,
@@ -1456,6 +1460,37 @@ struct RegisteredSource {
     source_authority: Option<SourceAuthorityRegistration>,
     source_authority_receipt: Option<SourceAuthorityRegistrationReceipt>,
     source_authority_pending: Option<PendingSourceAuthority>,
+}
+
+/// Transitional catalog adapter that retains the one writable source owner.
+/// Existing catalog reads and unrelated mutation routes continue to borrow its
+/// database; full-scan admission validates through the writer itself.
+struct CatalogSourceDatabase {
+    writer: SourceWriter,
+}
+
+impl CatalogSourceDatabase {
+    fn new(
+        database: SourceDatabase,
+        source_id: SourceId,
+        lifecycle_generation: u64,
+    ) -> Result<Self, SourceWriterError> {
+        Ok(Self {
+            writer: SourceWriter::new_for_scan(database, source_id, lifecycle_generation)?,
+        })
+    }
+
+    fn into_database(self) -> SourceDatabase {
+        self.writer.into_catalog_database()
+    }
+}
+
+impl Deref for CatalogSourceDatabase {
+    type Target = SourceDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        self.writer.catalog_database()
+    }
 }
 
 struct PendingSourceAuthority {
@@ -3945,6 +3980,27 @@ fn register_source(
     if !publication_is_current(admission, &source_id, lifecycle_generation, None) {
         return;
     }
+    let database =
+        match CatalogSourceDatabase::new(database, source_id.clone(), lifecycle_generation) {
+            Ok(database) => database,
+            Err(error) => {
+                let error = match error {
+                    SourceWriterError::Database(error) => {
+                        catalog_error_from_db_for_source(&source_id, error)
+                    }
+                    error => CatalogError::Database(error.to_string()),
+                };
+                emit_failure(
+                    reservation,
+                    admission,
+                    Some(source_id),
+                    Some(lifecycle_generation),
+                    CatalogOperation::Register,
+                    error,
+                );
+                return;
+            }
+        };
     let mut source = RegisteredSource {
         root: canonical_root,
         lifecycle_generation,
@@ -4210,7 +4266,7 @@ fn request_audit(
                 token.load(Ordering::Acquire)
             })
         })
-        .and_then(|()| audit_source(source, profile_guard, &source_id, &token));
+        .and_then(|()| audit_source(source, profile_guard, &source_id, &token, admission));
     let disposition = match result {
         Ok(snapshot) => {
             source.known_root_identity = Some(snapshot.root_identity.clone());
@@ -4292,6 +4348,7 @@ fn audit_error_policy(error: &CatalogError) -> (bool, bool) {
             CatalogError::ProfileUnavailable(_)
                 | CatalogError::SourceIdentityUncertain(_)
                 | CatalogError::DatabaseIntegrityUncertain(_)
+                | CatalogError::StaleLifecycleGeneration { .. }
         );
     (retryable, root_stale)
 }
@@ -4740,14 +4797,11 @@ fn retarget_previous_source(
         old_receipt = Some((receipt, journal));
     }
 
+    let database = previous.database.into_database();
     let result = if let Some(context) = retarget_context.as_mut() {
-        previous
-            .database
-            .retarget_catalog_root_with_source_authority(canonical_root, profile_guard, context)
+        database.retarget_catalog_root_with_source_authority(canonical_root, profile_guard, context)
     } else {
-        previous
-            .database
-            .retarget_catalog_root(canonical_root, profile_guard)
+        database.retarget_catalog_root(canonical_root, profile_guard)
     };
 
     if let (Some(context), Some((receipt, journal))) = (retarget_context, old_receipt) {
@@ -5027,7 +5081,7 @@ fn retire_source(
         return RetireSourceOutcome::Retained { source, reason };
     }
     let RegisteredSource { database, .. } = source;
-    let acknowledgement = match authority.close_database(database) {
+    let acknowledgement = match authority.close_database(database.into_database()) {
         Ok(acknowledgement) => acknowledgement,
         Err(error) => {
             report_source_authority_issue(
@@ -5072,29 +5126,106 @@ struct CatalogScanWriter<'a> {
     profile_guard: &'a WritableProfileGuard,
     database: &'a SourceDatabase,
     cancel: Option<&'a AtomicBool>,
+    owner: Option<&'a SourceWriter>,
+    lifecycle: Option<CatalogScanLifecycle<'a>>,
 }
 
-impl ScanWriter for CatalogScanWriter<'_> {
-    type Guard = ();
+#[derive(Clone, Copy)]
+struct CatalogScanLifecycle<'a> {
+    admission: &'a Mutex<AdmissionState>,
+    source_id: &'a SourceId,
+    generation: u64,
+    token: &'a Arc<AtomicBool>,
+}
 
-    fn lock(&self, _phase: ScanWritePhase) -> Self::Guard {}
+impl<'a> ScanWriter for CatalogScanWriter<'a> {
+    type Guard = Option<MutexGuard<'a, AdmissionState>>;
+
+    fn lock(&self, phase: ScanWritePhase) -> Self::Guard {
+        self.try_lock(phase)
+            .expect("catalog scan writer lock must retain source authority")
+    }
 
     fn try_lock(&self, _phase: ScanWritePhase) -> Result<Self::Guard, ScanError> {
-        if self
-            .cancel
-            .is_some_and(|cancel| cancel.load(Ordering::Acquire))
+        if self.lifecycle.is_none()
+            && self
+                .cancel
+                .is_some_and(|cancel| cancel.load(Ordering::Acquire))
         {
             return Err(ScanError::Canceled);
         }
-        self.validate_authority()
+        self.validate_authority()?;
+        self.lock_lifecycle(true)
     }
 
     fn try_lock_cleanup(&self) -> Result<Self::Guard, ScanError> {
-        self.validate_authority()
+        self.validate_authority()?;
+        self.lock_lifecycle(false)
+    }
+
+    fn commit_bounded_manifest_batch(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        expected_revision: u64,
+    ) -> Result<ManifestCommitResult, ScanError> {
+        let owner = self.owner.ok_or_else(|| {
+            ScanError::SourceOwner(String::from("catalog scan has no retained source writer"))
+        })?;
+        let fence = owner.current_scan_fence().map_err(scan_writer_error)?;
+        if fence.revision() != expected_revision {
+            return Err(ScanError::StaleRevision {
+                expected: expected_revision,
+                actual: fence.revision(),
+            });
+        }
+        owner
+            .commit_scan_manifest_batch(&fence, batch)
+            .map_err(scan_writer_error)
+    }
+
+    fn commit_scan_audit_completion(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        generation: u64,
+        expected_revision: u64,
+        completed_at: i64,
+        root_identity: RootIdentity,
+        audit_request: Option<&SourceAuditRequest>,
+    ) -> Result<(SourceAuditCommit, Vec<SourceManifestEntry>), ScanError> {
+        let owner = self.owner.ok_or_else(|| {
+            ScanError::SourceOwner(String::from("catalog audit has no retained source writer"))
+        })?;
+        let fence = owner.current_scan_fence().map_err(scan_writer_error)?;
+        if fence.revision() != expected_revision {
+            return Err(ScanError::StaleRevision {
+                expected: expected_revision,
+                actual: fence.revision(),
+            });
+        }
+        owner
+            .commit_scan_audit_completion(
+                &fence,
+                batch,
+                generation,
+                completed_at,
+                root_identity,
+                audit_request,
+            )
+            .map_err(scan_writer_error)
     }
 }
 
-impl CatalogScanWriter<'_> {
+fn scan_writer_error(error: SourceWriterError) -> ScanError {
+    match error {
+        SourceWriterError::Database(error) => ScanError::Db(error),
+        SourceWriterError::StaleRevision { expected, actual } => {
+            ScanError::StaleRevision { expected, actual }
+        }
+        error => ScanError::SourceOwner(error.to_string()),
+    }
+}
+
+impl<'a> CatalogScanWriter<'a> {
     fn validate_authority(&self) -> Result<(), ScanError> {
         self.profile_guard
             .validate_current()
@@ -5102,7 +5233,41 @@ impl CatalogScanWriter<'_> {
         self.database
             .validate_profile_guard(self.profile_guard)
             .map_err(ScanError::Db)?;
+        if let Some(owner) = self.owner {
+            owner.current_scan_fence().map_err(scan_writer_error)?;
+        }
         Ok(())
+    }
+
+    fn lock_lifecycle(
+        &self,
+        check_cancel: bool,
+    ) -> Result<Option<MutexGuard<'a, AdmissionState>>, ScanError> {
+        let Some(lifecycle) = self.lifecycle else {
+            return Ok(None);
+        };
+        let state = lifecycle
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let actual = state.sources.get(lifecycle.source_id);
+        if actual.is_none_or(|source| {
+            !source.active || source.lifecycle_generation != lifecycle.generation
+        }) || state.shutdown
+            || state.closed
+        {
+            return Err(ScanError::StaleLifecycle {
+                expected: lifecycle.generation,
+                actual: actual.map(|source| source.lifecycle_generation),
+            });
+        }
+        let same_attempt = actual
+            .and_then(|source| source.attempt_token.as_ref())
+            .is_some_and(|token| Arc::ptr_eq(token, lifecycle.token));
+        if !same_attempt || (check_cancel && lifecycle.token.load(Ordering::Acquire)) {
+            return Err(ScanError::Canceled);
+        }
+        Ok(Some(state))
     }
 }
 
@@ -5116,6 +5281,8 @@ fn maintain_catalog_database(
         profile_guard,
         database,
         cancel,
+        owner: None,
+        lifecycle: None,
     };
 
     loop {
@@ -5224,6 +5391,7 @@ fn audit_source(
     profile_guard: &WritableProfileGuard,
     source_id: &SourceId,
     token: &Arc<AtomicBool>,
+    admission: &Arc<Mutex<AdmissionState>>,
 ) -> Result<CatalogSnapshot, CatalogError> {
     profile_guard.validate_current().map_err(|error| {
         catalog_error_from_db_for_source(source_id, SourceDbError::ProfileOwnership(error))
@@ -5245,6 +5413,13 @@ fn audit_source(
         profile_guard,
         database: &source.database,
         cancel: Some(token),
+        owner: Some(&source.database.writer),
+        lifecycle: Some(CatalogScanLifecycle {
+            admission,
+            source_id,
+            generation: source.lifecycle_generation,
+            token,
+        }),
     };
     let audit = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
         &source.database,
@@ -5850,6 +6025,20 @@ fn scan_error(
 ) -> CatalogError {
     match error {
         yield_scan::sample_sources::scanner::ScanError::Canceled => CatalogError::Canceled,
+        yield_scan::sample_sources::scanner::ScanError::StaleLifecycle {
+            expected,
+            actual: Some(actual),
+        } => CatalogError::StaleLifecycleGeneration {
+            source_id: source_id.clone(),
+            expected: actual,
+            received: expected,
+        },
+        yield_scan::sample_sources::scanner::ScanError::StaleLifecycle { actual: None, .. } => {
+            CatalogError::SourceUnavailable(String::from("source retired while scanning"))
+        }
+        yield_scan::sample_sources::scanner::ScanError::SourceOwner(error) => {
+            CatalogError::SourceIdentityUncertain(error)
+        }
         yield_scan::sample_sources::scanner::ScanError::Db(error) => {
             catalog_error_from_db_for_source(source_id, error)
         }
@@ -7924,7 +8113,8 @@ mod tests {
         let source = RegisteredSource {
             root: fixture.root.path().to_path_buf(),
             lifecycle_generation: 1,
-            database,
+            database: CatalogSourceDatabase::new(database, source_id.clone(), 1)
+                .expect("retained source writer"),
             publication_fence,
             known_root_identity: Some(root_identity.clone()),
             snapshot: Some(CatalogSnapshot {
@@ -7997,7 +8187,8 @@ mod tests {
         let mut source = RegisteredSource {
             root: replacement_root.path().to_path_buf(),
             lifecycle_generation: 1,
-            database,
+            database: CatalogSourceDatabase::new(database, source_id.clone(), 1)
+                .expect("retained source writer"),
             publication_fence,
             known_root_identity: Some(root_identity.clone()),
             snapshot: None,
@@ -8177,7 +8368,8 @@ mod tests {
         let source = RegisteredSource {
             root: replacement_root.path().to_path_buf(),
             lifecycle_generation: 1,
-            database,
+            database: CatalogSourceDatabase::new(database, source_id.clone(), 1)
+                .expect("retained source writer"),
             publication_fence: stale_publication_fence,
             known_root_identity: Some(root_identity),
             snapshot: None,
@@ -8297,7 +8489,8 @@ mod tests {
         let source = RegisteredSource {
             root: fixture.root.path().to_path_buf(),
             lifecycle_generation: 1,
-            database,
+            database: CatalogSourceDatabase::new(database, source_id.clone(), 1)
+                .expect("retained source writer"),
             publication_fence,
             known_root_identity: Some(root_identity),
             snapshot: Some(snapshot),
@@ -8950,7 +9143,8 @@ mod tests {
         let replacement_source = RegisteredSource {
             root: source_root.path().to_path_buf(),
             lifecycle_generation: 2,
-            database,
+            database: CatalogSourceDatabase::new(database, source_id.clone(), 2)
+                .expect("retained source writer"),
             publication_fence,
             known_root_identity: None,
             snapshot: None,
@@ -9471,6 +9665,8 @@ mod tests {
             profile_guard: &fixture.guard,
             database: &database,
             cancel: Some(&cancel),
+            owner: None,
+            lifecycle: None,
         };
         assert!(writer.try_lock_cleanup().is_ok());
 
@@ -9490,6 +9686,109 @@ mod tests {
             )))
         ));
         assert!(child_path.join("sentinel").is_file());
+    }
+
+    #[test]
+    fn retained_scan_writer_commits_first_audit_then_rejects_retired_lifecycle() {
+        let fixture = Fixture::new("catalog-scan-retired-lifecycle");
+        let source_id = SourceId::from_string("source-scan-retired-lifecycle");
+        write_test_wav(&fixture.root.path().join("one.wav"), 44_100, 128);
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("profile catalog database");
+        let retained = CatalogSourceDatabase::new(database, source_id.clone(), 1)
+            .expect("pre-audit source writer");
+        let token = Arc::new(AtomicBool::new(false));
+        let admission = Mutex::new(AdmissionState::new());
+        admission.lock().unwrap().sources.insert(
+            source_id.clone(),
+            DesiredSource {
+                lifecycle_generation: 1,
+                active: true,
+                attempt_token: Some(Arc::clone(&token)),
+                last_curation_request_id: None,
+            },
+        );
+        let writer = CatalogScanWriter {
+            profile_guard: &fixture.guard,
+            database: &retained,
+            cancel: Some(token.as_ref()),
+            owner: Some(&retained.writer),
+            lifecycle: Some(CatalogScanLifecycle {
+                admission: &admission,
+                source_id: &source_id,
+                generation: 1,
+                token: &token,
+            }),
+        };
+        assert!(writer.try_lock(ScanWritePhase::Manifest).is_ok());
+        let mut progress_count = 0;
+        let audit = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+            &retained,
+            None,
+            now_epoch_seconds(),
+            &mut |_, _| {
+                assert!(
+                    admission.try_lock().is_ok(),
+                    "traversal must not hold the lifecycle write guard"
+                );
+                progress_count += 1;
+            },
+            &writer,
+            None,
+        )
+        .expect("first complete audit through retained writer");
+        assert!(progress_count > 0);
+        assert_eq!(audit.stats.committed_delta.created.len(), 1);
+        assert_eq!(
+            audit.stats.committed_delta.revision,
+            audit.audit_commit.committed_source_revision()
+        );
+        assert_eq!(
+            retained.writer.current_revision().unwrap().revision(),
+            audit.audit_commit.committed_source_revision()
+        );
+        write_test_wav(&fixture.root.path().join("one.wav"), 44_100, 256);
+        let mut retired_during_traversal = false;
+        let mut at_retirement = None;
+        assert!(matches!(
+            audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+                &retained,
+                None,
+                now_epoch_seconds(),
+                &mut |_, _| {
+                    if !retired_during_traversal {
+                        at_retirement = Some(retained.manifest_snapshot_with_revision().unwrap());
+                        apply_admission_action(
+                            &mut admission.lock().unwrap(),
+                            AdmissionAction::Remove {
+                                source_id: source_id.clone(),
+                                lifecycle_generation: 2,
+                            },
+                        );
+                        retired_during_traversal = true;
+                    }
+                },
+                &writer,
+                None,
+            ),
+            Err(ScanError::StaleLifecycle { .. })
+        ));
+        assert!(retired_during_traversal);
+        assert!(matches!(
+            writer.try_lock(ScanWritePhase::Manifest),
+            Err(ScanError::StaleLifecycle {
+                expected: 1,
+                actual: Some(2)
+            })
+        ));
+        assert_eq!(
+            retained.manifest_snapshot_with_revision().unwrap(),
+            at_retirement.expect("revision observed at retirement")
+        );
     }
 
     #[test]
