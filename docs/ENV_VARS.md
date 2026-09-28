@@ -525,13 +525,10 @@ Semantics:
 - when present and `RUST_LOG` is unset, Yield installs the default filter
   `yield=debug,perf=info,info` so Yield-owned debug events and opt-in
   performance events are visible without turning third-party crates up to `debug`
-- when present and `RUST_LOG` is also set, `RUST_LOG` still owns the final
-  filter expression, but Yield still treats the run as debug mode for
-  diagnostics that explicitly gate on the Yield-owned debug feature
-- on Windows release builds, the same flag also preserves the existing console
-  attach behavior for interactive debugging
+- when present and `RUST_LOG` is also set, `RUST_LOG` owns the final filter
+  expression
 
-Structured debug event contract for later instrumentation:
+Structured debug event contract for instrumentation:
 - action events must use stable `action`, `pane`, `source`, `outcome`,
   `elapsed_ms`, and `error` fields
 - DB events must use stable `operation`, `source`, `outcome`, `elapsed_ms`, and
@@ -557,6 +554,19 @@ Yield-owned debug feature is enabled via `--log`, `-log`, or
 `YIELD_DEBUG_LOGGING`.
 `RUST_LOG` overrides that default filter when it is set.
 
+The GPUI launcher writes formatted tracing events to stdout and to a profile-local
+`logs/yield_<timestamp>_<process>_<run>_<sequence>.log` segment. Each segment
+rotates before a whole event would exceed 10 MiB; one indivisible event larger
+than 10 MiB remains whole, so the maximum overshoot is that event's size.
+Startup and each successful rotation retain at most ten matching regular Yield
+segments. Existing oversized segments are never rewritten or truncated; they
+age out through count retention. Other files and symlinks in `logs/` are left
+alone. A logging worker performs writes and cleanup away from the UI and audio
+threads. If rotation or cleanup fails, Yield keeps writing to the current file
+where possible and reports degraded retention on stderr. A saturated worker
+queue may drop events and reports their count on stderr. Logs can contain local
+paths; review them before sharing a support bundle.
+
 ### Debug log workflow
 
 - local release debugging:
@@ -575,8 +585,10 @@ Yield-owned debug feature is enabled via `--log`, `-log`, or
   - sandbox/manual QA profile:
     `powershell -ExecutionPolicy Bypass -File scripts/run.ps1 bug-bundle -Sandbox`
 - what the log captures automatically:
-  - startup metadata, warnings/errors, and the structured Yield-owned debug
-    action/DB events emitted during the reproduced run
+  - startup log location, warnings/errors, and any structured debug events
+    actually emitted by instrumented crates during the reproduced run. The
+    launcher does not fabricate action or database events for uninstrumented
+    paths.
 - what still requires manual reproduction:
   - you still need to rerun the failing scenario with `--log`; the file records
     what happened during that run, but it does not retroactively reconstruct an

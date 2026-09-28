@@ -482,11 +482,12 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::sample_sources::scanner::open_maintained_scan_database;
 
     #[test]
     fn interleaved_manifest_writer_forces_exact_committed_resnapshot() {
         let directory = tempfile::tempdir().expect("source root");
-        let database = SourceDatabase::open_for_scan(directory.path()).expect("source database");
+        let database = open_maintained_scan_database(directory.path()).expect("source database");
         let mut initial_batch = database.write_batch().expect("initial batch");
         initial_batch
             .upsert_file_with_hash(Path::new("initial.wav"), 1, 1, "initial")
@@ -537,7 +538,7 @@ mod tests {
     #[test]
     fn targeted_commit_reports_stale_revision_after_an_interleaved_writer() {
         let directory = tempfile::tempdir().expect("source root");
-        let database = SourceDatabase::open_for_scan(directory.path()).expect("source database");
+        let database = open_maintained_scan_database(directory.path()).expect("source database");
         let mut initial_batch = database.write_batch().expect("initial batch");
         initial_batch
             .upsert_file_with_hash(Path::new("initial.wav"), 1, 1, "initial")

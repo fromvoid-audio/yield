@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use yield_core::COLLECTION_COUNT;
 use yield_design::{Theme, ThemeError, validate_theme};
 use yield_library::sample_sources::UI_PREFERENCES_MAX_BYTES;
 
@@ -14,6 +15,8 @@ use crate::SessionError;
 pub const UI_PREFERENCES_SCHEMA_VERSION: u32 = 1;
 const MAX_THEME_SOURCE_PATH_BYTES: usize = 16 * 1024;
 const MAX_AUDIO_OUTPUT_NAME_BYTES: usize = 1024;
+/// Longest persisted custom collection label, measured in UTF-8 bytes.
+pub const MAX_COLLECTION_NAME_BYTES: usize = 128;
 const OUTPUT_VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Default interval between positive-rating decay steps, in weeks.
@@ -45,6 +48,10 @@ fn default_output_volume() -> f32 {
 
 fn default_text_scale_percent() -> u16 {
     DEFAULT_TEXT_SCALE_PERCENT
+}
+
+fn default_collection_names() -> [Option<String>; COLLECTION_COUNT] {
+    std::array::from_fn(|_| None)
 }
 
 /// The optional, renderer-neutral audio output routing persisted with the UI preferences.
@@ -145,6 +152,9 @@ pub struct UiPreferences {
     /// Optional output routing requested by the user.
     #[serde(default)]
     pub audio_output: AudioOutputPreferences,
+    /// Profile-owned custom labels for the six stable collection slots.
+    #[serde(default = "default_collection_names")]
+    pub collection_names: [Option<String>; COLLECTION_COUNT],
 }
 
 impl Default for UiPreferences {
@@ -163,6 +173,7 @@ impl Default for UiPreferences {
             normalized_audition_enabled: false,
             output_volume: 1.0,
             audio_output: AudioOutputPreferences::default(),
+            collection_names: default_collection_names(),
         }
     }
 }
@@ -185,6 +196,9 @@ impl UiPreferences {
         validate_trash_folder(self.trash_folder.as_deref())?;
         validate_output_volume(self.output_volume)?;
         self.audio_output.validate()?;
+        for name in self.collection_names.iter().flatten() {
+            validate_collection_name(name)?;
+        }
         Ok(Self { theme, ..self })
     }
 
@@ -263,6 +277,14 @@ pub enum PreferenceError {
         /// The invalid audio output field name.
         field: &'static str,
     },
+    /// A collection label did not meet the bounded single-line name contract.
+    #[error(
+        "collection name must be trimmed, non-empty, single-line, NUL-free, and at most {MAX_COLLECTION_NAME_BYTES} UTF-8 bytes"
+    )]
+    InvalidCollectionName,
+    /// The requested stable collection slot does not exist.
+    #[error("collection slot must be less than {COLLECTION_COUNT}")]
+    InvalidCollectionSlot,
     /// The profile payload exceeded its bounded UTF-8 byte limit.
     #[error(
         "UI preferences payload exceeds the {UI_PREFERENCES_MAX_BYTES}-byte limit ({actual} bytes)"
@@ -341,6 +363,17 @@ fn validate_rating_decay_weeks(weeks: u16) -> Result<(), PreferenceError> {
     Ok(())
 }
 
+fn validate_collection_name(name: &str) -> Result<(), PreferenceError> {
+    if name.is_empty()
+        || name.trim() != name
+        || name.len() > MAX_COLLECTION_NAME_BYTES
+        || name.chars().any(char::is_control)
+    {
+        return Err(PreferenceError::InvalidCollectionName);
+    }
+    Ok(())
+}
+
 fn validate_trash_folder(path: Option<&Path>) -> Result<(), PreferenceError> {
     if let Some(path) = path {
         let text = path.to_str().ok_or(PreferenceError::InvalidTrashFolder)?;
@@ -389,6 +422,13 @@ pub enum PreferencePatch {
     SetOutputVolume(f32),
     /// Replace all optional audio output routing fields atomically.
     SetAudioOutput(AudioOutputPreferences),
+    /// Assign a custom display label to one stable collection slot.
+    SetCollectionName {
+        /// Zero-based slot identity, independent of active source.
+        slot: usize,
+        /// Trimmed, bounded user label.
+        name: String,
+    },
     /// Replace the invalid or current document with built-in defaults.
     Reset,
 }
@@ -437,6 +477,13 @@ impl PreferencePatch {
             Self::SetAudioOutput(audio_output) => {
                 audio_output.validate()?;
                 preferences.audio_output = audio_output;
+            }
+            Self::SetCollectionName { slot, name } => {
+                validate_collection_name(&name)?;
+                let Some(current) = preferences.collection_names.get_mut(slot) else {
+                    return Err(PreferenceError::InvalidCollectionSlot);
+                };
+                *current = Some(name);
             }
             Self::Reset => *preferences = Self::default_preferences(),
         }
@@ -720,6 +767,66 @@ mod tests {
             UiPreferences::from_payload(&payload).expect("decode"),
             preferences
         );
+    }
+
+    #[test]
+    fn collection_names_are_bounded_slot_stable_and_round_trip() {
+        let mut preferences = UiPreferences::default();
+        assert!(
+            PreferencePatch::SetCollectionName {
+                slot: 2,
+                name: "Percussion".to_string(),
+            }
+            .apply(&mut preferences)
+            .expect("rename slot")
+        );
+        assert_eq!(
+            preferences.collection_names[2].as_deref(),
+            Some("Percussion")
+        );
+        assert!(
+            preferences
+                .collection_names
+                .iter()
+                .enumerate()
+                .all(|(slot, name)| { slot == 2 || name.is_none() })
+        );
+        assert_eq!(
+            UiPreferences::from_payload(&preferences.to_payload().unwrap()).unwrap(),
+            preferences
+        );
+        assert_eq!(
+            PreferencePatch::SetCollectionName {
+                slot: COLLECTION_COUNT,
+                name: "Wrong".to_string(),
+            }
+            .apply(&mut preferences),
+            Err(PreferenceError::InvalidCollectionSlot)
+        );
+        for invalid in [
+            "",
+            " Name",
+            "Name ",
+            "two\nlines",
+            "two\twords",
+            "bad\0name",
+            &"x".repeat(129),
+        ] {
+            assert_eq!(
+                PreferencePatch::SetCollectionName {
+                    slot: 2,
+                    name: invalid.to_string(),
+                }
+                .apply(&mut preferences),
+                Err(PreferenceError::InvalidCollectionName)
+            );
+        }
+        assert_eq!(
+            preferences.collection_names[2].as_deref(),
+            Some("Percussion")
+        );
+        PreferencePatch::Reset.apply(&mut preferences).unwrap();
+        assert!(preferences.collection_names.iter().all(Option::is_none));
     }
 
     #[test]

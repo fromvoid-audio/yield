@@ -154,7 +154,19 @@ if [[ ! -d "$logs_dir" ]]; then
   exit 1
 fi
 
-newest_log="$(ls -1t "$logs_dir"/*.log 2>/dev/null | head -n 1 || true)"
+# Prefer complete Yield segments over unrelated or temporary files. Retain the
+# historical generic fallback for profiles that have only older log formats.
+newest_log=""
+while IFS= read -r candidate; do
+  name="$(basename "$candidate")"
+  if [[ "$name" =~ ^yield_[[:xdigit:]]{16}_[[:xdigit:]]{8}_[[:xdigit:]]{8}_[[:xdigit:]]{8}\.log$ ]] && [[ -f "$candidate" ]] && [[ ! -L "$candidate" ]]; then
+    newest_log="$candidate"
+    break
+  fi
+done < <(ls -1t "$logs_dir"/yield_*.log 2>/dev/null || true)
+if [[ -z "$newest_log" ]]; then
+  newest_log="$(ls -1t "$logs_dir"/*.log 2>/dev/null | head -n 1 || true)"
+fi
 if [[ -z "$newest_log" ]]; then
   echo "[latest_log] No .log files found under $logs_dir"
   exit 0

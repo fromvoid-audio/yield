@@ -2,6 +2,7 @@ use super::super::{
     DEFAULT_ANTI_CLIP_FADE, EdgeFade, FadeOutHandle, FadeOutOnRequest, fade_duration,
 };
 use super::support::ConstantSource;
+use crate::Source;
 use std::time::Duration;
 
 #[test]
@@ -54,6 +55,25 @@ fn fade_out_on_request_ramps_to_zero_and_stops() {
     assert_eq!(samples[7], 0.5);
     assert_eq!(samples[8], 0.0);
     assert_eq!(samples[9], 0.0);
+}
+
+#[test]
+fn replacing_a_midspan_source_does_not_double_the_first_output_frame() {
+    let source = ConstantSource::new(1_000, 1, 1.0, 1.0);
+    let handle = FadeOutHandle::new();
+    let mut previous = FadeOutOnRequest::new(source, handle.clone());
+    previous.by_ref().take(100).for_each(drop);
+    handle.request_fade_out_frames(4);
+
+    // The new source starts away from the span edge, where its edge fade is
+    // already at full gain. A transition fade must complement the old sink.
+    let mut replacement = ConstantSource::new(1_000, 1, 1.0, 1.0).fade_in(Duration::from_millis(4));
+    let mixed: Vec<f32> = (0..4)
+        .map(|_| previous.next().unwrap_or_default() + replacement.next().unwrap_or_default())
+        .collect();
+
+    assert!(mixed[0] <= 1.01, "first mixed frame jumped: {mixed:?}");
+    assert!(mixed.iter().all(|sample| *sample <= 1.1 && *sample >= 0.7));
 }
 
 #[test]

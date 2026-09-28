@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use crate::Source;
 
 use super::super::{PlaybackSpanHandle, playback_span_handle::PlaybackSpanSnapshot};
+use super::loop_mode::LoopModeHandle;
 use super::span_edge_fade::{span_edge_fade_frames, span_edge_fade_gain};
 
 pub(super) struct SpanSamplesSource {
@@ -12,6 +13,7 @@ pub(super) struct SpanSamplesSource {
     playback_span: PlaybackSpanHandle,
     active_span: PlaybackSpanSnapshot,
     mode: SpanSamplesMode,
+    live_loop_mode: Option<LoopModeHandle>,
     position_sample: u64,
     fade_frames: u64,
 }
@@ -39,6 +41,7 @@ impl SpanSamplesSource {
             playback_span,
             active_span,
             mode,
+            live_loop_mode: None,
             position_sample: position_sample as u64,
             fade_frames: 0,
         }
@@ -47,6 +50,19 @@ impl SpanSamplesSource {
     pub(super) fn with_edge_fade(mut self, fade: Duration) -> Self {
         self.fade_frames = span_edge_fade_frames(self.sample_rate, u64::MAX, fade);
         self
+    }
+
+    pub(super) fn with_live_loop_mode(mut self, mode: LoopModeHandle) -> Self {
+        self.live_loop_mode = Some(mode);
+        self
+    }
+
+    fn mode(&self) -> SpanSamplesMode {
+        match self.live_loop_mode.as_ref() {
+            Some(mode) if mode.looped() => SpanSamplesMode::Looped,
+            Some(_) => SpanSamplesMode::OneShot,
+            None => self.mode,
+        }
     }
 
     fn prepare_frame(&mut self) -> bool {
@@ -66,7 +82,7 @@ impl SpanSamplesSource {
             discontinuity = true;
         }
         let frame = self.current_frame();
-        let can_continue = match self.mode {
+        let can_continue = match self.mode() {
             SpanSamplesMode::Looped if !self.active_span.contains(frame) => {
                 self.seek_to_frame(self.active_span.start_frame());
                 discontinuity = true;
@@ -118,10 +134,16 @@ impl Iterator for SpanSamplesSource {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.samples.is_empty() {
+            if let Some(mode) = self.live_loop_mode.as_ref() {
+                mode.mark_finished();
+            }
             return None;
         }
 
         if !self.prepare_frame() {
+            if let Some(mode) = self.live_loop_mode.as_ref() {
+                mode.mark_finished();
+            }
             return None;
         }
         let frame = self.current_frame();
@@ -129,7 +151,10 @@ impl Iterator for SpanSamplesSource {
         let index = match self.sample_index() {
             Some(index) => index,
             None => {
-                if self.mode == SpanSamplesMode::OneShot {
+                if self.mode() == SpanSamplesMode::OneShot {
+                    if let Some(mode) = self.live_loop_mode.as_ref() {
+                        mode.mark_finished();
+                    }
                     return None;
                 }
                 let start_frame = self.active_span.start_frame();
@@ -172,6 +197,32 @@ mod tests {
         PlaybackSourceIdentity, PlaybackSourceKind, PlaybackSpanPlan, PlaybackSpanRequest,
     };
 
+    #[test]
+    fn live_mode_change_keeps_the_current_sample_position() {
+        let samples = Arc::<[f32]>::from(vec![1.0, 2.0, 3.0, 4.0]);
+        let span = PlaybackSpanHandle::from_plan(&span_plan(0, 4, 0));
+        let mode = LoopModeHandle::new(true, 4, 0);
+        let mut source =
+            SpanSamplesSource::new(1, 1_000, samples, span, SpanSamplesMode::Looped, 0)
+                .with_live_loop_mode(mode.clone());
+
+        assert_eq!(
+            (0..6).map(|_| source.next()).collect::<Vec<_>>(),
+            vec![
+                Some(1.0),
+                Some(2.0),
+                Some(3.0),
+                Some(4.0),
+                Some(1.0),
+                Some(2.0)
+            ]
+        );
+        mode.set_looped(false);
+        assert_eq!(source.next(), Some(3.0));
+        assert_eq!(source.next(), Some(4.0));
+        assert_eq!(source.next(), None);
+        assert!(mode.finished());
+    }
     #[test]
     fn growing_loop_keeps_reading_forward_without_restart() {
         let samples = Arc::<[f32]>::from(vec![0.0, 1.0, 2.0, 3.0, 4.0]);

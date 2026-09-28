@@ -9,7 +9,12 @@ cd "$ROOT_DIR"
 
 call_pattern='SourceDatabase::(open|open_with_database_root|open_fast|open_fast_with_database_root|open_read_only|open_read_only_with_database_root|open_connection)[[:space:]]*\('
 declaration_pattern='pub fn (open|open_with_database_root|open_fast|open_fast_with_database_root|open_read_only|open_read_only_with_database_root|open_connection)[[:space:]]*\('
-scope=(benches crates src tests tools)
+scope=()
+for candidate in benches crates src tests tools; do
+  if [[ -d "$candidate" ]]; then
+    scope+=("$candidate")
+  fi
+done
 violations=""
 
 if command -v rg >/dev/null 2>&1; then
@@ -36,3 +41,10 @@ if [[ -n "$violations" ]]; then
 fi
 
 echo "[source_db_roles] OK"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[source_db_roles] python3 is required for the competing-writer guard" >&2
+  exit 1
+fi
+python3 scripts/internal/check/check_source_db_competing_writers.py --self-test
+python3 scripts/internal/check/check_source_db_competing_writers.py

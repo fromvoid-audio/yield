@@ -80,6 +80,12 @@ reference source or backend code does not satisfy the row.
 | Settings and auxiliary UI | `app_chrome`, `release_update` | Audio options, dialogs, context menus, shortcuts, updates, diagnostics |
 | Platform behavior | `reference/radiant/src/native_app/shell`, `reference/radiant/src/native_runtime` | macOS and Windows build/input/window lifecycle coverage |
 
+The [active reference edit-action inventory](GPUI_REFERENCE_EDIT_ACTIONS.md)
+maps destructive waveform and slice-review actions to GPUI owners and bounded
+follow-up gaps. Prepared output alone does not establish parity.
+The [prepared edit handoff](GPUI_PREPARED_EDIT_CONTRACT.md) records the
+immutable request and current macOS publication boundary for OPT-1475.
+
 ## Completion evidence
 
 ### Initial slice, 2026-09-07

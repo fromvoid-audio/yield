@@ -903,7 +903,7 @@ mod tests {
         prepare_diff_from_capability, prepare_for_apply, prepare_for_apply_with_post_hash_hook,
         refresh_noop_preparation_or_skip,
     };
-    use crate::sample_sources::SourceDatabase;
+    use crate::sample_sources::scanner::open_maintained_scan_database;
     use crate::sample_sources::scanner::scan::{ScanContext, ScanError, ScanMode, scan_once};
     use crate::sample_sources::scanner::scan_diff::PreparedFile;
     use crate::sample_sources::scanner::scan_diff_phase::prepare_diff;
@@ -917,7 +917,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("one.wav");
         std::fs::write(&file_path, b"one").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         scan_once(&db).unwrap();
         db.set_missing(Path::new("one.wav"), true).unwrap();
         let prepared = PreparedFile {
@@ -946,7 +946,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("one.wav");
         std::fs::write(&file_path, b"one").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         scan_once(&db).unwrap();
         let entry = db.entry_for_path(Path::new("one.wav")).unwrap().unwrap();
         let mut context = ScanContext::from_existing(
@@ -992,7 +992,7 @@ mod tests {
         let outside_file = outside.path().join("outside.wav");
         std::fs::write(&source, b"inside").unwrap();
         std::fs::write(&outside_file, b"outside").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         scan_once(&db).unwrap();
         let entry = db.entry_for_path(relative).unwrap().unwrap();
         let mut context = ScanContext::from_existing(
@@ -1037,7 +1037,7 @@ mod tests {
         let outside_file = outside.path().join("outside.wav");
         std::fs::write(&source, b"inside").unwrap();
         std::fs::write(&outside_file, b"outside").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         scan_once(&db).unwrap();
         let entry = db.entry_for_path(relative).unwrap().unwrap();
         let mut context = ScanContext::from_existing(
@@ -1098,7 +1098,7 @@ mod tests {
         std::fs::write(nested.join("one.wav"), b"inside").unwrap();
         let outside = tempdir().unwrap();
         std::fs::write(outside.path().join("one.wav"), b"outside").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         scan_once(&db).unwrap();
         let entry = db.entry_for_path(relative).unwrap().unwrap();
         let mut context = ScanContext::from_existing(
@@ -1152,7 +1152,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("one.wav");
         std::fs::write(&file_path, b"one").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         let mut context = ScanContext::from_existing(
             HashMap::new(),
             ScanMode::Quick,
@@ -1185,7 +1185,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("one.wav");
         std::fs::write(&file_path, [1_u8; 32]).unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         db.upsert_file(Path::new("one.wav"), 32, 1).unwrap();
         let prepared = PreparedFile {
             facts: read_facts(dir.path(), &file_path).unwrap(),
@@ -1219,7 +1219,7 @@ mod tests {
         let outside_file = outside.path().join("outside.wav");
         std::fs::write(&source, b"inside").unwrap();
         std::fs::write(&outside_file, b"outside").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         let context = ScanContext::from_existing(
             HashMap::new(),
             ScanMode::Quick,
@@ -1248,7 +1248,7 @@ mod tests {
         let outside_file = outside.path().join("outside.wav");
         std::fs::write(&source, b"inside").unwrap();
         std::fs::write(&outside_file, b"outside").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         let context = ScanContext::from_existing(
             HashMap::new(),
             ScanMode::Quick,
@@ -1279,7 +1279,7 @@ mod tests {
         std::fs::write(nested.join("one.wav"), b"inside").unwrap();
         let outside = tempdir().unwrap();
         std::fs::write(outside.path().join("one.wav"), b"outside").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         let context = ScanContext::from_existing(
             HashMap::new(),
             ScanMode::Quick,
@@ -1313,7 +1313,7 @@ mod tests {
         let outside_file = outside.path().join("outside.wav");
         std::fs::write(&source, b"inside").unwrap();
         std::fs::write(&outside_file, b"outside").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         let prepared = PreparedFile {
             facts: read_facts(dir.path(), &source).unwrap(),
             hash_required: true,
@@ -1347,7 +1347,7 @@ mod tests {
         let outside_file = outside.path().join("outside.wav");
         std::fs::write(&source, b"inside").unwrap();
         std::fs::write(&outside_file, b"outside").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         let mut context = ScanContext::from_existing(
             HashMap::new(),
             ScanMode::Quick,
@@ -1386,7 +1386,7 @@ mod tests {
         let relative = Path::new("one.wav");
         let source = dir.path().join(relative);
         std::fs::write(&source, b"inside").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         let mut context = ScanContext::from_existing(
             HashMap::new(),
             ScanMode::Quick,
@@ -1428,7 +1428,7 @@ mod tests {
         let outside_file = outside.path().join("outside.wav");
         std::fs::write(&source, b"inside").unwrap();
         std::fs::write(&outside_file, b"outside").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         let mut context = ScanContext::from_existing(
             HashMap::new(),
             ScanMode::Quick,
@@ -1520,7 +1520,7 @@ mod tests {
         let outside_file = outside.path().join("outside.wav");
         std::fs::write(&source, b"source").unwrap();
         std::fs::write(&outside_file, b"outside").unwrap();
-        let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+        let db = open_maintained_scan_database(dir.path()).unwrap();
         scan_once(&db).unwrap();
         let entry = db.entry_for_path(Path::new("one.wav")).unwrap().unwrap();
         let mut context = ScanContext::from_existing(

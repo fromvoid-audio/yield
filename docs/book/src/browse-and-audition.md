@@ -16,7 +16,7 @@ The main surface has three working areas:
 
 - `Space` toggles playback.
 - `Shift-Space` replays from the last start point.
-- `Option-Space` plays a random sample section.
+- `R` plays a random section of the selected sample.
 - `Up` and `Down` move through the visible rows.
 - `Shift-Up` and `Shift-Down` extend the sample selection.
 - `Esc` stops playback, closes transient UI, or clears selection depending on context.

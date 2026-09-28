@@ -170,9 +170,15 @@ if (-not (Test-Path -LiteralPath $logsDir -PathType Container)) {
   exit 1
 }
 
-$newest = Get-ChildItem -LiteralPath $logsDir -File -Filter "*.log" -ErrorAction SilentlyContinue |
+$newest = Get-ChildItem -LiteralPath $logsDir -File -Filter "yield_*.log" -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -match '^yield_[0-9a-f]{16}_[0-9a-f]{8}_[0-9a-f]{8}_[0-9a-f]{8}\.log$' } |
   Sort-Object -Property LastWriteTime -Descending |
   Select-Object -First 1
+if ($null -eq $newest) {
+  $newest = Get-ChildItem -LiteralPath $logsDir -File -Filter "*.log" -ErrorAction SilentlyContinue |
+    Sort-Object -Property LastWriteTime -Descending |
+    Select-Object -First 1
+}
 
 if ($null -eq $newest) {
   Write-Host ("[latest_log] No .log files found under {0}" -f $logsDir)

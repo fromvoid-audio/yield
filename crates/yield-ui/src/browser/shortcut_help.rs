@@ -232,6 +232,10 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
         description: "Play a random section of the selected sample",
     },
     ShortcutRow {
+        keys: "R",
+        description: "Play a random section of the selected sample",
+    },
+    ShortcutRow {
         keys: "Shift + Random",
         description: "Choose a listed sample, then a random section",
     },
@@ -241,7 +245,11 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
     },
     ShortcutRow {
         keys: "Space",
-        description: "Play/stop; random section in sticky mode",
+        description: "Replay the selected sample or span; random section in sticky mode",
+    },
+    ShortcutRow {
+        keys: "Shift-Space",
+        description: "Play from the current play mark to the sample end",
     },
     ShortcutRow {
         keys: "Cmd-Space",
@@ -260,7 +268,7 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
         description: "Set the focused sample as compare anchor",
     },
     ShortcutRow {
-        keys: "Shift-Space",
+        keys: "Shift-C",
         description: "Replay the compare anchor without changing focus",
     },
     ShortcutRow {
@@ -273,7 +281,7 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
     },
     ShortcutRow {
         keys: "X",
-        description: "Toggle the focused sample in the selection",
+        description: "Toggle the focused sample when the waveform is fully zoomed out",
     },
     ShortcutRow {
         keys: "Cmd/Ctrl-A",
@@ -367,7 +375,7 @@ const WAVEFORM_ROWS: &[ShortcutRow] = &[
     },
     ShortcutRow {
         keys: "X",
-        description: "Reset the waveform viewport",
+        description: "Reset the waveform viewport when zoomed in",
     },
     ShortcutRow {
         keys: "Left / Right",

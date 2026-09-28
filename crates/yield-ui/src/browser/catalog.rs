@@ -48,6 +48,7 @@ pub(super) struct CatalogActivation {
     pub(super) root_identity: Option<RootIdentity>,
     pub(super) audit_finished: bool,
     pub(super) audit_error: Option<String>,
+    pub(super) audit_retryable: bool,
     pub(super) force_reload: bool,
     pub(super) fallback_to_scan: bool,
 }
@@ -174,6 +175,7 @@ impl Browser {
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
         super::curation_queue::cancel_for_source_change(self);
+        self.collection_rename_editor = None;
         self.display_labels.cancel_for_source_change();
         self.reset_browser_focus_state();
         self.context_menu = None;
@@ -295,6 +297,7 @@ impl Browser {
             root_identity: None,
             audit_finished: false,
             audit_error: None,
+            audit_retryable: false,
             force_reload,
             fallback_to_scan,
         });
@@ -334,6 +337,8 @@ impl Browser {
 
     /// Queue removal of the browser's current catalog projection.
     pub(super) fn deactivate_catalog_source(&mut self, cx: &mut Context<Self>) {
+        self.job_action = None;
+        self.job_action_error = None;
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::cancel_for_source_change(self);
         super::tag_chips::cancel_for_source_change(self);
@@ -642,6 +647,8 @@ impl Browser {
         }
         let Some((source_id, lifecycle_generation)) = catalog_event_identity(&event) else {
             if matches!(event, CatalogEvent::Closed) {
+                self.job_action = None;
+                self.job_action_error = None;
                 super::source_recovery::cancel_for_source_change(self);
                 super::rating_decay::cancel_for_source_change(self);
                 super::tag_chips::cancel_for_source_change(self);
@@ -681,10 +688,13 @@ impl Browser {
                 true
             }
             CatalogEvent::AuditCommitted { .. } => {
+                self.job_action = None;
+                self.job_action_error = None;
                 super::rating_decay::note_audit_committed(self);
                 if let Some(activation) = self.catalog_activation.as_mut() {
                     activation.audit_finished = true;
                     activation.audit_error = None;
+                    activation.audit_retryable = false;
                 }
                 if let CatalogEvent::AuditCommitted { snapshot } = &event
                     && let Some(activation) = self.catalog_activation.as_mut()
@@ -693,6 +703,17 @@ impl Browser {
                 }
                 self.set_scan_status("Catalog audit committed…".to_string());
                 self.start_catalog_projection(event, publication_fence, cx);
+                true
+            }
+            CatalogEvent::AuditCanceled { .. } => {
+                self.job_action = None;
+                self.job_action_error = None;
+                if let Some(activation) = self.catalog_activation.as_mut() {
+                    activation.audit_finished = true;
+                    activation.audit_error = Some("Audit canceled; Retry when ready".into());
+                    activation.audit_retryable = true;
+                }
+                self.set_scan_status("Source audit canceled; Retry when ready");
                 true
             }
             CatalogEvent::WavMetadataReady { .. } | CatalogEvent::WavMetadataFailed { .. } => {
@@ -725,7 +746,12 @@ impl Browser {
             | CatalogEvent::CurationTagFactsFailed { .. }
             | CatalogEvent::RatingDecayProgress { .. }
             | CatalogEvent::RatingDecayFailed { .. } => false,
-            CatalogEvent::Failed { error, .. } => {
+            CatalogEvent::Failed {
+                error, operation, ..
+            } => {
+                if *operation == CatalogOperation::Audit {
+                    self.job_action = None;
+                }
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
@@ -734,6 +760,8 @@ impl Browser {
                 if let Some(activation) = self.catalog_activation.as_mut() {
                     activation.audit_finished = true;
                     activation.audit_error = Some(error.to_string());
+                    activation.audit_retryable =
+                        *operation == CatalogOperation::Audit && error.audit_retryable();
                 }
                 self.set_scan_status(format!("Catalog update failed: {error}"));
                 if let Some(index) = self.active_source
@@ -1017,6 +1045,7 @@ impl Browser {
         if let Some(activation) = self.catalog_activation.as_mut() {
             activation.audit_finished = false;
             activation.audit_error = Some(status.to_string());
+            activation.audit_retryable = false;
         }
         self.set_scan_status(status.to_string());
     }
@@ -1051,6 +1080,10 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             lifecycle_generation,
         }
         | CatalogEvent::Removed {
+            source_id,
+            lifecycle_generation,
+        }
+        | CatalogEvent::AuditCanceled {
             source_id,
             lifecycle_generation,
         } => Some((source_id.clone(), *lifecycle_generation)),
@@ -1654,6 +1687,7 @@ mod tests {
             root_identity: None,
             audit_finished: false,
             audit_error: None,
+            audit_retryable: false,
             force_reload: false,
             fallback_to_scan: false,
         };
