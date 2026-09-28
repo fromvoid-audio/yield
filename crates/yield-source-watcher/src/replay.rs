@@ -12,6 +12,9 @@ use yield_library::sample_sources::reconciliation::{BackendStreamIdentity, RootI
 
 use crate::SourceWatchSpec;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 /// Maximum number of native paths retained for one replay candidate.
 pub const MAX_REPLAY_EVENTS: usize = 256;
 /// Maximum native path-spelling bytes retained for one replay candidate.
@@ -301,6 +304,15 @@ impl ReplayIngress {
     /// Stop accepting callbacks. Late events cannot mutate the retained candidate.
     pub fn close(&self) {
         lock_unpoisoned(&self.state).closed = true;
+    }
+
+    /// Retain a second conservative native flag without revisiting an event path.
+    #[cfg(target_os = "macos")]
+    fn mark_reason(&self, reason: ReplayUncertainty) {
+        let mut state = lock_unpoisoned(&self.state);
+        if !state.closed {
+            mark_uncertain(&mut state, reason);
+        }
     }
 
     /// Record the native `HistoryDone` sentinel without interpreting its path as a mutation.

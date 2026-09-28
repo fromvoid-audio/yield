@@ -12,5 +12,10 @@ workspace = true
 notify.workspace = true
 yield-library.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+fsevent-sys = "=4.1.0"
+libc = "=0.2.189"
+uuid = "=1.26.0"
+
 [dev-dependencies]
 tempfile.workspace = true
