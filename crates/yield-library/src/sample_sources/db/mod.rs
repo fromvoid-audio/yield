@@ -96,8 +96,9 @@ pub use types::{
     SourceDirectoryTruthCursor, SourceDirectoryTruthPage, SourceDirectoryTruthPublication,
     SourceDirectoryTruthState, SourceDirectoryTruthUnavailableReason, SourceDisplayLabelEntry,
     SourceDisplayLabelResult, SourceIndexClassification, SourceIndexDiagnostic, SourceIndexEntry,
-    SourceIndexSnapshot, SourceManifestEntry, SourcePlaybackType, SourceTag, SourceTagPage,
-    SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage, WavEntry,
+    SourceIndexSnapshot, SourceManifestEntry, SourcePlaybackType, SourceTag,
+    SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor,
+    SourceTagPageEntry, SourceTagUsage, WavEntry,
 };
 pub use util::normalize_relative_path;
 pub use write::{
@@ -160,6 +161,10 @@ pub const SOURCE_TAG_PAGE_MAX_TAG_IDS: usize = 64;
 pub const SOURCE_TAG_PAGE_MAX_PREFIX_BYTES: usize = 1024;
 /// Maximum number of entries returned by one bounded source-tag page request.
 pub const SOURCE_TAG_PAGE_MAX_PAGE_SIZE: usize = 64;
+/// Maximum encoded byte length of one path returned by a tag-assignment page.
+pub const SOURCE_TAG_ASSIGNMENT_MAX_PATH_BYTES: usize = 4096;
+/// Maximum aggregate path bytes returned by one tag-assignment page.
+pub const SOURCE_TAG_ASSIGNMENT_MAX_PAGE_BYTES: usize = 64 * 1024;
 /// Env var that enables read-only source DB opening by default.
 pub const SOURCE_DB_READ_ONLY_ENV: &str = "YIELD_SOURCE_DB_READ_ONLY";
 
