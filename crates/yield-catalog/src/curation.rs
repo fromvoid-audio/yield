@@ -929,7 +929,7 @@ pub(crate) fn execute_inner(
     let owner_revision = source
         .database
         .writer
-        .current_revision()
+        .current_revision_for_command()
         .map_err(|error| curation_writer_error(source_id, error))?;
     if owner_revision.revision() != expected_revision {
         return Err(CatalogError::StaleRevision {

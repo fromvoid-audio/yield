@@ -16,5 +16,6 @@ yield-source-watcher = { path = "../yield-source-watcher" }
 
 [dev-dependencies]
 hound.workspace = true
+rusqlite = "=0.37.0"
 tempfile = "3.23.0"
 yield-library = { path = "../yield-library", features = ["test-support"] }
