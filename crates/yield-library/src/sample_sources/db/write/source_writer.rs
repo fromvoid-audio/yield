@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::app_dirs::WritableProfileGuard;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use crate::sample_sources::SourceId;
 use crate::sample_sources::db::read::browser_metadata_rows_for_paths;
@@ -810,6 +811,41 @@ impl SourceWriter {
             lease_epoch: scan.lease_epoch,
             revision: scan.revision,
         })
+    }
+
+    /// Commit one bounded catalog metadata/collection command on the retained source.
+    ///
+    /// Catalog requests have a revision fence and one terminal response, rather than a durable
+    /// operation-journal command identity. This route keeps their existing retry behavior and
+    /// avoids consuming the finite operation-receipt table for every UI metadata edit.
+    pub fn commit_catalog_curation_command(
+        &self,
+        expected: &SourceRevision,
+        profile_guard: &WritableProfileGuard,
+        updates: &[SourceCurationUpdate],
+    ) -> Result<SourceCurationCommitReceipt, SourceWriterError> {
+        let current = self.current_revision()?;
+        if expected.source_id != current.source_id
+            || expected.root_identity != current.root_identity
+            || expected.root_binding_identity != current.root_binding_identity
+            || expected.database_identity != current.database_identity
+            || expected.lifecycle_generation != current.lifecycle_generation
+            || expected.lease_epoch != current.lease_epoch
+        {
+            return Err(SourceWriterError::StaleFence);
+        }
+        if expected.revision != current.revision {
+            return Err(SourceWriterError::StaleRevision {
+                expected: expected.revision,
+                actual: current.revision,
+            });
+        }
+        Ok(self.database.commit_curation_with_profile_guard(
+            profile_guard,
+            expected.revision,
+            &expected.root_identity,
+            updates,
+        )?)
     }
 
     /// Synchronous worker primitive; the owned worker bounds the caller's response time.

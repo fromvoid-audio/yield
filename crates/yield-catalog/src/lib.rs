@@ -10625,6 +10625,86 @@ mod tests {
     }
 
     #[test]
+    fn catalog_metadata_commands_do_not_exhaust_operation_receipt_history() {
+        let fixture = Fixture::new("catalog-curation-long-session");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-long-session");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        let mut revision = snapshot.committed_revision;
+
+        // Operation-journal receipts have a separate finite 256-row budget. Ordinary catalog
+        // metadata edits must continue beyond it while retaining one exact revision per edit.
+        for request_id in 1..=257 {
+            service
+                .submit(CatalogCommand::ApplyCuration {
+                    source_id: source_id.clone(),
+                    lifecycle_generation: 1,
+                    expected_revision: revision,
+                    root_identity: snapshot.root_identity.clone(),
+                    request_id,
+                    updates: vec![SourceCurationUpdate::SetLocked {
+                        path: path.clone(),
+                        locked: request_id % 2 == 1,
+                    }],
+                })
+                .expect("curation admission");
+            let event = receive_until(&service, |event| {
+                matches!(
+                    event,
+                    CatalogEvent::CurationCommitted {
+                        request_id: observed,
+                        ..
+                    } | CatalogEvent::CurationFailed {
+                        request_id: observed,
+                        ..
+                    } if *observed == request_id
+                )
+            });
+            let CatalogEvent::CurationCommitted { receipt, .. } = event else {
+                panic!("catalog curation must commit: {event:?}");
+            };
+            assert_eq!(receipt.source_revision(), revision + 1);
+            revision = receipt.source_revision();
+        }
+
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id: source_id.clone(),
+                expected_revision: Some(revision),
+            })
+            .expect("read last catalog revision");
+        let event = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        });
+        let CatalogEvent::SnapshotReady { snapshot } = event else {
+            unreachable!();
+        };
+        assert_eq!(snapshot.committed_revision, revision);
+        assert!(
+            snapshot
+                .curation_metadata
+                .get(Path::new("one.wav"))
+                .expect("last metadata row")
+                .locked
+        );
+        service.shutdown();
+
+        let reopened = CatalogService::start(&fixture.guard).expect("reopened catalog service");
+        let snapshot = register_and_audit(&reopened, fixture.root.path(), &source_id);
+        assert!(
+            snapshot
+                .curation_metadata
+                .get(Path::new("one.wav"))
+                .expect("reopened metadata row")
+                .locked
+        );
+        reopened.shutdown();
+    }
+
+    #[test]
     fn curation_tag_admission_validates_labels_and_releases_payload_credit() {
         let fixture = Fixture::new("catalog-curation-tags");
         write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
