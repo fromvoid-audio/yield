@@ -43,6 +43,57 @@ filesystem effects, or turn receipts/snapshots into operation or filesystem auth
 The broader lifecycle and snapshot proposal below remains the OPT-1637 decision
 boundary; later work must add caller routing and any cross-owner lease pin explicitly.
 
+OPT-1782's scan bootstrap adds a separate `SourceScanFence` from the retained
+`SourceWriter`. `new_for_scan` and `current_scan_fence` can validate the profile,
+physical source root, database binding, positive lease epoch, and numeric
+revision before the first complete manifest audit. It carries the catalog
+generation supplied at construction; only a catalog lifecycle guard can verify
+that this generation has not since retired. This observation
+is not a scan commit, a durable receipt, or an authoritative browser snapshot.
+`current_revision` remains audit-gated for curation and browser reads. The scanner
+uses this separate fence for the catalog full-audit route. `RegisteredSource`
+retains the `SourceWriter` around its one writable database; it does not reopen
+a second source connection. The catalog scan adapter holds the admission mutex
+through each bounded write, rejects a retired generation or replaced attempt,
+and revalidates the writer's physical source and lease. Traversal, file reads,
+and hashing run before that guard is acquired. The catalog full-audit route
+commits its revision-advancing manifest batches and final staged-audit
+activation through typed `SourceWriter` methods with an exact scan fence.
+Revision-neutral directory staging and legacy catalog mutation routes still
+borrow the retained database under their existing guarded boundaries; their
+broader command migration is separate work.
+The explicit scanner committed-batch callback now uses a revision-fenced bounded
+transaction and returns a structured delta for that traversal batch. Ordinary
+legacy scan entrypoints retain their existing rebase behavior until their owner
+route is migrated. An incomplete full traversal retains absence-based manifest
+and index rows everywhere, leaving deletion for a complete retry. The catalog
+publishes the terminal audit snapshot only after the complete staged activation;
+its structured delta and SourceRevision name the same committed revision.
+
+OPT-1783's exact-entry and bounded subtree scanner entrypoints accept a
+retained `SourceWriter` directly and derive their database from that same
+owner. Every revision-advancing targeted batch uses its scan fence and typed
+commit, while exact-path and subtree reads stay limited to the supplied
+scope. A catalog-owned targeted operation must use `CatalogScanWriter` to add
+the active lifecycle and attempt-token check; the direct owner route checks
+physical profile, root, lease, database, and revision authority. The existing
+catalog watcher still requests full audits from pathless hints.
+
+OPT-1784 preserves scanner `Incomplete` as a typed catalog audit outcome,
+including the last safe committed revision as diagnostic evidence. The catalog
+only reports `Committed` after the full writer-backed audit and coherent
+snapshot publish. An incomplete outcome retains the pending watcher hint for
+retry and leaves the prior browser snapshot authoritative; it does not treat
+safe partial source rows as complete coverage.
+
+OPT-1790 routes authoritative pending-rename retention completion through a
+typed scan-writer method. The retained source writer validates the physical
+source lease, database binding, lifecycle, and observed manifest revision before
+the revision-neutral auxiliary transaction commits. The catalog wrapper also
+holds its scan lifecycle admission guard. Rename staging and reconciliation in
+manifest batches continue through their existing revision-fenced writer route;
+an incomplete audit does not advance rename retention.
+
 ## Boundary and authority
 
 One physical source has one serialized writable SQL owner. The owner retains the
@@ -186,6 +237,14 @@ reconciliation. It must not guess rollback, increment again, or report a success
 duplicate from a different request. This contract does not add a second journal or
 silently route curation-family callers; those migrations belong to OPT-1782 through
 OPT-1794.
+
+The GPUI catalog's ordinary metadata and collection edits now enter the retained
+`SourceWriter::commit_catalog_curation_command` with an owner-issued `SourceRevision`.
+They retain the catalog's one-terminal-response and stale-revision retry behavior;
+volatile UI request IDs are not substituted for durable operation-journal identities.
+The durable `SourceWriterRequest` receipt table remains reserved for commands that
+carry a stable operation/participant/command identity, so a long UI editing session
+does not exhaust its finite history budget.
 
 ## Read-only snapshots
 

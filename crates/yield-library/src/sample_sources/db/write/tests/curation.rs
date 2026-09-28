@@ -16,6 +16,11 @@ use crate::sample_sources::db::SourceLeaseError;
 #[cfg(unix)]
 use crate::sample_sources::db::file_ops_journal::{CopyJournalEntryInit, FileOpJournalEntry};
 use crate::sample_sources::db::{DatabaseRootBindingGuard, SourceDirectoryTruthState};
+use crate::sample_sources::readiness::{
+    ArtifactPublishOutcome, ReadinessFailureClassification, ReadinessFailureOutcome,
+    ReadinessRetryPolicy, ReadinessStage, ReadinessTarget, ReadinessTargetPublication,
+    SourceAvailability,
+};
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
     Rating, SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SampleCollection,
@@ -36,6 +41,188 @@ struct CurationFixture {
     profile_guard: WritableProfileGuard,
     root_identity: RootIdentity,
     revision: u64,
+}
+
+#[test]
+fn source_writer_routes_readiness_claim_failure_retry_and_completion() {
+    let mut fixture = CurationFixture::new_profile_bound();
+    let source_id = SourceId::from_string("readiness-writer-test");
+    fixture
+        .database
+        .connection
+        .execute(
+            "UPDATE wav_files SET file_identity = CASE path
+             WHEN 'one.wav' THEN 'file-one' WHEN 'two.wav' THEN 'file-two' END",
+            [],
+        )
+        .expect("seed manifest identities");
+    let source_target = ReadinessTarget::source(
+        source_id.as_str(),
+        ReadinessStage::SimilarityLayout,
+        "layout-v1",
+        1,
+        "membership-v1",
+    );
+    let mut targets = Vec::new();
+    for (identity, path, content) in [
+        ("file-one", "one.wav", "content-one"),
+        ("file-two", "two.wav", "content-two"),
+    ] {
+        for (stage, version) in [
+            (ReadinessStage::IndexedIdentity, "identity-v1"),
+            (ReadinessStage::AnalysisFeatures, "features-v1"),
+            (ReadinessStage::EmbeddingAspects, "embedding-v1"),
+        ] {
+            targets.push(ReadinessTarget::file(
+                source_id.as_str(),
+                identity,
+                path,
+                stage,
+                version,
+                1,
+                content,
+            ));
+        }
+    }
+    let target = targets[0].clone();
+    targets.push(source_target);
+    let deficits = {
+        let mut store = fixture
+            .database
+            .readiness_store()
+            .expect("owned readiness store");
+        let origin = store
+            .capture_publication_origin()
+            .expect("publication origin");
+        store
+            .publish_targets(
+                &origin,
+                &ReadinessTargetPublication::new(
+                    source_id.as_str(),
+                    1,
+                    1,
+                    SourceAvailability::Active,
+                    "readiness-contract-v1",
+                    &targets,
+                    1,
+                ),
+            )
+            .expect("publish target");
+        let deficits = store
+            .reconcile(source_id.as_str(), 10)
+            .expect("reconcile")
+            .deficits;
+        assert!(deficits.iter().any(|deficit| deficit.target == target));
+        deficits
+    };
+    let mut writer =
+        SourceWriter::new(fixture.database, source_id.clone(), 7).expect("source writer");
+    let initial = writer.current_revision().expect("initial revision");
+    writer
+        .commit_catalog_curation_command(
+            &initial,
+            &fixture.profile_guard,
+            &[SourceCurationUpdate::SetRating {
+                path: CurationFixture::path("one.wav"),
+                rating: Rating::KEEP_3,
+            }],
+        )
+        .expect("advance source revision");
+    assert!(matches!(
+        writer.claim_readiness_target(&initial, &target, 10, 100),
+        Err(SourceWriterError::StaleRevision { .. })
+    ));
+    let revision = writer.current_revision().expect("current revision");
+    assert!(matches!(
+        writer.enqueue_readiness_jobs(&initial, &deficits, 10),
+        Err(SourceWriterError::StaleRevision { .. })
+    ));
+    let oversized = vec![deficits[0].clone(); 65];
+    assert!(matches!(
+        writer.enqueue_readiness_jobs(&revision, &oversized, 10),
+        Err(SourceWriterError::InvalidRequest(_))
+    ));
+    let mut oversized_bytes = deficits[0].clone();
+    oversized_bytes.target.content_generation =
+        "x".repeat(crate::operation_journal::MAX_RECORD_BYTES);
+    assert!(matches!(
+        writer.enqueue_readiness_jobs(&revision, &[oversized_bytes], 10),
+        Err(SourceWriterError::InvalidRequest(_))
+    ));
+    let mut mixed_source = deficits.clone();
+    mixed_source[0].target.source_id = String::from("another-source");
+    assert!(matches!(
+        writer.enqueue_readiness_jobs(&revision, &mixed_source, 10),
+        Err(SourceWriterError::StaleFence)
+    ));
+    let jobs_before: i64 = writer
+        .catalog_database()
+        .connection
+        .query_row("SELECT COUNT(*) FROM analysis_jobs", [], |row| row.get(0))
+        .expect("work row count before admission");
+    assert_eq!(jobs_before, 0);
+    assert!(
+        writer
+            .enqueue_readiness_jobs(&revision, &deficits, 10)
+            .expect("enqueue through writer")
+            > 0
+    );
+
+    let mut wrong_source = target.clone();
+    wrong_source.source_id = String::from("another-source");
+    assert!(matches!(
+        writer.claim_readiness_target(&revision, &wrong_source, 10, 100),
+        Err(SourceWriterError::StaleFence)
+    ));
+
+    let claim = writer
+        .claim_readiness_target(&revision, &target, 10, 100)
+        .expect("claim")
+        .expect("work available");
+    let retry_policy = ReadinessRetryPolicy::new(3, 10, 2).expect("retry policy");
+    assert_eq!(
+        writer
+            .fail_readiness_work(
+                &revision,
+                &claim,
+                ReadinessFailureClassification::Retryable,
+                "transient",
+                "retry the same target",
+                11,
+                retry_policy,
+            )
+            .expect("record failure"),
+        ReadinessFailureOutcome::RetryScheduled { retry_at: 14 }
+    );
+    assert!(
+        writer
+            .claim_readiness_target(&revision, &target, 13, 100)
+            .expect("before retry")
+            .is_none()
+    );
+    let retry = writer
+        .claim_readiness_target(&revision, &target, 14, 100)
+        .expect("retry")
+        .expect("retry due");
+    assert_eq!(retry.failure_attempts(), 1);
+    assert_eq!(
+        writer
+            .complete_readiness_work(&revision, &claim, 15, None)
+            .expect("stale completion"),
+        ArtifactPublishOutcome::RejectedStale
+    );
+    assert_eq!(
+        writer
+            .complete_readiness_work(&revision, &retry, 15, None)
+            .expect("completion"),
+        ArtifactPublishOutcome::Recorded
+    );
+    let database = writer.into_catalog_database();
+    let mut replacement = SourceWriter::new(database, source_id, 8).expect("new lifecycle");
+    assert!(matches!(
+        replacement.claim_readiness_target(&revision, &target, 16, 100),
+        Err(SourceWriterError::StaleFence)
+    ));
 }
 
 impl CurationFixture {
@@ -226,6 +413,137 @@ fn source_writer_state_snapshot(database: &SourceDatabase) -> SourceWriterStateS
             )
             .expect("receipt count"),
     }
+}
+
+#[test]
+fn scan_fence_bootstraps_before_audit_without_weakening_curation_fence() {
+    let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
+    let temporary_root =
+        std::fs::canonicalize(std::env::temp_dir()).expect("canonical temporary root");
+    let config_base_dir = tempfile::tempdir_in(temporary_root).expect("config base");
+    let _config_base = ConfigBaseGuard::set(config_base_dir.path().to_path_buf());
+    let _profile = PersistenceProfileGuard::named("source-scan-fence-test");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile guard");
+    let source = tempfile::tempdir().expect("source root");
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source.path(),
+        &profile_guard,
+        Path::new("scan-fence-profile-bound"),
+    )
+    .expect("profile-bound source db");
+    assert!(
+        database
+            .last_authoritative_audit_metadata()
+            .expect("audit metadata")
+            .is_none()
+    );
+
+    let writer =
+        SourceWriter::new_for_scan(database, SourceId::from_string("source-scan-fence-test"), 7)
+            .expect("scan owner before audit");
+    let initial = writer.current_scan_fence().expect("initial scan fence");
+    assert_eq!(initial.lifecycle_generation(), 7);
+    assert!(initial.lease_epoch() > 0);
+    assert_eq!(initial.revision(), 0);
+    assert_eq!(
+        writer
+            .validate_scan_fence(&initial)
+            .expect("same owner and revision"),
+        initial
+    );
+    assert!(matches!(
+        writer.current_revision(),
+        Err(SourceWriterError::InvalidRequest(
+            "source writer requires a complete authoritative audit"
+        ))
+    ));
+
+    let mut scan_batch = writer
+        .catalog_database()
+        .write_batch()
+        .expect("bounded scan batch");
+    scan_batch
+        .upsert_file(Path::new("one.wav"), 10, 1)
+        .expect("prepared scan row");
+    let committed = writer
+        .commit_scan_manifest_batch(&initial, scan_batch)
+        .expect("owner commits bounded scan row");
+    assert_eq!(committed.revision, 1);
+    assert_eq!(committed.touched_path_changes.len(), 1);
+    assert_eq!(committed.touched_path_changes[0].0, Path::new("one.wav"));
+    let mut stale_batch = writer
+        .catalog_database()
+        .write_batch()
+        .expect("stale bounded batch");
+    stale_batch
+        .upsert_file(Path::new("stale.wav"), 20, 2)
+        .expect("prepared stale row");
+    assert!(matches!(
+        writer.commit_scan_manifest_batch(&initial, stale_batch),
+        Err(SourceWriterError::StaleRevision {
+            expected: 0,
+            actual: 1
+        })
+    ));
+    assert!(
+        writer
+            .catalog_database()
+            .entry_for_path(Path::new("stale.wav"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        writer.validate_scan_fence(&initial),
+        Err(SourceWriterError::StaleRevision {
+            expected: 0,
+            actual: 1
+        })
+    ));
+    assert!(matches!(
+        writer.current_revision(),
+        Err(SourceWriterError::InvalidRequest(
+            "source writer requires a complete authoritative audit"
+        ))
+    ));
+
+    writer
+        .database_for_tests()
+        .begin_source_directory_truth_generation(1, 0)
+        .expect("directory generation");
+    writer
+        .database_for_tests()
+        .write_batch()
+        .expect("audit batch")
+        .commit_manifest_audit_with_staged_directory_truth(
+            1,
+            1,
+            10,
+            initial.root_identity().clone(),
+            None,
+        )
+        .expect("complete audit");
+    assert_eq!(
+        writer
+            .current_revision()
+            .expect("curation fence after completed audit")
+            .revision(),
+        2
+    );
+}
+
+#[test]
+fn scan_fence_requires_retained_profile_owned_source() {
+    let fixture = CurationFixture::new();
+    assert!(matches!(
+        SourceWriter::new_for_scan(
+            fixture.database,
+            SourceId::from_string("unbound-scan-source"),
+            1,
+        ),
+        Err(SourceWriterError::Database(
+            SourceDbError::ProfileOwnershipRequired
+        ))
+    ));
 }
 
 #[test]

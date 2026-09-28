@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::scan::{ScanContext, ScanError};
 use super::scan_capability::SourceRootCapability;
-use super::scan_diff::mark_missing;
+use super::scan_diff::{absent_missing_candidates, mark_missing};
 use super::scan_index::reconcile_index_entries;
 use super::scan_writer::{ScanWritePhase, ScanWriter};
 use crate::sample_sources::SourceDatabase;
@@ -18,40 +18,42 @@ pub(super) fn db_sync_phase(
     cancel: Option<&AtomicBool>,
     writer: &impl ScanWriter,
 ) -> Result<(u64, Vec<SourceManifestEntry>), ScanError> {
-    let mut existing = std::mem::take(&mut context.existing)
-        .into_values()
-        .filter(|entry| !context.preserves_missing_row(&entry.relative_path))
-        .collect::<Vec<_>>()
-        .into_iter();
-    loop {
-        if cancel_requested(cancel) {
-            return Err(ScanError::Canceled);
+    // Partial traversal can commit observed additions, but it cannot establish
+    // absence anywhere in the root. Delay every removal until a complete retry.
+    if !context.has_uncertain_prefixes() {
+        let mut existing = std::mem::take(&mut context.existing)
+            .into_values()
+            .filter(|entry| !context.preserves_missing_row(&entry.relative_path))
+            .collect::<Vec<_>>()
+            .into_iter();
+        loop {
+            if cancel_requested(cancel) {
+                return Err(ScanError::Canceled);
+            }
+            let chunk = existing
+                .by_ref()
+                .take(MISSING_BATCH_SIZE)
+                .collect::<Vec<_>>();
+            if chunk.is_empty() {
+                break;
+            }
+            let chunk = absent_missing_candidates(db.root(), context.traversal_policy(), chunk);
+            if chunk.is_empty() {
+                continue;
+            }
+            source_root.ensure_current_generation()?;
+            let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
+            if cancel_requested(cancel) {
+                return Err(ScanError::Canceled);
+            }
+            let mut batch = db.write_batch()?;
+            context.ensure_rename_candidate_generation(&mut batch)?;
+            mark_missing(db, &mut batch, chunk, &mut context.stats)?;
+            if cancel_requested(cancel) {
+                return Err(ScanError::Canceled);
+            }
+            context.commit_batch(db, batch, writer)?;
         }
-        let chunk = existing
-            .by_ref()
-            .take(MISSING_BATCH_SIZE)
-            .collect::<Vec<_>>();
-        if chunk.is_empty() {
-            break;
-        }
-        let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
-        if cancel_requested(cancel) {
-            return Err(ScanError::Canceled);
-        }
-        let mut batch = db.write_batch()?;
-        context.ensure_rename_candidate_generation(&mut batch)?;
-        mark_missing(
-            db,
-            context.traversal_policy(),
-            &mut batch,
-            chunk,
-            &mut context.stats,
-        )?;
-        if cancel_requested(cancel) {
-            return Err(ScanError::Canceled);
-        }
-        source_root.ensure_current_generation()?;
-        context.commit_batch(db, batch)?;
     }
 
     source_root.ensure_current_generation()?;
@@ -96,7 +98,6 @@ pub(super) fn complete_scan_generation(
     if cancel_requested(cancel) {
         return Err(ScanError::Canceled);
     }
-    source_root.ensure_current_generation()?;
     if context.mode == super::scan::ScanMode::Targeted {
         let index_projection_is_current = !context.stats.committed_source_index_delta.is_empty()
             && context.stats.committed_source_index_delta.revision
@@ -107,7 +108,7 @@ pub(super) fn complete_scan_generation(
             // and must not create an unrepresentable intermediate browser revision.
             batch.commit_auxiliary_state()?;
         } else {
-            context.commit_batch(db, batch)?;
+            context.commit_batch(db, batch, writer)?;
         }
         Ok(context.latest_committed_snapshot())
     } else {

@@ -12,7 +12,7 @@ use yield_library::sample_sources::db::BrowserMetadataCursor;
 use yield_library::sample_sources::reconciliation::RootIdentity;
 use yield_library::sample_sources::{
     BrowserFileMetadata, SampleCollection, SourceCurationCommitReceipt, SourceCurationUpdate,
-    SourceDatabase, SourceManifestEntry,
+    SourceDatabase, SourceManifestEntry, SourceWriterError,
 };
 
 use super::{
@@ -926,15 +926,28 @@ pub(crate) fn execute_inner(
         });
     }
 
+    let owner_revision = source
+        .database
+        .writer
+        .current_revision()
+        .map_err(|error| curation_writer_error(source_id, error))?;
+    if owner_revision.revision() != expected_revision {
+        return Err(CatalogError::StaleRevision {
+            expected: expected_revision,
+            actual: owner_revision.revision(),
+        });
+    }
+    if owner_revision.root_identity() != expected_root_identity {
+        return Err(CatalogError::StaleRootGeneration {
+            source_id: source_id.clone(),
+            detail: String::from("source writer root identity differs from the curation request"),
+        });
+    }
     let receipt = source
         .database
-        .commit_curation_with_profile_guard(
-            profile_guard,
-            expected_revision,
-            expected_root_identity,
-            updates,
-        )
-        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+        .writer
+        .commit_catalog_curation_command(&owner_revision, profile_guard, updates)
+        .map_err(|error| curation_writer_error(source_id, error))?;
 
     // The library receipt is durable authority. Any post-commit check failure only invalidates
     // the retained cache; it must never turn a successful database commit into CurationFailed.
@@ -949,6 +962,24 @@ pub(crate) fn execute_inner(
         source.snapshot = None;
     }
     Ok(receipt)
+}
+
+fn curation_writer_error(source_id: &SourceId, error: SourceWriterError) -> CatalogError {
+    match error {
+        SourceWriterError::Database(error) => {
+            super::catalog_error_from_db_for_source(source_id, error)
+        }
+        SourceWriterError::StaleRevision { expected, actual } => {
+            CatalogError::StaleRevision { expected, actual }
+        }
+        SourceWriterError::StaleFence | SourceWriterError::SupersededLifecycle { .. } => {
+            CatalogError::SourceIdentityUncertain(error.to_string())
+        }
+        SourceWriterError::Uncertain { .. } | SourceWriterError::MalformedReceipt => {
+            CatalogError::DatabaseIntegrityUncertain(error.to_string())
+        }
+        error => CatalogError::Database(error.to_string()),
+    }
 }
 
 fn post_commit_binding_is_current(

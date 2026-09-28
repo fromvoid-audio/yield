@@ -1,4 +1,13 @@
 use super::scan::ScanError;
+use yield_library::sample_sources::SourceManifestEntry;
+use yield_library::sample_sources::db::{
+    ManifestCommitResult, SourceDatabase, SourceDirectoryEntry, SourceDirectoryTruthCleanup,
+    SourceWriteBatch,
+};
+use yield_library::sample_sources::reconciliation::{
+    RootIdentity, SourceAuditCommit, SourceAuditRequest,
+};
+use yield_library::sample_sources::{SourceWriter, SourceWriterError};
 
 /// Database mutation phases exposed by the scanner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +48,82 @@ pub trait ScanWriter {
     fn try_lock_cleanup(&self) -> Result<Self::Guard, ScanError> {
         self.try_lock(ScanWritePhase::Manifest)
     }
+
+    /// Start private, revision-neutral directory staging for a full audit.
+    fn begin_directory_truth_generation(
+        &self,
+        db: &SourceDatabase,
+        expected_entry_count: u64,
+    ) -> Result<u64, ScanError> {
+        Ok(db.begin_next_source_directory_truth_generation(expected_entry_count)?)
+    }
+
+    /// Stage a bounded set of observed directories without publishing it.
+    fn stage_directory_truth_entries(
+        &self,
+        db: &SourceDatabase,
+        generation: u64,
+        entries: &[SourceDirectoryEntry],
+    ) -> Result<(), ScanError> {
+        Ok(db.stage_source_directory_truth_entries(generation, entries)?)
+    }
+
+    /// Discard only private staging after an aborted audit.
+    fn discard_directory_truth_generation_batch(
+        &self,
+        db: &SourceDatabase,
+        generation: u64,
+        requested_limit: usize,
+    ) -> Result<SourceDirectoryTruthCleanup, ScanError> {
+        Ok(db.discard_source_directory_truth_generation_batch(generation, requested_limit)?)
+    }
+
+    /// Commit a prepared, revision-fenced manifest batch through the active
+    /// source owner. Callers must hold this writer's bounded mutation guard.
+    fn commit_bounded_manifest_batch(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        expected_revision: u64,
+    ) -> Result<ManifestCommitResult, ScanError> {
+        Ok(batch.commit_with_bounded_manifest_changes(expected_revision)?)
+    }
+
+    /// Commit prepared rename-retention state at the completed scan's observed revision.
+    /// Callers hold this writer's mutation guard and check the root after preparation.
+    fn commit_pending_rename_scan_completion(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        expected_revision: u64,
+    ) -> Result<(), ScanError> {
+        if !batch.matches_revision(expected_revision)? {
+            return Err(ScanError::StaleRevision {
+                expected: expected_revision,
+                actual: batch.get_revision()?,
+            });
+        }
+        batch.commit_auxiliary_state()?;
+        Ok(())
+    }
+
+    /// Activate a complete staged audit and return the committed manifest on
+    /// the same owner that admitted its bounded scan batches.
+    fn commit_scan_audit_completion(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        generation: u64,
+        expected_revision: u64,
+        completed_at: i64,
+        root_identity: RootIdentity,
+        audit_request: Option<&SourceAuditRequest>,
+    ) -> Result<(SourceAuditCommit, Vec<SourceManifestEntry>), ScanError> {
+        Ok(batch.commit_manifest_audit_with_staged_directory_truth(
+            generation,
+            expected_revision,
+            completed_at,
+            root_identity,
+            audit_request,
+        )?)
+    }
 }
 
 /// Default coordinator for callers that already own serialization or only need SQLite's
@@ -50,4 +135,134 @@ impl ScanWriter for UncoordinatedScanWriter {
     type Guard = ();
 
     fn lock(&self, _phase: ScanWritePhase) -> Self::Guard {}
+}
+
+/// A retained source owner can coordinate targeted scanner writes directly.
+/// The catalog's own scan writer adds lifecycle admission on top of this
+/// physical source check when a catalog operation owns the scan.
+impl ScanWriter for SourceWriter {
+    type Guard = ();
+
+    fn lock(&self, phase: ScanWritePhase) -> Self::Guard {
+        self.try_lock(phase)
+            .expect("source scan writer lock must retain physical authority")
+    }
+
+    fn try_lock(&self, _phase: ScanWritePhase) -> Result<Self::Guard, ScanError> {
+        self.current_scan_fence().map_err(source_writer_error)?;
+        Ok(())
+    }
+
+    fn begin_directory_truth_generation(
+        &self,
+        db: &SourceDatabase,
+        expected_entry_count: u64,
+    ) -> Result<u64, ScanError> {
+        if !std::ptr::eq(db, self.catalog_database()) {
+            return Err(ScanError::SourceOwner(String::from(
+                "directory staging belongs to another source database",
+            )));
+        }
+        self.begin_scan_directory_truth_generation(expected_entry_count)
+            .map_err(source_writer_error)
+    }
+
+    fn stage_directory_truth_entries(
+        &self,
+        db: &SourceDatabase,
+        generation: u64,
+        entries: &[SourceDirectoryEntry],
+    ) -> Result<(), ScanError> {
+        if !std::ptr::eq(db, self.catalog_database()) {
+            return Err(ScanError::SourceOwner(String::from(
+                "directory staging belongs to another source database",
+            )));
+        }
+        self.stage_scan_directory_truth_entries(generation, entries)
+            .map_err(source_writer_error)
+    }
+
+    fn discard_directory_truth_generation_batch(
+        &self,
+        db: &SourceDatabase,
+        generation: u64,
+        requested_limit: usize,
+    ) -> Result<SourceDirectoryTruthCleanup, ScanError> {
+        if !std::ptr::eq(db, self.catalog_database()) {
+            return Err(ScanError::SourceOwner(String::from(
+                "directory staging belongs to another source database",
+            )));
+        }
+        self.discard_scan_directory_truth_generation_batch(generation, requested_limit)
+            .map_err(source_writer_error)
+    }
+
+    fn commit_bounded_manifest_batch(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        expected_revision: u64,
+    ) -> Result<ManifestCommitResult, ScanError> {
+        let fence = self.current_scan_fence().map_err(source_writer_error)?;
+        if fence.revision() != expected_revision {
+            return Err(ScanError::StaleRevision {
+                expected: expected_revision,
+                actual: fence.revision(),
+            });
+        }
+        self.commit_scan_manifest_batch(&fence, batch)
+            .map_err(source_writer_error)
+    }
+
+    fn commit_pending_rename_scan_completion(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        expected_revision: u64,
+    ) -> Result<(), ScanError> {
+        let fence = self.current_scan_fence().map_err(source_writer_error)?;
+        if fence.revision() != expected_revision {
+            return Err(ScanError::StaleRevision {
+                expected: expected_revision,
+                actual: fence.revision(),
+            });
+        }
+        self.commit_scan_pending_rename_completion(&fence, batch)
+            .map_err(source_writer_error)
+    }
+
+    fn commit_scan_audit_completion(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        generation: u64,
+        expected_revision: u64,
+        completed_at: i64,
+        root_identity: RootIdentity,
+        audit_request: Option<&SourceAuditRequest>,
+    ) -> Result<(SourceAuditCommit, Vec<SourceManifestEntry>), ScanError> {
+        let fence = self.current_scan_fence().map_err(source_writer_error)?;
+        if fence.revision() != expected_revision {
+            return Err(ScanError::StaleRevision {
+                expected: expected_revision,
+                actual: fence.revision(),
+            });
+        }
+        self.commit_scan_audit_completion(
+            &fence,
+            batch,
+            generation,
+            completed_at,
+            root_identity,
+            audit_request,
+        )
+        .map_err(source_writer_error)
+    }
+}
+
+fn source_writer_error(error: SourceWriterError) -> ScanError {
+    match error {
+        SourceWriterError::Database(error) => ScanError::Db(error),
+        SourceWriterError::StaleRevision { expected, actual } => {
+            ScanError::StaleRevision { expected, actual }
+        }
+        error => ScanError::SourceOwner(error.to_string()),
+    }
 }

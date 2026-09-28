@@ -18,6 +18,19 @@ This is the **candidate register**, not the completed parity verdict. It enumera
 
 The reference source remains `yield-legacy` `c80002becec0071298fa110ee0935edee9957978`. The current GPUI comparison head is `yield` `f7779fe73c3b1bf127b0577027c6441aab91ecc8`. Older table rows identify their own review baselines; their old draft/To Review labels are historical, not current Linear status. The following status check uses the live Yield v19.1 issues at this head.
 
+### Source-owner update after the native queue was written
+
+This audit branch now includes GPUI main `c1e3419a8a93b3c80022dcfe4f719f64303cbf9b` (PR #119). That newer head does not supply new native acceptance for the rows below. It does change which backend leaves are ready and which route claims are valid:
+
+| Route | Current evidence at `c1e3419a` | Next acceptance boundary |
+|---|---|---|
+| Scanner and directory truth | OPT-1782, OPT-1783, OPT-1784 and OPT-1786 are Done with source-writer routing and full exact-head local CI. | Finder checkpoint replay still needs proof-bearing batches (OPT-1921) before OPT-1785 can be accepted. |
+| Source metadata, collections and pending rename | OPT-1788 and OPT-1790 are Done with typed source-writer routes and full exact-head local CI. | Rating/listen burst coalescing remains OPT-1789; an accepted curation request has a distinct request ID and predecessor fence, so a queued accepted request cannot simply be dropped. |
+| Readiness and analysis enqueue | OPT-1791 and OPT-1792 are Done with bounded writer entrypoints and full exact-head local CI. | A production feature worker/artifact route is still absent (OPT-1922, then OPT-1708). These writer methods do not prove production analysis readiness. |
+| Physical publication and cleanup | The retained macOS qualification remains unsupported. | OPT-1868 and the OPT-1632/OPT-1634 owner/checkpoint chain remain unmet; no prepared edit, extraction, move, or cleanup row inherits physical acceptance. |
+
+The smallest currently implementable core code leaf from this source-owner slice is OPT-1789, subject to a bounded pre-admission latest-value design that preserves the existing request/receipt lineage. OPT-1717 is the next independent audible native leaf when the Mac is unlocked. OPT-1901 is review-ready in source but remains a live gateway/OAuth acceptance item; the private destination is `PORTALSURFER/yield`, and no test issue has yet been confirmed. Keep one Linear issue In Progress at a time; this audit is a draft evidence register, not an additional implementation lane.
+
 |Previously listed route|Current disposition|Evidence or remaining owner|
 |---|---|---|
 |Random-section shortcut OPT-1909|Done|Plain R replaced the two modified-Space chords after physical-key acceptance; preserve the new binding when comparing reference shortcuts.|

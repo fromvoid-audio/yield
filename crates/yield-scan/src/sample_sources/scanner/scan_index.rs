@@ -89,12 +89,16 @@ pub(super) fn reconcile_index_entries(
         .cloned()
         .collect::<BTreeSet<_>>();
 
+    // A visible supported manifest row can replace its old index-only class even
+    // during a partial scan. Absence-based index deletion needs full coverage.
     let removals = existing
         .keys()
         .filter(|path| {
             (context.has_committed_manifest_path(path)
                 && !unavailable_manifest_paths.contains(*path))
-                || (!observed.contains_key(*path) && !context.preserves_missing_row(path))
+                || (!context.has_uncertain_prefixes()
+                    && !observed.contains_key(*path)
+                    && !context.preserves_missing_row(path))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -123,11 +127,9 @@ pub(super) fn reconcile_index_entries(
     for entry in upserts {
         batch.upsert_source_index_entry(&entry)?;
     }
-    source_root.ensure_current_generation()?;
-    source_root.ensure_current_generation()?;
     // Index-only facts are source projection facts, not auxiliary metadata. Route every
     // mutation through the bounded source commit so the scanner can publish the exact
     // revision only after this transaction commits.
-    context.commit_batch(database, batch)?;
+    context.commit_batch(database, batch, writer)?;
     Ok(())
 }

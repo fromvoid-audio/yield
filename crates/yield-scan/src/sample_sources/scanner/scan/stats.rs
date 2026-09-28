@@ -12,6 +12,8 @@ pub struct CommittedScanBatch {
     pub revision: u64,
     /// Source-relative paths changed by this transaction, in scan order.
     pub paths: Vec<PathBuf>,
+    /// Structured changes from this transaction's touched pre- and post-state.
+    pub delta: CommittedSourceDelta,
 }
 
 /// Why a directory was not fully represented by a source traversal.
