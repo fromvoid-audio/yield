@@ -86,7 +86,7 @@ fn source_writer_routes_readiness_claim_failure_retry_and_completion() {
     }
     let target = targets[0].clone();
     targets.push(source_target);
-    {
+    let deficits = {
         let mut store = fixture
             .database
             .readiness_store()
@@ -113,8 +113,8 @@ fn source_writer_routes_readiness_claim_failure_retry_and_completion() {
             .expect("reconcile")
             .deficits;
         assert!(deficits.iter().any(|deficit| deficit.target == target));
-        store.persist_deficits(&deficits, 10).expect("enqueue work");
-    }
+        deficits
+    };
     let mut writer =
         SourceWriter::new(fixture.database, source_id.clone(), 7).expect("source writer");
     let initial = writer.current_revision().expect("initial revision");
@@ -133,6 +133,40 @@ fn source_writer_routes_readiness_claim_failure_retry_and_completion() {
         Err(SourceWriterError::StaleRevision { .. })
     ));
     let revision = writer.current_revision().expect("current revision");
+    assert!(matches!(
+        writer.enqueue_readiness_jobs(&initial, &deficits, 10),
+        Err(SourceWriterError::StaleRevision { .. })
+    ));
+    let oversized = vec![deficits[0].clone(); 65];
+    assert!(matches!(
+        writer.enqueue_readiness_jobs(&revision, &oversized, 10),
+        Err(SourceWriterError::InvalidRequest(_))
+    ));
+    let mut oversized_bytes = deficits[0].clone();
+    oversized_bytes.target.content_generation =
+        "x".repeat(crate::operation_journal::MAX_RECORD_BYTES);
+    assert!(matches!(
+        writer.enqueue_readiness_jobs(&revision, &[oversized_bytes], 10),
+        Err(SourceWriterError::InvalidRequest(_))
+    ));
+    let mut mixed_source = deficits.clone();
+    mixed_source[0].target.source_id = String::from("another-source");
+    assert!(matches!(
+        writer.enqueue_readiness_jobs(&revision, &mixed_source, 10),
+        Err(SourceWriterError::StaleFence)
+    ));
+    let jobs_before: i64 = writer
+        .catalog_database()
+        .connection
+        .query_row("SELECT COUNT(*) FROM analysis_jobs", [], |row| row.get(0))
+        .expect("work row count before admission");
+    assert_eq!(jobs_before, 0);
+    assert!(
+        writer
+            .enqueue_readiness_jobs(&revision, &deficits, 10)
+            .expect("enqueue through writer")
+            > 0
+    );
 
     let mut wrong_source = target.clone();
     wrong_source.source_id = String::from("another-source");
