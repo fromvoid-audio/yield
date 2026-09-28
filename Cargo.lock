@@ -8689,6 +8689,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "hound",
+ "rusqlite",
  "tempfile",
  "thiserror 2.0.20",
  "yield-library",
@@ -8807,8 +8808,11 @@ dependencies = [
 name = "yield-source-watcher"
 version = "0.1.0"
 dependencies = [
+ "fsevent-sys",
+ "libc",
  "notify",
  "tempfile",
+ "uuid",
  "yield-library",
 ]
 

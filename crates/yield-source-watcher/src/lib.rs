@@ -17,6 +17,9 @@ use std::time::Instant;
 use yield_library::sample_sources::SourceId;
 use yield_library::sample_sources::reconciliation::RootIdentity;
 
+/// Bounded capture of native replay candidates; it never grants continuity authority.
+pub mod replay;
+
 /// Filename prefixes for source-local files which must not feed an audit back into itself.
 ///
 /// These names are compared lexically in the callback. The callback does not inspect metadata or
