@@ -1029,6 +1029,14 @@ pub enum CatalogError {
     /// The scanner could not complete its authoritative audit.
     #[error("catalog audit failed: {0}")]
     Audit(String),
+    /// The scanner committed safe work but did not establish complete source coverage.
+    #[error("catalog audit incomplete after source revision {committed_revision}: {detail}")]
+    AuditIncomplete {
+        /// Last committed source revision, which is not authoritative audit coverage.
+        committed_revision: u64,
+        /// Diagnostic describing the coverage gap or interrupted checkpoint.
+        detail: String,
+    },
     /// An audit was canceled before it could publish.
     #[error("catalog audit canceled")]
     Canceled,
@@ -4293,6 +4301,7 @@ fn request_audit(
             }
         }
         Err(error) => {
+            let incomplete = matches!(error, CatalogError::AuditIncomplete { .. });
             let (retryable, root_stale) = audit_error_policy(&error);
             let published = publish_if_current(
                 admission,
@@ -4308,9 +4317,13 @@ fn request_audit(
                 },
             );
             if published {
-                AuditDisposition::Failed {
-                    retryable,
-                    root_stale,
+                if incomplete {
+                    AuditDisposition::Incomplete
+                } else {
+                    AuditDisposition::Failed {
+                        retryable,
+                        root_stale,
+                    }
                 }
             } else {
                 AuditDisposition::Canceled
@@ -6046,6 +6059,12 @@ fn scan_error(
             CatalogError::StaleRootGeneration {
                 source_id: source_id.clone(),
                 detail: format!("source root changed while scanning: {}", root.display()),
+            }
+        }
+        yield_scan::sample_sources::scanner::ScanError::Incomplete { committed, error } => {
+            CatalogError::AuditIncomplete {
+                committed_revision: committed.committed_delta.revision,
+                detail: format!("{source_id}: {error}"),
             }
         }
         error => CatalogError::Audit(format!("{source_id}: {error}")),
@@ -12316,9 +12335,12 @@ mod tests {
         assert!(matches!(
             failed,
             CatalogEvent::Failed {
-                error: CatalogError::Audit(message),
+                error: CatalogError::AuditIncomplete {
+                    detail,
+                    committed_revision: _,
+                },
                 ..
-            } if message.contains("retry required")
+            } if detail.contains("retry required")
         ));
         drop(permissions);
 
@@ -13479,6 +13501,28 @@ mod tests {
             CatalogError::ProfileUnavailable(message)
                 if message.contains("profile ownership is required")
         ));
+    }
+
+    #[test]
+    fn incomplete_scan_result_retains_typed_retryable_catalog_evidence() {
+        let source_id = SourceId::from_string("incomplete-policy");
+        let mut committed = yield_scan::sample_sources::scanner::ScanStats::default();
+        committed.committed_delta.revision = 7;
+        let error = scan_error(
+            &source_id,
+            ScanError::Incomplete {
+                committed: Box::new(committed),
+                error: String::from("unreadable subtree; retry required"),
+            },
+        );
+        assert!(matches!(
+            error,
+            CatalogError::AuditIncomplete {
+                committed_revision: 7,
+                ref detail,
+            } if detail.contains("retry required")
+        ));
+        assert_eq!(audit_error_policy(&error), (true, false));
     }
 
     #[test]

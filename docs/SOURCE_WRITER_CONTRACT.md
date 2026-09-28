@@ -79,6 +79,13 @@ the active lifecycle and attempt-token check; the direct owner route checks
 physical profile, root, lease, database, and revision authority. The existing
 catalog watcher still requests full audits from pathless hints.
 
+OPT-1784 preserves scanner `Incomplete` as a typed catalog audit outcome,
+including the last safe committed revision as diagnostic evidence. The catalog
+only reports `Committed` after the full writer-backed audit and coherent
+snapshot publish. An incomplete outcome retains the pending watcher hint for
+retry and leaves the prior browser snapshot authoritative; it does not treat
+safe partial source rows as complete coverage.
+
 ## Boundary and authority
 
 One physical source has one serialized writable SQL owner. The owner retains the

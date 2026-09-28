@@ -290,6 +290,7 @@ pub(super) enum AuditTrigger {
 #[derive(Clone, Copy)]
 pub(super) enum AuditDisposition {
     Committed,
+    Incomplete,
     Failed { retryable: bool, root_stale: bool },
     Canceled,
 }
@@ -339,6 +340,9 @@ pub(super) fn run_watcher_idle_work(
                 source
                     .watcher_schedule
                     .audit_succeeded(source.watcher.is_some(), completed_at);
+            }
+            AuditDisposition::Incomplete => {
+                source.watcher_schedule.audit_failed(pending, completed_at);
             }
             AuditDisposition::Failed {
                 retryable: true, ..
