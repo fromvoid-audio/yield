@@ -53,6 +53,11 @@ is not a scan commit, a durable receipt, or an authoritative browser snapshot.
 `current_revision` remains audit-gated for curation and browser reads. The scanner
 still needs a typed, bounded commit route under the same retained owner and a
 catalog lifecycle guard before the full-scan migration can pass.
+The explicit scanner committed-batch callback now uses a revision-fenced bounded
+transaction and returns a structured delta for that traversal batch. Ordinary
+legacy scan entrypoints retain their existing rebase behavior until their owner
+route is migrated. An incomplete full traversal retains absence-based manifest
+and index rows everywhere, leaving deletion for a complete retry.
 
 ## Boundary and authority
 

@@ -10,7 +10,7 @@ use std::{
 use crate::sample_sources::SourceDatabase;
 use yield_library::sample_sources::{SourceIndexDiagnostic, SourceTraversalPolicy};
 
-use super::scan::{CommittedScanBatch, ScanContext, ScanError};
+use super::scan::{CommittedScanBatch, CommittedSourceDelta, ScanContext, ScanError};
 use super::scan_capability::{SourcePathBinding, SourceRootCapability};
 use super::scan_diff::{PreparedFile, apply_diff};
 use super::scan_diff_phase::prepare_diff_from_facts;
@@ -762,10 +762,19 @@ fn apply_batch_with_source_root_and_precommit_hook(
         return Ok(ApplyBatchOutcome::default());
     }
     source_root.ensure_current_generation()?;
-    let revision = context.commit_batch(db, batch)?;
+    let delta = if context.exact_committed_batches {
+        context.commit_batch_with_delta(db, batch)?
+    } else {
+        let revision = context.commit_batch(db, batch)?;
+        CommittedSourceDelta {
+            revision,
+            ..CommittedSourceDelta::default()
+        }
+    };
     on_committed_batch(CommittedScanBatch {
-        revision,
+        revision: delta.revision,
         paths: audited_paths.clone(),
+        delta,
     });
     Ok(ApplyBatchOutcome {
         committed: true,

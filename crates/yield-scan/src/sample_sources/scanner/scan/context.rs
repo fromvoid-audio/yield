@@ -5,7 +5,7 @@ use crate::sample_sources::SourceDatabase;
 use crate::sample_sources::db::{SourceIndexEntry, SourceWriteBatch, WavEntry};
 use yield_library::sample_sources::{SourceManifestEntry, SourceTraversalPolicy};
 
-use super::{ScanError, ScanMode, ScanStats};
+use super::{CommittedSourceDelta, ScanError, ScanMode, ScanStats};
 
 const MANIFEST_AUDIT_CHECKPOINT_SIZE: usize = 64;
 
@@ -13,6 +13,7 @@ pub(crate) struct ScanContext {
     pub(crate) existing: HashMap<PathBuf, WavEntry>,
     pub(crate) stats: ScanStats,
     pub(crate) mode: ScanMode,
+    pub(crate) exact_committed_batches: bool,
     pub(crate) rename_candidate_generation: Option<u64>,
     allow_rename_candidates: bool,
     existing_index_entries: BTreeMap<PathBuf, SourceIndexEntry>,
@@ -62,6 +63,7 @@ impl ScanContext {
             existing,
             stats: ScanStats::default(),
             mode,
+            exact_committed_batches: false,
             rename_candidate_generation: None,
             allow_rename_candidates: true,
             existing_index_entries: BTreeMap::new(),
@@ -402,17 +404,37 @@ impl ScanContext {
         self.commit_batch_with_post_commit_hook(db, batch, || {})
     }
 
+    pub(in crate::sample_sources::scanner) fn commit_batch_with_delta(
+        &mut self,
+        db: &SourceDatabase,
+        batch: SourceWriteBatch<'_>,
+    ) -> Result<CommittedSourceDelta, ScanError> {
+        let (_, delta) = self.commit_batch_inner(db, batch, true, || {})?;
+        Ok(delta.expect("exact scan commit always produces a delta"))
+    }
+
     fn commit_batch_with_post_commit_hook(
         &mut self,
         db: &SourceDatabase,
         batch: SourceWriteBatch<'_>,
         post_commit_hook: impl FnOnce(),
     ) -> Result<u64, ScanError> {
+        self.commit_batch_inner(db, batch, false, post_commit_hook)
+            .map(|(revision, _)| revision)
+    }
+
+    fn commit_batch_inner(
+        &mut self,
+        db: &SourceDatabase,
+        batch: SourceWriteBatch<'_>,
+        exact_delta: bool,
+        post_commit_hook: impl FnOnce(),
+    ) -> Result<(u64, Option<CommittedSourceDelta>), ScanError> {
         if !batch.matches_source_traversal_policy(self.traversal_policy)? {
             return Err(ScanError::TraversalPolicyChanged);
         }
         let expected_revision = self.committed_manifest_revision;
-        let result = if self.mode == ScanMode::Targeted {
+        let result = if self.mode == ScanMode::Targeted || exact_delta {
             if !batch.matches_revision(expected_revision)? {
                 drop(batch);
                 return Err(ScanError::StaleRevision {
@@ -425,6 +447,19 @@ impl ScanContext {
             batch.commit_with_manifest_changes(expected_revision)?
         };
         post_commit_hook();
+        let delta = exact_delta.then(|| {
+            let before = result
+                .touched_path_changes
+                .iter()
+                .filter_map(|(path, _)| self.committed_manifest.get(path).cloned())
+                .collect::<Vec<_>>();
+            let after = result
+                .touched_path_changes
+                .iter()
+                .filter_map(|(_, entry)| entry.clone())
+                .collect::<Vec<_>>();
+            super::super::manifest::build_committed_delta(&before, &after, result.revision)
+        });
         if let Some(index_commit) = result.source_index_commit.as_ref() {
             self.stats.committed_source_index_delta.record_commit(
                 index_commit.source_revision,
@@ -449,7 +484,7 @@ impl ScanContext {
         }
         self.committed_manifest_revision = result.revision;
         self.last_committed_revision = Some(result.revision);
-        Ok(result.revision)
+        Ok((result.revision, delta))
     }
 
     pub(in crate::sample_sources::scanner) fn committed_snapshot(
@@ -570,5 +605,34 @@ mod tests {
         let result = context.commit_batch(&database, second_batch);
 
         assert!(matches!(result, Err(ScanError::StaleRevision { .. })));
+    }
+
+    #[test]
+    fn structured_full_scan_batch_rejects_an_interleaved_revision() {
+        let directory = tempfile::tempdir().expect("source root");
+        let database = open_maintained_scan_database(directory.path()).expect("source database");
+        let (revision, manifest) = database
+            .manifest_snapshot_with_revision()
+            .expect("initial manifest");
+        let existing = index_existing(&database).expect("existing rows");
+        let mut context = ScanContext::from_existing(existing, ScanMode::Quick, revision, manifest);
+
+        database
+            .upsert_file(Path::new("external.wav"), 2, 2)
+            .expect("interleaved writer");
+        let mut scan_batch = database.write_batch().expect("scan batch");
+        scan_batch
+            .upsert_file_with_hash(Path::new("scan.wav"), 3, 3, "scan")
+            .expect("scan row");
+        assert!(matches!(
+            context.commit_batch_with_delta(&database, scan_batch),
+            Err(ScanError::StaleRevision { .. })
+        ));
+        assert!(
+            database
+                .entry_for_path(Path::new("scan.wav"))
+                .unwrap()
+                .is_none()
+        );
     }
 }

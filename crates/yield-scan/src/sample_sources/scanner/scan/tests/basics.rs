@@ -3,6 +3,7 @@ use crate::sample_sources::scanner::UncoordinatedScanWriter;
 use crate::sample_sources::scanner::scan_fs::{
     force_directory_entry_failure, force_directory_read_failure, force_file_type_failure,
 };
+use std::path::PathBuf;
 
 #[test]
 fn scan_add_update_and_prune_missing() {
@@ -42,6 +43,49 @@ fn scan_add_update_and_prune_missing() {
     let rows = db.list_files().unwrap();
     assert_eq!(rows.len(), 1);
     assert!(!rows[0].missing);
+}
+
+#[test]
+fn full_scan_callback_reports_exact_structured_traversal_batch_delta() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("one.wav");
+    std::fs::write(&file_path, b"one").unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
+    let mut batches = Vec::new();
+    scan_with_progress_and_writer_and_committed_batch(
+        &db,
+        ScanMode::Quick,
+        None,
+        &mut |_, _| {},
+        &mut |batch| batches.push(batch),
+        &UncoordinatedScanWriter,
+    )
+    .expect("first full scan");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].revision, batches[0].delta.revision);
+    assert_eq!(batches[0].paths, [PathBuf::from("one.wav")]);
+    assert_eq!(batches[0].delta.created.len(), 1);
+    assert!(batches[0].delta.changed.is_empty());
+    assert!(batches[0].delta.deleted.is_empty());
+
+    std::fs::write(&file_path, b"longer-data").unwrap();
+    batches.clear();
+    scan_with_progress_and_writer_and_committed_batch(
+        &db,
+        ScanMode::Quick,
+        None,
+        &mut |_, _| {},
+        &mut |batch| batches.push(batch),
+        &UncoordinatedScanWriter,
+    )
+    .expect("changed full scan");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].revision, batches[0].delta.revision);
+    assert_eq!(batches[0].delta.changed.len(), 1);
+    assert_eq!(
+        batches[0].delta.changed[0].relative_path,
+        Path::new("one.wav")
+    );
 }
 
 #[test]
@@ -85,6 +129,41 @@ fn full_scan_preserves_an_unreadable_subtree_and_recovers_its_real_deletion() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn incomplete_full_scan_does_not_publish_deletion_outside_unreadable_subtree() {
+    let dir = tempdir().unwrap();
+    let protected = dir.path().join("protected");
+    std::fs::create_dir(&protected).unwrap();
+    std::fs::write(protected.join("kick.wav"), b"kick").unwrap();
+    std::fs::write(dir.path().join("outside.wav"), b"outside").unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
+    scan_once(&db).unwrap();
+
+    std::fs::remove_file(protected.join("kick.wav")).unwrap();
+    std::fs::remove_file(dir.path().join("outside.wav")).unwrap();
+    let failure = force_directory_read_failure(&protected);
+    let ScanError::Incomplete { committed, .. } = scan_once(&db).unwrap_err() else {
+        panic!("unreadable subtree must leave coverage incomplete");
+    };
+    assert!(committed.committed_delta.deleted.is_empty());
+    assert_eq!(committed.missing, 0);
+    assert!(
+        db.entry_for_path(Path::new("outside.wav"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.entry_for_path(Path::new("protected/kick.wav"))
+            .unwrap()
+            .is_some()
+    );
+
+    drop(failure);
+    let recovered = scan_once(&db).expect("complete retry");
+    assert_eq!(recovered.missing, 2);
+    assert_eq!(db.count_files().unwrap(), 0);
 }
 
 #[test]

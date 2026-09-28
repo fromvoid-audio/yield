@@ -18,40 +18,44 @@ pub(super) fn db_sync_phase(
     cancel: Option<&AtomicBool>,
     writer: &impl ScanWriter,
 ) -> Result<(u64, Vec<SourceManifestEntry>), ScanError> {
-    let mut existing = std::mem::take(&mut context.existing)
-        .into_values()
-        .filter(|entry| !context.preserves_missing_row(&entry.relative_path))
-        .collect::<Vec<_>>()
-        .into_iter();
-    loop {
-        if cancel_requested(cancel) {
-            return Err(ScanError::Canceled);
+    // Partial traversal can commit observed additions, but it cannot establish
+    // absence anywhere in the root. Delay every removal until a complete retry.
+    if !context.has_uncertain_prefixes() {
+        let mut existing = std::mem::take(&mut context.existing)
+            .into_values()
+            .filter(|entry| !context.preserves_missing_row(&entry.relative_path))
+            .collect::<Vec<_>>()
+            .into_iter();
+        loop {
+            if cancel_requested(cancel) {
+                return Err(ScanError::Canceled);
+            }
+            let chunk = existing
+                .by_ref()
+                .take(MISSING_BATCH_SIZE)
+                .collect::<Vec<_>>();
+            if chunk.is_empty() {
+                break;
+            }
+            let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
+            if cancel_requested(cancel) {
+                return Err(ScanError::Canceled);
+            }
+            let mut batch = db.write_batch()?;
+            context.ensure_rename_candidate_generation(&mut batch)?;
+            mark_missing(
+                db,
+                context.traversal_policy(),
+                &mut batch,
+                chunk,
+                &mut context.stats,
+            )?;
+            if cancel_requested(cancel) {
+                return Err(ScanError::Canceled);
+            }
+            source_root.ensure_current_generation()?;
+            context.commit_batch(db, batch)?;
         }
-        let chunk = existing
-            .by_ref()
-            .take(MISSING_BATCH_SIZE)
-            .collect::<Vec<_>>();
-        if chunk.is_empty() {
-            break;
-        }
-        let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
-        if cancel_requested(cancel) {
-            return Err(ScanError::Canceled);
-        }
-        let mut batch = db.write_batch()?;
-        context.ensure_rename_candidate_generation(&mut batch)?;
-        mark_missing(
-            db,
-            context.traversal_policy(),
-            &mut batch,
-            chunk,
-            &mut context.stats,
-        )?;
-        if cancel_requested(cancel) {
-            return Err(ScanError::Canceled);
-        }
-        source_root.ensure_current_generation()?;
-        context.commit_batch(db, batch)?;
     }
 
     source_root.ensure_current_generation()?;
