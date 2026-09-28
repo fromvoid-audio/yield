@@ -16,20 +16,21 @@ This is the **candidate register**, not the completed parity verdict. It enumera
 
 ## Current-head status and next native session (2026-09-28)
 
-The reference source remains `yield-legacy` `c80002becec0071298fa110ee0935edee9957978`. The current GPUI comparison head is `yield` `f7779fe73c3b1bf127b0577027c6441aab91ecc8`. Older table rows identify their own review baselines; their old draft/To Review labels are historical, not current Linear status. The following status check uses the live Yield v19.1 issues at this head.
+The reference source remains `yield-legacy` `c80002becec0071298fa110ee0935edee9957978`. The latest integrated GPUI source head checked in this pass is `yield` `54d11d56a881a06b8b4aeb92418fceae91789d24` (OPT-1582, PR #121). The separate OPT-1789 implementation is draft PR #120 at `eb34c7e204e3f6e249ce21b94d2d9d29b5bdb945`; it is **not** part of that main head. Older table rows identify their own review baselines; their old draft/To Review labels are historical, not current Linear status. The status and native queue below supersede those labels, not the source-level observations in those rows.
 
 ### Source-owner update after the native queue was written
 
-This audit branch now includes GPUI main `c1e3419a8a93b3c80022dcfe4f719f64303cbf9b` (PR #119). That newer head does not supply new native acceptance for the rows below. It does change which backend leaves are ready and which route claims are valid:
+This audit branch includes GPUI main `54d11d56a881a06b8b4aeb92418fceae91789d24` (through PR #121). That head does not supply new native acceptance for the rows below. It does change which backend leaves are ready and which route claims are valid:
 
-| Route | Current evidence at `c1e3419a` | Next acceptance boundary |
+| Route | Current evidence at `54d11d5` and named separate PRs | Next acceptance boundary |
 |---|---|---|
-| Scanner and directory truth | OPT-1782, OPT-1783, OPT-1784 and OPT-1786 are Done with source-writer routing and full exact-head local CI. | Finder checkpoint replay still needs proof-bearing batches (OPT-1921) before OPT-1785 can be accepted. |
-| Source metadata, collections and pending rename | OPT-1788 and OPT-1790 are Done with typed source-writer routes and full exact-head local CI. | Rating/listen burst coalescing remains OPT-1789; an accepted curation request has a distinct request ID and predecessor fence, so a queued accepted request cannot simply be dropped. |
+| Scanner and directory truth | OPT-1782, OPT-1783, OPT-1784 and OPT-1786 are Done with source-writer routing and full exact-head local CI. | Finder checkpoint replay still needs proof-bearing batches (OPT-1921) before OPT-1785 can be accepted. The pinned macOS watcher callback currently discards native event IDs; a pathless hint is not a replay cursor. |
+| Source metadata, collections and pending rename | OPT-1788 and OPT-1790 are Done with typed source-writer routes and full exact-head local CI. Draft PR #120 implements bounded pre-admission rating/listen coalescing and passed exact-head local CI; OPT-1789 is To Review. | A native secondary-display rating/listen burst, source switch, restart, and failed-save rollback check is still needed. A process exit inside the 40 ms pre-admission staging window is an explicit review risk; accepted request IDs and predecessor fences cannot be silently dropped. |
+| Missing-source reconnect | OPT-1582 is Done: PR #121 merged the verified same-source-ID reconnect and audit fixture after full exact-head local CI. | OPT-1482 still owns broader reconnect/remap/root-replacement UX and native recovery acceptance. |
 | Readiness and analysis enqueue | OPT-1791 and OPT-1792 are Done with bounded writer entrypoints and full exact-head local CI. | A production feature worker/artifact route is still absent (OPT-1922, then OPT-1708). These writer methods do not prove production analysis readiness. |
 | Physical publication and cleanup | The retained macOS qualification remains unsupported. | OPT-1868 and the OPT-1632/OPT-1634 owner/checkpoint chain remain unmet; no prepared edit, extraction, move, or cleanup row inherits physical acceptance. |
 
-The smallest currently implementable core code leaf from this source-owner slice is OPT-1789, subject to a bounded pre-admission latest-value design that preserves the existing request/receipt lineage. OPT-1717 is the next independent audible native leaf when the Mac is unlocked. OPT-1901 is review-ready in source but remains a live gateway/OAuth acceptance item; the private destination is `PORTALSURFER/yield`, and no test issue has yet been confirmed. Keep one Linear issue In Progress at a time; this audit is a draft evidence register, not an additional implementation lane.
+The next source-owner implementation leaf is OPT-1921, whose native watcher adapter must preserve event IDs and prove bounded replay batches; it remains Backlog while that contract is designed. OPT-1789 is the nearest core native review. OPT-1717 is an independent audible native leaf when the Mac is unlocked. OPT-1901 is review-ready in source but remains a live gateway/OAuth acceptance item; the private destination is `PORTALSURFER/yield`, and no test issue has yet been confirmed. Keep one Linear issue In Progress at a time; this audit is an evidence register, not an additional implementation lane.
 
 |Previously listed route|Current disposition|Evidence or remaining owner|
 |---|---|---|
@@ -38,16 +39,24 @@ The smallest currently implementable core code leaf from this source-owner slice
 |Destructive/normalization action inventory OPT-1734|Done|Use `docs/GPUI_REFERENCE_EDIT_ACTIONS.md`; do not repeat its edit-action classification here. Physical publication and cleanup remain unmet under OPT-1868.|
 |Competing-profile recovery OPT-1752 and macOS keyboard/pointer sessions OPT-1737/OPT-1741|Done|Earlier descriptions of these as restart or pointer blockers are stale. The separate device-loss session below is still open.|
 |Feedback gateway OPT-1901|To Review|The configured private target is `PORTALSURFER/yield`; local gateway tests passed, while live Cloudflare/OAuth cutover and a confirmed private test issue require separate approval and acceptance.|
+|Rating/listen coalescing OPT-1789|To Review|Draft PR #120 at `eb34c7e` passed full local CI; native burst and persistence acceptance remains open.|
+|Missing-source reconnect OPT-1582|Done|PR #121 merged at `54d11d5`, with same-source-ID verified registration and audit fixture plus full local CI.|
+|Watcher replay OPT-1921|Backlog|Current callback discards native event IDs. A proof-bearing capture route is required before replay or OPT-1785 acceptance.|
 
 The next unlocked-Mac session should use a disposable profile and samples in an isolated Yield build on the **secondary monitor**. Keep the active DAW and live library untouched. Each row requires its own result; a running app or green headless test does not satisfy the native check.
 
 |Order|Issue and native action|Pass evidence to record|Prerequisite|
 |---|---|---|---|
-|1|OPT-1717: play a disposable audible sample, cause output-device loss, restore the device, and retry playback.|Device-loss status and audible stop/resume behavior, exact build and device, plus user signoff. A blocked or ambiguous result stays open.|An unlocked Mac and a safe device switch that does not disturb the active DAW.|
-|2|OPT-1901: authorize Yield in the private gateway, exercise cancel/denial/expiry, then submit one labeled test issue.|Exact deployed Worker/OAuth callback and repository, redacted authentication outcomes, one confirmed GitHub issue URL, and no automatic duplicate after uncertain POST.|Separate live cutover approval, Cloudflare login, then the unlocked Mac.|
+|1|OPT-1789: burst rating and listen changes on a disposable selected sample; switch sources, restart, and exercise failed-save rollback.|Latest admitted value and distinct accepted-request lineage survive source switch/restart; collection/tag ordering is unchanged; a failed save reports failure without a false success.|Unlocked Mac, secondary-display isolated build of exact PR #120 head, disposable profile and source.|
+|2|OPT-1717: play a disposable audible sample, cause output-device loss, restore the device, and retry playback.|Device-loss status and audible stop/resume behavior, exact build and device, plus user signoff. A blocked or ambiguous result stays open.|An unlocked Mac and a safe device switch that does not disturb the active DAW.|
+|3|OPT-1901: authorize Yield in the private gateway, exercise cancel/denial/expiry, then submit one labeled test issue.|Exact deployed Worker/OAuth callback and repository, redacted authentication outcomes, one confirmed GitHub issue URL, and no automatic duplicate after uncertain POST.|Separate live cutover approval, Cloudflare login, then the unlocked Mac.|
 |Deferred by product priority|OPT-1882: Default/200% text in normal and constrained windows, AX actions, and restart persistence.|Readable controls and status text, focus/AX evidence, exact build and isolated profile restart.|The user's core-stability-first plan places enlarged-text acceptance after core issues.|
 
-OPT-1867 still needs a per-state native priority comparison for active controls beyond these issue-specific checks. Record those results against the exact action/control row and build when that focused matrix runs; do not infer them from the two sessions above.
+OPT-1867 still needs a per-state native priority comparison for active controls beyond these issue-specific checks. Record those results against the exact action/control row and build when that focused matrix runs; do not infer them from the issue-specific sessions above.
+
+### Current shortcut overrides for historical rows
+
+The detailed shortcut table below intentionally retains its `493bd34c` comparison baseline. Its Control/Option-Space row describes a superseded draft: OPT-1909 is Done with **plain R** for random-section audition after physical-key acceptance; the modified-Space chords were intercepted on the test Mac and are not advertised as working. Plain Space and Shift-Space are Done under OPT-1906. The reference `R` destructive-edit row remains an unmet *reference* action; the active GPUI plain-R route is random-section audition, not reverse editing. Reviewers should use these current routes when reading those older candidate rows, and should not infer destructive-edit parity from the shared key.
 
 ## Visible-control pass: toolbar and settings
 
@@ -534,7 +543,7 @@ The [reference contextual help](https://github.com/PORTALSURFER/yield-legacy/blo
 
 ## Dependency-ready work from this pass
 
-The five previously listed GPUI interaction leaves are Done, as recorded in the current-head section above. OPT-1867 itself remains the active source-level audit. OPT-1717 is the next core native-only leaf for an unlocked Mac. The metadata/source-writer and physical file-operation leaves are separately tracked under their owner issues; a declared control in this register does not authorize bypassing their durable identity, receipt, or macOS publication contracts.
+The five previously listed GPUI interaction leaves are Done, as recorded in the current-head section above. OPT-1867 itself remains the active source-level audit. OPT-1789 is the next core native review for an unlocked Mac, followed by the independent OPT-1717 audible session. The metadata/source-writer and physical file-operation leaves are separately tracked under their owner issues; a declared control in this register does not authorize bypassing their durable identity, receipt, or macOS publication contracts.
 
 No destructive edit, extraction, file move, or cleanup row passes physical-publication acceptance until OPT-1868 qualifies it.
 
