@@ -1,8 +1,8 @@
 //! Bounded, single-use ingress for a native FSEvents replay stream.
 //!
 //! This buffer preserves native event IDs and source-relative paths without manufacturing a
-//! continuity proof. A future native stream owner must establish `sinceWhen`, delivery coverage,
-//! and durable prior authority before passing a batch to reconciliation admission.
+//! continuity proof. The native stream owner establishes `sinceWhen` and delivery coverage;
+//! durable prior authority is required before reconciliation can admit a proof-bearing batch.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};

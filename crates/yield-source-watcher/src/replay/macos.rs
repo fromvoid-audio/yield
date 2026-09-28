@@ -2,7 +2,8 @@
 //!
 //! Per-device callback paths are relative to the volume root. macOS may include or omit `/`.
 //! This module translates them into the source root's namespace before the common ingress
-//! validates source relativity. It does not start a native stream or grant replay proof.
+//! validates source relativity. The sibling native worker starts the stream; translation alone
+//! never grants replay proof.
 
 use std::path::{Path, PathBuf};
 

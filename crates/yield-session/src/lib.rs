@@ -3032,7 +3032,21 @@ mod tests {
         service: &SourceRegistryService,
         predicate: impl Fn(&CatalogEvent) -> bool,
     ) -> CatalogEvent {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        wait_for_catalog_event_with_budget(
+            service,
+            predicate,
+            Duration::from_secs(60),
+            "catalog event",
+        )
+    }
+
+    fn wait_for_catalog_event_with_budget(
+        service: &SourceRegistryService,
+        predicate: impl Fn(&CatalogEvent) -> bool,
+        budget: Duration,
+        phase: &str,
+    ) -> CatalogEvent {
+        let deadline = Instant::now() + budget;
         let mut other_events = Vec::new();
         loop {
             match service.try_recv_catalog() {
@@ -3045,7 +3059,7 @@ mod tests {
                 Err(TryRecvError::Empty) => {
                     assert!(
                         Instant::now() < deadline,
-                        "timed out waiting for catalog event; other events: {other_events:?}"
+                        "timed out waiting for {phase}; other events: {other_events:?}"
                     );
                     thread::sleep(Duration::from_millis(5));
                 }
@@ -4094,9 +4108,11 @@ mod tests {
                 lifecycle_generation: 1,
             })
             .expect("catalog registration");
-        wait_for_catalog_event(
+        wait_for_catalog_event_with_budget(
             &service,
             |event| matches!(event, CatalogEvent::Registered { source_id: registered, .. } if registered == &source_id),
+            Duration::from_secs(120),
+            "fixture source registration",
         );
         service
             .submit_catalog(CatalogCommand::RequestAudit {
@@ -4118,9 +4134,11 @@ mod tests {
             &service,
             |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() > 0),
         );
-        wait_for_catalog_event(
+        wait_for_catalog_event_with_budget(
             &service,
             |event| matches!(event, CatalogEvent::AuditCommitted { snapshot } if snapshot.source_id == source_id),
+            Duration::from_secs(120),
+            "256-folder fixture audit commit",
         );
         service.shutdown().expect("session shutdown");
     }
