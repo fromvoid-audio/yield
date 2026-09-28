@@ -14,6 +14,28 @@ This is the **candidate register**, not the completed parity verdict. It enumera
 - `OPT-1474` retained macOS staged publication and cleanup as unsupported. Reference actions requiring physical publication or cleanup remain unmet until `OPT-1868` qualifies a production primitive; a source-list unregistration is a different operation. Neither a projected control nor a headless fixture waives the physical-operation gate.
 - Per-family tickets below are triage owners, **not** proof that they cover every individual action. Each row with pending native evidence still needs a concrete comparison or an explicit unreachable-action decision before this inventory can pass.
 
+## Current-head status and next native session (2026-09-28)
+
+The reference source remains `yield-legacy` `c80002becec0071298fa110ee0935edee9957978`. The current GPUI comparison head is `yield` `f7779fe73c3b1bf127b0577027c6441aab91ecc8`. Older table rows identify their own review baselines; their old draft/To Review labels are historical, not current Linear status. The following status check uses the live Yield v19.1 issues at this head.
+
+|Previously listed route|Current disposition|Evidence or remaining owner|
+|---|---|---|
+|Random-section shortcut OPT-1909|Done|Plain R replaced the two modified-Space chords after physical-key acceptance; preserve the new binding when comparing reference shortcuts.|
+|Zoom-state X OPT-1910, workspace dividers OPT-1911, source-row reorder OPT-1914, toolbar Focus Loaded Sample OPT-1916, and browser columns OPT-1908|Done|Their own merged issues retain the focused and secondary-display evidence. Their older candidate rows below need no second implementation claim.|
+|Destructive/normalization action inventory OPT-1734|Done|Use `docs/GPUI_REFERENCE_EDIT_ACTIONS.md`; do not repeat its edit-action classification here. Physical publication and cleanup remain unmet under OPT-1868.|
+|Competing-profile recovery OPT-1752 and macOS keyboard/pointer sessions OPT-1737/OPT-1741|Done|Earlier descriptions of these as restart or pointer blockers are stale. The separate device-loss session below is still open.|
+|Feedback gateway OPT-1901|To Review|The configured private target is `PORTALSURFER/yield`; local gateway tests passed, while live Cloudflare/OAuth cutover and a confirmed private test issue require separate approval and acceptance.|
+
+The next unlocked-Mac session should use a disposable profile and samples in an isolated Yield build on the **secondary monitor**. Keep the active DAW and live library untouched. Each row requires its own result; a running app or green headless test does not satisfy the native check.
+
+|Order|Issue and native action|Pass evidence to record|Prerequisite|
+|---|---|---|---|
+|1|OPT-1717: play a disposable audible sample, cause output-device loss, restore the device, and retry playback.|Device-loss status and audible stop/resume behavior, exact build and device, plus user signoff. A blocked or ambiguous result stays open.|An unlocked Mac and a safe device switch that does not disturb the active DAW.|
+|2|OPT-1901: authorize Yield in the private gateway, exercise cancel/denial/expiry, then submit one labeled test issue.|Exact deployed Worker/OAuth callback and repository, redacted authentication outcomes, one confirmed GitHub issue URL, and no automatic duplicate after uncertain POST.|Separate live cutover approval, Cloudflare login, then the unlocked Mac.|
+|Deferred by product priority|OPT-1882: Default/200% text in normal and constrained windows, AX actions, and restart persistence.|Readable controls and status text, focus/AX evidence, exact build and isolated profile restart.|The user's core-stability-first plan places enlarged-text acceptance after core issues.|
+
+OPT-1867 still needs a per-state native priority comparison for active controls beyond these issue-specific checks. Record those results against the exact action/control row and build when that focused matrix runs; do not infer them from the two sessions above.
+
 ## Visible-control pass: toolbar and settings
 
 The reference [main toolbar projection](https://github.com/PORTALSURFER/yield-legacy/blob/c80002becec0071298fa110ee0935edee9957978/src/native_app/app_chrome/toolbar/projection.rs#L35) and [top settings bar](https://github.com/PORTALSURFER/yield-legacy/blob/c80002becec0071298fa110ee0935edee9957978/src/native_app/app_chrome/settings/top_bar.rs#L66) establish these 18 controls independently of the action enum, including their conditional controls. Other app surfaces still need a visible-control pass. A GPUI view element is a candidate route, not proof of matching behavior.
@@ -497,17 +519,11 @@ The [reference contextual help](https://github.com/PORTALSURFER/yield-legacy/blo
 |[Esc: close help, rename, column drag, context menu, destructive edit, dropdown, job/transaction detail, tag completion, or collection focus](https://github.com/PORTALSURFER/yield-legacy/blob/c80002becec0071298fa110ee0935edee9957978/src/native_app/shell/shortcuts/help/context.rs#L8)|[GPUI key priority](../crates/yield-ui/src/browser/mod.rs#L2560) covers implemented modal, input, context-menu and gesture states; several reference transients have no GPUI surface yet|Individual GPUI cancellation fixtures exist; one combined priority matrix is absent|No complete native transient Escape matrix recorded|yield-ui focus/transients|OPT-1737/1751 focus priority, plus each missing surface owner (OPT-1475/1479/1866/1902)|
 |[Enter: confirm pending destructive edit; Up/Down: tag completion; Delete/Backspace: selected tag](https://github.com/PORTALSURFER/yield-legacy/blob/c80002becec0071298fa110ee0935edee9957978/src/native_app/shell/shortcuts/help/context.rs#L48)|GPUI tag input/completion key handling precedes global browser keys; pending destructive-edit confirmation is absent with its publication flow|GPUI tag-completion tests are adjacent; exact selected-tag and confirmation priority needs comparison|No complete native contextual key matrix recorded|yield-ui metadata/edit focus|OPT-1486/1737 tag input, OPT-1475/1868 destructive confirmation|
 
-## Smallest currently implementable leaves from this pass
+## Dependency-ready work from this pass
 
-These source-confirmed GPUI routes have existing building blocks and no new backend ownership decision in their bounded acceptance. Work through one issue at a time while keeping the next in Backlog. Native evidence remains part of each leaf's own acceptance.
+The five previously listed GPUI interaction leaves are Done, as recorded in the current-head section above. OPT-1867 itself remains the active source-level audit. OPT-1717 is the next core native-only leaf for an unlocked Mac. The metadata/source-writer and physical file-operation leaves are separately tracked under their owner issues; a declared control in this register does not authorize bypassing their durable identity, receipt, or macOS publication contracts.
 
-1. [OPT-1909](https://linear.app/boostnlvp/issue/OPT-1909/restore-control-space-and-option-space-random-section-audition): random-section Space chords have draft PR #87 and app-targeted native transport evidence; physical-key OS interception and human audible acceptance remain open.
-2. [OPT-1910](https://linear.app/boostnlvp/issue/OPT-1910/match-zoom-state-x-shortcut-behavior-in-yield-gpui): X state precedence is merged in PR #88, but the full-zoom native selection/focus branch remains To Review.
-3. [OPT-1911](https://linear.app/boostnlvp/issue/OPT-1911/restore-yield-workspace-sidebar-and-waveform-panel-resizing): workspace dividers are merged and Done in PR #89. Inner filter/collection and browser-column layout remain separate.
-4. [OPT-1914](https://linear.app/boostnlvp/issue/OPT-1914/1499-l-restore-persistent-source-row-reorder-in-yield-gpui): the source-row sweep found a persistent reference reorder gesture absent from the GPUI sidebar; its implementation is To Review, while OPT-1752 may still block native restart acceptance.
-5. [OPT-1916](https://linear.app/boostnlvp/issue/OPT-1916/restore-focus-loaded-sample-toolbar-control-in-yield): the reference toolbar focus control now has a source implementation in draft PR #102; isolated native pointer and AX acceptance remains open.
-
-The macOS-wide audit links destructive and normalization omissions to [OPT-1734](https://linear.app/boostnlvp/issue/OPT-1734/1487-c-inventory-remaining-active-reference-actions-decision), which remains Backlog with its own prerequisites. No destructive edit, extraction, file move, or cleanup row passes physical-publication acceptance until OPT-1868 qualifies it.
+No destructive edit, extraction, file move, or cleanup row passes physical-publication acceptance until OPT-1868 qualifies it.
 
 The reference [Harvest family drawer](https://github.com/PORTALSURFER/yield-legacy/blob/c80002becec0071298fa110ee0935edee9957978/src/native_app/app_chrome/library_browser/library_sidebar/harvest_family.rs#L17) has state/count readouts and three navigation buttons, but is **not counted as an active macOS surface** here: [production projection](https://github.com/PORTALSURFER/yield-legacy/blob/c80002becec0071298fa110ee0935edee9957978/src/native_app/app_chrome/view_models/library_sidebar.rs#L171) mounts it only when `harvest_family_open` is true, the [app state](https://github.com/PORTALSURFER/yield-legacy/blob/c80002becec0071298fa110ee0935edee9957978/src/native_app/app/state/ui_state.rs#L328) initializes that flag false, and the reviewed reference source contains no production write or toggle for it. Its unit fixture constructs the drawer directly and does not prove reachability. The separate active Harvest context-menu actions remain listed above; a future reachable drawer would need its own parity decision.
 
