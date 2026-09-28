@@ -88,6 +88,23 @@ pub trait ScanWriter {
         Ok(batch.commit_with_bounded_manifest_changes(expected_revision)?)
     }
 
+    /// Commit prepared rename-retention state at the completed scan's observed revision.
+    /// Callers hold this writer's mutation guard and check the root after preparation.
+    fn commit_pending_rename_scan_completion(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        expected_revision: u64,
+    ) -> Result<(), ScanError> {
+        if !batch.matches_revision(expected_revision)? {
+            return Err(ScanError::StaleRevision {
+                expected: expected_revision,
+                actual: batch.get_revision()?,
+            });
+        }
+        batch.commit_auxiliary_state()?;
+        Ok(())
+    }
+
     /// Activate a complete staged audit and return the committed manifest on
     /// the same owner that admitted its bounded scan batches.
     fn commit_scan_audit_completion(
@@ -193,6 +210,22 @@ impl ScanWriter for SourceWriter {
             });
         }
         self.commit_scan_manifest_batch(&fence, batch)
+            .map_err(source_writer_error)
+    }
+
+    fn commit_pending_rename_scan_completion(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        expected_revision: u64,
+    ) -> Result<(), ScanError> {
+        let fence = self.current_scan_fence().map_err(source_writer_error)?;
+        if fence.revision() != expected_revision {
+            return Err(ScanError::StaleRevision {
+                expected: expected_revision,
+                actual: fence.revision(),
+            });
+        }
+        self.commit_scan_pending_rename_completion(&fence, batch)
             .map_err(source_writer_error)
     }
 

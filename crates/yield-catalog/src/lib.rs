@@ -5262,6 +5262,27 @@ impl<'a> ScanWriter for CatalogScanWriter<'a> {
             .map_err(scan_writer_error)
     }
 
+    fn commit_pending_rename_scan_completion(
+        &self,
+        batch: SourceWriteBatch<'_>,
+        expected_revision: u64,
+    ) -> Result<(), ScanError> {
+        self.validate_authority()?;
+        let owner = self.owner.ok_or_else(|| {
+            ScanError::SourceOwner(String::from("catalog scan has no retained source writer"))
+        })?;
+        let fence = owner.current_scan_fence().map_err(scan_writer_error)?;
+        if fence.revision() != expected_revision {
+            return Err(ScanError::StaleRevision {
+                expected: expected_revision,
+                actual: fence.revision(),
+            });
+        }
+        owner
+            .commit_scan_pending_rename_completion(&fence, batch)
+            .map_err(scan_writer_error)
+    }
+
     fn commit_scan_audit_completion(
         &self,
         batch: SourceWriteBatch<'_>,
@@ -9864,6 +9885,43 @@ mod tests {
             retained.writer.current_revision().unwrap().revision(),
             audit.audit_commit.committed_source_revision()
         );
+        let rename_revision = audit.audit_commit.committed_source_revision();
+        let rename_generation_before = retained
+            .pending_rename_diagnostics()
+            .unwrap()
+            .authoritative_generation;
+        assert!(matches!(
+            writer.commit_pending_rename_scan_completion(
+                other_database.write_batch().unwrap(),
+                rename_revision
+            ),
+            Err(ScanError::SourceOwner(_))
+        ));
+        assert!(matches!(
+            writer.commit_pending_rename_scan_completion(
+                retained.write_batch().unwrap(),
+                rename_revision - 1
+            ),
+            Err(ScanError::StaleRevision { .. })
+        ));
+        assert_eq!(
+            retained
+                .pending_rename_diagnostics()
+                .unwrap()
+                .authoritative_generation,
+            rename_generation_before
+        );
+        let mut rename_batch = retained.write_batch().unwrap();
+        let rename_report = rename_batch
+            .complete_pending_rename_authoritative_scan(false)
+            .unwrap();
+        writer
+            .commit_pending_rename_scan_completion(rename_batch, rename_revision)
+            .expect("retained writer commits rename completion");
+        assert_eq!(
+            rename_report.diagnostics.authoritative_generation,
+            rename_generation_before + 1
+        );
         write_test_wav(&fixture.root.path().join("one.wav"), 44_100, 256);
         let mut retired_during_traversal = false;
         let mut at_retirement = None;
@@ -9898,6 +9956,13 @@ mod tests {
                 actual: Some(2)
             })
         ));
+        assert_eq!(
+            retained
+                .pending_rename_diagnostics()
+                .unwrap()
+                .authoritative_generation,
+            rename_generation_before + 1
+        );
         assert_eq!(
             retained.manifest_snapshot_with_revision().unwrap(),
             at_retirement.expect("revision observed at retirement")

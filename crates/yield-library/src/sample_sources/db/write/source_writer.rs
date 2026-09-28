@@ -712,6 +712,29 @@ impl SourceWriter {
         Ok(batch.commit_with_bounded_manifest_changes(expected.revision)?)
     }
 
+    /// Commit a prepared pending-rename retention batch for the exact completed scan revision.
+    /// The retained source owner checks its lease, binding, and batch origin before publication.
+    pub fn commit_scan_pending_rename_completion(
+        &self,
+        expected: &SourceScanFence,
+        batch: SourceWriteBatch<'_>,
+    ) -> Result<(), SourceWriterError> {
+        if !std::ptr::eq(batch.owner, &self.database) {
+            return Err(SourceWriterError::InvalidRequest(
+                "rename completion belongs to another source database",
+            ));
+        }
+        self.validate_scan_fence(expected)?;
+        if !batch.matches_revision(expected.revision)? {
+            return Err(SourceWriterError::StaleRevision {
+                expected: expected.revision,
+                actual: batch.get_revision()?,
+            });
+        }
+        batch.commit_auxiliary_state()?;
+        Ok(())
+    }
+
     /// Allocate private directory-truth staging under the retained source owner.
     /// Staging is revision-neutral; the final audit commit fences its publication.
     pub fn begin_scan_directory_truth_generation(
