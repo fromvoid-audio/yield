@@ -16,6 +16,11 @@ use crate::sample_sources::db::SourceLeaseError;
 #[cfg(unix)]
 use crate::sample_sources::db::file_ops_journal::{CopyJournalEntryInit, FileOpJournalEntry};
 use crate::sample_sources::db::{DatabaseRootBindingGuard, SourceDirectoryTruthState};
+use crate::sample_sources::readiness::{
+    ArtifactPublishOutcome, ReadinessFailureClassification, ReadinessFailureOutcome,
+    ReadinessRetryPolicy, ReadinessStage, ReadinessTarget, ReadinessTargetPublication,
+    SourceAvailability,
+};
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
     Rating, SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SampleCollection,
@@ -36,6 +41,154 @@ struct CurationFixture {
     profile_guard: WritableProfileGuard,
     root_identity: RootIdentity,
     revision: u64,
+}
+
+#[test]
+fn source_writer_routes_readiness_claim_failure_retry_and_completion() {
+    let mut fixture = CurationFixture::new_profile_bound();
+    let source_id = SourceId::from_string("readiness-writer-test");
+    fixture
+        .database
+        .connection
+        .execute(
+            "UPDATE wav_files SET file_identity = CASE path
+             WHEN 'one.wav' THEN 'file-one' WHEN 'two.wav' THEN 'file-two' END",
+            [],
+        )
+        .expect("seed manifest identities");
+    let source_target = ReadinessTarget::source(
+        source_id.as_str(),
+        ReadinessStage::SimilarityLayout,
+        "layout-v1",
+        1,
+        "membership-v1",
+    );
+    let mut targets = Vec::new();
+    for (identity, path, content) in [
+        ("file-one", "one.wav", "content-one"),
+        ("file-two", "two.wav", "content-two"),
+    ] {
+        for (stage, version) in [
+            (ReadinessStage::IndexedIdentity, "identity-v1"),
+            (ReadinessStage::AnalysisFeatures, "features-v1"),
+            (ReadinessStage::EmbeddingAspects, "embedding-v1"),
+        ] {
+            targets.push(ReadinessTarget::file(
+                source_id.as_str(),
+                identity,
+                path,
+                stage,
+                version,
+                1,
+                content,
+            ));
+        }
+    }
+    let target = targets[0].clone();
+    targets.push(source_target);
+    {
+        let mut store = fixture
+            .database
+            .readiness_store()
+            .expect("owned readiness store");
+        let origin = store
+            .capture_publication_origin()
+            .expect("publication origin");
+        store
+            .publish_targets(
+                &origin,
+                &ReadinessTargetPublication::new(
+                    source_id.as_str(),
+                    1,
+                    1,
+                    SourceAvailability::Active,
+                    "readiness-contract-v1",
+                    &targets,
+                    1,
+                ),
+            )
+            .expect("publish target");
+        let deficits = store
+            .reconcile(source_id.as_str(), 10)
+            .expect("reconcile")
+            .deficits;
+        assert!(deficits.iter().any(|deficit| deficit.target == target));
+        store.persist_deficits(&deficits, 10).expect("enqueue work");
+    }
+    let mut writer =
+        SourceWriter::new(fixture.database, source_id.clone(), 7).expect("source writer");
+    let initial = writer.current_revision().expect("initial revision");
+    writer
+        .commit_catalog_curation_command(
+            &initial,
+            &fixture.profile_guard,
+            &[SourceCurationUpdate::SetRating {
+                path: CurationFixture::path("one.wav"),
+                rating: Rating::KEEP_3,
+            }],
+        )
+        .expect("advance source revision");
+    assert!(matches!(
+        writer.claim_readiness_target(&initial, &target, 10, 100),
+        Err(SourceWriterError::StaleRevision { .. })
+    ));
+    let revision = writer.current_revision().expect("current revision");
+
+    let mut wrong_source = target.clone();
+    wrong_source.source_id = String::from("another-source");
+    assert!(matches!(
+        writer.claim_readiness_target(&revision, &wrong_source, 10, 100),
+        Err(SourceWriterError::StaleFence)
+    ));
+
+    let claim = writer
+        .claim_readiness_target(&revision, &target, 10, 100)
+        .expect("claim")
+        .expect("work available");
+    let retry_policy = ReadinessRetryPolicy::new(3, 10, 2).expect("retry policy");
+    assert_eq!(
+        writer
+            .fail_readiness_work(
+                &revision,
+                &claim,
+                ReadinessFailureClassification::Retryable,
+                "transient",
+                "retry the same target",
+                11,
+                retry_policy,
+            )
+            .expect("record failure"),
+        ReadinessFailureOutcome::RetryScheduled { retry_at: 14 }
+    );
+    assert!(
+        writer
+            .claim_readiness_target(&revision, &target, 13, 100)
+            .expect("before retry")
+            .is_none()
+    );
+    let retry = writer
+        .claim_readiness_target(&revision, &target, 14, 100)
+        .expect("retry")
+        .expect("retry due");
+    assert_eq!(retry.failure_attempts(), 1);
+    assert_eq!(
+        writer
+            .complete_readiness_work(&revision, &claim, 15, None)
+            .expect("stale completion"),
+        ArtifactPublishOutcome::RejectedStale
+    );
+    assert_eq!(
+        writer
+            .complete_readiness_work(&revision, &retry, 15, None)
+            .expect("completion"),
+        ArtifactPublishOutcome::Recorded
+    );
+    let database = writer.into_catalog_database();
+    let mut replacement = SourceWriter::new(database, source_id, 8).expect("new lifecycle");
+    assert!(matches!(
+        replacement.claim_readiness_target(&revision, &target, 16, 100),
+        Err(SourceWriterError::StaleFence)
+    ));
 }
 
 impl CurationFixture {
