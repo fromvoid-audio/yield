@@ -337,25 +337,38 @@ fn targeted_index_delta_is_bound_to_the_next_source_revision() {
 }
 
 #[test]
-fn uncertain_subtree_does_not_false_delete_index_only_rows() {
+fn uncertain_subtree_does_not_false_delete_index_only_rows_anywhere() {
     use crate::sample_sources::scanner::scan_fs::force_directory_read_failure;
 
     let directory = tempdir().unwrap();
     let protected = directory.path().join("protected");
     std::fs::create_dir(&protected).unwrap();
     std::fs::write(protected.join("notes.txt"), b"notes").unwrap();
+    std::fs::write(directory.path().join("outside.txt"), b"outside").unwrap();
     let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
 
     std::fs::remove_file(protected.join("notes.txt")).unwrap();
+    std::fs::remove_file(directory.path().join("outside.txt")).unwrap();
     let failure = force_directory_read_failure(&protected);
     assert!(matches!(
         scan_once(&database),
         Err(ScanError::Incomplete { .. })
     ));
+    let retained = database
+        .list_source_index_entries()
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.relative_path)
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        database.list_source_index_entries().unwrap()[0].relative_path,
-        Path::new("protected/notes.txt")
+        retained,
+        [
+            PathBuf::from("protected/notes.txt"),
+            PathBuf::from("outside.txt")
+        ]
+        .into_iter()
+        .collect()
     );
 
     drop(failure);

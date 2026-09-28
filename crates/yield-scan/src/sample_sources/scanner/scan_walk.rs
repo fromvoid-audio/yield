@@ -10,7 +10,7 @@ use std::{
 use crate::sample_sources::SourceDatabase;
 use yield_library::sample_sources::{SourceIndexDiagnostic, SourceTraversalPolicy};
 
-use super::scan::{CommittedScanBatch, ScanContext, ScanError};
+use super::scan::{CommittedScanBatch, CommittedSourceDelta, ScanContext, ScanError};
 use super::scan_capability::{SourcePathBinding, SourceRootCapability};
 use super::scan_diff::{PreparedFile, apply_diff};
 use super::scan_diff_phase::prepare_diff_from_facts;
@@ -651,17 +651,8 @@ fn apply_batch_with_source_root_and_precommit_hook(
     if cancel_requested(cancel) {
         return Err(ScanError::Canceled);
     }
-    let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
-    if cancel_requested(cancel) {
-        return Err(ScanError::Canceled);
-    }
-    let mut batch = db.write_batch()?;
-    let stats_before_staging = context.stats.clone();
-    let generation_before_staging = context.rename_candidate_generation;
-    context.ensure_rename_candidate_generation(&mut batch)?;
-    let mut audited_paths = Vec::with_capacity(ready.len());
-    let mut retained = Vec::with_capacity(ready.len());
-    for mut file in ready {
+    let mut validated = Vec::with_capacity(ready.len());
+    for file in ready {
         let relative_path = file.facts.relative.clone();
         let file_handle = file
             .source_file
@@ -689,49 +680,38 @@ fn apply_batch_with_source_root_and_precommit_hook(
                 continue;
             }
         }
-        let retained_file = file
-            .source_file
-            .take()
-            .expect("validated source files retain their descriptor until commit");
-        let retained_facts = file.facts.clone();
-        let content_was_hashed = file.content_hash.is_some();
-        let existing_before = context.existing.get(&relative_path).cloned();
-        apply_diff(db, &mut batch, file, context)?;
-        audited_paths.push(relative_path.clone());
-        retained.push(RetainedPublication {
-            relative_path,
-            facts: retained_facts,
-            content_was_hashed,
-            file: retained_file,
-            existing_before,
-        });
+        validated.push(file);
+    }
+    if validated.is_empty() {
+        return Ok(ApplyBatchOutcome::default());
     }
     if cancel_requested(cancel) {
         return Err(ScanError::Canceled);
     }
-    for publication in &retained {
-        precommit(&publication.relative_path);
+    for file in &validated {
+        precommit(&file.facts.relative);
     }
-    let final_bindings = retained
+    let final_bindings = validated
         .iter()
-        .map(|publication| {
-            let absolute = root.join(&publication.relative_path);
-            let descriptor_matches = read_facts_from_open_file(root, &absolute, &publication.file)
+        .map(|file| {
+            let relative_path = &file.facts.relative;
+            let absolute = root.join(relative_path);
+            let source_file = file
+                .source_file
+                .as_ref()
+                .expect("validated source files retain their descriptor until commit");
+            let descriptor_matches = read_facts_from_open_file(root, &absolute, source_file)
                 .is_ok_and(|facts| {
-                    if publication.content_was_hashed {
-                        publication.facts.same_content_snapshot(&facts)
+                    if file.content_hash.is_some() {
+                        file.facts.same_content_snapshot(&facts)
                     } else {
-                        publication.facts.same_file_facts(&facts)
+                        file.facts.same_file_facts(&facts)
                     }
                 });
             let binding = source_root
-                .path_binding(&publication.relative_path, &publication.file)
+                .path_binding(relative_path, source_file)
                 .unwrap_or(SourcePathBinding::Changed);
-            (
-                publication.relative_path.clone(),
-                descriptor_matches,
-                binding,
-            )
+            (relative_path.clone(), descriptor_matches, binding)
         })
         .collect::<Vec<_>>();
     if final_bindings
@@ -740,18 +720,6 @@ fn apply_batch_with_source_root_and_precommit_hook(
             !descriptor_matches || *binding != SourcePathBinding::Matches
         })
     {
-        drop(batch);
-        context.stats = stats_before_staging;
-        context.rename_candidate_generation = generation_before_staging;
-        for publication in &retained {
-            if let Some(existing) = publication.existing_before.clone() {
-                context
-                    .existing
-                    .insert(publication.relative_path.clone(), existing);
-            } else {
-                context.existing.remove(&publication.relative_path);
-            }
-        }
         for (relative_path, _descriptor_matches, binding) in final_bindings {
             if binding == SourcePathBinding::Retire {
                 continue;
@@ -762,23 +730,46 @@ fn apply_batch_with_source_root_and_precommit_hook(
         return Ok(ApplyBatchOutcome::default());
     }
     source_root.ensure_current_generation()?;
-    let revision = context.commit_batch(db, batch)?;
+    let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
+    if cancel_requested(cancel) {
+        return Err(ScanError::Canceled);
+    }
+    let mut batch = db.write_batch()?;
+    context.ensure_rename_candidate_generation(&mut batch)?;
+    let mut audited_paths = Vec::with_capacity(validated.len());
+    let mut retained_files = Vec::with_capacity(validated.len());
+    for mut file in validated {
+        audited_paths.push(file.facts.relative.clone());
+        retained_files.push(
+            file.source_file
+                .take()
+                .expect("validated source files retain their descriptor until commit"),
+        );
+        apply_diff(db, &mut batch, file, context)?;
+    }
+    if cancel_requested(cancel) {
+        return Err(ScanError::Canceled);
+    }
+    let delta = if context.exact_committed_batches {
+        context.commit_batch_with_delta(db, batch, writer)?
+    } else {
+        let revision = context.commit_batch(db, batch, writer)?;
+        CommittedSourceDelta {
+            revision,
+            ..CommittedSourceDelta::default()
+        }
+    };
+    drop(_writer);
+    drop(retained_files);
     on_committed_batch(CommittedScanBatch {
-        revision,
+        revision: delta.revision,
         paths: audited_paths.clone(),
+        delta,
     });
     Ok(ApplyBatchOutcome {
         committed: true,
         audited_paths,
     })
-}
-
-struct RetainedPublication {
-    relative_path: std::path::PathBuf,
-    facts: super::scan_fs::FileFacts,
-    content_was_hashed: bool,
-    file: std::fs::File,
-    existing_before: Option<crate::sample_sources::WavEntry>,
 }
 
 #[derive(Default)]
@@ -1368,6 +1359,10 @@ mod tests {
             false,
             &super::super::scan_writer::UncoordinatedScanWriter,
             |path| {
+                let probe = db
+                    .write_batch()
+                    .expect("filesystem validation must run outside a SQLite transaction");
+                drop(probe);
                 let absolute = dir.path().join(path);
                 std::fs::remove_file(&absolute).unwrap();
                 symlink(&outside_file, absolute).unwrap();

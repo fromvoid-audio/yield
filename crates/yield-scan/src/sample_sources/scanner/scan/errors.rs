@@ -15,6 +15,17 @@ pub enum ScanError {
     /// Scan was canceled by the caller.
     #[error("Scan canceled")]
     Canceled,
+    /// The catalog's source generation was retired before a bounded write.
+    #[error("Source lifecycle changed while scanning (expected {expected}, current {actual:?})")]
+    StaleLifecycle {
+        /// Generation retained by this scan.
+        expected: u64,
+        /// Current generation, or none when the source is no longer registered.
+        actual: Option<u64>,
+    },
+    /// The retained source writer rejected its current physical or lease fence.
+    #[error("Source writer authority is unavailable: {0}")]
+    SourceOwner(String),
     /// A newer source manifest revision invalidated work planned from an older snapshot.
     #[error(
         "Source manifest changed while the scan checkpoint was being finalized \

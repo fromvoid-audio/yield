@@ -187,17 +187,25 @@ fn required_prepared_hash(content_hash: Option<String>) -> String {
     content_hash.expect("hash-required scan entries must be prepared before opening a write batch")
 }
 
+/// Resolve filesystem absence before opening a SQLite write transaction.
+pub(super) fn absent_missing_candidates(
+    root: &Path,
+    policy: SourceTraversalPolicy,
+    existing: impl IntoIterator<Item = WavEntry>,
+) -> Vec<WavEntry> {
+    existing
+        .into_iter()
+        .filter(|entry| !is_supported_scannable_audio_file(root, &entry.relative_path, policy))
+        .collect()
+}
+
 pub(super) fn mark_missing(
     db: &SourceDatabase,
-    policy: SourceTraversalPolicy,
     batch: &mut SourceWriteBatch<'_>,
     existing: impl IntoIterator<Item = WavEntry>,
     stats: &mut ScanStats,
 ) -> Result<(), ScanError> {
     for stale in existing {
-        if is_supported_scannable_audio_file(db.root(), &stale.relative_path, policy) {
-            continue;
-        }
         let Some(leftover) = db.entry_for_path(&stale.relative_path)? else {
             continue;
         };

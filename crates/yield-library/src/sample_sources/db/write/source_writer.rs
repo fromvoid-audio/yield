@@ -19,12 +19,15 @@ use uuid::Uuid;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use crate::sample_sources::SourceId;
 use crate::sample_sources::db::read::browser_metadata_rows_for_paths;
-use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
+use crate::sample_sources::reconciliation::{
+    RootIdentity, RootRelativePath, SourceAuditCommit, SourceAuditRequest,
+};
 
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
-    BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, Rating, SampleCollection,
-    SourceDatabase, SourceDbError, SourcePlaybackType,
+    BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, ManifestCommitResult, Rating,
+    SampleCollection, SourceDatabase, SourceDbError, SourceManifestEntry, SourcePlaybackType,
+    SourceWriteBatch,
 };
 use super::curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
@@ -81,6 +84,21 @@ impl std::fmt::Display for SourceCommandId {
 /// the retained profile, database binding, and source lease before using it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceRevision {
+    source_id: SourceId,
+    root_identity: RootIdentity,
+    root_binding_identity: String,
+    database_identity: String,
+    lifecycle_generation: u64,
+    lease_epoch: u64,
+    revision: u64,
+}
+
+/// Owner-issued scan position before or between authoritative manifest audits.
+///
+/// This is an observation, not a write grant or a completed-audit revision. Scan
+/// commands must revalidate it under the retained source owner before mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceScanFence {
     source_id: SourceId,
     root_identity: RootIdentity,
     root_binding_identity: String,
@@ -314,6 +332,33 @@ impl SourceRevision {
     }
 }
 
+impl SourceScanFence {
+    /// Borrow the retained source identity.
+    pub fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Borrow the physical root identity validated by the source lease.
+    pub fn root_identity(&self) -> &RootIdentity {
+        &self.root_identity
+    }
+
+    /// Return the catalog lifecycle generation supplied to the owner.
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
+    }
+
+    /// Return the positive source lease epoch.
+    pub const fn lease_epoch(&self) -> u64 {
+        self.lease_epoch
+    }
+
+    /// Return the observed source revision, which may precede the first full audit.
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
 /// Identity echoed by a source-writer receipt or retained uncertain result.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SourceWriterCommandIdentity {
@@ -521,8 +566,47 @@ enum SourceWriterFault {
 }
 
 impl SourceWriter {
+    /// Borrow the retained database for catalog paths that have not yet been
+    /// migrated to typed source-writer commands. The borrow cannot outlive this
+    /// owner and must not be used to construct a second writable connection.
+    pub fn catalog_database(&self) -> &SourceDatabase {
+        &self.database
+    }
+
+    /// Return the database to the catalog's explicit drained-close boundary.
+    pub fn into_catalog_database(self) -> SourceDatabase {
+        self.database
+    }
+
     /// Retain one existing profile/source-lease-bound database as the sole writer owner.
     pub fn new(
+        database: SourceDatabase,
+        source_id: SourceId,
+        lifecycle_generation: u64,
+    ) -> Result<Self, SourceWriterError> {
+        let writer = Self::retain(database, source_id, lifecycle_generation)?;
+        let current = writer.current_revision()?;
+        writer.ensure_stored_source_id(current.source_id())?;
+        Ok(writer)
+    }
+
+    /// Retain a profile-bound source before its first complete manifest audit.
+    ///
+    /// This issues scan observations only; it does not route a scan mutation.
+    /// Curation and browser snapshots still require [`Self::current_revision`]
+    /// and its complete-audit check.
+    pub fn new_for_scan(
+        database: SourceDatabase,
+        source_id: SourceId,
+        lifecycle_generation: u64,
+    ) -> Result<Self, SourceWriterError> {
+        let writer = Self::retain(database, source_id, lifecycle_generation)?;
+        let current = writer.current_scan_fence()?;
+        writer.ensure_stored_source_id(current.source_id())?;
+        Ok(writer)
+    }
+
+    fn retain(
         database: SourceDatabase,
         source_id: SourceId,
         lifecycle_generation: u64,
@@ -535,13 +619,11 @@ impl SourceWriter {
             #[cfg(test)]
             fault: None,
         };
-        let current = writer.current_revision()?;
-        writer.ensure_stored_source_id(&current.source_id)?;
         Ok(writer)
     }
 
-    /// Return a fresh revision only after revalidating the retained source authority.
-    pub fn current_revision(&self) -> Result<SourceRevision, SourceWriterError> {
+    /// Observe a live scan position without asserting completed manifest coverage.
+    pub fn current_scan_fence(&self) -> Result<SourceScanFence, SourceWriterError> {
         let profile_guard = self
             .database
             .profile_guard
@@ -560,28 +642,15 @@ impl SourceWriter {
             .database_file_binding
             .as_deref()
             .ok_or(SourceDbError::ProfileOwnershipRequired)?;
-        let audit = self.database.last_authoritative_audit_metadata()?.ok_or(
-            SourceWriterError::InvalidRequest(
-                "source writer requires a complete authoritative audit",
-            ),
-        )?;
         let revision = self.database.get_revision()?;
-        if audit.source_revision != revision {
-            return Err(SourceWriterError::InvalidRequest(
-                "source revision is not aligned with the authoritative audit",
-            ));
-        }
-        if audit.root_identity != live_media_root_identity {
-            return Err(SourceWriterError::StaleFence);
-        }
         let lease_epoch = u64::try_from(lease.epoch())
             .ok()
             .filter(|epoch| *epoch > 0)
             .ok_or(SourceWriterError::StaleFence)?;
         let root_binding_identity = binding.root().identity();
         let database_identity = binding.identity();
-        if audit.root_identity.as_bytes().is_empty()
-            || audit.root_identity.as_bytes().len() > MAX_RECORD_BYTES
+        if live_media_root_identity.as_bytes().is_empty()
+            || live_media_root_identity.as_bytes().len() > MAX_RECORD_BYTES
             || root_binding_identity.len() > MAX_RECORD_BYTES
             || database_identity.len() > MAX_RECORD_BYTES
         {
@@ -589,14 +658,110 @@ impl SourceWriter {
                 "source revision identity exceeds the bounded record size",
             ));
         }
-        Ok(SourceRevision {
+        Ok(SourceScanFence {
             source_id: self.source_id.clone(),
-            root_identity: audit.root_identity,
+            root_identity: live_media_root_identity,
             root_binding_identity: root_binding_identity.to_owned(),
             database_identity: database_identity.to_owned(),
             lifecycle_generation: self.lifecycle_generation,
             lease_epoch,
             revision,
+        })
+    }
+
+    /// Revalidate an earlier scan observation under this retained owner.
+    pub fn validate_scan_fence(
+        &self,
+        expected: &SourceScanFence,
+    ) -> Result<SourceScanFence, SourceWriterError> {
+        let current = self.current_scan_fence()?;
+        if expected.source_id != current.source_id
+            || expected.root_identity != current.root_identity
+            || expected.root_binding_identity != current.root_binding_identity
+            || expected.database_identity != current.database_identity
+            || expected.lifecycle_generation != current.lifecycle_generation
+            || expected.lease_epoch != current.lease_epoch
+        {
+            return Err(SourceWriterError::StaleFence);
+        }
+        if expected.revision != current.revision {
+            return Err(SourceWriterError::StaleRevision {
+                expected: expected.revision,
+                actual: current.revision,
+            });
+        }
+        Ok(current)
+    }
+
+    /// Commit one already-prepared bounded scan batch on this retained database.
+    /// Filesystem traversal, file reads, and hashing must finish before the
+    /// batch is constructed. The catalog holds its lifecycle guard for this
+    /// call; the writer revalidates the physical lease and exact revision.
+    pub fn commit_scan_manifest_batch(
+        &self,
+        expected: &SourceScanFence,
+        batch: SourceWriteBatch<'_>,
+    ) -> Result<ManifestCommitResult, SourceWriterError> {
+        if !std::ptr::eq(batch.owner, &self.database) {
+            return Err(SourceWriterError::InvalidRequest(
+                "scan batch belongs to another source database",
+            ));
+        }
+        self.validate_scan_fence(expected)?;
+        Ok(batch.commit_with_bounded_manifest_changes(expected.revision)?)
+    }
+
+    /// Atomically activate complete staged directory truth and its manifest
+    /// audit at the owner's exact scan revision. Staging and traversal remain
+    /// outside this final bounded transaction.
+    pub fn commit_scan_audit_completion(
+        &self,
+        expected: &SourceScanFence,
+        batch: SourceWriteBatch<'_>,
+        generation: u64,
+        completed_at: i64,
+        root_identity: RootIdentity,
+        audit_request: Option<&SourceAuditRequest>,
+    ) -> Result<(SourceAuditCommit, Vec<SourceManifestEntry>), SourceWriterError> {
+        if !std::ptr::eq(batch.owner, &self.database) {
+            return Err(SourceWriterError::InvalidRequest(
+                "scan audit batch belongs to another source database",
+            ));
+        }
+        self.validate_scan_fence(expected)?;
+        Ok(batch.commit_manifest_audit_with_staged_directory_truth(
+            generation,
+            expected.revision,
+            completed_at,
+            root_identity,
+            audit_request,
+        )?)
+    }
+
+    /// Return a fresh revision only after revalidating authoritative audit coverage.
+    pub fn current_revision(&self) -> Result<SourceRevision, SourceWriterError> {
+        let scan = self.current_scan_fence()?;
+        let audit = self.database.last_authoritative_audit_metadata()?.ok_or(
+            SourceWriterError::InvalidRequest(
+                "source writer requires a complete authoritative audit",
+            ),
+        )?;
+        if audit.source_revision != scan.revision {
+            return Err(SourceWriterError::InvalidRequest(
+                "source revision is not aligned with the authoritative audit",
+            ));
+        }
+        if audit.root_identity != scan.root_identity {
+            return Err(SourceWriterError::StaleFence);
+        }
+        Ok(SourceRevision {
+            source_id: scan.source_id,
+            root_identity: scan.root_identity,
+            root_binding_identity: scan.root_binding_identity,
+            database_identity: scan.database_identity,
+            lifecycle_generation: scan.lifecycle_generation,
+            lease_epoch: scan.lease_epoch,
+            revision: scan.revision,
         })
     }
 

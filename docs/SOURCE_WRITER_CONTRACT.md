@@ -43,6 +43,33 @@ filesystem effects, or turn receipts/snapshots into operation or filesystem auth
 The broader lifecycle and snapshot proposal below remains the OPT-1637 decision
 boundary; later work must add caller routing and any cross-owner lease pin explicitly.
 
+OPT-1782's scan bootstrap adds a separate `SourceScanFence` from the retained
+`SourceWriter`. `new_for_scan` and `current_scan_fence` can validate the profile,
+physical source root, database binding, positive lease epoch, and numeric
+revision before the first complete manifest audit. It carries the catalog
+generation supplied at construction; only a catalog lifecycle guard can verify
+that this generation has not since retired. This observation
+is not a scan commit, a durable receipt, or an authoritative browser snapshot.
+`current_revision` remains audit-gated for curation and browser reads. The scanner
+uses this separate fence for the catalog full-audit route. `RegisteredSource`
+retains the `SourceWriter` around its one writable database; it does not reopen
+a second source connection. The catalog scan adapter holds the admission mutex
+through each bounded write, rejects a retired generation or replaced attempt,
+and revalidates the writer's physical source and lease. Traversal, file reads,
+and hashing run before that guard is acquired. The catalog full-audit route
+commits its revision-advancing manifest batches and final staged-audit
+activation through typed `SourceWriter` methods with an exact scan fence.
+Revision-neutral directory staging and legacy catalog mutation routes still
+borrow the retained database under their existing guarded boundaries; their
+broader command migration is separate work.
+The explicit scanner committed-batch callback now uses a revision-fenced bounded
+transaction and returns a structured delta for that traversal batch. Ordinary
+legacy scan entrypoints retain their existing rebase behavior until their owner
+route is migrated. An incomplete full traversal retains absence-based manifest
+and index rows everywhere, leaving deletion for a complete retry. The catalog
+publishes the terminal audit snapshot only after the complete staged activation;
+its structured delta and SourceRevision name the same committed revision.
+
 ## Boundary and authority
 
 One physical source has one serialized writable SQL owner. The owner retains the

@@ -282,6 +282,7 @@ pub fn audit_manifest_for_catalog_with_budget_and_progress_and_writer(
         false,
         false,
         false,
+        true,
         &mut |_| {},
         writer,
     ) {
@@ -442,6 +443,7 @@ fn audit_source_and_record_after_scan_outcome(
         Some(completed_at),
         false,
         true,
+        false,
         false,
         &mut |_| {},
         writer,
@@ -644,14 +646,14 @@ fn record_staged_manifest_audit_completion(
             }
             let root_identity =
                 RootIdentity::from_bytes(source_root.generation().as_bytes().to_vec());
-            let (audit_commit, committed_manifest) = batch
-                .commit_manifest_audit_with_staged_directory_truth(
-                    generation,
-                    expected_revision,
-                    completed_at,
-                    root_identity,
-                    audit_request,
-                )?;
+            let (audit_commit, committed_manifest) = writer.commit_scan_audit_completion(
+                batch,
+                generation,
+                expected_revision,
+                completed_at,
+                root_identity,
+                audit_request,
+            )?;
             Ok((audit_commit, committed_manifest))
         })();
         (generation, result)
@@ -839,8 +841,9 @@ fn scan(
 
 /// Scan with progress and invoke a callback after every bounded manifest transaction commits.
 ///
-/// The callback receives only paths from the committed transaction and its exact committed
-/// revision. It runs on the scanning worker, before the scan continues to the next batch.
+/// The callback receives the exact revision, touched paths, and structured delta
+/// from each traversal batch. It runs on the scanning worker before the next batch.
+/// A concurrent revision change fails this bounded callback path as stale.
 pub fn scan_with_progress_and_writer_and_committed_batch(
     db: &SourceDatabase,
     mode: ScanMode,
@@ -860,6 +863,7 @@ pub fn scan_with_progress_and_writer_and_committed_batch(
         cancel,
         Some(on_progress),
         None,
+        true,
         true,
         true,
         true,
@@ -915,6 +919,7 @@ fn scan_with_writer_using_root(
         finalize_pending_renames,
         true,
         true,
+        false,
         &mut |_| {},
         writer,
     )
@@ -931,6 +936,7 @@ fn scan_with_writer_using_root_and_committed_batch(
     finalize_pending_renames: bool,
     reconcile_renames: bool,
     complete_generation: bool,
+    exact_committed_batches: bool,
     on_committed_batch: &mut dyn FnMut(CommittedScanBatch),
     writer: &impl ScanWriter,
 ) -> Result<ScanStats, ScanError> {
@@ -940,6 +946,7 @@ fn scan_with_writer_using_root_and_committed_batch(
     source_root.ensure_current_generation()?;
     let traversal_policy = db.source_traversal_policy()?;
     let mut context = ScanContext::new(db, mode, manifest_revision, manifest_before.clone())?;
+    context.exact_committed_batches = exact_committed_batches;
     context.set_traversal_policy(traversal_policy);
     if let Some(started_at) = manifest_audit_started_at {
         context.resume_manifest_audit(db, started_at)?;
