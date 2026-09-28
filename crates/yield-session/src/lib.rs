@@ -3070,6 +3070,41 @@ mod tests {
         }
     }
 
+    fn wait_for_catalog_event_retaining_unmatched(
+        service: &SourceRegistryService,
+        pending: &mut Vec<CatalogEvent>,
+        predicate: impl Fn(&CatalogEvent) -> bool,
+        budget: Duration,
+        phase: &str,
+    ) -> CatalogEvent {
+        if let Some(index) = pending.iter().position(&predicate) {
+            return pending.remove(index);
+        }
+        let deadline = Instant::now() + budget;
+        loop {
+            match service.try_recv_catalog() {
+                Ok(event) if predicate(&event) => return event,
+                Ok(event) => {
+                    assert!(
+                        pending.len() < 32,
+                        "too many catalog events while waiting for {phase}"
+                    );
+                    pending.push(event);
+                }
+                Err(TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for {phase}; pending events: {pending:?}"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    panic!("catalog event channel disconnected while waiting for {phase}")
+                }
+            }
+        }
+    }
+
     #[test]
     fn canonical_root_rejects_ambiguous_paths() {
         assert!(matches!(
@@ -4108,8 +4143,10 @@ mod tests {
                 lifecycle_generation: 1,
             })
             .expect("catalog registration");
-        wait_for_catalog_event_with_budget(
+        let mut pending_catalog_events = Vec::new();
+        wait_for_catalog_event_retaining_unmatched(
             &service,
+            &mut pending_catalog_events,
             |event| matches!(event, CatalogEvent::Registered { source_id: registered, .. } if registered == &source_id),
             Duration::from_secs(120),
             "fixture source registration",
@@ -4134,8 +4171,9 @@ mod tests {
             &service,
             |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() > 0),
         );
-        wait_for_catalog_event_with_budget(
+        wait_for_catalog_event_retaining_unmatched(
             &service,
+            &mut pending_catalog_events,
             |event| matches!(event, CatalogEvent::AuditCommitted { snapshot } if snapshot.source_id == source_id),
             Duration::from_secs(120),
             "256-folder fixture audit commit",
@@ -4367,15 +4405,22 @@ mod tests {
             Err(CatalogSubmitError::Closed)
         );
 
-        let operation = wait_for_catalog_event(&service, |event| {
-            matches!(
-                event,
-                CatalogEvent::CurationOperationCompleted {
-                    request_id: 9_100,
-                    ..
-                }
-            )
-        });
+        let mut pending_catalog_events = Vec::new();
+        let operation = wait_for_catalog_event_retaining_unmatched(
+            &service,
+            &mut pending_catalog_events,
+            |event| {
+                matches!(
+                    event,
+                    CatalogEvent::CurationOperationCompleted {
+                        request_id: 9_100,
+                        ..
+                    }
+                )
+            },
+            Duration::from_secs(120),
+            "compound curation completion",
+        );
         match operation {
             CatalogEvent::CurationOperationCompleted { outcome, .. } => {
                 assert!(outcome.is_success());
@@ -4391,8 +4436,13 @@ mod tests {
             }
             _ => unreachable!(),
         }
-        let closed =
-            wait_for_catalog_event(&service, |event| matches!(event, CatalogEvent::Closed));
+        let closed = wait_for_catalog_event_retaining_unmatched(
+            &service,
+            &mut pending_catalog_events,
+            |event| matches!(event, CatalogEvent::Closed),
+            Duration::from_secs(120),
+            "catalog shutdown event",
+        );
         assert!(matches!(closed, CatalogEvent::Closed));
         assert!(matches!(
             service.try_recv_catalog(),
