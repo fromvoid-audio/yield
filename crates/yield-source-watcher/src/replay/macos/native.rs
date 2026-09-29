@@ -752,4 +752,89 @@ mod tests {
             "{outcome:?}"
         );
     }
+
+    /// Deliberately run on a macOS host when refreshing the checked-in, redacted shapes.
+    /// Native event IDs and callback grouping vary, so this prints only stable action labels,
+    /// ordinals, and source-relative paths for review instead of rewriting the fixture.
+    #[test]
+    #[ignore = "manual disposable-source FSEvents capture for Finder fixture review"]
+    fn capture_disposable_file_action_shapes_for_fixture_review() {
+        let _capture_guard = capture_test_guard();
+        let temp = tempfile::tempdir().expect("disposable capture root");
+        let root = fs::canonicalize(temp.path()).expect("canonical capture root");
+        let metadata = fs::metadata(&root).expect("capture root metadata");
+        let identity = physical_root_identity(&root, &metadata).expect("physical root identity");
+        let spec = SourceWatchSpec::new(
+            SourceId::from_string("finder-fixture-capture"),
+            1,
+            root.clone(),
+            Some(identity),
+        );
+        let capture_action = |action: &str, expected: &Path, mutate: &mut dyn FnMut()| {
+            let capture = BootstrapCapture::start(spec.clone(), Duration::from_secs(5))
+                .expect("isolated native stream");
+            mutate();
+            let mut candidate = capture
+                .finish(Duration::from_secs(5))
+                .expect("bounded native capture");
+            // FSEvents may publish a just-completed action after HistoryDone.
+            let after = candidate.started_after();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !candidate
+                .events()
+                .iter()
+                .any(|event| event.relative_path() == expected)
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(100));
+                candidate = capture_history(spec.clone(), after, Duration::from_secs(5))
+                    .expect("bounded native history retry");
+            }
+            assert!(candidate.history_complete(), "{action} history incomplete");
+            for (ordinal, event) in candidate.events().iter().enumerate() {
+                let relative = event.relative_path();
+                assert!(
+                    !relative.is_absolute(),
+                    "{action} retained an absolute path"
+                );
+                assert!(
+                    relative
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+                );
+                eprintln!(
+                    "{action}\t{}\t{}\t{:?}",
+                    ordinal + 1,
+                    relative.display(),
+                    event.kind()
+                );
+            }
+            assert!(
+                candidate
+                    .events()
+                    .iter()
+                    .any(|event| event.relative_path() == expected),
+                "{action} did not capture its disposable target"
+            );
+        };
+        capture_action("create", Path::new("kick.wav"), &mut || {
+            fs::write(root.join("kick.wav"), b"sample").expect("create disposable sample");
+        });
+        capture_action("duplicate", Path::new("kick copy.wav"), &mut || {
+            fs::copy(root.join("kick.wav"), root.join("kick copy.wav"))
+                .expect("duplicate disposable sample");
+        });
+        capture_action("rename", Path::new("snare.wav"), &mut || {
+            fs::rename(root.join("kick copy.wav"), root.join("snare.wav"))
+                .expect("rename disposable sample");
+        });
+        capture_action("reparent", Path::new("drums/snare.wav"), &mut || {
+            fs::create_dir(root.join("drums")).expect("create disposable parent");
+            fs::rename(root.join("snare.wav"), root.join("drums/snare.wav"))
+                .expect("move disposable sample");
+        });
+        capture_action("delete", Path::new("drums/snare.wav"), &mut || {
+            fs::remove_file(root.join("drums/snare.wav")).expect("remove disposable sample");
+        });
+    }
 }

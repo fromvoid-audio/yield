@@ -185,10 +185,16 @@ const KNOWN_FLAGS: fs::FSEventStreamEventFlags = fs::kFSEventStreamEventFlagMust
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use yield_library::sample_sources::SourceId;
-    use yield_library::sample_sources::reconciliation::RootIdentity;
+    use yield_library::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
+    use yield_library::sample_sources::db::DurableReplayUncertaintyState;
+    use yield_library::sample_sources::reconciliation::{
+        RawObservationLimits, ReconciliationAdmissionLimits, ReconciliationAdmissionOwner,
+        ReconciliationAdmissionSupervisor, RootIdentity,
+    };
+    use yield_library::sample_sources::{SourceDatabase, SourceId, SourceWriter};
 
     use super::*;
     use crate::SourceWatchSpec;
@@ -334,6 +340,208 @@ mod tests {
             candidate
                 .uncertainty()
                 .contains(ReplayUncertainty::EVENT_LIMIT)
+        );
+    }
+
+    #[test]
+    fn redacted_finder_shapes_replay_through_current_source_owner() {
+        let fixture = include_str!("fixtures/finder_v1.tsv");
+        let mut actions: BTreeMap<&str, Vec<(&str, u64, &str, &str)>> = BTreeMap::new();
+        for line in fixture.lines().filter(|line| !line.starts_with('#')) {
+            let columns: Vec<_> = line.split('\t').collect();
+            assert_eq!(columns.len(), 5, "fixture schema");
+            let path = Path::new(columns[2]);
+            assert!(!path.is_absolute(), "fixture must not retain machine paths");
+            assert!(
+                path.components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            );
+            actions.entry(columns[0]).or_default().push((
+                columns[2],
+                columns[1].parse().expect("stable event ID"),
+                columns[3],
+                columns[4],
+            ));
+        }
+        assert_eq!(actions.len(), 6, "every Finder fixture action is present");
+
+        for (action, events) in actions {
+            let ingress = ReplayIngress::new(
+                SourceWatchSpec::new(
+                    SourceId::from_string("finder-fixture-source"),
+                    3,
+                    PathBuf::from("/fixture-volume/Library"),
+                    Some(RootIdentity::from_bytes(b"finder-fixture-root".to_vec())),
+                ),
+                17,
+                [7; 16],
+                100,
+            )
+            .expect("disposable fixture ingress");
+            for (path, id, shape, _) in &events {
+                let flags = match *shape {
+                    "created-file" => {
+                        fs::kFSEventStreamEventFlagItemCreated
+                            | fs::kFSEventStreamEventFlagItemIsFile
+                    }
+                    "renamed-file" => {
+                        fs::kFSEventStreamEventFlagItemRenamed
+                            | fs::kFSEventStreamEventFlagItemIsFile
+                    }
+                    "removed-file" => {
+                        fs::kFSEventStreamEventFlagItemRemoved
+                            | fs::kFSEventStreamEventFlagItemIsFile
+                    }
+                    "unknown-event" => 1 << 31,
+                    other => panic!("unknown fixture flag shape: {other}"),
+                };
+                record_callback_batch(
+                    &ingress,
+                    Path::new("/fixture-volume"),
+                    &[MacosReplayEvent {
+                        event_id: *id,
+                        volume_relative_path: Path::new(path),
+                        flags,
+                    }],
+                );
+            }
+            ingress.mark_history_complete();
+            let candidate = ingress.into_candidate();
+            let expected: Vec<_> = events
+                .iter()
+                .filter(|(_, _, _, relative)| *relative != "-")
+                .map(|(_, _, _, relative)| Path::new(relative))
+                .collect();
+            assert_eq!(candidate.events().len(), expected.len(), "{action}");
+            for (event, relative) in candidate.events().iter().zip(expected) {
+                assert_eq!(event.relative_path(), relative, "{action}");
+                assert!(!event.relative_path().is_absolute(), "{action}");
+            }
+            assert_eq!(candidate.uncertainty().is_empty(), action != "unsupported");
+
+            let limits = ReconciliationAdmissionLimits::new(
+                1,
+                RawObservationLimits::new(8, 4096, 4096).expect("lane bound"),
+                RawObservationLimits::new(32, 16384, 16384).expect("global bound"),
+                8,
+                8,
+                8,
+            )
+            .expect("owner bounds");
+            let mut owner =
+                ReconciliationAdmissionOwner::new(ReconciliationAdmissionSupervisor::new(limits));
+            let lane = owner
+                .begin_source(
+                    candidate.source_id().clone(),
+                    candidate.root_identity().clone(),
+                )
+                .expect("current source lane");
+            let handoff = candidate
+                .into_observation_batch(3, lane.generation())
+                .expect("callback paths or uncertainty must reach reconciliation");
+            let (batch, continuous) = handoff.into_admission_parts();
+            assert_eq!(continuous, action != "unsupported", "{action}");
+            let admission = owner
+                .admit_replay_with_durable_prior(batch, None, continuous)
+                .expect("existing owner replay route");
+            assert!(
+                admission.audit_request().is_some(),
+                "no durable prior: {action}"
+            );
+        }
+    }
+
+    #[test]
+    fn disposable_profile_persists_owner_routed_finder_uncertainty() {
+        let _runtime = yield_library::test_runtime::TestRuntimeGuard::acquire();
+        let temporary_root =
+            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+        let base = tempfile::tempdir_in(temporary_root).expect("isolated config base");
+        let _config_base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("finder-fixture-profile");
+        let profile = WritableProfileGuard::acquire_current().expect("isolated profile owner");
+        let source = tempfile::tempdir().expect("disposable source root");
+        let source_root = std::fs::canonicalize(source.path()).expect("canonical source root");
+        let source_id = SourceId::from_string("finder-fixture-owned-source");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            &source_root,
+            &profile,
+            Path::new("finder-fixture-owned-source"),
+        )
+        .expect("isolated source database");
+        let writer = SourceWriter::new_for_scan(database, source_id.clone(), 7)
+            .expect("source-owned writer");
+        let initial = writer.current_scan_fence().expect("initial source fence");
+        let mut audit = writer
+            .catalog_database()
+            .write_batch()
+            .expect("isolated audit batch");
+        audit.complete_manifest_audit(1).expect("complete audit");
+        audit
+            .commit_with_manifest_snapshot_and_audit(initial.root_identity().clone(), None)
+            .expect("committed source revision");
+        let fence = writer.current_scan_fence().expect("source fence");
+        let ingress = ReplayIngress::new(
+            SourceWatchSpec::new(
+                source_id.clone(),
+                7,
+                source_root.clone(),
+                Some(fence.root_identity().clone()),
+            ),
+            17,
+            [7; 16],
+            100,
+        )
+        .expect("physical source ingress");
+        let changed_path = source_root.join("kick.wav");
+        record_callback_batch(
+            &ingress,
+            Path::new("/"),
+            &[MacosReplayEvent {
+                event_id: 101,
+                volume_relative_path: &changed_path,
+                flags: fs::kFSEventStreamEventFlagItemCreated
+                    | fs::kFSEventStreamEventFlagItemIsFile,
+            }],
+        );
+        ingress.mark_history_complete();
+        let candidate = ingress.into_candidate();
+        assert_eq!(candidate.events()[0].relative_path(), Path::new("kick.wav"));
+        let limits = ReconciliationAdmissionLimits::new(
+            1,
+            RawObservationLimits::new(8, 4096, 4096).expect("lane bound"),
+            RawObservationLimits::new(32, 16384, 16384).expect("global bound"),
+            8,
+            8,
+            8,
+        )
+        .expect("owner bounds");
+        let mut owner =
+            ReconciliationAdmissionOwner::new(ReconciliationAdmissionSupervisor::new(limits));
+        let lane = owner
+            .begin_source(source_id.clone(), fence.root_identity().clone())
+            .expect("current source lane");
+        let handoff = candidate
+            .into_observation_batch(7, lane.generation())
+            .expect("native callback reaches reconciliation");
+        let (batch, continuous) = handoff.into_admission_parts();
+        let admission = owner
+            .admit_replay_with_durable_prior(batch, None, continuous)
+            .expect("unproven owner replay admission");
+        let marker = owner
+            .durable_audit_marker_for_replay(&admission)
+            .expect("source-wide current-lane audit marker");
+        let retained = writer
+            .retain_watcher_replay_uncertainty(&fence, &marker)
+            .expect("source writer persists uncertainty");
+        assert_eq!(retained.source_revision(), fence.revision());
+        assert_eq!(retained.source_id(), &source_id);
+        assert_eq!(
+            writer
+                .catalog_database()
+                .read_durable_replay_uncertainty()
+                .expect("source-owned readback"),
+            DurableReplayUncertaintyState::Retained(retained)
         );
     }
 }
