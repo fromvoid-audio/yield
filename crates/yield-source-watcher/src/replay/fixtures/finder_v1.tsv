@@ -1,0 +1,8 @@
+# Redacted disposable macOS capture paths with synthetic stable IDs and flag shapes. Fields: action, event ID, volume-relative path, flag shape, expected source-relative path.
+create	101	Library/kick.wav	created-file	kick.wav
+duplicate	102	Library/kick copy.wav	created-file	kick copy.wav
+rename	103	Library/kick copy.wav	renamed-file	kick copy.wav
+rename	104	Library/snare.wav	renamed-file	snare.wav
+reparent	105	Library/drums/snare.wav	renamed-file	drums/snare.wav
+delete	106	Library/drums/snare.wav	removed-file	drums/snare.wav
+unsupported	107	Library/unknown.bin	unknown-event	-
