@@ -50,6 +50,174 @@ struct CurationFixture {
 }
 
 #[test]
+fn replay_manifest_and_checkpoint_commit_once_before_raw_ticket_retirement() {
+    let fixture = CurationFixture::new_profile_bound();
+    let source = SourceId::from_string("atomic-replay-writer");
+    let root = fixture.root_identity.clone();
+    let stream =
+        BackendStreamIdentity::from_fsevents_volume(99, [2; 16]).expect("native volume identity");
+    let root_text = std::str::from_utf8(root.as_bytes()).expect("fixture root identity");
+    let seed = serde_json::json!({
+        "root_identity": root_text,
+        "event_id": 10,
+        "format_version": 4,
+        "source_id": source.as_str(),
+        "lifecycle_generation": 7,
+        "source_revision": fixture.revision,
+        "cause": "targeted_replay",
+        "continuity_proof": {
+            "root_identity": root_text,
+            "backend": "fsevents",
+            "backend_device": 99,
+            "backend_volume_uuid": uuid::Uuid::from_bytes([2; 16]).to_string(),
+            "watcher_generation": 1,
+            "replay_coverage_start_event_id": 10,
+            "replay_coverage_end_event_id": 10,
+            "acknowledged_end_event_id": 10
+        }
+    })
+    .to_string();
+    let mut seed_batch = fixture.database.write_batch().expect("seed batch");
+    seed_batch
+        .set_metadata(
+            crate::sample_sources::db::META_SOURCE_WATCHER_CHECKPOINT,
+            &seed,
+        )
+        .expect("seed checkpoint");
+    seed_batch.commit_auxiliary_state().expect("seed commit");
+    let writer = SourceWriter::new(fixture.database, source.clone(), 7).expect("source writer");
+    let expected = writer.current_scan_fence().expect("source revision");
+    let lane_limits = RawObservationLimits::new(8, 4096, 4096).expect("lane limits");
+    let limits = ReconciliationAdmissionLimits::new(
+        1,
+        lane_limits,
+        RawObservationLimits::new(32, 16384, 16384).expect("global limits"),
+        2,
+        8,
+        8,
+    )
+    .expect("admission limits");
+    let mut owner =
+        ReconciliationAdmissionOwner::new(ReconciliationAdmissionSupervisor::new(limits));
+    let lane = owner
+        .begin_source(source.clone(), root.clone())
+        .expect("capture lane");
+    let prior = writer
+        .catalog_database()
+        .read_durable_replay_prior(
+            &source,
+            &root,
+            crate::sample_sources::reconciliation::WatcherGeneration::new(7),
+            lane.generation(),
+        )
+        .expect("read prior")
+        .expect("valid prior");
+    let batch = SyntheticObservationBatch::new(
+        RawObservationProvenance::new(
+            source.clone(),
+            Some(root.clone()),
+            Some(stream),
+            lane.generation(),
+            CaptureBoundary::try_new(20, Some(11), Some(12)).expect("capture interval"),
+        ),
+        vec![RawObservation::new(
+            RawEventKind::Modify,
+            vec![RawObservedPath::new("one.wav".into(), RawPathRole::Subject)],
+        )],
+        lane_limits,
+    );
+    let admission = owner
+        .admit_replay_with_durable_prior(batch, Some(&prior), true)
+        .expect("admit replay");
+    assert_eq!(
+        admission.admission().disposition(),
+        AdapterDisposition::AdmittedWithContinuity
+    );
+    let ticket = match admission.admission().outcome() {
+        AdmissionOutcome::Accepted(ticket) => *ticket,
+        outcome => panic!("expected replay ticket, got {outcome:?}"),
+    };
+    let dispatched = owner.dispatch_next().expect("dispatch replay");
+    let proof = dispatched
+        .normalized()
+        .proof()
+        .watcher_continuity()
+        .expect("admitted proof")
+        .clone();
+    owner.mark_dispatched(ticket).expect("replay handed off");
+    owner.mark_applied(ticket).expect("replay applied");
+    assert!(owner.mark_replay_checkpointed(ticket, &prior).is_err());
+
+    let mut partial = writer
+        .catalog_database()
+        .write_batch()
+        .expect("partial replay batch");
+    partial
+        .upsert_file(Path::new("partial.wav"), 10, 1)
+        .expect("partial source fact");
+    partial
+        .set_metadata(
+            crate::sample_sources::db::META_SOURCE_WATCHER_UNCERTAINTY,
+            "unresolved",
+        )
+        .expect("uncertainty in transaction");
+    assert!(matches!(
+        writer.commit_watcher_replay_manifest_batch(&expected, partial, &prior, &proof),
+        Err(SourceWriterError::ReplayCheckpointMismatch)
+    ));
+    assert!(
+        writer
+            .catalog_database()
+            .entry_for_path(Path::new("partial.wav"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(writer.current_scan_fence().unwrap(), expected);
+
+    let mut manifest_batch = writer
+        .catalog_database()
+        .write_batch()
+        .expect("prepared replay batch");
+    manifest_batch
+        .upsert_file(Path::new("one.wav"), 20, 2)
+        .expect("prepared source fact");
+    let (manifest, committed) = writer
+        .commit_watcher_replay_manifest_batch(&expected, manifest_batch, &prior, &proof)
+        .expect("atomic replay acknowledgement");
+    assert_eq!(manifest.revision, expected.revision() + 1);
+    assert_eq!(manifest.touched_path_changes.len(), 1);
+    assert_eq!(manifest.touched_path_changes[0].0, Path::new("one.wav"));
+    assert_eq!(committed.acknowledged_sequence(), 12);
+    owner
+        .mark_replay_checkpointed(ticket, &committed)
+        .expect("retire after committed proof");
+    assert!(owner.mark_replay_checkpointed(ticket, &committed).is_err());
+
+    let mut duplicate = writer
+        .catalog_database()
+        .write_batch()
+        .expect("duplicate replay batch");
+    duplicate
+        .upsert_file(Path::new("duplicate.wav"), 30, 3)
+        .expect("duplicate source fact");
+    assert!(matches!(
+        writer.commit_watcher_replay_manifest_batch(&expected, duplicate, &prior, &proof),
+        Err(SourceWriterError::StaleRevision { .. })
+    ));
+    assert_eq!(
+        writer.current_scan_fence().unwrap().revision(),
+        manifest.revision
+    );
+    assert!(
+        writer
+            .catalog_database()
+            .entry_for_path(Path::new("duplicate.wav"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn source_writer_commits_only_exact_replay_proof_and_keeps_duplicate_idempotent() {
     let fixture = CurationFixture::new_profile_bound();
     let source = SourceId::from_string("replay-checkpoint-writer");
