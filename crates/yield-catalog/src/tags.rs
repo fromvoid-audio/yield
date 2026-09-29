@@ -323,10 +323,17 @@ pub(crate) fn read_assignment_page(
 
 pub(crate) fn read_assignment_preview(
     label: &str,
+    expected_source_ids: &[SourceId],
     profile_guard: &WritableProfileGuard,
     admission: &Arc<Mutex<AdmissionState>>,
     sources: &mut HashMap<SourceId, RegisteredSource>,
 ) -> Result<CatalogTagAssignmentPreview, CatalogError> {
+    if expected_source_ids.len() > MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES {
+        return Err(CatalogError::TagAssignmentPreviewTooManySources {
+            max: MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES,
+            actual: expected_source_ids.len(),
+        });
+    }
     if sources.len() > MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES {
         return Err(CatalogError::TagAssignmentPreviewTooManySources {
             max: MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES,
@@ -335,6 +342,15 @@ pub(crate) fn read_assignment_preview(
     }
     let mut ids = sources.keys().cloned().collect::<Vec<_>>();
     ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let mut expected_ids = expected_source_ids.to_vec();
+    expected_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    expected_ids.dedup();
+    if ids != expected_ids {
+        return Err(CatalogError::TagAssignmentPreviewIncomplete {
+            expected: expected_ids.len(),
+            available: ids.len(),
+        });
+    }
     let mut captured = Vec::with_capacity(ids.len());
     let mut affected_sources = Vec::new();
     let mut total_assignments = 0usize;

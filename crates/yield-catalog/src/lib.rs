@@ -498,6 +498,8 @@ pub enum CatalogCommand {
         request_id: u64,
         /// Tag label normalized by each source database query.
         label: String,
+        /// Complete source set visible in the profile registry at request time.
+        expected_source_ids: Vec<SourceId>,
     },
     /// Read a compact positional mask of source paths carrying every required tag.
     ///
@@ -996,6 +998,14 @@ pub enum CatalogError {
         max: usize,
         /// Observed registered source count.
         actual: usize,
+    },
+    /// The catalog worker does not hold every source in the requested profile set.
+    #[error("tag-assignment preview is incomplete: {available} of {expected} sources available")]
+    TagAssignmentPreviewIncomplete {
+        /// Number of sources in the requested profile set.
+        expected: usize,
+        /// Number of sources currently registered in the catalog worker.
+        available: usize,
     },
     /// An affected-assignment preview exceeded its complete-result bound.
     #[error("tag-assignment preview exceeded its {limit} limit of {max}")]
@@ -3269,8 +3279,18 @@ fn handle_command(
             );
             false
         }
-        CatalogCommand::RequestTagAssignmentPreview { request_id, label } => {
-            let result = tags::read_assignment_preview(&label, profile_guard, admission, sources);
+        CatalogCommand::RequestTagAssignmentPreview {
+            request_id,
+            label,
+            expected_source_ids,
+        } => {
+            let result = tags::read_assignment_preview(
+                &label,
+                &expected_source_ids,
+                profile_guard,
+                admission,
+                sources,
+            );
             let state = admission
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -7530,6 +7550,7 @@ mod tests {
             .submit(CatalogCommand::RequestTagAssignmentPreview {
                 request_id: 1_612,
                 label: String::from("SHARED"),
+                expected_source_ids: vec![first_id.clone(), second_id.clone()],
             })
             .unwrap();
         match receive_until(&service, |event| {
@@ -7588,6 +7609,7 @@ mod tests {
             .submit(CatalogCommand::RequestTagAssignmentPreview {
                 request_id: 1_613,
                 label: String::from("shared"),
+                expected_source_ids: vec![SourceId::from_string("preview-unaudited")],
             })
             .unwrap();
         assert!(matches!(
@@ -7600,6 +7622,40 @@ mod tests {
             )),
             CatalogEvent::TagAssignmentPreviewFailed {
                 error: CatalogError::SnapshotUnavailable,
+                ..
+            }
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn assignment_preview_rejects_a_partial_profile_source_set() {
+        let fixture = Fixture::new("catalog-assignment-preview-partial");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let first_id = SourceId::from_string("preview-active");
+        let second_id = SourceId::from_string("preview-inactive");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        register_and_audit(&service, fixture.root.path(), &first_id);
+        service
+            .submit(CatalogCommand::RequestTagAssignmentPreview {
+                request_id: 1_614,
+                label: String::from("shared"),
+                expected_source_ids: vec![first_id, second_id],
+            })
+            .unwrap();
+        assert!(matches!(
+            receive_until(&service, |event| matches!(
+                event,
+                CatalogEvent::TagAssignmentPreviewFailed {
+                    request_id: 1_614,
+                    ..
+                }
+            )),
+            CatalogEvent::TagAssignmentPreviewFailed {
+                error: CatalogError::TagAssignmentPreviewIncomplete {
+                    expected: 2,
+                    available: 1,
+                },
                 ..
             }
         ));

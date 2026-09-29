@@ -2285,6 +2285,11 @@ impl Browser {
             CatalogCommand::RequestTagAssignmentPreview {
                 request_id,
                 label: expected.label.clone(),
+                expected_source_ids: self
+                    .source_sessions
+                    .iter()
+                    .filter_map(|session| session.source_id.clone())
+                    .collect(),
             },
             cx,
         ) {
