@@ -7,7 +7,8 @@ use super::adapter::{
 use super::admission::{
     AdmissionError, AdmissionLaneKey, DispatchTicket, DispatchedObservation,
     ReconciliationAcknowledgementOutcome, ReconciliationAdmissionSupervisor,
-    ReconciliationLifecycle, SourceAuditReceipt, SourceAuditRequest,
+    ReconciliationLifecycle, RetainedUncertainty, SourceAuditReceipt, SourceAuditRequest,
+    UncertaintyReason,
 };
 use super::model::{RootIdentity, WatcherGeneration};
 use crate::sample_sources::SourceId;
@@ -204,6 +205,35 @@ impl ReconciliationAdmissionOwner {
         };
 
         Ok(OwnerReplayAdmission::new(admission, audit_request))
+    }
+
+    /// Widen an invalid replay admission to a source-wide marker bound to the active lane.
+    ///
+    /// The returned marker is suitable for source-writer durability. It uses the current lane's
+    /// root and generation even when rejected raw evidence named a different root, stream, or
+    /// generation. Until the writer persists it, the caller must keep the audit request and raw
+    /// evidence; a missing active lane yields no authority to publish or retire anything.
+    pub fn durable_audit_marker_for_replay(
+        &self,
+        admission: &OwnerReplayAdmission,
+    ) -> Option<RetainedUncertainty> {
+        let request = admission.audit_request()?;
+        let current = self.source_audit_request_for_current_lane(request.source_id())?;
+        if current.identity() != request.identity()
+            || !current.boundary().covers(request.boundary())
+        {
+            return None;
+        }
+        let reasons = self
+            .supervisor
+            .retained_uncertainties()
+            .iter()
+            .filter(|marker| marker.source_id() == Some(request.source_id()))
+            .flat_map(|marker| marker.reasons().iter().copied())
+            .collect::<Vec<UncertaintyReason>>();
+        Some(RetainedUncertainty::for_source_audit_request(
+            &current, reasons,
+        ))
     }
 
     /// Select the next admitted envelope using the supervisor's fair lane scheduler.
@@ -727,6 +757,7 @@ mod tests {
             outcome => panic!("unexpected owner replay outcome: {outcome:?}"),
         };
         assert!(owner.supervisor().retained_uncertainties().is_empty());
+        assert!(owner.durable_audit_marker_for_replay(&admission).is_none());
 
         let dispatched = owner.dispatch_next().expect("dispatch owner replay");
         let proof = dispatched
@@ -897,6 +928,14 @@ mod tests {
             assert_eq!(audit_request.source_id(), &source);
             assert_eq!(audit_request.root_identity(), &root_identity);
             assert_eq!(audit_request.generation(), lane.generation());
+            let durable = owner
+                .durable_audit_marker_for_replay(&admission)
+                .expect("invalid proof widens to durable source audit");
+            assert_eq!(durable.source_id(), Some(&source));
+            assert_eq!(durable.root_identity(), Some(&root_identity));
+            assert_eq!(durable.generation(), Some(lane.generation()));
+            assert!(durable.boundary().covers(audit_request.boundary()));
+            assert!(!durable.reasons().is_empty());
 
             let outcome = admission.admission().outcome();
             match outcome {
@@ -920,6 +959,43 @@ mod tests {
             }
             assert_eq!(owner.supervisor().in_flight(), 0);
         }
+    }
+
+    #[test]
+    fn wrong_root_replay_widens_using_current_root_not_rejected_provenance() {
+        let source = SourceId::from_string("wrong-root-replay");
+        let current_root = root(b"current-root");
+        let mut owner = owner(1, 1, 8);
+        let lane = owner
+            .begin_source(source.clone(), current_root.clone())
+            .expect("capturing lane");
+        let admission = owner
+            .admit_replay_with_durable_prior(
+                replay_batch(
+                    &source,
+                    &root(b"replaced-root"),
+                    lane.generation(),
+                    Some(b"owner-stream"),
+                    Some(11),
+                    Some(11),
+                    RawEventKind::Create,
+                ),
+                None,
+                false,
+            )
+            .expect("wrong root remains an adapter result");
+        assert_eq!(
+            admission.admission().disposition(),
+            AdapterDisposition::SourceAuditRequired
+        );
+        let marker = owner
+            .durable_audit_marker_for_replay(&admission)
+            .expect("current-root audit marker");
+        assert_eq!(marker.source_id(), Some(&source));
+        assert_eq!(marker.root_identity(), Some(&current_root));
+        assert_eq!(marker.generation(), Some(lane.generation()));
+        assert!(marker.reasons().contains(&UncertaintyReason::WrongRoot));
+        assert_eq!(owner.dispatch_next(), None);
     }
 
     #[test]
@@ -1344,6 +1420,7 @@ mod tests {
             &AdmissionOutcome::Rejected(AdmissionRejectReason::UnknownLane)
         );
         assert_eq!(unknown.audit_request(), None);
+        assert!(owner.durable_audit_marker_for_replay(&unknown).is_none());
         assert_eq!(owner.lane(&source), None);
         assert_eq!(owner.supervisor().in_flight(), 0);
 

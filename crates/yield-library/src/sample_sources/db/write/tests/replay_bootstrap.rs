@@ -229,9 +229,10 @@ fn retained_uncertainty_blocks_replay_through_restart_until_complete_audit() {
         .supervisor()
         .retained_uncertainties()
         .first()
-        .expect("retained marker");
+        .expect("retained marker")
+        .clone();
     let retained = writer
-        .retain_watcher_replay_uncertainty(&fence, marker)
+        .retain_watcher_replay_uncertainty(&fence, &marker)
         .expect("durable marker");
     assert_eq!(retained.source_revision(), fence.revision());
     assert_eq!(retained.backend_stream_identity(), Some(&stream));
@@ -244,9 +245,46 @@ fn retained_uncertainty_blocks_replay_through_restart_until_complete_audit() {
     );
     assert_eq!(
         writer
-            .retain_watcher_replay_uncertainty(&fence, marker)
+            .retain_watcher_replay_uncertainty(&fence, &marker)
             .unwrap(),
         retained
+    );
+    let wrong_root = SyntheticObservationBatch::new(
+        RawObservationProvenance::new(
+            source_id.clone(),
+            Some(
+                crate::sample_sources::reconciliation::RootIdentity::from_bytes(
+                    b"replaced-root".to_vec(),
+                ),
+            ),
+            Some(stream.clone()),
+            lane.generation(),
+            CaptureBoundary::try_new(102, Some(102), Some(102)).expect("later capture"),
+        ),
+        vec![RawObservation::new(
+            RawEventKind::Modify,
+            vec![RawObservedPath::new(
+                "kick.wav".into(),
+                RawPathRole::Subject,
+            )],
+        )],
+        lane_limits,
+    );
+    let invalid = owner
+        .admit_replay_with_durable_prior(wrong_root, None, false)
+        .expect("wrong root remains unproven");
+    let widened = owner
+        .durable_audit_marker_for_replay(&invalid)
+        .expect("current-root source audit marker");
+    assert_eq!(widened.root_identity(), Some(fence.root_identity()));
+    let retained = writer
+        .retain_watcher_replay_uncertainty(&fence, &widened)
+        .expect("persist widened audit disposition");
+    assert!(retained.reasons().contains(&UncertaintyReason::WrongRoot));
+    assert!(
+        retained
+            .reasons()
+            .contains(&UncertaintyReason::ReplayContinuityGap)
     );
     assert!(
         matches!(
@@ -265,6 +303,35 @@ fn retained_uncertainty_blocks_replay_through_restart_until_complete_audit() {
                 lane.generation(),
             )
             .expect("blocked read")
+            .is_none()
+    );
+    let mut incomplete = writer
+        .catalog_database()
+        .write_batch()
+        .expect("incomplete scan batch");
+    incomplete
+        .upsert_file(Path::new("partial.wav"), 10, 1)
+        .expect("safe partial fact");
+    writer
+        .commit_scan_manifest_batch(&fence, incomplete)
+        .expect("incomplete scan may retain a partial delta");
+    assert_eq!(
+        writer
+            .catalog_database()
+            .read_durable_replay_uncertainty()
+            .expect("uncertainty after incomplete scan"),
+        DurableReplayUncertaintyState::Retained(retained.clone())
+    );
+    assert!(
+        writer
+            .catalog_database()
+            .read_durable_replay_prior(
+                &source_id,
+                fence.root_identity(),
+                WatcherGeneration::new(7),
+                lane.generation(),
+            )
+            .expect("incomplete scan blocked read")
             .is_none()
     );
     drop(writer);
@@ -304,7 +371,7 @@ fn retained_uncertainty_blocks_replay_through_restart_until_complete_audit() {
         .expect("committed recovery audit");
     let recovered = writer.current_scan_fence().expect("recovery fence");
     let later = writer
-        .retain_watcher_replay_uncertainty(&recovered, marker)
+        .retain_watcher_replay_uncertainty(&recovered, &marker)
         .expect("later uncertainty after the audit");
     assert_eq!(later.source_revision(), recovered.revision());
     let new_evidence = BootstrapReplayEvidence::from_certain_empty_capture(
