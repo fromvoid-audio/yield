@@ -191,8 +191,8 @@ mod tests {
     use yield_library::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
     use yield_library::sample_sources::db::DurableReplayUncertaintyState;
     use yield_library::sample_sources::reconciliation::{
-        RawObservationLimits, ReconciliationAdmissionLimits, ReconciliationAdmissionOwner,
-        ReconciliationAdmissionSupervisor, RootIdentity,
+        AdapterDisposition, RawObservationLimits, ReconciliationAdmissionLimits,
+        ReconciliationAdmissionOwner, ReconciliationAdmissionSupervisor, RootIdentity,
     };
     use yield_library::sample_sources::{SourceDatabase, SourceId, SourceWriter};
 
@@ -442,12 +442,22 @@ mod tests {
             let (batch, continuous) = handoff.into_admission_parts();
             assert_eq!(continuous, action != "unsupported", "{action}");
             let admission = owner
-                .admit_replay_with_durable_prior(batch, None, continuous)
+                .admit_replay_with_durable_prior(batch.clone(), None, continuous)
                 .expect("existing owner replay route");
             assert!(
                 admission.audit_request().is_some(),
                 "no durable prior: {action}"
             );
+            if matches!(action, "create" | "duplicate" | "rename") {
+                let repeated = owner
+                    .admit_replay_with_durable_prior(batch, None, continuous)
+                    .expect("repeated callback admission");
+                assert_eq!(
+                    repeated.admission().disposition(),
+                    AdapterDisposition::DuplicateSuppressed,
+                    "duplicate {action} delivery must not dispatch another scan"
+                );
+            }
         }
     }
 
