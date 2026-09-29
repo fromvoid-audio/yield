@@ -363,7 +363,7 @@ mod tests {
                 columns[4],
             ));
         }
-        assert_eq!(actions.len(), 6, "every Finder fixture action is present");
+        assert_eq!(actions.len(), 8, "every Finder fixture action is present");
 
         for (action, events) in actions {
             let ingress = ReplayIngress::new(
@@ -383,6 +383,10 @@ mod tests {
                     "created-file" => {
                         fs::kFSEventStreamEventFlagItemCreated
                             | fs::kFSEventStreamEventFlagItemIsFile
+                    }
+                    "created-directory" => {
+                        fs::kFSEventStreamEventFlagItemCreated
+                            | fs::kFSEventStreamEventFlagItemIsDir
                     }
                     "renamed-file" => {
                         fs::kFSEventStreamEventFlagItemRenamed
