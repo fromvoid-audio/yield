@@ -126,6 +126,7 @@ fn replay_manifest_and_checkpoint_commit_once_before_raw_ticket_retirement() {
         )],
         lane_limits,
     );
+    let duplicate_batch = batch.clone();
     let admission = owner
         .admit_replay_with_durable_prior(batch, Some(&prior), true)
         .expect("admit replay");
@@ -133,6 +134,14 @@ fn replay_manifest_and_checkpoint_commit_once_before_raw_ticket_retirement() {
         admission.admission().disposition(),
         AdapterDisposition::AdmittedWithContinuity
     );
+    let duplicate = owner
+        .admit_replay_with_durable_prior(duplicate_batch, Some(&prior), true)
+        .expect("suppress duplicate delivery");
+    assert_eq!(
+        duplicate.admission().disposition(),
+        AdapterDisposition::DuplicateSuppressed
+    );
+    assert_eq!(owner.supervisor().in_flight(), 1);
     let ticket = match admission.admission().outcome() {
         AdmissionOutcome::Accepted(ticket) => *ticket,
         outcome => panic!("expected replay ticket, got {outcome:?}"),
@@ -144,9 +153,18 @@ fn replay_manifest_and_checkpoint_commit_once_before_raw_ticket_retirement() {
         .watcher_continuity()
         .expect("admitted proof")
         .clone();
+    assert_eq!(proof.source_id(), &source);
+    assert_eq!(proof.root_identity(), &root);
+    assert_eq!(proof.backend_stream_identity(), &stream);
+    assert_eq!(proof.watcher_generation(), lane.generation());
+    assert_eq!(proof.prior_acknowledgement().sequence(), 10);
+    assert_eq!(proof.replay_coverage().after_sequence(), 10);
+    assert_eq!(proof.replay_coverage().through_sequence(), 12);
+    assert!(proof.replay_coverage().is_contiguous());
     owner.mark_dispatched(ticket).expect("replay handed off");
     owner.mark_applied(ticket).expect("replay applied");
     assert!(owner.mark_replay_checkpointed(ticket, &prior).is_err());
+    assert_eq!(owner.supervisor().in_flight(), 1);
 
     let mut partial = writer
         .catalog_database()
@@ -173,6 +191,23 @@ fn replay_manifest_and_checkpoint_commit_once_before_raw_ticket_retirement() {
             .is_none()
     );
     assert_eq!(writer.current_scan_fence().unwrap(), expected);
+    assert_eq!(owner.supervisor().in_flight(), 1);
+    assert!(owner.mark_replay_checkpointed(ticket, &prior).is_err());
+    assert_eq!(
+        writer
+            .catalog_database()
+            .read_durable_replay_prior(
+                &source,
+                &root,
+                crate::sample_sources::reconciliation::WatcherGeneration::new(7),
+                lane.generation(),
+            )
+            .unwrap()
+            .unwrap()
+            .acknowledged_sequence(),
+        10,
+        "an incomplete replay transaction cannot advance the durable cursor"
+    );
 
     let mut manifest_batch = writer
         .catalog_database()
@@ -188,10 +223,55 @@ fn replay_manifest_and_checkpoint_commit_once_before_raw_ticket_retirement() {
     assert_eq!(manifest.touched_path_changes.len(), 1);
     assert_eq!(manifest.touched_path_changes[0].0, Path::new("one.wav"));
     assert_eq!(committed.acknowledged_sequence(), 12);
+    assert_eq!(
+        writer.current_scan_fence().unwrap().revision(),
+        manifest.revision,
+        "manifest and checkpoint publish at one covered source revision"
+    );
+    let stored_checkpoint = writer
+        .catalog_database()
+        .get_metadata(crate::sample_sources::db::META_SOURCE_WATCHER_CHECKPOINT)
+        .unwrap()
+        .expect("committed replay checkpoint");
+    let stored_checkpoint: serde_json::Value =
+        serde_json::from_str(&stored_checkpoint).expect("checkpoint JSON");
+    assert_eq!(stored_checkpoint["source_id"], source.as_str());
+    assert_eq!(stored_checkpoint["root_identity"], root_text);
+    assert_eq!(stored_checkpoint["lifecycle_generation"], 7);
+    assert_eq!(stored_checkpoint["source_revision"], manifest.revision);
+    assert_eq!(stored_checkpoint["event_id"], 12);
+    assert_eq!(
+        stored_checkpoint["continuity_proof"]["root_identity"],
+        root_text
+    );
+    assert_eq!(stored_checkpoint["continuity_proof"]["backend"], "fsevents");
+    assert_eq!(stored_checkpoint["continuity_proof"]["backend_device"], 99);
+    assert_eq!(
+        stored_checkpoint["continuity_proof"]["backend_volume_uuid"],
+        uuid::Uuid::from_bytes([2; 16]).to_string()
+    );
+    assert_eq!(
+        stored_checkpoint["continuity_proof"]["watcher_generation"],
+        lane.generation().get()
+    );
+    assert_eq!(
+        stored_checkpoint["continuity_proof"]["replay_coverage_start_event_id"],
+        11
+    );
+    assert_eq!(
+        stored_checkpoint["continuity_proof"]["replay_coverage_end_event_id"],
+        12
+    );
+    assert_eq!(
+        stored_checkpoint["continuity_proof"]["acknowledged_end_event_id"],
+        12
+    );
     owner
         .mark_replay_checkpointed(ticket, &committed)
         .expect("retire after committed proof");
+    assert_eq!(owner.supervisor().in_flight(), 0);
     assert!(owner.mark_replay_checkpointed(ticket, &committed).is_err());
+    assert_eq!(owner.supervisor().in_flight(), 0);
 
     let mut duplicate = writer
         .catalog_database()
