@@ -9546,9 +9546,20 @@ mod tests {
                 lifecycle_generation: 1,
             })
             .expect("register");
-        let _ = receive_until(&service, |event| {
-            matches!(event, CatalogEvent::Registered { .. })
-        });
+        // Native FSEvents setup can exceed the generic five-second event wait (observed
+        // at 6.9 seconds). This is fixture setup, before cancellation is requested; keep
+        // the cancellation acknowledgment below on its existing five-second deadline.
+        let registered = service
+            .recv_event_timeout(Duration::from_secs(20))
+            .expect("native source registration must finish before testing cancellation");
+        assert!(
+            matches!(
+                &registered,
+                CatalogEvent::Registered { source_id: registered_source, lifecycle_generation: 1 }
+                    if registered_source == &source_id
+            ),
+            "unexpected native registration event: {registered:?}"
+        );
         let pause = gate.arm_next_audit();
         service
             .submit(CatalogCommand::RequestAudit {
