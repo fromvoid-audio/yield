@@ -275,7 +275,10 @@ pub enum AdmissionRejectReason {
 }
 
 /// A bounded reason retained after raw evidence cannot safely be dispatched.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum UncertaintyReason {
     /// The source was not registered.
     UnknownLane,

@@ -26,19 +26,20 @@ use crate::sample_sources::readiness::{
     ReadinessRetryPolicy, ReadinessTarget, ReadinessWorkMutationOutcome,
 };
 use crate::sample_sources::reconciliation::{
-    BootstrapReplayEvidence, ReplayPriorToken, RootIdentity, RootRelativePath, SourceAuditCommit,
-    SourceAuditRequest, WatcherContinuityProof, WatcherGeneration,
+    BootstrapReplayEvidence, ReplayPriorToken, RetainedUncertainty, RootIdentity, RootRelativePath,
+    SourceAuditCommit, SourceAuditRequest, WatcherContinuityProof, WatcherGeneration,
 };
 
 use super::super::replay_authority::{
-    encode_bootstrap_checkpoint, encode_replay_checkpoint, parse_durable_replay_prior,
+    DurableReplayUncertainty, DurableReplayUncertaintyState, encode_bootstrap_checkpoint,
+    encode_replay_checkpoint, parse_durable_replay_prior,
 };
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
     BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage,
-    META_SOURCE_WATCHER_CHECKPOINT, ManifestCommitResult, Rating, SampleCollection, SourceDatabase,
-    SourceDbError, SourceDirectoryEntry, SourceDirectoryTruthCleanup, SourceManifestEntry,
-    SourcePlaybackType, SourceWriteBatch,
+    META_SOURCE_WATCHER_CHECKPOINT, META_SOURCE_WATCHER_UNCERTAINTY, ManifestCommitResult, Rating,
+    SampleCollection, SourceDatabase, SourceDbError, SourceDirectoryEntry,
+    SourceDirectoryTruthCleanup, SourceManifestEntry, SourcePlaybackType, SourceWriteBatch,
 };
 use super::curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
@@ -561,6 +562,12 @@ pub enum SourceWriterError {
         /// Event ID to use for an exact persisted checkpoint readback or retry.
         event_id: u64,
     },
+    /// A source-owned uncertainty marker is malformed or belongs to another source lane.
+    #[error("watcher replay uncertainty does not match the retained source")]
+    ReplayUncertaintyMismatch,
+    /// The uncertainty write may have committed but its exact readback failed.
+    #[error("watcher replay uncertainty outcome is uncertain")]
+    ReplayUncertaintyOutcomeUncertain,
     /// The first replay prior did not match the completed audit and live source lane.
     #[error("watcher replay bootstrap evidence does not match the retained source audit")]
     ReplayBootstrapMismatch,
@@ -600,6 +607,66 @@ enum SourceWriterFault {
 }
 
 impl SourceWriter {
+    /// Persist the first unresolved source-wide uncertainty marker under the exact source fence.
+    ///
+    /// One source-wide marker is enough to require a complete audit. Later markers widen its
+    /// bounded reasons and advance its revision watermark, so an earlier audit cannot clear
+    /// uncertainty observed afterward. A complete, matching bootstrap audit retires it.
+    pub fn retain_watcher_replay_uncertainty(
+        &self,
+        expected: &SourceScanFence,
+        marker: &RetainedUncertainty,
+    ) -> Result<DurableReplayUncertainty, SourceWriterError> {
+        self.validate_scan_fence(expected)?;
+        let requested = DurableReplayUncertainty::from_marker(
+            marker,
+            expected.source_id(),
+            expected.root_identity(),
+            expected.lifecycle_generation(),
+            expected.revision(),
+        )
+        .ok_or(SourceWriterError::ReplayUncertaintyMismatch)?;
+        let encoded = requested.encode().ok_or(SourceWriterError::InvalidRequest(
+            "watcher replay uncertainty exceeds the bounded metadata size",
+        ))?;
+        let mut batch = self.database.write_batch()?;
+        if !batch.matches_revision(expected.revision())? {
+            return Err(SourceWriterError::StaleRevision {
+                expected: expected.revision(),
+                actual: batch.get_revision()?,
+            });
+        }
+        let retained =
+            if let Some(stored) = batch.coordination_metadata(META_SOURCE_WATCHER_UNCERTAINTY)? {
+                let previous = DurableReplayUncertainty::decode(&stored)
+                    .ok_or(SourceWriterError::ReplayUncertaintyMismatch)?;
+                if previous.source_revision() > expected.revision() {
+                    return Err(SourceWriterError::ReplayUncertaintyMismatch);
+                }
+                let retained = previous
+                    .clone()
+                    .merged_with(&requested)
+                    .ok_or(SourceWriterError::ReplayUncertaintyMismatch)?;
+                if retained != previous {
+                    let encoded = retained.encode().ok_or(SourceWriterError::InvalidRequest(
+                        "watcher replay uncertainty exceeds the bounded metadata size",
+                    ))?;
+                    batch.set_metadata(META_SOURCE_WATCHER_UNCERTAINTY, &encoded)?;
+                }
+                retained
+            } else {
+                batch.set_metadata(META_SOURCE_WATCHER_UNCERTAINTY, &encoded)?;
+                requested
+            };
+        batch.commit_auxiliary_state()?;
+        match self.database.read_durable_replay_uncertainty() {
+            Ok(DurableReplayUncertaintyState::Retained(readback)) if readback == retained => {
+                Ok(readback)
+            }
+            _ => Err(SourceWriterError::ReplayUncertaintyOutcomeUncertain),
+        }
+    }
+
     /// Atomically advance the source-owned replay barrier from an admitted continuity proof.
     ///
     /// The proof is created only by reconciliation admission. The supplied prior must still
@@ -638,6 +705,12 @@ impl SourceWriter {
             });
         }
         let stored = batch.coordination_metadata(META_SOURCE_WATCHER_CHECKPOINT)?;
+        if batch
+            .coordination_metadata(META_SOURCE_WATCHER_UNCERTAINTY)?
+            .is_some()
+        {
+            return Err(SourceWriterError::ReplayCheckpointMismatch);
+        }
         if stored.as_deref() != Some(encoded.as_str()) {
             let stored_prior = stored.as_deref().and_then(|value| {
                 parse_durable_replay_prior(
@@ -708,23 +781,40 @@ impl SourceWriter {
             });
         }
         let stored = batch.get_metadata(super::super::META_SOURCE_WATCHER_CHECKPOINT)?;
+        let unresolved = batch.coordination_metadata(META_SOURCE_WATCHER_UNCERTAINTY)?;
+        if let Some(stored_marker) = unresolved.as_deref() {
+            let marker = DurableReplayUncertainty::decode(stored_marker)
+                .ok_or(SourceWriterError::ReplayBootstrapMismatch)?;
+            // A previously completed audit at this same revision did not cover evidence retained
+            // afterward. Only a new complete audit may retire the unresolved marker.
+            if marker.source_id() != expected.source_id()
+                || marker.root_identity() != expected.root_identity()
+                || marker.source_revision() >= audit.committed_source_revision()
+            {
+                return Err(SourceWriterError::ReplayBootstrapMismatch);
+            }
+        }
         if stored.as_deref() != Some(encoded.as_str()) {
-            if stored
-                .as_deref()
-                .and_then(|value| {
-                    parse_durable_replay_prior(
-                        value,
-                        expected.source_id(),
-                        expected.root_identity(),
-                        WatcherGeneration::new(expected.lifecycle_generation()),
-                        evidence.watcher_generation(),
-                    )
-                })
-                .is_some()
+            if unresolved.is_none()
+                && stored
+                    .as_deref()
+                    .and_then(|value| {
+                        parse_durable_replay_prior(
+                            value,
+                            expected.source_id(),
+                            expected.root_identity(),
+                            WatcherGeneration::new(expected.lifecycle_generation()),
+                            evidence.watcher_generation(),
+                        )
+                    })
+                    .is_some()
             {
                 return Err(SourceWriterError::ReplayBootstrapMismatch);
             }
             batch.set_metadata(super::super::META_SOURCE_WATCHER_CHECKPOINT, &encoded)?;
+        }
+        if unresolved.is_some() {
+            batch.remove_coordination_metadata(META_SOURCE_WATCHER_UNCERTAINTY)?;
         }
         batch.commit_auxiliary_state()?;
         match self.database.read_durable_replay_prior(

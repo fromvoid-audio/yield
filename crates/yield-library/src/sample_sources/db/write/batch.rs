@@ -130,6 +130,14 @@ impl<'conn> SourceWriteBatch<'conn> {
         Ok(())
     }
 
+    /// Retire auxiliary metadata in the same writer transaction as its replacement authority.
+    pub(super) fn remove_coordination_metadata(&mut self, key: &str) -> Result<(), SourceDbError> {
+        self.tx
+            .execute("DELETE FROM metadata WHERE key = ?1", [key])
+            .map_err(map_sql_error)?;
+        Ok(())
+    }
+
     /// Insert or update a wav row, resetting the tag to neutral on first insert.
     pub fn upsert_file(
         &mut self,
