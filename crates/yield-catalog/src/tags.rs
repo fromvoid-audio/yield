@@ -1,13 +1,17 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use yield_library::app_dirs::WritableProfileGuard;
-use yield_library::sample_sources::db::normalize_relative_path;
+use yield_library::filesystem_identity::stable_filesystem_identity;
+use yield_library::sample_sources::db::{
+    DB_FILE_NAME, LEGACY_DB_FILE_NAME, normalize_relative_path,
+};
 use yield_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use yield_library::sample_sources::{
-    SourceId, SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage,
+    SourceDatabase, SourceId, SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage,
     SourceTagPageCursor,
 };
 
@@ -345,20 +349,133 @@ pub(crate) fn read_assignment_preview(
     let mut expected_ids = expected_source_ids.to_vec();
     expected_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     expected_ids.dedup();
-    if ids != expected_ids {
+    profile_guard
+        .validate_current()
+        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    let registry_path = profile_guard
+        .profile_root()
+        .join(yield_library::sample_sources::library::LIBRARY_DB_FILE_NAME);
+    let registry = yield_library::sample_sources::library::load_source_registry_snapshot_read_only(
+        &registry_path,
+    )
+    .map_err(|error| {
+        CatalogError::Database(format!("could not read profile source registry: {error}"))
+    })?;
+    if registry.len() > MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES {
+        return Err(CatalogError::TagAssignmentPreviewTooManySources {
+            max: MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES,
+            actual: registry.len(),
+        });
+    }
+    let mut registry_ids = registry
+        .as_slice()
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<Vec<_>>();
+    registry_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    if registry_ids != expected_ids
+        || ids.iter().any(|id| {
+            registry_ids
+                .binary_search_by(|candidate| candidate.as_str().cmp(id.as_str()))
+                .is_err()
+        })
+    {
         return Err(CatalogError::TagAssignmentPreviewIncomplete {
-            expected: expected_ids.len(),
+            expected: registry_ids.len(),
             available: ids.len(),
         });
     }
     let mut captured = Vec::with_capacity(ids.len());
+    let mut inactive = Vec::new();
     let mut affected_sources = Vec::new();
     let mut total_assignments = 0usize;
     let mut total_bytes = 0usize;
-    for source_id in &ids {
-        let source = sources
-            .get_mut(source_id)
-            .expect("captured source remains in worker map");
+    for source_id in &registry_ids {
+        let registry_source = registry
+            .as_slice()
+            .iter()
+            .find(|source| &source.id == source_id)
+            .expect("registry id was captured");
+        let Some(source) = sources.get_mut(source_id) else {
+            let root_identity = checked_source_root_identity(source_id, &registry_source.root)?;
+            let database_root = profile_guard
+                .profile_root()
+                .join(super::catalog_profile_child(source_id));
+            let database_identity = checked_inactive_database_identity(source_id, &database_root)?;
+            let database = SourceDatabase::open_for_ui_read_with_database_root(
+                &registry_source.root,
+                &database_root,
+            )
+            .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+            if checked_inactive_database_identity(source_id, &database_root)? != database_identity {
+                return Err(CatalogError::DatabaseIntegrityUncertain(format!(
+                    "{source_id}: database changed while opening preview"
+                )));
+            }
+            let revision = database
+                .get_revision()
+                .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+            let cancellation = Arc::new(AtomicBool::new(false));
+            let mut cursor = None;
+            let mut paths = Vec::new();
+            loop {
+                let page = database
+                    .tag_assignments_page_at_revision(
+                        revision,
+                        label,
+                        cursor.as_ref(),
+                        super::SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
+                        &cancellation,
+                    )
+                    .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+                for path in page.paths {
+                    total_assignments = total_assignments.saturating_add(1);
+                    total_bytes = total_bytes.saturating_add(super::encoded_path_len(&path));
+                    if total_assignments > MAX_TAG_ASSIGNMENT_PREVIEW_PATHS {
+                        return Err(CatalogError::TagAssignmentPreviewTooLarge {
+                            limit: "assignment count",
+                            max: MAX_TAG_ASSIGNMENT_PREVIEW_PATHS,
+                        });
+                    }
+                    if total_bytes > MAX_TAG_ASSIGNMENT_PREVIEW_BYTES {
+                        return Err(CatalogError::TagAssignmentPreviewTooLarge {
+                            limit: "path bytes",
+                            max: MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
+                        });
+                    }
+                    paths.push(path);
+                }
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            if !paths.is_empty() {
+                affected_sources.push(CatalogTagAssignmentPreviewSource {
+                    source_id: source_id.clone(),
+                    lifecycle_generation: 0,
+                    root_identity: root_identity.clone(),
+                    revision,
+                    paths,
+                });
+            }
+            inactive.push((
+                source_id.clone(),
+                registry_source.root.clone(),
+                root_identity,
+                revision,
+                database_root,
+                database_identity,
+                database,
+            ));
+            continue;
+        };
+        if source.root != registry_source.root {
+            return Err(CatalogError::StaleRootGeneration {
+                source_id: source_id.clone(),
+                detail: String::from("registered source root differs from the profile registry"),
+            });
+        }
         let lifecycle_generation = source.lifecycle_generation;
         let expected_revision = source
             .snapshot
@@ -464,12 +581,94 @@ pub(crate) fn read_assignment_preview(
             });
         }
     }
+    for (source_id, root, root_identity, revision, database_root, database_identity, database) in
+        &inactive
+    {
+        if checked_inactive_database_identity(source_id, database_root)? != *database_identity {
+            return Err(CatalogError::DatabaseIntegrityUncertain(format!(
+                "{source_id}: database changed during assignment preview"
+            )));
+        }
+        if checked_source_root_identity(source_id, root)? != *root_identity {
+            return Err(CatalogError::StaleRootGeneration {
+                source_id: source_id.clone(),
+                detail: String::from("inactive source root changed during assignment preview"),
+            });
+        }
+        let actual = database
+            .get_revision()
+            .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
+        if actual != *revision {
+            return Err(CatalogError::StaleRevision {
+                expected: *revision,
+                actual,
+            });
+        }
+    }
+    let after_registry =
+        yield_library::sample_sources::library::load_source_registry_snapshot_read_only(
+            &registry_path,
+        )
+        .map_err(|error| {
+            CatalogError::Database(format!(
+                "could not recheck profile source registry: {error}"
+            ))
+        })?;
+    let mut after_sources = after_registry
+        .as_slice()
+        .iter()
+        .map(|source| (source.id.clone(), source.root.clone()))
+        .collect::<Vec<_>>();
+    after_sources.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    let mut before_sources = registry
+        .as_slice()
+        .iter()
+        .map(|source| (source.id.clone(), source.root.clone()))
+        .collect::<Vec<_>>();
+    before_sources.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    if before_sources != after_sources {
+        return Err(CatalogError::Canceled);
+    }
+    profile_guard
+        .validate_current()
+        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
     Ok(CatalogTagAssignmentPreview {
         label: label.to_owned(),
-        checked_sources: ids.len(),
+        checked_sources: registry_ids.len(),
         affected_sources,
         total_assignments,
     })
+}
+
+fn checked_inactive_database_identity(
+    source_id: &SourceId,
+    database_root: &Path,
+) -> Result<(PathBuf, String), CatalogError> {
+    for filename in [DB_FILE_NAME, LEGACY_DB_FILE_NAME] {
+        let path = database_root.join(filename);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CatalogError::DatabaseIntegrityUncertain(format!(
+                    "{source_id}: could not inspect {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(CatalogError::DatabaseIntegrityUncertain(format!(
+                "{source_id}: source database is not a regular file"
+            )));
+        }
+        let identity = stable_filesystem_identity(&path, &metadata).ok_or_else(|| {
+            CatalogError::DatabaseIntegrityUncertain(format!(
+                "{source_id}: source database identity unavailable"
+            ))
+        })?;
+        return Ok((path, identity));
+    }
+    Err(CatalogError::SnapshotUnavailable)
 }
 
 pub(crate) fn read_filter(

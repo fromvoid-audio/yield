@@ -376,7 +376,7 @@ pub const MAX_TAG_FILTER_MASK_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum aggregate bounded tag-read result payload retained across queued outcomes.
 pub const MAX_TAG_FILTER_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 
-/// Maximum number of registered sources in one immutable tag-assignment preview.
+/// Maximum number of profile sources in one immutable tag-assignment preview.
 pub const MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES: usize = 64;
 /// Maximum number of affected paths in one immutable tag-assignment preview.
 pub const MAX_TAG_ASSIGNMENT_PREVIEW_PATHS: usize = 512;
@@ -492,7 +492,7 @@ pub enum CatalogCommand {
         /// Requested page size in 1..=64.
         page_limit: usize,
     },
-    /// Capture one bounded immutable affected-assignment set across all registered sources.
+    /// Capture one bounded immutable affected-assignment set across all profile sources.
     RequestTagAssignmentPreview {
         /// Caller-assigned query identifier.
         request_id: u64,
@@ -666,6 +666,14 @@ pub enum CatalogTagPageQuery {
 /// Why a lazy tag-page request could not be admitted.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CatalogTagPageRequestError {
+    /// A profile-wide assignment preview exceeded its source-count admission bound.
+    #[error("tag-assignment preview contains {actual} sources; maximum is {max}")]
+    TooManyPreviewSources {
+        /// Maximum admitted source count.
+        max: usize,
+        /// Supplied source count.
+        actual: usize,
+    },
     /// The selected-path query exceeded the bounded path-count admission limit.
     #[error("tag-page request contains {actual} paths; maximum is {max}")]
     TooManyPaths {
@@ -991,7 +999,7 @@ pub enum CatalogError {
     /// The database has no complete authoritative catalog snapshot.
     #[error("catalog snapshot is unavailable until a complete audit commits")]
     SnapshotUnavailable,
-    /// An affected-assignment preview has more registered sources than its bounded contract.
+    /// An affected-assignment preview has more profile sources than its bounded contract.
     #[error("tag-assignment preview has {actual} sources; maximum is {max}")]
     TagAssignmentPreviewTooManySources {
         /// Maximum registered source count.
@@ -1000,7 +1008,9 @@ pub enum CatalogError {
         actual: usize,
     },
     /// The catalog worker does not hold every source in the requested profile set.
-    #[error("tag-assignment preview is incomplete: {available} of {expected} sources available")]
+    #[error(
+        "tag-assignment preview source set changed: {available} catalog sources, {expected} profile sources; refresh and try again"
+    )]
     TagAssignmentPreviewIncomplete {
         /// Number of sources in the requested profile set.
         expected: usize,
@@ -1116,7 +1126,7 @@ pub struct CatalogWavMetadata {
 pub struct CatalogTagAssignmentPreviewSource {
     /// Stable source identifier.
     pub source_id: SourceId,
-    /// Source lifecycle generation at capture.
+    /// Source lifecycle generation at capture, or zero for an inactive read-only source.
     pub lifecycle_generation: u64,
     /// Physical source-root identity at capture.
     pub root_identity: RootIdentity,
@@ -1131,7 +1141,7 @@ pub struct CatalogTagAssignmentPreviewSource {
 pub struct CatalogTagAssignmentPreview {
     /// Requested display label.
     pub label: String,
-    /// Number of registered sources checked, including those without this tag.
+    /// Number of profile sources checked, including those without this tag.
     pub checked_sources: usize,
     /// Affected sources and their exact paths.
     pub affected_sources: Vec<CatalogTagAssignmentPreviewSource>,
@@ -1997,8 +2007,20 @@ fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> 
         CatalogCommand::RequestTagAssignments {
             label, page_limit, ..
         } => validate_tag_assignment_request(label, *page_limit)?,
-        CatalogCommand::RequestTagAssignmentPreview { label, .. } => {
-            validate_tag_assignment_request(label, SOURCE_TAG_PAGE_MAX_PAGE_SIZE)?
+        CatalogCommand::RequestTagAssignmentPreview {
+            label,
+            expected_source_ids,
+            ..
+        } => {
+            validate_tag_assignment_request(label, SOURCE_TAG_PAGE_MAX_PAGE_SIZE)?;
+            if expected_source_ids.len() > MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES {
+                return Err(CatalogSubmitError::InvalidTagPageRequest(
+                    CatalogTagPageRequestError::TooManyPreviewSources {
+                        max: MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES,
+                        actual: expected_source_ids.len(),
+                    },
+                ));
+            }
         }
         CatalogCommand::RequestTagFilter {
             expected_manifest_len,
@@ -2390,7 +2412,23 @@ fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
             CatalogTagPageQuery::VocabularyPrefix { .. } => 0,
         },
         CatalogCommand::RequestTagAssignments { label, .. } => label.len(),
-        CatalogCommand::RequestTagAssignmentPreview { label, .. } => label.len(),
+        CatalogCommand::RequestTagAssignmentPreview {
+            label,
+            expected_source_ids,
+            ..
+        } => label
+            .len()
+            .saturating_add(
+                expected_source_ids
+                    .len()
+                    .saturating_mul(std::mem::size_of::<SourceId>()),
+            )
+            .saturating_add(
+                expected_source_ids
+                    .iter()
+                    .map(|id| id.as_str().len())
+                    .sum::<usize>(),
+            ),
         CatalogCommand::RequestTagFilter { required_tags, .. } => {
             let raw_bytes = required_tags
                 .iter()
@@ -6564,6 +6602,9 @@ mod tests {
         OPERATION_JOURNAL_OWNER_RESULT_CAPACITY, OperationId, OperationJournalOwner,
         OperationJournalOwnerQueueError, OperationJournalOwnerStatus, OperationJournalStore,
     };
+    use yield_library::sample_sources::{
+        GlobalLibraryWriter, GlobalLibraryWriterStatus, SampleSource, SourceRegistrySnapshot,
+    };
 
     static TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 
@@ -6600,6 +6641,31 @@ mod tests {
                 root,
             }
         }
+    }
+
+    fn persist_preview_registry(fixture: &Fixture, sources: Vec<(SourceId, PathBuf)>) {
+        let mut writer = GlobalLibraryWriter::start(&fixture.guard).expect("global writer");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while writer.status() == GlobalLibraryWriterStatus::Initializing {
+            assert!(
+                Instant::now() < deadline,
+                "global writer did not initialize"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let snapshot = SourceRegistrySnapshot::new(
+            sources
+                .into_iter()
+                .map(|(id, root)| SampleSource::new_with_id(id, root))
+                .collect(),
+        );
+        writer
+            .replace_source_registry(snapshot)
+            .expect("registry admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("registry result")
+            .expect("registry persisted");
+        assert!(writer.shutdown());
     }
 
     fn receive_until(
@@ -7523,6 +7589,13 @@ mod tests {
         write_test_wav(&second_root.path().join("two.wav"), 16_000, 4);
         let first_id = SourceId::from_string("preview-first");
         let second_id = SourceId::from_string("preview-second");
+        persist_preview_registry(
+            &fixture,
+            vec![
+                (first_id.clone(), fixture.root.path().to_path_buf()),
+                (second_id.clone(), second_root.path().to_path_buf()),
+            ],
+        );
         let service = CatalogService::start(&fixture.guard).expect("catalog service");
         let first_snapshot = register_and_audit(&service, fixture.root.path(), &first_id);
         let second_snapshot = register_and_audit(&service, second_root.path(), &second_id);
@@ -7594,6 +7667,10 @@ mod tests {
     fn assignment_preview_refuses_an_unaudited_registered_source() {
         let fixture = Fixture::new("catalog-assignment-preview-unaudited");
         let source_id = SourceId::from_string("preview-unaudited");
+        persist_preview_registry(
+            &fixture,
+            vec![(source_id.clone(), fixture.root.path().to_path_buf())],
+        );
         let service = CatalogService::start(&fixture.guard).expect("catalog service");
         service
             .submit(CatalogCommand::Register {
@@ -7634,13 +7711,21 @@ mod tests {
         write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
         let first_id = SourceId::from_string("preview-active");
         let second_id = SourceId::from_string("preview-inactive");
+        let second_root = tempfile::tempdir().unwrap();
+        persist_preview_registry(
+            &fixture,
+            vec![
+                (first_id.clone(), fixture.root.path().to_path_buf()),
+                (second_id.clone(), second_root.path().to_path_buf()),
+            ],
+        );
         let service = CatalogService::start(&fixture.guard).expect("catalog service");
         register_and_audit(&service, fixture.root.path(), &first_id);
         service
             .submit(CatalogCommand::RequestTagAssignmentPreview {
                 request_id: 1_614,
                 label: String::from("shared"),
-                expected_source_ids: vec![first_id, second_id],
+                expected_source_ids: vec![first_id],
             })
             .unwrap();
         assert!(matches!(
@@ -7659,6 +7744,147 @@ mod tests {
                 ..
             }
         ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn assignment_preview_reads_an_inactive_profile_source() {
+        let fixture = Fixture::new("catalog-assignment-preview-inactive");
+        let inactive_root = tempfile::tempdir().unwrap();
+        write_test_wav(&fixture.root.path().join("active.wav"), 16_000, 4);
+        write_test_wav(&inactive_root.path().join("inactive.wav"), 16_000, 4);
+        let active_id = SourceId::from_string("preview-current");
+        let inactive_id = SourceId::from_string("preview-retired");
+        persist_preview_registry(
+            &fixture,
+            vec![
+                (active_id.clone(), fixture.root.path().to_path_buf()),
+                (inactive_id.clone(), inactive_root.path().to_path_buf()),
+            ],
+        );
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let inactive_snapshot = register_and_audit(&service, inactive_root.path(), &inactive_id);
+        apply_curation_updates(
+            &service,
+            &inactive_id,
+            &inactive_snapshot,
+            1_615,
+            vec![SourceCurationUpdate::AddTag {
+                path: RootRelativePath::try_from_path(PathBuf::from("inactive.wav")).unwrap(),
+                label: String::from("shared"),
+            }],
+        );
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: inactive_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        let _ = receive_until(
+            &service,
+            |event| matches!(event, CatalogEvent::Removed { source_id, .. } if source_id == &inactive_id),
+        );
+        let active_snapshot = register_and_audit(&service, fixture.root.path(), &active_id);
+        apply_curation_updates(
+            &service,
+            &active_id,
+            &active_snapshot,
+            1_616,
+            vec![SourceCurationUpdate::AddTag {
+                path: RootRelativePath::try_from_path(PathBuf::from("active.wav")).unwrap(),
+                label: String::from("shared"),
+            }],
+        );
+        service
+            .submit(CatalogCommand::RequestTagAssignmentPreview {
+                request_id: 1_617,
+                label: String::from("shared"),
+                expected_source_ids: vec![active_id.clone(), inactive_id.clone()],
+            })
+            .unwrap();
+        match receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagAssignmentPreviewReady {
+                    request_id: 1_617,
+                    ..
+                } | CatalogEvent::TagAssignmentPreviewFailed {
+                    request_id: 1_617,
+                    ..
+                }
+            )
+        }) {
+            CatalogEvent::TagAssignmentPreviewReady { preview, .. } => {
+                assert_eq!(preview.checked_sources, 2);
+                assert_eq!(preview.total_assignments, 2);
+                assert_eq!(preview.affected_sources.len(), 2);
+                assert_eq!(preview.affected_sources[0].source_id, active_id);
+                assert_eq!(preview.affected_sources[1].source_id, inactive_id);
+                assert_eq!(
+                    preview.affected_sources[1].paths,
+                    vec![PathBuf::from("inactive.wav")]
+                );
+            }
+            event => panic!("expected complete inactive-source preview, got {event:?}"),
+        }
+        service.shutdown();
+    }
+
+    #[test]
+    fn assignment_preview_refuses_an_inactive_source_without_a_catalog() {
+        let fixture = Fixture::new("catalog-assignment-preview-uninitialized");
+        let inactive_root = tempfile::tempdir().unwrap();
+        write_test_wav(&fixture.root.path().join("active.wav"), 16_000, 4);
+        let active_id = SourceId::from_string("preview-initialized");
+        let inactive_id = SourceId::from_string("preview-uninitialized");
+        persist_preview_registry(
+            &fixture,
+            vec![
+                (active_id.clone(), fixture.root.path().to_path_buf()),
+                (inactive_id.clone(), inactive_root.path().to_path_buf()),
+            ],
+        );
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        register_and_audit(&service, fixture.root.path(), &active_id);
+        service
+            .submit(CatalogCommand::RequestTagAssignmentPreview {
+                request_id: 1_618,
+                label: String::from("shared"),
+                expected_source_ids: vec![active_id, inactive_id],
+            })
+            .unwrap();
+        assert!(matches!(
+            receive_until(&service, |event| matches!(
+                event,
+                CatalogEvent::TagAssignmentPreviewFailed {
+                    request_id: 1_618,
+                    ..
+                }
+            )),
+            CatalogEvent::TagAssignmentPreviewFailed {
+                error: CatalogError::SnapshotUnavailable,
+                ..
+            }
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn assignment_preview_rejects_an_unbounded_source_set_before_queueing() {
+        let fixture = Fixture::new("catalog-assignment-preview-bound");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let ids = (0..=MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES)
+            .map(|index| SourceId::from_string(format!("preview-{index}")))
+            .collect();
+        assert!(
+            matches!(service.submit(CatalogCommand::RequestTagAssignmentPreview {
+            request_id: 1_619,
+            label: String::from("shared"),
+            expected_source_ids: ids,
+        }), Err(CatalogSubmitError::InvalidTagPageRequest(
+            CatalogTagPageRequestError::TooManyPreviewSources { max: MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES, actual }
+        )) if actual == MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES + 1)
+        );
         service.shutdown();
     }
 
