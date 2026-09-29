@@ -95,6 +95,7 @@ struct CatalogTestGate {
     wake: Condvar,
     audit_state: Mutex<CatalogTestAuditState>,
     watcher_signals: Mutex<HashMap<(SourceId, u64), WatcherSignal>>,
+    watcher_install_counts: Mutex<HashMap<(SourceId, u64), usize>>,
 }
 
 #[cfg(test)]
@@ -126,6 +127,7 @@ impl CatalogTestGate {
                 at_boundary: false,
             }),
             watcher_signals: Mutex::new(HashMap::new()),
+            watcher_install_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -230,6 +232,12 @@ impl CatalogTestGate {
         lifecycle_generation: u64,
         signal: WatcherSignal,
     ) {
+        *self
+            .watcher_install_counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry((source_id.clone(), lifecycle_generation))
+            .or_default() += 1;
         let mut signals = self
             .watcher_signals
             .lock()
@@ -267,6 +275,16 @@ impl CatalogTestGate {
             .get(&(source_id.clone(), lifecycle_generation))
             .cloned();
         signal.is_some_and(|signal| signal.record_evidence(evidence, Instant::now()))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn watcher_install_count(&self, source_id: &SourceId, lifecycle_generation: u64) -> usize {
+        self.watcher_install_counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(source_id.clone(), lifecycle_generation))
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -12750,6 +12768,204 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(paths, vec![Path::new("one.wav"), Path::new("two.wav")]);
         service.shutdown();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_watcher_restart_audits_one_external_change_through_source_owner() {
+        let fixture = Fixture::new("catalog-native-watcher-restart-gap");
+        let root = fs::canonicalize(fixture.root.path()).expect("canonical source root");
+        write_test_wav(&root.join("before-restart.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-native-watcher-restart-gap");
+        let test_gate = Arc::new(CatalogTestGate::new());
+        let service = CatalogService::start_inner(
+            &fixture.guard,
+            Some(Arc::clone(&test_gate)),
+            None,
+            WatcherMode::Native,
+        )
+        .expect("production native catalog watcher service");
+        let initial = register_and_audit(&service, &root, &source_id);
+        assert!(
+            initial
+                .manifest
+                .iter()
+                .any(|entry| entry.relative_path == Path::new("before-restart.wav"))
+        );
+
+        // Let native events caused by registration/bootstrap settle before introducing the
+        // injected backend failure. Preserve any resulting committed audit as the baseline.
+        let mut baseline = initial;
+        let settle_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < settle_deadline,
+                "initial watcher did not settle"
+            );
+            match service.recv_event_timeout(Duration::from_millis(650)) {
+                Ok(CatalogEvent::AuditCommitted { snapshot })
+                    if snapshot.source_id == source_id
+                        && snapshot.lifecycle_generation == baseline.lifecycle_generation =>
+                {
+                    assert!(snapshot.committed_revision >= baseline.committed_revision);
+                    assert!(
+                        snapshot
+                            .manifest
+                            .iter()
+                            .any(|entry| entry.relative_path == Path::new("before-restart.wav"))
+                    );
+                    baseline = snapshot;
+                }
+                Ok(event) => panic!("unexpected event before watcher restart: {event:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("catalog event stream closed before watcher restart")
+                }
+            }
+        }
+
+        // Drive the production backend-failure branch through its existing test signal. The
+        // catalog closes that watcher, retries SourceWatcher::start, then performs its pending
+        // conservative source audit before accepting the next filesystem mutation as current.
+        assert!(test_gate.record_watcher_evidence(
+            &source_id,
+            baseline.lifecycle_generation,
+            WatchHintEvidence::BACKEND_ERROR,
+        ));
+        let recovered = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::AuditCommitted { snapshot }
+                if snapshot.source_id == source_id
+                    && snapshot.lifecycle_generation == baseline.lifecycle_generation)
+        });
+        let CatalogEvent::AuditCommitted {
+            snapshot: recovered,
+        } = recovered
+        else {
+            unreachable!();
+        };
+        assert!(
+            test_gate.watcher_install_count(&source_id, baseline.lifecycle_generation) >= 2,
+            "recovery audit must follow a restarted native source watcher"
+        );
+        assert!(recovered.committed_revision >= baseline.committed_revision);
+        assert!(
+            recovered
+                .manifest
+                .iter()
+                .any(|entry| entry.relative_path == Path::new("before-restart.wav"))
+        );
+
+        // Classify any late, independently delivered native hints from the restart itself before
+        // adding the post-restart file. Each must still publish only the existing source state.
+        let mut stable_recovery = recovered;
+        let recovery_settle_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < recovery_settle_deadline,
+                "native restart audits did not reach a quiet boundary"
+            );
+            match service.recv_event_timeout(Duration::from_millis(1_200)) {
+                Ok(CatalogEvent::AuditCommitted { snapshot })
+                    if snapshot.source_id == source_id
+                        && snapshot.lifecycle_generation == baseline.lifecycle_generation =>
+                {
+                    assert!(snapshot.committed_revision >= stable_recovery.committed_revision);
+                    assert!(
+                        snapshot
+                            .manifest
+                            .iter()
+                            .any(|entry| entry.relative_path == Path::new("before-restart.wav"))
+                    );
+                    assert!(
+                        !snapshot
+                            .manifest
+                            .iter()
+                            .any(|entry| entry.relative_path == Path::new("after-restart.wav"))
+                    );
+                    stable_recovery = snapshot;
+                }
+                Ok(event) => panic!("unexpected event while settling restart audits: {event:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("catalog event stream closed while settling restart audits")
+                }
+            }
+        }
+
+        // This file is created only after the restart-recovery audit committed. It must be
+        // observed by the newly installed native watcher and become a single source-owned audit
+        // publication, rather than being lost in the restart gap or published as a raw event.
+        write_test_wav(&root.join("after-restart.wav"), 16_000, 4);
+        let mutation_deadline = Instant::now() + Duration::from_secs(5);
+        let mut mutation_commits = Vec::new();
+        let converged = loop {
+            assert!(
+                Instant::now() < mutation_deadline,
+                "external source change did not audit"
+            );
+            match service.recv_event_timeout(Duration::from_millis(50)) {
+                Ok(CatalogEvent::AuditCommitted { snapshot })
+                    if snapshot.source_id == source_id
+                        && snapshot.lifecycle_generation
+                            == stable_recovery.lifecycle_generation =>
+                {
+                    let contains_external = snapshot
+                        .manifest
+                        .iter()
+                        .any(|entry| entry.relative_path == Path::new("after-restart.wav"));
+                    mutation_commits.push((snapshot.committed_revision, contains_external));
+                    if contains_external {
+                        break snapshot;
+                    }
+                }
+                Ok(event) => panic!("unexpected event after external source change: {event:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("catalog event stream closed before external change audit")
+                }
+            }
+        };
+        // A changed manifest batch and the following authoritative audit-completion batch each
+        // advance the source revision; one AuditCommitted event is still the single publication.
+        assert_eq!(
+            mutation_commits,
+            vec![(stable_recovery.committed_revision + 2, true)]
+        );
+        assert_eq!(
+            converged.committed_revision,
+            stable_recovery.committed_revision + 2,
+            "one post-restart filesystem change produces one audit publication"
+        );
+        assert!(
+            converged
+                .manifest
+                .iter()
+                .any(|entry| entry.relative_path == Path::new("before-restart.wav"))
+        );
+
+        match service.recv_event_timeout(Duration::from_millis(650)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            other => panic!("duplicate watcher audit publication after convergence: {other:?}"),
+        }
+        service.shutdown();
+
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            &root,
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("reopen source-owned catalog after watcher restart");
+        assert_eq!(
+            database.get_revision().expect("durable source revision"),
+            converged.committed_revision
+        );
+        assert!(
+            database
+                .list_files()
+                .expect("durable authoritative source manifest")
+                .iter()
+                .any(|entry| entry.relative_path == Path::new("after-restart.wav"))
+        );
     }
 
     #[test]

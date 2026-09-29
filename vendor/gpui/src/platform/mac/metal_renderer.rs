@@ -282,16 +282,50 @@ impl MetalRenderer {
         }
     }
 
-    /// Replace the optional post-pass only after the new program compiled.
+    /// A rejected post-pass restores the normal compositor.
     pub fn set_post_shader(&mut self, source: Option<&str>) -> Result<(), String> {
         let candidate = source
             .map(|source| PostShader::compile(&self.device, source))
-            .transpose()?;
-        self.post_shader = candidate;
+            .transpose();
+        self.post_shader = None;
+        match candidate {
+            Ok(shader) => self.post_shader = shader,
+            Err(error) => {
+                self.post_target = None;
+                return Err(error);
+            }
+        }
         if self.post_shader.is_none() {
             self.post_target = None;
         }
         Ok(())
+    }
+
+    /// Prepare an optional target; allocation failure disables the effect once
+    /// and leaves this frame on the direct drawable path.
+    fn prepare_post_target(
+        &mut self,
+        width: u64,
+        height: u64,
+        allocate: impl FnOnce(&metal::DeviceRef, u64, u64) -> Result<metal::Texture, String>,
+    ) -> Option<metal::Texture> {
+        self.post_shader.as_ref()?;
+        let needs_target = self
+            .post_target
+            .as_ref()
+            .is_none_or(|target| target.width() != width || target.height() != height);
+        if needs_target {
+            match allocate(&self.device, width, height) {
+                Ok(target) => self.post_target = Some(target),
+                Err(error) => {
+                    log::error!("visual post effect disabled: {error}");
+                    self.post_shader = None;
+                    self.post_target = None;
+                    return None;
+                }
+            }
+        }
+        self.post_target.clone()
     }
 
     pub fn layer(&self) -> &metal::MetalLayerRef {
@@ -384,22 +418,11 @@ impl MetalRenderer {
             return;
         };
 
-        let post_target = if self.post_shader.is_some() {
-            let width = i32::from(viewport_size.width) as u64;
-            let height = i32::from(viewport_size.height) as u64;
-            if width == 0 || height == 0 {
-                return;
-            }
-            let needs_target = self.post_target.as_ref().is_none_or(|target| {
-                target.width() != width || target.height() != height
-            });
-            if needs_target {
-                self.post_target = Some(post_shader::new_target(&self.device, width, height));
-            }
-            self.post_target.clone()
-        } else {
-            None
-        };
+        let post_target = self.prepare_post_target(
+            drawable.texture().width(),
+            drawable.texture().height(),
+            post_shader::new_target,
+        );
         let scene_target = post_target.as_deref().unwrap_or_else(|| drawable.texture());
 
         loop {
@@ -478,15 +501,11 @@ impl MetalRenderer {
         let alpha = if self.layer.is_opaque() { 1. } else { 0. };
         let mut instance_offset = 0;
 
-        let mut command_encoder = new_command_encoder(
-            command_buffer,
-            target,
-            viewport_size,
-            |color_attachment| {
+        let mut command_encoder =
+            new_command_encoder(command_buffer, target, viewport_size, |color_attachment| {
                 color_attachment.set_load_action(metal::MTLLoadAction::Clear);
                 color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
-            },
-        );
+            });
 
         for batch in scene.batches() {
             let ok = match batch {
@@ -1402,4 +1421,87 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+}
+
+#[cfg(test)]
+mod post_pass_tests {
+    use super::*;
+
+    const IDENTITY: &str = r#"
+@group(0) @binding(0) var screen: texture_2d<f32>;
+@group(0) @binding(1) var screen_sampler: sampler;
+@fragment
+fn post_fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    return textureSample(screen, screen_sampler, uv);
+}
+"#;
+
+    #[test]
+    fn post_pass_reuses_target_and_falls_back_after_resize_allocation_failure() {
+        objc::rc::autoreleasepool(|| {
+            let mut renderer =
+                MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())));
+            assert!(
+                renderer
+                    .prepare_post_target(8, 8, |_, _, _| {
+                        panic!("disabled pass must not allocate")
+                    })
+                    .is_none()
+            );
+            renderer.set_post_shader(Some(IDENTITY)).unwrap();
+            let target = renderer
+                .prepare_post_target(8, 8, post_shader::new_target)
+                .unwrap();
+            let cached = renderer
+                .prepare_post_target(8, 8, |_, _, _| {
+                    panic!("unchanged drawable size must reuse the target")
+                })
+                .unwrap();
+            assert_eq!(target.as_ptr(), cached.as_ptr());
+
+            assert!(
+                renderer
+                    .prepare_post_target(16, 8, |_, width, height| {
+                        assert_eq!((width, height), (16, 8));
+                        Err(String::from("injected Metal allocation failure"))
+                    })
+                    .is_none()
+            );
+            assert!(renderer.post_shader.is_none());
+            assert!(renderer.post_target.is_none());
+            assert!(
+                renderer
+                    .prepare_post_target(16, 8, |_, _, _| {
+                        panic!("failed optional effect must not retry every frame")
+                    })
+                    .is_none()
+            );
+
+            // Explicit re-enable can recover, and disabling releases the cached target.
+            renderer.set_post_shader(Some(IDENTITY)).unwrap();
+            let resized = renderer
+                .prepare_post_target(16, 8, post_shader::new_target)
+                .unwrap();
+            assert_eq!((resized.width(), resized.height()), (16, 8));
+            renderer.set_post_shader(None).unwrap();
+            assert!(renderer.post_target.is_none());
+        });
+    }
+
+    #[test]
+    fn post_pass_invalid_replacement_restores_normal_compositor() {
+        objc::rc::autoreleasepool(|| {
+            let mut renderer =
+                MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())));
+            renderer.set_post_shader(Some(IDENTITY)).unwrap();
+            assert!(
+                renderer
+                    .prepare_post_target(8, 8, post_shader::new_target)
+                    .is_some()
+            );
+            assert!(renderer.set_post_shader(Some("not valid WGSL")).is_err());
+            assert!(renderer.post_shader.is_none());
+            assert!(renderer.post_target.is_none());
+        });
+    }
 }

@@ -1,11 +1,13 @@
 //! One optional WGSL fragment pass over the composed Metal window image.
 
+use foreign_types::ForeignType;
 use metal::{MTLPixelFormat, MTLTextureUsage};
 use naga::{
     ResourceBinding,
     back::msl::{BindSamplerTarget, BindTarget, EntryPointResources, Options, PipelineOptions},
     valid::{Capabilities, ValidationFlags, Validator},
 };
+use objc::{msg_send, sel, sel_impl};
 
 const VERTEX_SOURCE: &str = r#"
 struct PostVertex {
@@ -36,7 +38,9 @@ pub(super) struct PostShader {
 impl PostShader {
     pub fn compile(device: &metal::DeviceRef, source: &str) -> Result<Self, String> {
         if source.len() > 64 * 1024 {
-            return Err(String::from("WGSL post shader exceeds the 64 KiB source limit"));
+            return Err(String::from(
+                "WGSL post shader exceeds the 64 KiB source limit",
+            ));
         }
         let module = naga::front::wgsl::parse_str(&format!("{VERTEX_SOURCE}\n{source}"))
             .map_err(|error| format!("WGSL parse error: {error}"))?;
@@ -54,14 +58,20 @@ impl PostShader {
             .map_err(|error| format!("WGSL validation error: {error}"))?;
         let mut resources = EntryPointResources::default();
         resources.resources.insert(
-            ResourceBinding { group: 0, binding: 0 },
+            ResourceBinding {
+                group: 0,
+                binding: 0,
+            },
             BindTarget {
                 texture: Some(0),
                 ..Default::default()
             },
         );
         resources.resources.insert(
-            ResourceBinding { group: 0, binding: 1 },
+            ResourceBinding {
+                group: 0,
+                binding: 1,
+            },
             BindTarget {
                 sampler: Some(BindSamplerTarget::Resource(0)),
                 ..Default::default()
@@ -115,7 +125,15 @@ impl PostShader {
         sampler_descriptor.set_mag_filter(metal::MTLSamplerMinMagFilter::Linear);
         sampler_descriptor.set_address_mode_s(metal::MTLSamplerAddressMode::ClampToEdge);
         sampler_descriptor.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
-        let sampler = device.new_sampler(&sampler_descriptor);
+        // Like textures, sampler allocation is nullable in Metal's API.
+        let sampler: *mut metal::MTLSamplerState = unsafe {
+            msg_send![device, newSamplerStateWithDescriptor: sampler_descriptor.as_ref()]
+        };
+        if sampler.is_null() {
+            return Err(String::from("Metal post-pass sampler allocation failed"));
+        }
+        // The new-family selector transfers one retained reference to this handle.
+        let sampler = unsafe { metal::SamplerState::from_ptr(sampler) };
         Ok(Self { pipeline, sampler })
     }
 }
@@ -124,7 +142,10 @@ pub(super) fn new_target(
     device: &metal::DeviceRef,
     width: u64,
     height: u64,
-) -> metal::Texture {
+) -> Result<metal::Texture, String> {
+    if width == 0 || height == 0 {
+        return Err(String::from("post-pass target dimensions must be nonzero"));
+    }
     let descriptor = metal::TextureDescriptor::new();
     descriptor.set_texture_type(metal::MTLTextureType::D2);
     descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
@@ -132,7 +153,17 @@ pub(super) fn new_target(
     descriptor.set_height(height);
     descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
     descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-    device.new_texture(&descriptor)
+    // Metal may return nil under memory pressure. metal::DeviceRef::new_texture
+    // wraps the result as non-null, so check it before constructing an owned handle.
+    let texture: *mut metal::MTLTexture =
+        unsafe { msg_send![device, newTextureWithDescriptor: descriptor.as_ref()] };
+    if texture.is_null() {
+        return Err(format!(
+            "could not allocate {width}x{height} post-pass target"
+        ));
+    }
+    // `newTextureWithDescriptor:` returns a retained (+1) object on success.
+    Ok(unsafe { metal::Texture::from_ptr(texture) })
 }
 
 #[cfg(test)]

@@ -1759,12 +1759,12 @@ impl Window {
     /// The source provides `post_fragment` with a UV input at location 0;
     /// group 0 binding 0 is the window texture and binding 1 is its sampler.
     ///
-    /// The disabled path uses the normal compositor. A rejected shader leaves the
-    /// previous effect unchanged so callers can present the error and recover.
+    /// The disabled path uses the normal compositor. A rejected shader restores
+    /// that path and returns a diagnostic for the caller.
     pub fn set_post_shader(&mut self, source: Option<&str>) -> Result<(), String> {
-        self.platform_window.set_post_shader(source)?;
+        let result = self.platform_window.set_post_shader(source);
         self.refresh();
-        Ok(())
+        result
     }
 
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)

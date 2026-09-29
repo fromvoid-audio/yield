@@ -32,6 +32,10 @@ if [[ "$scope" == "session" ]]; then
 fi
 if [[ "$scope" == "full" ]]; then
   run cargo check --locked -p yield
+  if [[ -f vendor/gpui/Cargo.toml ]]; then
+    # Exercise authored Metal guards; dependency unit tests are otherwise skipped.
+    run cargo test --manifest-path vendor/gpui/Cargo.toml --locked --no-default-features --features font-kit,runtime_shaders --lib post_ -- --test-threads=1
+  fi
 else
   run cargo check --locked -p yield-library --no-default-features
 fi

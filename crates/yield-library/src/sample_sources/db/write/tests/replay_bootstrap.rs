@@ -166,6 +166,9 @@ fn retained_uncertainty_blocks_replay_through_restart_until_complete_audit() {
         .catalog_database()
         .write_batch()
         .expect("audit batch");
+    batch
+        .upsert_file(Path::new("last-good.wav"), 44, 4)
+        .expect("last-good source fact");
     batch.complete_manifest_audit(1).expect("complete audit");
     let (audit, _) = batch
         .commit_with_manifest_snapshot_and_audit(initial.root_identity().clone(), None)
@@ -325,6 +328,21 @@ fn retained_uncertainty_blocks_replay_through_restart_until_complete_audit() {
     assert!(
         writer
             .catalog_database()
+            .entry_for_path(Path::new("last-good.wav"))
+            .expect("read last-good row after incomplete scan")
+            .is_some()
+    );
+    let checkpoint = writer
+        .catalog_database()
+        .get_metadata(META_SOURCE_WATCHER_CHECKPOINT)
+        .expect("read checkpoint after incomplete scan")
+        .expect("prior checkpoint remains stored");
+    let checkpoint: serde_json::Value =
+        serde_json::from_str(&checkpoint).expect("checkpoint JSON after incomplete scan");
+    assert_eq!(checkpoint["event_id"], 100);
+    assert!(
+        writer
+            .catalog_database()
             .read_durable_replay_prior(
                 &source_id,
                 fence.root_identity(),
@@ -345,6 +363,19 @@ fn retained_uncertainty_blocks_replay_through_restart_until_complete_audit() {
             .expect("reopen uncertainty"),
         DurableReplayUncertaintyState::Retained(retained),
     );
+    assert!(
+        reopened
+            .entry_for_path(Path::new("last-good.wav"))
+            .expect("read last-good row after recovery restart")
+            .is_some()
+    );
+    let checkpoint = reopened
+        .get_metadata(META_SOURCE_WATCHER_CHECKPOINT)
+        .expect("read checkpoint after restart")
+        .expect("prior checkpoint remains stored after restart");
+    let checkpoint: serde_json::Value =
+        serde_json::from_str(&checkpoint).expect("checkpoint JSON after restart");
+    assert_eq!(checkpoint["event_id"], 100);
     assert!(
         reopened
             .read_durable_replay_prior(

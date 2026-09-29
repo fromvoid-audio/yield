@@ -54,7 +54,10 @@ pub fn run(initial_root: Option<PathBuf>) {
                     let source = next.then_some(DEBUG_POST_EFFECT);
                     match handle.update(cx, |_, window, _| window.set_post_shader(source)) {
                         Ok(Ok(())) => enabled.set(next),
-                        Ok(Err(error)) => eprintln!("visual post effect unavailable: {error}"),
+                        Ok(Err(error)) => {
+                            enabled.set(false);
+                            eprintln!("visual post effect unavailable: {error}");
+                        }
                         Err(error) => eprintln!("could not update visual post effect: {error}"),
                     }
                 });
