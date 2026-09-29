@@ -25,7 +25,7 @@ use crate::sample_sources::reconciliation::{
     AdapterDisposition, AdmissionOutcome, BackendStreamIdentity, CaptureBoundary, RawEventKind,
     RawObservation, RawObservationLimits, RawObservationProvenance, RawObservedPath, RawPathRole,
     ReconciliationAdmissionLimits, ReconciliationAdmissionOwner, ReconciliationAdmissionSupervisor,
-    SyntheticObservationBatch,
+    ReconciliationScopeKind, SyntheticObservationBatch, WatcherGeneration,
 };
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
@@ -417,6 +417,275 @@ fn replay_manifest_and_checkpoint_commit_once_before_raw_ticket_retirement() {
         writer.current_scan_fence().unwrap().revision(),
         manifest.revision
     );
+}
+
+#[test]
+fn replay_cursor_gaps_and_overflow_keep_last_good_state_until_a_complete_audit() {
+    let cases = [
+        (
+            "missing cursor",
+            CaptureBoundary::try_new(21, None, None).expect("missing cursor boundary"),
+            RawEventKind::Create,
+        ),
+        (
+            "cursor gap",
+            CaptureBoundary::try_new(22, Some(12), Some(13)).expect("gap boundary"),
+            RawEventKind::Modify,
+        ),
+        (
+            "overflow",
+            CaptureBoundary::try_new(23, Some(14), Some(15)).expect("overflow boundary"),
+            RawEventKind::Overflow,
+        ),
+    ];
+    for (label, boundary, kind) in cases {
+        assert_replay_case_keeps_last_good_state(label, boundary, kind);
+    }
+}
+
+fn assert_replay_case_keeps_last_good_state(
+    label: &str,
+    boundary: CaptureBoundary,
+    kind: RawEventKind,
+) {
+    let fixture = CurationFixture::new_profile_bound();
+    let source = SourceId::from_string("gap-overflow-replay-writer");
+    let root = fixture.root_identity.clone();
+    let stream =
+        BackendStreamIdentity::from_fsevents_volume(99, [2; 16]).expect("native volume identity");
+    let root_text = std::str::from_utf8(root.as_bytes()).expect("fixture root identity");
+    let seed = serde_json::json!({
+        "root_identity": root_text,
+        "event_id": 10,
+        "format_version": 4,
+        "source_id": source.as_str(),
+        "lifecycle_generation": 7,
+        "source_revision": fixture.revision,
+        "cause": "targeted_replay",
+        "continuity_proof": {
+            "root_identity": root_text,
+            "backend": "fsevents",
+            "backend_device": 99,
+            "backend_volume_uuid": uuid::Uuid::from_bytes([2; 16]).to_string(),
+            "watcher_generation": 1,
+            "replay_coverage_start_event_id": 10,
+            "replay_coverage_end_event_id": 10,
+            "acknowledged_end_event_id": 10
+        }
+    })
+    .to_string();
+    let mut seed_batch = fixture.database.write_batch().expect("seed batch");
+    seed_batch
+        .set_metadata(
+            crate::sample_sources::db::META_SOURCE_WATCHER_CHECKPOINT,
+            &seed,
+        )
+        .expect("seed checkpoint");
+    seed_batch.commit_auxiliary_state().expect("seed commit");
+
+    let writer = SourceWriter::new(fixture.database, source.clone(), 7).expect("source writer");
+    let expected = writer.current_scan_fence().expect("source revision");
+    let lane_limits = RawObservationLimits::new(8, 4096, 4096).expect("lane limits");
+    let limits = ReconciliationAdmissionLimits::new(
+        1,
+        lane_limits,
+        RawObservationLimits::new(32, 16384, 16384).expect("global limits"),
+        2,
+        8,
+        8,
+    )
+    .expect("admission limits");
+    let mut owner =
+        ReconciliationAdmissionOwner::new(ReconciliationAdmissionSupervisor::new(limits));
+    let lane = owner
+        .begin_source(source.clone(), root.clone())
+        .expect("capture lane");
+    let prior = writer
+        .catalog_database()
+        .read_durable_replay_prior(&source, &root, WatcherGeneration::new(7), lane.generation())
+        .expect("read prior")
+        .expect("valid prior");
+    let before = source_writer_state_snapshot(writer.catalog_database());
+    let checkpoint_before = writer
+        .catalog_database()
+        .get_metadata(crate::sample_sources::db::META_SOURCE_WATCHER_CHECKPOINT)
+        .expect("checkpoint metadata")
+        .expect("checkpoint exists");
+
+    // Hold a valid-looking replay proof without publishing it. Later evidence that exposes a
+    // missing interval must fence this proof before its manifest or checkpoint can commit.
+    let valid_batch = SyntheticObservationBatch::new(
+        RawObservationProvenance::new(
+            source.clone(),
+            Some(root.clone()),
+            Some(stream.clone()),
+            lane.generation(),
+            CaptureBoundary::try_new(20, Some(11), Some(12)).expect("valid interval"),
+        ),
+        vec![RawObservation::new(
+            RawEventKind::Modify,
+            vec![RawObservedPath::new("one.wav".into(), RawPathRole::Subject)],
+        )],
+        lane_limits,
+    );
+    let valid = owner
+        .admit_replay_with_durable_prior(valid_batch, Some(&prior), true)
+        .expect("admit valid replay proof");
+    assert_eq!(
+        valid.admission().disposition(),
+        AdapterDisposition::AdmittedWithContinuity
+    );
+    let ticket = match valid.admission().outcome() {
+        AdmissionOutcome::Accepted(ticket) => *ticket,
+        outcome => panic!("expected valid replay ticket, got {outcome:?}"),
+    };
+    let dispatched = owner.dispatch_next().expect("dispatch valid replay");
+    let proof = dispatched
+        .normalized()
+        .proof()
+        .watcher_continuity()
+        .expect("valid continuity proof")
+        .clone();
+    owner
+        .mark_dispatched(ticket)
+        .expect("valid replay dispatched");
+    owner.mark_applied(ticket).expect("valid replay applied");
+    assert_eq!(owner.supervisor().in_flight(), 1);
+
+    let paths = if kind == RawEventKind::Overflow {
+        Vec::new()
+    } else {
+        vec![RawObservedPath::new("one.wav".into(), RawPathRole::Subject)]
+    };
+    let batch = SyntheticObservationBatch::new(
+        RawObservationProvenance::new(
+            source.clone(),
+            Some(root.clone()),
+            Some(stream.clone()),
+            lane.generation(),
+            boundary,
+        ),
+        vec![RawObservation::new(kind, paths)],
+        lane_limits,
+    );
+    let admission = owner
+        .admit_replay_with_durable_prior(batch, Some(&prior), true)
+        .unwrap_or_else(|error| panic!("{label} remains auditable: {error:?}"));
+    assert_eq!(
+        admission.admission().disposition(),
+        AdapterDisposition::SourceAuditRequired,
+        "{label} must widen to an audit"
+    );
+    let request = admission.audit_request().expect("source audit request");
+    assert_eq!(request.source_id(), &source);
+    assert_eq!(request.root_identity(), &root);
+    assert_eq!(request.generation(), lane.generation());
+    let marker = owner
+        .durable_audit_marker_for_replay(&admission)
+        .expect("current-lane durable audit marker");
+    assert_eq!(marker.scope(), ReconciliationScopeKind::SourceAudit);
+    assert!(marker.boundary().covers(request.boundary()));
+    assert!(!marker.reasons().is_empty());
+
+    match (kind, admission.admission().outcome()) {
+        (RawEventKind::Overflow, AdmissionOutcome::Rejected(_)) => {
+            assert_eq!(owner.dispatch_next(), None);
+        }
+        (RawEventKind::Create | RawEventKind::Modify, AdmissionOutcome::Accepted(ticket)) => {
+            let ticket = *ticket;
+            let dispatched = owner.dispatch_next().expect("dispatch unproven audit work");
+            assert_eq!(dispatched.ticket(), ticket);
+            assert!(dispatched.normalized().proof().is_unproven());
+            assert!(!dispatched.normalized().scopes().is_empty());
+            assert!(
+                dispatched
+                    .normalized()
+                    .scopes()
+                    .iter()
+                    .any(|scope| scope.kind() == ReconciliationScopeKind::ExactEntry)
+            );
+            owner
+                .mark_dispatched(ticket)
+                .expect("audit work dispatched");
+            owner.mark_applied(ticket).expect("audit work applied");
+            owner
+                .mark_unproven_audit_handed_off(ticket)
+                .expect("handoff for complete audit");
+        }
+        (_, outcome) => panic!("unexpected {label} outcome: {outcome:?}"),
+    }
+    assert_eq!(owner.supervisor().in_flight(), 1, "valid proof stays held");
+
+    writer
+        .retain_watcher_replay_uncertainty(&expected, &marker)
+        .unwrap_or_else(|error| panic!("persist {label} uncertainty: {error:?}"));
+    assert_eq!(writer.current_scan_fence().unwrap(), expected);
+
+    let audit_request = owner
+        .source_audit_request_for_current_lane(&source)
+        .expect("current audit request");
+    let retained_markers = owner.supervisor().retained_uncertainties().len();
+    assert!(retained_markers > 0, "{label} retains an audit barrier");
+    assert_eq!(
+        owner.acknowledge_source_audit_receipt(&audit_request.incomplete()),
+        crate::sample_sources::reconciliation::ReconciliationAcknowledgementOutcome::unchanged(
+            retained_markers,
+        ),
+        "an incomplete audit cannot retire uncertainty"
+    );
+    assert!(
+        writer
+            .catalog_database()
+            .get_metadata(crate::sample_sources::db::META_SOURCE_WATCHER_UNCERTAINTY)
+            .expect("retained uncertainty metadata")
+            .is_some()
+    );
+
+    let mut candidate = writer
+        .catalog_database()
+        .write_batch()
+        .expect("candidate replay manifest");
+    candidate
+        .upsert_file(Path::new("unproven-derived.wav"), 30, 3)
+        .expect("candidate derived source fact");
+    assert!(matches!(
+        writer.commit_watcher_replay_manifest_batch(&expected, candidate, &prior, &proof),
+        Err(SourceWriterError::ReplayCheckpointMismatch)
+    ));
+    assert_eq!(
+        source_writer_state_snapshot(writer.catalog_database()),
+        before,
+        "uncertain replay preserves the last-good row and projection metadata"
+    );
+    assert!(
+        writer
+            .catalog_database()
+            .entry_for_path(Path::new("unproven-derived.wav"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(owner.supervisor().in_flight(), 1);
+    assert!(owner.mark_replay_checkpointed(ticket, &prior).is_err());
+    assert_eq!(owner.supervisor().in_flight(), 1);
+    assert_eq!(
+        writer
+            .catalog_database()
+            .get_metadata(crate::sample_sources::db::META_SOURCE_WATCHER_CHECKPOINT)
+            .unwrap()
+            .as_deref(),
+        Some(checkpoint_before.as_str()),
+        "uncertain replay leaves the persisted checkpoint bytes unchanged"
+    );
+    assert!(writer
+        .catalog_database()
+        .read_durable_replay_prior(
+            &source,
+            &root,
+            WatcherGeneration::new(7),
+            lane.generation(),
+        )
+        .unwrap()
+        .is_none());
 }
 
 #[test]
