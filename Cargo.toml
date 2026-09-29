@@ -70,3 +70,8 @@ incremental = true
 codegen-units = 256
 opt-level = 2
 strip = "none"
+
+# Keep GPUI at the exact 0.2.2 release while extending the macOS Metal
+# compositor with Yield's optional visual WGSL post-pass.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }

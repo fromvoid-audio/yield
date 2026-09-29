@@ -88,6 +88,14 @@ pub fn run(initial_root: Option<PathBuf>) {
                 ..Default::default()
             },
             move |window, cx| {
+                // The renderer experiment is opt-in until the effect controls and
+                // persistence contract are ready for users.
+                #[cfg(debug_assertions)]
+                if std::env::var("YIELD_DEV_POST_EFFECT").ok().as_deref() == Some("1") {
+                    if let Err(error) = window.set_post_shader(Some(DEBUG_POST_EFFECT)) {
+                        eprintln!("visual post effect unavailable: {error}");
+                    }
+                }
                 let view = cx.new(|cx| browser::Browser::new_window(window, cx));
                 window.focus(&view.read(cx).focus_handle(cx));
                 if let Some(root) = initial_root {
@@ -100,3 +108,15 @@ pub fn run(initial_root: Option<PathBuf>) {
         cx.activate(true);
     });
 }
+
+#[cfg(debug_assertions)]
+const DEBUG_POST_EFFECT: &str = r#"
+@group(0) @binding(0) var screen: texture_2d<f32>;
+@group(0) @binding(1) var screen_sampler: sampler;
+
+@fragment
+fn post_fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let color = textureSample(screen, screen_sampler, uv);
+    return vec4<f32>(color.rgb * vec3<f32>(0.94, 0.98, 1.08), color.a);
+}
+"#;
