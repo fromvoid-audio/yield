@@ -191,8 +191,8 @@ mod tests {
     use yield_library::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
     use yield_library::sample_sources::db::DurableReplayUncertaintyState;
     use yield_library::sample_sources::reconciliation::{
-        RawObservationLimits, ReconciliationAdmissionLimits, ReconciliationAdmissionOwner,
-        ReconciliationAdmissionSupervisor, RootIdentity,
+        AdapterDisposition, RawObservationLimits, ReconciliationAdmissionLimits,
+        ReconciliationAdmissionOwner, ReconciliationAdmissionSupervisor, RootIdentity,
     };
     use yield_library::sample_sources::{SourceDatabase, SourceId, SourceWriter};
 
@@ -303,6 +303,112 @@ mod tests {
                 .contains(ReplayUncertainty::MUST_SCAN_SUBDIRS)
         );
         assert!(candidate.events().is_empty());
+    }
+
+    #[test]
+    fn overflow_restart_and_scan_overlap_replays_request_a_current_source_audit() {
+        let cases = [
+            (
+                "overflow",
+                fs::kFSEventStreamEventFlagUserDropped
+                    | fs::kFSEventStreamEventFlagMustScanSubDirs
+                    | fs::kFSEventStreamEventFlagItemIsDir,
+                true,
+            ),
+            (
+                "restart-before-history-complete",
+                fs::kFSEventStreamEventFlagItemCreated | fs::kFSEventStreamEventFlagItemIsFile,
+                false,
+            ),
+            (
+                "scan-overlap-without-durable-prior",
+                fs::kFSEventStreamEventFlagItemCreated | fs::kFSEventStreamEventFlagItemIsFile,
+                true,
+            ),
+        ];
+        for (scenario, flags, history_complete) in cases {
+            let ingress = ReplayIngress::new(
+                SourceWatchSpec::new(
+                    SourceId::from_string("continuity-fixture-source"),
+                    7,
+                    PathBuf::from("/fixture-volume/Library"),
+                    Some(RootIdentity::from_bytes(
+                        b"continuity-fixture-root".to_vec(),
+                    )),
+                ),
+                17,
+                [7; 16],
+                100,
+            )
+            .expect("bounded replay ingress");
+            record_callback_batch(
+                &ingress,
+                Path::new("/fixture-volume"),
+                &[MacosReplayEvent {
+                    event_id: 101,
+                    volume_relative_path: Path::new("Library/kick.wav"),
+                    flags,
+                }],
+            );
+            if history_complete {
+                ingress.mark_history_complete();
+            }
+            let candidate = ingress.into_candidate();
+            if scenario == "overflow" {
+                assert!(
+                    candidate
+                        .uncertainty()
+                        .contains(ReplayUncertainty::DELIVERY_LOST)
+                );
+                assert!(
+                    candidate
+                        .uncertainty()
+                        .contains(ReplayUncertainty::MUST_SCAN_SUBDIRS)
+                );
+            }
+            let limits = ReconciliationAdmissionLimits::new(
+                1,
+                RawObservationLimits::new(8, 4096, 4096).expect("lane bound"),
+                RawObservationLimits::new(32, 16384, 16384).expect("global bound"),
+                8,
+                8,
+                8,
+            )
+            .expect("owner bounds");
+            let mut owner =
+                ReconciliationAdmissionOwner::new(ReconciliationAdmissionSupervisor::new(limits));
+            let lane = owner
+                .begin_source(
+                    candidate.source_id().clone(),
+                    candidate.root_identity().clone(),
+                )
+                .expect("current source lane");
+            let handoff = candidate
+                .into_observation_batch(7, lane.generation())
+                .expect("raw event or uncertainty reaches owner");
+            let (batch, continuous) = handoff.into_admission_parts();
+            assert_eq!(
+                continuous,
+                scenario == "scan-overlap-without-durable-prior",
+                "{scenario} continuity disposition"
+            );
+            let admitted = owner
+                .admit_replay_with_durable_prior(batch.clone(), None, continuous)
+                .expect("uncertain replay admission");
+            assert!(admitted.audit_request().is_some(), "{scenario}");
+            assert!(
+                owner.durable_audit_marker_for_replay(&admitted).is_some(),
+                "{scenario} must retain a durable source-wide barrier"
+            );
+            let repeated = owner
+                .admit_replay_with_durable_prior(batch, None, continuous)
+                .expect("duplicate replay admission");
+            assert_eq!(
+                repeated.admission().disposition(),
+                AdapterDisposition::DuplicateSuppressed,
+                "{scenario} duplicate must not dispatch another audit"
+            );
+        }
     }
 
     #[test]
