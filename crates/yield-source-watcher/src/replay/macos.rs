@@ -191,13 +191,17 @@ mod tests {
     use yield_library::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
     use yield_library::sample_sources::db::DurableReplayUncertaintyState;
     use yield_library::sample_sources::reconciliation::{
-        RawObservationLimits, ReconciliationAdmissionLimits, ReconciliationAdmissionOwner,
-        ReconciliationAdmissionSupervisor, RootIdentity,
+        BootstrapReplayEvidence, RawObservationLimits, ReconciliationAdmissionLimits,
+        ReconciliationAdmissionOwner, ReconciliationAdmissionSupervisor, RootIdentity,
+        WatcherGeneration,
     };
-    use yield_library::sample_sources::{SourceDatabase, SourceId, SourceWriter};
+    use yield_library::sample_sources::{
+        SourceDatabase, SourceId, SourceWriter, SourceWriterError,
+    };
 
     use super::*;
     use crate::SourceWatchSpec;
+    use crate::replay::{BackendStreamIdentity, ReplayUncertainty};
 
     fn ingress() -> ReplayIngress {
         let spec = SourceWatchSpec::new(
@@ -452,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn disposable_profile_persists_owner_routed_finder_uncertainty() {
+    fn disposable_profile_reports_finder_replay_continuity_and_audit() {
         let _runtime = yield_library::test_runtime::TestRuntimeGuard::acquire();
         let temporary_root =
             std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
@@ -460,8 +464,11 @@ mod tests {
         let _config_base = ConfigBaseGuard::set(base.path().to_path_buf());
         let _profile = PersistenceProfileGuard::named("finder-fixture-profile");
         let profile = WritableProfileGuard::acquire_current().expect("isolated profile owner");
-        let source = tempfile::tempdir().expect("disposable source root");
-        let source_root = std::fs::canonicalize(source.path()).expect("canonical source root");
+        let source = tempfile::tempdir().expect("disposable volume root");
+        let volume_root = std::fs::canonicalize(source.path()).expect("canonical volume root");
+        let source_root = volume_root.join("Library");
+        std::fs::create_dir(&source_root).expect("disposable Finder library root");
+        let source_root = std::fs::canonicalize(source_root).expect("canonical source root");
         let source_id = SourceId::from_string("finder-fixture-owned-source");
         let database = SourceDatabase::open_for_catalog_with_profile_guard(
             &source_root,
@@ -477,36 +484,12 @@ mod tests {
             .write_batch()
             .expect("isolated audit batch");
         audit.complete_manifest_audit(1).expect("complete audit");
-        audit
+        let (audit, _) = audit
             .commit_with_manifest_snapshot_and_audit(initial.root_identity().clone(), None)
             .expect("committed source revision");
         let fence = writer.current_scan_fence().expect("source fence");
-        let ingress = ReplayIngress::new(
-            SourceWatchSpec::new(
-                source_id.clone(),
-                7,
-                source_root.clone(),
-                Some(fence.root_identity().clone()),
-            ),
-            17,
-            [7; 16],
-            100,
-        )
-        .expect("physical source ingress");
-        let changed_path = source_root.join("kick.wav");
-        record_callback_batch(
-            &ingress,
-            Path::new("/"),
-            &[MacosReplayEvent {
-                event_id: 101,
-                volume_relative_path: &changed_path,
-                flags: fs::kFSEventStreamEventFlagItemCreated
-                    | fs::kFSEventStreamEventFlagItemIsFile,
-            }],
-        );
-        ingress.mark_history_complete();
-        let candidate = ingress.into_candidate();
-        assert_eq!(candidate.events()[0].relative_path(), Path::new("kick.wav"));
+        let stream = BackendStreamIdentity::from_fsevents_volume(17, [7; 16])
+            .expect("synthetic fixture stream");
         let limits = ReconciliationAdmissionLimits::new(
             1,
             RawObservationLimits::new(8, 4096, 4096).expect("lane bound"),
@@ -521,21 +504,505 @@ mod tests {
         let lane = owner
             .begin_source(source_id.clone(), fence.root_identity().clone())
             .expect("current source lane");
+        let bootstrap = BootstrapReplayEvidence::from_certain_empty_capture(
+            source_id.clone(),
+            fence.root_identity().clone(),
+            stream.clone(),
+            7,
+            lane.generation(),
+            100,
+            100,
+            true,
+            false,
+            0,
+        )
+        .expect("complete-audit capture boundary");
+        let prior = writer
+            .commit_bootstrap_replay_checkpoint(&fence, &audit, &bootstrap)
+            .expect("durable Finder replay prior");
+
+        let fixture = include_str!("fixtures/finder_v1.tsv");
+        let ingress = ReplayIngress::new(
+            SourceWatchSpec::new(
+                source_id.clone(),
+                7,
+                source_root.clone(),
+                Some(fence.root_identity().clone()),
+            ),
+            17,
+            [7; 16],
+            100,
+        )
+        .expect("disposable profile ingress");
+        let mut fixture_events = 0usize;
+        for line in fixture.lines().filter(|line| !line.starts_with('#')) {
+            let columns: Vec<_> = line.split('\t').collect();
+            assert_eq!(columns.len(), 5, "fixture schema");
+            if columns[3] == "unknown-event" {
+                continue;
+            }
+            let flags = match columns[3] {
+                "created-file" => {
+                    fs::kFSEventStreamEventFlagItemCreated | fs::kFSEventStreamEventFlagItemIsFile
+                }
+                "renamed-file" => {
+                    fs::kFSEventStreamEventFlagItemRenamed | fs::kFSEventStreamEventFlagItemIsFile
+                }
+                "removed-file" => {
+                    fs::kFSEventStreamEventFlagItemRemoved | fs::kFSEventStreamEventFlagItemIsFile
+                }
+                other => panic!("unknown Finder fixture flag shape: {other}"),
+            };
+            record_callback_batch(
+                &ingress,
+                &volume_root,
+                &[MacosReplayEvent {
+                    event_id: columns[1].parse().expect("fixture event ID"),
+                    volume_relative_path: Path::new(columns[2]),
+                    flags,
+                }],
+            );
+            fixture_events += 1;
+        }
+        ingress.mark_history_complete();
+        let candidate = ingress.into_candidate();
+        assert_eq!(candidate.events().len(), fixture_events);
+        assert!(candidate.uncertainty().is_empty());
         let handoff = candidate
             .into_observation_batch(7, lane.generation())
-            .expect("native callback reaches reconciliation");
+            .expect("supported Finder fixture reaches reconciliation");
         let (batch, continuous) = handoff.into_admission_parts();
+        assert!(continuous);
         let admission = owner
-            .admit_replay_with_durable_prior(batch, None, continuous)
-            .expect("unproven owner replay admission");
+            .admit_replay_with_durable_prior(batch.clone(), Some(&prior), continuous)
+            .expect("durable-prior Finder replay admission");
+        let ticket = match admission.admission().outcome() {
+            yield_library::sample_sources::reconciliation::AdmissionOutcome::Accepted(ticket) => {
+                *ticket
+            }
+            outcome => panic!("expected Finder replay ticket, got {outcome:?}"),
+        };
+        let dispatched = owner.dispatch_next().expect("dispatch Finder replay");
+        let proof = dispatched
+            .normalized()
+            .proof()
+            .watcher_continuity()
+            .expect("source-bound replay proof")
+            .clone();
+        assert_eq!(proof.source_id(), &source_id);
+        assert_eq!(proof.root_identity(), fence.root_identity());
+        assert_eq!(proof.backend_stream_identity(), &stream);
+        assert_eq!(proof.watcher_generation(), lane.generation());
+        assert_eq!(proof.prior_acknowledgement().sequence(), 100);
+        assert!(proof.replay_coverage().is_contiguous());
+        assert_eq!(proof.replay_coverage().after_sequence(), 100);
+        assert_eq!(proof.replay_coverage().through_sequence(), 106);
+        owner
+            .mark_dispatched(ticket)
+            .expect("Finder replay dispatched");
+        owner.mark_applied(ticket).expect("Finder replay applied");
+        let mut manifest = writer
+            .catalog_database()
+            .write_batch()
+            .expect("Finder manifest batch");
+        let event_paths: Vec<_> = batch
+            .observations()
+            .iter()
+            .flat_map(|observation| observation.paths())
+            .collect();
+        for (index, path) in event_paths.iter().enumerate() {
+            manifest
+                .upsert_file(path.path(), 100 + index as u64, 1)
+                .expect("bounded fixture path");
+        }
+        let (committed_manifest, committed_prior) = writer
+            .commit_watcher_replay_manifest_batch(&fence, manifest, &prior, &proof)
+            .expect("atomic Finder facts and replay barrier");
+        assert_eq!(committed_manifest.revision, fence.revision() + 1);
+        assert_eq!(committed_prior.acknowledged_sequence(), 106);
+        assert_eq!(event_paths.len(), 6);
+        let revision_after_commit = writer
+            .current_scan_fence()
+            .expect("committed fence")
+            .revision();
+        assert_eq!(owner.supervisor().in_flight(), 1);
+
+        // Restart after the transaction, before this process acknowledges or retires the ticket.
+        drop(owner);
+        drop(writer);
+        let reopened = SourceDatabase::open_for_catalog_with_profile_guard(
+            &source_root,
+            &profile,
+            Path::new("finder-fixture-owned-source"),
+        )
+        .expect("reopen after pre-ack restart");
+        let writer = SourceWriter::new_for_scan(reopened, source_id.clone(), 7)
+            .expect("reopened Finder source writer");
+        let reopened_fence = writer.current_scan_fence().expect("reopened source fence");
+        assert_eq!(reopened_fence.revision(), revision_after_commit);
+        assert_eq!(
+            writer
+                .catalog_database()
+                .read_durable_replay_prior(
+                    &source_id,
+                    fence.root_identity(),
+                    WatcherGeneration::new(7),
+                    lane.generation(),
+                )
+                .expect("reopened Finder prior")
+                .expect("committed prior survives restart"),
+            committed_prior
+        );
+        for path in &event_paths {
+            assert!(
+                writer
+                    .catalog_database()
+                    .entry_for_path(path.path())
+                    .expect("read Finder fixture projection")
+                    .is_some()
+            );
+        }
+        let last_good_entry = writer
+            .catalog_database()
+            .entry_for_path(event_paths[0].path())
+            .expect("snapshot last-good row")
+            .expect("committed last-good row");
+        let last_good_row = (
+            last_good_entry.relative_path,
+            last_good_entry.file_size,
+            last_good_entry.modified_ns,
+            last_good_entry.content_hash,
+        );
+
+        // A duplicate of the already-committed proof remains fenced after a real database
+        // reopen. Use a fresh batch and assert both the checkpoint and last-good row survive.
+        let mut duplicate = writer
+            .catalog_database()
+            .write_batch()
+            .expect("duplicate replay batch after reopen");
+        duplicate
+            .upsert_file(event_paths[0].path(), 777, 1)
+            .expect("duplicate fixture path");
+        assert!(matches!(
+            writer.commit_watcher_replay_manifest_batch(&reopened_fence, duplicate, &prior, &proof),
+            Err(SourceWriterError::ReplayCheckpointMismatch)
+        ));
+        assert_eq!(
+            writer
+                .current_scan_fence()
+                .expect("duplicate fence")
+                .revision(),
+            revision_after_commit
+        );
+        assert_eq!(
+            writer
+                .catalog_database()
+                .read_durable_replay_prior(
+                    &source_id,
+                    fence.root_identity(),
+                    WatcherGeneration::new(7),
+                    lane.generation(),
+                )
+                .expect("duplicate checkpoint readback")
+                .expect("committed prior survives duplicate"),
+            committed_prior
+        );
+        let duplicate_row = writer
+            .catalog_database()
+            .entry_for_path(event_paths[0].path())
+            .expect("last-good row after duplicate")
+            .expect("duplicate leaves last-good row");
+        assert_eq!(
+            (
+                duplicate_row.relative_path,
+                duplicate_row.file_size,
+                duplicate_row.modified_ns,
+                duplicate_row.content_hash,
+            ),
+            last_good_row
+        );
+
+        // Prepare a current, contiguous 107..108 proof before introducing uncertainty. Its
+        // later rejection therefore demonstrates the audit marker fence, not a stale cursor.
+        let next = ReplayIngress::new(
+            SourceWatchSpec::new(
+                source_id.clone(),
+                7,
+                source_root.clone(),
+                Some(fence.root_identity().clone()),
+            ),
+            17,
+            [7; 16],
+            committed_prior.acknowledged_sequence(),
+        )
+        .expect("contiguous next replay ingress");
+        record_callback_batch(
+            &next,
+            &volume_root,
+            &[
+                MacosReplayEvent {
+                    event_id: 107,
+                    volume_relative_path: Path::new("Library/next-a.wav"),
+                    flags: fs::kFSEventStreamEventFlagItemCreated
+                        | fs::kFSEventStreamEventFlagItemIsFile,
+                },
+                MacosReplayEvent {
+                    event_id: 108,
+                    volume_relative_path: Path::new("Library/next-b.wav"),
+                    flags: fs::kFSEventStreamEventFlagItemCreated
+                        | fs::kFSEventStreamEventFlagItemIsFile,
+                },
+            ],
+        );
+        next.mark_history_complete();
+        let next_candidate = next.into_candidate();
+        assert!(next_candidate.uncertainty().is_empty());
+        let next_handoff = next_candidate
+            .into_observation_batch(7, lane.generation())
+            .expect("current contiguous proof candidate");
+        let (next_batch, next_continuous) = next_handoff.into_admission_parts();
+        assert!(next_continuous);
+        let mut next_owner =
+            ReconciliationAdmissionOwner::new(ReconciliationAdmissionSupervisor::new(limits));
+        let next_lane = next_owner
+            .begin_source(source_id.clone(), fence.root_identity().clone())
+            .expect("current next-replay lane");
+        assert_eq!(next_lane.generation(), lane.generation());
+        let next_admission = next_owner
+            .admit_replay_with_durable_prior(
+                next_batch.clone(),
+                Some(&committed_prior),
+                next_continuous,
+            )
+            .expect("contiguous current replay admission");
+        let next_ticket = match next_admission.admission().outcome() {
+            yield_library::sample_sources::reconciliation::AdmissionOutcome::Accepted(ticket) => {
+                *ticket
+            }
+            outcome => panic!("expected contiguous replay ticket, got {outcome:?}"),
+        };
+        let next_dispatched = next_owner
+            .dispatch_next()
+            .expect("dispatch contiguous replay");
+        let next_proof = next_dispatched
+            .normalized()
+            .proof()
+            .watcher_continuity()
+            .expect("contiguous current proof")
+            .clone();
+        assert_eq!(next_proof.prior_acknowledgement().sequence(), 106);
+        assert!(next_proof.replay_coverage().is_contiguous());
+        assert_eq!(next_proof.replay_coverage().after_sequence(), 106);
+        assert_eq!(next_proof.replay_coverage().through_sequence(), 108);
+        next_owner
+            .mark_dispatched(next_ticket)
+            .expect("next replay dispatched");
+        next_owner
+            .mark_applied(next_ticket)
+            .expect("next replay applied");
+
+        // The unsupported Finder shape re-enters through the same isolated owner, widens to a
+        // source audit, and cannot reuse the previous proof or advance the stored checkpoint.
+        let unsupported = ReplayIngress::new(
+            SourceWatchSpec::new(
+                source_id.clone(),
+                7,
+                source_root.clone(),
+                Some(fence.root_identity().clone()),
+            ),
+            17,
+            [7; 16],
+            committed_prior.acknowledged_sequence(),
+        )
+        .expect("uncertain replay ingress");
+        let unsupported_row = fixture
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .find(|columns| columns[3] == "unknown-event")
+            .expect("unsupported Finder fixture row");
+        let unsupported_event = MacosReplayEvent {
+            // The redacted fixture supplies the unsupported shape; place it after the
+            // independently prepared, otherwise-valid 107..108 candidate interval.
+            event_id: unsupported_row[1]
+                .parse::<u64>()
+                .expect("unsupported event ID")
+                + 2,
+            volume_relative_path: Path::new(unsupported_row[2]),
+            flags: 1 << 31,
+        };
+        record_callback_batch(&unsupported, &volume_root, &[unsupported_event]);
+        unsupported.mark_history_complete();
+        let candidate = unsupported.into_candidate();
+        assert!(
+            candidate
+                .uncertainty()
+                .contains(ReplayUncertainty::UNKNOWN_EVENT)
+        );
+        let uncertain_handoff = candidate
+            .into_observation_batch(7, lane.generation())
+            .expect("unsupported fixture reaches audit route");
+        let (uncertain_batch, uncertain_continuous) = uncertain_handoff.into_admission_parts();
+        assert!(!uncertain_continuous);
+        let mut owner =
+            ReconciliationAdmissionOwner::new(ReconciliationAdmissionSupervisor::new(limits));
+        let current_lane = owner
+            .begin_source(source_id.clone(), fence.root_identity().clone())
+            .expect("current audit lane after restart");
+        assert_eq!(current_lane.generation(), lane.generation());
+        let admission = owner
+            .admit_replay_with_durable_prior(
+                uncertain_batch,
+                Some(&committed_prior),
+                uncertain_continuous,
+            )
+            .expect("unsupported replay is explicitly uncertain");
+        let audit_request = admission
+            .audit_request()
+            .expect("unsupported shape requests source audit");
+        assert_eq!(audit_request.source_id(), &source_id);
+        assert_eq!(audit_request.root_identity(), fence.root_identity());
         let marker = owner
             .durable_audit_marker_for_replay(&admission)
-            .expect("source-wide current-lane audit marker");
+            .expect("current-lane source-wide marker");
         let retained = writer
-            .retain_watcher_replay_uncertainty(&fence, &marker)
-            .expect("source writer persists uncertainty");
-        assert_eq!(retained.source_revision(), fence.revision());
+            .retain_watcher_replay_uncertainty(&reopened_fence, &marker)
+            .expect("persist source-audit uncertainty");
+        assert_eq!(retained.source_revision(), reopened_fence.revision());
         assert_eq!(retained.source_id(), &source_id);
+        assert_eq!(retained.root_identity(), fence.root_identity());
+        assert_eq!(
+            retained.backend_stream_identity(),
+            None,
+            "the durable source-wide audit marker does not bind one callback stream"
+        );
+        assert_eq!(
+            retained.watcher_generation(),
+            Some(current_lane.generation())
+        );
+        assert_eq!(
+            writer
+                .catalog_database()
+                .read_durable_replay_uncertainty()
+                .expect("durable uncertainty state"),
+            DurableReplayUncertaintyState::Retained(retained.clone())
+        );
+        let checkpoint = writer
+            .catalog_database()
+            .get_metadata(yield_library::sample_sources::db::META_SOURCE_WATCHER_CHECKPOINT)
+            .expect("read checkpoint metadata")
+            .expect("prior checkpoint remains stored");
+        assert!(checkpoint.contains("\"event_id\":106"));
+        assert!(
+            writer
+                .catalog_database()
+                .read_durable_replay_prior(
+                    &source_id,
+                    fence.root_identity(),
+                    WatcherGeneration::new(7),
+                    current_lane.generation(),
+                )
+                .expect("uncertain prior is blocked")
+                .is_none()
+        );
+        let last_good_revision = writer.current_scan_fence().expect("audit fence").revision();
+        assert_eq!(last_good_revision, revision_after_commit);
+        let mut forbidden = writer
+            .catalog_database()
+            .write_batch()
+            .expect("rejected uncertainty publication batch");
+        for observation in next_batch.observations() {
+            for path in observation.paths() {
+                forbidden
+                    .upsert_file(path.path(), 900, 9)
+                    .expect("otherwise-valid next source fact");
+            }
+        }
+        assert!(matches!(
+            writer.commit_watcher_replay_manifest_batch(
+                &reopened_fence,
+                forbidden,
+                &committed_prior,
+                &next_proof
+            ),
+            Err(SourceWriterError::ReplayCheckpointMismatch)
+        ));
+        assert_eq!(
+            writer.current_scan_fence().unwrap().revision(),
+            revision_after_commit
+        );
+        assert!(
+            writer
+                .catalog_database()
+                .entry_for_path(Path::new("next-a.wav"))
+                .expect("rejected next replay projection")
+                .is_none()
+        );
+        let uncertain_row = writer
+            .catalog_database()
+            .entry_for_path(event_paths[0].path())
+            .expect("last-good row after uncertainty")
+            .expect("uncertainty leaves last-good row");
+        assert_eq!(
+            (
+                uncertain_row.relative_path,
+                uncertain_row.file_size,
+                uncertain_row.modified_ns,
+                uncertain_row.content_hash,
+            ),
+            last_good_row
+        );
+        assert_eq!(
+            writer
+                .catalog_database()
+                .get_metadata(yield_library::sample_sources::db::META_SOURCE_WATCHER_CHECKPOINT)
+                .expect("checkpoint after blocked valid proof"),
+            Some(checkpoint.clone())
+        );
+
+        let valid_report = finder_evidence_json(
+            "valid_finder_replay",
+            lane.generation().get(),
+            100,
+            100,
+            101,
+            106,
+            Some(106),
+            106,
+            true,
+            fence.revision(),
+            revision_after_commit,
+            "none",
+            "not_required",
+            "not_applicable",
+            "committed_once; durable_after_pre_ack_restart",
+        );
+        let uncertain_report = finder_evidence_json(
+            "unsupported_finder_shape",
+            current_lane.generation().get(),
+            committed_prior.acknowledged_sequence(),
+            committed_prior.acknowledged_sequence(),
+            107,
+            108,
+            Some(108),
+            committed_prior.acknowledged_sequence(),
+            false,
+            revision_after_commit,
+            last_good_revision,
+            "unknown_event",
+            "retained_source_audit",
+            "omitted_source_wide_marker",
+            "checkpoint_not_advanced; last_good_projection_retained",
+        );
+        for report in [&valid_report, &uncertain_report] {
+            assert!(report.len() <= 2048, "redacted evidence remains bounded");
+            assert!(!report.contains(source_root.to_string_lossy().as_ref()));
+            assert!(
+                !report.contains("kick.wav"),
+                "raw Finder paths are not reported"
+            );
+            println!("YIELD_FINDER_CONTINUITY_EVIDENCE={report}");
+        }
         assert_eq!(
             writer
                 .catalog_database()
@@ -543,5 +1010,55 @@ mod tests {
                 .expect("source-owned readback"),
             DurableReplayUncertaintyState::Retained(retained)
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finder_evidence_json(
+        case: &str,
+        watcher_generation: u64,
+        prior_ack: u64,
+        started_after: u64,
+        first_sequence: u64,
+        last_sequence: u64,
+        covered_through: Option<u64>,
+        ack_after: u64,
+        barrier_advanced: bool,
+        source_revision_before: u64,
+        source_revision_after: u64,
+        uncertainty: &str,
+        audit_disposition: &str,
+        audit_marker_stream_identity: &str,
+        outcome: &str,
+    ) -> String {
+        let covered_region = covered_through.map_or_else(
+            || "null".to_owned(),
+            |through| {
+                format!("{{\"after\":{prior_ack},\"through\":{through},\"contiguous\":true}}")
+            },
+        );
+        format!(
+            "{{\"schema\":\"yield.finder-continuity-evidence.v1\",\
+             \"case\":\"{case}\",\
+             \"source_identity_ref\":\"fixture-source-01\",\
+             \"root_identity_ref\":\"fixture-root-01\",\
+             \"stream_identity\":{{\"backend\":\"fsevents\",\"device\":17,\
+             \"volume_uuid\":\"redacted-fixture-01\",\"matched\":true}},\
+             \"audit_marker_stream_identity\":\"{audit_marker_stream_identity}\",\
+             \"lifecycle_generation\":7,\"watcher_generation\":{watcher_generation},\
+             \"cursor\":{{\"prior_ack\":{prior_ack},\"started_after\":{started_after},\
+             \"first_sequence\":{first_sequence},\"last_sequence\":{last_sequence},\
+             \"durable_ack_after\":{ack_after}}},\
+             \"barrier\":{{\"before\":{prior_ack},\"after\":{ack_after},\
+             \"advanced\":{barrier_advanced}}},\
+             \"covered_region\":{covered_region},\
+             \"source_revision\":{{\"before\":{source_revision_before},\
+             \"after\":{source_revision_after}}},\
+             \"uncertainty\":[\"{uncertainty}\"],\
+             \"audit_disposition\":\"{audit_disposition}\",\
+             \"outcome\":\"{outcome}\",\
+             \"restart\":\"actual_profile_sqlite_reopen_before_case\",\
+             \"native_fsevents\":\"blocked_not_exercised_synthetic_fixture_only\",\
+             \"native_ui\":\"blocked_all_UI_controls_paused\"}}"
+        )
     }
 }
