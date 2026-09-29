@@ -745,6 +745,95 @@ impl SourceWriter {
         }
     }
 
+    /// Commit one bounded replay manifest delta and its acknowledgement in the same transaction.
+    ///
+    /// The caller keeps the admission ticket and raw batch until this returns a committed
+    /// checkpoint. A stale revision, uncertain marker, or mismatched prior rolls the prepared
+    /// manifest batch back, so no replay cursor can overtake its source facts.
+    pub fn commit_watcher_replay_manifest_batch(
+        &self,
+        expected: &SourceScanFence,
+        mut batch: SourceWriteBatch<'_>,
+        prior: &ReplayPriorToken,
+        proof: &WatcherContinuityProof,
+    ) -> Result<(ManifestCommitResult, ReplayPriorToken), SourceWriterError> {
+        if !std::ptr::eq(batch.owner, &self.database) {
+            return Err(SourceWriterError::InvalidRequest(
+                "replay batch belongs to another source database",
+            ));
+        }
+        self.validate_scan_fence(expected)?;
+        if prior.source_id() != expected.source_id()
+            || prior.root_identity() != expected.root_identity()
+            || proof.source_id() != expected.source_id()
+            || proof.root_identity() != expected.root_identity()
+            || proof.backend_stream_identity() != prior.backend_stream_identity()
+            || proof.watcher_generation() != prior.watcher_generation()
+            || proof.prior_acknowledgement().sequence() != prior.acknowledged_sequence()
+        {
+            return Err(SourceWriterError::ReplayCheckpointMismatch);
+        }
+        if !batch.matches_revision(expected.revision())? {
+            return Err(SourceWriterError::StaleRevision {
+                expected: expected.revision(),
+                actual: batch.get_revision()?,
+            });
+        }
+        if batch
+            .coordination_metadata(META_SOURCE_WATCHER_UNCERTAINTY)?
+            .is_some()
+        {
+            return Err(SourceWriterError::ReplayCheckpointMismatch);
+        }
+        let stored = batch.coordination_metadata(META_SOURCE_WATCHER_CHECKPOINT)?;
+        let stored_prior = stored.as_deref().and_then(|value| {
+            parse_durable_replay_prior(
+                value,
+                expected.source_id(),
+                expected.root_identity(),
+                WatcherGeneration::new(expected.lifecycle_generation()),
+                prior.watcher_generation(),
+            )
+        });
+        if stored_prior.as_ref() != Some(prior) {
+            return Err(SourceWriterError::ReplayCheckpointMismatch);
+        }
+        let committed_revision = expected
+            .revision()
+            .checked_add(1)
+            .ok_or(SourceWriterError::ReplayCheckpointMismatch)?;
+        let encoded =
+            encode_replay_checkpoint(proof, committed_revision, expected.lifecycle_generation())
+                .ok_or(SourceWriterError::ReplayCheckpointMismatch)?;
+        if encoded.len() > 16 * 1024 {
+            return Err(SourceWriterError::InvalidRequest(
+                "watcher replay checkpoint exceeds the bounded metadata size",
+            ));
+        }
+        batch.set_metadata(META_SOURCE_WATCHER_CHECKPOINT, &encoded)?;
+        let manifest = batch.commit_with_bounded_manifest_changes(expected.revision())?;
+        if manifest.revision != committed_revision {
+            return Err(SourceWriterError::ReplayCheckpointOutcomeUncertain {
+                event_id: proof.replay_coverage().through_sequence(),
+            });
+        }
+        match self.database.read_durable_replay_prior(
+            expected.source_id(),
+            expected.root_identity(),
+            WatcherGeneration::new(expected.lifecycle_generation()),
+            prior.watcher_generation(),
+        ) {
+            Ok(Some(token))
+                if token.acknowledged_sequence() == proof.replay_coverage().through_sequence() =>
+            {
+                Ok((manifest, token))
+            }
+            Ok(_) | Err(_) => Err(SourceWriterError::ReplayCheckpointOutcomeUncertain {
+                event_id: proof.replay_coverage().through_sequence(),
+            }),
+        }
+    }
+
     /// Persist the first replay prior after a complete, revision-matched source audit and a
     /// certain live FSEvents capture with no changed source paths.
     ///
