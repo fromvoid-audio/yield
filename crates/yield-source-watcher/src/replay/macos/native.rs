@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fsevent_sys as fs_event;
 use fsevent_sys::core_foundation as cf;
@@ -42,6 +42,77 @@ pub enum NativeReplayError {
     TimedOut,
     /// A physical identity or event cursor failed ingress validation.
     InvalidIdentity(ReplayStartError),
+    /// A device-local event cursor could not be captured before the audit.
+    CursorUnavailable,
+}
+
+/// A live, bounded device stream started before an authoritative source audit.
+///
+/// Dropping the session stops its worker. `finish` flushes events generated through the audit
+/// boundary and returns only a candidate; it does not grant replay or checkpoint authority.
+pub struct BootstrapCapture {
+    stop: mpsc::SyncSender<()>,
+    result: mpsc::Receiver<Result<ReplayCandidate, NativeReplayError>>,
+}
+
+impl BootstrapCapture {
+    /// Start a device-local FSEvents stream and wait until it is active before returning.
+    pub fn start(spec: SourceWatchSpec, timeout: Duration) -> Result<Self, NativeReplayError> {
+        if timeout.is_zero() {
+            return Err(NativeReplayError::InvalidTimeout);
+        }
+        if CAPTURE_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(NativeReplayError::Busy);
+        }
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (stop_tx, stop_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        if std::thread::Builder::new()
+            .name("yield-fsevents-bootstrap".into())
+            .spawn(move || {
+                let active = ActiveCapture;
+                let result = capture_live_on_worker(spec, ready_tx, stop_rx);
+                drop(active);
+                let _ = result_tx.send(result);
+            })
+            .is_err()
+        {
+            CAPTURE_ACTIVE.store(false, Ordering::Release);
+            return Err(NativeReplayError::WorkerUnavailable);
+        }
+        match ready_rx.recv_timeout(timeout) {
+            Ok(Ok(())) => Ok(Self {
+                stop: stop_tx,
+                result: result_rx,
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(RecvTimeoutError::Timeout) => Err(NativeReplayError::TimedOut),
+            Err(RecvTimeoutError::Disconnected) => match result_rx.recv() {
+                Ok(Err(error)) => Err(error),
+                _ => Err(NativeReplayError::WorkerUnavailable),
+            },
+        }
+    }
+
+    /// Stop after an audit, flush the active stream, and return its bounded event candidate.
+    pub fn finish(self, timeout: Duration) -> Result<ReplayCandidate, NativeReplayError> {
+        if timeout.is_zero() {
+            return Err(NativeReplayError::InvalidTimeout);
+        }
+        let _ = self.stop.send(());
+        self.result
+            .recv_timeout(timeout)
+            .unwrap_or(Err(NativeReplayError::TimedOut))
+    }
+}
+
+impl Drop for BootstrapCapture {
+    fn drop(&mut self) {
+        let _ = self.stop.try_send(());
+    }
 }
 
 /// Capture bounded historical changes after `after_event_id` from the source's device stream.
@@ -121,6 +192,157 @@ struct CallbackContext {
     volume_root: PathBuf,
     run_loop: cf::CFRunLoopRef,
     seen: usize,
+    stop_after_history: bool,
+    history_done: bool,
+}
+
+fn capture_live_on_worker(
+    spec: SourceWatchSpec,
+    ready: mpsc::SyncSender<Result<(), NativeReplayError>>,
+    stop: mpsc::Receiver<()>,
+) -> Result<ReplayCandidate, NativeReplayError> {
+    let root = spec.root().to_path_buf();
+    let metadata = fs::metadata(&root).map_err(|_| NativeReplayError::RootChanged)?;
+    if !metadata.is_dir() || fs::canonicalize(&root).ok().as_deref() != Some(root.as_path()) {
+        return Err(NativeReplayError::RootChanged);
+    }
+    let expected_root = spec
+        .root_identity()
+        .cloned()
+        .ok_or(NativeReplayError::RootChanged)?;
+    if physical_root_identity(&root, &metadata).as_ref() != Some(&expected_root) {
+        return Err(NativeReplayError::RootChanged);
+    }
+    let device =
+        libc::dev_t::try_from(metadata.dev()).map_err(|_| NativeReplayError::StreamUnavailable)?;
+    let volume_root = find_volume_root(&root, metadata.dev())?;
+    let uuid = volume_uuid(device)?;
+    // A device-local cursor is necessary: the host-wide cursor cannot identify a removable
+    // volume's history. The live stream starts before the caller can begin its audit.
+    // Despite the CFAbsoluteTime parameter type, FSEvents.h specifies a POSIX epoch value.
+    // CFAbsoluteTimeGetCurrent uses the 2001 epoch and would usually return cursor zero here.
+    let posix_now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| NativeReplayError::CursorUnavailable)?
+        .as_secs_f64();
+    let cursor = unsafe { FSEventsGetLastEventIdForDeviceBeforeTime(device, posix_now) };
+    // Zero is a valid beginning-of-history cursor on a fresh test volume. The bounded ingress
+    // still rejects an oversized history; `u64::MAX` is the unrepresentable since-now sentinel.
+    if cursor == u64::MAX {
+        return Err(NativeReplayError::CursorUnavailable);
+    }
+    let ingress = ReplayIngress::new(spec.clone(), metadata.dev(), uuid, cursor)
+        .map_err(NativeReplayError::InvalidIdentity)?;
+    let context = Box::into_raw(Box::new(CallbackContext {
+        ingress,
+        volume_root,
+        run_loop: ptr::null_mut(),
+        seen: 0,
+        stop_after_history: false,
+        history_done: false,
+    }));
+    let stream = unsafe { create_stream(&root, &(*context).volume_root, device, cursor, context) };
+    let Some(stream) = stream else {
+        unsafe { drop(Box::from_raw(context)) };
+        return Err(NativeReplayError::StreamUnavailable);
+    };
+    if unsafe { fs_event::FSEventStreamGetDeviceBeingWatched(stream) } != device {
+        unsafe {
+            fs_event::FSEventStreamInvalidate(stream);
+            fs_event::FSEventStreamRelease(stream);
+            drop(Box::from_raw(context));
+        }
+        return Err(NativeReplayError::StreamUnavailable);
+    }
+    let run_loop = unsafe { cf::CFRunLoopGetCurrent() };
+    unsafe {
+        (*context).run_loop = run_loop;
+        fs_event::FSEventStreamScheduleWithRunLoop(stream, run_loop, cf::kCFRunLoopDefaultMode);
+    }
+    if unsafe { fs_event::FSEventStreamStart(stream) } == 0 {
+        unsafe {
+            fs_event::FSEventStreamInvalidate(stream);
+            fs_event::FSEventStreamRelease(stream);
+            drop(Box::from_raw(context));
+        }
+        return Err(NativeReplayError::StreamUnavailable);
+    }
+    // The device time lookup may conservatively include events from before this capture.
+    // Drain that history while the audit has not begun, then use the stream's own device-local
+    // cursor as the exact start of the live audit interval.
+    while !unsafe { (*context).history_done } && unsafe { (*context).seen } < MAX_REPLAY_EVENTS {
+        if !matches!(stop.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+            unsafe {
+                fs_event::FSEventStreamStop(stream);
+                fs_event::FSEventStreamInvalidate(stream);
+                fs_event::FSEventStreamRelease(stream);
+                drop(Box::from_raw(context));
+            }
+            return Err(NativeReplayError::TimedOut);
+        }
+        unsafe { CFRunLoopRunInMode(cf::kCFRunLoopDefaultMode, 0.025, 1) };
+    }
+    let baseline = unsafe { fs_event::FSEventStreamGetLatestEventId(stream) };
+    let ready_for_audit = unsafe { (*context).history_done }
+        && baseline >= cursor
+        && baseline != u64::MAX
+        && fs::metadata(&root)
+            .ok()
+            .and_then(|current| physical_root_identity(&root, &current))
+            .as_ref()
+            == Some(&expected_root)
+        && volume_uuid(device).ok() == Some(uuid);
+    if !ready_for_audit {
+        unsafe {
+            fs_event::FSEventStreamStop(stream);
+            fs_event::FSEventStreamInvalidate(stream);
+            fs_event::FSEventStreamRelease(stream);
+            drop(Box::from_raw(context));
+        }
+        return Err(NativeReplayError::StreamUnavailable);
+    }
+    let live_ingress = match ReplayIngress::new(spec, metadata.dev(), uuid, baseline) {
+        Ok(ingress) => ingress,
+        Err(error) => {
+            unsafe {
+                fs_event::FSEventStreamStop(stream);
+                fs_event::FSEventStreamInvalidate(stream);
+                fs_event::FSEventStreamRelease(stream);
+                drop(Box::from_raw(context));
+            }
+            return Err(NativeReplayError::InvalidIdentity(error));
+        }
+    };
+    live_ingress.mark_history_complete();
+    unsafe {
+        (*context).ingress = live_ingress;
+        (*context).seen = 0;
+    }
+    if ready.send(Ok(())).is_ok() {
+        // Short run-loop slices make a fast audit/finish handshake safe without racing a
+        // cross-thread CFRunLoopStop before the run loop has entered.
+        while matches!(stop.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+            unsafe { CFRunLoopRunInMode(cf::kCFRunLoopDefaultMode, 0.025, 1) };
+        }
+        // Flush while the stream is still active. A blocked flush leaves the worker owning all
+        // CoreFoundation objects; the caller's finish deadline still returns promptly.
+        unsafe { FSEventStreamFlushSync(stream) };
+    }
+    unsafe {
+        fs_event::FSEventStreamStop(stream);
+        fs_event::FSEventStreamInvalidate(stream);
+        fs_event::FSEventStreamRelease(stream);
+    }
+    let context = unsafe { Box::from_raw(context) };
+    let final_metadata = fs::metadata(&root).map_err(|_| NativeReplayError::RootChanged)?;
+    if physical_root_identity(&root, &final_metadata).as_ref() != Some(&expected_root)
+        || fs::canonicalize(&root).ok().as_deref() != Some(root.as_path())
+        || final_metadata.dev() != metadata.dev()
+        || volume_uuid(device).ok() != Some(uuid)
+    {
+        context.ingress.mark_reason(ReplayUncertainty::ROOT_CHANGED);
+    }
+    Ok(context.ingress.into_candidate())
 }
 
 fn capture_on_worker(
@@ -151,6 +373,8 @@ fn capture_on_worker(
         volume_root,
         run_loop: ptr::null_mut(),
         seen: 0,
+        stop_after_history: true,
+        history_done: false,
     }));
     let stream = unsafe {
         create_stream(
@@ -378,7 +602,10 @@ extern "C" fn callback(
             },
         );
         if is_done {
-            unsafe { cf::CFRunLoopStop(context.run_loop) };
+            context.history_done = true;
+            if context.stop_after_history {
+                unsafe { cf::CFRunLoopStop(context.run_loop) };
+            }
         }
     }
     context.seen += bounded;
@@ -387,21 +614,39 @@ extern "C" fn callback(
 #[link(name = "CoreServices", kind = "framework")]
 unsafe extern "C" {
     fn FSEventsCopyUUIDForDevice(device: libc::dev_t) -> cf::CFRef;
+    fn FSEventsGetLastEventIdForDeviceBeforeTime(device: libc::dev_t, time: f64) -> u64;
+    fn FSEventStreamFlushSync(stream: fs_event::FSEventStreamRef);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFUUIDCreateString(allocator: cf::CFAllocatorRef, uuid: cf::CFRef) -> cf::CFStringRef;
     fn CFRetain(value: cf::CFRef) -> cf::CFRef;
+    fn CFRunLoopRunInMode(
+        mode: cf::CFStringRef,
+        seconds: f64,
+        return_after_source_handled: u8,
+    ) -> i32;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use yield_library::sample_sources::SourceId;
+
+    static CAPTURE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn capture_test_guard() -> MutexGuard<'static, ()> {
+        CAPTURE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn captures_native_history_for_a_disposable_source() {
+        let _capture_guard = capture_test_guard();
         let temp = tempfile::tempdir().expect("temporary source");
         let root = fs::canonicalize(temp.path()).expect("canonical source");
         let metadata = fs::metadata(&root).expect("source metadata");
@@ -412,10 +657,28 @@ mod tests {
             root,
             Some(identity),
         );
-        let since = unsafe { fs_event::FSEventsGetCurrentEventId() };
+        let seed = BootstrapCapture::start(spec.clone(), Duration::from_secs(5))
+            .expect("device-local seed stream");
+        fs::write(temp.path().join("seed.wav"), b"seed").expect("seed event");
+        let seed = seed.finish(Duration::from_secs(5)).expect("seed capture");
+        let since = seed.last_seen().expect("device-local event cursor");
         fs::write(temp.path().join("kick.wav"), b"sample").expect("changed sample");
-        let candidate =
-            capture_history(spec, since, Duration::from_secs(5)).expect("native history capture");
+        // FSEvents can publish a just-written file after an initial HistoryDone callback.
+        // A later capture must still replay it from the exact device-local cursor.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let candidate = loop {
+            let candidate = capture_history(spec.clone(), since, Duration::from_secs(5))
+                .expect("native history capture");
+            if candidate
+                .events()
+                .iter()
+                .any(|event| event.relative_path() == Path::new("kick.wav"))
+            {
+                break candidate;
+            }
+            assert!(Instant::now() < deadline, "{candidate:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        };
         assert_eq!(candidate.started_after(), since);
         assert!(candidate.history_complete());
         assert!(
@@ -431,6 +694,62 @@ mod tests {
                     .uncertainty()
                     .contains(ReplayUncertainty::MUST_SCAN_SUBDIRS),
             "{candidate:?}"
+        );
+    }
+
+    #[test]
+    fn live_bootstrap_capture_starts_before_audit_and_flushes_changes() {
+        let _capture_guard = capture_test_guard();
+        let temp = tempfile::tempdir().expect("temporary source");
+        let root = fs::canonicalize(temp.path()).expect("canonical source");
+        let metadata = fs::metadata(&root).expect("source metadata");
+        let identity = physical_root_identity(&root, &metadata).expect("physical root identity");
+        let spec = SourceWatchSpec::new(
+            SourceId::from_string("native-bootstrap"),
+            1,
+            root,
+            Some(identity),
+        );
+        let capture = BootstrapCapture::start(spec, Duration::from_secs(5))
+            .expect("live stream ready before the audit boundary");
+        fs::write(temp.path().join("kick.wav"), b"sample").expect("audit-overlap mutation");
+        let candidate = capture
+            .finish(Duration::from_secs(5))
+            .expect("bounded live capture");
+        assert!(candidate.history_complete(), "{candidate:?}");
+        assert!(
+            candidate
+                .events()
+                .iter()
+                .any(|event| event.relative_path() == Path::new("kick.wav")),
+            "{candidate:?}"
+        );
+    }
+
+    #[test]
+    fn live_bootstrap_capture_rejects_root_replacement() {
+        let _capture_guard = capture_test_guard();
+        let temp = tempfile::tempdir().expect("temporary parent");
+        let root = temp.path().join("source");
+        fs::create_dir(&root).expect("source root");
+        let root = fs::canonicalize(root).expect("canonical source");
+        let metadata = fs::metadata(&root).expect("source metadata");
+        let identity = physical_root_identity(&root, &metadata).expect("physical root identity");
+        let spec = SourceWatchSpec::new(
+            SourceId::from_string("replaced-bootstrap"),
+            1,
+            root.clone(),
+            Some(identity),
+        );
+        let capture =
+            BootstrapCapture::start(spec, Duration::from_secs(5)).expect("live stream ready");
+        fs::rename(&root, temp.path().join("old-source")).expect("move old root");
+        fs::create_dir(&root).expect("replacement root");
+        let outcome = capture.finish(Duration::from_secs(5));
+        assert!(
+            matches!(outcome, Err(NativeReplayError::RootChanged))
+                || matches!(outcome, Ok(ref candidate) if candidate.uncertainty().contains(ReplayUncertainty::ROOT_CHANGED)),
+            "{outcome:?}"
         );
     }
 }

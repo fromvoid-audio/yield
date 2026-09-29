@@ -30,6 +30,8 @@ use yield_library::sample_sources::db::{
     SourceDirectoryEntry, SourceDirectoryTruthPage, SourceDirectoryTruthState, SourceLeaseError,
     SourceManifestEntry, SourceWriteBatch,
 };
+#[cfg(target_os = "macos")]
+use yield_library::sample_sources::reconciliation::WatcherGeneration;
 use yield_library::sample_sources::reconciliation::{
     RootIdentity, RootRelativePath, SourceAuditCommit, SourceAuditRequest,
 };
@@ -52,6 +54,8 @@ use yield_scan::sample_sources::scanner::{
 };
 #[cfg(test)]
 use yield_source_watcher::WatchHintEvidence;
+#[cfg(target_os = "macos")]
+use yield_source_watcher::replay::macos::BootstrapCapture;
 use yield_source_watcher::{SourceWatchSpec, SourceWatcher, WatcherSignal};
 
 mod curation;
@@ -3135,6 +3139,7 @@ fn handle_command(
                 sources,
                 AuditTrigger::Explicit,
                 test_gate,
+                watcher_mode,
             );
             false
         }
@@ -4216,6 +4221,7 @@ fn request_audit(
     sources: &mut HashMap<SourceId, RegisteredSource>,
     trigger: AuditTrigger,
     test_gate: Option<&Arc<CatalogTestGate>>,
+    watcher_mode: WatcherMode,
 ) -> AuditDisposition {
     let Some(current_generation) = sources
         .get(&source_id)
@@ -4282,7 +4288,16 @@ fn request_audit(
                 || token.load(Ordering::Acquire),
             )
         })
-        .and_then(|()| audit_source(source, profile_guard, &source_id, &token, admission));
+        .and_then(|()| {
+            audit_source(
+                source,
+                profile_guard,
+                &source_id,
+                &token,
+                admission,
+                watcher_mode,
+            )
+        });
     let disposition = match result {
         Ok(snapshot) => {
             source.known_root_identity = Some(snapshot.root_identity.clone());
@@ -5501,6 +5516,7 @@ fn audit_source(
     source_id: &SourceId,
     token: &Arc<AtomicBool>,
     admission: &Arc<Mutex<AdmissionState>>,
+    watcher_mode: WatcherMode,
 ) -> Result<CatalogSnapshot, CatalogError> {
     profile_guard.validate_current().map_err(|error| {
         catalog_error_from_db_for_source(source_id, SourceDbError::ProfileOwnership(error))
@@ -5518,6 +5534,39 @@ fn audit_source(
             detail: String::from("root identity differs from the retained catalog snapshot"),
         });
     }
+    #[cfg(target_os = "macos")]
+    let bootstrap_capture = if matches!(watcher_mode, WatcherMode::Native)
+        && source
+            .database
+            .read_durable_replay_prior(
+                source_id,
+                &before_identity,
+                WatcherGeneration::new(source.lifecycle_generation),
+                WatcherGeneration::new(source.lifecycle_generation),
+            )
+            .map_err(|error| catalog_error_from_db_for_source(source_id, error))?
+            .is_none()
+    {
+        let spec = SourceWatchSpec::new(
+            source_id.clone(),
+            source.lifecycle_generation,
+            source.root.clone(),
+            Some(before_identity.clone()),
+        );
+        match BootstrapCapture::start(spec, Duration::from_secs(2)) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                eprintln!(
+                    "yield watcher replay bootstrap for {source_id:?}: stream start: {error:?}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = watcher_mode;
     let writer = CatalogScanWriter {
         profile_guard,
         database: &source.database,
@@ -5557,6 +5606,62 @@ fn audit_source(
             source_id: source_id.clone(),
             detail: String::from("root identity changed during authoritative audit"),
         });
+    }
+    if !publication_is_current(
+        admission,
+        source_id,
+        source.lifecycle_generation,
+        Some(token),
+    ) {
+        return Err(CatalogError::Canceled);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(capture) = bootstrap_capture {
+        match capture.finish(Duration::from_secs(2)) {
+            Ok(candidate) => {
+                let coverage = (
+                    candidate.history_complete(),
+                    candidate.uncertainty(),
+                    candidate.events().len(),
+                );
+                if let Some(evidence) = candidate
+                    .into_bootstrap_evidence(WatcherGeneration::new(source.lifecycle_generation))
+                {
+                    if !publication_is_current(
+                        admission,
+                        source_id,
+                        source.lifecycle_generation,
+                        Some(token),
+                    ) {
+                        return Err(CatalogError::Canceled);
+                    }
+                    let result = source
+                        .database
+                        .writer
+                        .current_scan_fence()
+                        .and_then(|fence| {
+                            source.database.writer.commit_bootstrap_replay_checkpoint(
+                                &fence,
+                                &audit.audit_commit,
+                                &evidence,
+                            )
+                        });
+                    if let Err(error) = result {
+                        eprintln!(
+                            "yield watcher replay bootstrap for {source_id:?}: checkpoint: {error}"
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "yield watcher replay bootstrap for {source_id:?}: incomplete coverage: history_complete={}, uncertainty={:?}, changed_paths={}",
+                        coverage.0, coverage.1, coverage.2
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!("yield watcher replay bootstrap for {source_id:?}: capture: {error:?}");
+            }
+        }
     }
     source
         .database
@@ -9344,6 +9449,115 @@ mod tests {
             CatalogEvent::SnapshotReady { .. }
         ));
         service.shutdown();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_initial_audit_bootstraps_durable_replay_prior() {
+        let fixture = Fixture::new("catalog-native-replay-bootstrap");
+        let root = fs::canonicalize(fixture.root.path()).expect("canonical source root");
+        let source_id = SourceId::from_string("native-replay-bootstrap");
+        let service = CatalogService::start_inner(&fixture.guard, None, None, WatcherMode::Native)
+            .expect("native catalog service");
+        let snapshot = register_and_audit(&service, &root, &source_id);
+        service.shutdown();
+
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            &root,
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("reopen source catalog");
+        let prior = database
+            .read_durable_replay_prior(
+                &source_id,
+                &snapshot.root_identity,
+                WatcherGeneration::new(snapshot.lifecycle_generation),
+                WatcherGeneration::new(snapshot.lifecycle_generation),
+            )
+            .expect("read durable replay checkpoint")
+            .expect("complete native audit must bootstrap a prior");
+        fs::write(root.join("kick.wav"), b"sample").expect("later source mutation");
+        let spec = SourceWatchSpec::new(
+            source_id,
+            snapshot.lifecycle_generation,
+            root,
+            Some(snapshot.root_identity),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let candidate = yield_source_watcher::replay::macos::capture_history(
+                spec.clone(),
+                prior.acknowledged_sequence(),
+                Duration::from_secs(5),
+            )
+            .expect("capture from the durable device cursor");
+            assert_eq!(candidate.stream_identity(), prior.backend_stream_identity());
+            assert!(candidate.history_complete());
+            assert!(candidate.uncertainty().is_empty(), "{candidate:?}");
+            if candidate
+                .events()
+                .iter()
+                .any(|event| event.relative_path() == Path::new("kick.wav"))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{candidate:?}");
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn canceled_native_initial_audit_leaves_no_replay_prior() {
+        let fixture = Fixture::new("catalog-native-replay-canceled");
+        let root = fs::canonicalize(fixture.root.path()).expect("canonical source root");
+        let source_id = SourceId::from_string("native-replay-canceled");
+        let gate = Arc::new(CatalogTestGate::new());
+        let service = CatalogService::start_inner(
+            &fixture.guard,
+            Some(Arc::clone(&gate)),
+            None,
+            WatcherMode::Native,
+        )
+        .expect("native catalog service");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: root.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("register");
+        let _ = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::Registered { .. })
+        });
+        let pause = gate.arm_next_audit();
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("audit");
+        gate.wait_until_audit_entered();
+        service.cancel_audit(&source_id, 1).expect("cancel audit");
+        drop(pause);
+        let _ = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::AuditCanceled { .. })
+        });
+        service.shutdown();
+
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            &root,
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("reopen source catalog");
+        assert!(
+            database
+                .get_metadata(yield_library::sample_sources::db::META_SOURCE_WATCHER_CHECKPOINT)
+                .expect("checkpoint read")
+                .is_none()
+        );
     }
 
     #[test]

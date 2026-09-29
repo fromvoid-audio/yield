@@ -10,8 +10,9 @@ mod owner;
 mod tests;
 
 pub use adapter::{
-    AdapterAdmission, AdapterDisposition, AdapterError, LiveAuditAdmission, LiveAuditCorrelation,
-    ReconciliationAdapter, ReplayPriorToken, SyntheticObservationBatch,
+    AdapterAdmission, AdapterDisposition, AdapterError, BootstrapReplayEvidence,
+    LiveAuditAdmission, LiveAuditCorrelation, ReconciliationAdapter, ReplayPriorToken,
+    SyntheticObservationBatch,
 };
 pub use admission::{
     AdmissionError, AdmissionLaneKey, AdmissionOutcome, AdmissionRejectReason,

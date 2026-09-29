@@ -15,7 +15,7 @@ use super::{
 
 mod native;
 
-pub use native::{NativeReplayError, capture_history};
+pub use native::{BootstrapCapture, NativeReplayError, capture_history};
 
 /// One borrowed native callback record, before source-relative validation.
 #[derive(Clone, Copy, Debug)]
@@ -114,6 +114,30 @@ pub(super) fn record_callback_event(
         fs::kFSEventStreamEventFlagItemIsSymlink => ReplayPathKind::Symlink,
         _ => ReplayPathKind::Unknown,
     };
+    if condition == ReplayEventCondition::Changed
+        && kind == ReplayPathKind::File
+        && absolute
+            .strip_prefix(ingress.spec.root())
+            .ok()
+            .is_some_and(|relative| {
+                relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+                    && relative
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            ingress
+                                .spec
+                                .ignored_file_name_prefixes()
+                                .iter()
+                                .any(|prefix| name.starts_with(prefix))
+                        })
+            })
+    {
+        ingress.record_ignored_artifact(event.event_id);
+        return;
+    }
     ingress.record_with_kind(Some(event.event_id), &absolute, condition, kind);
 }
 
@@ -219,6 +243,26 @@ mod tests {
         ingress.mark_history_complete();
         let candidate = ingress.into_candidate();
         assert_eq!(candidate.events()[0].relative_path(), Path::new("Kick.wav"));
+        assert!(candidate.uncertainty().is_empty());
+    }
+
+    #[test]
+    fn source_local_database_file_advances_cursor_without_a_replay_path() {
+        let ingress = ingress();
+        record_callback_batch(
+            &ingress,
+            Path::new("/Volumes/Samples"),
+            &[MacosReplayEvent {
+                event_id: 108,
+                volume_relative_path: Path::new("Library/.yield.db-wal"),
+                flags: fs::kFSEventStreamEventFlagItemModified
+                    | fs::kFSEventStreamEventFlagItemIsFile,
+            }],
+        );
+        ingress.mark_history_complete();
+        let candidate = ingress.into_candidate();
+        assert!(candidate.events().is_empty());
+        assert_eq!(candidate.last_seen(), Some(108));
         assert!(candidate.uncertainty().is_empty());
     }
 

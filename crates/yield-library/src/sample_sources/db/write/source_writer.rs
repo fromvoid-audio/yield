@@ -26,9 +26,11 @@ use crate::sample_sources::readiness::{
     ReadinessRetryPolicy, ReadinessTarget, ReadinessWorkMutationOutcome,
 };
 use crate::sample_sources::reconciliation::{
-    RootIdentity, RootRelativePath, SourceAuditCommit, SourceAuditRequest,
+    BootstrapReplayEvidence, ReplayPriorToken, RootIdentity, RootRelativePath, SourceAuditCommit,
+    SourceAuditRequest, WatcherGeneration,
 };
 
+use super::super::replay_authority::{encode_bootstrap_checkpoint, parse_durable_replay_prior};
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
     BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, ManifestCommitResult, Rating,
@@ -547,6 +549,15 @@ pub enum SourceWriterError {
     /// The sole snapshot worker exited before completing the request.
     #[error("source snapshot owner is unavailable")]
     SnapshotOwnerUnavailable,
+    /// The first replay prior did not match the completed audit and live source lane.
+    #[error("watcher replay bootstrap evidence does not match the retained source audit")]
+    ReplayBootstrapMismatch,
+    /// Commit may have happened, but a matching durable replay prior could not be read back.
+    #[error("watcher replay bootstrap outcome is uncertain at event {event_id}")]
+    ReplayBootstrapOutcomeUncertain {
+        /// Exact native event cursor whose outcome needs readback.
+        event_id: u64,
+    },
     /// Commit acknowledgement or readback became uncertain after durable work could have run.
     #[error("source writer commit outcome is uncertain")]
     Uncertain {
@@ -577,6 +588,76 @@ enum SourceWriterFault {
 }
 
 impl SourceWriter {
+    /// Persist the first replay prior after a complete, revision-matched source audit and a
+    /// certain live FSEvents capture with no changed source paths.
+    ///
+    /// The native stream and filesystem traversal must be finished before this transaction.
+    /// Existing current authority is never rewound; a legacy or stale checkpoint can be
+    /// replaced only by this complete-audit bootstrap path.
+    pub fn commit_bootstrap_replay_checkpoint(
+        &self,
+        expected: &SourceScanFence,
+        audit: &SourceAuditCommit,
+        evidence: &BootstrapReplayEvidence,
+    ) -> Result<ReplayPriorToken, SourceWriterError> {
+        self.validate_scan_fence(expected)?;
+        if audit.committed_source_revision() != expected.revision()
+            || audit.committed_root_identity() != expected.root_identity()
+            || evidence.source_id() != expected.source_id()
+            || evidence.root_identity() != expected.root_identity()
+            || evidence.lifecycle_generation() != expected.lifecycle_generation()
+        {
+            return Err(SourceWriterError::ReplayBootstrapMismatch);
+        }
+        let encoded = encode_bootstrap_checkpoint(evidence, expected.revision())
+            .ok_or(SourceWriterError::ReplayBootstrapMismatch)?;
+        if encoded.len() > 16 * 1024 {
+            return Err(SourceWriterError::InvalidRequest(
+                "watcher replay bootstrap exceeds the bounded metadata size",
+            ));
+        }
+        let mut batch = self.database.write_batch()?;
+        if !batch.matches_revision(expected.revision())? {
+            return Err(SourceWriterError::StaleRevision {
+                expected: expected.revision(),
+                actual: batch.get_revision()?,
+            });
+        }
+        let stored = batch.get_metadata(super::super::META_SOURCE_WATCHER_CHECKPOINT)?;
+        if stored.as_deref() != Some(encoded.as_str()) {
+            if stored
+                .as_deref()
+                .and_then(|value| {
+                    parse_durable_replay_prior(
+                        value,
+                        expected.source_id(),
+                        expected.root_identity(),
+                        WatcherGeneration::new(expected.lifecycle_generation()),
+                        evidence.watcher_generation(),
+                    )
+                })
+                .is_some()
+            {
+                return Err(SourceWriterError::ReplayBootstrapMismatch);
+            }
+            batch.set_metadata(super::super::META_SOURCE_WATCHER_CHECKPOINT, &encoded)?;
+        }
+        batch.commit_auxiliary_state()?;
+        match self.database.read_durable_replay_prior(
+            expected.source_id(),
+            expected.root_identity(),
+            WatcherGeneration::new(expected.lifecycle_generation()),
+            evidence.watcher_generation(),
+        ) {
+            Ok(Some(token)) if token.acknowledged_sequence() == evidence.through_sequence() => {
+                Ok(token)
+            }
+            Ok(_) | Err(_) => Err(SourceWriterError::ReplayBootstrapOutcomeUncertain {
+                event_id: evidence.through_sequence(),
+            }),
+        }
+    }
+
     fn validate_readiness_revision(
         &self,
         expected: &SourceRevision,
