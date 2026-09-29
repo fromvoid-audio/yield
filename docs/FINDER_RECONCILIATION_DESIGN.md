@@ -342,6 +342,101 @@ the existing contract.
 | Commit/recovery | In the fourth downstream integration PR, interrupt before and after writer/projection/checkpoint boundaries, then restart | Idempotent recovery from the last committed boundary |
 | Native acceptance | In the fourth downstream integration PR, use the normal writable macOS development profile with real sources | User-visible refresh/reconciliation behavior and no stale-generation effects |
 
+### Redacted continuity evidence from the existing Finder fixture
+
+The macOS replay integration test
+`replay::macos::tests::disposable_profile_reports_finder_replay_continuity_and_audit`
+is the machine-readable evidence harness for the redacted `finder_v1.tsv`
+fixture. It replays supported fixture rows through a disposable source/profile
+database, commits the contiguous 101–106 interval, closes and reopens SQLite,
+and checks that a duplicate old proof cannot change the projection or durable
+cursor. It then holds a valid contiguous 107–108 proof, retains the unsupported
+fixture uncertainty, and checks that this otherwise-valid candidate cannot
+publish or advance the barrier. The two emitted JSON lines are prefixed with
+`YIELD_FINDER_CONTINUITY_EVIDENCE=` for capture. The payload contains only
+stable fixture references, redacted stream identity, bounded sequence/revision
+facts, and explicit blocked-native status; it never contains a source path or a
+Finder filename. The profile and root are temporary and isolated. The fixture
+uses synthetic callback records, so these records are not evidence of native
+FSEvents delivery or Finder UI acceptance.
+
+Run and capture the evidence from the repository root:
+
+```sh
+set -o pipefail
+cargo test --locked -p yield-source-watcher \
+  disposable_profile_reports_finder_replay_continuity_and_audit \
+  -- --test-threads=1 --nocapture 2>&1 \
+  | tee /tmp/yield-finder-continuity.log
+```
+
+Extract and validate the emitted JSON using the system Python standard library
+(no Rust dependency or additional reporting framework). Keep the raw Cargo log
+separate because it includes local compiler paths; the `.jsonl` file contains
+only the two redacted records:
+
+```sh
+python3 - /tmp/yield-finder-continuity.log /tmp/yield-finder-continuity.jsonl <<'PY'
+import json
+import sys
+
+marker = "YIELD_FINDER_CONTINUITY_EVIDENCE="
+reports = [
+    json.loads(line.split(marker, 1)[1])
+    for line in open(sys.argv[1], encoding="utf-8")
+    if marker in line
+]
+assert len(reports) == 2, len(reports)
+required = {
+    "schema", "case", "source_identity_ref", "root_identity_ref",
+    "stream_identity", "audit_marker_stream_identity", "lifecycle_generation",
+    "watcher_generation", "cursor", "barrier", "covered_region",
+    "source_revision", "uncertainty", "audit_disposition", "outcome",
+    "restart", "native_fsevents", "native_ui",
+}
+for report in reports:
+    assert set(report) == required
+    assert report["schema"] == "yield.finder-continuity-evidence.v1"
+    assert len(json.dumps(report, separators=(",", ":"))) <= 2048
+    assert report["source_identity_ref"] == "fixture-source-01"
+    assert report["root_identity_ref"] == "fixture-root-01"
+    assert report["restart"] == "actual_profile_sqlite_reopen_before_case"
+    assert report["native_fsevents"] == "blocked_not_exercised_synthetic_fixture_only"
+    assert report["native_ui"] == "blocked_all_UI_controls_paused"
+    encoded = json.dumps(report)
+    assert "/Users/" not in encoded and "/tmp/" not in encoded
+    assert "kick.wav" not in encoded and "snare.wav" not in encoded
+
+valid, uncertain = reports
+assert valid["cursor"] == {
+    "prior_ack": 100, "started_after": 100, "first_sequence": 101,
+    "last_sequence": 106, "durable_ack_after": 106,
+}
+assert valid["barrier"] == {"before": 100, "after": 106, "advanced": True}
+assert valid["covered_region"] == {"after": 100, "through": 106, "contiguous": True}
+assert valid["source_revision"]["after"] == valid["source_revision"]["before"] + 1
+assert valid["audit_disposition"] == "not_required"
+assert uncertain["cursor"] == {
+    "prior_ack": 106, "started_after": 106, "first_sequence": 107,
+    "last_sequence": 108, "durable_ack_after": 106,
+}
+assert uncertain["barrier"] == {"before": 106, "after": 106, "advanced": False}
+assert uncertain["covered_region"] == {"after": 106, "through": 108, "contiguous": True}
+assert uncertain["source_revision"]["after"] == uncertain["source_revision"]["before"]
+assert uncertain["uncertainty"] == ["unknown_event"]
+assert uncertain["audit_disposition"] == "retained_source_audit"
+with open(sys.argv[2], "w", encoding="utf-8") as artifact:
+    for report in reports:
+        artifact.write(json.dumps(report, separators=(",", ":")) + "\n")
+print("validated 2 bounded, redacted Finder continuity evidence records")
+PY
+```
+
+This output is test evidence only. Record the tested commit separately in review
+metadata; do not place branch names, commit IDs, or machine paths in the bounded
+payload. Native FSEvents capture and manual Finder/UI acceptance remain separate
+gates.
+
 ## Explicit non-goals and risks
 
 Non-goals are directory truth, recursive hydration, a new persistent
