@@ -127,11 +127,16 @@ pub(super) fn record_callback_event(
                         .file_name()
                         .and_then(|name| name.to_str())
                         .is_some_and(|name| {
-                            ingress
-                                .spec
-                                .ignored_file_name_prefixes()
-                                .iter()
-                                .any(|prefix| name.starts_with(prefix))
+                            // Finder writes this exact metadata filename while browsing.
+                            // Only ignore a known file event: a directory with this name,
+                            // an audio filename beginning with it, or uncertain delivery
+                            // must still reach authoritative reconciliation.
+                            name == ".DS_Store"
+                                || ingress
+                                    .spec
+                                    .ignored_file_name_prefixes()
+                                    .iter()
+                                    .any(|prefix| name.starts_with(prefix))
                         })
             })
     {
@@ -270,6 +275,68 @@ mod tests {
         assert!(candidate.events().is_empty());
         assert_eq!(candidate.last_seen(), Some(108));
         assert!(candidate.uncertainty().is_empty());
+    }
+
+    #[test]
+    fn finder_metadata_file_advances_cursor_without_reconciliation() {
+        let ingress = ingress();
+        record_callback_batch(
+            &ingress,
+            Path::new("/Volumes/Samples"),
+            &[MacosReplayEvent {
+                event_id: 108,
+                volume_relative_path: Path::new("Library/.DS_Store"),
+                flags: fs::kFSEventStreamEventFlagItemModified
+                    | fs::kFSEventStreamEventFlagItemIsFile,
+            }],
+        );
+        ingress.mark_history_complete();
+        let candidate = ingress.into_candidate();
+        assert!(candidate.events().is_empty());
+        assert_eq!(candidate.last_seen(), Some(108));
+        assert!(candidate.history_complete());
+        assert!(candidate.uncertainty().is_empty());
+    }
+
+    #[test]
+    fn finder_metadata_filter_preserves_audio_directories_and_uncertain_delivery() {
+        for (path, flags) in [
+            (
+                "Library/.DS_Store.wav",
+                fs::kFSEventStreamEventFlagItemIsFile,
+            ),
+            ("Library/.DS_Store", fs::kFSEventStreamEventFlagItemIsDir),
+            ("Library/.DS_Store", 0),
+        ] {
+            let ingress = ingress();
+            record_callback_batch(
+                &ingress,
+                Path::new("/Volumes/Samples"),
+                &[MacosReplayEvent {
+                    event_id: 108,
+                    volume_relative_path: Path::new(path),
+                    flags: flags | fs::kFSEventStreamEventFlagItemModified,
+                }],
+            );
+            assert_eq!(ingress.into_candidate().events().len(), 1, "{path}");
+        }
+        let ingress = ingress();
+        record_callback_batch(
+            &ingress,
+            Path::new("/Volumes/Samples"),
+            &[MacosReplayEvent {
+                event_id: 108,
+                volume_relative_path: Path::new("Library/.DS_Store"),
+                flags: fs::kFSEventStreamEventFlagItemIsFile
+                    | fs::kFSEventStreamEventFlagUserDropped,
+            }],
+        );
+        assert!(
+            ingress
+                .into_candidate()
+                .uncertainty()
+                .contains(ReplayUncertainty::DELIVERY_LOST)
+        );
     }
 
     #[test]
