@@ -31,6 +31,7 @@ mod rename_destinations;
 mod rename_metadata;
 mod replay_authority;
 pub(crate) use replay_authority::ValidatedReplayAuthority;
+pub use replay_authority::{DurableReplayUncertainty, DurableReplayUncertaintyState};
 /// SQLite schema management for sample source databases.
 pub mod schema;
 mod source_authority;
@@ -123,6 +124,8 @@ pub const META_LAST_MANIFEST_AUDIT_AT: &str = "last_manifest_audit_at_v1";
 /// The value is owned by the native source watcher. It is deliberately separate from manifest
 /// revisions: a watcher cursor proves what needs replaying, not that the manifest itself changed.
 pub const META_SOURCE_WATCHER_CHECKPOINT: &str = "source_watcher_checkpoint_v1";
+/// Bounded source-owned marker requiring a complete audit before replay authority is reused.
+pub const META_SOURCE_WATCHER_UNCERTAINTY: &str = "source_watcher_uncertainty_v1";
 /// Metadata key for the last similarity-prep scan timestamp.
 /// Metadata key storing the last data revision cleaned by deferred maintenance.
 pub const META_DEFERRED_MAINTENANCE_REVISION: &str = "deferred_maintenance_revision_v1";

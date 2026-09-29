@@ -1,17 +1,265 @@
 //! Source-owned durable watcher authority for replay admission.
 
-use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fmt;
 
 use crate::sample_sources::reconciliation::{
-    BackendStreamIdentity, BootstrapReplayEvidence, ReplayPriorToken, RootIdentity,
+    BackendStreamIdentity, BootstrapReplayEvidence, CaptureBoundary, ReplayPriorToken,
+    RetainedUncertainty, RetainedUncertaintyBoundary, RootIdentity, UncertaintyReason,
     WatcherContinuityProof, WatcherGeneration,
 };
 use crate::sample_sources::{SourceDatabase, SourceId};
 
-use super::{META_SOURCE_WATCHER_CHECKPOINT, SourceDbError};
+use super::{META_SOURCE_WATCHER_CHECKPOINT, META_SOURCE_WATCHER_UNCERTAINTY, SourceDbError};
+
+const UNCERTAINTY_FORMAT_VERSION: u8 = 1;
+const MAX_UNCERTAINTY_BYTES: usize = 16 * 1024;
+
+/// One bounded, conservative source-wide audit marker retained until a complete audit.
+///
+/// A single source-wide marker is sufficient to prevent replay from granting authority. Later
+/// markers widen its bounded evidence and move its revision watermark forward, so an audit that
+/// completed before later uncertainty cannot clear it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableReplayUncertainty {
+    source_id: SourceId,
+    root_identity: RootIdentity,
+    lifecycle_generation: u64,
+    source_revision: u64,
+    watcher_generation: Option<WatcherGeneration>,
+    backend_stream_identity: Option<BackendStreamIdentity>,
+    capture_boundary: Option<CaptureBoundary>,
+    retained_boundary: RetainedUncertaintyBoundary,
+    reasons: Vec<UncertaintyReason>,
+}
+
+impl DurableReplayUncertainty {
+    /// Borrow the source that must be audited.
+    pub fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+    /// Borrow the physical root that was active when uncertainty was retained.
+    pub fn root_identity(&self) -> &RootIdentity {
+        &self.root_identity
+    }
+    /// Return the source lifecycle that retained the marker.
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
+    }
+    /// Return the latest committed source revision at which uncertainty was retained.
+    pub const fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+    /// Return the watcher generation when it was known.
+    pub const fn watcher_generation(&self) -> Option<WatcherGeneration> {
+        self.watcher_generation
+    }
+    /// Borrow the captured backend stream identity when it was known.
+    pub fn backend_stream_identity(&self) -> Option<&BackendStreamIdentity> {
+        self.backend_stream_identity.as_ref()
+    }
+    /// Return the original capture boundary when it was known.
+    pub const fn capture_boundary(&self) -> Option<CaptureBoundary> {
+        self.capture_boundary
+    }
+    /// Return the supervisor's retained uncertainty watermark.
+    pub const fn retained_boundary(&self) -> RetainedUncertaintyBoundary {
+        self.retained_boundary
+    }
+    /// Borrow the bounded reasons retained from unresolved markers.
+    pub fn reasons(&self) -> &[UncertaintyReason] {
+        &self.reasons
+    }
+
+    pub(super) fn from_marker(
+        marker: &RetainedUncertainty,
+        source_id: &SourceId,
+        root_identity: &RootIdentity,
+        lifecycle_generation: u64,
+        source_revision: u64,
+    ) -> Option<Self> {
+        if marker.source_id() != Some(source_id)
+            || marker
+                .root_identity()
+                .is_some_and(|observed| observed != root_identity)
+            || lifecycle_generation == 0
+            || source_revision == 0
+            || marker.generation() == Some(WatcherGeneration::new(0))
+            || marker.reasons().is_empty()
+            || marker.retained_boundary().first() > marker.retained_boundary().through()
+        {
+            return None;
+        }
+        Some(Self {
+            source_id: source_id.clone(),
+            root_identity: root_identity.clone(),
+            lifecycle_generation,
+            source_revision,
+            watcher_generation: marker.generation(),
+            backend_stream_identity: marker.backend_stream_identity().cloned(),
+            capture_boundary: marker.capture_boundary(),
+            retained_boundary: marker.retained_boundary(),
+            reasons: marker.reasons().to_vec(),
+        })
+    }
+
+    pub(super) fn merged_with(mut self, newer: &Self) -> Option<Self> {
+        if self.source_id != newer.source_id || self.root_identity != newer.root_identity {
+            return None;
+        }
+        self.lifecycle_generation = newer.lifecycle_generation;
+        self.source_revision = self.source_revision.max(newer.source_revision);
+        if self.watcher_generation != newer.watcher_generation {
+            self.watcher_generation = None;
+        }
+        if self.backend_stream_identity != newer.backend_stream_identity {
+            self.backend_stream_identity = None;
+        }
+        if self.capture_boundary != newer.capture_boundary {
+            self.capture_boundary = None;
+        }
+        self.retained_boundary = RetainedUncertaintyBoundary::new(
+            self.retained_boundary
+                .first()
+                .min(newer.retained_boundary.first()),
+            self.retained_boundary
+                .through()
+                .max(newer.retained_boundary.through()),
+        );
+        self.reasons.extend_from_slice(&newer.reasons);
+        self.reasons.sort_unstable();
+        self.reasons.dedup();
+        Some(self)
+    }
+
+    pub(super) fn encode(&self) -> Option<String> {
+        if self.source_id.as_str().len() > 256
+            || self.root_identity.as_bytes().len() > 2048
+            || self
+                .backend_stream_identity
+                .as_ref()
+                .is_some_and(|stream| stream.as_bytes().len() > 128)
+            || self.reasons.len() > 32
+        {
+            return None;
+        }
+        let capture = self.capture_boundary.map(|boundary| StoredCaptureBoundary {
+            captured_at: boundary.captured_at(),
+            first_sequence: boundary.first_sequence(),
+            last_sequence: boundary.last_sequence(),
+        });
+        let stored = StoredReplayUncertainty {
+            format_version: UNCERTAINTY_FORMAT_VERSION,
+            source_id: self.source_id.as_str().to_owned(),
+            root_identity: self.root_identity.as_bytes().to_vec(),
+            lifecycle_generation: self.lifecycle_generation,
+            source_revision: self.source_revision,
+            watcher_generation: self.watcher_generation.map(WatcherGeneration::get),
+            backend_stream_identity: self
+                .backend_stream_identity
+                .as_ref()
+                .map(|stream| stream.as_bytes().to_vec()),
+            capture_boundary: capture,
+            retained_first: self.retained_boundary.first(),
+            retained_through: self.retained_boundary.through(),
+            scope: "source_audit".to_owned(),
+            reasons: self.reasons.clone(),
+        };
+        let encoded = serde_json::to_string(&stored).ok()?;
+        (encoded.len() <= MAX_UNCERTAINTY_BYTES).then_some(encoded)
+    }
+
+    pub(super) fn decode(value: &str) -> Option<Self> {
+        if value.len() > MAX_UNCERTAINTY_BYTES {
+            return None;
+        }
+        let stored: StoredReplayUncertainty = serde_json::from_str(value).ok()?;
+        if stored.format_version != UNCERTAINTY_FORMAT_VERSION
+            || stored.source_id.is_empty()
+            || stored.source_id.len() > 256
+            || stored.root_identity.is_empty()
+            || stored.root_identity.len() > 2048
+            || stored.lifecycle_generation == 0
+            || stored.source_revision == 0
+            || stored.watcher_generation == Some(0)
+            || stored
+                .backend_stream_identity
+                .as_ref()
+                .is_some_and(|stream| stream.len() > 128)
+            || stored.retained_first > stored.retained_through
+            || stored.scope != "source_audit"
+            || stored.reasons.is_empty()
+            || stored.reasons.len() > 32
+        {
+            return None;
+        }
+        let capture_boundary = match stored.capture_boundary {
+            Some(boundary) => Some(
+                CaptureBoundary::try_new(
+                    boundary.captured_at,
+                    boundary.first_sequence,
+                    boundary.last_sequence,
+                )
+                .ok()?,
+            ),
+            None => None,
+        };
+        Some(Self {
+            source_id: SourceId::from_string(stored.source_id),
+            root_identity: RootIdentity::from_bytes(stored.root_identity),
+            lifecycle_generation: stored.lifecycle_generation,
+            source_revision: stored.source_revision,
+            watcher_generation: stored.watcher_generation.map(WatcherGeneration::new),
+            backend_stream_identity: stored
+                .backend_stream_identity
+                .map(BackendStreamIdentity::from_bytes),
+            capture_boundary,
+            retained_boundary: RetainedUncertaintyBoundary::new(
+                stored.retained_first,
+                stored.retained_through,
+            ),
+            reasons: stored.reasons,
+        })
+    }
+}
+
+/// Read outcome for a source-owned replay uncertainty marker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableReplayUncertaintyState {
+    /// No unresolved source-owned marker is stored.
+    Absent,
+    /// A valid source-owned marker was reconstructed.
+    Retained(DurableReplayUncertainty),
+    /// Unknown or malformed durable state still forbids replay authority.
+    Invalid,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCaptureBoundary {
+    captured_at: u64,
+    first_sequence: Option<u64>,
+    last_sequence: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredReplayUncertainty {
+    format_version: u8,
+    source_id: String,
+    root_identity: Vec<u8>,
+    lifecycle_generation: u64,
+    source_revision: u64,
+    watcher_generation: Option<u64>,
+    backend_stream_identity: Option<Vec<u8>>,
+    capture_boundary: Option<StoredCaptureBoundary>,
+    retained_first: u64,
+    retained_through: u64,
+    scope: String,
+    reasons: Vec<UncertaintyReason>,
+}
 
 const CHECKPOINT_FORMAT_VERSION: u64 = 4;
 const CHECKPOINT_FIELDS: [&str; 8] = [
@@ -94,6 +342,23 @@ impl ValidatedReplayAuthority {
 
 /// Read a durable replay prior from the source database's existing watcher checkpoint.
 impl SourceDatabase {
+    /// Read the bounded source-owned uncertainty that requires an authoritative audit.
+    /// Malformed state remains an explicit blocking outcome instead of disappearing.
+    pub fn read_durable_replay_uncertainty(
+        &self,
+    ) -> Result<DurableReplayUncertaintyState, SourceDbError> {
+        let Some(value) = self.get_metadata(META_SOURCE_WATCHER_UNCERTAINTY)? else {
+            return Ok(DurableReplayUncertaintyState::Absent);
+        };
+        let Some(marker) = DurableReplayUncertainty::decode(&value) else {
+            return Ok(DurableReplayUncertaintyState::Invalid);
+        };
+        if marker.source_revision() > self.get_revision()? {
+            return Ok(DurableReplayUncertaintyState::Invalid);
+        }
+        Ok(DurableReplayUncertaintyState::Retained(marker))
+    }
+
     /// Return opaque replay authority only when the stored checkpoint matches this source lane.
     ///
     /// The checkpoint parser is intentionally strict and fail-closed. In particular, legacy,
@@ -109,6 +374,13 @@ impl SourceDatabase {
         expected_source_lifecycle_generation: WatcherGeneration,
         owner_watcher_generation: WatcherGeneration,
     ) -> Result<Option<ReplayPriorToken>, SourceDbError> {
+        // Any unresolved or malformed marker blocks replay, including after a restart.
+        if self
+            .get_metadata(META_SOURCE_WATCHER_UNCERTAINTY)?
+            .is_some()
+        {
+            return Ok(None);
+        }
         let Some(value) = self.get_metadata(META_SOURCE_WATCHER_CHECKPOINT)? else {
             return Ok(None);
         };
@@ -596,6 +868,40 @@ mod tests {
         let zero = checkpoint().replace("\"source_revision\":12", "\"source_revision\":0");
         write_metadata(META_SOURCE_WATCHER_CHECKPOINT, &zero);
         assert_eq!(read(), None, "zero revision grants no replay authority");
+    }
+
+    #[test]
+    fn malformed_uncertainty_still_blocks_a_valid_replay_prior() {
+        let directory = tempdir().expect("source root");
+        let database = SourceDatabase::open_for_test_fixture_source_write(directory.path())
+            .expect("source database");
+        database
+            .set_metadata("revision", "12")
+            .expect("committed fixture revision");
+        database
+            .set_metadata(META_SOURCE_WATCHER_CHECKPOINT, &checkpoint())
+            .expect("checkpoint metadata");
+        let read = || {
+            database
+                .read_durable_replay_prior(
+                    &source_id(),
+                    &root(),
+                    WatcherGeneration::new(4),
+                    WatcherGeneration::new(4),
+                )
+                .expect("authority read")
+        };
+        assert!(read().is_some(), "valid checkpoint starts usable");
+        database
+            .set_metadata(META_SOURCE_WATCHER_UNCERTAINTY, "not-json")
+            .expect("malformed marker");
+        assert_eq!(
+            database
+                .read_durable_replay_uncertainty()
+                .expect("uncertainty read"),
+            DurableReplayUncertaintyState::Invalid,
+        );
+        assert_eq!(read(), None, "malformed marker cannot be ignored");
     }
 
     #[test]
