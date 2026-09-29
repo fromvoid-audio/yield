@@ -1345,6 +1345,18 @@ serialization; it is not OS-wide cross-user authority, a volume registry, ordina
 ledger integration. Other platforms remain fail-closed until an equivalent identity-safe
 application-data root and locking sequence is qualified.
 
+For the first OPT-1933 identity-provider milestone, the macOS production capability retains a
+clone of its acquired volume descriptor and the corresponding nonzero filesystem UUID, queried
+with `fgetattrlist(ATTR_VOL_INFO | ATTR_VOL_UUID)`.
+Acquisition, capability revalidation, and orderly handoff validate that UUID and the descriptor's
+device binding. A foreign dirty v1 marker therefore produces an actionable ambiguous-legacy
+diagnostic containing the device number, current UUID, marker path, prior owner, and generation;
+the original marker bytes are preserved. Same-profile dirty-marker continuity remains the existing
+recovery-only behavior. The lock filename and v1 marker format are still device-keyed, and no UUID
+namespace or alias migration is active in OPT-1933; the broader OPT-1932 migration remains open.
+A reused device number can therefore still encounter a preserved foreign marker that requires
+explicit reconciliation before migration.
+
 The following private OPT-1338 recovery-context slice binds that owner capability, a retained
 `BoundReserve`, and the profile-owned `OperationJournalStore` before any ledger transition. Each
 charge, spend, and release observation revalidates the journal namespace, profile identity, volume
