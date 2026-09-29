@@ -330,6 +330,7 @@ pub(super) fn run_watcher_idle_work(
         sources,
         AuditTrigger::Automatic,
         test_gate,
+        watcher_mode,
     );
     reservation.finish();
     let completed_at = Instant::now();

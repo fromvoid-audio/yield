@@ -8,7 +8,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use yield_library::sample_sources::SourceId;
-use yield_library::sample_sources::reconciliation::{BackendStreamIdentity, RootIdentity};
+use yield_library::sample_sources::reconciliation::{
+    BackendStreamIdentity, BootstrapReplayEvidence, RootIdentity, WatcherGeneration,
+};
 
 use crate::SourceWatchSpec;
 
@@ -136,6 +138,27 @@ pub struct ReplayCandidate {
 }
 
 impl ReplayCandidate {
+    /// Convert a live pre-audit capture into transport evidence only when no source path changed.
+    /// The retained source writer still needs the matching completed audit before checkpointing.
+    pub fn into_bootstrap_evidence(
+        self,
+        owner_watcher_generation: WatcherGeneration,
+    ) -> Option<BootstrapReplayEvidence> {
+        let through_sequence = self.last_seen.unwrap_or(self.started_after);
+        BootstrapReplayEvidence::from_certain_empty_capture(
+            self.source_id,
+            self.root_identity,
+            self.stream_identity,
+            self.lifecycle_generation,
+            owner_watcher_generation,
+            self.started_after,
+            through_sequence,
+            self.history_complete,
+            !self.uncertainty.is_empty(),
+            self.events.len(),
+        )
+    }
+
     /// Borrow the captured source ID.
     pub fn source_id(&self) -> &SourceId {
         &self.source_id
@@ -334,6 +357,21 @@ impl ReplayIngress {
             relative_path: relative_path.to_path_buf(),
             kind,
         });
+    }
+
+    /// Advance the native cursor for a known source-local artifact without treating it as an
+    /// audio-tree mutation. The caller must have validated the path and conservative flags.
+    #[cfg(target_os = "macos")]
+    fn record_ignored_artifact(&self, event_id: u64) {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.closed {
+            return;
+        }
+        if event_id <= self.started_after || state.last_seen.is_some_and(|last| event_id <= last) {
+            mark_uncertain(&mut state, ReplayUncertainty::NON_MONOTONIC_CURSOR);
+            return;
+        }
+        state.last_seen = Some(event_id);
     }
 
     /// Stop accepting callbacks. Late events cannot mutate the retained candidate.
