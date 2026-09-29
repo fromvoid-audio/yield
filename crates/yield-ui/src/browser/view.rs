@@ -149,7 +149,35 @@ fn sidebar_width(preferred: Option<f32>, window_width: f32, theme: &Theme) -> f3
         .clamp(MIN_SIDEBAR_WIDTH.min(maximum), maximum)
 }
 
-fn waveform_height(preferred: Option<f32>, window_height: f32, theme: &Theme) -> f32 {
+fn browser_toolbar_gap(window_width: f32, theme: &Theme) -> f32 {
+    if window_width < 1_120.0 {
+        theme.spacing.control_gap.min(4.0)
+    } else {
+        theme.spacing.control_gap
+    }
+}
+
+fn browser_toolbar_height(window_width: f32, theme: &Theme, enlarged: bool) -> f32 {
+    if !enlarged {
+        return theme.spacing.toolbar_height;
+    }
+    let rows = 2.0;
+    theme.spacing.control_height * rows
+        + browser_toolbar_gap(window_width, theme) * (rows - 1.0)
+        + theme.spacing.panel_padding * 2.0
+}
+
+fn browser_status_bar_height(theme: &Theme, enlarged: bool) -> f32 {
+    theme.spacing.status_height * if enlarged { 2.0 } else { 1.0 }
+}
+
+fn waveform_height(
+    preferred: Option<f32>,
+    window_height: f32,
+    theme: &Theme,
+    toolbar_height: f32,
+    status_height: f32,
+) -> f32 {
     let minimum = MIN_WAVEFORM_HEIGHT.max(
         theme.waveform.title_height
             + theme.waveform.metadata_height
@@ -157,8 +185,8 @@ fn waveform_height(preferred: Option<f32>, window_height: f32, theme: &Theme) ->
             + theme.spacing.waveform_min_bar_height,
     );
     let maximum = (window_height
-        - theme.spacing.toolbar_height
-        - theme.spacing.status_height
+        - toolbar_height
+        - status_height
         - theme.spacing.row_height * MIN_LIST_ROWS
         - PANE_RESIZE_RAIL)
         .max(minimum)
@@ -215,6 +243,14 @@ fn playback_type_label(playback_type: Option<PlaybackType>) -> &'static str {
     }
 }
 
+fn browser_column_width_scale(text_scale_percent: u16) -> f32 {
+    if text_scale_percent == yield_session::ENLARGED_TEXT_SCALE_PERCENT {
+        2.0
+    } else {
+        1.0
+    }
+}
+
 impl Browser {
     fn begin_column_reorder(&mut self, source: BrowserColumn, x: f32) {
         self.suppress_column_sort_click = false;
@@ -237,8 +273,10 @@ impl Browser {
         self.suppress_column_sort_click = true;
         let previous_override = self.column_layout.width_override(source);
         let previous_name_override = self.column_layout.width_override(BrowserColumn::Name);
+        let width_scale = browser_column_width_scale(self.general_settings.text_scale_percent);
         if source != BrowserColumn::Name {
-            self.column_layout.freeze_name_width(name_width);
+            self.column_layout
+                .freeze_name_width(name_width / width_scale);
         }
         self.column_gesture = Some(ColumnGesture::Resize {
             source,
@@ -269,9 +307,11 @@ impl Browser {
                 start_width,
                 ..
             } => {
+                let width_scale =
+                    browser_column_width_scale(self.general_settings.text_scale_percent);
                 if self
                     .column_layout
-                    .set_width(source, start_width + x - start_x)
+                    .set_width(source, (start_width + x - start_x) / width_scale)
                 {
                     cx.notify();
                 }
@@ -290,9 +330,14 @@ impl Browser {
                 let theme = active(cx);
                 let visibility =
                     browser_column_visibility(f32::from(window.bounds().size.width), &theme);
-                let columns =
-                    self.column_layout
-                        .resolve(&theme, visibility, f32::from(bounds.size.width));
+                let width_scale =
+                    browser_column_width_scale(self.general_settings.text_scale_percent);
+                let columns = self.column_layout.resolve(
+                    &theme,
+                    visibility,
+                    f32::from(bounds.size.width),
+                    width_scale,
+                );
                 let mut left = f32::from(bounds.origin.x) + theme.spacing.selected_marker_width;
                 let mut target = 0;
                 for column in &columns {
@@ -483,6 +528,17 @@ impl Browser {
                     self.preferred_waveform_height,
                     f32::from(window.bounds().size.height),
                     theme,
+                    browser_toolbar_height(
+                        f32::from(window.bounds().size.width),
+                        theme,
+                        self.general_settings.text_scale_percent
+                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
+                    ),
+                    browser_status_bar_height(
+                        theme,
+                        self.general_settings.text_scale_percent
+                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
+                    ),
                 ),
                 self.preferred_waveform_height,
             ),
@@ -520,6 +576,17 @@ impl Browser {
                     Some(drag.start_size + delta),
                     f32::from(window.bounds().size.height),
                     theme,
+                    browser_toolbar_height(
+                        f32::from(window.bounds().size.width),
+                        theme,
+                        self.general_settings.text_scale_percent
+                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
+                    ),
+                    browser_status_bar_height(
+                        theme,
+                        self.general_settings.text_scale_percent
+                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
+                    ),
                 ));
             }
         }
@@ -1217,6 +1284,8 @@ impl Render for Browser {
         context_menu::invalidate_if_stale(self);
         similar_sections::invalidate_if_stale(self);
         let mut theme = active(cx).clone();
+        let enlarged_text =
+            self.general_settings.text_scale_percent == yield_session::ENLARGED_TEXT_SCALE_PERCENT;
         theme.spacing.sidebar_width = sidebar_width(
             self.preferred_sidebar_width,
             f32::from(window.bounds().size.width),
@@ -1226,6 +1295,8 @@ impl Render for Browser {
             self.preferred_waveform_height,
             f32::from(window.bounds().size.height),
             &theme,
+            browser_toolbar_height(f32::from(window.bounds().size.width), &theme, enlarged_text),
+            browser_status_bar_height(&theme, enlarged_text),
         );
         let motion_frame = self.motion_frame(theme.motion, window);
         let jobs = super::job_details::snapshot(self, cx);
@@ -1270,9 +1341,12 @@ impl Render for Browser {
             - theme.spacing.sidebar_width
             - theme.spacing.selected_marker_width)
             .max(MIN_SAMPLE_NAME_WIDTH);
-        let resolved_columns =
-            self.column_layout
-                .resolve(&theme, column_visibility, available_table_width);
+        let resolved_columns = self.column_layout.resolve(
+            &theme,
+            column_visibility,
+            available_table_width,
+            browser_column_width_scale(self.general_settings.text_scale_percent),
+        );
         let name_column_width = resolved_columns
             .iter()
             .find(|column| column.id == BrowserColumn::Name)
@@ -1285,11 +1359,10 @@ impl Render for Browser {
         let row_columns = resolved_columns.clone();
         let toolbar_hover = theme.interaction.hover_fill;
         let toolbar_pressed = theme.interaction.pressed_fill;
-        let toolbar_gap = if f32::from(window.bounds().size.width) < 1_120.0 {
-            theme.spacing.control_gap.min(4.0)
-        } else {
-            theme.spacing.control_gap
-        };
+        let toolbar_gap = browser_toolbar_gap(f32::from(window.bounds().size.width), &theme);
+        let toolbar_height =
+            browser_toolbar_height(f32::from(window.bounds().size.width), &theme, enlarged_text);
+        let status_bar_height = browser_status_bar_height(&theme, enlarged_text);
         let loop_enabled = self.loop_toolbar_enabled();
         let loop_label = self.loop_toolbar_label();
         let bpm_snap_enabled = self.bpm_snap_enabled;
@@ -1721,10 +1794,14 @@ impl Render for Browser {
             )
             .child(
                 div()
+                    .debug_selector(|| "main-toolbar".into())
                     .flex()
                     .flex_none()
                     .items_center()
-                    .h(px(theme.spacing.toolbar_height))
+                    .h(px(toolbar_height))
+                    .when(enlarged_text, |element| {
+                        element.flex_wrap().content_start()
+                    })
                     .gap(px(toolbar_gap))
                     .px(px(theme.spacing.panel_padding))
                     .bg(color(theme.colors.surface_raised))
@@ -1737,6 +1814,9 @@ impl Render for Browser {
                                 - theme.spacing.panel_padding)
                                 .max(0.0)))
                             .h_full()
+                            .when(enlarged_text, |element| {
+                                element.h(px(theme.spacing.control_height))
+                            })
                             .on_mouse_down(MouseButton::Left, |_event, window, _cx| {
                                 window.start_window_move();
                             }),
@@ -2103,6 +2183,7 @@ impl Render for Browser {
                         div()
                             .min_w(px(80.0))
                             .w(px(220.0))
+                            .debug_selector(|| "browser-search-toolbar".into())
                             .relative()
                             .overflow_hidden()
                             .on_mouse_down(
@@ -2118,6 +2199,7 @@ impl Render for Browser {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .debug_selector(|| "source-root-label".into())
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
@@ -2161,6 +2243,7 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("audio-output-settings-toolbar")
+                            .debug_selector(|| "audio-output-settings-toolbar".into())
                             .flex_none()
                             .flex()
                             .items_center()
@@ -2189,6 +2272,7 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("reveal-toolbar")
+                            .debug_selector(|| "reveal-toolbar".into())
                             .flex_none()
                             .flex()
                             .items_center()
@@ -2205,6 +2289,7 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("choose-folder-toolbar")
+                            .debug_selector(|| "choose-folder-toolbar".into())
                             .flex_none()
                             .flex()
                             .items_center()
@@ -2256,6 +2341,7 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("shortcut-help-toolbar")
+                            .debug_selector(|| "shortcut-help-toolbar".into())
                             .flex_none()
                             .flex()
                             .items_center()
@@ -2438,7 +2524,11 @@ impl Render for Browser {
                     .w_full()
                     .min_w_0()
                     .overflow_hidden()
-                    .h(px(theme.spacing.status_height))
+                    .debug_selector(|| "main-status-bar".into())
+                    .h(px(status_bar_height))
+                    .when(enlarged_text, |element| {
+                        element.flex_wrap().content_start().items_start()
+                    })
                     .gap(px(theme.spacing.control_gap))
                     .px(px(theme.spacing.panel_padding))
                     .bg(color(theme.colors.surface_raised))
@@ -2522,7 +2612,7 @@ impl Render for Browser {
                     .id("status-job-details-panel")
                     .debug_selector(|| "status-job-details-panel".into())
                     .absolute()
-                    .bottom(px(theme.spacing.status_height))
+                    .bottom(px(status_bar_height))
                     .right(px(theme.spacing.panel_padding))
                     .w(px(360.0))
                     .max_h(px(300.0))
@@ -2586,7 +2676,7 @@ impl Render for Browser {
                 element.child(
                     div()
                         .absolute()
-                        .top(px(theme.spacing.toolbar_height))
+                        .top(px(toolbar_height))
                         .right_0()
                         .w(px(420.0))
                         .occlude()
@@ -2999,6 +3089,62 @@ mod tests {
                 SortColumn::Rating
             )
         });
+    }
+
+    #[gpui::test]
+    fn enlarged_column_resize_persists_logical_widths(cx: &mut TestAppContext) {
+        let enlarged = crate::theme::with_text_scale(&Theme::default(), 200);
+        cx.set_global(crate::theme::ActiveTheme(std::sync::Arc::new(enlarged)));
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, cx| {
+            view.general_settings.text_scale_percent = 200;
+            view.column_layout.set_width(BrowserColumn::Rating, 120.0);
+            cx.notify();
+        });
+        cx.refresh().expect("render enlarged browser columns");
+        cx.run_until_parked();
+
+        let name = cx.debug_bounds("browser-column-Name").expect("name header");
+        let rating = cx
+            .debug_bounds("browser-column-Rating")
+            .expect("rating header");
+        let resize = cx
+            .debug_bounds("browser-column-resize-Rating")
+            .expect("rating resize rail");
+        let start = point(
+            resize.origin.x + resize.size.width / 2.0,
+            resize.origin.y + resize.size.height / 2.0,
+        );
+        let end = point(start.x + px(34.0), start.y);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.refresh().expect("render enlarged resize");
+
+        let resized = cx
+            .debug_bounds("browser-column-Rating")
+            .expect("resized rating header");
+        assert_eq!(resized.size.width, rating.size.width + px(34.0));
+        let (rating_width, name_width) = cx.cx.update(|app| {
+            let view = browser.read(app);
+            (
+                view.column_layout
+                    .width_override(BrowserColumn::Rating)
+                    .expect("stored rating width"),
+                view.column_layout
+                    .width_override(BrowserColumn::Name)
+                    .expect("frozen name width"),
+            )
+        });
+        assert!(
+            (rating_width * 2.0 - f32::from(resized.size.width)).abs() <= 1.0,
+            "stored rating width {rating_width} should be logical at 200%: {resized:?}"
+        );
+        assert!(
+            (name_width * 2.0 - f32::from(name.size.width)).abs() <= 1.0,
+            "frozen name width {name_width} should remain logical at 200%: {name:?}"
+        );
+        assert_eq!(rating_width, 137.0);
     }
 
     #[gpui::test]
@@ -3644,6 +3790,131 @@ mod tests {
                 "{selector} is below strip: {bounds:?}, strip {strip:?}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn enlarged_browser_layout_keeps_toolbar_footer_and_columns_in_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        let enlarged = crate::theme::with_text_scale(&Theme::default(), 200);
+        cx.set_global(crate::theme::ActiveTheme(std::sync::Arc::new(enlarged)));
+        let window = cx.update(|app| {
+            app.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                        point(px(0.0), px(0.0)),
+                        gpui::size(px(960.0), px(560.0)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, app| app.new(Browser::new),
+            )
+            .expect("open minimum layout test window")
+        });
+        let browser = window.root(cx).expect("browser root");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        browser.update(&mut cx, |view, cx| {
+            view.general_settings.text_scale_percent = 200;
+            let root = PathBuf::from("/tmp/opt1880-enlarged-layout");
+            view.root = Some(root.clone());
+            view.entries = vec![AudioFile {
+                path: root.join("selectable.wav"),
+                relative_path: PathBuf::from("selectable.wav"),
+                byte_len: 0,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: None,
+                curation: None,
+            }];
+            view.view_model = BrowserViewModel::new(&view.entries);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.refresh().expect("enlarged browser layout");
+
+        let toolbar = cx.debug_bounds("main-toolbar").expect("toolbar bounds");
+        let status = cx.debug_bounds("main-status-bar").expect("status bounds");
+        let mut escaped_controls = Vec::new();
+        for selector in [
+            "browser-search-toolbar",
+            "source-root-label",
+            "audio-output-settings-toolbar",
+            "reveal-toolbar",
+            "choose-folder-toolbar",
+            "theme-settings",
+            "shortcut-help-toolbar",
+        ] {
+            let control = cx.debug_bounds(selector).expect("critical toolbar control");
+            if control.left() < toolbar.left()
+                || control.right() > toolbar.right()
+                || control.top() < toolbar.top()
+                || control.bottom() > toolbar.bottom()
+            {
+                escaped_controls.push(format!("{selector}: {control:?}"));
+            }
+        }
+        assert!(
+            escaped_controls.is_empty(),
+            "{escaped_controls:?}; toolbar: {toolbar:?}"
+        );
+        let random = cx
+            .debug_bounds("random-audition-toolbar")
+            .expect("random audition bounds");
+        let settings = cx.debug_bounds("theme-settings").expect("settings bounds");
+        assert!(
+            settings.top() > random.top(),
+            "toolbar did not wrap into two rows"
+        );
+        assert!(toolbar.size.height > px(70.0), "{toolbar:?}");
+        assert!(
+            status.top() >= toolbar.bottom(),
+            "{status:?} follows {toolbar:?}"
+        );
+        assert!(
+            status.bottom() <= px(560.0),
+            "footer escaped the window: {status:?}"
+        );
+        assert!(
+            status.size.height > px(60.0),
+            "footer did not reserve wrapped text: {status:?}"
+        );
+
+        let viewport = cx
+            .debug_bounds("sample-table-viewport")
+            .expect("sample table viewport");
+        let heading = cx
+            .debug_bounds("browser-column-Name")
+            .expect("sample name column header");
+        let row = cx
+            .debug_bounds("browser-row-name-0")
+            .expect("selectable sample row");
+        let content = cx
+            .debug_bounds("sample-table-content")
+            .expect("sample table content");
+        assert!(
+            viewport.size.height >= heading.size.height + row.size.height,
+            "enlarged toolbar left no room for a header and selectable sample row: viewport {viewport:?}, heading {heading:?}, row {row:?}"
+        );
+        assert!(row.top() >= viewport.top() && row.bottom() <= viewport.bottom());
+        assert!(
+            row.bottom() <= status.top(),
+            "row overlaps footer: {row:?}, {status:?}"
+        );
+        assert!(
+            content.size.width > viewport.size.width,
+            "enlarged columns should use the existing horizontal viewport: {content:?}, {viewport:?}"
+        );
+        assert!(
+            heading.size.width >= px(384.0),
+            "name column did not scale: {heading:?}"
+        );
+        let row_center = point(
+            row.origin.x + px(12.0),
+            row.origin.y + row.size.height / 2.0,
+        );
+        cx.simulate_mouse_down(row_center, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(row_center, MouseButton::Left, Modifiers::none());
+        browser.update(&mut cx, |view, _| assert_eq!(view.selected, Some(0)));
     }
 
     #[gpui::test]
@@ -4318,15 +4589,49 @@ mod tests {
         assert_eq!(sidebar_width(Some(420.0), 1_280.0, &theme), 420.0);
         assert_eq!(sidebar_width(Some(0.0), 1_280.0, &theme), 180.0);
 
-        assert_eq!(waveform_height(Some(512.0), 1_200.0, &theme), 512.0);
-        assert!(waveform_height(Some(512.0), 560.0, &theme) < 512.0);
-        assert_eq!(waveform_height(Some(512.0), 1_200.0, &theme), 512.0);
+        assert_eq!(
+            waveform_height(
+                Some(512.0),
+                1_200.0,
+                &theme,
+                theme.spacing.toolbar_height,
+                theme.spacing.status_height,
+            ),
+            512.0
+        );
+        assert!(
+            waveform_height(
+                Some(512.0),
+                560.0,
+                &theme,
+                theme.spacing.toolbar_height,
+                theme.spacing.status_height,
+            ) < 512.0
+        );
+        assert_eq!(
+            waveform_height(
+                Some(512.0),
+                1_200.0,
+                &theme,
+                theme.spacing.toolbar_height,
+                theme.spacing.status_height,
+            ),
+            512.0
+        );
         let enlarged = crate::theme::with_text_scale(&theme, 200);
         let minimum = enlarged.waveform.title_height
             + enlarged.waveform.metadata_height
             + enlarged.waveform.scrollbar_height
             + enlarged.spacing.waveform_min_bar_height;
-        assert!(waveform_height(Some(94.0), 560.0, &enlarged) >= minimum);
+        assert!(
+            waveform_height(
+                Some(94.0),
+                560.0,
+                &enlarged,
+                browser_toolbar_height(960.0, &enlarged, true),
+                browser_status_bar_height(&enlarged, true),
+            ) >= minimum
+        );
     }
 
     #[gpui::test]

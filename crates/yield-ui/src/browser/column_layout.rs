@@ -160,15 +160,22 @@ impl ColumnLayout {
         theme: &Theme,
         visibility: BrowserColumnVisibility,
         available_width: f32,
+        width_scale: f32,
     ) -> Vec<ResolvedColumn> {
+        let width_scale = if width_scale.is_finite() && width_scale > 0.0 {
+            width_scale
+        } else {
+            1.0
+        };
         let order = self.visible_order(visibility);
         let fixed = order
             .iter()
             .filter(|column| **column != BrowserColumn::Name)
-            .map(|column| self.width(*column, theme))
+            .map(|column| self.width(*column, theme) * width_scale)
             .sum::<f32>();
         let name_width = self.widths[BrowserColumn::Name.index()]
-            .unwrap_or_else(|| (available_width - fixed).max(MIN_NAME_WIDTH));
+            .map(|width| width * width_scale)
+            .unwrap_or_else(|| (available_width - fixed).max(MIN_NAME_WIDTH * width_scale));
         order
             .into_iter()
             .map(|id| ResolvedColumn {
@@ -176,7 +183,7 @@ impl ColumnLayout {
                 width: if id == BrowserColumn::Name {
                     name_width
                 } else {
-                    self.width(id, theme)
+                    self.width(id, theme) * width_scale
                 },
             })
             .collect()
@@ -281,5 +288,39 @@ mod tests {
         assert_eq!(layout.widths[BrowserColumn::Size.index()], Some(48.0));
         assert!(layout.set_width(BrowserColumn::Size, 900.0));
         assert_eq!(layout.widths[BrowserColumn::Size.index()], Some(420.0));
+    }
+
+    #[test]
+    fn resolved_width_scale_preserves_logical_overrides_and_column_order() {
+        let mut layout = ColumnLayout::default();
+        layout.set_width(BrowserColumn::Name, 300.0);
+        layout.set_width(BrowserColumn::Size, 120.0);
+        let theme = Theme::default();
+        let visibility = BrowserColumnVisibility {
+            playback_type: true,
+            last_played: true,
+        };
+        assert!(layout.reorder_visible(BrowserColumn::Rating, 4, visibility));
+        let normal = layout.resolve(&theme, visibility, 960.0, 1.0);
+        let enlarged = layout.resolve(&theme, visibility, 960.0, 2.0);
+
+        assert_eq!(
+            normal.iter().map(|column| column.id).collect::<Vec<_>>(),
+            enlarged.iter().map(|column| column.id).collect::<Vec<_>>()
+        );
+        for column in &normal {
+            let enlarged_column = enlarged
+                .iter()
+                .find(|scaled| scaled.id == column.id)
+                .expect("same visible column");
+            assert_eq!(enlarged_column.width, column.width * 2.0);
+        }
+        assert_eq!(layout.width_override(BrowserColumn::Name), Some(300.0));
+        assert_eq!(layout.width_override(BrowserColumn::Size), Some(120.0));
+        assert_eq!(
+            layout.resolve(&theme, visibility, 960.0, 1.0),
+            normal,
+            "repeated scale resolution does not accumulate into stored widths"
+        );
     }
 }
