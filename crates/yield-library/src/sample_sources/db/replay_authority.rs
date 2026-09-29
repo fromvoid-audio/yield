@@ -112,6 +112,18 @@ impl SourceDatabase {
         let Some(value) = self.get_metadata(META_SOURCE_WATCHER_CHECKPOINT)? else {
             return Ok(None);
         };
+        // A checkpoint cannot claim coverage of a source revision that has not committed.
+        // Later unrelated source writes may advance the revision without invalidating the
+        // watcher cursor, so require an existing revision rather than exact equality.
+        let committed_revision = self.get_revision()?;
+        let checkpoint_revision = parse_object(&value)
+            .ok()
+            .and_then(|object| u64_field(&object, "source_revision"));
+        if !checkpoint_revision
+            .is_some_and(|revision| revision != 0 && revision <= committed_revision)
+        {
+            return Ok(None);
+        }
         Ok(parse_durable_replay_prior(
             &value,
             expected_source_id,
@@ -492,6 +504,9 @@ mod tests {
         let database = SourceDatabase::open_for_test_fixture_source_write(directory.path())
             .expect("source database");
         database
+            .set_metadata("revision", "12")
+            .expect("committed fixture revision");
+        database
             .set_metadata(META_SOURCE_WATCHER_CHECKPOINT, value)
             .expect("checkpoint metadata");
         database
@@ -531,6 +546,9 @@ mod tests {
             let database = SourceDatabase::open_for_test_fixture_source_write(directory.path())
                 .expect("source database");
             database
+                .set_metadata("revision", "12")
+                .expect("committed fixture revision");
+            database
                 .set_metadata(META_SOURCE_WATCHER_CHECKPOINT, &checkpoint())
                 .expect("checkpoint metadata");
         }
@@ -546,6 +564,38 @@ mod tests {
             .expect("authority read")
             .expect("valid token");
         assert_eq!(token.acknowledged_sequence(), 17);
+    }
+
+    #[test]
+    fn checkpoint_cannot_claim_an_uncommitted_source_revision() {
+        let directory = tempdir().expect("source root");
+        let database = SourceDatabase::open_for_test_fixture_source_write(directory.path())
+            .expect("source database");
+        let write_metadata = |key: &str, value: &str| {
+            let mut batch = database.write_batch().expect("auxiliary batch");
+            batch.set_metadata(key, value).expect("metadata write");
+            batch.commit_auxiliary_state().expect("auxiliary commit");
+        };
+        write_metadata("revision", "11");
+        write_metadata(META_SOURCE_WATCHER_CHECKPOINT, &checkpoint());
+        let read = || {
+            database
+                .read_durable_replay_prior(
+                    &source_id(),
+                    &root(),
+                    WatcherGeneration::new(4),
+                    WatcherGeneration::new(4),
+                )
+                .expect("authority read")
+        };
+        assert_eq!(read(), None, "future revision grants no replay authority");
+        write_metadata("revision", "12");
+        assert!(read().is_some(), "committed revision grants authority");
+        write_metadata("revision", "13");
+        assert!(read().is_some(), "later writes do not rewind coverage");
+        let zero = checkpoint().replace("\"source_revision\":12", "\"source_revision\":0");
+        write_metadata(META_SOURCE_WATCHER_CHECKPOINT, &zero);
+        assert_eq!(read(), None, "zero revision grants no replay authority");
     }
 
     #[test]
