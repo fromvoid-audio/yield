@@ -27,15 +27,18 @@ use crate::sample_sources::readiness::{
 };
 use crate::sample_sources::reconciliation::{
     BootstrapReplayEvidence, ReplayPriorToken, RootIdentity, RootRelativePath, SourceAuditCommit,
-    SourceAuditRequest, WatcherGeneration,
+    SourceAuditRequest, WatcherContinuityProof, WatcherGeneration,
 };
 
-use super::super::replay_authority::{encode_bootstrap_checkpoint, parse_durable_replay_prior};
+use super::super::replay_authority::{
+    encode_bootstrap_checkpoint, encode_replay_checkpoint, parse_durable_replay_prior,
+};
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
-    BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, ManifestCommitResult, Rating,
-    SampleCollection, SourceDatabase, SourceDbError, SourceDirectoryEntry,
-    SourceDirectoryTruthCleanup, SourceManifestEntry, SourcePlaybackType, SourceWriteBatch,
+    BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage,
+    META_SOURCE_WATCHER_CHECKPOINT, ManifestCommitResult, Rating, SampleCollection, SourceDatabase,
+    SourceDbError, SourceDirectoryEntry, SourceDirectoryTruthCleanup, SourceManifestEntry,
+    SourcePlaybackType, SourceWriteBatch,
 };
 use super::curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
@@ -549,6 +552,15 @@ pub enum SourceWriterError {
     /// The sole snapshot worker exited before completing the request.
     #[error("source snapshot owner is unavailable")]
     SnapshotOwnerUnavailable,
+    /// The replay proof does not extend the exact retained durable checkpoint.
+    #[error("watcher replay checkpoint proof or prior does not match the retained source")]
+    ReplayCheckpointMismatch,
+    /// The source transaction may have committed, but exact checkpoint readback failed.
+    #[error("watcher replay checkpoint outcome is uncertain at event {event_id}")]
+    ReplayCheckpointOutcomeUncertain {
+        /// Event ID to use for an exact persisted checkpoint readback or retry.
+        event_id: u64,
+    },
     /// The first replay prior did not match the completed audit and live source lane.
     #[error("watcher replay bootstrap evidence does not match the retained source audit")]
     ReplayBootstrapMismatch,
@@ -588,6 +600,78 @@ enum SourceWriterFault {
 }
 
 impl SourceWriter {
+    /// Atomically advance the source-owned replay barrier from an admitted continuity proof.
+    ///
+    /// The proof is created only by reconciliation admission. The supplied prior must still
+    /// equal the checkpoint under the SQLite writer reservation. Duplicate delivery of the
+    /// same proof returns the already committed token. No pathless hint or audit can enter here.
+    pub fn commit_watcher_replay_checkpoint(
+        &self,
+        expected: &SourceScanFence,
+        prior: &ReplayPriorToken,
+        proof: &WatcherContinuityProof,
+    ) -> Result<ReplayPriorToken, SourceWriterError> {
+        self.validate_scan_fence(expected)?;
+        if prior.source_id() != expected.source_id()
+            || prior.root_identity() != expected.root_identity()
+            || proof.source_id() != expected.source_id()
+            || proof.root_identity() != expected.root_identity()
+            || proof.backend_stream_identity() != prior.backend_stream_identity()
+            || proof.watcher_generation() != prior.watcher_generation()
+            || proof.prior_acknowledgement().sequence() != prior.acknowledged_sequence()
+        {
+            return Err(SourceWriterError::ReplayCheckpointMismatch);
+        }
+        let encoded =
+            encode_replay_checkpoint(proof, expected.revision(), expected.lifecycle_generation())
+                .ok_or(SourceWriterError::ReplayCheckpointMismatch)?;
+        if encoded.len() > 16 * 1024 {
+            return Err(SourceWriterError::InvalidRequest(
+                "watcher replay checkpoint exceeds the bounded metadata size",
+            ));
+        }
+        let mut batch = self.database.write_batch()?;
+        if !batch.matches_revision(expected.revision())? {
+            return Err(SourceWriterError::StaleRevision {
+                expected: expected.revision(),
+                actual: batch.get_revision()?,
+            });
+        }
+        let stored = batch.coordination_metadata(META_SOURCE_WATCHER_CHECKPOINT)?;
+        if stored.as_deref() != Some(encoded.as_str()) {
+            let stored_prior = stored.as_deref().and_then(|value| {
+                parse_durable_replay_prior(
+                    value,
+                    expected.source_id(),
+                    expected.root_identity(),
+                    WatcherGeneration::new(expected.lifecycle_generation()),
+                    prior.watcher_generation(),
+                )
+            });
+            if stored_prior.as_ref() != Some(prior) {
+                return Err(SourceWriterError::ReplayCheckpointMismatch);
+            }
+            batch.set_metadata(META_SOURCE_WATCHER_CHECKPOINT, &encoded)?;
+        }
+        batch.commit_auxiliary_state()?;
+        let readback = self.database.read_durable_replay_prior(
+            expected.source_id(),
+            expected.root_identity(),
+            WatcherGeneration::new(expected.lifecycle_generation()),
+            prior.watcher_generation(),
+        );
+        match readback {
+            Ok(Some(token))
+                if token.acknowledged_sequence() == proof.replay_coverage().through_sequence() =>
+            {
+                Ok(token)
+            }
+            Ok(_) | Err(_) => Err(SourceWriterError::ReplayCheckpointOutcomeUncertain {
+                event_id: proof.replay_coverage().through_sequence(),
+            }),
+        }
+    }
+
     /// Persist the first replay prior after a complete, revision-matched source audit and a
     /// certain live FSEvents capture with no changed source paths.
     ///
