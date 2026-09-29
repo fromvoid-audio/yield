@@ -14,10 +14,187 @@ use super::super::{
     SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceDatabase, SourceDbError,
 };
 
+fn open_tag_test_db(root: &Path) -> SourceDatabase {
+    drop(SourceDatabase::open_for_maintenance(root).expect("prepare source schema"));
+    SourceDatabase::open_for_user_metadata_write(root).expect("operational metadata open")
+}
+
+#[test]
+fn tag_assignment_pages_cover_live_supported_paths_once() {
+    let dir = tempdir().unwrap();
+    let db = open_tag_test_db(dir.path());
+    for number in 0..137 {
+        let path = format!("samples/{number:03}.wav");
+        db.upsert_file(Path::new(&path), 10, 5).unwrap();
+        db.assign_tag_to_path(Path::new(&path), "  Deep   Kick ")
+            .unwrap();
+    }
+    for path in ["missing.wav", "notes.txt", "._sidecar.wav"] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+        db.assign_tag_to_path(Path::new(path), "deep kick").unwrap();
+    }
+    db.set_missing(Path::new("missing.wav"), true).unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut cursor = None;
+    let mut paths = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = db
+            .tag_assignments_page_at_revision(
+                revision,
+                "DEEP KICK",
+                cursor.as_ref(),
+                40,
+                &cancellation,
+            )
+            .unwrap();
+        assert!(page.tag_id.is_some());
+        assert!(page.paths.len() <= 40);
+        paths.extend(page.paths);
+        pages += 1;
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(pages, 4);
+    assert_eq!(paths.len(), 137);
+    assert_eq!(paths[0], PathBuf::from("samples/000.wav"));
+    assert_eq!(paths[136], PathBuf::from("samples/136.wav"));
+    assert!(paths.windows(2).all(|window| window[0] < window[1]));
+}
+
+#[test]
+fn tag_assignment_pages_reject_stale_and_foreign_cursors_and_cancellation() {
+    let dir = tempdir().unwrap();
+    let db = open_tag_test_db(dir.path());
+    for path in ["a.wav", "b.wav"] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+        db.assign_tag_to_path(Path::new(path), "shared").unwrap();
+    }
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let first = db
+        .tag_assignments_page_at_revision(revision, "shared", None, 1, &cancellation)
+        .unwrap();
+    let cursor = first.next_cursor.as_ref().unwrap();
+    let mut malformed_cursor = cursor.clone();
+    malformed_cursor.last_path = "missing.wav".to_owned();
+    assert!(
+        db.tag_assignments_page_at_revision(
+            revision,
+            "shared",
+            Some(&malformed_cursor),
+            1,
+            &cancellation
+        )
+        .is_err()
+    );
+    assert!(
+        db.tag_assignments_page_at_revision(revision, "other", Some(cursor), 1, &cancellation)
+            .is_err()
+    );
+    let other_dir = tempdir().unwrap();
+    let other_db = open_tag_test_db(other_dir.path());
+    assert!(
+        other_db
+            .tag_assignments_page_at_revision(revision, "shared", Some(cursor), 1, &cancellation)
+            .is_err()
+    );
+    db.assign_tag_to_path(Path::new("a.wav"), "later").unwrap();
+    assert!(
+        db.tag_assignments_page_at_revision(revision, "shared", Some(cursor), 1, &cancellation)
+            .is_err()
+    );
+    cancellation.store(true, Ordering::Release);
+    assert!(matches!(
+        db.tag_assignments_page_at_revision(
+            db.get_revision().unwrap(),
+            "shared",
+            None,
+            1,
+            &cancellation
+        ),
+        Err(SourceDbError::Canceled)
+    ));
+}
+
+#[test]
+fn tag_assignment_pages_reject_bad_input_and_return_explicit_empty() {
+    let dir = tempdir().unwrap();
+    let db = open_tag_test_db(dir.path());
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    for label in ["", "unknown"] {
+        let page = db
+            .tag_assignments_page_at_revision(revision, label, None, 999, &cancellation)
+            .unwrap();
+        assert_eq!(page.revision, revision);
+        assert_eq!(page.tag_id, None);
+        assert!(page.paths.is_empty());
+        assert!(page.next_cursor.is_none());
+    }
+    assert!(matches!(
+        db.tag_assignments_page_at_revision(
+            revision,
+            &"a".repeat(SOURCE_TAG_PAGE_MAX_PREFIX_BYTES + 1),
+            None,
+            1,
+            &cancellation
+        ),
+        Err(SourceDbError::TagPagePrefixTooLong { .. })
+    ));
+    assert!(matches!(
+        db.tag_assignments_page_at_revision(revision, "bad\0tag", None, 1, &cancellation),
+        Err(SourceDbError::TagPagePrefixContainsNul)
+    ));
+}
+
+#[test]
+fn tag_assignment_pages_fail_closed_on_oversized_path_and_page() {
+    let dir = tempdir().unwrap();
+    let db = open_tag_test_db(dir.path());
+    let long_path = format!(
+        "{}.wav",
+        "a".repeat(super::super::SOURCE_TAG_ASSIGNMENT_MAX_PATH_BYTES)
+    );
+    db.upsert_file(Path::new(&long_path), 10, 5).unwrap();
+    db.assign_tag_to_path(Path::new(&long_path), "long")
+        .unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    assert!(matches!(
+        db.tag_assignments_page_at_revision(
+            db.get_revision().unwrap(),
+            "long",
+            None,
+            1,
+            &cancellation
+        ),
+        Err(SourceDbError::TagAssignmentPageBytesTooLarge { .. })
+    ));
+
+    for number in 0..25 {
+        let path = format!("{number:03}-{}.wav", "b".repeat(3000));
+        db.upsert_file(Path::new(&path), 10, 5).unwrap();
+        db.assign_tag_to_path(Path::new(&path), "many").unwrap();
+    }
+    assert!(matches!(
+        db.tag_assignments_page_at_revision(
+            db.get_revision().unwrap(),
+            "many",
+            None,
+            64,
+            &cancellation
+        ),
+        Err(SourceDbError::TagAssignmentPageBytesTooLarge { .. })
+    ));
+}
+
 #[test]
 fn normalization_prevents_case_and_spacing_duplicates() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
     db.upsert_file(Path::new("two.wav"), 10, 5).unwrap();
 
@@ -37,7 +214,7 @@ fn normalization_prevents_case_and_spacing_duplicates() {
 #[test]
 fn most_used_tags_order_by_persisted_usage_then_label() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     for path in ["one.wav", "two.wav", "three.wav", "four.wav"] {
         db.upsert_file(Path::new(path), 10, 5).unwrap();
     }
@@ -71,7 +248,7 @@ fn most_used_tags_order_by_persisted_usage_then_label() {
 #[test]
 fn assignment_api_creates_then_resolves_existing_tag() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
     db.upsert_file(Path::new("two.wav"), 10, 5).unwrap();
 
@@ -97,7 +274,7 @@ fn assignment_api_creates_then_resolves_existing_tag() {
 #[test]
 fn search_tags_orders_exact_match_before_usage_matches() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     for path in ["one.wav", "two.wav", "three.wav"] {
         db.upsert_file(Path::new(path), 10, 5).unwrap();
     }
@@ -120,7 +297,7 @@ fn search_tags_orders_exact_match_before_usage_matches() {
 #[test]
 fn search_tags_finds_less_common_fuzzy_matches() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     for path in ["one.wav", "two.wav", "three.wav"] {
         db.upsert_file(Path::new(path), 10, 5).unwrap();
     }
@@ -144,7 +321,7 @@ fn search_tags_finds_less_common_fuzzy_matches() {
 #[test]
 fn tag_vocabulary_pages_are_keyset_paged_in_canonical_order() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
     for label in ["Bravo", "alpha", "charlie"] {
         db.assign_tag_to_path(Path::new("one.wav"), label).unwrap();
@@ -186,7 +363,7 @@ fn tag_vocabulary_pages_are_keyset_paged_in_canonical_order() {
 #[test]
 fn tag_vocabulary_prefixes_treat_percent_and_underscore_literally() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
     for label in ["foo%literal", "foo_literal", "fooXliteral", "éclair"] {
         db.assign_tag_to_path(Path::new("one.wav"), label).unwrap();
@@ -231,7 +408,7 @@ fn tag_vocabulary_prefixes_treat_percent_and_underscore_literally() {
 #[test]
 fn selected_tag_page_unions_paths_and_counts_distinct_selected_paths() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     for path in ["one.wav", "two.wav", "three.wav"] {
         db.upsert_file(Path::new(path), 10, 5).unwrap();
     }
@@ -279,7 +456,7 @@ fn selected_tag_page_unions_paths_and_counts_distinct_selected_paths() {
 #[test]
 fn selected_tag_page_handles_large_selection_mixed_counts_dedup_and_cursor() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     let paths = (0..129)
         .map(|index| PathBuf::from(format!("sample-{index:03}.wav")))
         .collect::<Vec<_>>();
@@ -330,7 +507,7 @@ fn selected_tag_page_handles_large_selection_mixed_counts_dedup_and_cursor() {
 #[test]
 fn canceled_tag_staging_rolls_back_temporary_selection_scope() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
     db.assign_tag_to_path(Path::new("one.wav"), "shared")
         .unwrap();
@@ -358,7 +535,7 @@ fn canceled_tag_staging_rolls_back_temporary_selection_scope() {
 #[test]
 fn tag_pages_reject_overlarge_inputs_before_querying() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     let too_many_paths = (0..=SOURCE_TAG_PAGE_MAX_PATHS)
         .map(|index| PathBuf::from(format!("{index}.wav")))
         .collect::<Vec<_>>();
@@ -388,7 +565,7 @@ fn tag_pages_reject_overlarge_inputs_before_querying() {
 #[test]
 fn tag_page_cursors_are_revision_and_query_fenced() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
     for label in ["alpha", "atom", "beta"] {
         db.assign_tag_to_path(Path::new("one.wav"), label).unwrap();
@@ -414,7 +591,7 @@ fn tag_page_cursors_are_revision_and_query_fenced() {
 #[test]
 fn tag_page_bounds_legacy_long_multibyte_and_nul_labels_while_advancing() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
     db.upsert_file(Path::new("two.wav"), 10, 5).unwrap();
     db.upsert_file(Path::new("three.wav"), 10, 5).unwrap();
@@ -460,7 +637,7 @@ fn tag_page_bounds_legacy_long_multibyte_and_nul_labels_while_advancing() {
 #[test]
 fn selected_tag_page_accepts_full_path_count_without_sqlite_bind_limit() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     let paths = (0..SOURCE_TAG_PAGE_MAX_PATHS)
         .map(|index| PathBuf::from(format!("sample-{index:05}.wav")))
         .collect::<Vec<_>>();
@@ -480,7 +657,7 @@ fn selected_tag_page_accepts_full_path_count_without_sqlite_bind_limit() {
 #[test]
 fn selected_tag_ids_page_returns_zero_mixed_and_all_counts() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     for path in ["one.wav", "two.wav", "three.wav"] {
         db.upsert_file(Path::new(path), 10, 5).unwrap();
     }
@@ -549,7 +726,7 @@ fn selected_tag_ids_page_returns_zero_mixed_and_all_counts() {
 #[test]
 fn selected_tag_ids_page_cursor_fences_paths_ids_and_revision() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     for path in ["one.wav", "two.wav"] {
         db.upsert_file(Path::new(path), 10, 5).unwrap();
     }
@@ -628,7 +805,7 @@ fn selected_tag_ids_page_cursor_fences_paths_ids_and_revision() {
 #[test]
 fn selected_tag_ids_page_bounds_ids_legacy_labels_and_cancellation() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("legacy.wav"), 10, 5).unwrap();
     db.connection
         .execute(
@@ -709,7 +886,7 @@ fn selected_tag_ids_page_bounds_ids_legacy_labels_and_cancellation() {
 #[test]
 fn tag_filter_visits_casefolded_and_deduplicated_punctuation_exact_matches() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     for path in ["one.wav", "two.wav", "three.wav"] {
         db.upsert_file(Path::new(path), 10, 5).unwrap();
     }
@@ -781,7 +958,7 @@ fn tag_filter_visits_casefolded_and_deduplicated_punctuation_exact_matches() {
 #[test]
 fn tag_filter_excludes_missing_and_unsupported_rows_and_empty_matches_live_supported() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     for path in ["live.wav", "missing.wav", "notes.txt", "._sidecar.wav"] {
         db.upsert_file(Path::new(path), 10, 5).unwrap();
         db.assign_tag_to_path(Path::new(path), "shared").unwrap();
@@ -818,7 +995,7 @@ fn tag_filter_excludes_missing_and_unsupported_rows_and_empty_matches_live_suppo
 #[test]
 fn tag_filter_rejects_stale_and_overlarge_requests() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
     db.assign_tag_to_path(Path::new("one.wav"), "shared")
         .unwrap();
@@ -863,7 +1040,7 @@ fn tag_filter_rejects_stale_and_overlarge_requests() {
 #[test]
 fn tag_filter_cancellation_and_visitor_errors_leave_no_temp_scope() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     for path in ["one.wav", "two.wav"] {
         db.upsert_file(Path::new(path), 10, 5).unwrap();
         db.assign_tag_to_path(Path::new(path), "shared").unwrap();
@@ -941,7 +1118,7 @@ fn tag_filter_cancellation_and_visitor_errors_leave_no_temp_scope() {
 #[test]
 fn tag_filter_does_not_decode_legacy_display_labels_and_uses_tag_id_index() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("legacy.wav"), 10, 5).unwrap();
     db.connection
         .execute(
@@ -1041,7 +1218,7 @@ fn tag_filter_does_not_decode_legacy_display_labels_and_uses_tag_id_index() {
 #[test]
 fn tag_filter_ascii_casefold_does_not_truncate_embedded_nul_values() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("nul.wav"), 10, 5).unwrap();
     let stored = "A\0x";
     db.connection
@@ -1097,7 +1274,7 @@ fn tag_filter_ascii_casefold_does_not_truncate_embedded_nul_values() {
 #[test]
 fn display_labels_preserve_native_order_playback_sanitization_and_empty_fallback() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     for path in [
         "one.wav",
         "empty.wav",
@@ -1157,7 +1334,7 @@ fn display_labels_preserve_native_order_playback_sanitization_and_empty_fallback
 #[test]
 fn display_labels_bound_legacy_text_and_high_tag_cardinality() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     for path in ["legacy-malformed.wav", "legacy-long.wav", "many.wav"] {
         db.upsert_file(Path::new(path), 10, 5).unwrap();
     }
@@ -1252,7 +1429,7 @@ fn display_labels_bound_legacy_text_and_high_tag_cardinality() {
 #[test]
 fn display_labels_reject_raw_path_bounds_and_deduplicate_normalized_paths() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("folder/one.wav"), 10, 5).unwrap();
     let revision = db.get_revision().unwrap();
     let cancellation = Arc::new(AtomicBool::new(false));
@@ -1301,7 +1478,7 @@ fn display_labels_reject_raw_path_bounds_and_deduplicate_normalized_paths() {
 #[test]
 fn display_labels_fence_revision_and_cancelled_reads_recover_connection() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
     db.assign_tag_to_path(Path::new("one.wav"), "warm").unwrap();
     for index in 0..10_000 {
@@ -1358,7 +1535,7 @@ fn display_labels_fence_revision_and_cancelled_reads_recover_connection() {
 #[test]
 fn display_label_query_uses_path_primary_key_lookup() {
     let dir = tempdir().unwrap();
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = open_tag_test_db(dir.path());
     db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
     let sql = format!(
         "EXPLAIN QUERY PLAN {}",

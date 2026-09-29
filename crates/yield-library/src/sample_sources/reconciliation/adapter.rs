@@ -278,6 +278,90 @@ pub struct ReplayPriorToken {
     acknowledged_sequence: u64,
 }
 
+/// Transport evidence for the first replay checkpoint after a complete source audit.
+///
+/// This is not durable authority. The source writer must match it to a committed audit and its
+/// retained physical source fence before it can persist the initial replay prior.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootstrapReplayEvidence {
+    source_id: SourceId,
+    root_identity: RootIdentity,
+    stream_identity: BackendStreamIdentity,
+    lifecycle_generation: u64,
+    watcher_generation: WatcherGeneration,
+    started_after: u64,
+    through_sequence: u64,
+}
+
+impl BootstrapReplayEvidence {
+    /// Accept only a complete, certain live capture with no changed source paths.
+    ///
+    /// Source-local database artifact events may advance the native cursor without becoming
+    /// changed source paths. Any actual changed path requires another audit and capture cycle.
+    pub fn from_certain_empty_capture(
+        source_id: SourceId,
+        root_identity: RootIdentity,
+        stream_identity: BackendStreamIdentity,
+        lifecycle_generation: u64,
+        watcher_generation: WatcherGeneration,
+        started_after: u64,
+        through_sequence: u64,
+        history_complete: bool,
+        uncertain: bool,
+        changed_path_count: usize,
+    ) -> Option<Self> {
+        if !history_complete
+            || uncertain
+            || changed_path_count != 0
+            || lifecycle_generation == 0
+            || watcher_generation.get() == 0
+            || through_sequence < started_after
+            || source_id.as_str().is_empty()
+            || root_identity.as_bytes().is_empty()
+        {
+            return None;
+        }
+        Some(Self {
+            source_id,
+            root_identity,
+            stream_identity,
+            lifecycle_generation,
+            watcher_generation,
+            started_after,
+            through_sequence,
+        })
+    }
+
+    /// Borrow the source identity captured by the live stream.
+    pub fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+    /// Borrow the physical source root captured by the live stream.
+    pub fn root_identity(&self) -> &RootIdentity {
+        &self.root_identity
+    }
+    /// Borrow the device and volume UUID identity captured by the live stream.
+    pub fn stream_identity(&self) -> &BackendStreamIdentity {
+        &self.stream_identity
+    }
+    /// Return the catalog source lifecycle generation.
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
+    }
+    /// Return the native watcher generation for this capture.
+    pub const fn watcher_generation(&self) -> WatcherGeneration {
+        self.watcher_generation
+    }
+    /// Return the device-local cursor that preceded the audit.
+    pub const fn started_after(&self) -> u64 {
+        self.started_after
+    }
+    /// Return the final device-local cursor covered by the flushed stream.
+    pub const fn through_sequence(&self) -> u64 {
+        self.through_sequence
+    }
+}
+
 impl ReplayPriorToken {
     /// Mint replay authority from the source-database module's unforgeable validation capability.
     pub(crate) fn from_validated_durable_authority(

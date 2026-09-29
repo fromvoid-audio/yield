@@ -265,6 +265,17 @@ pub enum SourceDbError {
         /// Aggregate path byte length supplied by the caller.
         actual: usize,
     },
+    /// A source-wide tag-assignment page contains an oversized path or total response.
+    #[error("Tag assignment page path bytes use {actual} bytes; maximum is {max}")]
+    TagAssignmentPageBytesTooLarge {
+        /// Maximum encoded path bytes accepted by this result boundary.
+        max: usize,
+        /// Encoded bytes observed before the page could be returned.
+        actual: usize,
+    },
+    /// A source-wide tag-assignment read exceeded its bounded SQLite work budget.
+    #[error("Tag assignment page exceeded its query work budget")]
+    TagAssignmentWorkBudgetExceeded,
     /// A bounded selected-tag page request contained too many source-tag ids.
     #[error("Tag page selected {actual} tag ids; maximum is {max}")]
     TagPageTooManyTagIds {

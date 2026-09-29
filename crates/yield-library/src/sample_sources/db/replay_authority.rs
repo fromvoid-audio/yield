@@ -6,8 +6,8 @@ use serde_json::{Map, Value};
 use std::fmt;
 
 use crate::sample_sources::reconciliation::{
-    BackendStreamIdentity, ReplayPriorToken, RootIdentity, WatcherContinuityProof,
-    WatcherGeneration,
+    BackendStreamIdentity, BootstrapReplayEvidence, ReplayPriorToken, RootIdentity,
+    WatcherContinuityProof, WatcherGeneration,
 };
 use crate::sample_sources::{SourceDatabase, SourceId};
 
@@ -33,6 +33,18 @@ const CONTINUITY_PROOF_FIELDS: [&str; 8] = [
     "replay_coverage_start_event_id",
     "replay_coverage_end_event_id",
     "acknowledged_end_event_id",
+];
+const BOOTSTRAP_PROOF_FIELDS: [&str; 10] = [
+    "root_identity",
+    "backend",
+    "backend_device",
+    "backend_volume_uuid",
+    "watcher_generation",
+    "stream_start_event_id",
+    "stream_end_event_id",
+    "source_audit_revision",
+    "history_complete",
+    "changed_source_paths",
 ];
 
 /// A construction capability that can only be created after this module validates DB metadata.
@@ -129,22 +141,46 @@ pub(super) fn parse_durable_replay_prior(
         || root_identity.as_bytes() != expected_root_identity.as_bytes()
         || u64_field(&object, "lifecycle_generation")? != expected_source_lifecycle_generation.get()
         || u64_field(&object, "source_revision").is_none()
-        || string_field(&object, "cause")? != "targeted_replay"
     {
         return None;
     }
 
     let proof = object.get("continuity_proof")?.as_object()?;
-    if !has_exact_fields(proof, &CONTINUITY_PROOF_FIELDS) {
-        return None;
+    let cause = string_field(&object, "cause")?;
+    match cause {
+        "targeted_replay" if has_exact_fields(proof, &CONTINUITY_PROOF_FIELDS) => {}
+        "bootstrap_audit" if has_exact_fields(proof, &BOOTSTRAP_PROOF_FIELDS) => {
+            if string_field(proof, "root_identity")? != root_identity
+                || u64_field(proof, "stream_start_event_id")?
+                    > u64_field(proof, "stream_end_event_id")?
+                || u64_field(proof, "stream_end_event_id")? != event_id
+                || u64_field(proof, "source_audit_revision")?
+                    != u64_field(&object, "source_revision")?
+                || proof.get("history_complete")?.as_bool()? != true
+                || u64_field(proof, "changed_source_paths")? != 0
+            {
+                return None;
+            }
+        }
+        _ => return None,
     }
     let proof_root_identity = string_field(proof, "root_identity")?;
     let backend = string_field(proof, "backend")?;
     let backend_device = u64_field(proof, "backend_device")?;
     let volume_uuid = uuid::Uuid::parse_str(string_field(proof, "backend_volume_uuid")?).ok()?;
-    let replay_start = u64_field(proof, "replay_coverage_start_event_id")?;
-    let replay_end = u64_field(proof, "replay_coverage_end_event_id")?;
-    let acknowledged_end = u64_field(proof, "acknowledged_end_event_id")?;
+    let (replay_start, replay_end, acknowledged_end) = if cause == "targeted_replay" {
+        (
+            u64_field(proof, "replay_coverage_start_event_id")?,
+            u64_field(proof, "replay_coverage_end_event_id")?,
+            u64_field(proof, "acknowledged_end_event_id")?,
+        )
+    } else {
+        (
+            u64_field(proof, "stream_start_event_id")?,
+            u64_field(proof, "stream_end_event_id")?,
+            event_id,
+        )
+    };
     if proof_root_identity != root_identity
         || backend != "fsevents"
         || backend_device == 0
@@ -207,6 +243,48 @@ pub(super) fn encode_replay_checkpoint(
                 "replay_coverage_start_event_id": coverage.after_sequence().checked_add(1)?,
                 "replay_coverage_end_event_id": coverage.through_sequence(),
                 "acknowledged_end_event_id": coverage.through_sequence(),
+            }
+        })
+        .to_string(),
+    )
+}
+
+/// Encode a point-in-time replay prior only from a complete audit and a certain live capture.
+pub(super) fn encode_bootstrap_checkpoint(
+    evidence: &BootstrapReplayEvidence,
+    source_revision: u64,
+) -> Option<String> {
+    let stream = evidence.stream_identity().as_bytes();
+    let payload = stream.strip_prefix(b"fsevents-volume:")?;
+    if payload.len() != 24 || source_revision == 0 {
+        return None;
+    }
+    let device = u64::from_be_bytes(payload[..8].try_into().ok()?);
+    let uuid = uuid::Uuid::from_slice(&payload[8..]).ok()?;
+    let root = std::str::from_utf8(evidence.root_identity().as_bytes()).ok()?;
+    if device == 0 || uuid.is_nil() || evidence.lifecycle_generation() == 0 {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "root_identity": root,
+            "event_id": evidence.through_sequence(),
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "source_id": evidence.source_id().as_str(),
+            "lifecycle_generation": evidence.lifecycle_generation(),
+            "source_revision": source_revision,
+            "cause": "bootstrap_audit",
+            "continuity_proof": {
+                "root_identity": root,
+                "backend": "fsevents",
+                "backend_device": device,
+                "backend_volume_uuid": uuid.to_string(),
+                "watcher_generation": evidence.watcher_generation().get(),
+                "stream_start_event_id": evidence.started_after(),
+                "stream_end_event_id": evidence.through_sequence(),
+                "source_audit_revision": source_revision,
+                "history_complete": true,
+                "changed_source_paths": 0,
             }
         })
         .to_string(),
@@ -381,6 +459,30 @@ mod tests {
         .to_string()
     }
 
+    fn bootstrap_checkpoint() -> Value {
+        serde_json::json!({
+            "root_identity": "root-a",
+            "event_id": 17,
+            "format_version": 4,
+            "source_id": "source-a",
+            "lifecycle_generation": 4,
+            "source_revision": 12,
+            "cause": "bootstrap_audit",
+            "continuity_proof": {
+                "root_identity": "root-a",
+                "backend": "fsevents",
+                "backend_device": 99,
+                "backend_volume_uuid": "550e8400-e29b-41d4-a716-446655440000",
+                "watcher_generation": 23,
+                "stream_start_event_id": 7,
+                "stream_end_event_id": 17,
+                "source_audit_revision": 12,
+                "history_complete": true,
+                "changed_source_paths": 0
+            }
+        })
+    }
+
     fn read_with_generations(
         value: &str,
         source_lifecycle_generation: u64,
@@ -519,6 +621,43 @@ mod tests {
         ];
         for value in cases {
             assert_eq!(read(&value), None, "value should fail closed: {value}");
+        }
+    }
+
+    #[test]
+    fn bootstrap_checkpoint_requires_exact_audit_and_gap_free_coverage_fields() {
+        let valid = bootstrap_checkpoint();
+        assert_eq!(
+            read(&valid.to_string()).unwrap().acknowledged_sequence(),
+            17
+        );
+        let mut cases = Vec::new();
+        for (field, value) in [
+            ("history_complete", serde_json::json!(false)),
+            ("changed_source_paths", serde_json::json!(1)),
+            ("stream_start_event_id", serde_json::json!(18)),
+            ("stream_end_event_id", serde_json::json!(16)),
+            ("source_audit_revision", serde_json::json!(11)),
+            ("backend_volume_uuid", serde_json::json!("bad-uuid")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["continuity_proof"][field] = value;
+            cases.push(invalid);
+        }
+        let mut missing = valid.clone();
+        missing["continuity_proof"]
+            .as_object_mut()
+            .unwrap()
+            .remove("history_complete");
+        cases.push(missing);
+        let mut extra = valid.clone();
+        extra["continuity_proof"]["unknown"] = serde_json::json!(true);
+        cases.push(extra);
+        let mut old = valid;
+        old["format_version"] = serde_json::json!(3);
+        cases.push(old);
+        for value in cases {
+            assert_eq!(read(&value.to_string()), None, "invalid bootstrap: {value}");
         }
     }
 }

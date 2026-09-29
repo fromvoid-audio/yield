@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 #[cfg(unix)]
@@ -14,11 +14,12 @@ use rusqlite::{OptionalExtension, Params, Transaction};
 
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
-    SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
+    SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SOURCE_TAG_ASSIGNMENT_MAX_PAGE_BYTES,
+    SOURCE_TAG_ASSIGNMENT_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
     SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
     SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceCurationTagFacts, SourceCurationTagFactsPage,
-    SourceDatabase, SourceDbError, SourceTag, SourceTagFilterResult, SourceTagPage,
-    SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
+    SourceDatabase, SourceDbError, SourceTag, SourceTagAssignmentCursor, SourceTagAssignmentPage,
+    SourceTagFilterResult, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
 };
 use super::identity::normalize_tag_identity;
 use super::{
@@ -31,6 +32,7 @@ const TAG_PAGE_PREVIEW_CHAR_LIMIT: usize = 256;
 const TAG_PAGE_STAGING_CHUNK_SIZE: usize = 128;
 const SOURCE_CURATION_TAG_FACTS_MAX_ASSIGNMENTS: usize = 4096;
 pub(super) const TAG_FILTER_PROGRESS_OPS: i32 = 256;
+const TAG_ASSIGNMENT_MAX_PROGRESS_CALLS: usize = 16_384;
 
 impl SourceDatabase {
     /// Read exact per-file Curation tag facts for a bounded set of live paths at one revision.
@@ -430,6 +432,175 @@ impl SourceDatabase {
         })
     }
 
+    /// Page live source-relative paths assigned to one normal tag at an exact revision.
+    ///
+    /// The cursor is bound to this source database path, canonical tag identity, and revision.
+    /// The caller must additionally fence source/root identity and lifecycle before publishing a
+    /// result. Each read uses a single SQLite snapshot and returns at most 64 paths and 64 KiB of
+    /// encoded path data. Empty or unknown tags return an explicit empty page.
+    pub fn tag_assignments_page_at_revision(
+        &self,
+        expected_revision: u64,
+        label: &str,
+        after_cursor: Option<&SourceTagAssignmentCursor>,
+        requested_limit: usize,
+        cancellation: &Arc<AtomicBool>,
+    ) -> Result<SourceTagAssignmentPage, SourceDbError> {
+        self.tag_assignments_page_at_revision_with_progress_callback(
+            expected_revision,
+            label,
+            after_cursor,
+            requested_limit,
+            cancellation,
+            None,
+        )
+    }
+
+    fn tag_assignments_page_at_revision_with_progress_callback(
+        &self,
+        expected_revision: u64,
+        label: &str,
+        after_cursor: Option<&SourceTagAssignmentCursor>,
+        requested_limit: usize,
+        cancellation: &Arc<AtomicBool>,
+        progress_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<SourceTagAssignmentPage, SourceDbError> {
+        let normalized_label = normalize_tag_page_prefix(label)?;
+        if cancellation.load(Ordering::Acquire) {
+            return Err(SourceDbError::Canceled);
+        }
+        let query_signature = tag_assignment_page_signature(&self.db_path, &normalized_label);
+        let limit = tag_page_limit(requested_limit);
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(map_sql_error)?;
+        let revision = source_revision(&transaction)?;
+        if revision != expected_revision {
+            return Err(SourceDbError::Unexpected);
+        }
+        if let Some(cursor) = after_cursor
+            && (cursor.revision != revision || cursor.query_signature != query_signature)
+        {
+            return Err(SourceDbError::Unexpected);
+        }
+        let tag_id = if normalized_label.is_empty() {
+            None
+        } else {
+            transaction
+                .query_row(
+                    "SELECT id FROM source_tags WHERE normalized_text = ?1 COLLATE BINARY",
+                    [&normalized_label],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(map_sql_error)?
+        };
+        let Some(tag_id) = tag_id else {
+            if after_cursor.is_some() {
+                return Err(SourceDbError::Unexpected);
+            }
+            transaction.rollback().map_err(map_sql_error)?;
+            return Ok(SourceTagAssignmentPage {
+                revision,
+                tag_id: None,
+                paths: Vec::new(),
+                next_cursor: None,
+            });
+        };
+        if let Some(cursor) = after_cursor {
+            validate_tag_assignment_cursor(&transaction, tag_id, cursor)?;
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return Err(SourceDbError::Canceled);
+        }
+        let progress_calls = Arc::new(AtomicUsize::new(0));
+        let budget_exceeded = Arc::new(AtomicBool::new(false));
+        let budget_calls = Arc::clone(&progress_calls);
+        let budget_flag = Arc::clone(&budget_exceeded);
+        let progress_callback = Some(Arc::new(move || {
+            if let Some(callback) = progress_callback.as_ref() {
+                callback();
+            }
+            if budget_calls.fetch_add(1, Ordering::Relaxed) >= TAG_ASSIGNMENT_MAX_PROGRESS_CALLS {
+                budget_flag.store(true, Ordering::Release);
+            }
+        }) as Arc<dyn Fn() + Send + Sync>);
+        let canceled_for_handler = Arc::clone(cancellation);
+        let exceeded_for_handler = Arc::clone(&budget_exceeded);
+        self.connection.progress_handler(
+            TAG_FILTER_PROGRESS_OPS,
+            Some(move || {
+                if let Some(callback) = progress_callback.as_ref() {
+                    callback();
+                }
+                canceled_for_handler.load(Ordering::Acquire)
+                    || exceeded_for_handler.load(Ordering::Acquire)
+            }),
+        );
+        let _progress_handler = TagFilterProgressHandlerGuard {
+            connection: &self.connection,
+        };
+        let sql = tag_assignment_paths_sql();
+        let mut statement = transaction
+            .prepare_cached(&sql)
+            .map_err(|error| map_tag_assignment_sql_error(error, &budget_exceeded))?;
+        let mut rows = statement
+            .query(rusqlite::params![
+                tag_id,
+                after_cursor.map_or("", |cursor| cursor.last_path.as_str()),
+                i64::try_from(limit + 1).unwrap_or(i64::MAX)
+            ])
+            .map_err(|error| map_tag_assignment_sql_error(error, &budget_exceeded))?;
+        let mut paths = Vec::with_capacity(limit + 1);
+        let mut page_bytes = 0usize;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| map_tag_assignment_sql_error(error, &budget_exceeded))?
+        {
+            if cancellation.load(Ordering::Acquire) {
+                return Err(SourceDbError::Canceled);
+            }
+            let path: String = row.get(0).map_err(map_tag_filter_sql_error)?;
+            validate_tag_assignment_path(&path)?;
+            if paths.len() < limit {
+                page_bytes = page_bytes.saturating_add(path.len());
+                if page_bytes > SOURCE_TAG_ASSIGNMENT_MAX_PAGE_BYTES {
+                    return Err(SourceDbError::TagAssignmentPageBytesTooLarge {
+                        max: SOURCE_TAG_ASSIGNMENT_MAX_PAGE_BYTES,
+                        actual: page_bytes,
+                    });
+                }
+            }
+            paths.push(path);
+        }
+        drop(rows);
+        drop(statement);
+        if cancellation.load(Ordering::Acquire) {
+            return Err(SourceDbError::Canceled);
+        }
+        let has_more = paths.len() > limit;
+        if has_more {
+            paths.truncate(limit);
+        }
+        let next_cursor = has_more.then(|| SourceTagAssignmentCursor {
+            revision,
+            query_signature,
+            last_path: paths
+                .last()
+                .expect("continued page has a last path")
+                .clone(),
+        });
+        drop(_progress_handler);
+        transaction.rollback().map_err(map_sql_error)?;
+        Ok(SourceTagAssignmentPage {
+            revision,
+            tag_id: Some(tag_id),
+            paths: paths.into_iter().map(PathBuf::from).collect(),
+            next_cursor,
+        })
+    }
+
     /// Fetch requested source tags for an exact bounded set of source-relative paths at one
     /// revision.
     ///
@@ -728,6 +899,23 @@ pub(super) fn map_tag_filter_sql_error(error: rusqlite::Error) -> SourceDbError 
     }
 }
 
+fn map_tag_assignment_sql_error(
+    error: rusqlite::Error,
+    budget_exceeded: &AtomicBool,
+) -> SourceDbError {
+    if budget_exceeded.load(Ordering::Acquire)
+        && matches!(
+            &error,
+            rusqlite::Error::SqliteFailure(sql_error, _)
+                if sql_error.code == rusqlite::ErrorCode::OperationInterrupted
+        )
+    {
+        SourceDbError::TagAssignmentWorkBudgetExceeded
+    } else {
+        map_tag_filter_sql_error(error)
+    }
+}
+
 pub(super) struct TagFilterProgressHandlerGuard<'connection> {
     connection: &'connection rusqlite::Connection,
 }
@@ -907,6 +1095,73 @@ fn tag_page_prefix_signature(prefix: &str) -> u64 {
     "vocabulary".hash(&mut hasher);
     prefix.hash(&mut hasher);
     hasher.finish()
+}
+
+fn tag_assignment_page_signature(db_path: &Path, normalized_label: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    "yield-source-tag-assignment-page-v1".hash(&mut hasher);
+    db_path.hash(&mut hasher);
+    normalized_label.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn tag_assignment_paths_sql() -> String {
+    format!(
+        "SELECT wft.path
+         FROM wav_file_tags AS wft
+         JOIN wav_files AS wf ON wf.path = wft.path
+         WHERE wft.tag_id = ?1 AND wft.path > ?2 COLLATE BINARY
+           AND wf.missing = 0 AND {filter}
+         ORDER BY wft.path COLLATE BINARY ASC LIMIT ?3",
+        filter = supported_tag_assignment_filter(),
+    )
+}
+
+fn supported_tag_assignment_filter() -> String {
+    crate::sample_sources::supported_audio_where_clause()
+        .replace("path", "wf.path")
+        .replace("extension", "wf.extension")
+}
+
+fn validate_tag_assignment_path(path: &str) -> Result<(), SourceDbError> {
+    if path.len() > SOURCE_TAG_ASSIGNMENT_MAX_PATH_BYTES {
+        return Err(SourceDbError::TagAssignmentPageBytesTooLarge {
+            max: SOURCE_TAG_ASSIGNMENT_MAX_PATH_BYTES,
+            actual: path.len(),
+        });
+    }
+    if path.contains('\0') || normalize_relative_path(Path::new(path))? != path {
+        return Err(SourceDbError::Unexpected);
+    }
+    Ok(())
+}
+
+fn validate_tag_assignment_cursor(
+    transaction: &Transaction<'_>,
+    tag_id: i64,
+    cursor: &SourceTagAssignmentCursor,
+) -> Result<(), SourceDbError> {
+    validate_tag_assignment_path(&cursor.last_path)?;
+    let query = format!(
+        "SELECT EXISTS(
+             SELECT 1 FROM wav_file_tags AS wft
+             JOIN wav_files AS wf ON wf.path = wft.path
+             WHERE wft.tag_id = ?1 AND wft.path = ?2 COLLATE BINARY
+               AND wf.missing = 0 AND {filter}
+         )",
+        filter = supported_tag_assignment_filter(),
+    );
+    let exists = transaction
+        .query_row(&query, rusqlite::params![tag_id, cursor.last_path], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(map_sql_error)?
+        != 0;
+    if exists {
+        Ok(())
+    } else {
+        Err(SourceDbError::Unexpected)
+    }
 }
 
 pub(super) fn source_revision(transaction: &Transaction<'_>) -> Result<u64, SourceDbError> {
@@ -1323,13 +1578,100 @@ mod plan_tests {
 
     use super::{
         SourceDatabase, SourceDbError, selected_tag_ids_page_sql, selected_tag_page_sql,
-        tag_prefix_upper_bound, tag_vocabulary_sql,
+        tag_assignment_paths_sql, tag_prefix_upper_bound, tag_vocabulary_sql,
     };
+
+    fn open_tag_test_db(root: &Path) -> SourceDatabase {
+        drop(SourceDatabase::open_for_maintenance(root).expect("prepare source schema"));
+        SourceDatabase::open_for_user_metadata_write(root).expect("operational metadata open")
+    }
+
+    #[test]
+    fn tag_assignment_page_plan_seeks_tag_id_and_path() {
+        let directory = tempdir().unwrap();
+        let database = open_tag_test_db(directory.path());
+        database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+        let tag = database
+            .assign_tag_to_path(Path::new("one.wav"), "shared")
+            .unwrap();
+        let plan = database
+            .connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                tag_assignment_paths_sql()
+            ))
+            .unwrap()
+            .query_map(rusqlite::params![tag.id, "", 65_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_wav_file_tags_tag_id")
+                    && detail.contains("path>")),
+            "tag assignment query does not keyset seek: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn tag_assignment_page_cancels_during_sql_and_recovers() {
+        let directory = tempdir().unwrap();
+        let database = open_tag_test_db(directory.path());
+        let paths = (0..512)
+            .map(|index| PathBuf::from(format!("sample-{index:04}.wav")))
+            .collect::<Vec<_>>();
+        for path in &paths {
+            database.upsert_file(path, 10, 5).unwrap();
+        }
+        let tag = database.assign_tag_to_path(&paths[0], "shared").unwrap();
+        let transaction = database.connection.unchecked_transaction().unwrap();
+        for path in &paths[1..] {
+            transaction
+                .execute(
+                    "INSERT INTO wav_file_tags (path, tag_id) VALUES (?1, ?2)",
+                    rusqlite::params![path.to_str().unwrap(), tag.id],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        let revision = database.get_revision().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let progress_seen = Arc::new(AtomicBool::new(false));
+        let cancellation_for_progress = Arc::clone(&cancellation);
+        let seen_for_progress = Arc::clone(&progress_seen);
+        let callback: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            seen_for_progress.store(true, Ordering::Release);
+            cancellation_for_progress.store(true, Ordering::Release);
+        });
+        assert!(matches!(
+            database.tag_assignments_page_at_revision_with_progress_callback(
+                revision,
+                "shared",
+                None,
+                64,
+                &cancellation,
+                Some(callback)
+            ),
+            Err(SourceDbError::Canceled)
+        ));
+        assert!(progress_seen.load(Ordering::Acquire));
+        cancellation.store(false, Ordering::Release);
+        assert_eq!(
+            database
+                .tag_assignments_page_at_revision(revision, "shared", None, 1, &cancellation)
+                .unwrap()
+                .paths
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn vocabulary_prefix_range_plans_include_an_index_seek() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
         for label in ["alpha", "atom", "beta"] {
             database
@@ -1356,7 +1698,7 @@ mod plan_tests {
     #[test]
     fn selected_tag_page_plan_uses_wav_file_tag_primary_key_lookup() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
         database
             .assign_tag_to_path(Path::new("one.wav"), "shared")
@@ -1394,7 +1736,7 @@ mod plan_tests {
     #[test]
     fn selected_tag_ids_page_plan_uses_bounded_path_and_id_lookups() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
         let tag = database
             .assign_tag_to_path(Path::new("one.wav"), "shared")
@@ -1446,7 +1788,7 @@ mod plan_tests {
     #[test]
     fn selected_tag_ids_page_cancels_during_grouped_query_and_cleans_temp_scope() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         let paths = (0..4096)
             .map(|index| PathBuf::from(format!("sample-{index:04}.wav")))
             .collect::<Vec<_>>();
@@ -1505,7 +1847,7 @@ mod plan_tests {
     #[test]
     fn curation_facts_keep_each_live_path_and_empty_tag_set_distinct() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         for name in ["empty.wav", "complete.wav", "playback.wav"] {
             database.upsert_file(Path::new(name), 10, 5).unwrap();
         }
@@ -1550,7 +1892,7 @@ mod plan_tests {
     #[test]
     fn curation_facts_reject_missing_stale_canceled_and_legacy_rows() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
         let tag = database
             .assign_tag_to_path(Path::new("one.wav"), "kick")
@@ -1613,7 +1955,7 @@ mod plan_tests {
     #[test]
     fn curation_facts_cancel_during_sql_and_recover_connection() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_tag_test_db(directory.path());
         let paths = (0..64)
             .map(|index| PathBuf::from(format!("sample-{index:02}.wav")))
             .collect::<Vec<_>>();

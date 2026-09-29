@@ -641,6 +641,27 @@ pub struct SourceTagPage {
     pub next_cursor: Option<SourceTagPageCursor>,
 }
 
+/// Opaque continuation for one source-wide tag-assignment read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTagAssignmentCursor {
+    pub(crate) revision: u64,
+    pub(crate) query_signature: u64,
+    pub(crate) last_path: String,
+}
+
+/// One bounded page of live source-relative paths carrying a normal tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTagAssignmentPage {
+    /// Source metadata revision observed by the read.
+    pub revision: u64,
+    /// Source-local tag id, or `None` when the canonical tag is absent.
+    pub tag_id: Option<i64>,
+    /// Live supported source-relative paths in binary key order.
+    pub paths: Vec<PathBuf>,
+    /// Continuation bound to the same tag identity and source revision.
+    pub next_cursor: Option<SourceTagAssignmentCursor>,
+}
+
 /// Exact, revision-fenced tag completeness facts for one live source file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceCurationTagFacts {
