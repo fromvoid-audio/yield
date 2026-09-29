@@ -433,6 +433,265 @@ fn retained_uncertainty_blocks_replay_through_restart_until_complete_audit() {
 }
 
 #[test]
+fn capacity_exhaustion_marker_survives_failed_write_retry_and_restart() {
+    let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
+    let temporary_root = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+    let base = tempfile::tempdir_in(temporary_root).expect("config base");
+    let _config_base = ConfigBaseGuard::set(base.path().to_path_buf());
+    let _profile = PersistenceProfileGuard::named("watcher-capacity-test");
+    let profile = WritableProfileGuard::acquire_current().expect("profile guard");
+    let source = tempfile::tempdir().expect("source root");
+    let child = Path::new("watcher-capacity-source");
+    let database =
+        SourceDatabase::open_for_catalog_with_profile_guard(source.path(), &profile, child)
+            .expect("profile-bound source");
+    let source_id = SourceId::from_string("watcher-capacity-source");
+    let writer = SourceWriter::new_for_scan(database, source_id.clone(), 7).expect("source writer");
+    let initial = writer.current_scan_fence().expect("initial fence");
+    let mut batch = writer
+        .catalog_database()
+        .write_batch()
+        .expect("audit batch");
+    batch.complete_manifest_audit(1).expect("complete audit");
+    let (audit, _) = batch
+        .commit_with_manifest_snapshot_and_audit(initial.root_identity().clone(), None)
+        .expect("committed audit");
+    let fence = writer.current_scan_fence().expect("audited fence");
+    let stream = BackendStreamIdentity::from_fsevents_volume(17, [3; 16]).expect("stream");
+    let bootstrap = BootstrapReplayEvidence::from_certain_empty_capture(
+        source_id.clone(),
+        fence.root_identity().clone(),
+        stream.clone(),
+        7,
+        WatcherGeneration::new(1),
+        100,
+        100,
+        true,
+        false,
+        0,
+    )
+    .expect("certain capture");
+    let prior = writer
+        .commit_bootstrap_replay_checkpoint(&fence, &audit, &bootstrap)
+        .expect("durable prior");
+    assert_eq!(prior.acknowledged_sequence(), 100);
+
+    let lane_limits = RawObservationLimits::new(8, 4096, 4096).expect("lane limits");
+    let limits = ReconciliationAdmissionLimits::new(
+        1,
+        lane_limits,
+        RawObservationLimits::new(32, 16384, 16384).expect("global limits"),
+        1,
+        8,
+        1,
+    )
+    .expect("admission limits");
+    let mut owner =
+        ReconciliationAdmissionOwner::new(ReconciliationAdmissionSupervisor::new(limits));
+    let observation = |source_id: SourceId,
+                       root_identity: crate::sample_sources::reconciliation::RootIdentity,
+                       generation: WatcherGeneration| {
+        SyntheticObservationBatch::new(
+            RawObservationProvenance::new(
+                source_id,
+                Some(root_identity),
+                Some(stream.clone()),
+                generation,
+                CaptureBoundary::try_new(102, Some(102), Some(102)).expect("boundary"),
+            ),
+            vec![RawObservation::new(
+                RawEventKind::Create,
+                vec![RawObservedPath::new(
+                    "capacity.wav".into(),
+                    RawPathRole::Subject,
+                )],
+            )],
+            lane_limits,
+        )
+    };
+    // Fill both ordinary and emergency uncertainty retention with unknown lanes.
+    for index in 0..2 {
+        owner
+            .admit_replay_with_durable_prior(
+                observation(
+                    SourceId::from_string(format!("unknown-capacity-{index}")),
+                    fence.root_identity().clone(),
+                    WatcherGeneration::new(1),
+                ),
+                None,
+                true,
+            )
+            .expect("bounded unknown-lane admission");
+    }
+    let lane = owner
+        .begin_source(source_id.clone(), fence.root_identity().clone())
+        .expect("current lane");
+    let admission = owner
+        .admit_replay_with_durable_prior(
+            observation(
+                source_id.clone(),
+                fence.root_identity().clone(),
+                lane.generation(),
+            ),
+            Some(&prior),
+            true,
+        )
+        .expect("capacity admission");
+    assert!(matches!(
+        admission.admission().outcome(),
+        crate::sample_sources::reconciliation::AdmissionOutcome::UncertaintyCapacityExhausted(_)
+    ));
+    assert!(admission.audit_request().is_some());
+    let marker = owner
+        .durable_audit_marker_for_replay(&admission)
+        .expect("current-lane source-wide marker despite exhausted retention");
+    assert_eq!(marker.source_id(), Some(&source_id));
+    assert_eq!(marker.root_identity(), Some(fence.root_identity()));
+
+    // Fill the SQLite database under a fixed page limit so marker persistence sees a real
+    // SQLITE_FULL result. The filler is test-only metadata, outside the source writer protocol.
+    let connection = &writer.catalog_database().connection;
+    let page_count: i64 = connection
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .expect("current page count");
+    connection
+        .execute_batch(&format!("PRAGMA max_page_count = {page_count}"))
+        .expect("bound database capacity");
+    let mut saw_full = false;
+    for index in 0..4096 {
+        match connection.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            rusqlite::params![format!("_capacity_fill_{index:04}"), "x".repeat(100)],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DiskFull =>
+            {
+                saw_full = true;
+                break;
+            }
+            Err(error) => panic!("unexpected capacity filler error: {error}"),
+        }
+    }
+    assert!(saw_full, "fixture must exhaust SQLite pages");
+    let failed_marker_write = writer
+        .retain_watcher_replay_uncertainty(&fence, &marker)
+        .expect_err("low-space marker write cannot claim durable acknowledgement");
+    assert!(
+        matches!(
+            failed_marker_write,
+            SourceWriterError::Database(crate::sample_sources::db::SourceDbError::Sql(
+                rusqlite::Error::SqliteFailure(error, _)
+            )) if error.code == rusqlite::ErrorCode::DiskFull
+        ),
+        "expected SQLITE_FULL, got {failed_marker_write:?}"
+    );
+    assert_eq!(
+        writer
+            .catalog_database()
+            .read_durable_replay_uncertainty()
+            .unwrap(),
+        DurableReplayUncertaintyState::Absent
+    );
+    connection
+        .execute_batch("PRAGMA max_page_count = 1000000")
+        .expect("restore database capacity");
+    connection
+        .execute("DELETE FROM metadata WHERE key LIKE '_capacity_fill_%'", [])
+        .expect("release test-only capacity filler");
+    let retained = writer
+        .retain_watcher_replay_uncertainty(&fence, &marker)
+        .expect("retry retained marker");
+    assert_eq!(
+        writer
+            .retain_watcher_replay_uncertainty(&fence, &marker)
+            .unwrap(),
+        retained,
+        "duplicate retry does not create a new barrier"
+    );
+    assert!(
+        writer
+            .commit_bootstrap_replay_checkpoint(&fence, &audit, &bootstrap)
+            .is_err(),
+        "pre-marker audit cannot retire uncertainty"
+    );
+    let mut incomplete = writer
+        .catalog_database()
+        .write_batch()
+        .expect("incomplete scan batch");
+    incomplete
+        .upsert_file(Path::new("partial.wav"), 10, 1)
+        .expect("partial scan fact");
+    writer
+        .commit_scan_manifest_batch(&fence, incomplete)
+        .expect("partial scan can publish safe facts");
+    assert_eq!(
+        writer
+            .catalog_database()
+            .read_durable_replay_uncertainty()
+            .unwrap(),
+        DurableReplayUncertaintyState::Retained(retained.clone()),
+        "partial scan cannot claim a complete recovery audit"
+    );
+    drop(writer);
+
+    let reopened =
+        SourceDatabase::open_for_catalog_with_profile_guard(source.path(), &profile, child)
+            .expect("reopen source");
+    assert_eq!(
+        reopened.read_durable_replay_uncertainty().unwrap(),
+        DurableReplayUncertaintyState::Retained(retained)
+    );
+    assert!(
+        reopened
+            .read_durable_replay_prior(
+                &source_id,
+                fence.root_identity(),
+                WatcherGeneration::new(7),
+                lane.generation(),
+            )
+            .expect("reopened replay read")
+            .is_none()
+    );
+    let writer =
+        SourceWriter::new_for_scan(reopened, source_id.clone(), 7).expect("reopened writer");
+    let mut batch = writer
+        .catalog_database()
+        .write_batch()
+        .expect("recovery batch");
+    batch
+        .complete_manifest_audit(2)
+        .expect("complete recovery audit");
+    let (recovery_audit, _) = batch
+        .commit_with_manifest_snapshot_and_audit(fence.root_identity().clone(), None)
+        .expect("committed recovery audit");
+    let recovered = writer.current_scan_fence().expect("recovered fence");
+    let recovery_capture = BootstrapReplayEvidence::from_certain_empty_capture(
+        source_id,
+        recovered.root_identity().clone(),
+        stream,
+        7,
+        lane.generation(),
+        200,
+        200,
+        true,
+        false,
+        0,
+    )
+    .expect("certain recovery capture");
+    writer
+        .commit_bootstrap_replay_checkpoint(&recovered, &recovery_audit, &recovery_capture)
+        .expect("only later complete audit restores replay authority");
+    assert_eq!(
+        writer
+            .catalog_database()
+            .read_durable_replay_uncertainty()
+            .unwrap(),
+        DurableReplayUncertaintyState::Absent
+    );
+}
+
+#[test]
 fn bootstrap_evidence_rejects_changed_paths_and_unknown_coverage() {
     let source = SourceId::from_string("source");
     let root = crate::sample_sources::reconciliation::RootIdentity::from_bytes(b"root".to_vec());
