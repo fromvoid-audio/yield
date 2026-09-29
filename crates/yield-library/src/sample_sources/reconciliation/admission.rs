@@ -1933,6 +1933,31 @@ impl ReconciliationAdmissionSupervisor {
 }
 
 impl RetainedUncertainty {
+    /// Represent a current-lane audit fallback without borrowing authority from invalid raw
+    /// provenance. A wrong-root or stale-generation event must widen the current source, rather
+    /// than persist the rejected event's identity as if it were the active lane.
+    pub(crate) fn for_source_audit_request(
+        request: &SourceAuditRequest,
+        mut reasons: Vec<UncertaintyReason>,
+    ) -> Self {
+        if reasons.is_empty() {
+            reasons.push(UncertaintyReason::ReplayContinuityMismatch);
+        }
+        reasons.sort_unstable();
+        reasons.dedup();
+        Self {
+            source_id: Some(request.source_id().clone()),
+            root_identity: Some(request.root_identity().clone()),
+            generation: Some(request.generation()),
+            backend_stream_identity: None,
+            capture_boundary: None,
+            retained_boundary: request.boundary(),
+            scope: ReconciliationScopeKind::SourceAudit,
+            reasons,
+            emergency: false,
+        }
+    }
+
     fn new(
         source_id: Option<SourceId>,
         root_identity: Option<RootIdentity>,
