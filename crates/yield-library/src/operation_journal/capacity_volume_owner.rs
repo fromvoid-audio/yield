@@ -94,6 +94,19 @@ pub(crate) enum VolumeOwnershipError {
         owner_profile_identity: String,
         generation: u64,
     },
+    /// A foreign dirty v1 marker is keyed only by a reusable device number, so its volume
+    /// authority is ambiguous even though the current descriptor has a stronger UUID.
+    #[cfg(target_os = "macos")]
+    #[error(
+        "ambiguous legacy dirty volume marker at {marker_path} for device {device} UUID {volume_uuid}; owner {owner_profile_identity} generation {generation}; preserve and reconcile this marker before retrying"
+    )]
+    AmbiguousLegacyDirtyMarker {
+        device: u64,
+        volume_uuid: String,
+        marker_path: PathBuf,
+        owner_profile_identity: String,
+        generation: u64,
+    },
     /// The marker changed while this capability was retained.
     #[error("volume ownership marker changed at {path}")]
     MarkerChanged { path: PathBuf },
@@ -116,6 +129,137 @@ struct OwnershipMarker {
     state: MarkerState,
     owner_profile_identity: String,
     generation: u64,
+}
+
+/// Strong macOS identity retained separately from the still device-keyed v1 marker namespace.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct MacVolumeBinding {
+    descriptor: File,
+    device: u64,
+    uuid: [u8; 16],
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MacVolumeObservation {
+    device: u64,
+    uuid: [u8; 16],
+}
+
+#[cfg(target_os = "macos")]
+impl MacVolumeBinding {
+    fn acquire(descriptor: &File, volume: &VolumeIdentity) -> Result<Self, VolumeOwnershipError> {
+        let observation = observe_mac_volume(descriptor)?;
+        if observation.device != volume.device {
+            return Err(VolumeOwnershipError::VolumeIdentityUnavailable);
+        }
+        Ok(Self {
+            descriptor: descriptor
+                .try_clone()
+                .map_err(|_| VolumeOwnershipError::VolumeIdentityUnavailable)?,
+            device: observation.device,
+            uuid: observation.uuid,
+        })
+    }
+
+    fn try_clone(&self) -> Result<Self, VolumeOwnershipError> {
+        Ok(Self {
+            descriptor: self
+                .descriptor
+                .try_clone()
+                .map_err(|_| VolumeOwnershipError::VolumeIdentityUnavailable)?,
+            device: self.device,
+            uuid: self.uuid,
+        })
+    }
+
+    fn validate(&self, expected: &VolumeIdentity) -> Result<(), VolumeOwnershipError> {
+        self.validate_with(expected, |descriptor| observe_mac_volume(descriptor))
+    }
+
+    fn validate_with<Observe>(
+        &self,
+        expected: &VolumeIdentity,
+        observe: Observe,
+    ) -> Result<(), VolumeOwnershipError>
+    where
+        Observe: FnOnce(&File) -> Result<MacVolumeObservation, VolumeOwnershipError>,
+    {
+        let current = observe(&self.descriptor)?;
+        if expected.device != self.device
+            || current.device != self.device
+            || current.uuid != self.uuid
+        {
+            return Err(VolumeOwnershipError::VolumeIdentityUnavailable);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+type VolumeBinding = Option<MacVolumeBinding>;
+
+#[cfg(not(target_os = "macos"))]
+type VolumeBinding = ();
+
+#[cfg(target_os = "macos")]
+fn observe_mac_volume(descriptor: &File) -> Result<MacVolumeObservation, VolumeOwnershipError> {
+    use std::os::fd::AsRawFd;
+
+    let mut attributes = libc::attrlist {
+        bitmapcount: 5,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut bytes = [0_u8; 20];
+    // SAFETY: both pointers refer to fully initialized, correctly sized stack values that remain
+    // live for the call. The descriptor is borrowed and fgetattrlist does not take ownership.
+    let result = unsafe {
+        libc::fgetattrlist(
+            descriptor.as_raw_fd(),
+            (&mut attributes as *mut libc::attrlist).cast(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(VolumeOwnershipError::VolumeIdentityUnavailable);
+    }
+    let uuid = parse_mac_volume_uuid(&bytes)?;
+    use std::os::unix::fs::MetadataExt;
+    let device = descriptor
+        .metadata()
+        .map_err(|_| VolumeOwnershipError::VolumeIdentityUnavailable)?
+        .dev() as u64;
+    if device == 0 {
+        return Err(VolumeOwnershipError::VolumeIdentityUnavailable);
+    }
+    Ok(MacVolumeObservation { device, uuid })
+}
+
+#[cfg(target_os = "macos")]
+fn format_uuid(uuid: &[u8; 16]) -> String {
+    uuid.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(target_os = "macos")]
+fn parse_mac_volume_uuid(bytes: &[u8]) -> Result<[u8; 16], VolumeOwnershipError> {
+    if bytes.len() != 20 || u32::from_ne_bytes(bytes[..4].try_into().unwrap()) != 20 {
+        return Err(VolumeOwnershipError::VolumeIdentityUnavailable);
+    }
+    let uuid: [u8; 16] = bytes[4..]
+        .try_into()
+        .map_err(|_| VolumeOwnershipError::VolumeIdentityUnavailable)?;
+    if uuid.iter().all(|byte| *byte == 0) {
+        return Err(VolumeOwnershipError::VolumeIdentityUnavailable);
+    }
+    Ok(uuid)
 }
 
 #[derive(Debug)]
@@ -161,6 +305,10 @@ pub(crate) struct VolumeOwnershipCapability {
     lock_identity: String,
     lock_file: File,
     marker: OwnershipMarker,
+    /// Production macOS ownership retains and revalidates the original volume descriptor and
+    /// UUID. Fixture providers and non-macOS builds keep the established device-only behavior.
+    #[cfg(target_os = "macos")]
+    mac_volume: Option<MacVolumeBinding>,
     /// Set before attempting a clean write.  A failed or uncertain write must never let this
     /// runtime continue using the old generation as if the handoff had not started.
     handoff_fenced: Rc<Cell<bool>>,
@@ -205,6 +353,12 @@ impl VolumeOwnershipCapability {
                     path: self.lock_path.clone(),
                     source,
                 })?;
+        #[cfg(target_os = "macos")]
+        let mac_volume = self
+            .mac_volume
+            .as_ref()
+            .map(MacVolumeBinding::try_clone)
+            .transpose()?;
         Ok(Self {
             registry: RegistryRoot {
                 path: self.registry.path.clone(),
@@ -216,6 +370,8 @@ impl VolumeOwnershipCapability {
             lock_identity: self.lock_identity.clone(),
             lock_file,
             marker: self.marker.clone(),
+            #[cfg(target_os = "macos")]
+            mac_volume,
             handoff_fenced: Rc::clone(&self.handoff_fenced),
             _owner_thread: PhantomData,
         })
@@ -227,6 +383,10 @@ impl VolumeOwnershipCapability {
             return Err(VolumeOwnershipError::HandoffFenced {
                 path: self.lock_path.clone(),
             });
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(binding) = &self.mac_volume {
+            binding.validate(&self.volume)?;
         }
         self.registry.validate()?;
         let lock = open_existing_lock(&self.registry.capability, &self.lock_path)?;
@@ -352,17 +512,22 @@ pub(super) fn acquire_for_descriptor(
     descriptor: &File,
     profile: &WritableProfileGuard,
 ) -> Result<VolumeOwnershipCapability, VolumeOwnershipError> {
-    let registry = production_registry_root()?;
     profile
         .validate_current()
         .map_err(|error| root_error(PathBuf::from("profile-owner.lock"), error))?;
     let facts = descriptor_capacity_facts(descriptor)
         .map_err(|_| VolumeOwnershipError::VolumeIdentityUnavailable)?;
-    acquire_inner(
+    #[cfg(target_os = "macos")]
+    let mac_volume = Some(MacVolumeBinding::acquire(descriptor, &facts.identity)?);
+    #[cfg(not(target_os = "macos"))]
+    let mac_volume = ();
+    let registry = production_registry_root()?;
+    acquire_inner_with_binding(
         registry,
         facts.identity,
         profile.profile_root_identity().to_owned(),
         false,
+        mac_volume,
     )
 }
 
@@ -373,17 +538,22 @@ pub(super) fn acquire_for_descriptor_after_clean_handoff(
     descriptor: &File,
     profile: &WritableProfileGuard,
 ) -> Result<VolumeOwnershipCapability, VolumeOwnershipError> {
-    let registry = production_registry_root()?;
     profile
         .validate_current()
         .map_err(|error| root_error(PathBuf::from("profile-owner.lock"), error))?;
     let facts = descriptor_capacity_facts(descriptor)
         .map_err(|_| VolumeOwnershipError::VolumeIdentityUnavailable)?;
-    acquire_inner(
+    #[cfg(target_os = "macos")]
+    let mac_volume = Some(MacVolumeBinding::acquire(descriptor, &facts.identity)?);
+    #[cfg(not(target_os = "macos"))]
+    let mac_volume = ();
+    let registry = production_registry_root()?;
+    acquire_inner_with_binding(
         registry,
         facts.identity,
         profile.profile_root_identity().to_owned(),
         true,
+        mac_volume,
     )
 }
 
@@ -462,21 +632,44 @@ fn lock_file_name(volume: &VolumeIdentity) -> Result<String, VolumeOwnershipErro
     ))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn acquire_inner(
     registry: RegistryRoot,
     volume: VolumeIdentity,
     owner_profile_identity: String,
     allow_clean_marker: bool,
 ) -> Result<VolumeOwnershipCapability, VolumeOwnershipError> {
-    acquire_inner_with_sync(
+    #[cfg(target_os = "macos")]
+    let binding = None;
+    #[cfg(not(target_os = "macos"))]
+    let binding = ();
+    acquire_inner_with_binding(
         registry,
         volume,
         owner_profile_identity,
         allow_clean_marker,
+        binding,
+    )
+}
+
+fn acquire_inner_with_binding(
+    registry: RegistryRoot,
+    volume: VolumeIdentity,
+    owner_profile_identity: String,
+    allow_clean_marker: bool,
+    binding: VolumeBinding,
+) -> Result<VolumeOwnershipCapability, VolumeOwnershipError> {
+    acquire_inner_with_binding_and_sync(
+        registry,
+        volume,
+        owner_profile_identity,
+        allow_clean_marker,
+        binding,
         sync_directory,
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn acquire_inner_with_sync<Sync>(
     registry: RegistryRoot,
     volume: VolumeIdentity,
@@ -487,6 +680,33 @@ fn acquire_inner_with_sync<Sync>(
 where
     Sync: Fn(&Dir, &Path) -> Result<(), VolumeOwnershipError>,
 {
+    #[cfg(target_os = "macos")]
+    let binding = None;
+    #[cfg(not(target_os = "macos"))]
+    let binding = ();
+    acquire_inner_with_binding_and_sync(
+        registry,
+        volume,
+        owner_profile_identity,
+        allow_clean_marker,
+        binding,
+        sync,
+    )
+}
+
+fn acquire_inner_with_binding_and_sync<Sync>(
+    registry: RegistryRoot,
+    volume: VolumeIdentity,
+    owner_profile_identity: String,
+    allow_clean_marker: bool,
+    binding: VolumeBinding,
+    sync: Sync,
+) -> Result<VolumeOwnershipCapability, VolumeOwnershipError>
+where
+    Sync: Fn(&Dir, &Path) -> Result<(), VolumeOwnershipError>,
+{
+    #[cfg(not(target_os = "macos"))]
+    let _ = binding;
     validate_owner_profile_identity(&owner_profile_identity)?;
     registry.validate()?;
     let name = lock_file_name(&volume)?;
@@ -500,6 +720,11 @@ where
         })?;
     try_exclusive_lock(&lock_file, &lock_path)?;
 
+    #[cfg(target_os = "macos")]
+    if let Some(binding) = &binding {
+        binding.validate(&volume)?;
+    }
+
     let previous = read_marker(
         lock_file
             .try_clone()
@@ -509,6 +734,20 @@ where
             })?,
         &lock_path,
     )?;
+    #[cfg(target_os = "macos")]
+    if let (Some(binding), Some(marker)) = (&binding, &previous) {
+        if marker.state == MarkerState::Dirty
+            && marker.owner_profile_identity != owner_profile_identity
+        {
+            return Err(VolumeOwnershipError::AmbiguousLegacyDirtyMarker {
+                device: volume.device,
+                volume_uuid: format_uuid(&binding.uuid),
+                marker_path: lock_path,
+                owner_profile_identity: marker.owner_profile_identity.clone(),
+                generation: marker.generation,
+            });
+        }
+    }
     let (marker, persist_marker) =
         next_dirty_marker(previous, &owner_profile_identity, allow_clean_marker)?;
     if persist_marker {
@@ -529,6 +768,8 @@ where
         lock_identity,
         lock_file,
         marker,
+        #[cfg(target_os = "macos")]
+        mac_volume: binding,
         handoff_fenced: Rc::new(Cell::new(false)),
         _owner_thread: PhantomData,
     };
@@ -1334,6 +1575,302 @@ mod tests {
             original
         );
         drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_volume_uuid_buffer_requires_exact_nonzero_identity() {
+        let mut valid = [0_u8; 20];
+        valid[..4].copy_from_slice(&20_u32.to_ne_bytes());
+        valid[4] = 1;
+        assert_eq!(parse_mac_volume_uuid(&valid).unwrap()[0], 1);
+        assert!(parse_mac_volume_uuid(&valid[..19]).is_err());
+        assert!(parse_mac_volume_uuid(&[valid.as_slice(), &[0]].concat()).is_err());
+
+        let mut truncated_claim = valid;
+        truncated_claim[..4].copy_from_slice(&19_u32.to_ne_bytes());
+        assert!(parse_mac_volume_uuid(&truncated_claim).is_err());
+        let mut oversized_claim = valid;
+        oversized_claim[..4].copy_from_slice(&21_u32.to_ne_bytes());
+        assert!(parse_mac_volume_uuid(&oversized_claim).is_err());
+        let mut zero_uuid = valid;
+        zero_uuid[4..].fill(0);
+        assert!(parse_mac_volume_uuid(&zero_uuid).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_binding_retains_descriptor_and_rejects_changed_observation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = fixture();
+        let volume = descriptor_capacity_facts(&fixture.descriptor)
+            .expect("descriptor volume facts")
+            .identity;
+        let binding =
+            MacVolumeBinding::acquire(&fixture.descriptor, &volume).expect("macOS descriptor UUID");
+        let retained_path = fixture.directory.path().join("descriptor");
+        fs::remove_file(&retained_path).expect("unlink original descriptor path");
+        drop(fixture.descriptor);
+        assert_eq!(
+            binding.descriptor.metadata().unwrap().dev() as u64,
+            volume.device
+        );
+        binding
+            .validate(&volume)
+            .expect("retained descriptor still identifies volume");
+
+        let changed_uuid = MacVolumeObservation {
+            device: volume.device,
+            uuid: [0x5a; 16],
+        };
+        assert!(
+            binding
+                .validate_with(&volume, |_| Ok(changed_uuid))
+                .is_err()
+        );
+        let changed_device = MacVolumeObservation {
+            device: volume.device.wrapping_add(1),
+            uuid: binding.uuid,
+        };
+        assert!(
+            binding
+                .validate_with(&volume, |_| Ok(changed_device))
+                .is_err()
+        );
+        drop(binding);
+        drop(fixture.directory);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_foreign_dirty_v1_marker_reports_ambiguity_and_preserves_bytes() {
+        let fixture = fixture();
+        let volume = descriptor_capacity_facts(&fixture.descriptor)
+            .expect("descriptor volume facts")
+            .identity;
+        let expected_device = volume.device;
+        let binding = Some(
+            MacVolumeBinding::acquire(&fixture.descriptor, &volume).expect("macOS descriptor UUID"),
+        );
+        let marker_path = fixture
+            .registry
+            .join(lock_file_name(&volume).expect("valid fixture device"));
+        let original =
+            b"version=1\nstate=dirty\nowner_profile_identity=old-profile\ngeneration=9\n";
+        fs::write(&marker_path, original).expect("write old dirty v1 marker");
+        let registry = open_no_follow_directory(&fixture.registry).expect("open fixture registry");
+        let registry_identity = identity_from_dir(&registry).expect("registry identity");
+
+        let error = acquire_inner_with_binding(
+            RegistryRoot {
+                path: fixture.registry.clone(),
+                identity: registry_identity,
+                capability: registry,
+            },
+            volume,
+            String::from("new-profile"),
+            false,
+            binding,
+        )
+        .expect_err("foreign dirty marker remains blocked");
+        let expected_uuid = format_uuid(&observe_mac_volume(&fixture.descriptor).unwrap().uuid);
+        let diagnostic = error.to_string();
+        assert!(matches!(
+            error,
+            VolumeOwnershipError::AmbiguousLegacyDirtyMarker {
+                device: actual_device,
+                volume_uuid,
+                marker_path: actual_path,
+                owner_profile_identity,
+                generation: 9,
+            } if actual_device == expected_device
+                && volume_uuid == expected_uuid
+                && actual_path == marker_path
+                && owner_profile_identity == "old-profile"
+        ));
+        assert!(diagnostic.contains(&expected_device.to_string()));
+        assert!(diagnostic.contains(&expected_uuid));
+        assert!(diagnostic.contains(&marker_path.display().to_string()));
+        assert!(diagnostic.contains("old-profile"));
+        assert!(diagnostic.contains("generation 9"));
+        assert!(diagnostic.contains("preserve and reconcile"));
+        assert_eq!(fs::read(&marker_path).expect("preserved marker"), original);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_same_profile_dirty_marker_retains_existing_recovery_continuity() {
+        let fixture = fixture();
+        let volume = descriptor_capacity_facts(&fixture.descriptor)
+            .expect("descriptor volume facts")
+            .identity;
+        let binding = Some(
+            MacVolumeBinding::acquire(&fixture.descriptor, &volume).expect("macOS descriptor UUID"),
+        );
+        let marker_path = fixture
+            .registry
+            .join(lock_file_name(&volume).expect("valid fixture device"));
+        let original =
+            b"version=1\nstate=dirty\nowner_profile_identity=same-profile\ngeneration=4\n";
+        fs::write(&marker_path, original).expect("write same-profile dirty v1 marker");
+        let registry = open_no_follow_directory(&fixture.registry).expect("open fixture registry");
+        let registry_identity = identity_from_dir(&registry).expect("registry identity");
+
+        let owner = acquire_inner_with_binding(
+            RegistryRoot {
+                path: fixture.registry.clone(),
+                identity: registry_identity,
+                capability: registry,
+            },
+            volume,
+            String::from("same-profile"),
+            false,
+            binding,
+        )
+        .expect("same-profile recovery-only continuity");
+        assert_eq!(owner.owner_generation(), 4);
+        owner.revalidate().expect("retained UUID binding validates");
+        assert_eq!(fs::read(&marker_path).expect("unchanged marker"), original);
+        drop(owner);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_uuid_binding_survives_context_clone_and_clean_handoff_generation() {
+        let fixture = fixture();
+        let volume = descriptor_capacity_facts(&fixture.descriptor)
+            .expect("descriptor volume facts")
+            .identity;
+        let registry = || {
+            let capability =
+                open_no_follow_directory(&fixture.registry).expect("open fixture registry");
+            let identity = identity_from_dir(&capability).expect("registry identity");
+            RegistryRoot {
+                path: fixture.registry.clone(),
+                identity,
+                capability,
+            }
+        };
+        let mut owner = acquire_inner_with_binding(
+            registry(),
+            volume.clone(),
+            String::from("handoff-profile"),
+            false,
+            Some(
+                MacVolumeBinding::acquire(&fixture.descriptor, &volume)
+                    .expect("initial macOS UUID binding"),
+            ),
+        )
+        .expect("initial macOS owner");
+        let context = owner.try_clone_for_context().expect("clone UUID binding");
+        let uuid = owner
+            .mac_volume
+            .as_ref()
+            .expect("retained macOS binding")
+            .uuid;
+        assert_eq!(
+            context
+                .mac_volume
+                .as_ref()
+                .expect("cloned macOS binding")
+                .uuid,
+            uuid
+        );
+        context.revalidate().expect("cloned binding validates");
+
+        owner
+            .mark_clean_after_handoff()
+            .expect("UUID is revalidated before clean handoff");
+        assert!(matches!(
+            context.revalidate(),
+            Err(VolumeOwnershipError::HandoffFenced { .. })
+        ));
+        drop(context);
+        drop(owner);
+
+        let restarted = acquire_inner_with_binding(
+            registry(),
+            volume.clone(),
+            String::from("handoff-profile"),
+            true,
+            Some(
+                MacVolumeBinding::acquire(&fixture.descriptor, &volume)
+                    .expect("restart macOS UUID binding"),
+            ),
+        )
+        .expect("same UUID clean-handoff restart");
+        assert_eq!(restarted.owner_generation(), 2);
+        assert_eq!(
+            restarted.mac_volume.as_ref().unwrap().uuid,
+            uuid,
+            "clean handoff retains the existing generation semantics on this UUID"
+        );
+        restarted.revalidate().expect("restarted binding validates");
+        drop(restarted);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_changed_expected_uuid_blocks_revalidation_and_preserves_dirty_marker() {
+        let fixture = fixture();
+        let volume = descriptor_capacity_facts(&fixture.descriptor)
+            .expect("descriptor volume facts")
+            .identity;
+        let mut owner = acquire_inner_with_binding(
+            {
+                let capability =
+                    open_no_follow_directory(&fixture.registry).expect("open fixture registry");
+                let identity = identity_from_dir(&capability).expect("registry identity");
+                RegistryRoot {
+                    path: fixture.registry.clone(),
+                    identity,
+                    capability,
+                }
+            },
+            volume.clone(),
+            String::from("binding-profile"),
+            false,
+            Some(
+                MacVolumeBinding::acquire(&fixture.descriptor, &volume)
+                    .expect("macOS UUID binding"),
+            ),
+        )
+        .expect("volume owner");
+        let marker_path = owner.lock_path_for_test().to_owned();
+        let original = fs::read(&marker_path).expect("dirty marker bytes");
+        owner.mac_volume.as_mut().unwrap().uuid = [0x7f; 16];
+
+        assert!(matches!(
+            owner.revalidate(),
+            Err(VolumeOwnershipError::VolumeIdentityUnavailable)
+        ));
+        assert!(matches!(
+            owner.mark_clean_after_handoff(),
+            Err(VolumeOwnershipError::VolumeIdentityUnavailable)
+        ));
+        assert_eq!(
+            fs::read(&marker_path).expect("unchanged dirty marker"),
+            original
+        );
+        drop(owner);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run against the disposable APFS descriptor using YIELD_OPT1932_APFS_DESCRIPTOR"]
+    fn macos_apfs_volume_uuid_provider_probe() {
+        let path = std::env::var_os("YIELD_OPT1932_APFS_DESCRIPTOR")
+            .expect("set YIELD_OPT1932_APFS_DESCRIPTOR to a disposable APFS file");
+        let descriptor = File::open(path).expect("open disposable APFS descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("descriptor capacity facts");
+        let observation = observe_mac_volume(&descriptor).expect("APFS UUID observation");
+        assert_eq!(observation.device, facts.identity.device);
+        assert_ne!(observation.uuid, [0; 16]);
     }
 
     #[cfg(unix)]
