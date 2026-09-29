@@ -157,6 +157,10 @@ pub(super) fn render_slider(
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                    // The slider owns this gesture. Letting the press bubble into the
+                    // transparent toolbar can also start a window move on macOS.
+                    window.prevent_default();
+                    cx.stop_propagation();
                     window.focus(&view.volume_focus_handle);
                     let Some(bounds) = bounds_for_down.borrow().as_ref().copied() else {
                         return;
