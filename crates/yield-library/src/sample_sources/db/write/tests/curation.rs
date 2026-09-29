@@ -116,7 +116,7 @@ fn replay_manifest_and_checkpoint_commit_once_before_raw_ticket_retirement() {
         RawObservationProvenance::new(
             source.clone(),
             Some(root.clone()),
-            Some(stream),
+            Some(stream.clone()),
             lane.generation(),
             CaptureBoundary::try_new(20, Some(11), Some(12)).expect("capture interval"),
         ),
@@ -214,6 +214,128 @@ fn replay_manifest_and_checkpoint_commit_once_before_raw_ticket_retirement() {
             .entry_for_path(Path::new("duplicate.wav"))
             .unwrap()
             .is_none()
+    );
+
+    let pending = SyntheticObservationBatch::new(
+        RawObservationProvenance::new(
+            source.clone(),
+            Some(root.clone()),
+            Some(stream.clone()),
+            lane.generation(),
+            CaptureBoundary::try_new(21, Some(13), Some(13)).expect("pending capture"),
+        ),
+        vec![RawObservation::new(
+            RawEventKind::Modify,
+            vec![RawObservedPath::new("two.wav".into(), RawPathRole::Subject)],
+        )],
+        lane_limits,
+    );
+    let pending = owner
+        .admit_replay_with_durable_prior(pending, Some(&committed), true)
+        .expect("next replay admitted");
+    let pending_ticket = match pending.admission().outcome() {
+        AdmissionOutcome::Accepted(ticket) => *ticket,
+        outcome => panic!("expected pending replay, got {outcome:?}"),
+    };
+    owner.dispatch_next().expect("pending dispatch");
+    owner
+        .mark_dispatched(pending_ticket)
+        .expect("pending handoff");
+    owner.mark_applied(pending_ticket).expect("pending applied");
+    owner
+        .stop_source(&source)
+        .expect("stop invalidates pending replay");
+    assert_eq!(owner.supervisor().in_flight(), 0);
+    assert!(
+        owner
+            .mark_replay_checkpointed(pending_ticket, &committed)
+            .is_err()
+    );
+    drop(writer);
+
+    let reopened = SourceDatabase::open_for_catalog_with_profile_guard(
+        fixture._source.path(),
+        &fixture.profile_guard,
+        Path::new("curation-profile-bound"),
+    )
+    .expect("reopen source database");
+    let writer =
+        SourceWriter::new_for_scan(reopened, source.clone(), 7).expect("reopened source owner");
+    let reopened_fence = writer.current_scan_fence().expect("reopened fence");
+    assert_eq!(reopened_fence.revision(), manifest.revision);
+    assert_eq!(
+        writer
+            .catalog_database()
+            .read_durable_replay_prior(
+                &source,
+                &root,
+                crate::sample_sources::reconciliation::WatcherGeneration::new(7),
+                lane.generation(),
+            )
+            .expect("reopened checkpoint")
+            .expect("old checkpoint retained"),
+        committed
+    );
+    let restarted = owner
+        .begin_source(source.clone(), root.clone())
+        .expect("restart watcher lane");
+    assert!(restarted.generation() > lane.generation());
+    let stale = SyntheticObservationBatch::new(
+        RawObservationProvenance::new(
+            source.clone(),
+            Some(root.clone()),
+            Some(stream),
+            lane.generation(),
+            CaptureBoundary::try_new(22, Some(13), Some(13)).expect("stale capture"),
+        ),
+        vec![RawObservation::new(
+            RawEventKind::Modify,
+            vec![RawObservedPath::new("two.wav".into(), RawPathRole::Subject)],
+        )],
+        lane_limits,
+    );
+    let invalid = owner
+        .admit_replay_with_durable_prior(stale, Some(&committed), true)
+        .expect("stale replay remains unproven");
+    assert_eq!(
+        invalid.admission().disposition(),
+        AdapterDisposition::SourceAuditRequired
+    );
+    let widened = owner
+        .durable_audit_marker_for_replay(&invalid)
+        .expect("current-lane audit disposition");
+    assert_eq!(widened.generation(), Some(restarted.generation()));
+    writer
+        .retain_watcher_replay_uncertainty(&reopened_fence, &widened)
+        .expect("persist restart audit disposition");
+    let stored_checkpoint = writer
+        .catalog_database()
+        .get_metadata(crate::sample_sources::db::META_SOURCE_WATCHER_CHECKPOINT)
+        .expect("read checkpoint metadata")
+        .expect("checkpoint retained under uncertainty");
+    let stored_checkpoint: serde_json::Value =
+        serde_json::from_str(&stored_checkpoint).expect("checkpoint JSON");
+    assert_eq!(stored_checkpoint["event_id"], 12);
+    assert!(
+        writer
+            .catalog_database()
+            .read_durable_replay_prior(
+                &source,
+                &root,
+                crate::sample_sources::reconciliation::WatcherGeneration::new(7),
+                restarted.generation(),
+            )
+            .expect("uncertain checkpoint read")
+            .is_none()
+    );
+    let rebound = owner
+        .rebind_source(&source, RootIdentity::from_bytes(b"rebound-root".to_vec()))
+        .expect("rebound lane");
+    assert!(rebound.generation() > restarted.generation());
+    assert!(owner.durable_audit_marker_for_replay(&invalid).is_none());
+    assert_eq!(
+        writer.current_scan_fence().unwrap().revision(),
+        manifest.revision
     );
 }
 
