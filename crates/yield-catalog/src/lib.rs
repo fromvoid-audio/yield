@@ -96,6 +96,7 @@ struct CatalogTestGate {
     audit_state: Mutex<CatalogTestAuditState>,
     watcher_signals: Mutex<HashMap<(SourceId, u64), WatcherSignal>>,
     watcher_install_counts: Mutex<HashMap<(SourceId, u64), usize>>,
+    bootstrap_capture_start_timeout: Mutex<Option<Duration>>,
 }
 
 #[cfg(test)]
@@ -128,7 +129,22 @@ impl CatalogTestGate {
             }),
             watcher_signals: Mutex::new(HashMap::new()),
             watcher_install_counts: Mutex::new(HashMap::new()),
+            bootstrap_capture_start_timeout: Mutex::new(None),
         }
+    }
+
+    fn set_bootstrap_capture_start_timeout(&self, timeout: Duration) {
+        *self
+            .bootstrap_capture_start_timeout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(timeout);
+    }
+
+    fn bootstrap_capture_start_timeout(&self) -> Option<Duration> {
+        *self
+            .bootstrap_capture_start_timeout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn before_receive(&self) {
@@ -343,6 +359,10 @@ impl CatalogTestGate {
     fn before_receive(&self) {}
 
     fn before_audit(&self) {}
+
+    fn bootstrap_capture_start_timeout(&self) -> Option<Duration> {
+        None
+    }
 
     fn install_watcher_signal(
         &self,
@@ -4307,6 +4327,11 @@ fn request_audit(
             )
         })
         .and_then(|()| {
+            // Production keeps the two-second best-effort startup budget. A test gate may
+            // extend it only to exercise the successful bootstrap/checkpoint path reliably.
+            let bootstrap_capture_start_timeout = test_gate
+                .and_then(|gate| gate.bootstrap_capture_start_timeout())
+                .unwrap_or(Duration::from_secs(2));
             audit_source(
                 source,
                 profile_guard,
@@ -4314,6 +4339,7 @@ fn request_audit(
                 &token,
                 admission,
                 watcher_mode,
+                bootstrap_capture_start_timeout,
             )
         });
     let disposition = match result {
@@ -5535,6 +5561,7 @@ fn audit_source(
     token: &Arc<AtomicBool>,
     admission: &Arc<Mutex<AdmissionState>>,
     watcher_mode: WatcherMode,
+    bootstrap_capture_start_timeout: Duration,
 ) -> Result<CatalogSnapshot, CatalogError> {
     profile_guard.validate_current().map_err(|error| {
         catalog_error_from_db_for_source(source_id, SourceDbError::ProfileOwnership(error))
@@ -5571,7 +5598,7 @@ fn audit_source(
             source.root.clone(),
             Some(before_identity.clone()),
         );
-        match BootstrapCapture::start(spec, Duration::from_secs(2)) {
+        match BootstrapCapture::start(spec, bootstrap_capture_start_timeout) {
             Ok(capture) => Some(capture),
             Err(error) => {
                 eprintln!(
@@ -5584,7 +5611,7 @@ fn audit_source(
         None
     };
     #[cfg(not(target_os = "macos"))]
-    let _ = watcher_mode;
+    let _ = (watcher_mode, bootstrap_capture_start_timeout);
     let writer = CatalogScanWriter {
         profile_guard,
         database: &source.database,
@@ -6374,7 +6401,15 @@ mod tests {
         service: &CatalogService,
         predicate: impl Fn(&CatalogEvent) -> bool,
     ) -> CatalogEvent {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        receive_until_timeout(service, predicate, Duration::from_secs(5))
+    }
+
+    fn receive_until_timeout(
+        service: &CatalogService,
+        predicate: impl Fn(&CatalogEvent) -> bool,
+        timeout: Duration,
+    ) -> CatalogEvent {
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             let event = match service.recv_event_timeout(Duration::from_millis(50)) {
                 Ok(event) => event,
@@ -6451,6 +6486,7 @@ mod tests {
         service: &CatalogService,
         root: &Path,
         source_id: &SourceId,
+        audit_timeout: Duration,
     ) -> CatalogSnapshot {
         service
             .submit(CatalogCommand::Register {
@@ -6460,7 +6496,7 @@ mod tests {
             })
             .expect("register");
         // Native FSEvents setup has exceeded five seconds under full-suite load.
-        // Bound setup separately; the subsequent audit assertions keep their five-second wait.
+        // Bound native setup separately; callers choose the audit wait needed for their fixture.
         let registration_deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             let remaining =
@@ -6482,19 +6518,29 @@ mod tests {
                 }
             }
         }
-        request_initial_audit(service, source_id)
+        request_initial_audit_with_timeout(service, source_id, audit_timeout)
     }
 
     fn request_initial_audit(service: &CatalogService, source_id: &SourceId) -> CatalogSnapshot {
+        request_initial_audit_with_timeout(service, source_id, Duration::from_secs(5))
+    }
+
+    fn request_initial_audit_with_timeout(
+        service: &CatalogService,
+        source_id: &SourceId,
+        timeout: Duration,
+    ) -> CatalogSnapshot {
         service
             .submit(CatalogCommand::RequestAudit {
                 source_id: source_id.clone(),
                 lifecycle_generation: 1,
             })
             .expect("audit");
-        match receive_until(service, |event| {
-            matches!(event, CatalogEvent::AuditCommitted { .. })
-        }) {
+        match receive_until_timeout(
+            service,
+            |event| matches!(event, CatalogEvent::AuditCommitted { .. }),
+            timeout,
+        ) {
             CatalogEvent::AuditCommitted { snapshot, .. } => snapshot,
             _ => unreachable!(),
         }
@@ -9518,9 +9564,20 @@ mod tests {
         let fixture = Fixture::new("catalog-native-replay-bootstrap");
         let root = fs::canonicalize(fixture.root.path()).expect("canonical source root");
         let source_id = SourceId::from_string("native-replay-bootstrap");
-        let service = CatalogService::start_inner(&fixture.guard, None, None, WatcherMode::Native)
-            .expect("native catalog service");
-        let snapshot = register_native_and_audit(&service, &root, &source_id);
+        let test_gate = Arc::new(CatalogTestGate::new());
+        // Production capture startup remains best-effort with a two-second deadline. This
+        // success-path fixture allows bounded native setup time so it can assert a durable prior.
+        test_gate.set_bootstrap_capture_start_timeout(Duration::from_secs(20));
+        let service = CatalogService::start_inner(
+            &fixture.guard,
+            Some(Arc::clone(&test_gate)),
+            None,
+            WatcherMode::Native,
+        )
+        .expect("native catalog service");
+        // The audit wait includes the explicit test-only capture setup budget above.
+        let snapshot =
+            register_native_and_audit(&service, &root, &source_id, Duration::from_secs(25));
         service.shutdown();
 
         let database = SourceDatabase::open_for_catalog_with_profile_guard(
@@ -9545,12 +9602,22 @@ mod tests {
             root,
             Some(snapshot.root_identity),
         );
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // The diagnostic run measured native FSEventStreamStart at 6.4 seconds on this
+        // fixture host, beyond the earlier five-second history-call budget. Keep production
+        // caller budgets unchanged; this success-path fixture allows bounded native startup.
+        let deadline = Instant::now() + Duration::from_secs(25);
         loop {
+            let history_timeout = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(20));
+            assert!(
+                !history_timeout.is_zero(),
+                "timed out waiting for the later native history event"
+            );
             let candidate = yield_source_watcher::replay::macos::capture_history(
                 spec.clone(),
                 prior.acknowledged_sequence(),
-                Duration::from_secs(5),
+                history_timeout,
             )
             .expect("capture from the durable device cursor");
             assert_eq!(candidate.stream_identity(), prior.backend_stream_identity());
@@ -12839,7 +12906,8 @@ mod tests {
             WatcherMode::Native,
         )
         .expect("production native catalog watcher service");
-        let initial = register_native_and_audit(&service, &root, &source_id);
+        let initial =
+            register_native_and_audit(&service, &root, &source_id, Duration::from_secs(5));
         assert!(
             initial
                 .manifest
