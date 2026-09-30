@@ -258,6 +258,17 @@ pub struct BrowserRow {
     pub id: AudioFileId,
 }
 
+/// Independently enabled local browser predicates whose choices remain retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserFilterFamily {
+    /// Filename search text.
+    Name,
+    /// Selected rating levels.
+    Rating,
+    /// Selected playback types.
+    PlaybackType,
+}
+
 /// Read-only browser view model for filtering, sorting, and keyboard navigation.
 ///
 /// It projects stable file identities back to indices in the current scan. The projection owns
@@ -265,6 +276,9 @@ pub struct BrowserRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrowserViewModel {
     query: String,
+    name_filter_enabled: bool,
+    rating_filter_enabled: bool,
+    playback_type_filter_enabled: bool,
     sort: SortSpec,
     folder: Option<PathBuf>,
     folder_scope: FolderScope,
@@ -284,6 +298,9 @@ impl BrowserViewModel {
     pub fn new(entries: &[AudioFile]) -> Self {
         let mut model = Self {
             query: String::new(),
+            name_filter_enabled: true,
+            rating_filter_enabled: true,
+            playback_type_filter_enabled: true,
             sort: SortSpec::default(),
             folder: None,
             folder_scope: FolderScope::DirectOnly,
@@ -306,6 +323,36 @@ impl BrowserViewModel {
         &self.query
     }
 
+    /// Return the family switch, independently of its retained text or selected chips.
+    pub fn filter_family_enabled(&self, family: BrowserFilterFamily) -> bool {
+        match family {
+            BrowserFilterFamily::Name => self.name_filter_enabled,
+            BrowserFilterFamily::Rating => self.rating_filter_enabled,
+            BrowserFilterFamily::PlaybackType => self.playback_type_filter_enabled,
+        }
+    }
+
+    /// Enable or suspend one predicate without discarding its choices or other filters.
+    pub fn set_filter_family_enabled(
+        &mut self,
+        entries: &[AudioFile],
+        family: BrowserFilterFamily,
+        enabled: bool,
+    ) -> bool {
+        let current = match family {
+            BrowserFilterFamily::Name => &mut self.name_filter_enabled,
+            BrowserFilterFamily::Rating => &mut self.rating_filter_enabled,
+            BrowserFilterFamily::PlaybackType => &mut self.playback_type_filter_enabled,
+        };
+        if *current == enabled {
+            return false;
+        }
+        *current = enabled;
+        self.reveal_id = None;
+        self.rebuild(entries);
+        true
+    }
+
     /// Return the current ordering.
     pub fn sort(&self) -> SortSpec {
         self.sort
@@ -326,7 +373,8 @@ impl BrowserViewModel {
         self.collection_filter
     }
 
-    /// Return the active source rating filter, or a disabled filter when no level is selected.
+    /// Return retained rating choices, independently of the family enable switch.
+    /// A zero mask means no selected level.
     pub fn rating_filter(&self) -> RatingFilter {
         self.rating_filter
     }
@@ -336,8 +384,8 @@ impl BrowserViewModel {
         self.playback_age_filter
     }
 
-    /// Return the active source playback-type filter, or a disabled filter when no type is
-    /// selected.
+    /// Return retained playback-type choices, independently of the family enable switch.
+    /// A zero mask means no selected type.
     pub fn playback_type_filter(&self) -> PlaybackTypeFilter {
         self.playback_type_filter
     }
@@ -766,7 +814,8 @@ impl BrowserViewModel {
                 in_folder
                     && (reveal_id.is_some_and(|reveal_id| entry.path.as_path() == reveal_id.path())
                         || (self.entry_matches_tag_filter(*entry_index)
-                            && audio_file_matches_name_query(entry, &query)
+                            && (!self.name_filter_enabled
+                                || audio_file_matches_name_query(entry, &query))
                             && self.collection_filter.is_none_or(|slot| {
                                 entry
                                     .curation
@@ -858,18 +907,19 @@ impl BrowserViewModel {
     fn entry_matches_scope(&self, entry: &AudioFile, query: &str) -> bool {
         self.folder.as_deref().is_none_or(|folder| {
             folder_contains_relative_path(folder, &entry.relative_path, self.folder_scope)
-        }) && audio_file_matches_name_query(entry, query)
+        }) && (!self.name_filter_enabled || audio_file_matches_name_query(entry, query))
     }
 
     fn entry_matches_rating(&self, entry: &AudioFile) -> bool {
-        self.rating_filter.is_disabled()
+        !self.rating_filter_enabled
+            || self.rating_filter.is_disabled()
             || entry
                 .curation
                 .is_some_and(|curation| self.rating_filter.matches(curation.rating()))
     }
 
     fn entry_matches_playback_type(&self, entry: &AudioFile) -> bool {
-        self.playback_type_filter.matches(entry.playback_type)
+        !self.playback_type_filter_enabled || self.playback_type_filter.matches(entry.playback_type)
     }
 
     fn entry_matches_playback_age(&self, entry: &AudioFile, now_unix_secs: i64) -> bool {
@@ -976,6 +1026,129 @@ mod tests {
             playback_type,
             curation,
         }
+    }
+
+    #[test]
+    fn filter_family_switches_suspend_only_their_predicate_and_retain_choices() {
+        let entries = vec![
+            typed_entry(
+                "kit/keep.wav",
+                Some(PlaybackType::Loop),
+                AudioFileCuration::from_parts(1, false, 1, None, None),
+            ),
+            typed_entry(
+                "kit/other.wav",
+                Some(PlaybackType::Loop),
+                AudioFileCuration::from_parts(1, false, 1, None, None),
+            ),
+            typed_entry(
+                "kit/keep-shot.wav",
+                Some(PlaybackType::OneShot),
+                AudioFileCuration::from_parts(1, false, 1, None, None),
+            ),
+            typed_entry(
+                "kit/keep-low.wav",
+                Some(PlaybackType::Loop),
+                AudioFileCuration::from_parts(-1, false, 1, None, None),
+            ),
+            typed_entry(
+                "elsewhere/keep.wav",
+                Some(PlaybackType::Loop),
+                AudioFileCuration::from_parts(1, false, 1, None, None),
+            ),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.set_folder_scope(
+            &entries,
+            Some(PathBuf::from("kit")),
+            FolderScope::DirectOnly,
+        );
+        model.set_query(&entries, "keep");
+        model.toggle_rating_filter(&entries, 1);
+        model.toggle_playback_type_filter(&entries, PlaybackType::Loop);
+        model.set_collection_filter(&entries, Some(0));
+        assert_eq!(model.rows().len(), 1);
+        for family in [
+            BrowserFilterFamily::Name,
+            BrowserFilterFamily::Rating,
+            BrowserFilterFamily::PlaybackType,
+        ] {
+            assert!(model.set_filter_family_enabled(&entries, family, false));
+            assert_eq!(model.rows().len(), 2);
+            assert_eq!(model.collection_counts(&entries)[0], 2);
+            assert_eq!(model.query(), "keep");
+            assert!(model.rating_filter().contains_level(1));
+            assert!(
+                model
+                    .playback_type_filter()
+                    .contains_type(PlaybackType::Loop)
+            );
+            assert!(!model.set_filter_family_enabled(&entries, family, false));
+            assert!(model.set_filter_family_enabled(&entries, family, true));
+            assert_eq!(model.rows().len(), 1);
+        }
+    }
+
+    #[test]
+    fn disabled_families_accept_new_choices_and_reenable_against_replacement_data() {
+        let entries = vec![
+            typed_entry(
+                "keep.wav",
+                Some(PlaybackType::Loop),
+                AudioFileCuration::from_parts(1, false, 0, None, None),
+            ),
+            typed_entry(
+                "other.wav",
+                Some(PlaybackType::OneShot),
+                AudioFileCuration::from_parts(-1, false, 0, None, None),
+            ),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        for family in [
+            BrowserFilterFamily::Name,
+            BrowserFilterFamily::Rating,
+            BrowserFilterFamily::PlaybackType,
+        ] {
+            model.set_filter_family_enabled(&entries, family, false);
+        }
+        model.set_query(&entries, "other");
+        model.toggle_rating_filter(&entries, 1);
+        model.toggle_playback_type_filter(&entries, PlaybackType::Loop);
+        assert_eq!(model.rows().len(), 2);
+        let mut replacement = entries.clone();
+        replacement[0].path = PathBuf::from("/new/keep.wav");
+        replacement[1].path = PathBuf::from("/new/other.wav");
+        replacement[1].curation = AudioFileCuration::from_parts(1, false, 0, None, None);
+        replacement[1].playback_type = Some(PlaybackType::Loop);
+        model.set_entries(&replacement);
+        for family in [
+            BrowserFilterFamily::Name,
+            BrowserFilterFamily::Rating,
+            BrowserFilterFamily::PlaybackType,
+        ] {
+            assert!(!model.filter_family_enabled(family));
+            model.set_filter_family_enabled(&replacement, family, true);
+        }
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].id, replacement[1].stable_id());
+    }
+
+    #[test]
+    fn family_switches_do_not_bypass_pending_tag_facts_or_temporary_reveals() {
+        let entries = vec![model_entry("keep.wav", 1), model_entry("other.wav", 1)];
+        let mut model = BrowserViewModel::new(&entries);
+        model.set_query(&entries, "keep");
+        model.begin_tag_filter(&entries);
+        assert!(model.rows().is_empty());
+        model.set_reveal(&entries, Some(entries[1].stable_id()));
+        assert_eq!(model.rows().len(), 1);
+        model.set_filter_family_enabled(&entries, BrowserFilterFamily::Name, false);
+        assert!(model.rows().is_empty());
+        assert!(model.reveal_id.is_none());
+        model.disable_tag_filter(&entries);
+        assert_eq!(model.rows().len(), 2);
+        model.set_filter_family_enabled(&entries, BrowserFilterFamily::Name, true);
+        assert_eq!(model.rows()[0].id, entries[0].stable_id());
     }
 
     #[test]

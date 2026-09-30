@@ -2180,6 +2180,15 @@ impl Render for Browser {
                             .child(random_audition::render_icon(random_color)),
                     )
                     .child(
+                        super::filter_family::render(
+                            self,
+                            &theme,
+                            yield_core::BrowserFilterFamily::Name,
+                            cx,
+                        )
+                        .h(px(theme.spacing.control_height)),
+                    )
+                    .child(
                         div()
                             .min_w(px(80.0))
                             .w(px(220.0))
@@ -3837,6 +3846,7 @@ mod tests {
         let mut escaped_controls = Vec::new();
         for selector in [
             "browser-search-toolbar",
+            "browser-name-filter-toggle",
             "source-root-label",
             "audio-output-settings-toolbar",
             "reveal-toolbar",

@@ -82,6 +82,9 @@ Search filenames with Cmd/Ctrl+F. Sort by name, rating, Type, collection, extens
 size, or Last Played. Type and Last Played columns appear when the window has
 room. Collection, rating, and TYPE filters intersect the folder and name scope.
 TYPE recognizes Loop and 1-Shot tags; clearing both chips disables that filter.
+The NAME, TYPE, and RATING labels independently suspend their filter families.
+Their text and chip selections stay visible and return when the family is enabled
+again. A filled circle means enabled; an empty circle means suspended.
 Use TAGS for comma-separated exact tag matches; every entered tag must match.
 Click the TAGS label to toggle filtering while retaining the draft. Tag filtering
 intersects the other filters, and confirmed metadata-only edits reuse its matches

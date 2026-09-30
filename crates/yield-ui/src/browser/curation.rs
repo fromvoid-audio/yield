@@ -36,19 +36,35 @@ use super::{Browser, catalog, tag_chips, tag_filter};
 const COMPACT_FILTER_LABEL_WIDTH: f32 = 82.0;
 const LATEST_CURATION_WINDOW: Duration = Duration::from_millis(40);
 
+fn compact_filter_label_width(theme: &Theme) -> f32 {
+    COMPACT_FILTER_LABEL_WIDTH * (theme.typography.small_size / 11.0).max(1.0)
+}
+
 fn compact_filter_chip_width(theme: &Theme, count: usize) -> f32 {
     let count = count.max(1) as f32;
+    let stacked = theme.typography.small_size > 16.0;
     let available = theme.spacing.sidebar_width
         - theme.spacing.panel_padding * 2.0
-        - COMPACT_FILTER_LABEL_WIDTH
-        - theme.spacing.control_gap * count;
+        - if stacked {
+            0.0
+        } else {
+            compact_filter_label_width(theme)
+        }
+        - theme.spacing.control_gap * (count - if stacked { 1.0 } else { 0.0 });
     (available / count).max(theme.spacing.border_width)
 }
 
-fn compact_filter_row<E>(theme: &Theme, label: &'static str, controls: Vec<E>) -> gpui::Div
+fn compact_filter_row<E>(
+    browser: &Browser,
+    theme: &Theme,
+    family: yield_core::BrowserFilterFamily,
+    controls: Vec<E>,
+    cx: &mut Context<Browser>,
+) -> gpui::Div
 where
     E: gpui::IntoElement,
 {
+    let stacked = theme.typography.small_size > 16.0;
     div()
         .flex()
         .flex_col()
@@ -64,18 +80,13 @@ where
                 .w_full()
                 .h(px(theme.spacing.row_height))
                 .items_center()
+                .when(stacked, |element| element.flex_col().h_auto().items_start())
                 .px(px(theme.spacing.panel_padding))
                 .gap(px(theme.spacing.control_gap))
                 .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .w(px(COMPACT_FILTER_LABEL_WIDTH))
-                        .h_full()
-                        .items_center()
-                        .text_size(px(theme.typography.small_size))
-                        .text_color(color(theme.colors.accent))
-                        .child(label),
+                    super::filter_family::render(browser, theme, family, cx)
+                        .w(px(compact_filter_label_width(theme)))
+                        .when(stacked, |element| element.w_full()),
                 )
                 .child(
                     div()
@@ -83,6 +94,9 @@ where
                         .flex_1()
                         .min_w_0()
                         .h_full()
+                        .when(stacked, |element| {
+                            element.flex_none().w_full().h(px(theme.spacing.row_height))
+                        })
                         .items_center()
                         .gap(px(theme.spacing.control_gap))
                         .children(controls),
@@ -1602,7 +1616,13 @@ pub(super) fn render_playback_type_filters(
                 )
         })
         .collect::<Vec<_>>();
-    compact_filter_row(&theme, "TYPE", chips)
+    compact_filter_row(
+        browser,
+        &theme,
+        yield_core::BrowserFilterFamily::PlaybackType,
+        chips,
+        cx,
+    )
 }
 
 fn playback_type_filter_label(playback_type: PlaybackType) -> &'static str {
@@ -1754,7 +1774,13 @@ pub(super) fn render_rating_filters(
                 .child(div().flex_none().w(px(10.0)).h(px(10.0)).bg(marker_color))
         })
         .collect::<Vec<_>>();
-    compact_filter_row(&theme, "RATING", chips)
+    compact_filter_row(
+        browser,
+        &theme,
+        yield_core::BrowserFilterFamily::Rating,
+        chips,
+        cx,
+    )
 }
 
 fn rating_filter_color(level: i8, theme: &Theme) -> yield_design::Color {

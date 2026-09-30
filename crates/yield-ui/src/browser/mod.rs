@@ -43,6 +43,8 @@ mod accessibility {
 
     pub(super) const TAG_FILTER_INPUT: &str = "browser-tag-filter-input";
     pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
+    pub(super) const CURATION_QUEUE_TOGGLE: &str = "browser-curation-queue-toggle";
+    pub(super) const CURATION_QUEUE_SCOPE: &str = "browser-curation-queue-scope";
     pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
     pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
     pub(super) const COLLECTION_RENAME: &str = "browser-collection-rename-input";
@@ -70,6 +72,9 @@ mod accessibility {
     pub(super) fn rating_filter_id(index: usize) -> String {
         format!("browser-rating-filter-{index}")
     }
+    pub(super) fn curation_queue_choice_id(index: usize) -> String {
+        format!("browser-curation-queue-choice-{index}")
+    }
 }
 mod audio_output;
 mod catalog;
@@ -84,6 +89,7 @@ mod direct_random;
 mod directory_open;
 mod display_labels;
 mod file_drag;
+mod filter_family;
 mod folder_keyboard;
 mod general_settings;
 mod handoff;
