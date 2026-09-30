@@ -22,7 +22,7 @@ TOP_LEVEL_CLOSE = re.compile(r"(?m)^}[ \t]*$")
 SOURCE_OPEN = re.compile(r"\bSourceDatabase\s*::\s*(open_\w+|open_with_role\w*)\s*\(")
 RAW_OPEN = re.compile(
     r"\b(?:rusqlite\s*::\s*)?Connection\s*::\s*"
-    r"(open|open_with_flags|open_in_memory)\s*\("
+    r"(open|open_with_flags|open_with_flags_and_vfs|open_in_memory)\s*\("
 )
 FUNCTION = re.compile(r"\bfn\s+(\w+)\s*(?:<[^\n{]*>)?\s*\(")
 
@@ -39,14 +39,12 @@ SOURCE_EXCEPTIONS = {
 # Source owner, lease control, snapshot destination, global library, and journal
 # opens are separate reviewed boundaries. New raw opens need an explicit review.
 RAW_EXCEPTIONS = {
-    ("crates/yield-library/src/operation_journal/store.rs", "open_inner_with_hooks", "open_with_flags"): 1,
+    ("crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs", "open_sqlite", "open_with_flags"): 1,
+    ("crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs", "open_sqlite", "open_with_flags_and_vfs"): 1,
     ("crates/yield-library/src/sample_sources/db/mod.rs", "snapshot_to_path_with_held_write_fence", "open"): 1,
-    ("crates/yield-library/src/sample_sources/db/open.rs", "open_source_database_with_profile_guard_inner", "open_with_flags"): 1,
     ("crates/yield-library/src/sample_sources/db/open.rs", "open_source_database_with_flags", "open_with_flags"): 1,
     ("crates/yield-library/src/sample_sources/db/open/read_only.rs", "open_read_only_source_database", "open_with_flags"): 1,
     ("crates/yield-library/src/sample_sources/db/schema/mod.rs", "current_table_shape", "open_in_memory"): 1,
-    ("crates/yield-library/src/sample_sources/db/source_lease.rs", "bootstrap", "open_with_flags"): 1,
-    ("crates/yield-library/src/sample_sources/library/connection.rs", "open_for_profile_guard", "open_with_flags"): 1,
     ("crates/yield-library/src/sample_sources/library/connection.rs", "open_at", "open"): 1,
     ("crates/yield-library/src/sample_sources/library/read_only.rs", "observe_source_registry", "open_with_flags"): 1,
 }
@@ -133,6 +131,13 @@ def self_test() -> None:
     assert validate(rejected)
     raw, _ = calls_in(source, "fn new_writer() { Connection::open_with_flags(); }")
     assert validate(raw)
+    vfs, _ = calls_in(source, "fn new_writer() { Connection::open_with_flags_and_vfs(); }")
+    assert validate(vfs)
+    retained = "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs"
+    reviewed, _ = calls_in(retained, "fn open_sqlite() { rusqlite::Connection::open_with_flags_and_vfs(); }")
+    assert not validate(reviewed)
+    assert inventory_label(reviewed[0]) == "retained-root-sqlite"
+    assert validate(reviewed + reviewed)
     fixture, _ = calls_in(
         source,
         "fn production() {}\n#[cfg(test)]\nmod tests {\n"
@@ -144,6 +149,8 @@ def self_test() -> None:
 
 
 def inventory_label(call: Call) -> str:
+    if call.kind == "raw" and call.path.endswith("/file_ops_journal/recovery_io.rs") and call.function == "open_sqlite":
+        return "retained-root-sqlite"
     if call.kind == "source":
         if call.opener in READ_ONLY_SOURCE_OPENS:
             return "legacy-read-only"
