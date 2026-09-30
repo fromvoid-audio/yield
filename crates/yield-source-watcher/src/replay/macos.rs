@@ -367,7 +367,7 @@ mod tests {
                 columns[4],
             ));
         }
-        assert_eq!(actions.len(), 6, "every Finder fixture action is present");
+        assert_eq!(actions.len(), 8, "every Finder fixture action is present");
 
         for (action, events) in actions {
             let ingress = ReplayIngress::new(
@@ -387,6 +387,10 @@ mod tests {
                     "created-file" => {
                         fs::kFSEventStreamEventFlagItemCreated
                             | fs::kFSEventStreamEventFlagItemIsFile
+                    }
+                    "created-directory" => {
+                        fs::kFSEventStreamEventFlagItemCreated
+                            | fs::kFSEventStreamEventFlagItemIsDir
                     }
                     "renamed-file" => {
                         fs::kFSEventStreamEventFlagItemRenamed
@@ -538,7 +542,13 @@ mod tests {
         for line in fixture.lines().filter(|line| !line.starts_with('#')) {
             let columns: Vec<_> = line.split('\t').collect();
             assert_eq!(columns.len(), 5, "fixture schema");
-            if columns[3] == "unknown-event" {
+            // This transaction exercises file-only incremental replay. Folder sessions
+            // use the manifest-audit route, covered by the all-action owner replay test
+            // and scanner directory-truth regressions; do not upsert directories as files.
+            if !matches!(
+                columns[0],
+                "create" | "duplicate" | "rename" | "reparent" | "delete"
+            ) {
                 continue;
             }
             let flags = match columns[3] {
