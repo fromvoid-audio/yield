@@ -6443,6 +6443,49 @@ mod tests {
         let _ = receive_until(service, |event| {
             matches!(event, CatalogEvent::Registered { .. })
         });
+        request_initial_audit(service, source_id)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn register_native_and_audit(
+        service: &CatalogService,
+        root: &Path,
+        source_id: &SourceId,
+    ) -> CatalogSnapshot {
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: root.to_path_buf(),
+                lifecycle_generation: 1,
+            })
+            .expect("register");
+        // Native FSEvents setup has exceeded five seconds under full-suite load.
+        // Bound setup separately; the subsequent audit assertions keep their five-second wait.
+        let registration_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let remaining =
+                registration_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "timed out waiting for Registered for source {source_id} lifecycle generation 1"
+                );
+            }
+            match service.recv_event_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(CatalogEvent::Registered {
+                    source_id: registered_source,
+                    lifecycle_generation: 1,
+                }) if registered_source == *source_id => break,
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("catalog event stream closed before Registered for source {source_id}")
+                }
+            }
+        }
+        request_initial_audit(service, source_id)
+    }
+
+    fn request_initial_audit(service: &CatalogService, source_id: &SourceId) -> CatalogSnapshot {
         service
             .submit(CatalogCommand::RequestAudit {
                 source_id: source_id.clone(),
@@ -9477,7 +9520,7 @@ mod tests {
         let source_id = SourceId::from_string("native-replay-bootstrap");
         let service = CatalogService::start_inner(&fixture.guard, None, None, WatcherMode::Native)
             .expect("native catalog service");
-        let snapshot = register_and_audit(&service, &root, &source_id);
+        let snapshot = register_native_and_audit(&service, &root, &source_id);
         service.shutdown();
 
         let database = SourceDatabase::open_for_catalog_with_profile_guard(
@@ -12796,7 +12839,7 @@ mod tests {
             WatcherMode::Native,
         )
         .expect("production native catalog watcher service");
-        let initial = register_and_audit(&service, &root, &source_id);
+        let initial = register_native_and_audit(&service, &root, &source_id);
         assert!(
             initial
                 .manifest
