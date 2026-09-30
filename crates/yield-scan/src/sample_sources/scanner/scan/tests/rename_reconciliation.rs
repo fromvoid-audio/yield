@@ -1286,6 +1286,44 @@ fn targeted_destination_expires_after_an_unrelated_batch() {
 }
 
 #[test]
+fn carried_destination_keeps_a_new_duplicate_ambiguous() {
+    let dir = tempdir().unwrap();
+    let old = dir.path().join("old.wav");
+    let first = dir.path().join("first.wav");
+    let second = dir.path().join("second.wav");
+    std::fs::write(&old, b"same-content").unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
+    scan_once(&db).unwrap();
+    db.set_tag(Path::new("old.wav"), Rating::KEEP_1).unwrap();
+
+    std::fs::write(&first, b"same-content").unwrap();
+    sync_paths(&db, &[PathBuf::from("first.wav")]).unwrap();
+    std::fs::remove_file(&old).unwrap();
+    std::fs::write(&second, b"same-content").unwrap();
+    let second_batch = sync_paths(
+        &db,
+        &[PathBuf::from("old.wav"), PathBuf::from("second.wav")],
+    )
+    .unwrap();
+
+    assert_eq!(second_batch.renames_reconciled, 0);
+    assert_eq!(
+        db.entry_for_path(Path::new("first.wav"))
+            .unwrap()
+            .unwrap()
+            .tag,
+        Rating::NEUTRAL
+    );
+    assert_eq!(
+        db.entry_for_path(Path::new("second.wav"))
+            .unwrap()
+            .unwrap()
+            .tag,
+        Rating::NEUTRAL
+    );
+}
+
+#[test]
 fn deferred_completion_does_not_treat_plain_delete_as_duplicate_rename() {
     let dir = tempdir().unwrap();
     let deleted = dir.path().join("deleted.wav");

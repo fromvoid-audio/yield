@@ -67,6 +67,70 @@ fn exact_sync_updates_one_live_entry_with_an_exact_manifest_snapshot() {
 }
 
 #[test]
+fn finder_create_duplicate_and_rename_targeted_batches_publish_once() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("kick.wav"), b"kick").unwrap();
+    std::fs::write(dir.path().join("unrelated.wav"), b"unrelated").unwrap();
+    for index in 0..64 {
+        std::fs::write(dir.path().join(format!("unrelated-{index}.wav")), b"other").unwrap();
+    }
+    let db = open_maintained_scan_database(dir.path()).unwrap();
+    scan_once(&db).expect("baseline full scan");
+    let baseline_revision = db.get_revision().unwrap();
+
+    std::fs::copy(
+        dir.path().join("kick.wav"),
+        dir.path().join("kick copy.wav"),
+    )
+    .unwrap();
+    let created = sync_paths(&db, &[PathBuf::from("kick copy.wav")]).unwrap();
+    assert_eq!(created.committed_delta.created.len(), 1);
+    assert_eq!(created.committed_delta.deleted.len(), 0);
+    let after_create = db.get_revision().unwrap();
+    assert!(after_create > baseline_revision);
+    assert_eq!(created.targeted_manifest_rows_read, 1);
+
+    std::fs::rename(
+        dir.path().join("kick copy.wav"),
+        dir.path().join("snare.wav"),
+    )
+    .unwrap();
+    let renamed = sync_paths(
+        &db,
+        &[PathBuf::from("kick copy.wav"), PathBuf::from("snare.wav")],
+    )
+    .unwrap();
+    assert!(renamed.committed_delta.created.is_empty());
+    assert!(renamed.committed_delta.deleted.is_empty());
+    assert_eq!(renamed.committed_delta.moved.len(), 1);
+    assert_eq!(
+        renamed.committed_delta.moved[0].old_relative_path,
+        Path::new("kick copy.wav")
+    );
+    assert_eq!(
+        renamed.committed_delta.moved[0].new_relative_path,
+        Path::new("snare.wav")
+    );
+    let after_rename = db.get_revision().unwrap();
+    assert!(after_rename > after_create);
+    assert!(
+        renamed.targeted_manifest_rows_read <= 8,
+        "bounded rename read {} rows",
+        renamed.targeted_manifest_rows_read
+    );
+    let visible_paths = db
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.relative_path)
+        .collect::<Vec<_>>();
+    assert_eq!(visible_paths.len(), 67);
+    assert!(visible_paths.contains(&PathBuf::from("kick.wav")));
+    assert!(visible_paths.contains(&PathBuf::from("snare.wav")));
+    assert!(!visible_paths.contains(&PathBuf::from("kick copy.wav")));
+}
+
+#[test]
 fn exact_sync_indexes_one_live_unsupported_entry_without_subtree_rows() {
     let dir = tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("target/inside")).unwrap();
