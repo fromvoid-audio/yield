@@ -225,6 +225,27 @@ and progress events retain their intent/request fences through module moves.
 Audio processing remains in Reson; moving a control into a UI module does not
 move DSP into the UI.
 
+The source database open-role architecture lane also runs
+`scripts/internal/check/check_gpui_owner_boundary.py` over production
+`crates/yield-ui/src`. UI persistence must go through the typed
+`SourceRegistryGlobal`, catalog, and profile-owned maintenance APIs; read-only
+filesystem inspection remains available to UI presentation and admission
+logic. Disposable filesystem setup inside structurally bounded `#[cfg(test)]`
+modules is excluded. If fixture mutations become production work, retire the
+fixture exception and route them through the owner rather than widen an
+allowlist. This finite lexical tripwire rejects representative raw
+SQLite/owner access and direct filesystem mutations; it does not resolve Rust
+aliases beyond direct `std::fs` paths, `use std::fs` module aliases, and
+single or grouped imported filesystem mutators, including `as` aliases. It
+detects bounded `OpenOptions::new()` chains that enable `write`, `append`,
+`create`, `create_new`, or `truncate` with literal `true`. It does not resolve
+crate re-exports, arbitrary local aliases, macro expansions, dynamically
+computed builder flags, or runtime authority. It grants no runtime authority.
+Disposable cache maintenance must use a captured disposable-cache namespace
+and profile identity, with conflict checks; if its target becomes authoritative
+sample, journal, or artifact data, or an arbitrary path, retire and re-review
+that route through its owning service.
+
 Known source IDs activate the session-owned catalog. The browser registers only
 the active source lifecycle, applies cached and audited snapshots through a
 cancellable background projection, and retires old registrations on switching.

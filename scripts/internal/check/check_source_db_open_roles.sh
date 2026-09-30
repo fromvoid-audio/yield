@@ -48,3 +48,5 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 python3 scripts/internal/check/check_source_db_competing_writers.py --self-test
 python3 scripts/internal/check/check_source_db_competing_writers.py
+python3 scripts/internal/check/check_gpui_owner_boundary.py --self-test
+python3 scripts/internal/check/check_gpui_owner_boundary.py
