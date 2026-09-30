@@ -17,6 +17,7 @@ use gpui::{
 pub(crate) mod beat_count_input;
 mod browser;
 pub(crate) mod external_clipboard;
+mod multiline_text_input;
 mod search_input;
 mod theme;
 
@@ -94,6 +95,7 @@ pub fn run(initial_root: Option<PathBuf>) {
             eprintln!("could not register Ioskeley Mono: {error}");
         }
         search_input::install_keybindings(cx);
+        multiline_text_input::install_keybindings(cx);
         browser::install_source_registry(cx);
         let initial_root = initial_root.clone();
         // Keep isolated debug QA windows off the primary work display when requested.

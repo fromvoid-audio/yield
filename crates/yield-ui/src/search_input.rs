@@ -87,6 +87,19 @@ pub(crate) struct SearchInputOptions {
 }
 
 impl SearchInputOptions {
+    pub(crate) const fn feedback_title() -> Self {
+        Self {
+            placeholder: "Feedback title",
+            max_bytes: Some(200),
+            max_characters: None,
+            paste_newlines: PasteNewlines::AsSpaces,
+            underlined: false,
+            ascii_digits_only: false,
+            compact_height: None,
+            use_row_height: false,
+        }
+    }
+
     pub(crate) const fn filename() -> Self {
         Self {
             placeholder: "Search filenames",
