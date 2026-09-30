@@ -157,6 +157,90 @@ fn catalog_manifest_audit_does_not_complete_on_incomplete_directory_evidence() {
 }
 
 #[test]
+fn catalog_audit_publishes_empty_and_unsupported_only_directories() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("empty")).unwrap();
+    std::fs::create_dir(dir.path().join("unsupported-only")).unwrap();
+    std::fs::write(dir.path().join("unsupported-only/notes.txt"), b"notes").unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
+
+    let audit = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+        &db,
+        None,
+        1234,
+        &mut |_, _| {},
+        &UncoordinatedScanWriter,
+        None,
+    )
+    .expect("complete manifest audit");
+
+    let page = db.source_directory_truth_page(None, 16).unwrap();
+    assert_eq!(
+        page.state.published_source_revision(),
+        Some(audit.audit_commit.committed_source_revision())
+    );
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| entry.relative_path.as_path())
+            .collect::<Vec<_>>(),
+        vec![Path::new("empty"), Path::new("unsupported-only")]
+    );
+    assert!(page.next_cursor.is_none());
+    assert!(db.list_files().unwrap().is_empty());
+    assert_eq!(
+        db.get_metadata(yield_library::sample_sources::db::META_LAST_MANIFEST_AUDIT_AT)
+            .unwrap()
+            .as_deref(),
+        Some("1234")
+    );
+}
+
+#[test]
+fn incomplete_folder_audit_keeps_last_good_directory_projection() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("empty")).unwrap();
+    std::fs::create_dir(dir.path().join("unsupported-only")).unwrap();
+    std::fs::write(dir.path().join("unsupported-only/notes.txt"), b"notes").unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
+    audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+        &db,
+        None,
+        1234,
+        &mut |_, _| {},
+        &UncoordinatedScanWriter,
+        None,
+    )
+    .expect("baseline complete audit");
+    let before = db.source_directory_truth_page(None, 16).unwrap();
+    let revision_before = db.get_revision().unwrap();
+
+    std::fs::remove_dir(dir.path().join("empty")).unwrap();
+    let cycle = dir.path().join("cycle");
+    std::fs::create_dir(&cycle).unwrap();
+    let _unsupported_identity =
+        force_directory_identity(&dir.path().join("unsupported-only"), Some("same-identity"));
+    let _cycle_identity = force_directory_identity(&cycle, Some("same-identity"));
+    let result = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+        &db,
+        None,
+        5678,
+        &mut |_, _| {},
+        &UncoordinatedScanWriter,
+        None,
+    );
+    assert!(matches!(result, Err(ScanError::Incomplete { .. })));
+    assert_eq!(db.get_revision().unwrap(), revision_before);
+    assert_eq!(db.source_directory_truth_page(None, 16).unwrap(), before);
+    assert_eq!(
+        db.get_metadata(yield_library::sample_sources::db::META_LAST_MANIFEST_AUDIT_AT)
+            .unwrap()
+            .as_deref(),
+        Some("1234")
+    );
+}
+
+#[test]
 fn full_scan_preserves_manifest_when_root_identity_is_unavailable() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("keep.wav"), b"keep").unwrap();
