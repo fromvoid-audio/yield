@@ -45,7 +45,13 @@ fn compact_filter_chip_width(theme: &Theme, count: usize) -> f32 {
     (available / count).max(theme.spacing.border_width)
 }
 
-fn compact_filter_row<E>(theme: &Theme, label: &'static str, controls: Vec<E>) -> gpui::Div
+fn compact_filter_row<E>(
+    browser: &Browser,
+    theme: &Theme,
+    family: yield_core::BrowserFilterFamily,
+    controls: Vec<E>,
+    cx: &mut Context<Browser>,
+) -> gpui::Div
 where
     E: gpui::IntoElement,
 {
@@ -67,15 +73,8 @@ where
                 .px(px(theme.spacing.panel_padding))
                 .gap(px(theme.spacing.control_gap))
                 .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .w(px(COMPACT_FILTER_LABEL_WIDTH))
-                        .h_full()
-                        .items_center()
-                        .text_size(px(theme.typography.small_size))
-                        .text_color(color(theme.colors.accent))
-                        .child(label),
+                    super::filter_family::render(browser, theme, family, cx)
+                        .w(px(COMPACT_FILTER_LABEL_WIDTH)),
                 )
                 .child(
                     div()
@@ -1602,7 +1601,13 @@ pub(super) fn render_playback_type_filters(
                 )
         })
         .collect::<Vec<_>>();
-    compact_filter_row(&theme, "TYPE", chips)
+    compact_filter_row(
+        browser,
+        &theme,
+        yield_core::BrowserFilterFamily::PlaybackType,
+        chips,
+        cx,
+    )
 }
 
 fn playback_type_filter_label(playback_type: PlaybackType) -> &'static str {
@@ -1754,7 +1759,13 @@ pub(super) fn render_rating_filters(
                 .child(div().flex_none().w(px(10.0)).h(px(10.0)).bg(marker_color))
         })
         .collect::<Vec<_>>();
-    compact_filter_row(&theme, "RATING", chips)
+    compact_filter_row(
+        browser,
+        &theme,
+        yield_core::BrowserFilterFamily::Rating,
+        chips,
+        cx,
+    )
 }
 
 fn rating_filter_color(level: i8, theme: &Theme) -> yield_design::Color {

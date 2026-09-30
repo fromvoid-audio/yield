@@ -269,6 +269,12 @@ impl BrowserAccessibility {
         ] {
             control_focus.insert(id.to_owned(), cx.focus_handle());
         }
+        for family in super::filter_family::FAMILIES {
+            control_focus.insert(
+                super::filter_family::id(family).to_owned(),
+                cx.focus_handle(),
+            );
+        }
         control_focus.insert(JOB_DETAILS.to_owned(), job_details_focus);
         for id in SETTINGS_ORDER.iter().copied().chain([SETTINGS_OPEN]) {
             control_focus.insert(id.to_owned(), cx.focus_handle());
@@ -433,6 +439,9 @@ impl BrowserAccessibility {
                                 })
                             })
                             .flatten();
+                        let filter_family_action = super::filter_family::FAMILIES
+                            .into_iter()
+                            .find(|family| event.id == super::filter_family::id(*family));
                         let extra_action = matches!(
                             event.id.as_str(),
                             TAG_FILTER_INPUT
@@ -450,7 +459,9 @@ impl BrowserAccessibility {
                             || playback_type_action.is_some()
                             || playback_age_action.is_some()
                             || rating_action.is_some();
-                        let extra_action = extra_action || curation_scope_action.is_some();
+                        let extra_action = extra_action
+                            || curation_scope_action.is_some()
+                            || filter_family_action.is_some();
                         let transport_action = matches!(
                             event.id.as_str(),
                             PLAY | STOP
@@ -681,6 +692,12 @@ impl BrowserAccessibility {
                                 JOB_CANCEL => {
                                     view.cancel_job_audit(cx);
                                     window.focus(&view.job_details_focus_handle);
+                                }
+                                _ if filter_family_action.is_some() => {
+                                    view.toggle_filter_family(
+                                        filter_family_action.expect("validated family action"),
+                                        cx,
+                                    );
                                 }
                                 _ => match source_action {
                                     Some((index, true)) => {
@@ -1482,6 +1499,22 @@ impl Browser {
                         enabled: true,
                     });
                 }
+            }
+            for family in super::filter_family::FAMILIES {
+                controls.push(AxChild {
+                    id: super::filter_family::id(family).into(),
+                    role: AxRole::CheckBox,
+                    label: format!("{} filter family", super::filter_family::label(family)),
+                    value: Some(
+                        if self.view_model.filter_family_enabled(family) {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                        .into(),
+                    ),
+                    enabled: active_source,
+                });
             }
             for (index, kind) in PLAYBACK_TYPE_FILTERS.iter().enumerate() {
                 controls.push(AxChild {

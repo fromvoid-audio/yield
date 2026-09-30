@@ -14,12 +14,15 @@ use crate::app_dirs::WritableProfileGuard;
 use crate::durable_capacity::{
     PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity, descriptor_capacity_facts,
 };
+#[cfg(target_os = "macos")]
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use crate::sample_sources::db::BoundDatabaseRoot;
 
+use super::capacity_reserve::{ProtectedReserve, ReserveFailureReason, ReserveObservation};
+#[cfg(target_os = "macos")]
 use super::capacity_reserve::{
-    ProtectedReserve, ReserveFailureReason, ReserveObservation, allocate_protected_reserve,
-    revalidate_existing_owned_file, revalidate_existing_partial_owned_file,
+    allocate_protected_reserve, revalidate_existing_owned_file,
+    revalidate_existing_partial_owned_file,
 };
 
 /// Reserved direct child name for the owner-created recovery-reserve namespace.
@@ -614,12 +617,21 @@ impl BoundReserveView<'_> {
     }
 
     pub(super) fn revalidate(&self) -> Result<(), ReserveNamespaceFailureReason> {
-        validate_root(self.root, self.profile_guard)?;
-        self.reserve
-            .revalidate()
-            .map_err(ReserveNamespaceFailureReason::Observation)?;
-        verify_current_child_binding(self.root, &self.reserve.observation().identity)?;
-        validate_root(self.root, self.profile_guard)
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Err(ReserveNamespaceFailureReason::Observation(
+                ReserveFailureReason::Unsupported,
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            validate_root(self.root, self.profile_guard)?;
+            self.reserve
+                .revalidate()
+                .map_err(ReserveNamespaceFailureReason::Observation)?;
+            verify_current_child_binding(self.root, &self.reserve.observation().identity)?;
+            validate_root(self.root, self.profile_guard)
+        }
     }
 
     pub(super) fn revalidate_and_prove(
