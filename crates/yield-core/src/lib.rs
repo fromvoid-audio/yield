@@ -373,7 +373,8 @@ impl BrowserViewModel {
         self.collection_filter
     }
 
-    /// Return the active source rating filter, or a disabled filter when no level is selected.
+    /// Return retained rating choices, independently of the family enable switch.
+    /// A zero mask means no selected level.
     pub fn rating_filter(&self) -> RatingFilter {
         self.rating_filter
     }
@@ -383,8 +384,8 @@ impl BrowserViewModel {
         self.playback_age_filter
     }
 
-    /// Return the active source playback-type filter, or a disabled filter when no type is
-    /// selected.
+    /// Return retained playback-type choices, independently of the family enable switch.
+    /// A zero mask means no selected type.
     pub fn playback_type_filter(&self) -> PlaybackTypeFilter {
         self.playback_type_filter
     }
