@@ -44,9 +44,10 @@ impl LibraryDatabase {
             ready.wait();
             release.wait();
         }
+        #[cfg(test)]
         let db_path = binding.path().join(LIBRARY_DB_FILE_NAME);
-        let connection = Connection::open_with_flags(
-            &db_path,
+        let connection = binding.open_sqlite(
+            Path::new(LIBRARY_DB_FILE_NAME),
             OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         #[cfg(test)]

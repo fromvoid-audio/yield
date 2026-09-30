@@ -87,6 +87,11 @@ impl DatabaseFileBinding {
         &self.path
     }
 
+    /// Return the direct child whose identity this binding retains.
+    pub(crate) fn name(&self) -> &Path {
+        &self.name
+    }
+
     /// Build a retained main-file proof from a file opened through `root`.
     pub(crate) fn new(
         root: Arc<BoundDatabaseRoot>,

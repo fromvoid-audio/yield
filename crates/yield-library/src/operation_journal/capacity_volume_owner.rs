@@ -1034,7 +1034,7 @@ fn sync_directory(directory: &Dir, path: &Path) -> Result<(), VolumeOwnershipErr
     {
         directory
             .try_clone()
-            .and_then(|directory| directory.into_std_file().sync_all())
+            .and_then(|directory| crate::directory_sync::sync_directory(&directory.into_std_file()))
             .map_err(|source| VolumeOwnershipError::RootUnavailable {
                 path: path.to_path_buf(),
                 reason: format!("failed to flush ownership namespace: {source}"),

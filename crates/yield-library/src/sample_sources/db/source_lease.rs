@@ -446,11 +446,13 @@ impl SourceLeaseReservation {
     ) -> Result<Arc<SourceLease>, SourceLeaseError> {
         self.validate_before_open(profile_guard, &database_file_binding)?;
         let db_path = database_file_binding.path().to_path_buf();
-        let mut control = Connection::open_with_flags(
-            &db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(map_sql_error)?;
+        let mut control = database_file_binding
+            .root()
+            .open_sqlite(
+                database_file_binding.name(),
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .map_err(map_sql_error)?;
         database_file_binding
             .validate(&control)
             .map_err(map_database_error)?;
