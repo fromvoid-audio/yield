@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use yield_core::COLLECTION_COUNT;
 use yield_design::{Theme, ThemeError, validate_theme};
@@ -15,6 +16,11 @@ use crate::SessionError;
 pub const UI_PREFERENCES_SCHEMA_VERSION: u32 = 1;
 const MAX_THEME_SOURCE_PATH_BYTES: usize = 16 * 1024;
 const MAX_AUDIO_OUTPUT_NAME_BYTES: usize = 1024;
+/// Maximum UTF-8 source size for one imported user WGSL shader.
+pub const MAX_USER_SHADER_SOURCE_BYTES: usize = 64 * 1024;
+/// Shader ABI generation included in user-approval fingerprints.
+pub const USER_SHADER_CONTRACT_VERSION: u32 = 1;
+const USER_SHADER_APPROVAL_DOMAIN_PREFIX: &[u8] = b"PORTALSURFER/Yield/WGSL-approval\0contract-v";
 /// Longest persisted custom collection label, measured in UTF-8 bytes.
 pub const MAX_COLLECTION_NAME_BYTES: usize = 128;
 const OUTPUT_VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -29,6 +35,8 @@ pub const ENLARGED_TEXT_SCALE_PERCENT: u16 = 200;
 pub const MIN_RATING_DECAY_WEEKS: u16 = 1;
 /// Longest supported rating-decay interval.
 pub const MAX_RATING_DECAY_WEEKS: u16 = 52;
+/// Largest strength value accepted for a shipped visual effect.
+pub const MAX_VISUAL_EFFECT_STRENGTH_PERCENT: u16 = 100;
 
 fn default_rating_decay_weeks() -> u16 {
     DEFAULT_RATING_DECAY_WEEKS
@@ -52,6 +60,134 @@ fn default_text_scale_percent() -> u16 {
 
 fn default_collection_names() -> [Option<String>; COLLECTION_COUNT] {
     std::array::from_fn(|_| None)
+}
+
+/// One safe visual effect authored and compiled into Yield.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShippedVisualEffectPreset {
+    /// Convert the composed window to luma while preserving alpha.
+    #[default]
+    Grayscale,
+    /// Invert premultiplied RGB while preserving alpha.
+    Invert,
+    /// Two ordered passes: grayscale, then invert; strength applies to each pass.
+    GrayscaleThenInvert,
+}
+
+/// Persistent selection and per-pass strength for the built-in visual effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShippedVisualEffectPreferences {
+    /// Whether the selected effect is active.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Built-in effect selected even while disabled.
+    #[serde(default)]
+    pub preset: ShippedVisualEffectPreset,
+    /// Blend strength, from 0 through 100 percent.
+    #[serde(default = "default_visual_effect_strength_percent")]
+    pub strength_percent: u16,
+}
+
+fn default_visual_effect_strength_percent() -> u16 {
+    MAX_VISUAL_EFFECT_STRENGTH_PERCENT
+}
+
+impl Default for ShippedVisualEffectPreferences {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preset: ShippedVisualEffectPreset::Grayscale,
+            strength_percent: default_visual_effect_strength_percent(),
+        }
+    }
+}
+
+impl ShippedVisualEffectPreferences {
+    fn validate(self) -> Result<Self, PreferenceError> {
+        if self.strength_percent > MAX_VISUAL_EFFECT_STRENGTH_PERCENT {
+            return Err(PreferenceError::InvalidVisualEffectStrength);
+        }
+        Ok(self)
+    }
+}
+
+/// Bounded local WGSL content with an explicit profile-owned approval receipt.
+///
+/// The profile file is trusted local state, not a user-signature service. A matching
+/// fingerprint records explicit approval for exact source bytes under one shader ABI;
+/// it does not sandbox WGSL or provide GPU execution time limits. Older binaries reject
+/// profiles containing this configured field under the existing strict unknown-field policy.
+///
+/// Contract v1 is the current single-pass window ABI: a user provides only the fragment
+/// `post_fragment`; Yield injects its fullscreen `post_vertex`. Group 0 binding 0 is the
+/// composed window texture and binding 1 its sampler. There are no uniforms, time/music
+/// values, asset bindings, or multipass resources. UV is normalized; source pixels are
+/// premultiplied-alpha BGRA8. This gate does not parse, compile, or promise that source is
+/// valid or performant; the current consumer compiles for Metal 2.3 with empty Naga
+/// capabilities. Explicit approval must precede future execution from a confirmed
+/// owner snapshot; source paths, names, and successful parsing cannot approve code.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserShaderPreferences {
+    /// Exact UTF-8 source bytes last imported by the user.
+    pub source: String,
+    /// Fingerprint approved for these exact bytes and the current shader contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_fingerprint: Option<String>,
+    /// Whether the approved source is selected for the single-pass window effect.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl UserShaderPreferences {
+    fn validate(&self) -> Result<(), PreferenceError> {
+        let fingerprint = user_shader_content_fingerprint(&self.source)?;
+        if self
+            .approved_fingerprint
+            .as_deref()
+            .is_some_and(|approval| approval != fingerprint)
+        {
+            return Err(PreferenceError::InvalidStoredUserShaderApproval);
+        }
+        if self.enabled && self.approved_fingerprint.as_deref() != Some(&fingerprint) {
+            return Err(PreferenceError::UserShaderNotApproved);
+        }
+        Ok(())
+    }
+}
+
+/// Fingerprint exact source UTF-8 bytes for the current documented shader contract.
+///
+/// The receipt is `sha256:v1:<lowercase-hex>`, hashing the fixed domain prefix
+/// `PORTALSURFER/Yield/WGSL-approval\0contract-v`, the decimal contract version, a NUL,
+/// and the exact source bytes.
+/// Any shader ABI change must increment the contract version and requires reapproval.
+pub fn user_shader_content_fingerprint(source: &str) -> Result<String, PreferenceError> {
+    validate_user_shader_source(source)?;
+    let mut hasher = Sha256::new();
+    hasher.update(USER_SHADER_APPROVAL_DOMAIN_PREFIX);
+    hasher.update(USER_SHADER_CONTRACT_VERSION.to_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(source.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(format!("sha256:v{USER_SHADER_CONTRACT_VERSION}:{hex}"))
+}
+
+fn validate_user_shader_source(source: &str) -> Result<(), PreferenceError> {
+    if source.len() > MAX_USER_SHADER_SOURCE_BYTES {
+        return Err(PreferenceError::UserShaderSourceTooLarge);
+    }
+    if source.trim().is_empty() {
+        return Err(PreferenceError::UserShaderSourceEmpty);
+    }
+    Ok(())
 }
 
 /// The optional, renderer-neutral audio output routing persisted with the UI preferences.
@@ -155,6 +291,12 @@ pub struct UiPreferences {
     /// Profile-owned custom labels for the six stable collection slots.
     #[serde(default = "default_collection_names")]
     pub collection_names: [Option<String>; COLLECTION_COUNT],
+    /// Opt-in built-in window effect; old preference documents default to disabled grayscale.
+    #[serde(default)]
+    pub shipped_visual_effect: ShippedVisualEffectPreferences,
+    /// Optional exact-content user shader state; absent unless explicitly imported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_shader: Option<UserShaderPreferences>,
 }
 
 impl Default for UiPreferences {
@@ -174,11 +316,27 @@ impl Default for UiPreferences {
             output_volume: 1.0,
             audio_output: AudioOutputPreferences::default(),
             collection_names: default_collection_names(),
+            shipped_visual_effect: ShippedVisualEffectPreferences::default(),
+            user_shader: None,
         }
     }
 }
 
 impl UiPreferences {
+    /// Return source only when enabled and approved for its exact bytes and current contract.
+    ///
+    /// Future execution code must call this only on a confirmed owner snapshot, not an
+    /// optimistic UI projection. Approval is not a WGSL sandbox or GPU time limit.
+    pub fn enabled_user_shader_source(&self) -> Option<&str> {
+        let user_shader = self.user_shader.as_ref()?;
+        if !user_shader.enabled {
+            return None;
+        }
+        let fingerprint = user_shader_content_fingerprint(&user_shader.source).ok()?;
+        (user_shader.approved_fingerprint.as_deref() == Some(&fingerprint))
+            .then_some(user_shader.source.as_str())
+    }
+
     /// Validate the complete preference document without performing filesystem I/O.
     pub fn validate(self) -> Result<Self, PreferenceError> {
         if self.schema_version != UI_PREFERENCES_SCHEMA_VERSION {
@@ -196,6 +354,10 @@ impl UiPreferences {
         validate_trash_folder(self.trash_folder.as_deref())?;
         validate_output_volume(self.output_volume)?;
         self.audio_output.validate()?;
+        self.shipped_visual_effect.validate()?;
+        if let Some(user_shader) = self.user_shader.as_ref() {
+            user_shader.validate()?;
+        }
         for name in self.collection_names.iter().flatten() {
             validate_collection_name(name)?;
         }
@@ -263,6 +425,27 @@ pub enum PreferenceError {
     /// The in-app text scale is not one of the supported sizes.
     #[error("text scale must be 100% or 200%")]
     InvalidTextScale,
+    /// A shipped visual effect strength was outside the inclusive 0..=100 range.
+    #[error("visual effect strength must be between 0 and 100 percent")]
+    InvalidVisualEffectStrength,
+    /// Imported source contained no non-whitespace text.
+    #[error("user shader source must contain non-whitespace UTF-8 text")]
+    UserShaderSourceEmpty,
+    /// Imported source exceeded the raw UTF-8 source limit.
+    #[error("user shader source exceeds the {MAX_USER_SHADER_SOURCE_BYTES}-byte UTF-8 limit")]
+    UserShaderSourceTooLarge,
+    /// Approval was requested before importing source.
+    #[error("import a user shader source before approving it")]
+    UserShaderNotImported,
+    /// Caller-confirmed fingerprint does not match the currently imported exact bytes.
+    #[error("approval fingerprint does not match the current user shader source")]
+    UserShaderApprovalMismatch,
+    /// A persisted receipt is malformed, stale, or belongs to an older shader contract.
+    #[error("stored user shader approval is invalid; re-import and explicitly approve the source")]
+    InvalidStoredUserShaderApproval,
+    /// Enable requires a matching explicit approval for the exact current source.
+    #[error("approve the current user shader source before enabling it")]
+    UserShaderNotApproved,
     /// An audio output host or device name was empty, contained a NUL, or exceeded its bound.
     #[error(
         "audio output {field} must be non-empty, contain no NUL bytes, and be at most {MAX_AUDIO_OUTPUT_NAME_BYTES} bytes"
@@ -429,6 +612,24 @@ pub enum PreferencePatch {
         /// Trimmed, bounded user label.
         name: String,
     },
+    /// Replace the selected built-in visual effect configuration.
+    SetShippedVisualEffect(ShippedVisualEffectPreferences),
+    /// Import or replace WGSL text; replacement always clears approval and disables it.
+    ImportUserShader {
+        /// Exact UTF-8 WGSL text.
+        source: String,
+    },
+    /// Approve the currently imported source after the caller confirms its fingerprint.
+    ApproveUserShader {
+        /// Expected exact-content fingerprint shown to the caller.
+        expected_fingerprint: String,
+    },
+    /// Enable or disable imported WGSL; enable requires a matching approval.
+    SetUserShaderEnabled(bool),
+    /// Revoke approval and disable the retained source.
+    RevokeUserShaderApproval,
+    /// Remove the retained source and all approval state.
+    ClearUserShader,
     /// Replace the invalid or current document with built-in defaults.
     Reset,
 }
@@ -485,6 +686,51 @@ impl PreferencePatch {
                 };
                 *current = Some(name);
             }
+            Self::SetShippedVisualEffect(effect) => {
+                preferences.shipped_visual_effect = effect.validate()?;
+            }
+            Self::ImportUserShader { source } => {
+                validate_user_shader_source(&source)?;
+                preferences.user_shader = Some(UserShaderPreferences {
+                    source,
+                    approved_fingerprint: None,
+                    enabled: false,
+                });
+            }
+            Self::ApproveUserShader {
+                expected_fingerprint,
+            } => {
+                let Some(user_shader) = preferences.user_shader.as_mut() else {
+                    return Err(PreferenceError::UserShaderNotImported);
+                };
+                let current = user_shader_content_fingerprint(&user_shader.source)?;
+                if expected_fingerprint != current {
+                    return Err(PreferenceError::UserShaderApprovalMismatch);
+                }
+                user_shader.approved_fingerprint = Some(current);
+            }
+            Self::SetUserShaderEnabled(enabled) => {
+                if enabled {
+                    let Some(user_shader) = preferences.user_shader.as_mut() else {
+                        return Err(PreferenceError::UserShaderNotImported);
+                    };
+                    user_shader.validate()?;
+                    let current = user_shader_content_fingerprint(&user_shader.source)?;
+                    if user_shader.approved_fingerprint.as_deref() != Some(&current) {
+                        return Err(PreferenceError::UserShaderNotApproved);
+                    }
+                    user_shader.enabled = true;
+                } else if let Some(user_shader) = preferences.user_shader.as_mut() {
+                    user_shader.enabled = false;
+                }
+            }
+            Self::RevokeUserShaderApproval => {
+                if let Some(user_shader) = preferences.user_shader.as_mut() {
+                    user_shader.enabled = false;
+                    user_shader.approved_fingerprint = None;
+                }
+            }
+            Self::ClearUserShader => preferences.user_shader = None,
             Self::Reset => *preferences = Self::default_preferences(),
         }
         Ok(before != *preferences)
@@ -492,6 +738,36 @@ impl PreferencePatch {
 
     fn is_reset(&self) -> bool {
         matches!(self, Self::Reset)
+    }
+
+    /// Return whether this is one of the explicit user-shader profile commands.
+    pub fn is_user_shader_command(&self) -> bool {
+        matches!(
+            self,
+            Self::ImportUserShader { .. }
+                | Self::ApproveUserShader { .. }
+                | Self::SetUserShaderEnabled(_)
+                | Self::RevokeUserShaderApproval
+                | Self::ClearUserShader
+        )
+    }
+
+    /// Apply the command to an immutable input and validate the complete candidate snapshot.
+    ///
+    /// For shader commands, or snapshots that retain imported shader content, the result is
+    /// rejected if its serialized aggregate exceeds the profile payload bound, before a profile
+    /// owner can replace its last-good in-memory state. Profiles without shader content retain
+    /// their existing size behavior. UI projection can reuse this exact command behavior, but
+    /// remains optimistic and grants no execution authority.
+    pub fn project(&self, current: &UiPreferences) -> Result<UiPreferences, PreferenceError> {
+        let shader_command = self.is_user_shader_command();
+        let mut candidate = current.clone();
+        self.clone().apply(&mut candidate)?;
+        let candidate = candidate.validate()?;
+        if shader_command || candidate.user_shader.is_some() {
+            let _ = candidate.to_payload()?;
+        }
+        Ok(candidate)
     }
 
     fn default_preferences() -> UiPreferences {
@@ -723,7 +999,9 @@ impl PreferenceCoordinator {
         }
         let was_invalid = !self.valid;
         let is_reset = patch.is_reset();
-        let changed = patch.apply(&mut self.current)?;
+        let candidate = patch.project(&self.current)?;
+        let changed = candidate != self.current;
+        self.current = candidate;
         let recovered = is_reset && was_invalid;
         if recovered {
             self.valid = true;
@@ -767,6 +1045,95 @@ mod tests {
             UiPreferences::from_payload(&payload).expect("decode"),
             preferences
         );
+    }
+
+    #[test]
+    fn shipped_two_pass_preset_round_trips_through_profile_owner() {
+        assert_eq!(
+            serde_json::to_string(&ShippedVisualEffectPreset::Grayscale).unwrap(),
+            "\"grayscale\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ShippedVisualEffectPreset::Invert).unwrap(),
+            "\"invert\""
+        );
+        let effect = ShippedVisualEffectPreferences {
+            enabled: true,
+            preset: ShippedVisualEffectPreset::GrayscaleThenInvert,
+            strength_percent: 80,
+        };
+        let mut owner = PreferenceCoordinator::new();
+        owner.load_valid(UiPreferences::default());
+        owner
+            .apply_loaded_patch(
+                PreferenceRequestId(1),
+                PreferencePatch::SetShippedVisualEffect(effect),
+            )
+            .expect("owner accepts compound preset");
+        let payload = owner
+            .snapshot()
+            .to_payload()
+            .expect("persistable owner state");
+        let loaded = UiPreferences::from_payload(&payload).expect("reload compound preset");
+        assert_eq!(loaded.shipped_visual_effect, effect);
+        assert!(payload.contains("grayscale_then_invert"));
+        assert_eq!(
+            UiPreferences::default().shipped_visual_effect,
+            ShippedVisualEffectPreferences::default()
+        );
+    }
+
+    #[test]
+    fn shipped_visual_effect_is_legacy_defaulted_validated_and_profile_owned() {
+        let mut legacy = serde_json::to_value(UiPreferences::default()).expect("encode");
+        legacy
+            .as_object_mut()
+            .expect("preferences object")
+            .remove("shipped_visual_effect");
+        let legacy = serde_json::to_string(&legacy).expect("legacy JSON");
+        let loaded = UiPreferences::from_payload(&legacy).expect("legacy preferences");
+        assert_eq!(
+            loaded.shipped_visual_effect,
+            ShippedVisualEffectPreferences::default()
+        );
+
+        let effect = ShippedVisualEffectPreferences {
+            enabled: true,
+            preset: ShippedVisualEffectPreset::Invert,
+            strength_percent: 70,
+        };
+        let mut coordinator = PreferenceCoordinator::new();
+        coordinator.load_valid(loaded);
+        assert!(
+            coordinator
+                .apply_loaded_patch(
+                    PreferenceRequestId(1),
+                    PreferencePatch::SetShippedVisualEffect(effect),
+                )
+                .expect("owner accepts effect patch")
+        );
+        assert_eq!(coordinator.snapshot().shipped_visual_effect, effect);
+        let durable_payload = coordinator.snapshot().to_payload().expect("owner payload");
+        assert_eq!(
+            UiPreferences::from_payload(&durable_payload)
+                .expect("reloaded profile payload")
+                .shipped_visual_effect,
+            effect
+        );
+
+        let mut invalid_strength = serde_json::to_value(UiPreferences::default()).unwrap();
+        invalid_strength["shipped_visual_effect"]["strength_percent"] = 101.into();
+        assert_eq!(
+            UiPreferences::from_payload(&invalid_strength.to_string()),
+            Err(PreferenceError::InvalidVisualEffectStrength)
+        );
+
+        let mut unknown_preset = serde_json::to_value(UiPreferences::default()).unwrap();
+        unknown_preset["shipped_visual_effect"]["preset"] = "arbitrary_shader".into();
+        assert!(matches!(
+            UiPreferences::from_payload(&unknown_preset.to_string()),
+            Err(PreferenceError::Json(_))
+        ));
     }
 
     #[test]
@@ -889,6 +1256,280 @@ mod tests {
                 .loop_lock_override,
             None
         );
+    }
+
+    #[test]
+    fn user_shader_requires_exact_explicit_approval_and_round_trips_owner_state() {
+        let original = "@fragment fn post_fragment() {}";
+        let changed = "@fragment fn post_fragment() {}\n";
+        let original_fingerprint =
+            user_shader_content_fingerprint(original).expect("fingerprint source");
+        let changed_fingerprint =
+            user_shader_content_fingerprint(changed).expect("fingerprint whitespace edit");
+        assert_ne!(original_fingerprint, changed_fingerprint);
+
+        let mut coordinator = PreferenceCoordinator::new();
+        coordinator.load_valid(UiPreferences::default());
+        let initial = coordinator.snapshot();
+
+        assert_eq!(
+            coordinator.apply_loaded_patch(
+                PreferenceRequestId(1),
+                PreferencePatch::SetUserShaderEnabled(true),
+            ),
+            Err(PreferenceError::UserShaderNotImported)
+        );
+        assert_eq!(coordinator.snapshot(), initial);
+
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(2),
+                PreferencePatch::ImportUserShader {
+                    source: original.to_owned(),
+                },
+            )
+            .expect("import disables and clears approval");
+        assert!(
+            coordinator
+                .snapshot()
+                .enabled_user_shader_source()
+                .is_none()
+        );
+        let imported = coordinator.snapshot();
+
+        assert_eq!(
+            coordinator.apply_loaded_patch(
+                PreferenceRequestId(3),
+                PreferencePatch::SetUserShaderEnabled(true),
+            ),
+            Err(PreferenceError::UserShaderNotApproved)
+        );
+        assert_eq!(coordinator.snapshot(), imported);
+
+        assert_eq!(
+            coordinator.apply_loaded_patch(
+                PreferenceRequestId(4),
+                PreferencePatch::ApproveUserShader {
+                    expected_fingerprint: changed_fingerprint.clone(),
+                },
+            ),
+            Err(PreferenceError::UserShaderApprovalMismatch)
+        );
+        assert_eq!(coordinator.snapshot(), imported);
+        assert_eq!(
+            coordinator.snapshot().enabled_user_shader_source(),
+            None,
+            "a mismatch cannot produce executable source"
+        );
+
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(5),
+                PreferencePatch::ApproveUserShader {
+                    expected_fingerprint: original_fingerprint.clone(),
+                },
+            )
+            .expect("explicit matching approval");
+        assert!(
+            coordinator
+                .snapshot()
+                .enabled_user_shader_source()
+                .is_none()
+        );
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(7),
+                PreferencePatch::SetUserShaderEnabled(true),
+            )
+            .expect("enable only after approval");
+        assert_eq!(
+            coordinator.snapshot().enabled_user_shader_source(),
+            Some(original)
+        );
+
+        let payload = coordinator.snapshot().to_payload().expect("owner save");
+        let restored = UiPreferences::from_payload(&payload).expect("owner reload");
+        assert_eq!(restored, coordinator.snapshot());
+        assert_eq!(restored.enabled_user_shader_source(), Some(original));
+        let mut stale_receipt = serde_json::to_value(&restored).expect("encode stale receipt");
+        stale_receipt["user_shader"]["source"] = format!("{original} ").into();
+        assert_eq!(
+            UiPreferences::from_payload(&stale_receipt.to_string()),
+            Err(PreferenceError::InvalidStoredUserShaderApproval)
+        );
+
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(6),
+                PreferencePatch::ImportUserShader {
+                    source: changed.to_owned(),
+                },
+            )
+            .expect("whitespace replacement clears stale approval");
+        let replaced = coordinator.snapshot();
+        assert_eq!(
+            replaced.user_shader.as_ref().unwrap().approved_fingerprint,
+            None
+        );
+        assert!(!replaced.user_shader.as_ref().unwrap().enabled);
+        assert!(replaced.enabled_user_shader_source().is_none());
+
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(8),
+                PreferencePatch::ApproveUserShader {
+                    expected_fingerprint: changed_fingerprint,
+                },
+            )
+            .expect("new exact bytes need their own approval");
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(9),
+                PreferencePatch::SetUserShaderEnabled(true),
+            )
+            .expect("enable new explicitly approved bytes");
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(10),
+                PreferencePatch::RevokeUserShaderApproval,
+            )
+            .expect("revoke disables in the owner");
+        let revoked = coordinator.snapshot();
+        assert_eq!(
+            revoked.user_shader.as_ref().unwrap().approved_fingerprint,
+            None
+        );
+        assert!(!revoked.user_shader.as_ref().unwrap().enabled);
+        assert!(revoked.enabled_user_shader_source().is_none());
+        coordinator
+            .apply_loaded_patch(PreferenceRequestId(11), PreferencePatch::ClearUserShader)
+            .expect("clear source and receipt");
+        assert_eq!(coordinator.snapshot().user_shader, None);
+    }
+
+    #[test]
+    fn user_shader_bounds_malformed_receipts_and_aggregate_rejection_keep_last_good_state() {
+        let mut coordinator = PreferenceCoordinator::new();
+        coordinator.load_valid(UiPreferences::default());
+        let initial = coordinator.snapshot();
+        assert_eq!(
+            coordinator.apply_loaded_patch(
+                PreferenceRequestId(1),
+                PreferencePatch::ImportUserShader {
+                    source: " \n\t".to_owned(),
+                },
+            ),
+            Err(PreferenceError::UserShaderSourceEmpty)
+        );
+        assert_eq!(
+            coordinator.apply_loaded_patch(
+                PreferenceRequestId(2),
+                PreferencePatch::ImportUserShader {
+                    source: "x".repeat(MAX_USER_SHADER_SOURCE_BYTES + 1),
+                },
+            ),
+            Err(PreferenceError::UserShaderSourceTooLarge)
+        );
+        assert_eq!(coordinator.snapshot(), initial);
+
+        // Backslashes and newlines expand in JSON so a valid 64 KiB source can exceed
+        // the complete 128 KiB profile payload limit. The rejected command must not
+        // replace owner state or prevent the next ordinary command from succeeding.
+        let escaped_source = "\\\n".repeat(MAX_USER_SHADER_SOURCE_BYTES / 2);
+        assert_eq!(escaped_source.len(), MAX_USER_SHADER_SOURCE_BYTES);
+        assert!(matches!(
+            coordinator.apply_loaded_patch(
+                PreferenceRequestId(3),
+                PreferencePatch::ImportUserShader {
+                    source: escaped_source,
+                },
+            ),
+            Err(PreferenceError::PayloadTooLarge { .. })
+        ));
+        assert_eq!(coordinator.snapshot(), initial);
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(4),
+                PreferencePatch::SetTextScalePercent(ENLARGED_TEXT_SCALE_PERCENT),
+            )
+            .expect("owner accepts next command after rejected import");
+
+        let mut malformed = UiPreferences::default();
+        malformed.user_shader = Some(UserShaderPreferences {
+            source: "valid-looking source".into(),
+            approved_fingerprint: Some("sha256:v1:not-a-digest".into()),
+            enabled: false,
+        });
+        assert_eq!(
+            malformed.clone().validate(),
+            Err(PreferenceError::InvalidStoredUserShaderApproval)
+        );
+        malformed.user_shader.as_mut().unwrap().enabled = true;
+        assert!(malformed.enabled_user_shader_source().is_none());
+
+        let legacy = serde_json::to_value(UiPreferences::default()).expect("encode legacy");
+        assert!(legacy.get("user_shader").is_none());
+        let restored = UiPreferences::from_payload(&legacy.to_string()).expect("legacy defaults");
+        assert_eq!(restored.user_shader, None);
+    }
+
+    #[test]
+    fn ordinary_preference_command_cannot_overflow_approved_shader_profile() {
+        let source = "\\".repeat(58 * 1024);
+        let fingerprint = user_shader_content_fingerprint(&source).expect("fingerprint");
+        let mut coordinator = PreferenceCoordinator::new();
+        coordinator.load_valid(UiPreferences::default());
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(1),
+                PreferencePatch::ImportUserShader {
+                    source: source.clone(),
+                },
+            )
+            .expect("bounded source fits profile payload");
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(2),
+                PreferencePatch::ApproveUserShader {
+                    expected_fingerprint: fingerprint,
+                },
+            )
+            .expect("explicit approval");
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(3),
+                PreferencePatch::SetUserShaderEnabled(true),
+            )
+            .expect("enable approved shader");
+
+        let last_good = coordinator.snapshot();
+        let revision = coordinator.revision();
+        let large_trash_path = PathBuf::from(format!("/{}", "p".repeat(14_000)));
+        assert!(matches!(
+            coordinator.apply_loaded_patch(
+                PreferenceRequestId(4),
+                PreferencePatch::SetTrashFolder(Some(large_trash_path)),
+            ),
+            Err(PreferenceError::PayloadTooLarge { .. })
+        ));
+        assert_eq!(coordinator.snapshot(), last_good);
+        assert_eq!(coordinator.revision(), revision);
+        assert_eq!(
+            coordinator.snapshot().enabled_user_shader_source(),
+            Some(source.as_str())
+        );
+
+        coordinator
+            .apply_loaded_patch(
+                PreferenceRequestId(5),
+                PreferencePatch::SetTextScalePercent(ENLARGED_TEXT_SCALE_PERCENT),
+            )
+            .expect("next non-overflowing command still commits");
+        let restored = UiPreferences::from_payload(
+            &coordinator.snapshot().to_payload().expect("last-good save"),
+        )
+        .expect("last-good source remains reloadable");
+        assert_eq!(restored.enabled_user_shader_source(), Some(source.as_str()));
     }
 
     #[test]
