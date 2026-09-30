@@ -1281,7 +1281,10 @@ fn verify_current_child_binding(
 mod tests {
     use super::*;
 
-    use std::fs::{self, OpenOptions};
+    use std::fs;
+    #[cfg(target_os = "macos")]
+    use std::fs::OpenOptions;
+    #[cfg(target_os = "macos")]
     use std::io::Write;
 
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};

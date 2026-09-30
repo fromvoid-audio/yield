@@ -759,6 +759,7 @@ pub(super) fn toggle_from_toolbar(
 }
 
 /// Toggle zero-crossing snapping from a native accessibility action.
+#[cfg(target_os = "macos")]
 pub(super) fn toggle_from_accessibility(
     browser: &mut Browser,
     window: &mut Window,

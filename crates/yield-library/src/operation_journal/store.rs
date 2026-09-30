@@ -1466,7 +1466,7 @@ impl OperationJournalStore {
         Ok(page)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn insert_ordinary_claim_for_test(
         &self,
         claim_id: Uuid,
@@ -2239,7 +2239,7 @@ impl OperationJournalStore {
         self.profile_guard.try_clone()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn test_reserve_bootstrap_snapshot(
         &self,
         volume: &crate::durable_capacity::VolumeIdentity,
@@ -2585,7 +2585,7 @@ impl OperationJournalStore {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn acquire_owned_source_reserve_with_test_hook<F>(
         &self,
         volume_owner: VolumeOwnershipCapability,

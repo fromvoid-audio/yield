@@ -562,15 +562,17 @@ impl Browser {
     }
 
     pub(crate) fn new_window(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut browser = Self::new(cx);
+        let browser = Self::new(cx);
         #[cfg(target_os = "macos")]
-        {
+        let browser = {
+            let mut browser = browser;
             browser.accessibility = accessibility::BrowserAccessibility::new(
                 window,
                 cx,
                 browser.job_details_focus_handle.clone(),
             );
-        }
+            browser
+        };
         #[cfg(not(target_os = "macos"))]
         let _ = window;
         browser

@@ -46,6 +46,7 @@ pub(crate) enum FileClipboardError {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     UnsupportedPlatform,
     /// The native clipboard rejected the handoff.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     Platform(String),
 }
 
@@ -60,6 +61,7 @@ impl Display for FileClipboardError {
             Self::UnsupportedPlatform => {
                 formatter.write_str("Native file clipboard handoff is unsupported on this platform")
             }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Self::Platform(message) => formatter.write_str(message),
         }
     }

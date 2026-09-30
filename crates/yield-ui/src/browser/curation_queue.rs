@@ -191,6 +191,7 @@ pub(super) fn toggle_scope_menu(browser: &mut Browser, cx: &mut Context<Browser>
 }
 
 /// Return whether the active source's scope choices are visible.
+#[cfg(target_os = "macos")]
 pub(super) fn scope_menu_open(browser: &Browser) -> bool {
     browser.curation_queue.scope_menu_open
 }

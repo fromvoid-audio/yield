@@ -15,6 +15,16 @@ release-ready macOS acceptance in OPT-1863. The old PowerShell commands remain
 in `scripts/gpui-local-ci.ps1.deferred` for later reassessment; they have not
 been validated on a Windows host.
 
+The user's 2026-09-30 instruction permits development on Linux while Mac checks
+are tracked for later. Run `bash scripts/gpui-development-checks.sh check` for
+formatting and the normal locked app check, or `test` to also run core, shared
+reserve, filter-handler and enlarged-browser fixtures. This portable development
+command requires the host's GPUI build dependencies and preserves normal lint
+settings. It does not run native AX, Metal, FSEvents, audible or release checks,
+and does not replace the macOS local CI gate or claim Linux desktop support.
+Remaining native sessions are indexed in [OPT-1953](https://linear.app/boostnlvp/issue/OPT-1953),
+including new filter controls (OPT-1954) and target-gating regressions (OPT-1955).
+
 The full lane also runs the vendored GPUI Metal post-pass regression tests with
 its own locked manifest. Application tests do not run dependency unit tests.
 These checks exercise shader compilation, cached-target reuse, resize allocation

@@ -299,6 +299,7 @@ impl Browser {
         cx.notify();
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) fn set_volume_from_accessibility(
         &mut self,
         value: f32,

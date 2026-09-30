@@ -63,13 +63,13 @@ use super::store::{
     OperationJournalStoreError, OrdinaryClaimReleaseReceipt, SourceReserveBindingFailure,
     StagingCheckpointAck,
 };
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use super::store::{ReleaseTestBoundary, ReleaseTestDirective};
 use super::work_plan::derive_work_plan;
 
 const CONTROL_INPUT_BYTES: usize = 1;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreparedAdmissionFactsFault {
     LowReserve,
@@ -501,7 +501,7 @@ pub(crate) struct PreparedAdmissionInput {
     plan: FullCapacityPlan,
     claims: AdmissionClaimInventory,
     timestamp_unix_ms: i64,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     facts_fault: Option<PreparedAdmissionFactsFault>,
 }
 
@@ -629,7 +629,7 @@ impl PreparedAdmissionInput {
             plan,
             claims,
             timestamp_unix_ms,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "macos"))]
             facts_fault: None,
         };
         prepared.validate_shape()?;
@@ -653,12 +653,12 @@ impl PreparedAdmissionInput {
             plan,
             claims,
             timestamp_unix_ms: 1,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "macos"))]
             facts_fault: None,
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn with_facts_fault(mut self, fault: PreparedAdmissionFactsFault) -> Self {
         self.facts_fault = Some(fault);
         self
@@ -674,7 +674,7 @@ pub struct OperationJournalOwner {
     worker: Option<JoinHandle<()>>,
     #[cfg(test)]
     prepared_admission_id_allocations: Arc<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     synthetic_chunk_write_invocations: Arc<AtomicUsize>,
 }
 
@@ -1322,7 +1322,7 @@ fn observe_retained_descriptor_inner(
     Ok((expected_volume, facts, provenance))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn prepared_admission_fault_facts(
     fault: PreparedAdmissionFactsFault,
     reserve: &mut OwnedReserveAllocation,
@@ -1434,7 +1434,7 @@ impl OwnerRuntime {
         Ok(runtime)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn fail_next_chunk_callback_witness_for_test(&mut self, reason: impl Into<String>) {
         self.next_chunk_callback_witness_error = Some(reason.into());
     }
@@ -1510,11 +1510,11 @@ impl OwnerRuntime {
             }
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "macos"))]
         let observation = self
             .refresh_live_descriptor_capacity_for_admission(prepared.facts_fault)
             .map_err(|reason| PreparedAdmissionError::DescriptorRefreshRejected { reason })?;
-        #[cfg(not(test))]
+        #[cfg(not(all(test, target_os = "macos")))]
         let observation = self
             .refresh_live_descriptor_capacity_for_admission()
             .map_err(|reason| PreparedAdmissionError::DescriptorRefreshRejected { reason })?;
@@ -1663,11 +1663,11 @@ impl OwnerRuntime {
             .map_err(|error| OperationJournalOwnerError::ChunkClaim {
                 reason: error.to_string(),
             })?;
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "macos"))]
         let observation = self
             .refresh_live_descriptor_capacity_for_admission(None)
             .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
-        #[cfg(not(test))]
+        #[cfg(not(all(test, target_os = "macos")))]
         let observation = self
             .refresh_live_descriptor_capacity_for_admission()
             .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
@@ -1739,11 +1739,11 @@ impl OwnerRuntime {
         }
         self.store().validate_for_admission()?;
         let snapshot = self.chunk_rebuild_snapshot()?;
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "macos"))]
         let observation = self
             .refresh_live_descriptor_capacity_for_admission(None)
             .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
-        #[cfg(not(test))]
+        #[cfg(not(all(test, target_os = "macos")))]
         let observation = self
             .refresh_live_descriptor_capacity_for_admission()
             .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
@@ -2092,11 +2092,11 @@ impl OwnerRuntime {
         self.validate_chunk_operation_state(permit.operation_id(), "entry")?;
         self.store().validate_for_admission()?;
         let snapshot = self.chunk_rebuild_snapshot()?;
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "macos"))]
         let observation = self
             .refresh_live_descriptor_capacity_for_admission(None)
             .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
-        #[cfg(not(test))]
+        #[cfg(not(all(test, target_os = "macos")))]
         let observation = self
             .refresh_live_descriptor_capacity_for_admission()
             .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
@@ -3069,7 +3069,7 @@ impl OwnerRuntime {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn refresh_live_descriptor_capacity_for_admission(
         &mut self,
         fault: Option<PreparedAdmissionFactsFault>,
@@ -3086,11 +3086,15 @@ impl OwnerRuntime {
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(all(test, target_os = "macos")))]
     fn refresh_live_descriptor_capacity_for_admission(
         &mut self,
     ) -> Result<LiveDescriptorCapacityObservation, String> {
-        self.refresh_live_descriptor_capacity_inner(true)
+        self.refresh_live_descriptor_capacity_inner(
+            #[cfg(test)]
+            None,
+            true,
+        )
     }
 
     fn refresh_live_descriptor_capacity_inner(
@@ -3200,7 +3204,7 @@ impl OwnerRuntime {
         Ok(LiveDescriptorCapacityObservation { facts, provenance })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn refresh_live_descriptor_capacity_with_reader(
         &mut self,
         facts_reader: &dyn Fn(
@@ -3263,7 +3267,7 @@ impl OwnerRuntime {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn install_drop_observer(
         &mut self,
         observer: OwnerRuntimeDropObserver,
@@ -3555,7 +3559,7 @@ impl OperationJournalOwner {
             worker: Some(worker),
             #[cfg(test)]
             prepared_admission_id_allocations,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "macos"))]
             synthetic_chunk_write_invocations,
         })
     }
@@ -3578,7 +3582,7 @@ impl OperationJournalOwner {
             .load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn synthetic_chunk_write_invocations(&self) -> usize {
         self.synthetic_chunk_write_invocations
             .load(Ordering::Relaxed)
@@ -4073,7 +4077,7 @@ impl OperationJournalClient {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn inject_active_recovery_charge_for_test(
         &self,
         operation_id: OperationId,
@@ -4091,7 +4095,7 @@ impl OperationJournalClient {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn inspect_capacity_for_test(
         &self,
     ) -> Result<OperationJournalRequest<CapacityLedgerTestSnapshot>, OperationJournalOwnerQueueError>
@@ -5334,13 +5338,17 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 mod tests {
     use super::*;
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
+    #[cfg(target_os = "macos")]
+    use crate::durable_capacity::descriptor_capacity_facts;
     use crate::durable_capacity::{
         CapacityAllocationClass, DurableCapacityPlan, PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
-        descriptor_capacity_facts,
     };
+    #[cfg(target_os = "macos")]
     use crate::file_operation_owner::{EffectOutcome, FileOperationOwner};
+    #[cfg(target_os = "macos")]
     use crate::operation_journal::capacity_provider::{CapacityProvider, CapacityRebuildReadiness};
     use crate::operation_journal::full_progress_codec::StoredFullProgressRecord;
+    #[cfg(target_os = "macos")]
     use crate::operation_journal::store::{OrdinaryClaimRebuildSnapshot, RebuildClaim};
     use crate::operation_journal::{
         AdmissionClaim, CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
@@ -5369,6 +5377,7 @@ mod tests {
         WaveformOutputSpec, WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
         decode,
     };
+    #[cfg(target_os = "macos")]
     use crate::sample_sources::db::SourceDatabase;
     use crate::sample_sources::{SourceId, SourcePlaybackType};
     use crate::test_runtime::TestRuntimeGuard;
@@ -7763,6 +7772,7 @@ mod tests {
         )
     }
 
+    #[cfg(target_os = "macos")]
     fn prepared_copy_all_classes_input(
         volume: VolumeIdentity,
         allocation_unit: u64,
