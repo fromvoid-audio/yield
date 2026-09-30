@@ -148,6 +148,7 @@ pub(crate) enum LedgerError {
     #[error("charge {0} is already reconstituted")]
     AlreadyReconstituted(Uuid),
     #[error("charge {0} is not the active charge for its volume")]
+    #[cfg(target_os = "macos")]
     ChargeNotActive(Uuid),
     #[error("charge {charge_id} remains active in state {state:?}")]
     ActiveForCleanHandoff {
@@ -607,10 +608,13 @@ fn historical_snapshot(
 
 pub(super) struct SpendOutcome {
     pub(super) snapshot: ChargeSnapshot,
+    #[cfg(target_os = "macos")]
     pub(super) head: ChargeSnapshot,
+    #[cfg(target_os = "macos")]
     pub(super) applied: bool,
 }
 
+#[cfg(target_os = "macos")]
 pub(super) enum ReconstitutePreflight {
     Historical(ChargeSnapshot),
     Pending,
@@ -967,7 +971,9 @@ pub(super) fn spend_with_outcome(
             if kind == "Spent" && amount == amount_bytes {
                 return Ok(SpendOutcome {
                     snapshot: historical_snapshot(snapshot.clone(), sequence, remaining, state),
+                    #[cfg(target_os = "macos")]
                     head: snapshot,
+                    #[cfg(target_os = "macos")]
                     applied: false,
                 });
             }
@@ -1027,13 +1033,16 @@ pub(super) fn spend_with_outcome(
         })?;
         Ok(SpendOutcome {
             snapshot: head.clone(),
+            #[cfg(target_os = "macos")]
             head,
+            #[cfg(target_os = "macos")]
             applied: true,
         })
     })();
     finish_transaction(connection, result)
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn charge_snapshot_for_volume(
     connection: &Connection,
     expected_volume: &VolumeIdentity,
@@ -1051,6 +1060,7 @@ pub(super) fn charge_snapshot_for_volume(
     Ok(snapshot)
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn require_active_charge_for_volume(
     connection: &Connection,
     expected_volume: &VolumeIdentity,
@@ -1067,6 +1077,7 @@ pub(super) fn require_active_charge_for_volume(
     finish_transaction(connection, result)
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn reconstitute_preflight(
     connection: &Connection,
     expected_volume: &VolumeIdentity,

@@ -27,6 +27,22 @@ use crate::timestamps::system_time_to_unix_nanos;
 
 use super::super::{DatabaseRootBindingGuard, SourceDatabase};
 
+#[cfg(not(windows))]
+fn sync_retained_directory(directory: &fs::File) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // Linux directory capabilities may use O_PATH, which cannot be fsynced. Open the
+        // directory itself for read through the retained descriptor, never its ambient path.
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        open(directory, Path::new("."), &options)?.sync_all()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        directory.sync_all()
+    }
+}
+
 /// Result of a descriptor-bound staged publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum StagedFinalization {
@@ -692,21 +708,18 @@ impl BoundDatabaseRoot {
         #[cfg(not(windows))]
         {
             let profile_root = profile_guard.profile_root_dir()?;
-            profile_root.into_std_file().sync_all().map_err(|source| {
+            sync_retained_directory(&profile_root.into_std_file()).map_err(|source| {
                 profile_binding_error(
                     profile_guard,
                     format!("failed to flush profile namespace: {source}"),
                 )
             })?;
-            self._capability
-                .try_clone()
-                .and_then(|directory| directory.sync_all())
-                .map_err(|source| {
-                    profile_binding_error(
-                        profile_guard,
-                        format!("failed to flush operation-journal namespace: {source}"),
-                    )
-                })
+            sync_retained_directory(&self._capability).map_err(|source| {
+                profile_binding_error(
+                    profile_guard,
+                    format!("failed to flush operation-journal namespace: {source}"),
+                )
+            })
         }
     }
 
@@ -1349,6 +1362,28 @@ impl RecoverySourceDatabases for SourceDatabaseRecoveryAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_directory_sync_survives_ambient_path_replacement() {
+        let temp = tempfile::tempdir().expect("temporary parent");
+        let original = temp.path().join("original");
+        let moved = temp.path().join("moved");
+        fs::create_dir(&original).expect("directory");
+        let capability = open_ambient_dir(&original, ambient_authority()).expect("capability");
+        sync_retained_directory(&capability).expect("sync retained directory capability");
+
+        fs::rename(&original, &moved).expect("move retained directory");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &original)
+            .expect("replace ambient path with dangling symlink");
+        sync_retained_directory(&capability).expect("sync must not reopen the ambient path");
+        assert!(moved.is_dir());
+        assert!(
+            fs::symlink_metadata(&original)
+                .expect("replacement")
+                .is_symlink()
+        );
+    }
 
     #[cfg(not(windows))]
     #[test]

@@ -51,10 +51,12 @@ enum PendingMaintenance {
 }
 
 impl GeneralSettings {
+    #[cfg(target_os = "macos")]
     pub(super) fn picking(&self) -> bool {
         self.picking
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) fn maintenance_busy(&self) -> bool {
         self.maintenance.is_some()
     }
@@ -72,10 +74,12 @@ impl GeneralSettings {
             .unwrap_or_else(|| "Not measured".into())
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) fn status(&self) -> &str {
         &self.status
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) fn maintenance_status(&self) -> &str {
         &self.maintenance_status
     }
