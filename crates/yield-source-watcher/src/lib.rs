@@ -534,7 +534,9 @@ fn classify_event(spec: &SourceWatchSpec, event: &Event) -> WatchHintEvidence {
                 evidence = evidence.union(classify_root_event(event.kind));
             }
             PathRelation::Descendant => {
-                if is_ignored_file_name(path, spec.ignored_file_name_prefixes) {
+                if is_ignored_file_name(path, spec.ignored_file_name_prefixes)
+                    || is_finder_bookkeeping_event(path, event.kind)
+                {
                     continue;
                 }
                 evidence = evidence.union(classify_descendant_event(event.kind));
@@ -585,6 +587,26 @@ fn is_ignored_file_name(path: &Path, prefixes: &[&str]) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
+}
+
+fn is_finder_bookkeeping_event(path: &Path, kind: EventKind) -> bool {
+    // Notify's macOS adapter drops the file/dir flag on data and metadata writes.
+    // Filter only ordinary bookkeeping writes to Finder's exact reserved filename;
+    // directory creation/removal, renames, unknown kinds and rescan flags retain
+    // their conservative behavior. Never prefix-match an audio filename here.
+    cfg!(target_os = "macos")
+        && path.file_name().is_some_and(|name| name == ".DS_Store")
+        && matches!(
+            kind,
+            EventKind::Create(notify::event::CreateKind::File)
+                | EventKind::Remove(notify::event::RemoveKind::File)
+                | EventKind::Modify(ModifyKind::Data(_))
+                | EventKind::Modify(ModifyKind::Metadata(
+                    notify::event::MetadataKind::Any
+                        | notify::event::MetadataKind::Other
+                        | notify::event::MetadataKind::Extended
+                ))
+        )
 }
 
 #[cfg(test)]
@@ -804,6 +826,58 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finder_bookkeeping_does_not_schedule_audit_but_real_changes_do() {
+        let root = PathBuf::from("/tmp/source-watcher-test-root");
+        let signal = WatcherSignal::new(spec(&root));
+        let metadata = root.join(".DS_Store");
+        for kind in [
+            EventKind::Create(notify::event::CreateKind::File),
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Remove(notify::event::RemoveKind::File),
+        ] {
+            signal.record_notify_result(Ok(event(kind, &[&metadata])), Instant::now());
+            assert!(signal.take_hint().is_none(), "{kind:?}");
+        }
+        for (path, kind) in [
+            (
+                root.join(".DS_Store.wav"),
+                EventKind::Create(notify::event::CreateKind::File),
+            ),
+            (
+                metadata.clone(),
+                EventKind::Create(notify::event::CreateKind::Folder),
+            ),
+            (
+                metadata.clone(),
+                EventKind::Remove(notify::event::RemoveKind::Folder),
+            ),
+            (
+                metadata.clone(),
+                EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any)),
+            ),
+            (metadata.clone(), EventKind::Any),
+        ] {
+            signal.record_notify_result(Ok(event(kind, &[&path])), Instant::now());
+            assert!(signal.take_hint().is_some(), "{path:?}: {kind:?}");
+        }
+        let mut rescan = event(
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            &[&metadata],
+        );
+        rescan.attrs.set_flag(Flag::Rescan);
+        signal.record_notify_result(Ok(rescan), Instant::now());
+        assert!(
+            signal
+                .take_hint()
+                .expect("rescan retained")
+                .evidence()
+                .requires_full_rescan()
+        );
+    }
+
     #[test]
     fn custom_artifact_prefixes_are_accepted() {
         let root = PathBuf::from("/tmp/source-watcher-test-root");
@@ -860,5 +934,40 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         };
         assert!(accepted_evidence);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_finder_bookkeeping_is_quiet_while_audio_creation_is_observed() {
+        let root = tempfile::tempdir().expect("temporary source root");
+        let canonical_root = root.path().canonicalize().expect("canonical source root");
+        let watcher = SourceWatcher::start(spec(&canonical_root)).expect("native watcher");
+        fs::write(
+            canonical_root.join(".DS_Store"),
+            b"disposable Finder metadata",
+        )
+        .expect("write bookkeeping file");
+        let quiet_until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < quiet_until {
+            if let Some(hint) = watcher.take_hint() {
+                // Creating a child can also report metadata for the source root. The
+                // catalog already discards that hint after verifying root identity.
+                assert!(!hint.evidence().has_descendant_change());
+                assert!(!hint.evidence().requires_full_rescan());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        fs::write(canonical_root.join(".DS_Store.wav"), b"disposable audio")
+            .expect("write audio filename sharing the prefix");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(hint) = watcher.take_hint()
+                && hint.evidence().has_descendant_change()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "audio creation was not observed");
+            thread::sleep(Duration::from_millis(25));
+        }
     }
 }

@@ -5,12 +5,10 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-#[cfg(debug_assertions)]
-use std::{cell::Cell, rc::Rc};
 
 use gpui::{
-    App, AppContext, Application, Bounds, Focusable, KeyBinding, Menu, MenuItem, TitlebarOptions,
-    WindowBounds, WindowOptions, actions, point, px, size,
+    App, AppContext, Application, BorrowAppContext, Bounds, Focusable, KeyBinding, Menu, MenuItem,
+    TitlebarOptions, WindowBounds, WindowOptions, actions, point, px, size,
 };
 
 #[allow(dead_code)]
@@ -36,29 +34,60 @@ const WINDOW_HEIGHT: f32 = 720.0;
 /// Start the browser window.
 pub fn run(initial_root: Option<PathBuf>) {
     Application::new().run(move |cx: &mut App| {
+        #[cfg(debug_assertions)]
+        let debug_post_effect_enabled =
+            std::env::var("YIELD_DEV_POST_EFFECT").ok().as_deref() == Some("1");
+        #[cfg(not(debug_assertions))]
+        let debug_post_effect_enabled = false;
+        cx.set_global(theme::DebugPostEffectOverride {
+            enabled: debug_post_effect_enabled,
+            revision: u64::from(debug_post_effect_enabled),
+        });
         cx.on_action(|_: &Quit, cx| cx.quit());
         #[cfg(debug_assertions)]
         {
-            let enabled = Rc::new(Cell::new(
-                std::env::var("YIELD_DEV_POST_EFFECT").ok().as_deref() == Some("1"),
-            ));
             cx.on_action(move |_: &TogglePostEffect, cx| {
                 let Some(handle) = cx.active_window() else {
                     return;
                 };
-                let next = !enabled.get();
-                let enabled = Rc::clone(&enabled);
+                let next = cx.update_global::<theme::DebugPostEffectOverride, _>(|state, _| {
+                    state.enabled = !state.enabled;
+                    state.revision = state.revision.wrapping_add(1);
+                    state.enabled
+                });
                 // Native menu actions can run while the active window is already
                 // being updated, so return it to App before updating its renderer.
                 cx.defer(move |cx| {
-                    let source = next.then_some(DEBUG_POST_EFFECT);
-                    match handle.update(cx, |_, window, _| window.set_post_shader(source)) {
-                        Ok(Ok(())) => enabled.set(next),
-                        Ok(Err(error)) => {
-                            enabled.set(false);
-                            eprintln!("visual post effect unavailable: {error}");
+                    if next {
+                        match handle.update(cx, |_, window, _| {
+                            window.set_post_shader(Some(DEBUG_POST_EFFECT))
+                        }) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                cx.update_global::<theme::DebugPostEffectOverride, _>(
+                                    |state, _| {
+                                        state.enabled = false;
+                                        state.revision = state.revision.wrapping_add(1);
+                                    },
+                                );
+                                eprintln!("visual post effect unavailable: {error}");
+                                let _ = handle.update(cx, |_, window, _| window.refresh());
+                            }
+                            Err(error) => {
+                                cx.update_global::<theme::DebugPostEffectOverride, _>(
+                                    |state, _| {
+                                        state.enabled = false;
+                                        state.revision = state.revision.wrapping_add(1);
+                                    },
+                                );
+                                eprintln!("could not update visual post effect: {error}");
+                                if let Some(active) = cx.active_window() {
+                                    let _ = active.update(cx, |_, window, _| window.refresh());
+                                }
+                            }
                         }
-                        Err(error) => eprintln!("could not update visual post effect: {error}"),
+                    } else if let Err(error) = handle.update(cx, |_, window, _| window.refresh()) {
+                        eprintln!("could not restore saved visual effect: {error}");
                     }
                 });
             });
@@ -130,6 +159,10 @@ pub fn run(initial_root: Option<PathBuf>) {
                 #[cfg(debug_assertions)]
                 if std::env::var("YIELD_DEV_POST_EFFECT").ok().as_deref() == Some("1") {
                     if let Err(error) = window.set_post_shader(Some(DEBUG_POST_EFFECT)) {
+                        cx.update_global::<theme::DebugPostEffectOverride, _>(|state, _| {
+                            state.enabled = false;
+                            state.revision = state.revision.wrapping_add(1);
+                        });
                         eprintln!("visual post effect unavailable: {error}");
                     }
                 }

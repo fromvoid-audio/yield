@@ -1272,6 +1272,8 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reconcile_shipped_visual_effect(window, cx);
+        self.refresh_user_shader_review_token();
         #[cfg(target_os = "macos")]
         self.sync_browser_accessibility(window, cx);
         if self.playmark_timing_blur_subscription.is_none() {

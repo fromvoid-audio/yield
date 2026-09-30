@@ -48,6 +48,11 @@ try {
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   & $python.Source $guard
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  $uiGuard = Join-Path $PSScriptRoot "check_gpui_owner_boundary.py"
+  & $python.Source $uiGuard --self-test
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  & $python.Source $uiGuard
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   exit 0
 } finally {
   Pop-Location

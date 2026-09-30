@@ -53,6 +53,7 @@ use schemars::JsonSchema;
 use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use std::any::Any;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::io::Cursor;
@@ -71,6 +72,108 @@ use uuid::Uuid;
 pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
+
+/// Maximum number of ordered WGSL post-processing passes supported by a window.
+pub const MAX_POST_SHADER_PASSES: usize = 4;
+
+/// Failure while installing an optional WGSL post-processing chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PostShaderError {
+    /// The active renderer does not support visual post-processing.
+    UnsupportedPlatform,
+    /// The requested chain exceeds [`MAX_POST_SHADER_PASSES`].
+    TooManyPasses {
+        /// Number of requested passes.
+        requested: usize,
+        /// Maximum number of supported passes.
+        maximum: usize,
+    },
+    /// The prepared shader chain belongs to a different window renderer.
+    RendererMismatch,
+    /// WGSL parsing, validation, Metal translation, or pipeline compilation failed.
+    Compile(String),
+}
+
+impl fmt::Display for PostShaderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedPlatform => {
+                formatter.write_str("visual post-processing is unavailable on this renderer")
+            }
+            Self::TooManyPasses { requested, maximum } => write!(
+                formatter,
+                "visual post-processing requested {requested} passes; maximum is {maximum}"
+            ),
+            Self::RendererMismatch => formatter.write_str(
+                "prepared visual post-processing belongs to a different or retired renderer",
+            ),
+            Self::Compile(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PostShaderError {}
+
+/// An opaque compiler bound to one window renderer and its retained GPU device.
+///
+/// Call [`Self::prepare_chain`] from a background executor. Preparation performs
+/// synchronous shader compilation and cannot be cancelled once in progress. This
+/// type does not schedule or bound concurrent work and does not grant approval or
+/// execution authority. Callers must retain the source snapshot, approval, and
+/// request generation separately, bound in-flight preparations, and discard
+/// results after a source change, disable, cancellation, window close, or renderer
+/// replacement. Never wait for a worker preparation to finish on the UI thread.
+#[derive(Clone)]
+pub struct PostShaderCompiler {
+    backend: Arc<dyn PostShaderCompilerBackend>,
+}
+
+/// A compiled, opaque shader chain that can only be installed by its originating
+/// renderer. It does not grant approval or authorize shader execution by itself.
+pub struct PreparedPostShaderChain {
+    payload: Box<dyn Any + Send>,
+}
+
+pub(crate) trait PostShaderCompilerBackend: Send + Sync {
+    fn prepare_chain(&self, sources: &[String]) -> Result<Box<dyn Any + Send>, PostShaderError>;
+}
+
+impl PostShaderCompiler {
+    pub(crate) fn new(backend: impl PostShaderCompilerBackend + 'static) -> Self {
+        Self {
+            backend: Arc::new(backend),
+        }
+    }
+
+    /// Compile an ordered chain of at most [`MAX_POST_SHADER_PASSES`] WGSL sources.
+    ///
+    /// This method does not access a window or install the result. Run it on a
+    /// background executor and never wait for it on the UI thread; a running
+    /// Metal compilation cannot be cancelled.
+    pub fn prepare_chain(
+        &self,
+        sources: &[String],
+    ) -> Result<PreparedPostShaderChain, PostShaderError> {
+        if sources.len() > MAX_POST_SHADER_PASSES {
+            return Err(PostShaderError::TooManyPasses {
+                requested: sources.len(),
+                maximum: MAX_POST_SHADER_PASSES,
+            });
+        }
+        self.backend
+            .prepare_chain(sources)
+            .map(|payload| PreparedPostShaderChain { payload })
+    }
+}
+
+impl PreparedPostShaderChain {
+    pub(crate) fn downcast<T: Any + Send>(self) -> Result<T, Self> {
+        match self.payload.downcast::<T>() {
+            Ok(payload) => Ok(*payload),
+            Err(payload) => Err(Self { payload }),
+        }
+    }
+}
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) use linux::*;
@@ -498,14 +601,28 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn draw(&self, scene: &Scene);
-    /// Install a visual WGSL pass over the composed window, or remove it.
-    /// Backends without post-pass support reject enabling while accepting disable.
-    fn set_post_shader(&self, source: Option<&str>) -> Result<(), String> {
-        if source.is_some() {
-            Err(String::from("visual post-processing is unavailable on this renderer"))
+    /// Install an ordered visual WGSL pass chain over the composed window.
+    /// Each source samples its preceding pass at group 0 binding 0, uses the
+    /// sampler at binding 1, and may sample the original composed window at
+    /// binding 2. An empty slice restores the normal compositor. Unsupported
+    /// backends return [`PostShaderError::UnsupportedPlatform`].
+    fn set_post_shaders(&self, sources: &[&str]) -> Result<(), PostShaderError> {
+        if !sources.is_empty() {
+            Err(PostShaderError::UnsupportedPlatform)
         } else {
             Ok(())
         }
+    }
+    /// Capture an opaque compiler for this window's current renderer.
+    fn post_shader_compiler(&self) -> Result<PostShaderCompiler, PostShaderError> {
+        Err(PostShaderError::UnsupportedPlatform)
+    }
+    /// Install a prepared chain only if it was compiled for this exact renderer.
+    fn install_prepared_post_shader_chain(
+        &self,
+        _prepared: PreparedPostShaderChain,
+    ) -> Result<(), PostShaderError> {
+        Err(PostShaderError::UnsupportedPlatform)
     }
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;

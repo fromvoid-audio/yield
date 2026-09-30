@@ -114,6 +114,8 @@ mod tag_pager;
 mod tags;
 mod transient_markers;
 mod transport;
+#[cfg(target_os = "macos")]
+mod user_shader_runtime;
 mod view;
 mod volume;
 mod waveform;
@@ -2417,13 +2419,13 @@ impl Browser {
         }
     }
 
-    fn reset_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.reset_theme_from_accessibility(cx);
+    fn reset_theme(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_theme_from_accessibility(window, cx);
     }
 
-    fn reset_theme_from_accessibility(&mut self, cx: &mut Context<Self>) {
+    fn reset_theme_from_accessibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.preferences_editable() {
-            self.reset_preferences(cx);
+            self.reset_preferences(window, cx);
             return;
         }
         let theme = Theme::default();
@@ -2444,10 +2446,18 @@ impl Browser {
         cx.notify();
     }
 
-    fn reset_preferences(&mut self, cx: &mut Context<Self>) {
+    fn reset_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.disable_user_shader_locally(window, "Custom shader disabled while settings reset.");
+        self.general_settings.visual_effect_local_enabled = Some(false);
         if !self.submit_preference_patch(PreferencePatch::Reset, cx) {
+            self.general_settings
+                .mark_local_visual_effect_disable_unpersisted("settings unavailable");
+            cx.notify();
             return;
         }
+        self.general_settings
+            .visual_effect_persistence_status
+            .clear();
         self.theme_load.invalidate();
         self.theme_task.take();
         cx.set_global(ActiveTheme::default());

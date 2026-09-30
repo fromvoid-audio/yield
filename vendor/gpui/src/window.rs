@@ -1754,15 +1754,67 @@ impl Window {
         self.platform_window.start_window_move()
     }
 
-    /// Apply one optional WGSL fragment pass to the composed window image.
+    /// Apply an ordered WGSL post-processing chain to the composed window image.
     ///
-    /// The source provides `post_fragment` with a UV input at location 0;
-    /// group 0 binding 0 is the window texture and binding 1 is its sampler.
-    ///
-    /// The disabled path uses the normal compositor. A rejected shader restores
-    /// that path and returns a diagnostic for the caller.
+    /// Each source defines `post_fragment` with UV input at location 0. Group 0
+    /// binding 0 samples the prior pass (the composed window for the first pass),
+    /// binding 1 is the sampler, and optional binding 2 samples the immutable
+    /// original composed window. The chain is limited to
+    /// [`crate::MAX_POST_SHADER_PASSES`]. Each shader source is limited to 64 KiB.
+    /// An empty slice restores the normal compositor. Rejected replacements
+    /// clear the previous chain and return a diagnostic. For N passes the
+    /// renderer retains N offscreen BGRA8 textures (the composed image plus
+    /// N-1 intermediates), about 126.6 MiB for four passes at 3840x2160. The
+    /// pass cap bounds this resource use; it is not a performance guarantee.
+    pub fn set_post_shaders(&mut self, sources: &[&str]) -> Result<(), crate::PostShaderError> {
+        let result = self.platform_window.set_post_shaders(sources);
+        self.refresh();
+        result
+    }
+
+    /// Compatibility wrapper for callers that install one pass.
     pub fn set_post_shader(&mut self, source: Option<&str>) -> Result<(), String> {
-        let result = self.platform_window.set_post_shader(source);
+        match source {
+            Some(source) => self
+                .set_post_shaders(&[source])
+                .map_err(|error| error.to_string()),
+            None => self
+                .set_post_shaders(&[])
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    /// Capture an opaque compiler bound to this window's current renderer.
+    ///
+    /// Move the compiler and owned source strings to a background executor, then
+    /// use [`Self::install_prepared_post_shader_chain`] to install the result.
+    /// Closing or replacing this window's renderer makes the prepared result
+    /// stale. Compilation cannot be cancelled after it starts. The caller must
+    /// bound in-flight preparations, recheck the approved source snapshot and
+    /// request generation before installation, and discard results after disable,
+    /// cancellation, close, or source change. This compiler does not enforce any
+    /// of those scheduling or approval rules.
+    pub fn post_shader_compiler(
+        &self,
+    ) -> Result<crate::PostShaderCompiler, crate::PostShaderError> {
+        self.platform_window.post_shader_compiler()
+    }
+
+    /// Install a chain prepared by this exact window renderer.
+    ///
+    /// A stale or foreign result is rejected and restores the normal compositor.
+    /// This method performs no WGSL parsing or Metal pipeline creation. Callers
+    /// must install only if their approved source snapshot and request generation
+    /// are still current; otherwise discard the result. Use
+    /// [`Self::set_post_shaders`] with an empty slice, or [`Self::set_post_shader`]
+    /// with `None`, to clear the active chain.
+    pub fn install_prepared_post_shader_chain(
+        &mut self,
+        prepared: crate::PreparedPostShaderChain,
+    ) -> Result<(), crate::PostShaderError> {
+        let result = self
+            .platform_window
+            .install_prepared_post_shader_chain(prepared);
         self.refresh();
         result
     }

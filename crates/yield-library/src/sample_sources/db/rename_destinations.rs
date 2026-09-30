@@ -24,6 +24,18 @@ impl RenameCandidateScanKind {
 }
 
 impl SourceDatabase {
+    /// Whether a specific old path is still eligible to supply rename metadata.
+    pub fn has_pending_rename_for_path(&self, relative_path: &Path) -> Result<bool, SourceDbError> {
+        let path = normalize_relative_path(relative_path)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_wav_renames WHERE path = ?1)",
+                params![path],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(map_sql_error)
+    }
+
     /// List recent destinations plus candidates retained for unresolved content matches.
     pub fn list_pending_rename_destinations(&self) -> Result<Vec<PathBuf>, SourceDbError> {
         let generation = self
@@ -200,6 +212,113 @@ impl SourceDatabase {
                     Ok(path) => Some(path),
                     Err(error) => {
                         tracing::warn!(%error, "Skipping invalid recent rename destination path");
+                        None
+                    }
+                })
+                .collect(),
+            overflow,
+        ))
+    }
+
+    /// Return recent destinations which could match one pending source path.
+    /// Known, different content hashes exclude unrelated arrivals before a
+    /// targeted scan reads their manifest rows. Unknown hashes remain eligible
+    /// for the existing bounded deep-hash reconciliation.
+    pub fn list_recent_unretained_rename_destinations_for_pending_path(
+        &self,
+        pending_path: &Path,
+        limit: usize,
+    ) -> Result<(Vec<PathBuf>, bool), SourceDbError> {
+        let pending_path = normalize_relative_path(pending_path)?;
+        let generation = self
+            .get_metadata(TARGETED_SCAN_GENERATION_KEY)?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let previous = generation.saturating_sub(1);
+        let query_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT destination.path
+                 FROM pending_wav_rename_destinations AS destination
+                 JOIN pending_wav_renames AS pending ON pending.path = ?1
+                 JOIN wav_files AS live ON live.path = destination.path AND live.missing = 0
+                 WHERE destination.retained_hash IS NULL
+                   AND destination.scan_generation = ?2
+                   AND (
+                       (pending.file_identity IS NOT NULL
+                        AND pending.file_identity = live.file_identity)
+                       OR pending.content_hash IS NULL
+                       OR live.content_hash IS NULL
+                       OR pending.content_hash = live.content_hash
+                   )
+                 ORDER BY destination.path ASC
+                 LIMIT ?3",
+            )
+            .map_err(map_sql_error)?;
+        let rows = statement
+            .query_map(params![pending_path, previous as i64, query_limit], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(map_sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql_error)?;
+        let overflow = rows.len() > limit;
+        Ok((
+            rows.into_iter()
+                .take(limit)
+                .filter_map(|path| match parse_relative_path_from_db(&path) {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        tracing::warn!(%error, "Skipping invalid recent rename destination path");
+                        None
+                    }
+                })
+                .collect(),
+            overflow,
+        ))
+    }
+
+    /// Find unresolved source paths which could claim a live destination.
+    /// A previous destination for any of these paths must remain in the
+    /// candidate set so a new duplicate cannot win by scan ordering alone.
+    pub fn list_pending_rename_paths_for_destination(
+        &self,
+        destination_path: &Path,
+        limit: usize,
+    ) -> Result<(Vec<PathBuf>, bool), SourceDbError> {
+        let destination_path = normalize_relative_path(destination_path)?;
+        let query_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT pending.path
+                 FROM pending_wav_renames AS pending
+                 JOIN wav_files AS live ON live.path = ?1 AND live.missing = 0
+                 WHERE (pending.file_identity IS NOT NULL
+                        AND pending.file_identity = live.file_identity)
+                    OR pending.content_hash IS NULL
+                    OR live.content_hash IS NULL
+                    OR pending.content_hash = live.content_hash
+                 ORDER BY pending.path ASC
+                 LIMIT ?2",
+            )
+            .map_err(map_sql_error)?;
+        let rows = statement
+            .query_map(params![destination_path, query_limit], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(map_sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql_error)?;
+        let overflow = rows.len() > limit;
+        Ok((
+            rows.into_iter()
+                .take(limit)
+                .filter_map(|path| match parse_relative_path_from_db(&path) {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        tracing::warn!(%error, "Skipping invalid pending rename path");
                         None
                     }
                 })
