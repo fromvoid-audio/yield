@@ -287,8 +287,8 @@ fn open_source_database_with_profile_guard_inner(
         .validate_profile_guard(profile_guard)
         .map_err(map_database_root_open_error)?;
     let connect_started = std::time::Instant::now();
-    let connection = match Connection::open_with_flags(
-        &db_path,
+    let connection = match database_root.open_sqlite(
+        database_name,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     ) {
         Ok(connection) => {

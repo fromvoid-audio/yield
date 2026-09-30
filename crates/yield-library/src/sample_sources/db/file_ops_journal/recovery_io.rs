@@ -16,6 +16,8 @@ use cap_primitives::fs::{FollowSymlinks, OpenOptions, open, open_ambient_dir, op
 use cap_primitives::fs::{hard_link, remove_file};
 
 use crate::app_dirs::{ProfileChildLease, ProfileOwnershipError, WritableProfileGuard};
+#[cfg(not(windows))]
+use crate::directory_sync::sync_directory as sync_retained_directory;
 use crate::filesystem_identity::{
     stable_filesystem_identity, stable_filesystem_identity_from_open_file,
 };
@@ -26,22 +28,6 @@ use crate::sample_sources::finalization::{
 use crate::timestamps::system_time_to_unix_nanos;
 
 use super::super::{DatabaseRootBindingGuard, SourceDatabase};
-
-#[cfg(not(windows))]
-fn sync_retained_directory(directory: &fs::File) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        // Linux directory capabilities may use O_PATH, which cannot be fsynced. Open the
-        // directory itself for read through the retained descriptor, never its ambient path.
-        let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        open(directory, Path::new("."), &options)?.sync_all()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        directory.sync_all()
-    }
-}
 
 /// Result of a descriptor-bound staged publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -610,6 +596,34 @@ impl fmt::Display for BoundDatabaseRootError {
 }
 
 impl BoundDatabaseRoot {
+    /// Open a direct database child without resolving the retained Linux root to an ambient path.
+    /// The caller must retain this root until the connection closes and keep its existing
+    /// profile/main-file identity checks before and after opening.
+    pub(crate) fn open_sqlite(
+        &self,
+        name: &Path,
+        flags: rusqlite::OpenFlags,
+    ) -> rusqlite::Result<rusqlite::Connection> {
+        let components = relative_components(name)
+            .map_err(|_| rusqlite::Error::InvalidPath(name.to_path_buf()))?;
+        if components.len() != 1 {
+            return Err(rusqlite::Error::InvalidPath(name.to_path_buf()));
+        }
+        let flags = flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        #[cfg(target_os = "linux")]
+        {
+            rusqlite::Connection::open_with_flags_and_vfs(
+                self.path.join(name),
+                flags,
+                crate::sqlite_linux::vfs_name()?,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            rusqlite::Connection::open_with_flags(self.path.join(name), flags)
+        }
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }

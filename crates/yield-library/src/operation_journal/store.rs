@@ -3015,7 +3015,7 @@ impl OperationJournalStore {
         }
         validate_pre_sqlite_sidecars(&database_root, &database_path, rollback_journal.as_ref())?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let connection = Connection::open_with_flags(&database_path, flags)?;
+        let connection = database_root.open_sqlite(database_name, flags)?;
         connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, SQLITE_VALUE_LIMIT)?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
         validate_connection_identity(

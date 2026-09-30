@@ -7019,14 +7019,18 @@ mod tests {
     fn owner_rejects_unsupported_reserve_before_namespace_effects() {
         let fixture = fixture("journal-owner-unsupported-reserve");
         let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let registry_path = fixture.owner.profile_root().join("volume-owner-registry");
+        fs::create_dir(&registry_path).expect("fixture volume registry");
         let reserve_path = fixture
             .owner
             .profile_root()
             .join("operation_journal")
             .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
-        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
         let reason = wait_until_unavailable(&owner);
-        assert!(reason.contains("reserve bootstrap"));
+        assert!(reason.contains("reserve bootstrap"), "{reason}");
         assert!(!reserve_path.exists());
         assert!(!owner.shutdown());
         drop(fixture);

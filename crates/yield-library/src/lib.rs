@@ -7,6 +7,8 @@
 pub mod app_dirs;
 /// Shared structured debug diagnostics helpers for storage-owned seams.
 pub mod diagnostics;
+#[cfg(not(windows))]
+mod directory_sync;
 /// Pre-intent durable capacity discovery and accounting.
 pub mod durable_capacity;
 mod env_flags;
@@ -20,6 +22,8 @@ pub mod operation_journal;
 pub mod sample_sources;
 /// Optional SQLite extension loader shared by storage code.
 pub mod sqlite_ext;
+#[cfg(target_os = "linux")]
+mod sqlite_linux;
 mod sqlite_wal;
 /// Process-global test runtime isolation helpers.
 #[cfg(any(test, feature = "test-support"))]

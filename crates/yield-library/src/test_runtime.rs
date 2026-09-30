@@ -241,9 +241,9 @@ mod tests {
 
     #[test]
     fn panic_unwind_restores_environment_and_current_directory() {
+        let mut outer = TestRuntimeGuard::acquire();
         let original_dir = std::env::current_dir().expect("current directory");
         let temp = tempdir().expect("temporary working directory");
-        let mut outer = TestRuntimeGuard::acquire();
         outer.set_var(TEST_ENV, "before-panic");
 
         let result = catch_unwind(AssertUnwindSafe(|| {

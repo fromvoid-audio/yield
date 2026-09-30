@@ -27,6 +27,12 @@ if [[ "$scope" == "test" ]]; then
   run cargo test --locked -p yield-library --lib capacity_reserve_namespace
   run cargo test --locked -p yield-library --lib file_ops_journal::recovery_io
   run cargo test --locked -p yield-library --lib recovery_reserve
+  # Run process-spawning lock fixtures serially so child startup cannot inherit
+  # another fixture's live lock across its clean-handoff/drop assertion.
+  run cargo test --locked -p yield-library --lib capacity_volume_owner -- --test-threads=1
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    run cargo test --locked -p yield-library --lib sqlite_linux
+  fi
   run cargo test --locked -p yield-library --test profile_admission
 fi
 
