@@ -19,21 +19,18 @@ On/Off value. Filled/empty circles and text colors show enabled/suspended states
 With enlarged text, the Type/Rating label sits above the chips so retaining
 choices does not squeeze the rating markers into undersized hit targets.
 
-Validation on the Linux development host: all 184 yield-core tests passed,
-including independent family intersections, collection counts, disabled-choice
-edits, and replacement-data restoration. Native macOS AX, keyboard/pointer,
-constrained-layout and exact-head local CI acceptance must still run on macOS.
-The ordinary Linux UI check is blocked by existing recovery-reserve dead-code
-lints under deny(warnings). A diagnostic UI check with `RUSTFLAGS='--cap-lints warn'`
-passed after correcting an unguarded macOS-only reserve check and completing
-existing Curation AX identifiers in the non-macOS stub. Those corrections
-preserve unsupported-platform behavior and do not provide native AX support.
-The diagnostic is type-check evidence only, not the required local CI gate.
-The focused GPUI handler test also passed with the same diagnostic lint setting;
-it verifies inactive-source rejection and retained drafts/choices after switching
-all three families off. This is a headless test, not native macOS acceptance.
-The enlarged-browser layout regression also passed with that lint setting,
-including the NAME control in toolbar viewport bounds.
+Validation on the Linux development host uses normal lint settings through
+`scripts/gpui-development-checks.sh test`; the app check, all core tests and
+focused GPUI family/layout fixtures pass. The full headless UI suite also passes.
+
+The lifecycle fixtures drive the real source projection retirement and scan
+installation routes. They verify that suspended choices survive retirement,
+inactive-source actions do nothing, and re-enable projects only replacement
+identities with current metadata. A recreated Browser receives a preference
+snapshot with persisted text scaling while its session-only Name/Type/Rating
+switches and choices return to defaults. This is constructor/preference-reload
+evidence, not an operating-system process restart or durable browser-preference
+claim. Native restart/AX acceptance remains in OPT-1954.
 
 ## Remaining macOS verification
 
