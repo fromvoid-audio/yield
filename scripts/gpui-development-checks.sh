@@ -22,12 +22,12 @@ run cargo check --locked -p yield
 
 if [[ "$scope" == "test" ]]; then
   run cargo test --locked -p yield-core --lib
-  run cargo test --locked -p yield-library --lib recovery_reserve
-  run cargo test --locked -p yield-library --lib capacity_reserve_namespace
-  run cargo test --locked -p yield-library --lib file_ops_journal::recovery_io
-  run cargo test --locked -p yield-library --test profile_admission
   run cargo test --locked -p yield-ui --lib filter_family::tests
   run cargo test --locked -p yield-ui --lib enlarged_browser_layout_keeps_toolbar_footer_and_columns_in_viewport
+  run cargo test --locked -p yield-library --lib capacity_reserve_namespace
+  run cargo test --locked -p yield-library --lib file_ops_journal::recovery_io
+  run cargo test --locked -p yield-library --lib recovery_reserve
+  run cargo test --locked -p yield-library --test profile_admission
 fi
 
 echo "[gpui-development] PASS head=$(git rev-parse HEAD) scope=$scope host=$(uname -s)"

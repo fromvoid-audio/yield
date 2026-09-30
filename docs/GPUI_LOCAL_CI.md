@@ -24,6 +24,11 @@ settings. It does not run native AX, Metal, FSEvents, audible or release checks,
 and does not replace the macOS local CI gate or claim Linux desktop support.
 Remaining native sessions are indexed in [OPT-1953](https://linear.app/boostnlvp/issue/OPT-1953),
 including new filter controls (OPT-1954) and target-gating regressions (OPT-1955).
+The Linux `test` scope currently reports a writable-storage compatibility failure
+tracked in [OPT-1957](https://linear.app/boostnlvp/issue/OPT-1957): SQLite's
+`SQLITE_OPEN_NOFOLLOW` rejects the retained `/proc/self/fd` directory alias.
+The development command retains those tests and their failure; it does not
+remove no-follow protection or turn compile success into storage acceptance.
 
 The full lane also runs the vendored GPUI Metal post-pass regression tests with
 its own locked manifest. Application tests do not run dependency unit tests.
