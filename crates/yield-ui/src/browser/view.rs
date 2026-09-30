@@ -2179,12 +2179,15 @@ impl Render for Browser {
                             .on_click(cx.listener(Self::random_audition_from_toolbar))
                             .child(random_audition::render_icon(random_color)),
                     )
-                    .child(super::filter_family::render(
-                        self,
-                        &theme,
-                        yield_core::BrowserFilterFamily::Name,
-                        cx,
-                    ))
+                    .child(
+                        super::filter_family::render(
+                            self,
+                            &theme,
+                            yield_core::BrowserFilterFamily::Name,
+                            cx,
+                        )
+                        .h(px(theme.spacing.control_height)),
+                    )
                     .child(
                         div()
                             .min_w(px(80.0))

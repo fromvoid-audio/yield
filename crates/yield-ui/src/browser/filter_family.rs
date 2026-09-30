@@ -46,7 +46,7 @@ pub(super) fn render(
         })
         .flex()
         .flex_none()
-        .h_full()
+        .h(px(theme.spacing.row_height))
         .items_center()
         .px(px(theme.spacing.control_gap))
         .cursor_pointer()

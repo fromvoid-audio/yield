@@ -27,3 +27,15 @@ passed after correcting an unguarded macOS-only reserve check and completing
 existing Curation AX identifiers in the non-macOS stub. Those corrections
 preserve unsupported-platform behavior and do not provide native AX support.
 The diagnostic is type-check evidence only, not the required local CI gate.
+
+## Remaining macOS verification
+
+Run `scripts/gpui-local-ci.sh full` at the PR's exact head. In an isolated profile,
+check Name/Type/Rating pointer and AX actions with representative WAVs, retained
+text/chips while disabled, combinations with Tags/Curation, refreshed metadata,
+source replacement, and focus when a selected row disappears. Check Default and
+200% text at a normal window and 960×560; the new NAME control must leave critical
+toolbar actions reachable. Record actual results and the exact build; then add
+Harvest's family control once its bounded facts/filter route exists. Restart
+fixtures must explicitly distinguish the existing session lifetime from durable
+preferences rather than infer persistence from a successful in-session toggle.

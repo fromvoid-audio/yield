@@ -36,11 +36,15 @@ use super::{Browser, catalog, tag_chips, tag_filter};
 const COMPACT_FILTER_LABEL_WIDTH: f32 = 82.0;
 const LATEST_CURATION_WINDOW: Duration = Duration::from_millis(40);
 
+fn compact_filter_label_width(theme: &Theme) -> f32 {
+    COMPACT_FILTER_LABEL_WIDTH * (theme.typography.small_size / 11.0).max(1.0)
+}
+
 fn compact_filter_chip_width(theme: &Theme, count: usize) -> f32 {
     let count = count.max(1) as f32;
     let available = theme.spacing.sidebar_width
         - theme.spacing.panel_padding * 2.0
-        - COMPACT_FILTER_LABEL_WIDTH
+        - compact_filter_label_width(theme)
         - theme.spacing.control_gap * count;
     (available / count).max(theme.spacing.border_width)
 }
@@ -74,7 +78,7 @@ where
                 .gap(px(theme.spacing.control_gap))
                 .child(
                     super::filter_family::render(browser, theme, family, cx)
-                        .w(px(COMPACT_FILTER_LABEL_WIDTH)),
+                        .w(px(compact_filter_label_width(theme))),
                 )
                 .child(
                     div()
