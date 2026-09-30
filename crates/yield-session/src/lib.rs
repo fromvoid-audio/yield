@@ -65,8 +65,11 @@ pub use maintenance::{
 pub use preferences::{
     AudioOutputPreferences, DEFAULT_RATING_DECAY_WEEKS, DEFAULT_TEXT_SCALE_PERCENT,
     ENLARGED_TEXT_SCALE_PERCENT, MAX_COLLECTION_NAME_BYTES, MAX_RATING_DECAY_WEEKS,
-    MIN_RATING_DECAY_WEEKS, PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
-    PreferenceRevision, UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
+    MAX_USER_SHADER_SOURCE_BYTES, MAX_VISUAL_EFFECT_STRENGTH_PERCENT, MIN_RATING_DECAY_WEEKS,
+    PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId, PreferenceRevision,
+    ShippedVisualEffectPreferences, ShippedVisualEffectPreset, UI_PREFERENCES_SCHEMA_VERSION,
+    USER_SHADER_CONTRACT_VERSION, UiPreferences, UserShaderPreferences,
+    user_shader_content_fingerprint,
 };
 use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};
 
@@ -4535,6 +4538,74 @@ mod tests {
         );
         assert_eq!(restored.theme_source_path, Some(source_path));
         reopened.shutdown().expect("reopen preference shutdown");
+    }
+
+    // The session owner requires the qualified physical reserve provider at bootstrap.
+    // Linux deliberately reports Unsupported; pure preference/receipt fixtures run there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn approved_user_shader_survives_profile_owner_shutdown_and_reopen() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+
+        let source = "@fragment fn post_fragment() -> vec4<f32> { return vec4<f32>(1.0); }";
+        let fingerprint =
+            user_shader_content_fingerprint(source).expect("source fingerprint for confirmation");
+        let patches = [
+            PreferencePatch::ImportUserShader {
+                source: source.to_owned(),
+            },
+            PreferencePatch::ApproveUserShader {
+                expected_fingerprint: fingerprint,
+            },
+            PreferencePatch::SetUserShaderEnabled(true),
+        ];
+        let mut saved_revision = 0;
+        for patch in patches {
+            let request = service
+                .patch_preferences(patch)
+                .expect("submit profile-owned shader command");
+            let applied = wait_for_preference_event(&service, |event| {
+                matches!(
+                    event,
+                    PreferenceEvent::RequestApplied { request: applied, .. }
+                        if *applied == request
+                )
+            });
+            if let PreferenceEvent::RequestApplied { revision, .. } = applied {
+                saved_revision = revision.get();
+            }
+        }
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() >= saved_revision),
+        );
+        service.shutdown().expect("owner flush and shutdown");
+
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let restored = wait_for_preference_snapshot(&reopened, |preferences| {
+            preferences.enabled_user_shader_source() == Some(source)
+        });
+        assert_eq!(restored.enabled_user_shader_source(), Some(source));
+        assert_eq!(
+            restored
+                .user_shader
+                .as_ref()
+                .and_then(|shader| shader.approved_fingerprint.as_deref()),
+            Some(
+                user_shader_content_fingerprint(source)
+                    .expect("recompute restored fingerprint")
+                    .as_str()
+            )
+        );
+        reopened.shutdown().expect("reopen owner shutdown");
     }
 
     #[test]

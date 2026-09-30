@@ -346,6 +346,12 @@ impl PreferenceState {
 }
 
 fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
+    if patch.is_user_shader_command() {
+        if let Ok(candidate) = patch.project(preferences) {
+            *preferences = candidate;
+        }
+        return;
+    }
     match patch {
         PreferencePatch::ReplaceTheme { theme, source_path } => {
             preferences.theme = theme.clone();
@@ -380,6 +386,14 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
                 *current = Some(name.clone());
             }
         }
+        PreferencePatch::SetShippedVisualEffect(effect) => {
+            preferences.shipped_visual_effect = *effect;
+        }
+        PreferencePatch::ImportUserShader { .. }
+        | PreferencePatch::ApproveUserShader { .. }
+        | PreferencePatch::SetUserShaderEnabled(_)
+        | PreferencePatch::RevokeUserShaderApproval
+        | PreferencePatch::ClearUserShader => {}
         PreferencePatch::Reset => *preferences = UiPreferences::default(),
     }
 }
