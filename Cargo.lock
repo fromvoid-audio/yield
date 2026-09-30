@@ -8829,6 +8829,7 @@ dependencies = [
  "yield-catalog",
  "yield-core",
  "yield-design",
+ "yield-issue-gateway",
  "yield-library",
  "yield-media",
  "yield-platform",

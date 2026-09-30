@@ -19,6 +19,7 @@ use super::column_layout::{BrowserColumn, ColumnGesture, DRAG_THRESHOLD, Resolve
 use super::context_menu;
 use super::curation;
 use super::display_labels;
+use super::feedback_issue;
 use super::file_drag;
 use super::metronome;
 use super::motion;
@@ -2694,6 +2695,9 @@ impl Render for Browser {
                     cx,
                 ))
             })
+            .when(self.feedback_issue.open, |element| {
+                element.child(feedback_issue::render(self, window.bounds().size, cx))
+            })
     }
 }
 
@@ -2712,6 +2716,38 @@ mod tests {
     use yield_media::WaveformPreview;
 
     use super::super::transport;
+
+    #[gpui::test]
+    fn shift_f1_opens_feedback_from_text_focus_and_escape_restores_focus(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                view.feedback_issue.use_test_service();
+                let search_focus = view.search_input.read(cx).focus_handle();
+                window.focus(&search_focus);
+                let held = KeyDownEvent {
+                    keystroke: Keystroke::parse("shift-f1").expect("Shift-F1"),
+                    is_held: true,
+                };
+                assert!(!view.handle_feedback_key(&held, window, cx));
+                assert!(!view.feedback_issue.open);
+                let press = KeyDownEvent {
+                    keystroke: Keystroke::parse("shift-f1").expect("Shift-F1"),
+                    is_held: false,
+                };
+                assert!(view.handle_feedback_key(&press, window, cx));
+                assert!(view.feedback_issue.open);
+                let escape = KeyDownEvent {
+                    keystroke: Keystroke::parse("escape").expect("Escape"),
+                    is_held: false,
+                };
+                assert!(view.handle_feedback_key(&escape, window, cx));
+                assert!(!view.feedback_issue.open);
+                assert!(search_focus.is_focused(window));
+            });
+        });
+    }
 
     fn inert_preview() -> WaveformPreview {
         WaveformPreview {

@@ -83,6 +83,7 @@ mod curation_queue;
 mod direct_random;
 mod directory_open;
 mod display_labels;
+mod feedback_issue;
 mod file_drag;
 mod folder_keyboard;
 mod general_settings;
@@ -482,6 +483,7 @@ pub(crate) struct Browser {
     general_settings: general_settings::GeneralSettings,
     audio_settings_open: bool,
     shortcut_help: shortcut_help::ShortcutHelpState,
+    feedback_issue: feedback_issue::FeedbackIssueState,
     audio_output_focus_handle: FocusHandle,
     audio_output_dropdown: Option<audio_output::AudioOutputDropdown>,
     audio_output_option_index: usize,
@@ -830,6 +832,7 @@ impl Browser {
             general_settings: general_settings::GeneralSettings::default(),
             audio_settings_open: false,
             shortcut_help: shortcut_help::ShortcutHelpState::new(cx),
+            feedback_issue: feedback_issue::FeedbackIssueState::new(cx),
             audio_output_focus_handle: cx.focus_handle(),
             audio_output_dropdown: None,
             audio_output_option_index: 0,
@@ -2749,6 +2752,9 @@ impl Browser {
         if key == "escape" && self.pane_resize_drag.is_some() {
             self.cancel_pane_resize(cx);
             cx.stop_propagation();
+            return;
+        }
+        if self.handle_feedback_key(event, window, cx) {
             return;
         }
         if self
