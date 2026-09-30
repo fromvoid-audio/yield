@@ -1036,23 +1036,16 @@ pub(crate) fn reconcile_scan_renames(
         .cloned()
         .collect::<HashSet<_>>();
     let persisted_candidates = if context.mode == ScanMode::Targeted {
-        let mut persisted = if db.has_pending_renames()? {
-            let (paths, overflow) =
-                db.list_recent_unretained_rename_destinations(TARGETED_RENAME_CANDIDATE_LIMIT)?;
-            if overflow {
-                return Err(ScanError::TargetedRenameCandidateOverflow {
-                    limit: TARGETED_RENAME_CANDIDATE_LIMIT,
-                });
-            }
-            paths.into_iter().collect::<HashSet<_>>()
-        } else {
-            HashSet::new()
-        };
-        for path in manifest_before
-            .iter()
-            .map(|entry| &entry.relative_path)
-            .chain(current_candidates.iter())
-        {
+        let relevant_pending = relevant_pending_paths(
+            db,
+            manifest_before
+                .iter()
+                .map(|entry| entry.relative_path.clone()),
+            &current_candidates,
+        )?;
+        let mut persisted =
+            recent_unretained_candidates_for_pending_paths(db, relevant_pending.iter().cloned())?;
+        for path in relevant_pending.iter().chain(current_candidates.iter()) {
             persisted.extend(db.list_retained_rename_destinations_for_pending_path(path)?);
         }
         persisted
@@ -1429,15 +1422,12 @@ fn extend_retained_rename_candidates(
 ) -> Result<(), ScanError> {
     let pending_paths = pending_paths.into_iter().collect::<HashSet<_>>();
     let has_pending_renames = db.has_pending_renames()?;
+    let pending_paths = relevant_pending_paths(db, pending_paths, candidates)?;
     if has_pending_renames {
-        let (paths, overflow) =
-            db.list_recent_unretained_rename_destinations(TARGETED_RENAME_CANDIDATE_LIMIT)?;
-        if overflow {
-            return Err(ScanError::TargetedRenameCandidateOverflow {
-                limit: TARGETED_RENAME_CANDIDATE_LIMIT,
-            });
-        }
-        candidates.extend(paths);
+        candidates.extend(recent_unretained_candidates_for_pending_paths(
+            db,
+            pending_paths.iter().cloned(),
+        )?);
     }
 
     let mut retained_match = false;
@@ -1458,6 +1448,64 @@ fn extend_retained_rename_candidates(
         candidates.extend(paths);
     }
     Ok(())
+}
+
+fn recent_unretained_candidates_for_pending_paths(
+    db: &SourceDatabase,
+    pending_paths: impl IntoIterator<Item = std::path::PathBuf>,
+) -> Result<HashSet<std::path::PathBuf>, ScanError> {
+    let mut candidates = HashSet::new();
+    for path in pending_paths.into_iter().collect::<HashSet<_>>() {
+        let remaining = TARGETED_RENAME_CANDIDATE_LIMIT.saturating_sub(candidates.len());
+        let (paths, overflow) =
+            db.list_recent_unretained_rename_destinations_for_pending_path(&path, remaining)?;
+        if overflow {
+            return Err(ScanError::TargetedRenameCandidateOverflow {
+                limit: TARGETED_RENAME_CANDIDATE_LIMIT,
+            });
+        }
+        candidates.extend(paths);
+    }
+    Ok(candidates)
+}
+
+fn relevant_pending_paths(
+    db: &SourceDatabase,
+    pending_paths: impl IntoIterator<Item = std::path::PathBuf>,
+    current_candidates: &HashSet<std::path::PathBuf>,
+) -> Result<HashSet<std::path::PathBuf>, ScanError> {
+    if !db.has_pending_renames()? {
+        return Ok(HashSet::new());
+    }
+    let mut relevant = HashSet::new();
+    for path in pending_paths.into_iter().collect::<HashSet<_>>() {
+        if db.has_pending_rename_for_path(&path)? {
+            relevant.insert(path);
+        }
+    }
+    if relevant.len() > TARGETED_RENAME_CANDIDATE_LIMIT {
+        return Err(ScanError::TargetedRenameCandidateOverflow {
+            limit: TARGETED_RENAME_CANDIDATE_LIMIT,
+        });
+    }
+    for destination in current_candidates {
+        let (paths, overflow) = db.list_pending_rename_paths_for_destination(
+            destination,
+            TARGETED_RENAME_CANDIDATE_LIMIT,
+        )?;
+        if overflow {
+            return Err(ScanError::TargetedRenameCandidateOverflow {
+                limit: TARGETED_RENAME_CANDIDATE_LIMIT,
+            });
+        }
+        relevant.extend(paths);
+        if relevant.len() > TARGETED_RENAME_CANDIDATE_LIMIT {
+            return Err(ScanError::TargetedRenameCandidateOverflow {
+                limit: TARGETED_RENAME_CANDIDATE_LIMIT,
+            });
+        }
+    }
+    Ok(relevant)
 }
 
 /// Complete a bounded batch of pending deep-content hashes without launching an unowned worker.
