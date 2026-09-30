@@ -16,6 +16,8 @@ Pointer and macOS AX actions share the same handler, which rejects actions
 without an active source, invalidates prepared file handoffs and reconciles
 selection and focus. Each new AX family control is a checkbox with an explicit
 On/Off value. Filled/empty circles and text colors show enabled/suspended states.
+With enlarged text, the Type/Rating label sits above the chips so retaining
+choices does not squeeze the rating markers into undersized hit targets.
 
 Validation on the Linux development host: all 184 yield-core tests passed,
 including independent family intersections, collection counts, disabled-choice
@@ -27,6 +29,11 @@ passed after correcting an unguarded macOS-only reserve check and completing
 existing Curation AX identifiers in the non-macOS stub. Those corrections
 preserve unsupported-platform behavior and do not provide native AX support.
 The diagnostic is type-check evidence only, not the required local CI gate.
+The focused GPUI handler test also passed with the same diagnostic lint setting;
+it verifies inactive-source rejection and retained drafts/choices after switching
+all three families off. This is a headless test, not native macOS acceptance.
+The enlarged-browser layout regression also passed with that lint setting,
+including the NAME control in toolbar viewport bounds.
 
 ## Remaining macOS verification
 

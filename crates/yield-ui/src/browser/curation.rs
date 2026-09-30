@@ -42,10 +42,15 @@ fn compact_filter_label_width(theme: &Theme) -> f32 {
 
 fn compact_filter_chip_width(theme: &Theme, count: usize) -> f32 {
     let count = count.max(1) as f32;
+    let stacked = theme.typography.small_size > 16.0;
     let available = theme.spacing.sidebar_width
         - theme.spacing.panel_padding * 2.0
-        - compact_filter_label_width(theme)
-        - theme.spacing.control_gap * count;
+        - if stacked {
+            0.0
+        } else {
+            compact_filter_label_width(theme)
+        }
+        - theme.spacing.control_gap * (count - if stacked { 1.0 } else { 0.0 });
     (available / count).max(theme.spacing.border_width)
 }
 
@@ -59,6 +64,7 @@ fn compact_filter_row<E>(
 where
     E: gpui::IntoElement,
 {
+    let stacked = theme.typography.small_size > 16.0;
     div()
         .flex()
         .flex_col()
@@ -74,11 +80,13 @@ where
                 .w_full()
                 .h(px(theme.spacing.row_height))
                 .items_center()
+                .when(stacked, |element| element.flex_col().h_auto().items_start())
                 .px(px(theme.spacing.panel_padding))
                 .gap(px(theme.spacing.control_gap))
                 .child(
                     super::filter_family::render(browser, theme, family, cx)
-                        .w(px(compact_filter_label_width(theme))),
+                        .w(px(compact_filter_label_width(theme)))
+                        .when(stacked, |element| element.w_full()),
                 )
                 .child(
                     div()
@@ -86,6 +94,9 @@ where
                         .flex_1()
                         .min_w_0()
                         .h_full()
+                        .when(stacked, |element| {
+                            element.flex_none().w_full().h(px(theme.spacing.row_height))
+                        })
                         .items_center()
                         .gap(px(theme.spacing.control_gap))
                         .children(controls),
