@@ -3846,6 +3846,7 @@ mod tests {
         let mut escaped_controls = Vec::new();
         for selector in [
             "browser-search-toolbar",
+            "browser-name-filter-toggle",
             "source-root-label",
             "audio-output-settings-toolbar",
             "reveal-toolbar",
