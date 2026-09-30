@@ -300,7 +300,7 @@ exceptions until they are routed or separately qualified.
 
 `python3 scripts/internal/check/check_source_db_competing_writers.py --inventory`
 prints the reviewed production open sites with source locations and roles. At this
-revision it reports 13 direct open calls:
+revision it reports 14 direct open calls:
 
 | Boundary | Direct calls | Disposition |
 | --- | ---: | --- |
@@ -308,7 +308,7 @@ revision it reports 13 direct open calls:
 | Path-only source compatibility | 4 | `SampleSource::open_db`, source-local recovery `open`, `scan_in_background`, and their low-level SQLite opener fail with `ProfileOwnershipRequired` before filesystem work in normal builds. Their callers still need typed owner routing. |
 | Retained-root SQLite helper | 2 | Mutually exclusive Linux VFS and other-platform branches in `BoundDatabaseRoot::open_sqlite`; one direct child, forced no-follow, retained directory lifetime and caller profile/file checks. Guarded source, lease-control, journal and global-library opens delegate here. |
 | Snapshot destination | 1 | Creates a new snapshot file under the source writer fence; not a second live-source connection. |
-| Source read-only opener | 1 | Legacy path-only read connection; lacks the owner-held no-sidecar-write proof. |
+| Source read-only openers | 2 | Legacy path-only low-level read connection and the bounded inactive-source tag preview's root-bound read role. Neither supplies the owner-held no-sidecar-write proof. |
 | Path-only global library opener | 1 | Legacy guarded compatibility connection, outside the physical source-data writer. |
 | Global-library read-only opener | 1 | Legacy observation outside the physical source-data writer. |
 | In-memory schema probe | 1 | In-memory connection only. |

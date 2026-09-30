@@ -3,6 +3,7 @@
 
 //! Profile-owned tag-definition mutation state.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
 
 use gpui::{AnyView, App, Context, Render, Window, div, prelude::*, px};
@@ -10,7 +11,9 @@ use yield_design::Theme;
 use yield_library::sample_sources::{
     ProfileTagCategory, ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularySetReceipt,
 };
-use yield_session::{VocabularyRequest, VocabularySubmitError};
+use yield_session::{
+    CatalogEvent, CatalogTagAssignmentPreview, VocabularyRequest, VocabularySubmitError,
+};
 
 use crate::theme::color;
 
@@ -21,15 +24,25 @@ use super::source_registry::SourceRegistryGlobal;
 pub(super) struct TagDictionaryState {
     pending: Option<DictionaryMutation>,
     last_removed: Option<LastRemovedDefinition>,
+    preview: Option<AssignmentPreviewState>,
 }
+
+static NEXT_PREVIEW_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 impl Default for TagDictionaryState {
     fn default() -> Self {
         Self {
             pending: None,
             last_removed: None,
+            preview: None,
         }
     }
+}
+
+enum AssignmentPreviewState {
+    Loading { request_id: u64, label: String },
+    Ready(CatalogTagAssignmentPreview),
+    Failed { label: String, message: String },
 }
 
 enum DictionaryMutation {
@@ -70,7 +83,7 @@ impl Render for RemoveDefinitionTooltip {
             .border_color(color(theme.colors.border_emphasis))
             .text_size(px(theme.typography.small_size))
             .text_color(color(theme.colors.text_primary))
-            .child("Remove definition")
+            .child("Remove definition only · assignments stay")
     }
 }
 
@@ -80,6 +93,54 @@ pub(super) fn remove_definition_tooltip(_: &mut Window, cx: &mut App) -> AnyView
 }
 
 impl TagDictionaryState {
+    pub(super) fn has_preview(&self) -> bool {
+        self.preview.is_some()
+    }
+
+    pub(super) fn preview_pending(&self) -> bool {
+        matches!(
+            self.preview.as_ref(),
+            Some(AssignmentPreviewState::Loading { .. })
+        )
+    }
+
+    pub(super) fn next_preview_request_id(&self) -> u64 {
+        NEXT_PREVIEW_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(super) fn begin_preview(&mut self, request_id: u64, label: String) {
+        self.preview = Some(AssignmentPreviewState::Loading { request_id, label });
+    }
+
+    pub(super) fn close_preview(&mut self) {
+        self.preview = None;
+    }
+
+    fn accept_preview_event(&mut self, event: &CatalogEvent) -> bool {
+        let Some(AssignmentPreviewState::Loading { request_id, label }) = self.preview.as_ref()
+        else {
+            return false;
+        };
+        let replacement = match event {
+            CatalogEvent::TagAssignmentPreviewReady {
+                request_id: event_id,
+                preview,
+            } if event_id == request_id && preview.label == *label => {
+                AssignmentPreviewState::Ready(preview.clone())
+            }
+            CatalogEvent::TagAssignmentPreviewFailed {
+                request_id: event_id,
+                error,
+            } if event_id == request_id => AssignmentPreviewState::Failed {
+                label: label.clone(),
+                message: error.to_string(),
+            },
+            _ => return false,
+        };
+        self.preview = Some(replacement);
+        true
+    }
+
     pub(super) fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
@@ -148,6 +209,112 @@ impl TagDictionaryState {
         self.last_removed = None;
         DictionaryCompletion::Restored
     }
+}
+
+pub(super) fn apply_preview_event(browser: &mut Browser, event: &CatalogEvent) -> bool {
+    browser.tag_dictionary.accept_preview_event(event)
+}
+
+pub(super) fn render_preview(
+    browser: &Browser,
+    theme: Theme,
+    cx: &mut Context<Browser>,
+) -> impl gpui::IntoElement {
+    let title = match browser.tag_dictionary.preview.as_ref() {
+        Some(AssignmentPreviewState::Loading { label, .. })
+        | Some(AssignmentPreviewState::Failed { label, .. }) => label.clone(),
+        Some(AssignmentPreviewState::Ready(preview)) => preview.label.clone(),
+        None => String::new(),
+    };
+    let close = div()
+        .id("tag-assignment-preview-close")
+        .cursor_pointer()
+        .text_color(color(theme.colors.text_muted))
+        .on_click(cx.listener(|view, _, _, cx| {
+            view.tag_dictionary.close_preview();
+            super::tag_library::invalidate(view);
+            view.start_source_registry_poll(cx);
+            cx.notify();
+        }))
+        .child("Close");
+    let body = match browser.tag_dictionary.preview.as_ref() {
+        Some(AssignmentPreviewState::Loading { .. }) => div()
+            .child("Reading affected assignments…")
+            .into_any_element(),
+        Some(AssignmentPreviewState::Failed { message, .. }) => div()
+            .text_color(color(theme.colors.warning))
+            .child(format!("Preview unavailable: {message}"))
+            .into_any_element(),
+        Some(AssignmentPreviewState::Ready(preview)) => {
+            let sources = preview
+                .affected_sources
+                .iter()
+                .map(|source| {
+                    let source_label = browser
+                        .source_sessions
+                        .iter()
+                        .find(|session| session.source_id.as_ref() == Some(&source.source_id))
+                        .map(|session| session.label.clone())
+                        .unwrap_or_else(|| source.source_id.to_string());
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(theme.spacing.control_gap))
+                        .child(format!(
+                            "{source_label} · {} assignments",
+                            source.paths.len()
+                        ))
+                        .children(source.paths.iter().map(|path| {
+                            div()
+                                .pl(px(theme.spacing.control_gap))
+                                .text_color(color(theme.colors.text_muted))
+                                .child(path.display().to_string())
+                        }))
+                })
+                .collect::<Vec<_>>();
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(theme.spacing.control_gap))
+                .child(format!(
+                    "{} assignments in {} of {} sources",
+                    preview.total_assignments,
+                    preview.affected_sources.len(),
+                    preview.checked_sources
+                ))
+                .child("Preview only · assignment-wide changes are not available yet")
+                .children(sources)
+                .into_any_element()
+        }
+        None => div().into_any_element(),
+    };
+    div()
+        .id("tag-assignment-preview")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .gap(px(theme.spacing.control_gap))
+        .p(px(theme.spacing.panel_padding))
+        .text_size(px(theme.typography.small_size))
+        .text_color(color(theme.colors.text_primary))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .child(format!("Assignments: {title}"))
+                .child(div().flex_1())
+                .child(close),
+        )
+        .child(
+            div()
+                .id("tag-assignment-preview-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(body),
+        )
 }
 
 /// Render the explicit undo control for the most recent successful removal.
@@ -279,10 +446,64 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DictionaryCompletion, LastRemovedDefinition, TagDictionaryState};
+    use std::path::PathBuf;
+
+    use super::{
+        AssignmentPreviewState, DictionaryCompletion, LastRemovedDefinition, TagDictionaryState,
+    };
+    use yield_library::sample_sources::SourceId;
+    use yield_library::sample_sources::reconciliation::RootIdentity;
     use yield_library::sample_sources::{
         ProfileTagCategory, ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyEntry,
     };
+    use yield_session::{
+        CatalogEvent, CatalogTagAssignmentPreview, CatalogTagAssignmentPreviewSource,
+    };
+
+    #[test]
+    fn affected_assignment_preview_ignores_stale_events_and_remains_immutable_until_closed() {
+        let mut state = TagDictionaryState::default();
+        state.begin_preview(42, String::from("shared"));
+        let preview = CatalogTagAssignmentPreview {
+            label: String::from("shared"),
+            checked_sources: 2,
+            affected_sources: vec![CatalogTagAssignmentPreviewSource {
+                source_id: SourceId::from_string("first"),
+                lifecycle_generation: 7,
+                root_identity: RootIdentity::from_bytes(vec![1; 16]),
+                revision: 9,
+                paths: vec![PathBuf::from("one.wav"), PathBuf::from("two.wav")],
+            }],
+            total_assignments: 2,
+        };
+        assert!(
+            !state.accept_preview_event(&CatalogEvent::TagAssignmentPreviewReady {
+                request_id: 41,
+                preview: preview.clone(),
+            })
+        );
+        assert!(state.preview_pending());
+        assert!(
+            state.accept_preview_event(&CatalogEvent::TagAssignmentPreviewReady {
+                request_id: 42,
+                preview: preview.clone(),
+            })
+        );
+        assert!(
+            !state.accept_preview_event(&CatalogEvent::TagAssignmentPreviewReady {
+                request_id: 42,
+                preview: CatalogTagAssignmentPreview {
+                    total_assignments: 0,
+                    ..preview.clone()
+                },
+            })
+        );
+        assert!(
+            matches!(state.preview.as_ref(), Some(AssignmentPreviewState::Ready(ready)) if *ready == preview)
+        );
+        state.close_preview();
+        assert!(!state.has_preview());
+    }
 
     #[test]
     fn successful_removal_keeps_only_the_latest_bounded_beforeimage() {
