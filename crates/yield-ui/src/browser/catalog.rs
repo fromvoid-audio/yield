@@ -440,6 +440,7 @@ impl Browser {
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
+                self.tag_dictionary.close_preview();
                 self.display_labels.cancel_for_source_change();
                 self.cancel_catalog_projection();
                 self.reset_catalog_metadata();
@@ -605,6 +606,15 @@ impl Browser {
         }
         if matches!(
             &event,
+            CatalogEvent::TagAssignmentPreviewReady { .. }
+                | CatalogEvent::TagAssignmentPreviewFailed { .. }
+        ) && super::tag_dictionary::apply_preview_event(self, &event)
+        {
+            cx.notify();
+            return true;
+        }
+        if matches!(
+            &event,
             CatalogEvent::DisplayLabelsReady { .. } | CatalogEvent::DisplayLabelsFailed { .. }
         ) && self.apply_display_labels_event(&event)
         {
@@ -749,6 +759,10 @@ impl Browser {
             | CatalogEvent::CurationOperationCompleted { .. }
             | CatalogEvent::TagPageReady { .. }
             | CatalogEvent::TagPageFailed { .. }
+            | CatalogEvent::TagAssignmentsReady { .. }
+            | CatalogEvent::TagAssignmentsFailed { .. }
+            | CatalogEvent::TagAssignmentPreviewReady { .. }
+            | CatalogEvent::TagAssignmentPreviewFailed { .. }
             | CatalogEvent::TagFilterReady { .. }
             | CatalogEvent::TagFilterFailed { .. }
             | CatalogEvent::DisplayLabelsReady { .. }
@@ -1121,6 +1135,16 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             lifecycle_generation,
             ..
         }
+        | CatalogEvent::TagAssignmentsReady {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::TagAssignmentsFailed {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
         | CatalogEvent::TagFilterReady {
             source_id,
             lifecycle_generation,
@@ -1181,7 +1205,10 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             lifecycle_generation: Some(lifecycle_generation),
             ..
         } => Some((source_id.clone(), *lifecycle_generation)),
-        CatalogEvent::Failed { .. } | CatalogEvent::Closed => None,
+        CatalogEvent::TagAssignmentPreviewReady { .. }
+        | CatalogEvent::TagAssignmentPreviewFailed { .. }
+        | CatalogEvent::Failed { .. }
+        | CatalogEvent::Closed => None,
     }
 }
 

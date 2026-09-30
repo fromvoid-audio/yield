@@ -259,6 +259,7 @@ pub(super) fn toggle(browser: &mut Browser, cx: &mut Context<Browser>) {
         browser.start_source_registry_poll(cx);
     } else {
         browser.tag_library.clear_visible_work();
+        browser.tag_dictionary.close_preview();
     }
     cx.notify();
 }
@@ -309,6 +310,7 @@ pub(super) fn cancel_for_source_change(browser: &mut Browser) {
 pub(super) fn has_pending(browser: &Browser) -> bool {
     let state = &browser.tag_library;
     browser.tag_dictionary.has_pending()
+        || browser.tag_dictionary.preview_pending()
         || state.category_pending.is_some()
         || (state.open
             && (state.source_pending.is_some()
@@ -1463,10 +1465,20 @@ pub(super) fn render(
         .child("TAG EDITOR")
         .child(div().flex_1())
         .child(close_button(theme.clone(), cx));
-    let editor = super::tags::render(browser, theme.clone(), cx).into_any_element();
-    let selected = super::tag_chips::render(browser, theme.clone(), cx).into_any_element();
-    let body = render_categories(browser, theme.clone(), cx).into_any_element();
-    let controls = render_page_controls(browser, theme.clone(), cx).into_any_element();
+    let content = if browser.tag_dictionary.has_preview() {
+        super::tag_dictionary::render_preview(browser, theme.clone(), cx).into_any_element()
+    } else {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(super::tags::render(browser, theme.clone(), cx))
+            .child(super::tag_chips::render(browser, theme.clone(), cx))
+            .child(render_categories(browser, theme.clone(), cx))
+            .child(render_page_controls(browser, theme.clone(), cx))
+            .into_any_element()
+    };
     let status = browser.tag_library.message.clone().map(|message| {
         div()
             .flex_none()
@@ -1495,10 +1507,7 @@ pub(super) fn render(
             theme.clone(),
             cx,
         ))
-        .child(editor)
-        .child(selected)
-        .child(body)
-        .child(controls)
+        .child(content)
         .children(status)
 }
 
@@ -1719,6 +1728,44 @@ fn render_candidate(
     let pressed = color(theme.interaction.pressed_fill);
     let remove_pending =
         browser.tag_dictionary.has_pending() || browser.tag_library.category_pending.is_some();
+    let preview_button = removal_target.as_ref().map(|target| {
+        let preview_token = token.clone();
+        let preview_target = target.clone();
+        div()
+            .id(("tag-library-preview-assignments", index))
+            .flex_none()
+            .px(px(theme.spacing.row_padding_x))
+            .h(px(theme.spacing.control_height))
+            .flex()
+            .items_center()
+            .text_size(px(theme.typography.small_size))
+            .text_color(color(if remove_pending {
+                theme.colors.text_disabled
+            } else {
+                theme.colors.text_muted
+            }))
+            .when(!remove_pending, |element| {
+                element
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .active(move |style| style.bg(pressed))
+            })
+            .on_click(cx.listener(move |view, _, _, cx| {
+                cx.stop_propagation();
+                if !remove_pending {
+                    view.preview_tag_library_assignments(
+                        index,
+                        preview_token.clone(),
+                        generation,
+                        epoch,
+                        profile_revision,
+                        preview_target.clone(),
+                        cx,
+                    );
+                }
+            }))
+            .child("Preview")
+    });
     let remove_button = removal_target.map(|target| {
         let remove_enabled = !remove_pending;
         let remove_token = token.clone();
@@ -1819,6 +1866,7 @@ fn render_candidate(
                 .text_color(color(theme.colors.text_muted))
                 .child(assignment),
         )
+        .children(preview_button)
         .children(remove_button)
 }
 
@@ -2179,6 +2227,79 @@ impl Browser {
             }
             Err(error) => {
                 self.tag_library.message = Some(format!("Could not save tag category: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Capture a complete affected-assignment snapshot for one fenced dictionary row.
+    pub(super) fn preview_tag_library_assignments(
+        &mut self,
+        index: usize,
+        token: CandidateToken,
+        generation: u64,
+        epoch: u64,
+        profile_revision: Option<u64>,
+        expected: DefinitionRemovalTarget,
+        cx: &mut Context<Browser>,
+    ) {
+        if self.tag_dictionary.has_pending() || self.tag_library.category_pending.is_some() {
+            self.tag_library.message = Some(String::from("Tag dictionary write is still pending"));
+            cx.notify();
+            return;
+        }
+        if self.tag_library.generation != generation
+            || self.tag_library.pager.page_epoch != epoch
+            || self.tag_library.profile_revision != profile_revision
+            || self
+                .tag_library
+                .pager
+                .merged_page
+                .get(index)
+                .map(MergedCandidate::token)
+                != Some(token.clone())
+        {
+            self.tag_library.message = Some(String::from("Tag row changed; refresh and try again"));
+            self.tag_library.mark_dirty();
+            self.start_source_registry_poll(cx);
+            cx.notify();
+            return;
+        }
+        let Some(candidate) = self.tag_library.pager.merged_page.get(index) else {
+            return;
+        };
+        if definition_removal_target(
+            candidate,
+            &self.tag_library.profile_categories,
+            self.tag_library.profile_lookup_state,
+        ) != Some(expected.clone())
+        {
+            self.tag_library.message = Some(String::from(
+                "Tag definition changed; refresh and try again",
+            ));
+            cx.notify();
+            return;
+        }
+        let request_id = self.tag_dictionary.next_preview_request_id();
+        match catalog::submit_catalog_command(
+            CatalogCommand::RequestTagAssignmentPreview {
+                request_id,
+                label: expected.label.clone(),
+                expected_source_ids: self
+                    .source_sessions
+                    .iter()
+                    .filter_map(|session| session.source_id.clone())
+                    .collect(),
+            },
+            cx,
+        ) {
+            Ok(()) => {
+                self.tag_dictionary
+                    .begin_preview(request_id, expected.label);
+                self.start_source_registry_poll(cx);
+            }
+            Err(error) => {
+                self.tag_library.message = Some(format!("Could not preview assignments: {error}"));
             }
         }
         cx.notify();
