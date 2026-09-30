@@ -18,6 +18,7 @@ yield-core.workspace = true
 yield-design.workspace = true
 yield-media.workspace = true
 yield-library.workspace = true
+yield-issue-gateway = { path = "../yield-issue-gateway" }
 yield-session.workspace = true
 yield-platform.workspace = true
 
