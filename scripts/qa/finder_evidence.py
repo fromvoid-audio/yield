@@ -59,6 +59,8 @@ def integer(value):
 
 
 def fixture_rows(data):
+    if len(data) > 8192:
+        raise ValueError("fixture exceeded byte limit")
     rows = []
     for line in data.decode("utf-8").splitlines():
         if not line or line.startswith("#"):
@@ -76,6 +78,11 @@ def fixture_rows(data):
             raise ValueError("fixture cursors must advance")
         if flags not in {"created-file", "renamed-file", "removed-file", "unknown-event"}:
             raise ValueError("unknown fixture event shape")
+        expected_flags = {"create": "created-file", "duplicate": "created-file",
+                          "rename": "renamed-file", "reparent": "renamed-file",
+                          "delete": "removed-file", "unsupported": "unknown-event"}
+        if flags != expected_flags[action] or (relative == "-") != (action == "unsupported"):
+            raise ValueError("fixture action and disposition disagree")
         for locator in (volume_path, relative):
             if locator == "-":
                 continue
@@ -113,7 +120,7 @@ def validate_record(record):
     integer(stream["device"])
     if stream["matched"] is not True:
         raise ValueError("invalid stream match")
-    if record["lifecycle_generation"] != 7 or integer(record["watcher_generation"]) == 0:
+    if integer(record["lifecycle_generation"]) != 7 or integer(record["watcher_generation"]) == 0:
         raise ValueError("invalid model generation fence")
     if record["restart"] != "actual_profile_sqlite_reopen_before_case" or record["native_fsevents"] != "blocked_not_exercised_synthetic_fixture_only" or record["native_ui"] != "blocked_all_UI_controls_paused":
         raise ValueError("existing synthetic records cannot claim native acceptance")
@@ -151,6 +158,8 @@ def validate_record(record):
 
 
 def parse_records(data):
+    if len(data) > MAX_INPUT_BYTES:
+        raise ValueError("input exceeded byte limit")
     records = []
     for line in data.decode("utf-8").splitlines():
         if not line.startswith(PREFIX):
