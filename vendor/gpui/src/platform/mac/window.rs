@@ -1475,8 +1475,24 @@ impl PlatformWindow for MacWindow {
     }
 
     #[cfg(not(feature = "macos-blade"))]
-    fn set_post_shader(&self, source: Option<&str>) -> Result<(), String> {
-        self.0.lock().renderer.set_post_shader(source)
+    fn set_post_shaders(&self, sources: &[&str]) -> Result<(), crate::PostShaderError> {
+        self.0.lock().renderer.set_post_shaders(sources)
+    }
+
+    #[cfg(not(feature = "macos-blade"))]
+    fn post_shader_compiler(&self) -> Result<crate::PostShaderCompiler, crate::PostShaderError> {
+        Ok(self.0.lock().renderer.post_shader_compiler())
+    }
+
+    #[cfg(not(feature = "macos-blade"))]
+    fn install_prepared_post_shader_chain(
+        &self,
+        prepared: crate::PreparedPostShaderChain,
+    ) -> Result<(), crate::PostShaderError> {
+        self.0
+            .lock()
+            .renderer
+            .install_prepared_post_shader_chain(prepared)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

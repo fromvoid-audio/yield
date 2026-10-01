@@ -1,5 +1,8 @@
 use super::metal_atlas::MetalAtlas;
-use super::post_shader::{self, PostShader};
+use super::post_shader::{self, MetalPostShaderCompiler, PostShader, PreparedMetalPostShaderChain};
+use crate::platform::{
+    MAX_POST_SHADER_PASSES, PostShaderCompiler, PostShaderError, PreparedPostShaderChain,
+};
 use crate::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
     Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
@@ -99,6 +102,7 @@ impl InstanceBufferPool {
 
 pub(crate) struct MetalRenderer {
     device: metal::Device,
+    renderer_identity: Arc<()>,
     layer: metal::MetalLayer,
     presents_with_transaction: bool,
     command_queue: CommandQueue,
@@ -118,8 +122,9 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
-    post_shader: Option<PostShader>,
-    post_target: Option<metal::Texture>,
+    post_shaders: Vec<PostShader>,
+    post_scene_target: Option<metal::Texture>,
+    post_targets: Vec<metal::Texture>,
 }
 
 #[repr(C)]
@@ -141,6 +146,7 @@ impl MetalRenderer {
             log::error!("unable to access a compatible graphics device");
             std::process::exit(1);
         };
+        let renderer_identity = Arc::new(());
 
         let layer = metal::MetalLayer::new();
         layer.set_device(&device);
@@ -259,6 +265,7 @@ impl MetalRenderer {
 
         Self {
             device,
+            renderer_identity,
             layer,
             presents_with_transaction: false,
             command_queue,
@@ -277,55 +284,115 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
-            post_shader: None,
-            post_target: None,
+            post_shaders: Vec::new(),
+            post_scene_target: None,
+            post_targets: Vec::new(),
         }
     }
 
-    /// A rejected post-pass restores the normal compositor.
-    pub fn set_post_shader(&mut self, source: Option<&str>) -> Result<(), String> {
-        let candidate = source
-            .map(|source| PostShader::compile(&self.device, source))
-            .transpose();
-        self.post_shader = None;
-        match candidate {
-            Ok(shader) => self.post_shader = shader,
-            Err(error) => {
-                self.post_target = None;
-                return Err(error);
+    /// A rejected chain replacement restores the normal compositor.
+    pub fn set_post_shaders(&mut self, sources: &[&str]) -> Result<(), PostShaderError> {
+        self.post_shaders.clear();
+        self.post_scene_target = None;
+        self.post_targets.clear();
+        if sources.is_empty() {
+            return Ok(());
+        }
+        if sources.len() > MAX_POST_SHADER_PASSES {
+            return Err(PostShaderError::TooManyPasses {
+                requested: sources.len(),
+                maximum: MAX_POST_SHADER_PASSES,
+            });
+        }
+        let mut shaders = Vec::with_capacity(sources.len());
+        for source in sources {
+            match PostShader::compile(&self.device, source) {
+                Ok(shader) => shaders.push(shader),
+                Err(error) => return Err(PostShaderError::Compile(error)),
             }
         }
-        if self.post_shader.is_none() {
-            self.post_target = None;
+        self.post_shaders = shaders;
+        Ok(())
+    }
+
+    pub(crate) fn post_shader_compiler(&self) -> PostShaderCompiler {
+        PostShaderCompiler::new(MetalPostShaderCompiler {
+            device: self.device.clone(),
+            renderer_identity: self.renderer_identity.clone(),
+        })
+    }
+
+    pub(crate) fn install_prepared_post_shader_chain(
+        &mut self,
+        prepared: PreparedPostShaderChain,
+    ) -> Result<(), PostShaderError> {
+        let prepared = match prepared.downcast::<PreparedMetalPostShaderChain>() {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                self.disable_post_shaders();
+                return Err(PostShaderError::UnsupportedPlatform);
+            }
+        };
+        if prepared.device_id != self.device.registry_id()
+            || !Arc::ptr_eq(&prepared.renderer_identity, &self.renderer_identity)
+        {
+            self.disable_post_shaders();
+            return Err(PostShaderError::RendererMismatch);
         }
+        self.post_shaders = prepared.shaders;
+        self.post_scene_target = None;
+        self.post_targets.clear();
         Ok(())
     }
 
     /// Prepare an optional target; allocation failure disables the effect once
     /// and leaves this frame on the direct drawable path.
-    fn prepare_post_target(
+    fn prepare_post_targets(
         &mut self,
         width: u64,
         height: u64,
-        allocate: impl FnOnce(&metal::DeviceRef, u64, u64) -> Result<metal::Texture, String>,
-    ) -> Option<metal::Texture> {
-        self.post_shader.as_ref()?;
-        let needs_target = self
-            .post_target
+        mut allocate: impl FnMut(&metal::DeviceRef, u64, u64) -> Result<metal::Texture, String>,
+    ) -> Option<()> {
+        if self.post_shaders.is_empty() {
+            return None;
+        }
+        let scene_target_wrong_size = self
+            .post_scene_target
             .as_ref()
             .is_none_or(|target| target.width() != width || target.height() != height);
-        if needs_target {
+        if scene_target_wrong_size {
+            self.post_scene_target = None;
+            self.post_targets.clear();
+        }
+        if self.post_scene_target.is_none() {
             match allocate(&self.device, width, height) {
-                Ok(target) => self.post_target = Some(target),
+                Ok(target) => self.post_scene_target = Some(target),
                 Err(error) => {
+                    self.disable_post_shaders();
                     log::error!("visual post effect disabled: {error}");
-                    self.post_shader = None;
-                    self.post_target = None;
                     return None;
                 }
             }
         }
-        self.post_target.clone()
+        let intermediate_count = self.post_shaders.len().saturating_sub(1);
+        while self.post_targets.len() < intermediate_count {
+            match allocate(&self.device, width, height) {
+                Ok(target) => self.post_targets.push(target),
+                Err(error) => {
+                    self.disable_post_shaders();
+                    log::error!("visual post effect disabled: {error}");
+                    return None;
+                }
+            }
+        }
+        self.post_targets.truncate(intermediate_count);
+        Some(())
+    }
+
+    fn disable_post_shaders(&mut self) {
+        self.post_shaders.clear();
+        self.post_scene_target = None;
+        self.post_targets.clear();
     }
 
     pub fn layer(&self) -> &metal::MetalLayerRef {
@@ -418,35 +485,42 @@ impl MetalRenderer {
             return;
         };
 
-        let post_target = self.prepare_post_target(
+        let use_post_chain = self.prepare_post_targets(
             drawable.texture().width(),
             drawable.texture().height(),
             post_shader::new_target,
         );
-        let scene_target = post_target.as_deref().unwrap_or_else(|| drawable.texture());
+        // Clone the Objective-C texture handle so the mutable scene renderer
+        // can borrow `self` while writing into the prepared composed-image target.
+        let scene_target = use_post_chain
+            .is_some()
+            .then(|| self.post_scene_target.as_ref().unwrap().clone());
 
         loop {
             let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
 
-            let command_buffer =
-                self.draw_primitives(scene, &mut instance_buffer, scene_target, viewport_size);
+            let command_buffer = self.draw_primitives(
+                scene,
+                &mut instance_buffer,
+                scene_target
+                    .as_deref()
+                    .unwrap_or_else(|| drawable.texture()),
+                viewport_size,
+            );
 
             match command_buffer {
                 Ok(command_buffer) => {
-                    if let (Some(shader), Some(source)) = (&self.post_shader, &post_target) {
-                        let encoder = new_command_encoder(
+                    if use_post_chain.is_some() {
+                        encode_post_chain(
                             &command_buffer,
+                            &self.post_shaders,
+                            self.post_scene_target
+                                .as_deref()
+                                .expect("post chain scene target was prepared"),
+                            &self.post_targets,
                             drawable.texture(),
                             viewport_size,
-                            |attachment| {
-                                attachment.set_load_action(metal::MTLLoadAction::DontCare);
-                            },
                         );
-                        encoder.set_render_pipeline_state(&shader.pipeline);
-                        encoder.set_fragment_texture(0, Some(source));
-                        encoder.set_fragment_sampler_state(0, Some(&shader.sampler));
-                        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
-                        encoder.end_encoding();
                     }
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
@@ -1225,6 +1299,37 @@ impl MetalRenderer {
     }
 }
 
+fn encode_post_chain(
+    command_buffer: &metal::CommandBufferRef,
+    shaders: &[PostShader],
+    original: &metal::TextureRef,
+    intermediates: &[metal::Texture],
+    drawable: &metal::TextureRef,
+    viewport_size: Size<DevicePixels>,
+) {
+    for (index, shader) in shaders.iter().enumerate() {
+        let source = if index == 0 {
+            original
+        } else {
+            intermediates[index - 1].as_ref()
+        };
+        let target = if index + 1 == shaders.len() {
+            drawable
+        } else {
+            intermediates[index].as_ref()
+        };
+        let encoder = new_command_encoder(command_buffer, target, viewport_size, |attachment| {
+            attachment.set_load_action(metal::MTLLoadAction::DontCare)
+        });
+        encoder.set_render_pipeline_state(&shader.pipeline);
+        encoder.set_fragment_texture(0, Some(source));
+        encoder.set_fragment_sampler_state(0, Some(&shader.sampler));
+        encoder.set_fragment_texture(1, Some(original));
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
+    }
+}
+
 fn new_command_encoder<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     target: &'a metal::TextureRef,
@@ -1426,6 +1531,7 @@ pub struct SurfaceBounds {
 #[cfg(test)]
 mod post_pass_tests {
     use super::*;
+    use metal::{MTLOrigin, MTLRegion, MTLSize};
 
     const IDENTITY: &str = r#"
 @group(0) @binding(0) var screen: texture_2d<f32>;
@@ -1436,72 +1542,384 @@ fn post_fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
+    const SCALE_RED: &str = r#"
+@group(0) @binding(0) var screen: texture_2d<f32>;
+@group(0) @binding(1) var screen_sampler: sampler;
+@fragment
+fn post_fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let color = textureSample(screen, screen_sampler, uv);
+    return vec4<f32>(color.r * 0.5, color.g, color.b, color.a);
+}
+"#;
+
+    const ADD_RED: &str = r#"
+@group(0) @binding(0) var screen: texture_2d<f32>;
+@group(0) @binding(1) var screen_sampler: sampler;
+@fragment
+fn post_fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let color = textureSample(screen, screen_sampler, uv);
+    return vec4<f32>(color.r + 0.2, color.g, color.b, color.a);
+}
+"#;
+
+    const SCALE_AND_READ_ORIGINAL: &str = r#"
+@group(0) @binding(0) var screen: texture_2d<f32>;
+@group(0) @binding(1) var screen_sampler: sampler;
+@group(0) @binding(2) var composed: texture_2d<f32>;
+@fragment
+fn post_fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let prior = textureSample(screen, screen_sampler, uv);
+    let original = textureSample(composed, screen_sampler, uv);
+    return vec4<f32>(original.r, prior.r, 0.0, 1.0);
+}
+"#;
+
+    const ADD_HALF_RED: &str = r#"
+@group(0) @binding(0) var screen: texture_2d<f32>;
+@group(0) @binding(1) var screen_sampler: sampler;
+@fragment
+fn post_fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let color = textureSample(screen, screen_sampler, uv);
+    return vec4<f32>(color.r + 0.5, color.g, color.b, color.a);
+}
+"#;
+
     #[test]
-    fn post_pass_reuses_target_and_falls_back_after_resize_allocation_failure() {
+    fn post_chain_reuses_resizes_and_releases_targets_on_failure_or_disable() {
         objc::rc::autoreleasepool(|| {
             let mut renderer =
                 MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())));
             assert!(
                 renderer
-                    .prepare_post_target(8, 8, |_, _, _| {
+                    .prepare_post_targets(8, 8, |_, _, _| {
                         panic!("disabled pass must not allocate")
                     })
                     .is_none()
             );
-            renderer.set_post_shader(Some(IDENTITY)).unwrap();
-            let target = renderer
-                .prepare_post_target(8, 8, post_shader::new_target)
+            renderer
+                .set_post_shaders(&[IDENTITY, IDENTITY, IDENTITY])
                 .unwrap();
-            let cached = renderer
-                .prepare_post_target(8, 8, |_, _, _| {
+            renderer
+                .prepare_post_targets(8, 8, post_shader::new_target)
+                .unwrap();
+            let scene = renderer.post_scene_target.as_ref().unwrap().clone();
+            let targets = renderer.post_targets.clone();
+            renderer
+                .prepare_post_targets(8, 8, |_, _, _| {
                     panic!("unchanged drawable size must reuse the target")
                 })
                 .unwrap();
-            assert_eq!(target.as_ptr(), cached.as_ptr());
+            assert_eq!(
+                scene.as_ptr(),
+                renderer.post_scene_target.as_ref().unwrap().as_ptr()
+            );
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0].as_ptr(), renderer.post_targets[0].as_ptr());
+            assert_eq!(targets[1].as_ptr(), renderer.post_targets[1].as_ptr());
 
+            renderer
+                .prepare_post_targets(16, 8, post_shader::new_target)
+                .unwrap();
+            let resized_scene = renderer.post_scene_target.as_ref().unwrap();
+            let resized_targets = &renderer.post_targets;
+            assert_eq!((resized_scene.width(), resized_scene.height()), (16, 8));
+            assert!(
+                resized_targets
+                    .iter()
+                    .all(|target| target.width() == 16 && target.height() == 8)
+            );
+            assert_ne!(scene.as_ptr(), resized_scene.as_ptr());
+            assert_ne!(targets[0].as_ptr(), resized_targets[0].as_ptr());
+
+            let mut allocations = 0;
             assert!(
                 renderer
-                    .prepare_post_target(16, 8, |_, width, height| {
-                        assert_eq!((width, height), (16, 8));
-                        Err(String::from("injected Metal allocation failure"))
+                    .prepare_post_targets(24, 8, |device, width, height| {
+                        assert_eq!((width, height), (24, 8));
+                        allocations += 1;
+                        if allocations == 1 {
+                            post_shader::new_target(device, width, height)
+                        } else {
+                            Err(String::from(
+                                "injected intermediate Metal allocation failure",
+                            ))
+                        }
                     })
                     .is_none()
             );
-            assert!(renderer.post_shader.is_none());
-            assert!(renderer.post_target.is_none());
+            assert_eq!(
+                allocations, 2,
+                "one scene then one failed intermediate allocation"
+            );
+            assert!(renderer.post_shaders.is_empty());
+            assert!(renderer.post_scene_target.is_none());
+            assert!(renderer.post_targets.is_empty());
             assert!(
                 renderer
-                    .prepare_post_target(16, 8, |_, _, _| {
+                    .prepare_post_targets(24, 8, |_, _, _| {
                         panic!("failed optional effect must not retry every frame")
                     })
                     .is_none()
             );
 
-            // Explicit re-enable can recover, and disabling releases the cached target.
-            renderer.set_post_shader(Some(IDENTITY)).unwrap();
-            let resized = renderer
-                .prepare_post_target(16, 8, post_shader::new_target)
+            // Explicit re-enable can recover, and disable releases all cached targets.
+            renderer.set_post_shaders(&[IDENTITY, IDENTITY]).unwrap();
+            renderer
+                .prepare_post_targets(16, 8, post_shader::new_target)
                 .unwrap();
+            let resized = renderer.post_scene_target.as_ref().unwrap();
+            let resized_targets = &renderer.post_targets;
             assert_eq!((resized.width(), resized.height()), (16, 8));
-            renderer.set_post_shader(None).unwrap();
-            assert!(renderer.post_target.is_none());
+            assert_eq!(resized_targets.len(), 1);
+            renderer.set_post_shaders(&[]).unwrap();
+            assert!(renderer.post_scene_target.is_none());
+            assert!(renderer.post_targets.is_empty());
         });
     }
 
     #[test]
-    fn post_pass_invalid_replacement_restores_normal_compositor() {
+    fn post_chain_admission_and_invalid_replacement_clear_previous_effect() {
         objc::rc::autoreleasepool(|| {
             let mut renderer =
                 MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())));
-            renderer.set_post_shader(Some(IDENTITY)).unwrap();
+            renderer
+                .set_post_shaders(&[IDENTITY, IDENTITY, IDENTITY, IDENTITY])
+                .unwrap();
+            assert_eq!(renderer.post_shaders.len(), 4);
+            assert!(matches!(
+                renderer.set_post_shaders(&[IDENTITY; 5]),
+                Err(PostShaderError::TooManyPasses {
+                    requested: 5,
+                    maximum: 4
+                })
+            ));
+            assert!(renderer.post_shaders.is_empty());
+
+            renderer.set_post_shaders(&[IDENTITY]).unwrap();
+            assert_eq!(renderer.post_shaders.len(), 1);
             assert!(
                 renderer
-                    .prepare_post_target(8, 8, post_shader::new_target)
-                    .is_some()
+                    .set_post_shaders(&[IDENTITY, "not valid WGSL"])
+                    .is_err()
             );
-            assert!(renderer.set_post_shader(Some("not valid WGSL")).is_err());
-            assert!(renderer.post_shader.is_none());
-            assert!(renderer.post_target.is_none());
+            assert!(renderer.post_shaders.is_empty());
+            assert!(renderer.post_scene_target.is_none());
+            assert!(renderer.post_targets.is_empty());
+            // The original single-pass API retains its old diagnostic type and behavior.
+            assert!(renderer.set_post_shaders(&["not valid WGSL"]).is_err());
+        });
+    }
+
+    #[test]
+    fn prepared_chain_compiles_on_worker_installs_and_renders_pixels() {
+        objc::rc::autoreleasepool(|| {
+            fn assert_send<T: Send>() {}
+            assert_send::<PostShaderCompiler>();
+            assert_send::<PreparedPostShaderChain>();
+
+            let mut renderer =
+                MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())));
+            let compiler = renderer.post_shader_compiler();
+            let sources = vec![SCALE_RED.to_owned(), ADD_HALF_RED.to_owned()];
+            let prepared = std::thread::spawn(move || compiler.prepare_chain(&sources))
+                .join()
+                .expect("worker preparation completes")
+                .expect("valid chain compiles on worker");
+            renderer
+                .install_prepared_post_shader_chain(prepared)
+                .expect("the originating renderer accepts its prepared chain");
+            assert_eq!(renderer.post_shaders.len(), 2);
+
+            let pixel =
+                render_compiled_chain(&renderer.device, &renderer.post_shaders, [0, 0, 102, 255]);
+            assert!(
+                (pixel[2] as i16 - 179).abs() <= 2,
+                "prepared passes did not produce the ordered result: {pixel:?}"
+            );
+            assert_eq!(pixel[3], 255);
+        });
+    }
+
+    #[test]
+    fn prepared_chain_rejects_another_live_renderer_on_the_same_device() {
+        objc::rc::autoreleasepool(|| {
+            let origin = MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())));
+            let mut other = MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())));
+            assert_eq!(origin.device.registry_id(), other.device.registry_id());
+            other.set_post_shaders(&[IDENTITY]).unwrap();
+            other
+                .prepare_post_targets(8, 8, post_shader::new_target)
+                .unwrap();
+            let compiler = origin.post_shader_compiler();
+            let prepared =
+                std::thread::spawn(move || compiler.prepare_chain(&[IDENTITY.to_owned()]))
+                    .join()
+                    .unwrap()
+                    .unwrap();
+
+            assert_eq!(
+                other.install_prepared_post_shader_chain(prepared),
+                Err(PostShaderError::RendererMismatch)
+            );
+            assert!(other.post_shaders.is_empty());
+            assert!(other.post_scene_target.is_none());
+            assert!(other.post_targets.is_empty());
+        });
+    }
+
+    #[test]
+    fn retained_compiler_finishes_after_origin_drop_but_cannot_install_on_replacement() {
+        objc::rc::autoreleasepool(|| {
+            let compiler = {
+                let origin =
+                    MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())));
+                origin.post_shader_compiler()
+            };
+            let prepared =
+                std::thread::spawn(move || compiler.prepare_chain(&[IDENTITY.to_owned()]))
+                    .join()
+                    .expect("retained compiler survives origin renderer drop")
+                    .expect("worker compilation succeeds after origin drop");
+            let mut replacement =
+                MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())));
+
+            assert_eq!(
+                replacement.install_prepared_post_shader_chain(prepared),
+                Err(PostShaderError::RendererMismatch)
+            );
+            assert!(replacement.post_shaders.is_empty());
+        });
+    }
+
+    #[test]
+    fn failed_preparation_preserves_active_chain_and_enforces_cap() {
+        objc::rc::autoreleasepool(|| {
+            let mut renderer =
+                MetalRenderer::new(Arc::new(Mutex::new(InstanceBufferPool::default())));
+            renderer.set_post_shaders(&[IDENTITY]).unwrap();
+            let existing_pipeline = renderer.post_shaders[0].pipeline.as_ptr();
+            let compiler = renderer.post_shader_compiler();
+
+            let failed = std::thread::spawn(move || {
+                compiler.prepare_chain(&[IDENTITY.to_owned(), String::from("invalid WGSL")])
+            })
+            .join()
+            .unwrap();
+            assert!(matches!(failed, Err(PostShaderError::Compile(_))));
+            assert_eq!(renderer.post_shaders.len(), 1);
+            assert_eq!(
+                renderer.post_shaders[0].pipeline.as_ptr(),
+                existing_pipeline
+            );
+            assert!(matches!(
+                renderer
+                    .post_shader_compiler()
+                    .prepare_chain(&vec![String::new(); 5]),
+                Err(PostShaderError::TooManyPasses {
+                    requested: 5,
+                    maximum: MAX_POST_SHADER_PASSES
+                })
+            ));
+            assert_eq!(renderer.post_shaders.len(), 1);
+        });
+    }
+
+    fn readable_texture(device: &metal::DeviceRef, width: u64, height: u64) -> metal::Texture {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_texture_type(metal::MTLTextureType::D2);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_width(width);
+        descriptor.set_height(height);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        device.new_texture(&descriptor)
+    }
+
+    fn render_chain(sources: &[&str], bgra: [u8; 4]) -> [u8; 4] {
+        let device = metal::Device::system_default().expect("Metal device");
+        let shaders: Vec<_> = sources
+            .iter()
+            .map(|source| post_shader::PostShader::compile(&device, source).unwrap())
+            .collect();
+        render_compiled_chain(&device, &shaders, bgra)
+    }
+
+    fn render_compiled_chain(
+        device: &metal::DeviceRef,
+        shaders: &[PostShader],
+        bgra: [u8; 4],
+    ) -> [u8; 4] {
+        let original = readable_texture(&device, 1, 1);
+        original.replace_region(
+            MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            },
+            0,
+            bgra.as_ptr().cast(),
+            4,
+        );
+        let intermediates: Vec<_> = (1..shaders.len())
+            .map(|_| readable_texture(&device, 1, 1))
+            .collect();
+        let output = readable_texture(&device, 1, 1);
+        let queue = device.new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        encode_post_chain(
+            command_buffer,
+            shaders,
+            original.as_ref(),
+            &intermediates,
+            output.as_ref(),
+            size(DevicePixels(1), DevicePixels(1)),
+        );
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(
+            command_buffer.status(),
+            metal::MTLCommandBufferStatus::Completed
+        );
+        let mut pixel = [0u8; 4];
+        output.get_bytes(
+            pixel.as_mut_ptr().cast(),
+            4,
+            MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            },
+            0,
+        );
+        pixel
+    }
+
+    #[test]
+    fn post_chain_order_changes_rendered_pixel_output() {
+        objc::rc::autoreleasepool(|| {
+            let scale_then_add = render_chain(&[SCALE_RED, ADD_RED], [0, 0, 102, 255]);
+            let add_then_scale = render_chain(&[ADD_RED, SCALE_RED], [0, 0, 102, 255]);
+            assert!(
+                scale_then_add[2] > add_then_scale[2] + 20,
+                "{scale_then_add:?} vs {add_then_scale:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn post_chain_binding_two_samples_immutable_original_composition() {
+        objc::rc::autoreleasepool(|| {
+            let pixel = render_chain(&[ADD_HALF_RED, SCALE_AND_READ_ORIGINAL], [0, 0, 64, 255]);
+            // BGRA output: green is the prior pass (~0.75), red is original (~0.25).
+            assert!(pixel[1] > pixel[2] + 70, "{pixel:?}");
+            assert!((pixel[2] as i16 - 64).abs() < 12, "{pixel:?}");
         });
     }
 }

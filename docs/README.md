@@ -10,6 +10,10 @@ Machine-consumed check allowlists do not live here anymore. They now live under
 
 ## Canonical docs
 
+- [Visual WGSL effect contract](GPUI_VISUAL_EFFECT_CONTRACT.md)
+  - composed-window texture/pass ABI, approval and lifecycle boundaries, platform
+    capability and performance limits; native verification tracked separately
+
 - `docs/ENV_VARS.md`
   - environment variable reference, release lifecycle/operator commands, and
     safety notes
