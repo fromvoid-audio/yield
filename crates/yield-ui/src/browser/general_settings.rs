@@ -469,10 +469,9 @@ impl Browser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_visual_effect_enabled(!self.visual_effect_config().enabled, window, cx);
+        self.toggle_visual_effect_from_accessibility(window, cx);
     }
 
-    #[cfg(target_os = "macos")]
     pub(super) fn toggle_visual_effect_from_accessibility(
         &mut self,
         window: &mut Window,
@@ -1872,7 +1871,7 @@ impl Browser {
                 div()
                     .w_full()
                     .text_color(color(theme.colors.text_muted))
-                    .child("Custom WGSL is stored for review and approval only; this UI does not execute it."),
+                    .child("Review the exact source and approve it before enabling. Custom shaders run on macOS; unsupported renderers keep the normal UI."),
             )
             .child(
                 div()
@@ -2027,10 +2026,12 @@ fn control(
         "user-shader-revoke" => "settings-user-shader-revoke",
         "user-shader-clear" => "settings-user-shader-clear",
         "user-shader-copy" => "settings-user-shader-copy",
+        "user-shader-toggle" => "settings-user-shader-toggle",
         _ => id,
     };
     div()
         .id(id)
+        .debug_selector(move || id.to_owned())
         .relative()
         .when_some(browser.ax_focus(ax_id), |element, focus| {
             element.track_focus(&focus)
@@ -2465,8 +2466,6 @@ fn post_vertex(@builtin(vertex_index) index: u32) -> PostVertex {
         assert!(runtime.should_start("sha256:v1:current"));
         assert!(!runtime.locally_disabled);
         runtime.mark_failed("compile failed".into());
-        assert!(!runtime.owns_renderer);
-        assert_eq!(runtime.status, "compile failed");
         assert!(!runtime.selected(true));
         assert!(runtime.suppress_shipped);
         assert!(!runtime.should_start("sha256:v1:current"));

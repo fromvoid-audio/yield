@@ -5,17 +5,19 @@ pixels, not audio DSP, layout, focus, or input hit testing.
 
 ## Implementation and acceptance boundary
 
-This tree integrates the ordered renderer chain, shipped settings, content approval,
-source review, background preparation and custom activation from OPT-1941 through
-OPT-1949. The source candidate was preserved in PR #150 and reconciled with current
-main, including Linux development checks and existing preference model changes.
+This integration brings the staged OPT-1941–1949 visual controls, ordered Metal
+passes, source review and confirmed custom activation onto current main, preserving
+the newer feedback, filter and Linux storage changes. The profile preference and
+approval model was already integrated independently.
 
-Native macOS compilation, full CI and hands-on acceptance remain pending. OPT-1939/1940
-track native watcher registration qualification;
-[OPT-1978](https://linear.app/boostnlvp/issue/OPT-1978) tracks this integration’s
-exact-head macOS compilation and CI; OPT-1931 owns physical display,
-input, resize, fullscreen, idle, toggle and accessibility acceptance. Linux checks
-and focused model tests do not establish those checks or release acceptance.
+Linux can check the normal application build, preference/projection behavior,
+source import bounds, WGSL policy and generated shader validation. Linux cannot
+compile or execute the macOS Metal/AX paths. Native compilation, renderer tests,
+owned preference restart and physical display/input acceptance remain separate
+Linear verification work in [OPT-1974](https://linear.app/boostnlvp/issue/OPT-1974),
+under OPT-1953, and OPT-1931. Native full CI also retains
+the watcher registration blocker OPT-1939/1940. A source merge does not establish
+macOS release acceptance or Linux desktop support.
 
 ## Pass and texture semantics
 
@@ -136,8 +138,7 @@ The implementation uses pinned GPUI 0.2.2's macOS Metal backend, Naga 25.0.1,
 Metal 0.29 and MSL 2.3 translation with empty Naga capabilities. No Windows,
 Linux or `macos-blade` post-effect implementation is qualified here. Unsupported
 platform preparation APIs return Unsupported. Dependency package versions and
-sources must remain pinned; native GPUI changes still require macOS compilation
-and acceptance checks.
+sources remain pinned; native backend changes require the separate macOS checks.
 
 For N active passes, the renderer keeps one composed-UI target plus N-1
 intermediates: approximately `4 * physical_width * physical_height * N` bytes
@@ -165,7 +166,7 @@ Profile and caller definitions:
 [session preferences](../crates/yield-session/src/preferences.rs),
 [settings controls](../crates/yield-ui/src/browser/general_settings.rs), and
 [confirmation gate](../crates/yield-ui/src/browser/preferences.rs).
-The [custom runtime](../crates/yield-ui/src/browser/user_shader_runtime.rs) contains
-ABI-v1 policy validation and the preparation permit.
+[Custom source policy](../crates/yield-ui/src/browser/user_shader_runtime.rs)
+contains ABI-v1 validation and the preparation permit.
 Use [the validation guide](TEST.md) for check selection and
 [visual acceptance](GPUI_VISUAL_ACCEPTANCE.md) with OPT-1931 for hands-on evidence.

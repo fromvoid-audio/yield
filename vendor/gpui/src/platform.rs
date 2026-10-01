@@ -131,7 +131,7 @@ pub struct PostShaderCompiler {
 /// A compiled, opaque shader chain that can only be installed by its originating
 /// renderer. It does not grant approval or authorize shader execution by itself.
 pub struct PreparedPostShaderChain {
-    payload: Box<dyn Any + Send>,
+    _payload: Box<dyn Any + Send>,
 }
 
 pub(crate) trait PostShaderCompilerBackend: Send + Sync {
@@ -139,6 +139,7 @@ pub(crate) trait PostShaderCompilerBackend: Send + Sync {
 }
 
 impl PostShaderCompiler {
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn new(backend: impl PostShaderCompilerBackend + 'static) -> Self {
         Self {
             backend: Arc::new(backend),
@@ -162,15 +163,16 @@ impl PostShaderCompiler {
         }
         self.backend
             .prepare_chain(sources)
-            .map(|payload| PreparedPostShaderChain { payload })
+            .map(|payload| PreparedPostShaderChain { _payload: payload })
     }
 }
 
 impl PreparedPostShaderChain {
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn downcast<T: Any + Send>(self) -> Result<T, Self> {
-        match self.payload.downcast::<T>() {
+        match self._payload.downcast::<T>() {
             Ok(payload) => Ok(*payload),
-            Err(payload) => Err(Self { payload }),
+            Err(payload) => Err(Self { _payload: payload }),
         }
     }
 }

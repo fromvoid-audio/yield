@@ -129,7 +129,8 @@ impl PreferenceState {
 
     /// Return the settled profile snapshot only while its owner state is safe to review.
     pub(super) fn confirmed_snapshot(&self) -> Option<&UiPreferences> {
-        self.ready_for_maintenance().then_some(&self.baseline)
+        (self.ready_for_maintenance() && self.persisted_revision >= self.revision)
+            .then_some(&self.baseline)
     }
 
     pub(super) fn has_pending_user_shader_patch(&self) -> bool {
@@ -925,6 +926,23 @@ mod tests {
         assert!(state.ready_for_maintenance());
         state.load_failed(String::from("malformed"));
         assert!(!state.ready_for_maintenance());
+    }
+
+    #[test]
+    fn shader_snapshot_cannot_authorize_execution_ahead_of_persistence() {
+        let mut state = PreferenceState::new();
+        assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
+        // The owner may publish an applied snapshot before its save completes.
+        // An empty request list alone is not a persistence receipt.
+        state.revision = 7;
+        assert!(state.ready_for_maintenance());
+        assert!(state.confirmed_snapshot().is_none());
+        state.mark_persisted_for_test(6);
+        assert!(state.confirmed_snapshot().is_none());
+        state.mark_persisted_for_test(7);
+        assert!(state.confirmed_snapshot().is_some());
+        state.mark_closed();
+        assert!(state.confirmed_snapshot().is_none());
     }
 
     #[test]

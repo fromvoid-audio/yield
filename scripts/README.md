@@ -7,6 +7,36 @@ are deferred until the macOS release-ready gate OPT-1863 is complete.
 The older `scripts/ci.sh` lanes below still target the legacy Radiant app and
 are not GPUI acceptance gates.
 
+For a reproducible CPU waveform baseline (OPT-1713), use Python 3 on Linux or
+macOS in a clean checkout with the repository's Rust toolchain:
+
+```sh
+python3 scripts/internal/perf/gpui_baseline.py --out target/qa/baseline-1.json
+python3 scripts/internal/perf/gpui_baseline.py --out target/qa/baseline-2.json
+```
+
+The harness runs the existing ignored waveform geometry/cache benchmark once,
+with five measured cases: geometry, gain preview, and fade preview (the latter
+two at 2,048 and 65,536 input columns). Each capture includes the exact Git
+head/tree, Rust/Cargo versions, build profile/configuration hashes, constant-band
+fixture and source hash, CPU/memory identity, Linux affinity/cgroup limits, command,
+iteration counts, and total nanoseconds for misses and hits. Compare captures
+only when build, fixture, host and measurement configuration match; timing values
+will vary. `--profile release-local` selects the existing optimized local profile.
+Custom Rust flags, Cargo target/profile overrides, dirty checkouts and unidentified
+CPU hosts are blocked. Output paths must be new; keep reports under ignored
+`target/qa/`. Command failure, timeout, output flooding, zero matched tests, or
+missing/duplicate records cannot produce a captured result.
+
+`captured` means the CPU measurements were obtained, with no performance threshold
+or release verdict. Compilation time is excluded from those measurements. Native
+frame/input/idle-memory/audio acceptance is explicitly unsupported on Linux and
+unverified on macOS; rendering and GPU work are excluded on both. Large-source
+durable-owner evidence remains OPT-1683's separate workload, and the existing
+backend/perf scripts remain its entrypoints. Do not use this CPU capture to clear
+native or large-library gates. Harness regressions can be checked with
+`python3 -m unittest discover -s scripts/internal/perf -p test_gpui_baseline.py`.
+
 Top-level `scripts/` is intentionally small. `scripts/command-inventory.json`
 is the checked inventory for public entrypoints, compatibility wrappers, and
 dispatcher maps. These are the public entrypoints people should run directly:

@@ -4873,6 +4873,21 @@ mod tests {
     fn waveform_geometry_cache_benchmark() {
         use std::{hint::black_box, time::Instant};
 
+        fn report(
+            kind: &str,
+            inputs: usize,
+            width: usize,
+            misses: usize,
+            cold: std::time::Duration,
+            warm: std::time::Duration,
+        ) {
+            eprintln!(
+                "YIELD_BASELINE={{\"schema\":\"yield.waveform-geometry.v1\",\"kind\":\"{kind}\",\"input_columns\":{inputs},\"width_px\":{width},\"height_px\":180,\"miss_iterations\":{misses},\"hit_iterations\":100,\"miss_total_ns\":{},\"hit_total_ns\":{}}}",
+                cold.as_nanos(),
+                warm.as_nanos()
+            );
+        }
+
         let cache = WaveformRenderCache::default();
         let bands = vec![[0.5, 0.4, 0.3, 0.6]; 2_048];
         let bounds = test_bounds(640.0, 180.0);
@@ -4888,6 +4903,7 @@ mod tests {
         }
         let warm = warm_start.elapsed();
         eprintln!("waveform geometry: 100 misses {cold:?}; 100 hits {warm:?}");
+        report("geometry", 2_048, 640, 100, cold, warm);
 
         let selection = WaveformEditRegion::new(0.25, 0.75).expect("benchmark selection");
         for (preview_len, generation) in [(2_048, 200), (65_536, 300)] {
@@ -4932,6 +4948,7 @@ mod tests {
             eprintln!(
                 "gain preview {preview_len} inputs at 1120px: 8 distinct gains {cold:?}; 100 cache hits {warm:?}"
             );
+            report("gain", preview_len, 1_120, 8, cold, warm);
             let settings_for = |step| {
                 WaveformEditSettings::new(
                     1.0,
@@ -4973,6 +4990,7 @@ mod tests {
             eprintln!(
                 "fade preview {preview_len} inputs at 1120px: 8 distinct fades {cold:?}; 100 cache hits {warm:?}"
             );
+            report("fade", preview_len, 1_120, 8, cold, warm);
         }
     }
 }

@@ -10,10 +10,6 @@ Machine-consumed check allowlists do not live here anymore. They now live under
 
 ## Canonical docs
 
-- [Visual WGSL effect contract](GPUI_VISUAL_EFFECT_CONTRACT.md)
-  - composed-window texture/pass ABI, approval and lifecycle boundaries, platform
-    capability and performance limits; deferred native verification
-
 - `docs/ENV_VARS.md`
   - environment variable reference, release lifecycle/operator commands, and
     safety notes
@@ -31,6 +27,9 @@ Machine-consumed check allowlists do not live here anymore. They now live under
   - common failure modes, diagnostics, and guardrail-change workflow
 - `docs/book/src/`
   - public mdBook source for user-facing Yield documentation
+
+- [Visual WGSL effect contract](GPUI_VISUAL_EFFECT_CONTRACT.md)
+  - shipped presets, custom source approval, renderer lifetime and native verification limits
 
 ## Live operational files
 
