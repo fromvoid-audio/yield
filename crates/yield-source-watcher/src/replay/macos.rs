@@ -127,11 +127,21 @@ pub(super) fn record_callback_event(
                         .file_name()
                         .and_then(|name| name.to_str())
                         .is_some_and(|name| {
-                            ingress
-                                .spec
-                                .ignored_file_name_prefixes()
-                                .iter()
-                                .any(|prefix| name.starts_with(prefix))
+                            // Finder writes this exact metadata filename while browsing.
+                            // Only ignore a known file event: a directory with this name,
+                            // an audio filename beginning with it, or uncertain delivery
+                            // must still reach authoritative reconciliation.
+                            (name == ".DS_Store"
+                                && flags
+                                    & (fs::kFSEventStreamEventFlagItemCreated
+                                        | fs::kFSEventStreamEventFlagItemRemoved
+                                        | fs::kFSEventStreamEventFlagItemRenamed)
+                                    == 0)
+                                || ingress
+                                    .spec
+                                    .ignored_file_name_prefixes()
+                                    .iter()
+                                    .any(|prefix| name.starts_with(prefix))
                         })
             })
     {
@@ -191,9 +201,9 @@ mod tests {
     use yield_library::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
     use yield_library::sample_sources::db::DurableReplayUncertaintyState;
     use yield_library::sample_sources::reconciliation::{
-        BootstrapReplayEvidence, RawObservationLimits, ReconciliationAdmissionLimits,
-        ReconciliationAdmissionOwner, ReconciliationAdmissionSupervisor, RootIdentity,
-        WatcherGeneration,
+        AdapterDisposition, BootstrapReplayEvidence, RawObservationLimits,
+        ReconciliationAdmissionLimits, ReconciliationAdmissionOwner,
+        ReconciliationAdmissionSupervisor, RootIdentity, WatcherGeneration,
     };
     use yield_library::sample_sources::{
         SourceDatabase, SourceId, SourceWriter, SourceWriterError,
@@ -277,6 +287,80 @@ mod tests {
     }
 
     #[test]
+    fn finder_metadata_file_advances_cursor_without_reconciliation() {
+        let ingress = ingress();
+        record_callback_batch(
+            &ingress,
+            Path::new("/Volumes/Samples"),
+            &[MacosReplayEvent {
+                event_id: 108,
+                volume_relative_path: Path::new("Library/.DS_Store"),
+                flags: fs::kFSEventStreamEventFlagItemModified
+                    | fs::kFSEventStreamEventFlagItemIsFile,
+            }],
+        );
+        ingress.mark_history_complete();
+        let candidate = ingress.into_candidate();
+        assert!(candidate.events().is_empty());
+        assert_eq!(candidate.last_seen(), Some(108));
+        assert!(candidate.history_complete());
+        assert!(candidate.uncertainty().is_empty());
+    }
+
+    #[test]
+    fn finder_metadata_filter_preserves_audio_directories_and_uncertain_delivery() {
+        for (path, flags) in [
+            (
+                "Library/.DS_Store.wav",
+                fs::kFSEventStreamEventFlagItemIsFile,
+            ),
+            ("Library/.DS_Store", fs::kFSEventStreamEventFlagItemIsDir),
+            (
+                "Library/.DS_Store",
+                fs::kFSEventStreamEventFlagItemIsFile | fs::kFSEventStreamEventFlagItemCreated,
+            ),
+            (
+                "Library/.DS_Store",
+                fs::kFSEventStreamEventFlagItemIsFile | fs::kFSEventStreamEventFlagItemRemoved,
+            ),
+            (
+                "Library/.DS_Store",
+                fs::kFSEventStreamEventFlagItemIsFile | fs::kFSEventStreamEventFlagItemRenamed,
+            ),
+            ("Library/.DS_Store", 0),
+        ] {
+            let ingress = ingress();
+            record_callback_batch(
+                &ingress,
+                Path::new("/Volumes/Samples"),
+                &[MacosReplayEvent {
+                    event_id: 108,
+                    volume_relative_path: Path::new(path),
+                    flags: flags | fs::kFSEventStreamEventFlagItemModified,
+                }],
+            );
+            assert_eq!(ingress.into_candidate().events().len(), 1, "{path}");
+        }
+        let ingress = ingress();
+        record_callback_batch(
+            &ingress,
+            Path::new("/Volumes/Samples"),
+            &[MacosReplayEvent {
+                event_id: 108,
+                volume_relative_path: Path::new("Library/.DS_Store"),
+                flags: fs::kFSEventStreamEventFlagItemIsFile
+                    | fs::kFSEventStreamEventFlagUserDropped,
+            }],
+        );
+        assert!(
+            ingress
+                .into_candidate()
+                .uncertainty()
+                .contains(ReplayUncertainty::DELIVERY_LOST)
+        );
+    }
+
+    #[test]
     fn combined_drop_and_root_flags_remain_distinct_uncertainty() {
         let ingress = ingress();
         record_callback_batch(
@@ -307,6 +391,112 @@ mod tests {
                 .contains(ReplayUncertainty::MUST_SCAN_SUBDIRS)
         );
         assert!(candidate.events().is_empty());
+    }
+
+    #[test]
+    fn overflow_restart_and_scan_overlap_replays_request_a_current_source_audit() {
+        let cases = [
+            (
+                "overflow",
+                fs::kFSEventStreamEventFlagUserDropped
+                    | fs::kFSEventStreamEventFlagMustScanSubDirs
+                    | fs::kFSEventStreamEventFlagItemIsDir,
+                true,
+            ),
+            (
+                "restart-before-history-complete",
+                fs::kFSEventStreamEventFlagItemCreated | fs::kFSEventStreamEventFlagItemIsFile,
+                false,
+            ),
+            (
+                "scan-overlap-without-durable-prior",
+                fs::kFSEventStreamEventFlagItemCreated | fs::kFSEventStreamEventFlagItemIsFile,
+                true,
+            ),
+        ];
+        for (scenario, flags, history_complete) in cases {
+            let ingress = ReplayIngress::new(
+                SourceWatchSpec::new(
+                    SourceId::from_string("continuity-fixture-source"),
+                    7,
+                    PathBuf::from("/fixture-volume/Library"),
+                    Some(RootIdentity::from_bytes(
+                        b"continuity-fixture-root".to_vec(),
+                    )),
+                ),
+                17,
+                [7; 16],
+                100,
+            )
+            .expect("bounded replay ingress");
+            record_callback_batch(
+                &ingress,
+                Path::new("/fixture-volume"),
+                &[MacosReplayEvent {
+                    event_id: 101,
+                    volume_relative_path: Path::new("Library/kick.wav"),
+                    flags,
+                }],
+            );
+            if history_complete {
+                ingress.mark_history_complete();
+            }
+            let candidate = ingress.into_candidate();
+            if scenario == "overflow" {
+                assert!(
+                    candidate
+                        .uncertainty()
+                        .contains(ReplayUncertainty::DELIVERY_LOST)
+                );
+                assert!(
+                    candidate
+                        .uncertainty()
+                        .contains(ReplayUncertainty::MUST_SCAN_SUBDIRS)
+                );
+            }
+            let limits = ReconciliationAdmissionLimits::new(
+                1,
+                RawObservationLimits::new(8, 4096, 4096).expect("lane bound"),
+                RawObservationLimits::new(32, 16384, 16384).expect("global bound"),
+                8,
+                8,
+                8,
+            )
+            .expect("owner bounds");
+            let mut owner =
+                ReconciliationAdmissionOwner::new(ReconciliationAdmissionSupervisor::new(limits));
+            let lane = owner
+                .begin_source(
+                    candidate.source_id().clone(),
+                    candidate.root_identity().clone(),
+                )
+                .expect("current source lane");
+            let handoff = candidate
+                .into_observation_batch(7, lane.generation())
+                .expect("raw event or uncertainty reaches owner");
+            let (batch, continuous) = handoff.into_admission_parts();
+            assert_eq!(
+                continuous,
+                scenario == "scan-overlap-without-durable-prior",
+                "{scenario} continuity disposition"
+            );
+            let admitted = owner
+                .admit_replay_with_durable_prior(batch.clone(), None, continuous)
+                .expect("uncertain replay admission");
+            assert!(admitted.audit_request().is_some(), "{scenario}");
+            assert!(
+                owner.durable_audit_marker_for_replay(&admitted).is_some(),
+                "{scenario} must retain a durable source-wide barrier"
+            );
+            let repeated = owner
+                .admit_replay_with_durable_prior(batch, None, continuous)
+                .expect("duplicate replay admission");
+            assert_eq!(
+                repeated.admission().disposition(),
+                AdapterDisposition::DuplicateSuppressed,
+                "{scenario} duplicate must not dispatch another audit"
+            );
+        }
     }
 
     #[test]
@@ -446,12 +636,22 @@ mod tests {
             let (batch, continuous) = handoff.into_admission_parts();
             assert_eq!(continuous, action != "unsupported", "{action}");
             let admission = owner
-                .admit_replay_with_durable_prior(batch, None, continuous)
+                .admit_replay_with_durable_prior(batch.clone(), None, continuous)
                 .expect("existing owner replay route");
             assert!(
                 admission.audit_request().is_some(),
                 "no durable prior: {action}"
             );
+            if matches!(action, "create" | "duplicate" | "rename") {
+                let repeated = owner
+                    .admit_replay_with_durable_prior(batch, None, continuous)
+                    .expect("repeated callback admission");
+                assert_eq!(
+                    repeated.admission().disposition(),
+                    AdapterDisposition::DuplicateSuppressed,
+                    "duplicate {action} delivery must not dispatch another scan"
+                );
+            }
         }
     }
 
