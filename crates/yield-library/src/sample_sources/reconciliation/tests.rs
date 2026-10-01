@@ -534,6 +534,31 @@ fn complete_and_incomplete_rename_preserve_endpoint_roles_and_order() {
 }
 
 #[test]
+fn finder_cross_parent_move_and_directory_delete_widen_only_affected_parents() {
+    let result = normalized(vec![
+        RawObservation::new(
+            RawEventKind::Rename,
+            vec![
+                path("old/snare.wav", RawPathRole::RenameSource),
+                path("new/snare.wav", RawPathRole::RenameDestination),
+            ],
+        ),
+        RawObservation::new(
+            RawEventKind::Delete,
+            vec![path("new/kit", RawPathRole::Subject).with_hint(RawPathHint::Directory)],
+        ),
+    ]);
+    let scopes = result.scopes();
+    assert_eq!(scopes.len(), 3);
+    assert_eq!(scopes[0].kind(), ReconciliationScopeKind::ExactEntry);
+    assert_eq!(scope_path(&scopes[0]), Some(Path::new("old/snare.wav")));
+    assert_eq!(scopes[1].kind(), ReconciliationScopeKind::ExactEntry);
+    assert_eq!(scope_path(&scopes[1]), Some(Path::new("new/snare.wav")));
+    assert_eq!(scopes[2].kind(), ReconciliationScopeKind::Subtree);
+    assert_eq!(scope_path(&scopes[2]), Some(Path::new("new")));
+}
+
+#[test]
 fn complete_and_uncertain_copy_keep_destination_and_optional_source() {
     let result = normalized(vec![
         RawObservation::new(

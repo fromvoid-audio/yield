@@ -241,6 +241,90 @@ fn incomplete_folder_audit_keeps_last_good_directory_projection() {
 }
 
 #[test]
+fn finder_directory_reparent_and_incomplete_delete_preserve_last_good_truth() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("old/kit/empty")).unwrap();
+    std::fs::create_dir(dir.path().join("new")).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
+    let audit = |at| {
+        audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+            &db,
+            None,
+            at,
+            &mut |_, _| {},
+            &UncoordinatedScanWriter,
+            None,
+        )
+    };
+    audit(1234).unwrap();
+    let before = db.source_directory_truth_page(None, 16).unwrap();
+    let identities = ["old/kit", "old/kit/empty"].map(|path| {
+        before
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == Path::new(path))
+            .unwrap()
+            .directory_identity
+            .clone()
+    });
+
+    std::fs::rename(dir.path().join("old/kit"), dir.path().join("new/kit")).unwrap();
+    audit(2345).unwrap();
+    let moved = db.source_directory_truth_page(None, 16).unwrap();
+    assert_eq!(moved.entries.len(), 4);
+    for (path, identity) in ["new/kit", "new/kit/empty"].into_iter().zip(identities) {
+        assert_eq!(
+            moved
+                .entries
+                .iter()
+                .find(|entry| entry.relative_path == Path::new(path))
+                .unwrap()
+                .directory_identity,
+            identity
+        );
+    }
+    assert!(
+        !moved
+            .entries
+            .iter()
+            .any(|entry| entry.relative_path.starts_with("old/kit"))
+    );
+
+    std::fs::remove_dir_all(dir.path().join("new/kit")).unwrap();
+    let revision = db.get_revision().unwrap();
+    // Deterministic traversal uncertainty, independent of Unix permissions/root privileges.
+    let failure = crate::sample_sources::scanner::scan_fs::force_directory_read_failure(
+        &dir.path().join("new"),
+    );
+    assert!(matches!(audit(3456), Err(ScanError::Incomplete { .. })));
+    assert_eq!(db.source_directory_truth_page(None, 16).unwrap(), moved);
+    assert_eq!(db.get_revision().unwrap(), revision);
+    assert_eq!(
+        db.get_metadata(yield_library::sample_sources::db::META_LAST_MANIFEST_AUDIT_AT)
+            .unwrap()
+            .as_deref(),
+        Some("2345")
+    );
+
+    drop(failure);
+    let complete = audit(4567).unwrap();
+    let deleted = db.source_directory_truth_page(None, 16).unwrap();
+    assert_eq!(
+        deleted
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.as_path())
+            .collect::<Vec<_>>(),
+        vec![Path::new("new"), Path::new("old")]
+    );
+    assert_eq!(
+        deleted.state.published_source_revision(),
+        Some(complete.audit_commit.committed_source_revision())
+    );
+    assert!(db.get_revision().unwrap() > revision);
+}
+
+#[test]
 fn full_scan_preserves_manifest_when_root_identity_is_unavailable() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("keep.wav"), b"keep").unwrap();

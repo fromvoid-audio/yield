@@ -131,6 +131,96 @@ fn finder_create_duplicate_and_rename_targeted_batches_publish_once() {
 }
 
 #[test]
+fn finder_cross_parent_move_and_delete_keep_identity_and_bound_region_reads() {
+    let dir = tempdir().unwrap();
+    for parent in ["old", "new", "unrelated"] {
+        std::fs::create_dir(dir.path().join(parent)).unwrap();
+    }
+    std::fs::write(dir.path().join("old/snare.wav"), b"snare").unwrap();
+    std::fs::write(dir.path().join("unrelated/snare.wav"), b"unrelated snare").unwrap();
+    for index in 0..64 {
+        std::fs::write(dir.path().join(format!("unrelated/{index}.wav")), b"other").unwrap();
+    }
+    let db = open_maintained_scan_database(dir.path()).unwrap();
+    scan_once(&db).unwrap();
+    db.set_tag(Path::new("old/snare.wav"), Rating::KEEP_1)
+        .unwrap();
+    let before = db
+        .entry_for_path(Path::new("old/snare.wav"))
+        .unwrap()
+        .unwrap();
+    assert!(before.content_hash.is_some());
+
+    // Both endpoints belong to the affected region; sibling sources are not scanned.
+    std::fs::rename(
+        dir.path().join("old/snare.wav"),
+        dir.path().join("new/snare.wav"),
+    )
+    .unwrap();
+    let moved = sync_paths(&db, &[PathBuf::from("old"), PathBuf::from("new")]).unwrap();
+    assert_eq!(moved.renames_reconciled, 1);
+    assert!(moved.committed_delta.created.is_empty());
+    assert!(moved.committed_delta.deleted.is_empty());
+    assert_eq!(moved.committed_delta.moved.len(), 1);
+    assert_eq!(
+        moved.committed_delta.moved[0].old_relative_path,
+        Path::new("old/snare.wav")
+    );
+    assert_eq!(
+        moved.committed_delta.moved[0].new_relative_path,
+        Path::new("new/snare.wav")
+    );
+    assert!(moved.targeted_manifest_rows_read <= 8);
+    let after = db
+        .entry_for_path(Path::new("new/snare.wav"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.tag, Rating::KEEP_1);
+    let old_identity = moved
+        .manifest_before
+        .iter()
+        .find(|entry| entry.relative_path == Path::new("old/snare.wav"))
+        .unwrap()
+        .file_identity
+        .as_ref()
+        .unwrap();
+    let new_identity = moved
+        .manifest_after
+        .iter()
+        .find(|entry| entry.relative_path == Path::new("new/snare.wav"))
+        .unwrap()
+        .file_identity
+        .as_ref()
+        .unwrap();
+    assert_eq!(old_identity, new_identity);
+    assert_eq!(after.content_hash, before.content_hash);
+    assert!(
+        db.entry_for_path(Path::new("old/snare.wav"))
+            .unwrap()
+            .is_none()
+    );
+
+    // Deleting the moved file must not retire a different parent with the same filename.
+    std::fs::remove_file(dir.path().join("new/snare.wav")).unwrap();
+    let deleted = sync_paths(&db, &[PathBuf::from("new")]).unwrap();
+    assert_eq!(deleted.missing, 1);
+    assert_eq!(deleted.committed_delta.deleted.len(), 1);
+    assert!(deleted.committed_delta.revision > moved.committed_delta.revision);
+    assert!(deleted.targeted_manifest_rows_read <= 4);
+    assert!(
+        db.entry_for_path(Path::new("new/snare.wav"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.entry_for_path(Path::new("unrelated/snare.wav"))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(db.count_files().unwrap(), 65);
+}
+
+#[test]
 fn exact_sync_indexes_one_live_unsupported_entry_without_subtree_rows() {
     let dir = tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("target/inside")).unwrap();
