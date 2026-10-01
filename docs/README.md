@@ -28,6 +28,9 @@ Machine-consumed check allowlists do not live here anymore. They now live under
 - `docs/book/src/`
   - public mdBook source for user-facing Yield documentation
 
+- [Visual WGSL effect contract](GPUI_VISUAL_EFFECT_CONTRACT.md)
+  - shipped presets, custom source approval, renderer lifetime and native verification limits
+
 ## Live operational files
 
 - Planning and backlog
