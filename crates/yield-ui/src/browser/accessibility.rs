@@ -59,6 +59,19 @@ const MOTION: &str = "settings-motion";
 const TEXT_SCALE: &str = "settings-text-scale";
 const AUTOPLAY: &str = "settings-autoplay";
 const HELP_TIPS: &str = "settings-help-tips";
+const VISUAL_EFFECT_PRESET: &str = "settings-visual-effect-preset";
+const VISUAL_EFFECT_TOGGLE: &str = "settings-visual-effect-toggle";
+const VISUAL_EFFECT_STRENGTH_DECREASE: &str = "settings-visual-effect-strength-decrease";
+const VISUAL_EFFECT_STRENGTH_INCREASE: &str = "settings-visual-effect-strength-increase";
+const USER_SHADER_IMPORT: &str = "settings-user-shader-import";
+const USER_SHADER_CANCEL: &str = "settings-user-shader-cancel";
+const USER_SHADER_APPROVE: &str = "settings-user-shader-approve";
+const USER_SHADER_REVOKE: &str = "settings-user-shader-revoke";
+const USER_SHADER_CLEAR: &str = "settings-user-shader-clear";
+const USER_SHADER_COPY: &str = "settings-user-shader-copy";
+const USER_SHADER_TOGGLE: &str = "settings-user-shader-toggle";
+const USER_SHADER_STATUS: &str = "settings-user-shader-status";
+const USER_SHADER_PREVIEW: &str = "settings-user-shader-preview";
 const RATING_DECAY_DECREASE: &str = "settings-rating-decay-decrease";
 const RATING_DECAY_INCREASE: &str = "settings-rating-decay-increase";
 const TRASH_CHOOSE: &str = "settings-trash-choose";
@@ -77,6 +90,17 @@ const SETTINGS_ORDER: &[&str] = &[
     TEXT_SCALE,
     AUTOPLAY,
     HELP_TIPS,
+    VISUAL_EFFECT_PRESET,
+    VISUAL_EFFECT_TOGGLE,
+    VISUAL_EFFECT_STRENGTH_DECREASE,
+    VISUAL_EFFECT_STRENGTH_INCREASE,
+    USER_SHADER_IMPORT,
+    USER_SHADER_CANCEL,
+    USER_SHADER_APPROVE,
+    USER_SHADER_REVOKE,
+    USER_SHADER_CLEAR,
+    USER_SHADER_COPY,
+    USER_SHADER_TOGGLE,
     SETTINGS_CLOSE,
     RATING_DECAY_DECREASE,
     RATING_DECAY_INCREASE,
@@ -509,7 +533,7 @@ impl BrowserAccessibility {
                         if sample_action.is_some() && super::tag_filter::scope_pending(view) {
                             return;
                         }
-                        if settings_action && !view.settings_control_enabled(&event.id) {
+                        if settings_action && !view.settings_control_enabled(&event.id, cx) {
                             return;
                         }
                         if matches!(
@@ -795,7 +819,7 @@ impl Browser {
             let available = SETTINGS_ORDER
                 .iter()
                 .copied()
-                .filter(|id| self.settings_control_enabled(id))
+                .filter(|id| self.settings_control_enabled(id, cx))
                 .collect::<Vec<_>>();
             if available.is_empty() {
                 return false;
@@ -828,7 +852,7 @@ impl Browser {
         false
     }
 
-    fn settings_control_enabled(&self, id: &str) -> bool {
+    fn settings_control_enabled(&self, id: &str, cx: &Context<Self>) -> bool {
         if id == SETTINGS_OPEN {
             return true;
         }
@@ -837,9 +861,59 @@ impl Browser {
         }
         let editable = self.preferences_editable();
         let busy = self.general_settings.maintenance_busy();
+        let diagnostic_override = cx
+            .try_global::<crate::theme::DebugPostEffectOverride>()
+            .is_some_and(|state| state.enabled);
         match id {
             SETTINGS_CLOSE | THEME_RESET => true,
             THEME_CHOOSE | MOTION | TEXT_SCALE | AUTOPLAY | HELP_TIPS => editable,
+            USER_SHADER_IMPORT => {
+                editable
+                    && self.preferences.ready_for_maintenance()
+                    && !self.general_settings.user_shader_picker_open()
+            }
+            USER_SHADER_CANCEL => self.general_settings.user_shader_import_busy(),
+            USER_SHADER_APPROVE => {
+                let reviewed = self
+                    .general_settings
+                    .reviewed_user_shader_fingerprint
+                    .as_deref();
+                let confirmed = self.preferences.confirmed_snapshot();
+                let current = confirmed
+                    .and_then(|preferences| preferences.user_shader.as_ref())
+                    .and_then(|shader| {
+                        yield_session::user_shader_content_fingerprint(&shader.source).ok()
+                    });
+                editable
+                    && !self.general_settings.user_shader_import_busy()
+                    && current.as_deref().is_some_and(|fingerprint| {
+                        reviewed == Some(fingerprint)
+                            && confirmed
+                                .and_then(|preferences| preferences.user_shader.as_ref())
+                                .is_some_and(|shader| {
+                                    shader.approved_fingerprint.as_deref() != Some(fingerprint)
+                                })
+                    })
+            }
+            USER_SHADER_REVOKE => self.preferences.effective().user_shader.is_some(),
+            USER_SHADER_CLEAR => self.preferences.effective().user_shader.is_some(),
+            USER_SHADER_COPY => self.preferences.effective().user_shader.is_some(),
+            USER_SHADER_TOGGLE => {
+                let has_source = self.preferences.effective().user_shader.is_some();
+                let selected = self.user_shader_selected_for_controls();
+                let debug_override = cx
+                    .try_global::<crate::theme::DebugPostEffectOverride>()
+                    .is_some_and(|state| state.enabled);
+                has_source
+                    && (selected
+                        || (cfg!(target_os = "macos")
+                            && !debug_override
+                            && self.preferences.ready_for_maintenance()))
+            }
+            VISUAL_EFFECT_PRESET
+            | VISUAL_EFFECT_STRENGTH_DECREASE
+            | VISUAL_EFFECT_STRENGTH_INCREASE => editable && !diagnostic_override,
+            VISUAL_EFFECT_TOGGLE => !diagnostic_override,
             THEME_RELOAD => editable && self.theme_load.pending_path.is_none(),
             RATING_DECAY_DECREASE => {
                 editable
@@ -862,7 +936,7 @@ impl Browser {
     }
 
     fn perform_settings_action(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.settings_control_enabled(id) {
+        if !self.settings_control_enabled(id, cx) {
             return;
         }
         match id {
@@ -870,17 +944,28 @@ impl Browser {
             SETTINGS_CLOSE => self.close_general_settings(window, cx),
             THEME_CHOOSE => self.choose_theme_from_accessibility(cx),
             THEME_RELOAD => self.reload_theme_from_accessibility(cx),
-            THEME_RESET => self.reset_theme_from_accessibility(cx),
+            THEME_RESET => self.reset_theme_from_accessibility(window, cx),
             MOTION => self.toggle_motion_from_accessibility(cx),
             TEXT_SCALE => self.toggle_text_scale_from_accessibility(cx),
             AUTOPLAY => self.toggle_autoplay_from_accessibility(cx),
             HELP_TIPS => self.toggle_help_tooltips_from_accessibility(cx),
+            VISUAL_EFFECT_PRESET => self.cycle_visual_effect_preset(cx),
+            VISUAL_EFFECT_TOGGLE => self.toggle_visual_effect_from_accessibility(window, cx),
+            VISUAL_EFFECT_STRENGTH_DECREASE => self.change_visual_effect_strength(-10, cx),
+            VISUAL_EFFECT_STRENGTH_INCREASE => self.change_visual_effect_strength(10, cx),
             RATING_DECAY_DECREASE => self.change_rating_decay(-1, cx),
             RATING_DECAY_INCREASE => self.change_rating_decay(1, cx),
             TRASH_CHOOSE => self.choose_trash_folder_from_accessibility(cx),
             TRASH_CLEAR => self.clear_trash_folder_from_accessibility(cx),
             STORAGE_REFRESH => self.refresh_global_storage(cx),
             CACHE_CLEAR => self.clear_rebuildable_cache(cx),
+            USER_SHADER_IMPORT => self.choose_user_shader_from_accessibility(window, cx),
+            USER_SHADER_CANCEL => self.cancel_user_shader_import(cx),
+            USER_SHADER_APPROVE => self.approve_user_shader_from_accessibility(cx),
+            USER_SHADER_REVOKE => self.revoke_user_shader_approval(window, cx),
+            USER_SHADER_CLEAR => self.clear_user_shader(window, cx),
+            USER_SHADER_COPY => self.copy_user_shader_source(cx),
+            USER_SHADER_TOGGLE => self.toggle_user_shader_from_accessibility(window, cx),
             _ => {}
         }
     }
@@ -1267,6 +1352,38 @@ impl Browser {
                 let weeks = self.general_settings.rating_decay_weeks;
                 let weeks_value = Some(format!("{weeks} weeks"));
                 let theme = crate::theme::active(cx);
+                let effect = self.visual_effect_config();
+                let debug_effect_override = cx
+                    .try_global::<crate::theme::DebugPostEffectOverride>()
+                    .is_some_and(|state| state.enabled);
+                let user_shader_effective = self.preferences.effective();
+                let user_shader_preview = user_shader_effective.user_shader.as_ref();
+                let user_shader_fingerprint = user_shader_preview.and_then(|shader| {
+                    yield_session::user_shader_content_fingerprint(&shader.source).ok()
+                });
+                let user_shader_review_status = super::general_settings::user_shader_review_status(
+                    self.preferences.confirmed_snapshot(),
+                    user_shader_preview,
+                    self.preferences.has_pending_user_shader_patch(),
+                    self.general_settings.user_shader_import_busy(),
+                    &self.general_settings.user_shader_status,
+                    self.preference_status(),
+                );
+                let general_status = if debug_effect_override {
+                    "Shipped effects paused by the debug post effect override".to_string()
+                } else {
+                    [
+                        self.general_settings.status(),
+                        self.general_settings.visual_effect_status.as_str(),
+                        self.general_settings
+                            .visual_effect_persistence_status
+                            .as_str(),
+                    ]
+                    .into_iter()
+                    .filter(|status| !status.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+                };
                 controls.extend([
                     button(THEME_CHOOSE, "Choose theme file", None, editable),
                     button(
@@ -1294,6 +1411,92 @@ impl Browser {
                         editable,
                     ),
                     toggle(HELP_TIPS, "Help tips", self.help_tooltips_enabled, editable),
+                    button(
+                        VISUAL_EFFECT_PRESET,
+                        "Visual effect",
+                        Some(
+                            super::general_settings::visual_effect_preset_label(effect.preset)
+                                .to_string(),
+                        ),
+                        editable && !debug_effect_override,
+                    ),
+                    toggle(
+                        VISUAL_EFFECT_TOGGLE,
+                        "Visual effect enabled",
+                        effect.enabled,
+                        !debug_effect_override,
+                    ),
+                    button(
+                        VISUAL_EFFECT_STRENGTH_DECREASE,
+                        "Decrease visual effect strength",
+                        Some(super::general_settings::visual_effect_strength_label(effect)),
+                        editable && !debug_effect_override && effect.strength_percent > 0,
+                    ),
+                    button(
+                        VISUAL_EFFECT_STRENGTH_INCREASE,
+                        "Increase visual effect strength",
+                        Some(super::general_settings::visual_effect_strength_label(effect)),
+                        editable
+                            && !debug_effect_override
+                            && effect.strength_percent
+                                < yield_session::MAX_VISUAL_EFFECT_STRENGTH_PERCENT,
+                    ),
+                    button(
+                        USER_SHADER_IMPORT,
+                        if self.general_settings.user_shader_import_busy() {
+                            "Choose another WGSL source"
+                        } else {
+                            "Import WGSL source"
+                        },
+                        None,
+                        self.settings_control_enabled(USER_SHADER_IMPORT, cx),
+                    ),
+                    button(
+                        USER_SHADER_CANCEL,
+                        "Cancel WGSL import",
+                        None,
+                        self.settings_control_enabled(USER_SHADER_CANCEL, cx),
+                    ),
+                    button(
+                        USER_SHADER_APPROVE,
+                        "Approve displayed WGSL source",
+                        user_shader_fingerprint.clone(),
+                        self.settings_control_enabled(USER_SHADER_APPROVE, cx),
+                    ),
+                    button(
+                        USER_SHADER_REVOKE,
+                        "Revoke WGSL approval",
+                        None,
+                        self.settings_control_enabled(USER_SHADER_REVOKE, cx),
+                    ),
+                    button(
+                        USER_SHADER_CLEAR,
+                        "Clear imported WGSL source",
+                        None,
+                        self.settings_control_enabled(USER_SHADER_CLEAR, cx),
+                    ),
+                    button(
+                        USER_SHADER_COPY,
+                        "Copy exact WGSL source",
+                        None,
+                        self.settings_control_enabled(USER_SHADER_COPY, cx),
+                    ),
+                    button(
+                        USER_SHADER_TOGGLE,
+                        if user_shader_fingerprint.is_some()
+                            && self.user_shader_selected_for_controls()
+                        {
+                            "Disable custom shader"
+                        } else {
+                            "Enable custom shader"
+                        },
+                        Some(if user_shader_fingerprint.is_some() {
+                            "single-pass WGSL over the composed window; replaces shipped effects while enabled".into()
+                        } else {
+                            String::from("No custom source is saved")
+                        }),
+                        self.settings_control_enabled(USER_SHADER_TOGGLE, cx),
+                    ),
                     button(SETTINGS_CLOSE, "Close general settings", None, true),
                     button(
                         RATING_DECAY_DECREASE,
@@ -1347,11 +1550,41 @@ impl Browser {
                         enabled: true,
                     },
                 ]);
+                controls.push(AxChild {
+                    id: USER_SHADER_STATUS.into(),
+                    role: AxRole::Group,
+                    label: "Custom WGSL approval status".into(),
+                    value: Some(format!("{user_shader_review_status} {}", {
+                        #[cfg(target_os = "macos")]
+                        {
+                            self.general_settings.user_shader_runtime_status()
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            ""
+                        }
+                    })),
+                    enabled: true,
+                });
+                if let Some(shader) = user_shader_preview {
+                    let preview = user_shader_fingerprint
+                        .map(|fingerprint| {
+                            format!("Fingerprint: {fingerprint}\n\n{}", shader.source)
+                        })
+                        .unwrap_or_else(|| shader.source.clone());
+                    controls.push(AxChild {
+                        id: USER_SHADER_PREVIEW.into(),
+                        role: AxRole::Group,
+                        label: "Exact custom WGSL source text and fingerprint".into(),
+                        value: Some(preview),
+                        enabled: true,
+                    });
+                }
                 for (id, label, status) in [
                     (
                         GENERAL_STATUS,
                         "General settings status",
-                        self.general_settings.status(),
+                        general_status.as_str(),
                     ),
                     (
                         MAINTENANCE_STATUS,
@@ -1864,5 +2097,70 @@ mod tests {
             );
             assert_eq!(control.enabled, enabled);
         }
+    }
+
+    #[test]
+    fn shipped_effect_controls_have_named_ax_actions_and_keyboard_order() {
+        let preset = SETTINGS_ORDER
+            .iter()
+            .position(|id| *id == VISUAL_EFFECT_PRESET)
+            .expect("preset participates in settings keyboard navigation");
+        assert_eq!(SETTINGS_ORDER[preset + 1], VISUAL_EFFECT_TOGGLE);
+        assert_eq!(SETTINGS_ORDER[preset + 2], VISUAL_EFFECT_STRENGTH_DECREASE);
+        assert_eq!(SETTINGS_ORDER[preset + 3], VISUAL_EFFECT_STRENGTH_INCREASE);
+
+        let choice = button(
+            VISUAL_EFFECT_PRESET,
+            "Visual effect",
+            Some("Invert".into()),
+            true,
+        );
+        assert_eq!(choice.role, AxRole::Button);
+        assert_eq!(choice.value.as_deref(), Some("Invert"));
+        let enabled = toggle(VISUAL_EFFECT_TOGGLE, "Visual effect enabled", true, false);
+        assert_eq!(enabled.role, AxRole::CheckBox);
+        assert_eq!(enabled.value.as_deref(), Some("On"));
+        assert!(!enabled.enabled);
+        let strength = button(
+            VISUAL_EFFECT_STRENGTH_INCREASE,
+            "Increase visual effect strength",
+            Some("90%".into()),
+            true,
+        );
+        assert_eq!(strength.value.as_deref(), Some("90%"));
+    }
+
+    #[test]
+    fn user_shader_review_actions_have_named_keyboard_controls() {
+        let import = SETTINGS_ORDER
+            .iter()
+            .position(|id| *id == USER_SHADER_IMPORT)
+            .expect("source import participates in settings keyboard navigation");
+        assert_eq!(SETTINGS_ORDER[import + 1], USER_SHADER_CANCEL);
+        assert_eq!(SETTINGS_ORDER[import + 2], USER_SHADER_APPROVE);
+        assert_eq!(SETTINGS_ORDER[import + 3], USER_SHADER_REVOKE);
+        assert_eq!(SETTINGS_ORDER[import + 4], USER_SHADER_CLEAR);
+        assert_eq!(SETTINGS_ORDER[import + 5], USER_SHADER_COPY);
+        assert_eq!(SETTINGS_ORDER[import + 6], USER_SHADER_TOGGLE);
+
+        let toggle = button(
+            USER_SHADER_TOGGLE,
+            "Enable custom shader",
+            Some("single-pass WGSL over the composed window".into()),
+            true,
+        );
+        assert_eq!(toggle.role, AxRole::Button);
+        assert_eq!(toggle.label, "Enable custom shader");
+        assert!(toggle.enabled);
+
+        let approve = button(
+            USER_SHADER_APPROVE,
+            "Approve displayed WGSL source",
+            Some("exact-source-fingerprint".into()),
+            true,
+        );
+        assert_eq!(approve.role, AxRole::Button);
+        assert_eq!(approve.value.as_deref(), Some("exact-source-fingerprint"));
+        assert!(approve.enabled);
     }
 }

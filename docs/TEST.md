@@ -224,6 +224,12 @@ broader suite also contains unrelated cleanup/source-shape guardrails that
 should be fixed deliberately rather than used as the non-blocking architecture
 gate.
 
+The source database open-role check also runs the GPUI owner-boundary tripwire
+for production `yield-ui` code. Run it with
+`scripts/check.sh source-db-open-roles` (or `scripts/check.ps1
+source-db-open-roles` on Windows). Its lexical scope and limitations are
+documented in [GPUI_ARCHITECTURE.md](GPUI_ARCHITECTURE.md).
+
 Windows note:
 
 - use the PowerShell wrappers in this repository

@@ -1,4 +1,4 @@
-//! One optional WGSL fragment pass over the composed Metal window image.
+//! Bounded WGSL fragment passes over the composed Metal window image.
 
 use foreign_types::ForeignType;
 use metal::{MTLPixelFormat, MTLTextureUsage};
@@ -8,6 +8,9 @@ use naga::{
     valid::{Capabilities, ValidationFlags, Validator},
 };
 use objc::{msg_send, sel, sel_impl};
+use std::sync::Arc;
+
+use crate::platform::{PostShaderCompilerBackend, PostShaderError};
 
 const VERTEX_SOURCE: &str = r#"
 struct PostVertex {
@@ -33,6 +36,37 @@ fn post_vertex(@builtin(vertex_index) index: u32) -> PostVertex {
 pub(super) struct PostShader {
     pub pipeline: metal::RenderPipelineState,
     pub sampler: metal::SamplerState,
+}
+
+pub(super) struct MetalPostShaderCompiler {
+    pub device: metal::Device,
+    pub renderer_identity: Arc<()>,
+}
+
+pub(super) struct PreparedMetalPostShaderChain {
+    pub device_id: u64,
+    pub renderer_identity: Arc<()>,
+    pub shaders: Vec<PostShader>,
+}
+
+impl PostShaderCompilerBackend for MetalPostShaderCompiler {
+    fn prepare_chain(
+        &self,
+        sources: &[String],
+    ) -> Result<Box<dyn std::any::Any + Send>, PostShaderError> {
+        let shaders = objc::rc::autoreleasepool(|| {
+            sources
+                .iter()
+                .map(|source| PostShader::compile(&self.device, source))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(PostShaderError::Compile)?;
+        Ok(Box::new(PreparedMetalPostShaderChain {
+            device_id: self.device.registry_id(),
+            renderer_identity: self.renderer_identity.clone(),
+            shaders,
+        }))
+    }
 }
 
 impl PostShader {
@@ -64,6 +98,16 @@ impl PostShader {
             },
             BindTarget {
                 texture: Some(0),
+                ..Default::default()
+            },
+        );
+        resources.resources.insert(
+            ResourceBinding {
+                group: 0,
+                binding: 2,
+            },
+            BindTarget {
+                texture: Some(1),
                 ..Default::default()
             },
         );

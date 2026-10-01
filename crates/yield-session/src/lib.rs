@@ -4544,6 +4544,73 @@ mod tests {
     // The session owner requires the qualified physical reserve provider at bootstrap.
     // Linux deliberately reports Unsupported; pure preference/receipt fixtures run there.
     #[cfg(target_os = "macos")]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn approved_user_shader_survives_profile_owner_shutdown_and_reopen() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+
+        let source = "@fragment fn post_fragment() -> vec4<f32> { return vec4<f32>(1.0); }";
+        let fingerprint =
+            user_shader_content_fingerprint(source).expect("source fingerprint for confirmation");
+        let patches = [
+            PreferencePatch::ImportUserShader {
+                source: source.to_owned(),
+            },
+            PreferencePatch::ApproveUserShader {
+                expected_fingerprint: fingerprint,
+            },
+            PreferencePatch::SetUserShaderEnabled(true),
+        ];
+        let mut saved_revision = 0;
+        for patch in patches {
+            let request = service
+                .patch_preferences(patch)
+                .expect("submit profile-owned shader command");
+            let applied = wait_for_preference_event(&service, |event| {
+                matches!(
+                    event,
+                    PreferenceEvent::RequestApplied { request: applied, .. }
+                        if *applied == request
+                )
+            });
+            if let PreferenceEvent::RequestApplied { revision, .. } = applied {
+                saved_revision = revision.get();
+            }
+        }
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() >= saved_revision),
+        );
+        service.shutdown().expect("owner flush and shutdown");
+
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let restored = wait_for_preference_snapshot(&reopened, |preferences| {
+            preferences.enabled_user_shader_source() == Some(source)
+        });
+        assert_eq!(restored.enabled_user_shader_source(), Some(source));
+        assert_eq!(
+            restored
+                .user_shader
+                .as_ref()
+                .and_then(|shader| shader.approved_fingerprint.as_deref()),
+            Some(
+                user_shader_content_fingerprint(source)
+                    .expect("recompute restored fingerprint")
+                    .as_str()
+            )
+        );
+        reopened.shutdown().expect("reopen owner shutdown");
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn approved_user_shader_survives_profile_owner_shutdown_and_reopen() {
         let temp = TempDir::new().expect("config base");
