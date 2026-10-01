@@ -1273,6 +1273,8 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reconcile_shipped_visual_effect(window, cx);
+        self.refresh_user_shader_review_token();
         #[cfg(target_os = "macos")]
         self.sync_browser_accessibility(window, cx);
         if self.playmark_timing_blur_subscription.is_none() {
@@ -2374,9 +2376,19 @@ impl Render for Browser {
                     ),
             )
             .when(self.theme_settings_open, |element| {
-                element
-                    .child(self.render_theme_settings(theme.clone(), cx))
-                    .child(self.render_general_settings(theme.clone(), cx))
+                element.child(
+                    div()
+                        .id("settings-panel-scroll")
+                        .debug_selector(|| "settings-panel-scroll".into())
+                        .flex()
+                        .flex_col()
+                        .flex_none()
+                        .w_full()
+                        .max_h(window.viewport_size().height * 0.5)
+                        .overflow_y_scroll()
+                        .child(self.render_theme_settings(theme.clone(), cx))
+                        .child(self.render_general_settings(theme.clone(), cx)),
+                )
             })
             .child(
                 div()
@@ -3835,6 +3847,64 @@ mod tests {
                 "{selector} is below strip: {bounds:?}, strip {strip:?}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn visual_settings_scroll_keeps_late_actions_reachable_and_footer_visible(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+        let enlarged = crate::theme::with_text_scale(&Theme::default(), 200);
+        cx.set_global(crate::theme::ActiveTheme(std::sync::Arc::new(enlarged)));
+        let window = cx.update(|app| {
+            app.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                        point(px(0.0), px(0.0)),
+                        gpui::size(px(960.0), px(560.0)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, app| app.new(Browser::new),
+            )
+            .expect("open constrained settings window")
+        });
+        let browser = window.root(cx).expect("browser root");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        browser.update(&mut cx, |view, cx| {
+            view.theme_settings_open = true;
+            view.general_settings.text_scale_percent = 200;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.refresh().expect("settings layout");
+        let scroll = cx
+            .debug_bounds("settings-panel-scroll")
+            .expect("settings viewport");
+        let before = cx
+            .debug_bounds("clear-rebuildable-cache")
+            .expect("last settings action");
+        assert!(scroll.size.height <= px(280.0));
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(scroll.left() + px(8.0), scroll.top() + px(8.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-4000.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.refresh().expect("scrolled settings layout");
+        let after = cx
+            .debug_bounds("clear-rebuildable-cache")
+            .expect("reachable last action");
+        assert!(after.top() < before.top());
+        assert!(
+            after.top() >= scroll.top() && after.bottom() <= scroll.bottom(),
+            "last action {after:?} outside scroll {scroll:?}"
+        );
+        let footer = cx.debug_bounds("main-status-bar").expect("footer");
+        assert!(
+            footer.bottom() <= px(560.0),
+            "footer {footer:?} escaped window"
+        );
     }
 
     #[gpui::test]

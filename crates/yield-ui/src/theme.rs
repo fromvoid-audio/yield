@@ -21,6 +21,16 @@ impl Default for ActiveTheme {
 
 impl Global for ActiveTheme {}
 
+/// Whether the explicit debug-only diagnostic shader currently owns the window pass.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DebugPostEffectOverride {
+    pub(crate) enabled: bool,
+    /// Monotonic-ish generation for every out-of-band renderer change/request.
+    pub(crate) revision: u64,
+}
+
+impl Global for DebugPostEffectOverride {}
+
 /// Return the active design tokens for a GPUI render pass.
 pub(crate) fn active(cx: &App) -> &Theme {
     &cx.global::<ActiveTheme>().0

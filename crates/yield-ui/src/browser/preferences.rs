@@ -90,6 +90,16 @@ impl PreferenceState {
             .any(|pending| matches!(pending.patch, PreferencePatch::SetAudioOutput(_)))
     }
 
+    fn visual_effect_disable_save_unconfirmed(&self) -> bool {
+        self.baseline.shipped_visual_effect.enabled
+            || self.pending.iter().any(|pending| {
+                matches!(
+                    &pending.patch,
+                    PreferencePatch::SetShippedVisualEffect(effect) if !effect.enabled
+                ) || matches!(&pending.patch, PreferencePatch::Reset)
+            })
+    }
+
     pub(super) fn has_pending_reset(&self) -> bool {
         self.pending
             .iter()
@@ -115,6 +125,18 @@ impl PreferenceState {
             && self.pending.is_empty()
             && !self.terminal
             && !self.blocked_until_reset
+    }
+
+    /// Return the settled profile snapshot only while its owner state is safe to review.
+    pub(super) fn confirmed_snapshot(&self) -> Option<&UiPreferences> {
+        (self.ready_for_maintenance() && self.persisted_revision >= self.revision)
+            .then_some(&self.baseline)
+    }
+
+    pub(super) fn has_pending_user_shader_patch(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|pending| pending.patch.is_user_shader_command())
     }
 
     pub(super) fn effective(&self) -> UiPreferences {
@@ -474,6 +496,13 @@ impl Browser {
             PreferenceEvent::RequestFailed { request, error } => {
                 let failed = self.preferences.fail_request(request, error.to_string());
                 if failed.is_some() {
+                    if matches!(
+                        failed.as_ref(),
+                        Some(PreferencePatch::SetShippedVisualEffect(effect)) if !effect.enabled
+                    ) {
+                        self.general_settings
+                            .mark_local_visual_effect_disable_unpersisted(&error.to_string());
+                    }
                     if let Some(failed_patch) = failed.as_ref()
                         && matches!(failed_patch, PreferencePatch::SetAudioOutput(_))
                     {
@@ -504,7 +533,15 @@ impl Browser {
             }
             PreferenceEvent::PersistenceUnavailable { error, .. } => {
                 let audio_output_pending = self.preferences.has_pending_audio_output_patch();
+                let disable_save_unconfirmed =
+                    self.preferences.visual_effect_disable_save_unconfirmed();
                 self.preferences.mark_unavailable(&error);
+                if self.general_settings.visual_effect_local_enabled == Some(false)
+                    && disable_save_unconfirmed
+                {
+                    self.general_settings
+                        .mark_local_visual_effect_disable_unpersisted(&error.to_string());
+                }
                 if audio_output_pending {
                     self.audio_output_persistence_failed(error.to_string());
                 }
@@ -516,7 +553,15 @@ impl Browser {
             }
             PreferenceEvent::Closed => {
                 let audio_output_pending = self.preferences.has_pending_audio_output_patch();
+                let disable_save_unconfirmed =
+                    self.preferences.visual_effect_disable_save_unconfirmed();
                 self.preferences.mark_closed();
+                if self.general_settings.visual_effect_local_enabled == Some(false)
+                    && disable_save_unconfirmed
+                {
+                    self.general_settings
+                        .mark_local_visual_effect_disable_unpersisted("settings owner closed");
+                }
                 if audio_output_pending {
                     self.audio_output_persistence_failed("settings persistence closed".to_string());
                 }
@@ -543,6 +588,7 @@ impl Browser {
         self.general_settings.text_scale_percent = effective.text_scale_percent;
         self.general_settings.rating_decay_weeks = effective.rating_decay_weeks;
         self.general_settings.trash_folder = effective.trash_folder.clone();
+        self.general_settings.shipped_visual_effect = effective.shipped_visual_effect;
         let previous_loop_mode = self.playback_policy.enabled();
         self.playback_policy
             .apply_preference(effective.loop_enabled);
@@ -883,6 +929,73 @@ mod tests {
     }
 
     #[test]
+    fn shader_snapshot_cannot_authorize_execution_ahead_of_persistence() {
+        let mut state = PreferenceState::new();
+        assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
+        // The owner may publish an applied snapshot before its save completes.
+        // An empty request list alone is not a persistence receipt.
+        state.revision = 7;
+        assert!(state.ready_for_maintenance());
+        assert!(state.confirmed_snapshot().is_none());
+        state.mark_persisted_for_test(6);
+        assert!(state.confirmed_snapshot().is_none());
+        state.mark_persisted_for_test(7);
+        assert!(state.confirmed_snapshot().is_some());
+        state.mark_closed();
+        assert!(state.confirmed_snapshot().is_none());
+    }
+
+    #[test]
+    fn enabled_shader_authority_waits_for_confirmed_persistence() {
+        let source =
+            "@fragment fn post_fragment() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }";
+        let fingerprint =
+            yield_session::user_shader_content_fingerprint(source).expect("source fingerprint");
+        let mut preferences = UiPreferences::default();
+        preferences.user_shader = Some(yield_session::UserShaderPreferences {
+            source: source.into(),
+            approved_fingerprint: Some(fingerprint),
+            enabled: false,
+        });
+        let mut state = PreferenceState::new();
+        assert!(state.accept_snapshot(PreferenceRevision::default(), preferences));
+        assert!(
+            state
+                .confirmed_snapshot()
+                .unwrap()
+                .enabled_user_shader_source()
+                .is_none()
+        );
+
+        state.queue_for_test(1, PreferencePatch::SetUserShaderEnabled(true));
+        assert!(state.effective().enabled_user_shader_source().is_some());
+        assert!(state.confirmed_snapshot().is_none());
+        state.mark_applied_for_test(1, 1);
+        assert!(state.confirmed_snapshot().is_none());
+        assert!(state.effective().enabled_user_shader_source().is_some());
+        state.mark_persisted_for_test(1);
+        // The persistence receipt retires the optimistic command, but the
+        // baseline remains the last authoritative snapshot until refreshed.
+        assert!(
+            state
+                .confirmed_snapshot()
+                .unwrap()
+                .enabled_user_shader_source()
+                .is_none()
+        );
+        let mut persisted = state.effective();
+        persisted.user_shader.as_mut().unwrap().enabled = true;
+        let mut reloaded = PreferenceState::new();
+        assert!(reloaded.accept_snapshot(PreferenceRevision::default(), persisted));
+        assert_eq!(
+            reloaded
+                .confirmed_snapshot()
+                .and_then(UiPreferences::enabled_user_shader_source),
+            Some(source)
+        );
+    }
+
+    #[test]
     fn failed_optimistic_preferences_cannot_authorize_maintenance() {
         let mut state = PreferenceState::new();
         assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
@@ -901,6 +1014,49 @@ mod tests {
         assert!(state.effective().help_tooltips_enabled);
         state.queue_for_test(3, PreferencePatch::SetHelpTooltipsEnabled(false));
         assert!(!state.effective().help_tooltips_enabled);
+    }
+
+    #[test]
+    fn pending_disable_keeps_last_confirmed_enabled_state_until_owner_confirmation() {
+        let mut state = PreferenceState::new();
+        let mut saved = UiPreferences::default();
+        saved.shipped_visual_effect.enabled = true;
+        state.accept_snapshot(PreferenceRevision::default(), saved.clone());
+        let mut disabled = saved.shipped_visual_effect;
+        disabled.enabled = false;
+        state.queue_for_test(1, PreferencePatch::SetShippedVisualEffect(disabled));
+        // A closed/unavailable owner freezes optimism, so inspect the confirmed
+        // baseline before freezing to report the unknown disable save outcome.
+        assert!(!state.effective().shipped_visual_effect.enabled);
+        assert!(state.visual_effect_disable_save_unconfirmed());
+        state.mark_closed();
+        assert!(!state.effective().shipped_visual_effect.enabled);
+
+        let mut confirmed = PreferenceState::new();
+        saved.shipped_visual_effect = disabled;
+        confirmed.accept_snapshot(PreferenceRevision::default(), saved);
+        assert!(!confirmed.visual_effect_disable_save_unconfirmed());
+        confirmed.queue_for_test(2, PreferencePatch::SetShippedVisualEffect(disabled));
+        assert!(confirmed.visual_effect_disable_save_unconfirmed());
+    }
+
+    #[test]
+    fn shipped_visual_effect_patch_projects_and_rolls_back_on_owner_rejection() {
+        let mut state = PreferenceState::new();
+        let baseline = UiPreferences::default();
+        assert!(state.accept_snapshot(PreferenceRevision::default(), baseline.clone()));
+        let selected = yield_session::ShippedVisualEffectPreferences {
+            enabled: true,
+            preset: yield_session::ShippedVisualEffectPreset::Invert,
+            strength_percent: 40,
+        };
+        state.queue_for_test(3, PreferencePatch::SetShippedVisualEffect(selected));
+        assert_eq!(state.effective().shipped_visual_effect, selected);
+        assert!(matches!(
+            state.fail_request_number(3, "profile rejected effect settings".into()),
+            Some(PreferencePatch::SetShippedVisualEffect(_))
+        ));
+        assert_eq!(state.effective(), baseline);
     }
 
     #[test]

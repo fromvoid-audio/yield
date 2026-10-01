@@ -14,10 +14,11 @@ The renderer-facing model getter returns source only when enabled with matching
 approval. Future runtime consumers must additionally require settled owner
 persistence and their renderer/window generation fences.
 
-This integration also carries additive, validated shipped-effect selection and
-strength preferences from the prepared model. It does not add controls, shader
-compilation or execution. OPT-1942/1945/1947 and native acceptance OPT-1931 remain
-open. Original combined PR #150 is preserved for the remaining integration.
+The model now feeds the integrated source review, shipped-effect controls and
+confirmed macOS runtime described in [the visual effect contract](GPUI_VISUAL_EFFECT_CONTRACT.md).
+Linux source checks do not qualify native compilation, renderer execution or
+acceptance; those remain in the Mac verification queue. Original combined PR #150
+is preserved for its unrelated Finder and catalog changes.
 
 Linux verification runs `cargo test --locked -p yield-session --lib preferences::tests`,
 the normal locked app check and headless UI suite. The actual session-owned
