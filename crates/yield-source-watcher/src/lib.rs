@@ -590,12 +590,15 @@ fn is_ignored_file_name(path: &Path, prefixes: &[&str]) -> bool {
 }
 
 fn is_finder_bookkeeping_event(path: &Path, kind: EventKind) -> bool {
+    cfg!(target_os = "macos") && is_reserved_finder_bookkeeping_write(path, kind)
+}
+
+fn is_reserved_finder_bookkeeping_write(path: &Path, kind: EventKind) -> bool {
     // Notify's macOS adapter drops the file/dir flag on data and metadata writes.
     // Filter only ordinary bookkeeping writes to Finder's exact reserved filename;
     // directory creation/removal, renames, unknown kinds and rescan flags retain
     // their conservative behavior. Never prefix-match an audio filename here.
-    cfg!(target_os = "macos")
-        && path.file_name().is_some_and(|name| name == ".DS_Store")
+    path.file_name().is_some_and(|name| name == ".DS_Store")
         && matches!(
             kind,
             EventKind::Create(notify::event::CreateKind::File)
@@ -824,6 +827,55 @@ mod tests {
                 .evidence()
                 .requires_full_rescan()
         );
+    }
+
+    #[test]
+    fn finder_bookkeeping_policy_preserves_namespace_changes_and_nonreserved_names() {
+        let path = Path::new("/fixture/Library/.DS_Store");
+        for kind in [
+            EventKind::Create(notify::event::CreateKind::File),
+            EventKind::Remove(notify::event::RemoveKind::File),
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended)),
+        ] {
+            assert!(is_reserved_finder_bookkeeping_write(path, kind));
+            assert!(!is_reserved_finder_bookkeeping_write(
+                Path::new("/fixture/Library/.DS_Store.wav"),
+                kind
+            ));
+            assert!(!is_reserved_finder_bookkeeping_write(
+                Path::new("/fixture/Library/.DS_Store.backup"),
+                kind
+            ));
+        }
+        for kind in [
+            EventKind::Any,
+            EventKind::Other,
+            EventKind::Create(notify::event::CreateKind::Folder),
+            EventKind::Remove(notify::event::RemoveKind::Folder),
+            EventKind::Create(notify::event::CreateKind::Any),
+            EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
+        ] {
+            assert!(
+                !is_reserved_finder_bookkeeping_write(path, kind),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn finder_bookkeeping_is_not_filtered_on_other_platforms() {
+        let root = PathBuf::from("/tmp/source-watcher-test-root");
+        let signal = WatcherSignal::new(spec(&root));
+        signal.record_notify_result(
+            Ok(event(
+                EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+                &[&root.join(".DS_Store")],
+            )),
+            Instant::now(),
+        );
+        assert!(signal.take_hint().is_some());
     }
 
     #[cfg(target_os = "macos")]
