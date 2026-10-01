@@ -18,7 +18,11 @@ been validated on a Windows host.
 The user's 2026-09-30 instruction permits development on Linux while Mac checks
 are tracked for later. Run `bash scripts/gpui-development-checks.sh check` for
 formatting and the normal locked app check, or `test` to also run core, shared
-reserve, filter-handler and enlarged-browser fixtures. This portable development
+reserve, filter-handler and enlarged-browser fixtures. Use `preflight` for branch
+policy, script fixture checks, source-writer/GPUI owner guards, format and the
+locked app check. It requires Python 3, ripgrep and cargo-nextest (qualified on
+Linux with 0.9.114); see [Scripts](../scripts/README.md) for setup and the archived
+Radiant preflight distinction. This portable development
 command requires the host's GPUI build dependencies and preserves normal lint
 settings. It does not run native AX, Metal, FSEvents, audible or release checks,
 and does not replace the macOS local CI gate or claim Linux desktop support.

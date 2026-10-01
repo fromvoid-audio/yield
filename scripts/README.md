@@ -7,6 +7,21 @@ are deferred until the macOS release-ready gate OPT-1863 is complete.
 The older `scripts/ci.sh` lanes below still target the legacy Radiant app and
 are not GPUI acceptance gates.
 
+For portable GPUI development, use `scripts/gpui-development-checks.sh check`
+(format and locked application check), `test` (the documented portable regression
+subset), or `preflight` (branch policy, script fixtures, source writer/GPUI owner
+boundary guards, format and locked application check). The preflight requires
+Python 3, ripgrep, the repository Rust toolchain and cargo-nextest; this Linux
+executor was qualified with cargo-nextest 0.9.114. Nextest validates stale binary
+selection in a disposable minimal crate, without compiling archived app tests.
+Install it with `cargo install cargo-nextest --version 0.9.114 --locked`.
+
+`scripts/agent.sh preflight` remains the archived Radiant agent contract. Its
+Radiant resolver and old app/readiness guard scopes are not the active GPUI
+preflight. They are retained for their historical lane, not reported as passing
+or skipped GPUI checks. Portable GPUI preflight does not certify native runtime,
+Metal, Finder or release acceptance; those require the macOS lane above.
+
 For a reproducible CPU waveform baseline (OPT-1713), use Python 3 on Linux or
 macOS in a clean checkout with the repository's Rust toolchain:
 

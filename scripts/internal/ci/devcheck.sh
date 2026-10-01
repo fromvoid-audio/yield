@@ -10,10 +10,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
-RADIANT_DIR="$(./scripts/radiant.sh locate | sed -n 's/^RADIANT_DIR=//p')"
-# shellcheck source=scripts/internal/use_cargo_cache.sh
-source "$ROOT_DIR/scripts/internal/use_cargo_cache.sh"
-yield_enable_cargo_cache
 
 usage() {
   cat <<'EOF'
@@ -56,6 +52,11 @@ if (( APP_ONLY == 1 && WORKSPACE == 1 )); then
   usage >&2
   exit 2
 fi
+
+RADIANT_DIR="$(./scripts/radiant.sh locate | sed -n 's/^RADIANT_DIR=//p')"
+# shellcheck source=scripts/internal/use_cargo_cache.sh
+source "$ROOT_DIR/scripts/internal/use_cargo_cache.sh"
+yield_enable_cargo_cache
 
 echo "[devcheck] branch policy"
 ./scripts/internal/check/check_main_branch.sh

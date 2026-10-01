@@ -7,8 +7,8 @@ cd "$repo_root"
 
 scope="${1:-check}"
 case "$scope" in
-  check|test) ;;
-  *) echo "Usage: scripts/gpui-development-checks.sh [check|test]" >&2; exit 2 ;;
+  check|test|preflight) ;;
+  *) echo "Usage: scripts/gpui-development-checks.sh [check|test|preflight]" >&2; exit 2 ;;
 esac
 
 run() {
@@ -17,6 +17,12 @@ run() {
 }
 
 echo "[gpui-development] host=$(uname -s) head=$(git rev-parse HEAD) scope=$scope"
+if [[ "$scope" == "preflight" ]]; then
+  run bash scripts/internal/check/check_main_branch.sh
+  run bash scripts/internal/check/check_script_guardrails.sh
+  run bash scripts/internal/check/check_source_db_open_roles.sh
+fi
+
 run cargo fmt --all --check
 run cargo check --locked -p yield
 
