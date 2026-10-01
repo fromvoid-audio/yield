@@ -11,10 +11,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
-RADIANT_DIR="$(./scripts/radiant.sh locate | sed -n 's/^RADIANT_DIR=//p')"
-# shellcheck source=scripts/internal/use_cargo_cache.sh
-source "$ROOT_DIR/scripts/internal/use_cargo_cache.sh"
-yield_enable_cargo_cache
 
 usage() {
   cat <<'USAGE'
@@ -39,6 +35,11 @@ while (( $# > 0 )); do
       ;;
   esac
 done
+
+RADIANT_DIR="$(./scripts/radiant.sh locate | sed -n 's/^RADIANT_DIR=//p')"
+# shellcheck source=scripts/internal/use_cargo_cache.sh
+source "$ROOT_DIR/scripts/internal/use_cargo_cache.sh"
+yield_enable_cargo_cache
 
 echo "[ci_agent] ./scripts/internal/check/check_main_branch.sh"
 ./scripts/internal/check/check_main_branch.sh

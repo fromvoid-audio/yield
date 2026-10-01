@@ -9,7 +9,7 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
+if [[ "${YIELD_VALIDATION_TEST_PLATFORM:-$(uname -s)}" != "Darwin" ]]; then
   exec "$@"
 fi
 

@@ -460,6 +460,11 @@ run_nextest_quick_profile_fixture() {
   fixture_dir="$(mktemp -d)"
   trap 'rm -rf "$fixture_dir"' RETURN
 
+  # Discover binaries in an isolated crate: the active GPUI app has no library
+  # test target, and this parser regression must not compile archived app tests.
+  mkdir -p "$fixture_dir/src"
+  printf '%s\n' '[package]' 'name = "yield"' 'version = "0.0.0"' 'edition = "2021"' > "$fixture_dir/Cargo.toml"
+  printf '%s\n' '#[test] fn fixture() {}' > "$fixture_dir/src/lib.rs"
   local config_path="$fixture_dir/nextest.toml"
   cat >"$config_path" <<'EOF'
 [profile.quick]
@@ -475,6 +480,8 @@ EOF
     cargo \
     nextest \
     list \
+    --manifest-path \
+    "$fixture_dir/Cargo.toml" \
     --config-file \
     "$config_path" \
     --package \

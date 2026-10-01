@@ -21,6 +21,14 @@ fail() {
   exit 1
 }
 
+# Container PID 1 may retain a terminated orphan as a zombie. kill -0 also
+# succeeds for zombies, which cannot execute or retain command resources.
+process_is_running() {
+  local state
+  state="$(ps -o stat= -p "$1" 2>/dev/null)" || return 1
+  [[ -n "$state" && "$state" != Z* ]]
+}
+
 run_watchdog() {
   YIELD_VALIDATION_IDLE_SECONDS=1 \
     YIELD_VALIDATION_DIAGNOSTIC_GRACE_SECONDS=1 \
@@ -44,7 +52,7 @@ echo "[validation_watchdog_test] PASS: child exit propagation"
 orphan_pid_file="$FIXTURE_DIR/orphan-child.pid"
 run_watchdog sh -c "sleep 30 & echo \$! > '$orphan_pid_file'"
 orphan_pid="$(cat "$orphan_pid_file")"
-kill -0 "$orphan_pid" 2>/dev/null && fail "background child survived normal parent exit"
+process_is_running "$orphan_pid" && fail "background child survived normal parent exit"
 echo "[validation_watchdog_test] PASS: normal-exit child cleanup"
 
 run_watchdog python3 -c 'import time; end=time.monotonic()+1.5
@@ -58,7 +66,7 @@ run_watchdog sh -c 'sleep 30' >"$FIXTURE_DIR/stall.out" 2>&1
 status=$?
 set -e
 [[ "$status" == "124" ]] || fail "expected stall exit 124, got $status"
-kill -0 "$unrelated_pid" 2>/dev/null || fail "unrelated process was terminated"
+process_is_running "$unrelated_pid" || fail "unrelated process was terminated"
 kill "$unrelated_pid"
 wait "$unrelated_pid" 2>/dev/null || true
 grep -Fq "confirmed no progress" "$FIXTURE_DIR/stall.out" || fail "missing stall diagnostic"
@@ -122,7 +130,7 @@ wait "$wrapper_pid"
 status=$?
 set -e
 [[ "$status" == "143" ]] || fail "expected cancellation exit 143, got $status"
-kill -0 "$owned_child_pid" 2>/dev/null && fail "owned child survived cancellation"
+process_is_running "$owned_child_pid" && fail "owned child survived cancellation"
 echo "[validation_watchdog_test] PASS: cancellation cleanup"
 
 prespawn_ready="$FIXTURE_DIR/prespawn-ready"
@@ -192,7 +200,9 @@ find "$target_root" -mindepth 1 -maxdepth 1 -type d -name '.lock-*' | grep -q . 
   && fail "validation target lease survived successful selectors"
 echo "[validation_watchdog_test] PASS: concurrent pathological target rotation"
 
-unset YIELD_VALIDATION_TEST_PLATFORM
+# Exercise the Darwin-only wrapper using the same platform fixture override
+# as target selection; Linux production commands still use the pass-through.
+export YIELD_VALIDATION_TEST_PLATFORM=Darwin
 unset CARGO_TARGET_DIR
 runner_target_root="$FIXTURE_DIR/runner-targets"
 YIELD_VALIDATION_TARGET_ROOT="$runner_target_root" \
