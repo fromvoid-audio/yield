@@ -765,41 +765,48 @@ pub(super) fn persist_readiness_deficits_owned(
 ) -> Result<usize, ReadinessError> {
     ownership.validate(&*connection)?;
     cancellation_checkpoint(cancel)?;
-    let mut unique = BTreeSet::new();
+    // The input is already loaded. Count distinct target/version checks, not duplicate rows
+    // or newly queued jobs. Reuse the same bounded-to-input set and preserve cancellation.
+    let key = |deficit: &ReadinessDeficit| {
+        (
+            deficit.target.key(),
+            deficit.target.required_version.clone(),
+            deficit.target.source_generation,
+            deficit.target.content_generation.clone(),
+        )
+    };
+    let mut pending = BTreeSet::new();
+    for deficit in deficits {
+        cancellation_checkpoint(cancel)?;
+        pending.insert(key(deficit));
+    }
+    let total = pending.len();
     let tx = connection.transaction()?;
     let mut changed = 0;
-    let total = deficits.len();
-    for (index, deficit) in deficits.iter().enumerate() {
+    let mut completed = 0;
+    progress(super::super::ReadinessProgress::QueueingTargets { completed, total });
+    for deficit in deficits {
         cancellation_checkpoint(cancel)?;
-        progress(super::super::ReadinessProgress::QueueingTargets {
-            completed: index.saturating_add(1),
-            total,
-        });
-        let target = &deficit.target;
-        if !unique.insert((
-            target.key(),
-            target.required_version.clone(),
-            target.source_generation,
-            target.content_generation.clone(),
-        )) {
+        if !pending.remove(&key(deficit)) {
             continue;
         }
-        let Some(current_target) = current_actionable_target(&tx, target)? else {
-            continue;
-        };
-        let sample_id = match current_target.scope_kind {
-            ReadinessScopeKind::File => current_target.scope_id.clone(),
-            ReadinessScopeKind::Source => format!("{}::__source__", current_target.source_id),
-        };
-        changed += match target_persistence_action(&tx, &current_target, created_at)? {
-            TargetPersistenceAction::Persist => {
-                persist_deficit(&tx, &current_target, &sample_id, created_at)?
-            }
-            TargetPersistenceAction::RefreshMetadata => {
-                refresh_work_metadata(&tx, &current_target)?
-            }
-            TargetPersistenceAction::Skip => 0,
-        };
+        if let Some(current_target) = current_actionable_target(&tx, &deficit.target)? {
+            let sample_id = match current_target.scope_kind {
+                ReadinessScopeKind::File => current_target.scope_id.clone(),
+                ReadinessScopeKind::Source => format!("{}::__source__", current_target.source_id),
+            };
+            changed += match target_persistence_action(&tx, &current_target, created_at)? {
+                TargetPersistenceAction::Persist => {
+                    persist_deficit(&tx, &current_target, &sample_id, created_at)?
+                }
+                TargetPersistenceAction::RefreshMetadata => {
+                    refresh_work_metadata(&tx, &current_target)?
+                }
+                TargetPersistenceAction::Skip => 0,
+            };
+        }
+        completed += 1;
+        progress(super::super::ReadinessProgress::QueueingTargets { completed, total });
     }
     ownership.validate(&tx)?;
     tx.commit()?;

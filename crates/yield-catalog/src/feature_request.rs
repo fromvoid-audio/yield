@@ -57,36 +57,6 @@ impl FeatureAnalysisBlocker {
         }
     }
 }
-/// Transient activity of one bounded feature request. This is not durable source completion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum FeatureAnalysisPhase {
-    /// Inspect the current committed, completely audited manifest and its admission fences.
-    InspectingManifest,
-    /// Compare this exact target with validated stored feature bytes.
-    ComparingReadiness,
-    /// Queue unfinished work through the retained owner and prepare its claim.
-    QueueingUnfinishedWork,
-}
-/// Measurement of transient preparation; no cumulative row visits or invented totals.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FeaturePhaseMeasurement {
-    /// Work has no published denominator; it is not a percentage or a completed-file count.
-    Indeterminate,
-}
-impl FeatureAnalysisPhase {
-    /// Preparation does not run an extra manifest pass to obtain a denominator.
-    pub fn measurement(self) -> FeaturePhaseMeasurement {
-        FeaturePhaseMeasurement::Indeterminate
-    }
-    /// Plain activity text, separate from a durable readiness result.
-    pub fn message(self) -> &'static str {
-        match self {
-            Self::InspectingManifest => "Inspecting audited source",
-            Self::ComparingReadiness => "Checking feature readiness",
-            Self::QueueingUnfinishedWork => "Preparing unfinished feature work",
-        }
-    }
-}
 /// Truthful state of one file-scoped AnalysisFeatures request, not overall source readiness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FeatureAnalysisState {
@@ -109,35 +79,6 @@ pub enum FeatureAnalysisState {
         /// Typed, bounded failure or unavailable resource.
         reason: FeatureAnalysisBlocker,
     },
-}
-
-impl FeatureAnalysisState {
-    /// Reduce one request's transient phases monotonically, allowing cache-hit/no-op and
-    /// early blocked terminals. A retry or new source revision must start a new request;
-    /// the caller still checks source/lifecycle/revision/request/path before this reducer.
-    pub fn follows(&self, previous: Option<&Self>) -> bool {
-        let Some(previous) = previous else {
-            return true;
-        };
-        if matches!(previous, Self::Ready { .. } | Self::Blocked { .. }) {
-            return false;
-        }
-        let rank = |state: &Self| match state {
-            Self::Preparing {
-                phase: FeatureAnalysisPhase::InspectingManifest,
-            } => 0,
-            Self::Preparing {
-                phase: FeatureAnalysisPhase::ComparingReadiness,
-            } => 1,
-            Self::Preparing {
-                phase: FeatureAnalysisPhase::QueueingUnfinishedWork,
-            } => 2,
-            Self::Queued => 3,
-            Self::Running => 4,
-            Self::Ready { .. } | Self::Blocked { .. } => 5,
-        };
-        rank(self) > rank(previous)
-    }
 }
 
 pub(super) fn request(

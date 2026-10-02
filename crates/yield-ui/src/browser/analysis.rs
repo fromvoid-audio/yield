@@ -144,15 +144,7 @@ pub(super) fn apply_catalog_event(
     ) {
         return true;
     }
-    let text = match state {
-        FeatureAnalysisState::Preparing { phase } => phase.message().to_owned(),
-        FeatureAnalysisState::Queued => "Features queued".to_owned(),
-        FeatureAnalysisState::Running => "Analyzing features".to_owned(),
-        FeatureAnalysisState::Ready { .. } => "Features ready".to_owned(),
-        FeatureAnalysisState::Blocked { reason } => {
-            format!("Features blocked: {}", reason.message())
-        }
-    };
+    let text = state.message();
     browser.set_playback_status(text);
     cx.notify();
     true
