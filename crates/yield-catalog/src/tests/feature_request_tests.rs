@@ -81,6 +81,82 @@ mod fixtures {
         assert!(inspecting.follows(None)); // fresh request/source revision reset
         assert!(!FeatureAnalysisState::Queued.follows(Some(&FeatureAnalysisState::Running)));
     }
+    fn assert_analysis_metrics(
+        service: &CatalogService,
+        expected: (u64, u64, u64, u64, u64, u64, u64, u64),
+    ) -> FeatureAnalysisMetrics {
+        // Event delivery can precede the worker's diagnostic update. Wait only for actual
+        // settled observation; no injected outcome, counter, source or clock is accepted.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(m) = service.try_feature_analysis_metrics() {
+                if m.dropped_before_work + m.terminal_ready + m.terminal_blocked >= expected.0 {
+                    assert_eq!(
+                        (
+                            m.entered,
+                            m.dropped_before_work,
+                            m.terminal_ready,
+                            m.terminal_blocked,
+                            m.terminal_stale,
+                            m.terminal_cancelled,
+                            m.terminal_enqueued,
+                            m.terminal_projection_rejected
+                        ),
+                        expected
+                    );
+                    assert_eq!(
+                        m.entered,
+                        m.dropped_before_work + m.terminal_ready + m.terminal_blocked
+                    );
+                    assert_eq!(
+                        m.terminal_enqueued + m.terminal_projection_rejected,
+                        m.terminal_ready + m.terminal_blocked
+                    );
+                    assert!(m.total_elapsed_us >= m.max_elapsed_us);
+                    assert!(!m.saturated);
+                    return m;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actual feature worker did not settle"
+            );
+            thread::yield_now();
+        }
+    }
+    fn await_removal_without_ready(service: &CatalogService, source: &SourceId, forbid_all: bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = service
+                .recv_event_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("actual source removal");
+            assert!(
+                !matches!(
+                    &event,
+                    CatalogEvent::FeatureAnalysisState {
+                        state: FeatureAnalysisState::Ready { .. },
+                        ..
+                    }
+                ),
+                "retired ready escaped producer fence"
+            );
+            if forbid_all {
+                assert!(!matches!(&event, CatalogEvent::FeatureAnalysisState { .. }));
+            }
+            if matches!(&event, CatalogEvent::Removed { source_id, .. } if source_id == source) {
+                break;
+            }
+        }
+        while let Ok(event) = service.try_recv_event() {
+            assert!(!matches!(
+                &event,
+                CatalogEvent::FeatureAnalysisState {
+                    state: FeatureAnalysisState::Ready { .. },
+                    ..
+                }
+            ));
+        }
+    }
     fn observer(f: &Fixture, source: &SourceId) -> rusqlite::Connection {
         SourceDatabase::open_connection_with_role_and_database_root(
             f.root.path(),
@@ -140,6 +216,7 @@ mod fixtures {
         preparation(&service, 2, false);
         assert_eq!(state(&service, 2), ready);
         assert_eq!(counts(&f, &source), (1, 1));
+        assert_analysis_metrics(&service, (2, 0, 2, 0, 0, 0, 2, 0));
         service.shutdown();
     }
     #[test]
@@ -196,6 +273,7 @@ mod fixtures {
             other => panic!("retry must defer or perform real failed computation: {other:?}"),
         }
         assert_eq!(counts(&f, &source), (0, 0));
+        assert_analysis_metrics(&service, (2, 0, 0, 2, 0, 0, 2, 0));
         service.shutdown();
     }
     #[test]
@@ -242,6 +320,7 @@ mod fixtures {
             })
             .unwrap();
         assert_eq!(target_count, 0);
+        assert_analysis_metrics(&service, (2, 0, 0, 2, 1, 1, 2, 0));
         service.shutdown();
     }
     #[test]
@@ -611,6 +690,112 @@ mod fixtures {
         preparation(&service, 3, false);
         assert_eq!(state(&service, 3), new);
         assert_eq!(counts(&f, &source), (2, 1));
+        service.shutdown();
+    }
+    #[test]
+    fn feature_analysis_metrics_queued_retirement_drops_before_source_sql() {
+        let f = Fixture::new("feature-metrics-queued-retirement");
+        write_test_wav(&f.root.path().join("tone.wav"), 16_000, 16_000);
+        let source = SourceId::from_string("feature-metrics-queued-retirement");
+        let (service, gate) = CatalogService::start_with_test_gate(&f.guard).unwrap();
+        let snapshot = register_and_audit(&service, f.root.path(), &source);
+        let before = counts(&f, &source);
+        let pause = gate.pause_next();
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision,
+                1,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source.clone(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        pause.release();
+        await_removal_without_ready(&service, &source, true);
+        assert_analysis_metrics(&service, (1, 1, 0, 0, 0, 0, 0, 0));
+        assert_eq!(counts(&f, &source), before);
+        service.shutdown();
+    }
+    #[test]
+    fn feature_analysis_metrics_actual_ready_projection_rejected_after_retirement() {
+        let f = Fixture::new("feature-metrics-terminal-retirement");
+        write_test_wav(&f.root.path().join("tone.wav"), 16_000, 16_000);
+        let source = SourceId::from_string("feature-metrics-terminal-retirement");
+        let (service, gate) = CatalogService::start_with_test_gate(&f.guard).unwrap();
+        let snapshot = register_and_audit(&service, f.root.path(), &source);
+        let pause = gate.arm_feature_terminal();
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision,
+                1,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        pause.wait_until_entered();
+        // Actual scanner/WAV/DSP/SourceWriter publication already completed. Pause changes
+        // only scheduling before the existing producer fence; no ready receipt is injected.
+        let before = counts(&f, &source);
+        assert_eq!(before, (1, 1));
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source.clone(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        drop(pause);
+        await_removal_without_ready(&service, &source, false);
+        assert_analysis_metrics(&service, (1, 0, 1, 0, 0, 0, 0, 1));
+        assert_eq!(counts(&f, &source), before);
+        service.shutdown();
+    }
+    #[test]
+    fn feature_analysis_metrics_getter_is_nonblocking_readonly_and_resets_on_restart() {
+        let f = Fixture::new("feature-metrics-observer");
+        write_test_wav(&f.root.path().join("tone.wav"), 16_000, 16_000);
+        let source = SourceId::from_string("feature-metrics-observer");
+        let service = CatalogService::start(&f.guard).unwrap();
+        let snapshot = register_and_audit(&service, f.root.path(), &source);
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision + 1,
+                1,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        state(&service, 1);
+        let metrics = assert_analysis_metrics(&service, (1, 0, 0, 1, 1, 0, 1, 0));
+        let connection = observer(&f, &source);
+        let file = PathBuf::from(connection.path().unwrap());
+        let persisted = || {
+            [
+                file.clone(),
+                PathBuf::from(format!("{}-wal", file.display())),
+            ]
+            .into_iter()
+            .filter_map(|path| fs::read(&path).ok().map(|bytes| (path, bytes)))
+            .collect::<Vec<_>>()
+        };
+        let before = persisted();
+        assert_eq!(service.try_feature_analysis_metrics().unwrap(), metrics);
+        assert_eq!(service.try_feature_analysis_metrics().unwrap(), metrics);
+        assert_eq!(persisted(), before);
+        let held = service.admission.lock().unwrap();
+        assert!(service.try_feature_analysis_metrics().is_none());
+        drop(held);
+        drop(connection);
+        service.shutdown();
+        let service = CatalogService::start(&f.guard).unwrap();
+        assert_eq!(
+            service.try_feature_analysis_metrics().unwrap(),
+            FeatureAnalysisMetrics::default()
+        );
         service.shutdown();
     }
 }

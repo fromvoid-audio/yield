@@ -98,10 +98,13 @@ pub(super) fn request(
     reservation: &mut EventReservation<'_>,
     admission: &Arc<Mutex<AdmissionState>>,
     sources: &mut HashMap<SourceId, RegisteredSource>,
+    _test_gate: Option<&Arc<CatalogTestGate>>,
 ) {
+    let started = Instant::now();
     let token = Arc::clone(&cancellation.0);
     let begun = {
         let mut state = admission.lock().unwrap_or_else(|p| p.into_inner());
+        state.feature_analysis_metrics.enter();
         (|| {
             if state.shutdown || state.closed {
                 return false;
@@ -119,16 +122,33 @@ pub(super) fn request(
         })()
     };
     if !begun {
+        admission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .feature_analysis_metrics
+            .drop_before_work(started.elapsed());
         return;
     }
     let Some(source) = sources.get_mut(&source_id) else {
+        admission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .feature_analysis_metrics
+            .drop_before_work(started.elapsed());
         return;
     };
     source.attempt_token = Some(Arc::clone(&token));
     let emit = |reservation: &mut EventReservation<'_>, source: &RegisteredSource, state| {
+        let terminal = feature_analysis_metrics::TerminalObservation::from_state(&state);
+        #[cfg(test)]
+        if terminal.is_some() {
+            if let Some(gate) = _test_gate {
+                gate.before_feature_terminal();
+            }
+        }
         // Cancelled is still a truthful terminal result for the current source. The physical
         // publication fence and caller request/revision checks reject late ready projections.
-        publish_source_if_current(
+        let enqueued = publish_source_if_current(
             admission,
             reservation,
             &source_id,
@@ -144,6 +164,13 @@ pub(super) fn request(
                 state,
             },
         );
+        if let Some(terminal) = terminal {
+            admission
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .feature_analysis_metrics
+                .terminal(terminal, enqueued, started.elapsed());
+        }
     };
     let blocked = |reason| FeatureAnalysisState::Blocked { reason };
     let now = || {

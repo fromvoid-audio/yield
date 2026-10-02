@@ -72,6 +72,7 @@ pub use harvest_facts::{
 };
 use yield_library::sample_sources::library::HarvestFactsClient;
 mod display_labels;
+mod feature_analysis_metrics;
 mod feature_job;
 mod feature_progress;
 mod feature_request;
@@ -80,6 +81,7 @@ pub use history_selection::{
     CollectionHistoryCancellation, CollectionHistoryFailure, CollectionHistoryRequest,
     SourceCollectionHistorySelection,
 };
+pub use feature_analysis_metrics::FeatureAnalysisMetrics;
 mod similarity_dispatch;
 mod similarity_query;
 pub use feature_job::{
@@ -157,6 +159,8 @@ struct CatalogTestGate {
     state: Mutex<CatalogTestGateState>,
     wake: Condvar,
     audit_state: Mutex<CatalogTestAuditState>,
+    feature_terminal_state: Mutex<CatalogTestAuditState>,
+    feature_terminal_wake: Condvar,
     watcher_signals: Mutex<HashMap<(SourceId, u64), WatcherSignal>>,
     watcher_install_counts: Mutex<HashMap<(SourceId, u64), usize>>,
     cancel_on_audit_progress: AtomicBool,
@@ -190,10 +194,38 @@ impl CatalogTestGate {
                 paused: false,
                 at_boundary: false,
             }),
+            feature_terminal_state: Mutex::new(CatalogTestAuditState {
+                paused: false,
+                at_boundary: false,
+            }),
+            feature_terminal_wake: Condvar::new(),
             watcher_signals: Mutex::new(HashMap::new()),
             watcher_install_counts: Mutex::new(HashMap::new()),
             cancel_on_audit_progress: AtomicBool::new(false),
         }
+    }
+
+    fn before_feature_terminal(&self) {
+        let mut state = self
+            .feature_terminal_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        state.at_boundary = true;
+        self.feature_terminal_wake.notify_all();
+        while state.paused {
+            state = self
+                .feature_terminal_wake
+                .wait(state)
+                .unwrap_or_else(|p| p.into_inner());
+        }
+        state.at_boundary = false;
+    }
+    fn arm_feature_terminal(&self) -> CatalogTestFeatureTerminalPause<'_> {
+        self.feature_terminal_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .paused = true;
+        CatalogTestFeatureTerminalPause { gate: self }
     }
 
     fn before_receive(&self) {
@@ -356,6 +388,46 @@ impl CatalogTestGate {
             .get(&(source_id.clone(), lifecycle_generation))
             .copied()
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+struct CatalogTestFeatureTerminalPause<'a> {
+    gate: &'a CatalogTestGate,
+}
+#[cfg(test)]
+impl CatalogTestFeatureTerminalPause<'_> {
+    fn wait_until_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = self
+            .gate
+            .feature_terminal_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        while !state.at_boundary {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "actual feature terminal did not arrive"
+            );
+            let (next, _) = self
+                .gate
+                .feature_terminal_wake
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|p| p.into_inner());
+            state = next;
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for CatalogTestFeatureTerminalPause<'_> {
+    fn drop(&mut self) {
+        self.gate
+            .feature_terminal_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .paused = false;
+        self.gate.feature_terminal_wake.notify_all();
     }
 }
 
@@ -1997,6 +2069,7 @@ struct CurationLineage {
 }
 
 struct AdmissionState {
+    feature_analysis_metrics: FeatureAnalysisMetrics,
     command_metrics: command_metrics::CommandMetrics,
     shutdown: bool,
     closed: bool,
@@ -2015,6 +2088,7 @@ impl AdmissionState {
     fn new() -> Self {
         Self {
             command_metrics: command_metrics::CommandMetrics::new(),
+            feature_analysis_metrics: FeatureAnalysisMetrics::default(),
             shutdown: false,
             closed: false,
             event_budget: 1,
@@ -3484,6 +3558,18 @@ impl CatalogService {
         }
     }
 
+    /// Copy fixed feature worker diagnostics without waiting, SQL or lease renewal.
+    /// Returns None while admission is busy; producer enqueue is not UI confirmation.
+    pub fn try_feature_analysis_metrics(&self) -> Option<FeatureAnalysisMetrics> {
+        match self.admission.try_lock() {
+            Ok(state) => Some(state.feature_analysis_metrics),
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                Some(error.into_inner().feature_analysis_metrics)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     fn submit_locked(
         &self,
         command: CatalogCommand,
@@ -4062,6 +4148,7 @@ fn handle_command(
                 reservation,
                 admission,
                 sources,
+                test_gate,
             );
             false
         }
