@@ -3,7 +3,7 @@
 This decision resolves the caller-policy prerequisite for OPT-1836. It covers the actual
 registry, preferences and profile-vocabulary producers in the current GPUI/session graph,
 plus the implemented operation-scoped registry API. It defines implementation requirements;
-the new common envelopes below are not implemented by this document or its fixtures.
+the original decision did not implement envelopes. Follow-up implementation status is recorded below.
 The existing profile-owned `GlobalLibraryWriter` remains the sole execution owner.
 
 ## Actual route inventory and chosen identity
@@ -136,7 +136,7 @@ immutable payload/work-key conflict, lost response, reopen and ambiguous retaine
 Session `coalesced_revision_does_not_accept_stale_save_ack`,
 `stale_save_ack_keeps_newer_preference_revision_dirty` and
 `reverting_before_save_ack_still_requires_latest_revision` cover local completion ordering.
-These establish current behavior and decision inputs; the proposed envelopes remain to be coded.
+These establish the original behavior and decision inputs; follow-up fixtures below cover implemented envelopes.
 
 Under OPT-1836, implement these finite leaves before marking that parent complete:
 
@@ -180,9 +180,40 @@ and closing queue even if a fresh client is later installed.
 
 The bounded queue, source/preference/label limits and current CAS transactions are unchanged.
 The new API is implemented, while legacy unframed methods and existing session producers still
-remain until OPT-2046/2047 adoption. Snapshot ordering/replay slots are OPT-2046 work; this common
-frame alone neither rejects lower snapshot revisions nor promises acquisition-local exact replay.
+remain until the relevant producer adoption. OPT-2046 below adds snapshot ordering/replay;
+the common frame by itself supplies only acquisition/context fencing. Vocabulary adoption is OPT-2047 work.
 No receipt table, source admission, file-operation authority or native physical qualification
 is added. Actual-owner fixtures cover all routes through a fresh owner with old context, current
 commit/CAS, mismatch checks, bounded admission, and pre-effect queued rejection / post-commit
 unconfirmable replies under a replaced profile root.
+
+
+## Implemented snapshot fences and session adoption (OPT-2046)
+
+The captured registry/preferences request's correlation is now explicitly the acquisition-local
+proposal revision. `SnapshotFences` retains exactly two `(revision, payload digest)` slots on the
+existing owner thread. Successful SQLite commit records a slot; failed/unconfirmed transactions
+supply no acknowledgement. Lower revisions return `GlobalSnapshotStaleRevision`, equal revisions
+with another payload return `GlobalSnapshotPayloadConflict`, and exact duplicates return the
+same typed unit acknowledgement/context without executing SQL again. A duplicate confirms its
+historical commit, not that no independent command has changed current storage since then.
+Slots reset with a new owner; stable operation receipt ledgers remain independent.
+
+Actual session `queue_save` and `queue_preference_save` construct the bounded immutable proposal
+from current loaded/coalesced state, capture the existing writer acquisition and retain its exact
+context in `SaveInFlight`/`PreferenceSaveInFlight`. Neither service swaps its writer into another
+acquisition. The completion context and typed snapshot result must match before local revision
+acceptance. A valid old acknowledgement leaves newer state dirty; registry resubmits only that
+newer current snapshot. Mismatched/stale-acquisition/disconnected results keep persistence
+unconfirmed and suspend shared confirmation. SQLite preference failures retain the existing
+route-local failure policy; they do not trigger blind replay. Shutdown/restart under a fresh
+valid acquisition loads authoritative storage before forming new proposals.
+
+Actual-owner fixtures prove ordering, conflicting payloads, response-loss replay without
+reapplying later values, failed transactions, two independent bounded slots and fresh-acquisition
+reopen. Session fixtures prove wrong-context and disconnected completions never clear dirty
+state or emit `Persisted`, newer coalesced registry state is the only next save, and fresh
+acquisition reload reconciles committed state. Four named preference integration fixtures use
+the explicit test-only no-capacity startup while preserving real owner/SQLite/restart. Production
+protected-reserve bootstrap is unchanged. Native retained capability checks remain separately
+scoped; these metadata tests supply no physical capacity/publication qualification.

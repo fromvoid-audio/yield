@@ -9,6 +9,20 @@ use super::tag_vocabulary::ProfileTagVocabularyInputError;
 /// Errors returned when operating on the library database.
 #[derive(Debug, Error)]
 pub enum LibraryError {
+    /// An ordinary snapshot proposal is older than this acquisition's last committed one.
+    #[error("global snapshot revision {proposed} is older than committed {committed}")]
+    GlobalSnapshotStaleRevision {
+        /// Supplied acquisition-local proposal revision.
+        proposed: u64,
+        /// Last committed acquisition-local proposal revision.
+        committed: u64,
+    },
+    /// One snapshot revision was reused for a different immutable payload.
+    #[error("global snapshot payload conflict at revision {revision}")]
+    GlobalSnapshotPayloadConflict {
+        /// Conflicting acquisition-local proposal revision.
+        revision: u64,
+    },
     /// Captured ordinary mutation belongs to a different acquisition; no transaction ran.
     #[error("stale global mutation acquisition")]
     GlobalMutationStaleAcquisition,
