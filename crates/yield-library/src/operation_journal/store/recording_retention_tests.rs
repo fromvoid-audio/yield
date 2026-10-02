@@ -466,7 +466,7 @@ fn recording_retention_capacity_exhaustion_preserves_existing_rows_and_rejects_b
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count, 8193);
+    assert_eq!(count, 8193 + 4); // Previously reserved controls remain intact too.
     assert!(
         store
             .recording_chunk_page(proposal.operation_id(), None)
@@ -606,7 +606,7 @@ fn recording_replaced_profile_rejects_before_retention_effect() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(rows, 0);
+    assert_eq!(rows, 4); // Initial reservations survived; no captured header was inserted.
     drop(store);
     fs::remove_dir_all(&root).unwrap();
     fs::rename(displaced, root).unwrap();
@@ -641,6 +641,11 @@ fn recording_retention_blocks_ordinary_charge_release_before_retirement_implemen
         &claims,
     )
     .unwrap();
+    // Reserved-only metadata already prevents release before any captured bytes exist.
+    assert!(store.persist_ordinary_claim_release(release_request(
+        proposal.operation_id(), claim_id, Uuid::new_v4()
+    )).is_err());
+    assert!(ordinary_claims::read_release(&store.connection, claim_id).unwrap().is_none());
     store
         .retain_recording_chunk(&initial_recording_header(&proposal))
         .unwrap();

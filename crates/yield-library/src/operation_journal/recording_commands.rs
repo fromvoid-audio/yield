@@ -12,6 +12,7 @@ use crate::file_operation_owner::{OutputIdentity, RootRegistrationRef};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub(crate) mod controls;
 /// Bounded reconstruction and seal observations; no live closure or filesystem authority.
 pub mod prefix;
 
