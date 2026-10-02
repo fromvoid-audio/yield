@@ -47,7 +47,8 @@ pub use catalog::{
     CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError, CatalogStatus,
     CatalogSubmitError, CatalogTagAssignmentPreview, CatalogTagAssignmentPreviewSource,
     CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
-    CatalogWavMetadataRequestError, FeatureAnalysisBlocker, FeatureAnalysisCancellation,
+    CatalogWavMetadataRequestError, CollectionHistoryCancellation, CollectionHistoryFailure,
+    CollectionHistoryRequest, FeatureAnalysisBlocker, FeatureAnalysisCancellation,
     FeatureAnalysisPhase, FeatureAnalysisState, FeaturePhaseMeasurement, HARVEST_FACTS_MAX_BYTES,
     HARVEST_FACTS_MAX_PATH_BYTES, HARVEST_FACTS_MAX_PATHS, HarvestFactsCancellation,
     HarvestFactsEntry, HarvestFactsFailure, HarvestState, IndexInspectionCancellation,
@@ -62,13 +63,13 @@ pub use catalog::{
     SOURCE_DISPLAY_LABEL_MAX_PATHS, SOURCE_INDEX_PAGE_MAX_ENTRIES, SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
     SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
     SOURCE_TAG_PAGE_MAX_TAG_IDS, SimilarityAspect, SimilarityCancellation,
-    SimilarityCandidateOutcome, SimilarityDispatchFailure, SourceCurationCommitReceipt,
-    SourceCurationOperationFailure, SourceCurationOperationFence, SourceCurationOperationOutcome,
-    SourceCurationTagFacts, SourceCurationUpdate, SourceDisplayLabelEntry,
-    SourceHarvestFactsRequest, SourceIndexInspectionError, SourceSimilarityRequest,
-    SourceSimilarityResult, SourceSimilarityRow, SourceTagAssignmentCursor,
-    SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
-    VerifiedSourceRoot, resolve_source_root,
+    SimilarityCandidateOutcome, SimilarityDispatchFailure, SourceCollectionHistorySelection,
+    SourceCurationCommitReceipt, SourceCurationOperationFailure, SourceCurationOperationFence,
+    SourceCurationOperationOutcome, SourceCurationTagFacts, SourceCurationUpdate,
+    SourceDisplayLabelEntry, SourceHarvestFactsRequest, SourceIndexInspectionError,
+    SourceSimilarityRequest, SourceSimilarityResult, SourceSimilarityRow,
+    SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor,
+    SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
 };
 use catalog::{CatalogService, CatalogSlot};
 use maintenance::{
@@ -2984,6 +2985,7 @@ mod tests {
         use super::*;
         include!("harvest_catalog_tests.rs");
     }
+    mod catalog_history_tests;
     mod snapshot_persistence {
         use super::*;
         include!("snapshot_persistence_tests.rs");
