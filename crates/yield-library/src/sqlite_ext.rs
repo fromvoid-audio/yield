@@ -17,6 +17,19 @@ mod policy;
 pub use policy::ExtensionLoadOutcome;
 use policy::ExtensionPolicyDecision;
 
+/// Whether any dynamic extension initialization was attempted in this process.
+/// Failed initialization can still install callbacks; bounded metadata policies fail closed.
+pub(crate) fn extension_load_attempted() -> bool {
+    loader::extension_load_attempted()
+}
+
+/// Retain the process extension boundary only on the entering metadata owner thread.
+/// No wait or cross-thread authority transfer; a prior attempt or active loader rejects.
+pub(crate) fn try_extension_free_metadata_scope() -> Option<std::sync::RwLockReadGuard<'static, ()>>
+{
+    loader::try_extension_free_scope()
+}
+
 /// Environment variable pointing at a loadable SQLite extension (.so/.dll/.dylib).
 pub const SQLITE_EXT_ENV: &str = "YIELD_SQLITE_EXT";
 
@@ -63,4 +76,12 @@ pub fn try_load_optional_extension(
             })
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn load_extension_for_test(
+    conn: &Connection,
+    path: &std::path::Path,
+) -> Result<(), rusqlite::Error> {
+    loader::load_extension(conn, path)
 }

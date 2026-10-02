@@ -47,15 +47,26 @@ pub(crate) fn retained_wal_bytes(connection: &Connection) -> Result<u64, WalAdmi
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(unavailable("writable database is not in WAL mode"));
     }
+    retained_sqlite_file_bytes(connection, ffi::SQLITE_FCNTL_JOURNAL_POINTER)
+}
+
+pub(crate) fn retained_database_bytes(connection: &Connection) -> Result<u64, WalAdmissionError> {
+    retained_sqlite_file_bytes(connection, ffi::SQLITE_FCNTL_FILE_POINTER)
+}
+
+fn retained_sqlite_file_bytes(
+    connection: &Connection,
+    opcode: i32,
+) -> Result<u64, WalAdmissionError> {
     let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
     // SAFETY: rusqlite's non-Sync Connection is held on its sole owner thread; there are no
     // concurrent calls on it. SQLite documents JOURNAL_POINTER as writing a borrowed sqlite3_file
-    // pointer (the WAL in WAL mode). It is used only within this call and never closes/escapes.
+    // pointer (database or journal depending on opcode). It is used only within this call and never closes/escapes.
     let result = unsafe {
         ffi::sqlite3_file_control(
             connection.handle(),
             c"main".as_ptr(),
-            ffi::SQLITE_FCNTL_JOURNAL_POINTER,
+            opcode,
             (&mut file as *mut *mut ffi::sqlite3_file).cast(),
         )
     };

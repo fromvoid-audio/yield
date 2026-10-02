@@ -131,9 +131,9 @@ pub use write::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite, SourceCommandId, SourceContentHashWrite,
     SourceCurationCommitReceipt, SourceCurationUpdate, SourceDirectoryTruthCommitResult,
     SourceFileWrite, SourceIndexCommitResult, SourceRevision, SourceScanFence, SourceSnapshotOwner,
-    SourceSnapshotPage, SourceTagAssignmentMutation, SourceTagAssignmentSelection, SourceTagWrite,
-    SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
-    SourceWriterReceipt, SourceWriterRequest,
+    SourceSnapshotPage, SourceTagAssignmentMutation, SourceTagAssignmentSelection,
+    SourceTagMetadataBudget, SourceTagWrite, SourceWriteCommand, SourceWriter,
+    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 
 /// Hidden filename used for per-source databases.

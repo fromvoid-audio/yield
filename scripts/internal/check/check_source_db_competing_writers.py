@@ -39,6 +39,8 @@ SOURCE_EXCEPTIONS = {
 # Source owner, lease control, snapshot destination, global library, and journal
 # opens are separate reviewed boundaries. New raw opens need an explicit review.
 RAW_EXCEPTIONS = {
+    # Bundled in-memory schema/runtime reference; no source path or durable writer is opened.
+    ("crates/yield-library/src/sample_sources/db/schema/metadata_budget.rs", "reference_image", "open_in_memory"): 1,
     ("crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs", "open_sqlite", "open_with_flags"): 1,
     ("crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs", "open_sqlite", "open_with_flags_and_vfs"): 1,
     ("crates/yield-library/src/sample_sources/db/mod.rs", "snapshot_to_path_with_held_write_fence", "open"): 1,
@@ -175,6 +177,8 @@ def inventory_label(call: Call) -> str:
         return "source-owner"
     if call.path.endswith("/source_lease.rs"):
         return "source-lease-control"
+    if call.path.endswith("/schema/metadata_budget.rs") and call.function == "reference_image" and call.opener == "open_in_memory":
+        return "in-memory-schema-probe"
     if call.path.endswith("/schema/mod.rs"):
         return "in-memory-schema-probe"
     if call.path.endswith("/mod.rs") and call.function == "snapshot_to_path_with_held_write_fence":

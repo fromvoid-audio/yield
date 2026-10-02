@@ -2170,7 +2170,7 @@ fn validate_database_root(
         .map_err(map_database_root_error)
 }
 
-const LEASE_TABLE_SQL: &str = "CREATE TABLE source_lease (
+pub(super) const LEASE_TABLE_SQL: &str = "CREATE TABLE source_lease (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     lease_schema_version INTEGER NOT NULL CHECK (lease_schema_version = 1),
     media_root_identity TEXT NOT NULL,
