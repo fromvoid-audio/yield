@@ -28,6 +28,7 @@ const STALE_CONTEXT_MESSAGE: &str =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContextMenuAction {
     AnalyzeFeatures,
+    ToggleSimilarityAnchor,
     Reveal,
     CopyPath,
     Unlock,
@@ -458,6 +459,9 @@ impl Browser {
         let target = menu.target.clone();
         self.close_context_menu(cx);
         match (action, target) {
+            (ContextMenuAction::ToggleSimilarityAnchor, ContextMenuTarget::Sample(target)) => {
+                self.toggle_similarity_anchor(target.relative_path, cx);
+            }
             (ContextMenuAction::AnalyzeFeatures, ContextMenuTarget::Sample(target)) => {
                 self.request_feature_analysis(
                     target.source_id,
@@ -586,6 +590,7 @@ fn context_menu_actions(
         ContextMenuAction::Reveal,
         ContextMenuAction::CopyPath,
         ContextMenuAction::AnalyzeFeatures,
+        ContextMenuAction::ToggleSimilarityAnchor,
     ];
     if curation.is_some_and(|curation| {
         curation.rating().value() == MAX_RATING && curation.rating().locked()
@@ -766,6 +771,7 @@ fn source_primary_menu_action(
 fn context_menu_action_label(action: ContextMenuAction) -> &'static str {
     match action {
         ContextMenuAction::AnalyzeFeatures => "Analyze features",
+        ContextMenuAction::ToggleSimilarityAnchor => "Toggle similarity anchor",
         ContextMenuAction::Reveal => file_manager_reveal_label(),
         ContextMenuAction::CopyPath => "Copy Path",
         ContextMenuAction::Unlock => "Unlock",
@@ -890,6 +896,7 @@ mod tests {
                 ContextMenuAction::Reveal,
                 ContextMenuAction::CopyPath,
                 ContextMenuAction::AnalyzeFeatures,
+                ContextMenuAction::ToggleSimilarityAnchor,
                 ContextMenuAction::Unlock,
                 ContextMenuAction::RemoveFromCollection { slot: 3 },
             ]
