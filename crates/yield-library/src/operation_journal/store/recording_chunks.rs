@@ -125,7 +125,10 @@ impl OperationJournalStore {
         let journal_bytes = plan.allocations().iter().filter(|a| a.class() == crate::operation_journal::full_capacity::FullCapacityAllocationClass::JournalRecord && a.volume() == &facts.identity).try_fold(0u64, |sum,a|sum.checked_add(a.logical_bytes())).ok_or_else(||error("journal capacity bound overflow"))?;
         if journal_bytes
             < crate::operation_journal::recording_commands::RECORDING_JOURNAL_PEAK_BYTES
-            || proposal.retained_metadata_bound().map_err(error)?
+            || crate::operation_journal::recording_commands::controls::reservation_metadata_bound(
+                proposal,
+            )
+            .map_err(error)?
                 > crate::operation_journal::recording_commands::MAX_RECORDING_RETAINED_ENCODED_BYTES
         {
             return Err(error(
@@ -194,6 +197,7 @@ impl OperationJournalStore {
             self.validate_namespace_without_sidecars()?;
             let proposal = self.recording_proposal(chunk.operation_id())?;
             let encoded = chunk.encode(&proposal).map_err(error)?;
+            self.verify_recording_reservation(&proposal, true)?;
             if let Some((sequence, existing)) =
                 self.read_recording_chunk_inside(chunk.chunk_id(), &proposal)?
             {
@@ -215,7 +219,7 @@ impl OperationJournalStore {
                     "recording slot has a different immutable chunk identity",
                 ));
             }
-            let (rows, bytes): (i64,i64) = self.connection.query_row("SELECT COUNT(*), COALESCE(SUM(bytes),0) FROM (SELECT length(record) AS bytes FROM operation_journal_recording_chunks LIMIT 8193)", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (rows, bytes) = self.recording_retained_totals()?;
             if rows >= MAX_ROWS
                 || bytes
                     .checked_add(encoded.len() as i64)
@@ -310,7 +314,7 @@ impl OperationJournalStore {
             return Err(error("cannot append after a short final PCM slot"));
         }
         if matches!(chunk.role(), RecordingChunkRole::Pcm { .. }) {
-            let patched: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot>10000)", params![chunk.operation_id().to_string()], |r| r.get(0))?;
+            let patched: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot BETWEEN 10001 AND 10015)", params![chunk.operation_id().to_string()], |r| r.get(0))?;
             if patched {
                 return Err(error("capture prefix already entered header finalization"));
             }
@@ -324,6 +328,7 @@ impl OperationJournalStore {
     ) -> Result<Option<RecordingCapturedChunk>, OperationJournalStoreError> {
         self.validate_namespace()?;
         let proposal = self.recording_proposal(operation_id)?;
+        self.verify_recording_reservation(&proposal, false)?;
         let result = self
             .read_recording_chunk_inside(chunk_id, &proposal)?
             .map(|(_, c)| c);
@@ -340,7 +345,8 @@ impl OperationJournalStore {
             return Err(error("invalid recording recovery cursor"));
         }
         let proposal = self.recording_proposal(operation_id)?;
-        let mut statement = self.connection.prepare("SELECT CASE WHEN typeof(chunk_id)='text' AND length(chunk_id)=36 THEN chunk_id ELSE NULL END,sequence FROM operation_journal_recording_chunks WHERE operation_id=?1 AND sequence>?2 ORDER BY sequence LIMIT 9")?;
+        self.verify_recording_reservation(&proposal, false)?;
+        let mut statement = self.connection.prepare("SELECT CASE WHEN typeof(chunk_id)='text' AND length(chunk_id)=36 THEN chunk_id ELSE NULL END,sequence FROM operation_journal_recording_chunks WHERE operation_id=?1 AND sequence>?2 AND slot NOT BETWEEN 20000 AND 20003 ORDER BY sequence LIMIT 9")?;
         let keys = statement
             .query_map(
                 params![operation_id.to_string(), after_sequence.unwrap_or(0)],

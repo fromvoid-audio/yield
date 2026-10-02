@@ -69,6 +69,7 @@ use super::validation::{RecordConsistency, classify_record};
 mod chunk_claims;
 mod chunk_staging;
 mod recording_chunks;
+mod recording_controls;
 pub(crate) use recording_chunks::{RecordingChunkPage, RecordingChunkReceipt};
 mod frozen_copy;
 #[allow(dead_code)]
@@ -946,6 +947,8 @@ pub struct OperationJournalStore {
     database_identity: String,
     database_root: BoundDatabaseRoot,
     profile_guard: WritableProfileGuard,
+    #[cfg(test)]
+    recording_readback_corruption: std::sync::Mutex<Option<uuid::Uuid>>,
     #[cfg(test)]
     insert_test_hook:
         std::sync::Mutex<Option<Box<dyn FnMut(InsertTestBoundary) -> InsertTestDirective + Send>>>,
@@ -3274,6 +3277,8 @@ impl OperationJournalStore {
             database_identity,
             database_root,
             profile_guard: retained_profile_guard,
+            #[cfg(test)]
+            recording_readback_corruption: std::sync::Mutex::new(None),
             #[cfg(test)]
             insert_test_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -6048,6 +6053,16 @@ impl OperationJournalStore {
                 None,
             );
         }
+        if let Err(error) = self.prepare_recording_initial_policy(record) {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                error,
+                None,
+                encoded.len(),
+                None,
+            );
+        }
         #[cfg(test)]
         if let Some(InsertTestDirective::Fail(error)) =
             self.insert_test_directive(InsertTestBoundary::BeforeBegin)
@@ -6078,6 +6093,14 @@ impl OperationJournalStore {
                 return self.rollback_insert_failure(operation_id, error, None, encoded.len());
             }
         };
+        if let Err(error) = self.reserve_recording_initial_inside_transaction(record) {
+            return self.rollback_insert_failure(
+                operation_id,
+                error,
+                Some(receipt.sequence),
+                encoded.len(),
+            );
+        }
         if let Some(claims) = claims {
             if let Err(error) = ordinary_claims::insert_rows_inside_transaction(
                 &self.connection,
@@ -6219,6 +6242,16 @@ impl OperationJournalStore {
                     Some(operation_id),
                     String::from("committed journal row could not be read back identically"),
                 ),
+                Some(receipt.sequence),
+                encoded.len(),
+                None,
+            );
+        }
+        if let Err(error) = self.verify_recording_initial_readback(record) {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::CommittedButNotAcknowledged,
+                error,
                 Some(receipt.sequence),
                 encoded.len(),
                 None,
@@ -8790,6 +8823,7 @@ impl From<EncodeError> for OperationJournalStoreError {
 #[cfg(test)]
 mod tests {
     include!("store/recording_retention_tests.rs");
+    include!("store/recording_control_tests.rs");
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]
