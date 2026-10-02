@@ -118,6 +118,7 @@ const PANE_RESIZE_RAIL: f32 = 6.0;
 enum PaneAxis {
     Sidebar,
     Waveform,
+    Collections,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -134,6 +135,9 @@ struct SidebarResizeToken;
 #[derive(Clone, Copy, Debug)]
 struct WaveformResizeToken;
 
+#[derive(Clone, Copy, Debug)]
+struct CollectionsResizeToken;
+
 struct PaneResizeGhost;
 
 impl Render for PaneResizeGhost {
@@ -149,6 +153,18 @@ fn sidebar_width(preferred: Option<f32>, window_width: f32, theme: &Theme) -> f3
     bounded_size(
         preferred.unwrap_or(theme.spacing.sidebar_width),
         MIN_SIDEBAR_WIDTH.min(maximum),
+        maximum,
+    )
+}
+
+pub(super) fn collections_height(preferred: Option<f32>, window_height: f32, theme: &Theme) -> f32 {
+    let minimum = theme.spacing.row_height * 2.0 + PANE_RESIZE_RAIL;
+    let maximum = (window_height * 0.25)
+        .max(minimum)
+        .min(360.0_f32.max(minimum));
+    bounded_size(
+        preferred.unwrap_or(theme.spacing.row_height * 5.0),
+        minimum,
         maximum,
     )
 }
@@ -530,6 +546,14 @@ impl Browser {
                 ),
                 self.preferred_sidebar_width,
             ),
+            PaneAxis::Collections => (
+                collections_height(
+                    self.preferred_collections_height,
+                    f32::from(window.bounds().size.height),
+                    theme,
+                ),
+                self.preferred_collections_height,
+            ),
             PaneAxis::Waveform => (
                 waveform_height(
                     self.preferred_waveform_height,
@@ -555,7 +579,7 @@ impl Browser {
             gesture: ResizeDrag::begin(
                 match axis {
                     PaneAxis::Sidebar => f32::from(position.x),
-                    PaneAxis::Waveform => f32::from(position.y),
+                    PaneAxis::Waveform | PaneAxis::Collections => f32::from(position.y),
                 },
                 start_size,
                 previous_preference,
@@ -585,6 +609,14 @@ impl Browser {
                 self.preferred_sidebar_width = Some(sidebar_width(
                     Some(requested),
                     f32::from(window.bounds().size.width),
+                    theme,
+                ));
+            }
+            PaneAxis::Collections => {
+                let requested = drag.gesture.requested_size(f32::from(position.y));
+                self.preferred_collections_height = Some(collections_height(
+                    Some(requested),
+                    f32::from(window.bounds().size.height),
                     theme,
                 ));
             }
@@ -627,6 +659,9 @@ impl Browser {
         };
         match drag.axis {
             PaneAxis::Sidebar => self.preferred_sidebar_width = drag.gesture.previous_preference(),
+            PaneAxis::Collections => {
+                self.preferred_collections_height = drag.gesture.previous_preference()
+            }
             PaneAxis::Waveform => {
                 self.preferred_waveform_height = drag.gesture.previous_preference()
             }
@@ -687,6 +722,52 @@ impl Browser {
             })
             .on_drag_move::<SidebarResizeToken>(cx.listener(
                 |view, event: &DragMoveEvent<SidebarResizeToken>, window, cx| {
+                    view.update_pane_resize(event.event.position, window, cx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseUpEvent, window, cx| {
+                    view.finish_pane_resize(event.position, window, cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseUpEvent, window, cx| {
+                    view.finish_pane_resize(event.position, window, cx);
+                }),
+            )
+    }
+
+    pub(super) fn render_collections_resize_rail(
+        &self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let rail_color = color(theme.colors.border);
+        let hover_color = color(theme.colors.border_emphasis);
+        div()
+            .id("sidebar-collections-resize")
+            .debug_selector(|| String::from("sidebar-collections-resize"))
+            .flex_none()
+            .w_full()
+            .h(px(PANE_RESIZE_RAIL))
+            .cursor_row_resize()
+            .bg(rail_color)
+            .hover(move |style| style.bg(hover_color))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                    window.prevent_default();
+                    view.begin_pane_resize(PaneAxis::Collections, event.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_drag(CollectionsResizeToken, |_, _, _, cx| {
+                cx.new(|_| PaneResizeGhost)
+            })
+            .on_drag_move::<CollectionsResizeToken>(cx.listener(
+                |view, event: &DragMoveEvent<CollectionsResizeToken>, window, cx| {
                     view.update_pane_resize(event.event.position, window, cx);
                 },
             ))
@@ -2450,6 +2531,7 @@ impl Render for Browser {
                         self,
                         theme.clone(),
                         motion_frame,
+                        f32::from(window.bounds().size.height),
                         cx,
                     ))
                     .child(self.render_sidebar_resize_rail(theme.clone(), cx))
