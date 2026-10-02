@@ -212,3 +212,8 @@ evidence boundary for those later tickets.
 - Local validation for this docs-only change: link/anchor review, matrix
   completeness review, whitespace check, and scoped diff review. No runtime
   tests are claimed.
+
+The [durability qualification matrix](DURABILITY_QUALIFICATION_MATRIX.md)
+(OPT-1843) defines bounded evidence categories and portable schema fixtures for
+these four claims. Its synthetic/observed review records provide no production
+qualification or live owner authority.
