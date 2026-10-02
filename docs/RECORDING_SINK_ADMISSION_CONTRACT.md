@@ -4,15 +4,16 @@ This decision names the missing portable contracts before activating recording i
 It does not implement namespace admission, a journal recording adapter, a qualified creation
 backend, native device capture or physical durability. OPT-1339 remains open.
 
-## Actual producer and current hazards
+## Producer inventory and hazards at the OPT-2041 decision
 
 Repository search `rg -n 'AudioRecorder|RecorderWriter|WavSampleWriter|RecordingOutcome'
 crates -g '*.rs'` finds the exported `reson::AudioRecorder` / `RecordingOutcome`, recording
 implementation and its tests. There is no current Yield GPUI/session/core producer of this
 recording API. `reson/src/lib.rs` reexports it; absence of an app caller does not make its
-path-opening behavior safe for future activation or external use.
+original path-opening behavior safe for future activation or external use. The following
+table records the pre-migration implementation; see the OPT-2056 status below.
 
-| Route | Current owned work | Missing boundary |
+| Route | Original owned work | Missing boundary |
 | --- | --- | --- |
 | `reson/src/recording/mod.rs` `AudioRecorder::start(config, PathBuf)` | Calls capture bootstrap, then CPAL `stream.play`; retains diagnostic pathname | No prepared output, live owner grant or absent-target predicate. |
 | `recording/capture.rs` `start_recording_runtime` | Resolves device/config; spawns writer, creates monitor, builds input stream | Writer opens before stream construction/play succeeds; later failure can leave a created/truncated file. |
@@ -22,8 +23,33 @@ path-opening behavior safe for future activation or external use.
 
 The existing serialization and temporary-file tests are codec/worker behavior. They do not
 qualify file creation, collision handling, source/profile authority, physical reserve or sync.
-The direct writer call remains a tracked unsafe implementation exception until the migration
-leaf removes it. This decision does not mark that exception or the parent complete.
+OPT-2056 removes the direct writer call as described below. This decision and that source
+migration do not complete the recording parent or qualify a physical adapter.
+
+## OPT-2056 portable source migration
+
+`AudioRecorder::start(config, path)` now returns an explicit unsupported recording error
+before querying devices or opening a pathname. Existing targets, absent paths and symlinks
+remain unchanged. `start_into_sink` accepts an already retained `RecordingSink` byte transport,
+a finite maximum frame count and a diagnostic locator that is never opened. No Yield GPUI
+caller is activated.
+
+`RecordingLimits` validates the format, checked RIFF byte budget and two-second ring before
+allocation or encoding. Paused stream construction precedes header serialization; initial
+header write/seek/flush errors surface before `play`. A bounded wrapper rejects writes or
+absolute/current seeks outside the allocation and rejects end-relative seeks. The worker
+drains complete interleaved frames in batches of at most 4096 samples, checks the finite frame
+budget, and reports codec/join errors. Stop drains accepted input and returns
+`StoppedUnpublished`; cancel/drop retain only a bounded prefix with `CancelledRetained`.
+Neither state proves filesystem publication, durability or loss-free input. Callback losses
+and writer errors remain visible through health counters.
+
+The sink trait is byte plumbing, not an admitted capability. Arbitrary transport implementations
+may block; the production owner channel still needs the bounded backpressure/cancellation and
+live-grant rules below. OPT-2057 must implement the journal capture/chunk contract, and
+OPT-2058 must connect the actual owner adapter and producer before activation. Memory-codec
+and worker tests exercise real serialization and failure propagation but do not provide
+physical qualification or native device lifecycle verification. OPT-1339 stays open.
 
 ## Chosen bounded transport and admission
 

@@ -21,10 +21,11 @@ use monitor::RecordingMonitor;
 use writer::RecorderWriter;
 
 pub use health::RecordingHealth;
+pub use writer::{RecordingLimits, RecordingPrefixState, RecordingSink};
 
 /// Summary returned when a recording completes.
 pub struct RecordingOutcome {
-    /// Path to the recorded WAV file on disk.
+    /// Diagnostic target locator; codec completion does not prove publication or reopen it.
     pub path: PathBuf,
     /// Input configuration used for the capture.
     pub resolved: ResolvedInput,
@@ -34,6 +35,8 @@ pub struct RecordingOutcome {
     pub duration_seconds: f32,
     /// Capture overrun and worker-failure counters for the completed session.
     pub health: RecordingHealth,
+    /// Unpublished prefix disposition; only the app owner may validate and publish staging.
+    pub prefix_state: RecordingPrefixState,
 }
 
 /// Active audio recorder that streams samples to a WAV file.
@@ -48,9 +51,24 @@ pub struct AudioRecorder {
 }
 
 impl AudioRecorder {
-    /// Start recording to the provided output path using the given input config.
-    pub fn start(config: &AudioInputConfig, path: PathBuf) -> Result<Self, AudioInputError> {
-        let runtime = capture::start_recording_runtime(config, &path)?;
+    /// Unadmitted pathname startup is unsupported and never opens/truncates an output.
+    /// Use an already retained sink through the app's actual owner/admission adapter.
+    pub fn start(_config: &AudioInputConfig, _path: PathBuf) -> Result<Self, AudioInputError> {
+        Err(AudioInputError::RecordingFailed {
+            detail: "Recording requires an admitted retained sink; pathname startup unsupported"
+                .into(),
+        })
+    }
+
+    /// Encode a finite capture into an already retained byte transport, without publication.
+    /// The app owns filesystem admission/collision/closure; `diagnostic_path` is never opened.
+    pub fn start_into_sink(
+        config: &AudioInputConfig,
+        sink: Box<dyn RecordingSink>,
+        max_frames: u64,
+        diagnostic_path: PathBuf,
+    ) -> Result<Self, AudioInputError> {
+        let runtime = capture::start_recording_runtime(config, sink, max_frames)?;
         runtime
             .stream
             .play()
@@ -59,7 +77,7 @@ impl AudioRecorder {
             stream: Some(runtime.stream),
             writer: Some(runtime.writer),
             resolved: runtime.resolved,
-            path,
+            path: diagnostic_path,
             monitor: runtime.monitor,
             health: runtime.health,
             active: true,
@@ -95,12 +113,25 @@ impl AudioRecorder {
             frames: stats.frames,
             duration_seconds,
             health: self.health(),
+            prefix_state: stats.state,
         })
+    }
+
+    /// Cancel at a bounded writer barrier and retain the unpublished prefix; never delete a path.
+    pub fn cancel(&mut self) -> Result<RecordingOutcome, AudioInputError> {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.cancel();
+        }
+        self.stop()
     }
 
     /// Return true while the recorder is actively capturing audio.
     pub fn is_active(&self) -> bool {
         self.active
+            && !self
+                .health
+                .writer_failed
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Return the resolved input configuration used for recording.
@@ -137,12 +168,44 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn unadmitted_pathname_start_preserves_existing_absent_and_symlink_outputs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recording.wav");
+        std::fs::write(&path, b"preserve original").unwrap();
+        let result = AudioRecorder::start(&AudioInputConfig::default(), path.clone());
+        assert!(
+            matches!(result, Err(AudioInputError::RecordingFailed { detail }) if detail.contains("admitted retained sink"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve original");
+        let absent = dir.path().join("absent.wav");
+        assert!(AudioRecorder::start(&AudioInputConfig::default(), absent.clone()).is_err());
+        assert!(!absent.exists());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("linked.wav");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(AudioRecorder::start(&AudioInputConfig::default(), link.clone()).is_err());
+            assert!(
+                std::fs::symlink_metadata(link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read(path).unwrap(), b"preserve original");
+        }
+    }
+
+    #[test]
     fn recorder_is_active_clears_after_stop() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("recording.wav");
         let health = Arc::new(RecordingHealthState::default());
-        let (writer, _capture) =
-            RecorderWriter::spawn(path.clone(), 48_000, 2, Arc::clone(&health)).unwrap();
+        let (writer, _capture) = RecorderWriter::spawn(
+            Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+            RecordingLimits::new(48_000, 2, 100).unwrap(),
+            Arc::clone(&health),
+        )
+        .unwrap();
         let (monitor, _monitor_capture) =
             monitor::start_recording_monitor(48_000, 2, Arc::clone(&health));
         let resolved = ResolvedInput {

@@ -1,38 +1,106 @@
-//! Background WAV-writer worker for recording sessions.
-
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+//! Bounded background WAV serialization into an already retained transport.
+//!
+//! No pathname opens or publication authority live here. The app's owner adapter remains
+//! responsible for admission, retained staging identity, sync/validation and publication.
+use super::health::RecordingHealthState;
+use crate::input::AudioInputError;
+use ringbuf::{HeapRb, traits::*};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use ringbuf::{HeapRb, traits::*};
-
-use crate::input::AudioInputError;
-
-use super::health::RecordingHealthState;
-
-const WRITER_BUFFER_SECONDS: usize = 2;
-const WRITER_DRAIN_SAMPLES: usize = 4_096;
+const WRITER_DRAIN_SAMPLES: usize = 4096;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const RUNNING: u8 = 0;
+const STOPPED: u8 = 1;
+const CANCELLED: u8 = 2;
 
-/// Writer-thread result summary returned when recording stops cleanly.
-#[derive(Clone, Copy)]
-pub(super) struct RecordingStats {
-    pub(super) frames: u64,
+/// Already retained byte transport. This interface grants no filesystem authority.
+/// Yield must supply its admitted owner channel; arbitrary transports are useful for codecs/tests.
+pub trait RecordingSink: Write + Seek + Send {}
+impl<T: Write + Seek + Send> RecordingSink for T {}
+
+/// Validated finite float32 WAV and callback-ring bounds.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordingLimits {
+    sample_rate: u32,
+    channels: u16,
+    max_frames: u64,
+    max_bytes: u64,
+    ring_samples: usize,
+}
+impl RecordingLimits {
+    /// Validate before allocating a ring or writing a header to any transport.
+    pub fn new(sample_rate: u32, channels: u16, max_frames: u64) -> Result<Self, AudioInputError> {
+        if !(1..=192_000).contains(&sample_rate) || !(1..=8).contains(&channels) || max_frames == 0
+        {
+            return Err(failed("invalid finite recording format/frame bounds"));
+        }
+        let max_bytes = max_frames
+            .checked_mul(u64::from(channels))
+            .and_then(|v| v.checked_mul(4))
+            .and_then(|v| v.checked_add(128))
+            .filter(|v| *v <= u64::from(u32::MAX))
+            .ok_or_else(|| failed("recording exceeds RIFF byte budget"))?;
+        let ring_samples = usize::try_from(sample_rate)
+            .ok()
+            .and_then(|v| v.checked_mul(usize::from(channels)))
+            .and_then(|v| v.checked_mul(2))
+            .filter(|v| *v <= 3_072_000)
+            .ok_or_else(|| failed("recording ring exceeds budget"))?;
+        Ok(Self {
+            sample_rate,
+            channels,
+            max_frames,
+            max_bytes,
+            ring_samples,
+        })
+    }
+    /// Maximum accepted audio frames; the transport/header allowance is separately checked.
+    pub fn max_frames(&self) -> u64 {
+        self.max_frames
+    }
+    /// Conservative maximum encoded bytes including bounded header patches.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
 }
 
-/// Lock-free producer owned exclusively by the capture callback.
+/// A codec completion is always unpublished; only an admitted owner can publish staging.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordingPrefixState {
+    /// User Stop drained the accepted ring and finalized its bounded prefix.
+    StoppedUnpublished,
+    /// Cancellation/drop retained a bounded partial prefix; no publication/cleanup was requested.
+    CancelledRetained,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RecordingStats {
+    pub(super) frames: u64,
+    pub(super) state: RecordingPrefixState,
+}
+
 pub(super) struct RecorderCapture {
     producer: ringbuf::HeapProd<f32>,
     health: Arc<RecordingHealthState>,
+    pub(super) mode: Arc<AtomicU8>,
+    channels: usize,
 }
-
 impl RecorderCapture {
     pub(super) fn submit(&mut self, samples: &[f32]) {
-        if self.producer.vacant_len() < samples.len() {
+        if samples.len() % self.channels != 0 {
+            self.health.writer_failed.store(true, Ordering::Release);
+            self.mode.store(CANCELLED, Ordering::Release);
+        }
+        if self.mode.load(Ordering::Acquire) != RUNNING
+            || self.health.writer_failed.load(Ordering::Acquire)
+            || self.producer.vacant_len() < samples.len()
+        {
             self.health
                 .writer_dropped_samples
                 .fetch_add(samples.len() as u64, Ordering::Relaxed);
@@ -46,245 +114,254 @@ impl RecorderCapture {
     }
 }
 
-/// Joinable WAV writer worker bound to one active recording session.
 pub(super) struct RecorderWriter {
-    stop: Arc<AtomicBool>,
+    mode: Arc<AtomicU8>,
     join: Option<JoinHandle<Result<RecordingStats, AudioInputError>>>,
 }
-
 impl RecorderWriter {
+    /// Prepare callback state without opening or writing a transport.
+    pub(super) fn prepare_capture(
+        limits: RecordingLimits,
+        health: Arc<RecordingHealthState>,
+    ) -> (RecorderCapture, ringbuf::HeapCons<f32>) {
+        let (producer, consumer) = HeapRb::<f32>::new(limits.ring_samples).split();
+        (
+            RecorderCapture {
+                producer,
+                health,
+                mode: Arc::new(AtomicU8::new(RUNNING)),
+                channels: usize::from(limits.channels),
+            },
+            consumer,
+        )
+    }
+
+    /// Start serialization only after paused stream construction and limits validation.
+    pub(super) fn spawn_prepared(
+        sink: Box<dyn RecordingSink>,
+        limits: RecordingLimits,
+        consumer: ringbuf::HeapCons<f32>,
+        mode: Arc<AtomicU8>,
+        health: Arc<RecordingHealthState>,
+    ) -> Result<Self, AudioInputError> {
+        let writer = WavSampleWriter::new(sink, limits)?;
+        let worker_mode = Arc::clone(&mode);
+        let join = thread::Builder::new()
+            .name("reson-recording-writer".into())
+            .spawn(move || {
+                let result = writer_loop(writer, consumer, &worker_mode);
+                if result.is_err() {
+                    health.writer_failed.store(true, Ordering::Release);
+                }
+                result
+            })
+            .map_err(|error| failed(&format!("recorder thread unavailable: {error}")))?;
+        Ok(Self {
+            mode,
+            join: Some(join),
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn spawn(
-        path: PathBuf,
-        sample_rate: u32,
-        channels: u16,
+        sink: Box<dyn RecordingSink>,
+        limits: RecordingLimits,
         health: Arc<RecordingHealthState>,
     ) -> Result<(Self, RecorderCapture), AudioInputError> {
-        let writer = WavSampleWriter::new(&path, sample_rate, channels)?;
-        let capacity = (sample_rate as usize)
-            .saturating_mul(channels.max(1) as usize)
-            .saturating_mul(WRITER_BUFFER_SECONDS)
-            .max(1);
-        let ring = HeapRb::<f32>::new(capacity);
-        let (producer, consumer) = ring.split();
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let worker_health = Arc::clone(&health);
-        let join = thread::spawn(move || {
-            let result = writer_loop(writer, consumer, &worker_stop);
-            record_writer_result(&result, &worker_health);
-            result
-        });
-        Ok((
-            Self {
-                stop,
-                join: Some(join),
-            },
-            RecorderCapture { producer, health },
-        ))
+        let (capture, consumer) = Self::prepare_capture(limits, Arc::clone(&health));
+        let writer =
+            Self::spawn_prepared(sink, limits, consumer, Arc::clone(&capture.mode), health)?;
+        Ok((writer, capture))
     }
-
-    /// Ask the writer to drain its bounded ring and finalize the WAV file.
+    /// Drain accepted frames; callers must stop/drop their input stream first.
     pub(super) fn stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        let _ = self
+            .mode
+            .compare_exchange(RUNNING, STOPPED, Ordering::AcqRel, Ordering::Acquire);
     }
-
+    /// Stop at a bounded frame barrier without publishing or deleting retained output.
+    pub(super) fn cancel(&mut self) {
+        self.mode.store(CANCELLED, Ordering::Release);
+    }
     pub(super) fn join(&mut self) -> Result<RecordingStats, AudioInputError> {
-        let handle = self
-            .join
+        self.join
             .take()
-            .ok_or_else(|| AudioInputError::RecordingFailed {
-                detail: "Recorder writer already joined".into(),
-            })?;
-        handle
+            .ok_or_else(|| failed("recorder writer already joined"))?
             .join()
-            .map_err(|_| AudioInputError::RecordingFailed {
-                detail: "Recorder writer thread panicked".into(),
-            })?
+            .map_err(|_| failed("recorder writer panicked; prefix is unconfirmed"))?
     }
 }
-
 impl Drop for RecorderWriter {
     fn drop(&mut self) {
-        self.stop();
-        if let Some(handle) = self.join.take() {
-            let _ = handle.join();
+        self.cancel();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
         }
-    }
-}
-
-fn record_writer_result(
-    result: &Result<RecordingStats, AudioInputError>,
-    health: &RecordingHealthState,
-) {
-    if result.is_err() {
-        health.writer_failed.store(true, Ordering::Release);
     }
 }
 
 fn writer_loop(
     mut writer: WavSampleWriter,
     mut consumer: ringbuf::HeapCons<f32>,
-    stop: &AtomicBool,
+    mode: &AtomicU8,
 ) -> Result<RecordingStats, AudioInputError> {
-    let mut samples = vec![0.0; WRITER_DRAIN_SAMPLES];
+    // A read batch must remain an exact number of interleaved frames for every accepted format.
+    let channels = usize::from(writer.limits.channels);
+    let mut samples = vec![0.0; WRITER_DRAIN_SAMPLES - WRITER_DRAIN_SAMPLES % channels];
     loop {
+        if mode.load(Ordering::Acquire) == CANCELLED {
+            break;
+        }
         let popped = consumer.pop_slice(&mut samples);
         if popped > 0 {
             writer.write_samples(&samples[..popped])?;
             continue;
         }
-        if stop.load(Ordering::Acquire) {
+        if mode.load(Ordering::Acquire) != RUNNING {
             break;
         }
         thread::sleep(IDLE_POLL_INTERVAL);
     }
-    writer.finalize()
+    let state = if mode.load(Ordering::Acquire) == CANCELLED {
+        RecordingPrefixState::CancelledRetained
+    } else {
+        RecordingPrefixState::StoppedUnpublished
+    };
+    writer.finalize(state)
+}
+
+struct BoundedSink {
+    inner: Box<dyn RecordingSink>,
+    position: u64,
+    limit: u64,
+}
+impl Write for BoundedSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let end = self
+            .position
+            .checked_add(bytes.len() as u64)
+            .filter(|v| *v <= self.limit)
+            .ok_or_else(|| io::Error::other("recording sink byte budget exceeded"))?;
+        let written = self.inner.write(bytes)?;
+        if written > bytes.len() {
+            return Err(io::Error::other("invalid sink write result"));
+        }
+        self.position = end - (bytes.len() - written) as u64;
+        Ok(written)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+impl Seek for BoundedSink {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let offset = match position {
+            SeekFrom::Start(v) => i128::from(v),
+            SeekFrom::Current(v) => i128::from(self.position) + i128::from(v),
+            SeekFrom::End(_) => {
+                return Err(io::Error::other(
+                    "unbounded end-relative recording seek unsupported",
+                ));
+            }
+        };
+        let offset = u64::try_from(offset)
+            .ok()
+            .filter(|v| *v <= self.limit)
+            .ok_or_else(|| io::Error::other("recording seek exceeds retained allocation"))?;
+        let observed = self.inner.seek(SeekFrom::Start(offset))?;
+        if observed != offset {
+            return Err(io::Error::other("recording sink seek result mismatch"));
+        }
+        self.position = offset;
+        Ok(offset)
+    }
 }
 
 struct WavSampleWriter {
-    writer: hound::WavWriter<BufWriter<File>>,
-    channels: u16,
+    writer: hound::WavWriter<BufWriter<BoundedSink>>,
+    limits: RecordingLimits,
     written_samples: u64,
 }
-
 impl WavSampleWriter {
-    fn new(path: &Path, sample_rate: u32, channels: u16) -> Result<Self, AudioInputError> {
+    fn new(
+        mut sink: Box<dyn RecordingSink>,
+        limits: RecordingLimits,
+    ) -> Result<Self, AudioInputError> {
+        if sink
+            .stream_position()
+            .map_err(|error| failed(&error.to_string()))?
+            != 0
+        {
+            return Err(failed(
+                "recording transport must start at its admitted origin",
+            ));
+        }
         let spec = hound::WavSpec {
-            channels,
-            sample_rate,
+            channels: limits.channels,
+            sample_rate: limits.sample_rate,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
         };
-        let file = File::create(path).map_err(|err| AudioInputError::RecordingFailed {
-            detail: format!("Failed to create wav file: {err}"),
-        })?;
-        let writer = hound::WavWriter::new(BufWriter::new(file), spec).map_err(|err| {
-            AudioInputError::RecordingFailed {
-                detail: format!("Failed to create wav writer: {err}"),
-            }
+        let mut writer = hound::WavWriter::new(
+            BufWriter::with_capacity(
+                16_384,
+                BoundedSink {
+                    inner: sink,
+                    position: 0,
+                    limit: limits.max_bytes,
+                },
+            ),
+            spec,
+        )
+        .map_err(|error| failed(&format!("WAV header unavailable: {error}")))?;
+        writer.flush().map_err(|error| {
+            failed(&format!(
+                "WAV initial header transport unconfirmed: {error}"
+            ))
         })?;
         Ok(Self {
             writer,
-            channels,
+            limits,
             written_samples: 0,
         })
     }
-
     fn write_samples(&mut self, samples: &[f32]) -> Result<(), AudioInputError> {
+        if samples.len() % usize::from(self.limits.channels) != 0 {
+            return Err(failed("incomplete interleaved recording frame"));
+        }
+        let next = self
+            .written_samples
+            .checked_add(samples.len() as u64)
+            .ok_or_else(|| failed("recording frame budget overflow"))?;
+        if next / u64::from(self.limits.channels) > self.limits.max_frames {
+            return Err(failed("recording frame budget exceeded; prefix retained"));
+        }
         for &sample in samples {
             self.writer
                 .write_sample(sample)
-                .map_err(|err| AudioInputError::RecordingFailed {
-                    detail: format!("Failed to write wav sample: {err}"),
-                })?;
-            self.written_samples += 1;
+                .map_err(|error| failed(&format!("recording sample write failed: {error}")))?;
         }
+        self.written_samples = next;
         Ok(())
     }
-
-    fn finalize(self) -> Result<RecordingStats, AudioInputError> {
+    fn finalize(self, state: RecordingPrefixState) -> Result<RecordingStats, AudioInputError> {
         self.writer
             .finalize()
-            .map_err(|err| AudioInputError::RecordingFailed {
-                detail: format!("Failed to finalize wav writer: {err}"),
-            })?;
-        let channels = self.channels.max(1) as u64;
+            .map_err(|error| failed(&format!("recording header/flush unconfirmed: {error}")))?;
         Ok(RecordingStats {
-            frames: self.written_samples / channels,
+            frames: self.written_samples / u64::from(self.limits.channels),
+            state,
         })
+    }
+}
+fn failed(detail: &str) -> AudioInputError {
+    AudioInputError::RecordingFailed {
+        detail: detail.into(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn wav_writer_outputs_float_wav() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("recording.wav");
-        let mut writer = WavSampleWriter::new(&path, 48_000, 2).unwrap();
-        writer.write_samples(&[0.0, 0.5, -0.5, 1.0]).unwrap();
-        let stats = writer.finalize().unwrap();
-        assert_eq!(stats.frames, 2);
-
-        let mut reader = hound::WavReader::open(&path).unwrap();
-        let spec = reader.spec();
-        assert_eq!(spec.channels, 2);
-        assert_eq!(spec.sample_rate, 48_000);
-        assert_eq!(spec.sample_format, hound::SampleFormat::Float);
-        assert_eq!(reader.samples::<f32>().count(), 4);
-    }
-
-    #[test]
-    fn recorder_stop_drains_in_flight_callback_samples() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("recording.wav");
-        let health = Arc::new(RecordingHealthState::default());
-        let (mut writer, mut capture) =
-            RecorderWriter::spawn(path.clone(), 48_000, 2, health).unwrap();
-
-        capture.submit(&[0.0, 0.25]);
-        capture.submit(&[-0.25, 0.5]);
-        writer.stop();
-
-        let stats = writer.join().unwrap();
-        assert_eq!(stats.frames, 2);
-
-        let reader = hound::WavReader::open(&path).unwrap();
-        let samples = reader
-            .into_samples::<f32>()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(samples, vec![0.0, 0.25, -0.25, 0.5]);
-    }
-
-    #[test]
-    fn recorder_drop_stops_worker_and_finalizes_file() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("recording.wav");
-        let health = Arc::new(RecordingHealthState::default());
-        let (writer, mut capture) = RecorderWriter::spawn(path.clone(), 48_000, 1, health).unwrap();
-        capture.submit(&[0.25, -0.25]);
-        drop(capture);
-
-        drop(writer);
-
-        let samples = hound::WavReader::open(&path)
-            .unwrap()
-            .into_samples::<f32>()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(samples, vec![0.25, -0.25]);
-    }
-
-    #[test]
-    fn stalled_writer_consumer_has_bounded_nonblocking_submission() {
-        let ring = HeapRb::<f32>::new(4);
-        let (producer, _consumer) = ring.split();
-        let health = Arc::new(RecordingHealthState::default());
-        let mut capture = RecorderCapture {
-            producer,
-            health: Arc::clone(&health),
-        };
-
-        capture.submit(&[0.0, 0.1, 0.2, 0.3, 0.4, 0.5]);
-
-        let snapshot = health.snapshot();
-        assert_eq!(snapshot.writer_dropped_samples, 6);
-        assert_eq!(snapshot.writer_overrun_events, 1);
-    }
-
-    #[test]
-    fn writer_failure_is_visible_in_health_snapshot() {
-        let health = RecordingHealthState::default();
-        let result = Err(AudioInputError::RecordingFailed {
-            detail: "synthetic writer failure".into(),
-        });
-
-        record_writer_result(&result, &health);
-
-        assert!(health.snapshot().writer_failed);
-    }
+    include!("writer_tests.rs");
 }
