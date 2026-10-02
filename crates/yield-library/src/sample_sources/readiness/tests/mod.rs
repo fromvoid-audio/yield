@@ -5,6 +5,7 @@ use crate::sample_sources::{SourceDatabase, SourceDatabaseConnectionRole};
 
 mod classification;
 mod persistence;
+mod progress;
 mod work;
 
 const SOURCE_ID: &str = "source-a";

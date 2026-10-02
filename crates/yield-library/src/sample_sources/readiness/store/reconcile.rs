@@ -380,12 +380,13 @@ fn build_snapshot(
     let mut entries = Vec::with_capacity(total);
     let mut deficits = Vec::new();
     let mut stage_counts = BTreeMap::new();
+    cancellation_checkpoint(cancel)?;
+    progress(ReadinessProgress::ComparingTargets {
+        completed: 0,
+        total,
+    });
     for (index, target) in targets.into_iter().enumerate() {
         cancellation_checkpoint(cancel)?;
-        progress(ReadinessProgress::ComparingTargets {
-            completed: index.saturating_add(1),
-            total,
-        });
         let key = target.key();
         let classification = classify_target(
             &target,
@@ -405,6 +406,10 @@ fn build_snapshot(
         entries.push(ReadinessEntry {
             target,
             classification,
+        });
+        progress(ReadinessProgress::ComparingTargets {
+            completed: index + 1,
+            total,
         });
     }
     let activity = resolve_activity(&entries, &deficits, now);

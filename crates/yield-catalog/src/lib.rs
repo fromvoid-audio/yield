@@ -63,14 +63,15 @@ mod curation;
 mod curation_tag_facts;
 mod display_labels;
 mod feature_job;
+mod feature_progress;
 mod feature_request;
 pub use feature_job::{
     ComputedFeatureJob, FeatureJobFailure, FeatureJobOutcome, PreparedFeatureJob,
     prepare_feature_job,
 };
+pub use feature_progress::{FeatureAnalysisPhase, FeaturePhaseMeasurement};
 pub use feature_request::{
-    FeatureAnalysisBlocker, FeatureAnalysisCancellation, FeatureAnalysisPhase,
-    FeatureAnalysisState, FeaturePhaseMeasurement,
+    FeatureAnalysisBlocker, FeatureAnalysisCancellation, FeatureAnalysisState,
 };
 mod index_pages;
 mod index_reveal;
@@ -15641,6 +15642,7 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     mod feature_job_tests;
+    mod feature_progress_tests;
     #[cfg(target_os = "linux")]
     mod feature_request_tests;
 }

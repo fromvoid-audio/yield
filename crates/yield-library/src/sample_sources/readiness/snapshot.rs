@@ -141,9 +141,9 @@ pub enum ReadinessProgress {
     },
     /// Actionable readiness targets are being checked for durable queue work.
     QueueingTargets {
-        /// Actionable targets checked so far.
+        /// Distinct target/version deficits checked so far, not newly queued or committed jobs.
         completed: usize,
-        /// Total actionable targets to check.
+        /// Total distinct already-loaded target/version deficits to check.
         total: usize,
     },
 }

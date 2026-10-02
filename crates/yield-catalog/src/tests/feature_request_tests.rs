@@ -38,7 +38,17 @@ mod fixtures {
             phases.push(FeatureAnalysisPhase::QueueingUnfinishedWork);
         }
         for phase in phases {
-            assert_eq!(phase.measurement(), FeaturePhaseMeasurement::Indeterminate);
+            assert_eq!(
+                phase.measurement(),
+                match phase {
+                    FeatureAnalysisPhase::InspectingManifest =>
+                        FeaturePhaseMeasurement::Indeterminate,
+                    _ => FeaturePhaseMeasurement::Targets {
+                        completed: 0,
+                        total: 1
+                    },
+                }
+            );
             assert_eq!(
                 state(service, id),
                 FeatureAnalysisState::Preparing { phase }
