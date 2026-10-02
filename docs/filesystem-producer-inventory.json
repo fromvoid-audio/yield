@@ -1,0 +1,607 @@
+{
+  "schema_version": 1,
+  "issue": "OPT-1636",
+  "baseline": "b3d3c8b41a780bcb468077e7916b8a8bd69183f5",
+  "rows": [
+    {
+      "path": "crates/reson/src/recording/writer.rs",
+      "function": "new",
+      "operation": "File::create",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1663",
+      "reason": "Existing recording WAV writer accepts a pathname and creates/truncates a file; this is not a qualified journal-backed user file operation.",
+      "retirement": "Audit its live recording caller and replace with bounded owner admission before claiming physical file-operation parity."
+    },
+    {
+      "path": "crates/reson/src/recording/writer.rs",
+      "function": "new",
+      "operation": "WavWriter::new",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1663",
+      "reason": "Existing recording WAV writer accepts a pathname and creates/truncates a file; this is not a qualified journal-backed user file operation.",
+      "retirement": "Audit its live recording caller and replace with bounded owner admission before claiming physical file-operation parity."
+    },
+    {
+      "path": "crates/yield-analysis/src/analysis/ann_index/container/mod.rs",
+      "function": "write_container",
+      "operation": "method::persist",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1655",
+      "reason": "Existing ANN/cache pathname producer; this entry does not grant ArtifactKey/store authority, no-replace publication or durability.",
+      "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
+    },
+    {
+      "path": "crates/yield-analysis/src/analysis/ann_index/container/stream_io.rs",
+      "function": "copy_range_with_hash",
+      "operation": "File::create",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1655",
+      "reason": "Existing ANN/cache pathname producer; this entry does not grant ArtifactKey/store authority, no-replace publication or durability.",
+      "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
+    },
+    {
+      "path": "crates/yield-analysis/src/analysis/ann_index/container/stream_io.rs",
+      "function": "create_tempfile",
+      "operation": "method::tempfile_in",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1655",
+      "reason": "Existing ANN/cache pathname producer; this entry does not grant ArtifactKey/store authority, no-replace publication or durability.",
+      "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
+    },
+    {
+      "path": "crates/yield-analysis/src/analysis/ann_index/publication.rs",
+      "function": "dump_hnsw",
+      "operation": "method::file_dump",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1655",
+      "reason": "Existing ANN/cache pathname producer; this entry does not grant ArtifactKey/store authority, no-replace publication or durability.",
+      "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
+    },
+    {
+      "path": "crates/yield-analysis/src/analysis/ann_index/publication.rs",
+      "function": "publish_index",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1655",
+      "reason": "Existing ANN/cache pathname producer; this entry does not grant ArtifactKey/store authority, no-replace publication or durability.",
+      "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
+    },
+    {
+      "path": "crates/yield-analysis/src/analysis/ann_index/state.rs",
+      "function": "file_dump",
+      "operation": "method::file_dump",
+      "count": 3,
+      "classification": "compatibility",
+      "issue": "OPT-1655",
+      "reason": "Existing ANN/cache pathname producer; this entry does not grant ArtifactKey/store authority, no-replace publication or durability.",
+      "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
+    },
+    {
+      "path": "crates/yield-analysis/src/analysis/ann_index/storage.rs",
+      "function": "index_root_dir",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1655",
+      "reason": "Existing ANN/cache pathname producer; this entry does not grant ArtifactKey/store authority, no-replace publication or durability.",
+      "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
+    },
+    {
+      "path": "crates/yield-analysis/src/analysis/ann_index/storage.rs",
+      "function": "remove_retired_artifacts",
+      "operation": "fs::remove_dir",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1655",
+      "reason": "Existing ANN/cache pathname producer; this entry does not grant ArtifactKey/store authority, no-replace publication or durability.",
+      "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
+    },
+    {
+      "path": "crates/yield-analysis/src/analysis/ann_index/storage.rs",
+      "function": "remove_retired_artifacts",
+      "operation": "fs::remove_file",
+      "count": 2,
+      "classification": "compatibility",
+      "issue": "OPT-1655",
+      "reason": "Existing ANN/cache pathname producer; this entry does not grant ArtifactKey/store authority, no-replace publication or durability.",
+      "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
+    },
+    {
+      "path": "crates/yield-analysis/src/analysis/ann_index/storage.rs",
+      "function": "remove_superseded_generation",
+      "operation": "fs::remove_file",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1655",
+      "reason": "Existing ANN/cache pathname producer; this entry does not grant ArtifactKey/store authority, no-replace publication or durability.",
+      "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
+    },
+    {
+      "path": "crates/yield-analysis/src/app_dirs.rs",
+      "function": "app_root_dir",
+      "operation": "fs::create_dir_all",
+      "count": 3,
+      "classification": "compatibility",
+      "issue": "OPT-1655",
+      "reason": "Existing ANN/cache pathname producer; this entry does not grant ArtifactKey/store authority, no-replace publication or durability.",
+      "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/overrides.rs",
+      "function": "set",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/paths.rs",
+      "function": "clear_rebuildable_cache_payloads",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1663",
+      "reason": "Older ambient disposable-cache clear API remains compiled; current session maintenance uses capability-relative storage_usage::clear instead.",
+      "retirement": "Retire this ambient API after the finite global/artifact caller audit confirms no remaining caller."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/paths.rs",
+      "function": "clear_rebuildable_cache_payloads",
+      "operation": "fs::remove_dir_all",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1663",
+      "reason": "Older ambient disposable-cache clear API remains compiled; current session maintenance uses capability-relative storage_usage::clear instead.",
+      "retirement": "Retire this ambient API after the finite global/artifact caller audit confirms no remaining caller."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/paths.rs",
+      "function": "create_app_subdir",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/paths.rs",
+      "function": "waveform_cache_dir",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/profile_ownership.rs",
+      "function": "open_child_dir",
+      "operation": "method::create_dir",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/profile_ownership.rs",
+      "function": "open_lock_file",
+      "operation": "OpenOptions::create",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/profile_ownership.rs",
+      "function": "open_lock_file",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/profile_ownership.rs",
+      "function": "open_or_create_final_child",
+      "operation": "method::create_dir",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/resolution.rs",
+      "function": "create_dir",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/state.rs",
+      "function": "<module>",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2025",
+      "reason": "Lazy automated-test config directory; test naming is not an exemption, so the exact constructor remains counted.",
+      "retirement": "Remove only with isolated test-profile support; this entry issues no physical reserve authority."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/storage_usage.rs",
+      "function": "clear",
+      "operation": "method::remove_dir",
+      "count": 1,
+      "classification": "maintenance",
+      "issue": "OPT-1636",
+      "reason": "Profile-owned disposable-cache clear uses held no-follow directory capabilities, cancellation and ownership checks.",
+      "retirement": "Remove with cache maintenance owner; never broaden to source deletion."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/storage_usage.rs",
+      "function": "clear",
+      "operation": "method::remove_file",
+      "count": 1,
+      "classification": "maintenance",
+      "issue": "OPT-1636",
+      "reason": "Profile-owned disposable-cache clear uses held no-follow directory capabilities, cancellation and ownership checks.",
+      "retirement": "Remove with cache maintenance owner; never broaden to source deletion."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/capacity_volume_owner.rs",
+      "function": "open_existing_lock",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/capacity_volume_owner.rs",
+      "function": "open_lock",
+      "operation": "OpenOptions::create",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/capacity_volume_owner.rs",
+      "function": "open_lock",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/capacity_volume_owner.rs",
+      "function": "open_registry_child_with_sync",
+      "operation": "method::create_dir",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/reconcile.rs",
+      "function": "reconcile_source_entry",
+      "operation": "method::remove_file",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1661",
+      "reason": "remove_file here removes a source database entry through existing writer/reconciliation APIs, not a filesystem object. Exact method tokens are counted to avoid blind method exclusions.",
+      "retirement": "Remove when the metadata reconciliation API is retired; physical committed-mutation routing remains OPT-1787."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/reconcile.rs",
+      "function": "reconcile_target_entry",
+      "operation": "method::remove_file",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1661",
+      "reason": "remove_file here removes a source database entry through existing writer/reconciliation APIs, not a filesystem object. Exact method tokens are counted to avoid blind method exclusions.",
+      "retirement": "Remove when the metadata reconciliation API is retired; physical committed-mutation routing remains OPT-1787."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs",
+      "function": "cleanup",
+      "operation": "fs::remove_file",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1635",
+      "reason": "Retained-root recovery I/O internal producer (cap_primitives imports, not ambient fs alias). Primitive support/held-object provenance and checkpoints remain independent open requirements.",
+      "retirement": "Retire or qualify through the accepted publication/cleanup contracts; never infer qualification from this inventory."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs",
+      "function": "ensure_parent",
+      "operation": "fs::create_dir",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1634",
+      "reason": "Retained-root recovery I/O internal producer (cap_primitives imports, not ambient fs alias). Primitive support/held-object provenance and checkpoints remain independent open requirements.",
+      "retirement": "Retire or qualify through the accepted publication/cleanup contracts; never infer qualification from this inventory."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs",
+      "function": "open_file_nofollow",
+      "operation": "OpenOptions::create_new",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1634",
+      "reason": "Retained-root recovery I/O internal producer (cap_primitives imports, not ambient fs alias). Primitive support/held-object provenance and checkpoints remain independent open requirements.",
+      "retirement": "Retire or qualify through the accepted publication/cleanup contracts; never infer qualification from this inventory."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs",
+      "function": "open_file_nofollow",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1634",
+      "reason": "Retained-root recovery I/O internal producer (cap_primitives imports, not ambient fs alias). Primitive support/held-object provenance and checkpoints remain independent open requirements.",
+      "retirement": "Retire or qualify through the accepted publication/cleanup contracts; never infer qualification from this inventory."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs",
+      "function": "publish",
+      "operation": "fs::hard_link",
+      "count": 1,
+      "classification": "compatibility",
+      "issue": "OPT-1634",
+      "reason": "Retained-root recovery I/O internal producer (cap_primitives imports, not ambient fs alias). Primitive support/held-object provenance and checkpoints remain independent open requirements.",
+      "retirement": "Retire or qualify through the accepted publication/cleanup contracts; never infer qualification from this inventory."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/mod.rs",
+      "function": "remove_snapshot_artifacts",
+      "operation": "fs::remove_file",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Source snapshot destination uses create_new and held write-fence revalidation; cleanup removes only its owned failed snapshot artifacts.",
+      "retirement": "Remove with snapshot API; source identity/capacity admission remain runtime requirements."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/mod.rs",
+      "function": "snapshot_to_path_with_held_write_fence",
+      "operation": "OpenOptions::create_new",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Source snapshot destination uses create_new and held write-fence revalidation; cleanup removes only its owned failed snapshot artifacts.",
+      "retirement": "Remove with snapshot API; source identity/capacity admission remain runtime requirements."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/mod.rs",
+      "function": "snapshot_to_path_with_held_write_fence",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Source snapshot destination uses create_new and held write-fence revalidation; cleanup removes only its owned failed snapshot artifacts.",
+      "retirement": "Remove with snapshot API; source identity/capacity admission remain runtime requirements."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/open/paths.rs",
+      "function": "for_writable",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/open/paths.rs",
+      "function": "migrate_legacy_source_db",
+      "operation": "fs::rename",
+      "count": 2,
+      "classification": "compatibility",
+      "issue": "OPT-1663",
+      "reason": "Legacy source database/sidecar rename beneath the source-open policy; not a user media rename producer or object-bound no-replace qualification.",
+      "retirement": "Retire after the source layout migration compatibility window and exact remaining caller audit."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/util.rs",
+      "function": "create_parent_if_needed",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/write/command.rs",
+      "function": "execute_write",
+      "operation": "method::remove_file",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1661",
+      "reason": "remove_file here removes a source database entry through existing writer/reconciliation APIs, not a filesystem object. Exact method tokens are counted to avoid blind method exclusions.",
+      "retirement": "Remove when the metadata reconciliation API is retired; physical committed-mutation routing remains OPT-1787."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/library/connection.rs",
+      "function": "create_parent_if_needed",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/sqlite_ext/policy.rs",
+      "function": "allowlisted_extension_dir",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1340",
+      "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
+      "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-media/src/edited_wav.rs",
+      "function": "encode_edited_wav_with_cancel",
+      "operation": "WavWriter::new",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1610",
+      "reason": "WAV encoder writes only to its caller-supplied Write+Seek sink; constructor grants no destination path or publication authority.",
+      "retirement": "Remove when encoder is retired; file-backed sinks still require their own owner admission."
+    },
+    {
+      "path": "crates/yield-media/src/span_export.rs",
+      "function": "export_wav_span_with_cancel",
+      "operation": "WavWriter::new",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1610",
+      "reason": "WAV encoder writes only to its caller-supplied Write+Seek sink; constructor grants no destination path or publication authority.",
+      "retirement": "Remove when encoder is retired; file-backed sinks still require their own owner admission."
+    },
+    {
+      "path": "crates/yield-scan/src/sample_sources/scanner/scan_diff.rs",
+      "function": "apply_rename",
+      "operation": "method::remove_file",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1661",
+      "reason": "remove_file here removes a source database entry through existing writer/reconciliation APIs, not a filesystem object. Exact method tokens are counted to avoid blind method exclusions.",
+      "retirement": "Remove when the metadata reconciliation API is retired; physical committed-mutation routing remains OPT-1787."
+    },
+    {
+      "path": "crates/yield-scan/src/sample_sources/scanner/scan_diff.rs",
+      "function": "mark_missing",
+      "operation": "method::remove_file",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1661",
+      "reason": "remove_file here removes a source database entry through existing writer/reconciliation APIs, not a filesystem object. Exact method tokens are counted to avoid blind method exclusions.",
+      "retirement": "Remove when the metadata reconciliation API is retired; physical committed-mutation routing remains OPT-1787."
+    },
+    {
+      "path": "crates/yield-session/src/lib.rs",
+      "function": "open_session_journal",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-1642",
+      "reason": "Profile persistence owner opens/starts the existing journal; count includes production and gated native fixture starts, not a second GUI coordinator.",
+      "retirement": "Remove only when the journal owner/bootstrap API is retired; current physical reserve fail-closed behavior must remain."
+    },
+    {
+      "path": "crates/yield-session/src/lib.rs",
+      "function": "start",
+      "operation": "fs::create_dir_all",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2025",
+      "reason": "Session cfg(test) registry/bootstrap seam; real profile/global writer, but no live capacity or physical source registration receipt. Exact feature code is counted.",
+      "retirement": "Remove with portable test seam; never enable it as production bootstrap."
+    },
+    {
+      "path": "crates/yield-session/src/lib.rs",
+      "function": "start",
+      "operation": "journal::start",
+      "count": 2,
+      "classification": "owner",
+      "issue": "OPT-1642",
+      "reason": "Profile persistence owner opens/starts the existing journal; count includes production and gated native fixture starts, not a second GUI coordinator.",
+      "retirement": "Remove only when the journal owner/bootstrap API is retired; current physical reserve fail-closed behavior must remain."
+    },
+    {
+      "path": "crates/yield-session/src/lib.rs",
+      "function": "start",
+      "operation": "journal::start_with_capacity_fixture_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2025",
+      "reason": "Session cfg(test) registry/bootstrap seam; real profile/global writer, but no live capacity or physical source registration receipt. Exact feature code is counted.",
+      "retirement": "Remove with portable test seam; never enable it as production bootstrap."
+    },
+    {
+      "path": "crates/yield-session/src/lib.rs",
+      "function": "start",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2025",
+      "reason": "Session cfg(test) registry/bootstrap seam; real profile/global writer, but no live capacity or physical source registration receipt. Exact feature code is counted.",
+      "retirement": "Remove with portable test seam; never enable it as production bootstrap."
+    },
+    {
+      "path": "crates/yield/src/logging.rs",
+      "function": "new",
+      "operation": "OpenOptions::create_new",
+      "count": 1,
+      "classification": "maintenance",
+      "issue": "OPT-1636",
+      "reason": "Application diagnostic log creation/rotation/pruning, separate from source media and durable operation completion.",
+      "retirement": "Remove with logging implementation; changing its namespace or caller requires explicit review."
+    },
+    {
+      "path": "crates/yield/src/logging.rs",
+      "function": "new",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "maintenance",
+      "issue": "OPT-1636",
+      "reason": "Application diagnostic log creation/rotation/pruning, separate from source media and durable operation completion.",
+      "retirement": "Remove with logging implementation; changing its namespace or caller requires explicit review."
+    },
+    {
+      "path": "crates/yield/src/logging.rs",
+      "function": "prune",
+      "operation": "fs::remove_file",
+      "count": 1,
+      "classification": "maintenance",
+      "issue": "OPT-1636",
+      "reason": "Application diagnostic log creation/rotation/pruning, separate from source media and durable operation completion.",
+      "retirement": "Remove with logging implementation; changing its namespace or caller requires explicit review."
+    },
+    {
+      "path": "crates/yield/src/logging.rs",
+      "function": "rotate",
+      "operation": "OpenOptions::create_new",
+      "count": 1,
+      "classification": "maintenance",
+      "issue": "OPT-1636",
+      "reason": "Application diagnostic log creation/rotation/pruning, separate from source media and durable operation completion.",
+      "retirement": "Remove with logging implementation; changing its namespace or caller requires explicit review."
+    },
+    {
+      "path": "crates/yield/src/logging.rs",
+      "function": "rotate",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "maintenance",
+      "issue": "OPT-1636",
+      "reason": "Application diagnostic log creation/rotation/pruning, separate from source media and durable operation completion.",
+      "retirement": "Remove with logging implementation; changing its namespace or caller requires explicit review."
+    }
+  ]
+}
