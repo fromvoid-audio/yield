@@ -623,6 +623,10 @@ where
 }
 
 fn lock_file_name(volume: &VolumeIdentity) -> Result<String, VolumeOwnershipError> {
+    // OPT-1934: retain the shared v1 device namespace. A UUID primary plus
+    // aliases cannot exclude shipped v1 binaries at a previously unseen device.
+    // UUID binding is descriptor validation only until an enforceable launch
+    // exclusion boundary is qualified (see GPUI_VOLUME_UPGRADE_EXCLUSION.md).
     if volume.device == 0 {
         return Err(VolumeOwnershipError::InvalidVolumeIdentity);
     }
@@ -1225,6 +1229,73 @@ mod tests {
 
     fn volume(device: u64) -> VolumeIdentity {
         VolumeIdentity { device }
+    }
+
+    #[test]
+    fn old_v1_unseen_device_ignores_uuid_dirty_owner_and_active_policy_keeps_shared_key() {
+        let fixture = fixture();
+        let modern = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(41),
+            "new-profile",
+        )
+        .unwrap();
+        let known_device_path = modern.lock_path_for_test().to_owned();
+        let known_dirty = fs::read(&known_device_path).unwrap();
+        drop(modern); // Dirty exit; preserve its device marker.
+
+        // Hypothetical UUID primary for A. This is fixture data, not activation
+        // of a new production namespace or a claim about an actual remount.
+        let uuid_primary = fixture.registry.join("volume-uuid-A.lock");
+        let uuid_dirty = b"version=2\nvolume_uuid=A\nstate=dirty\nowner_profile_identity=new-profile\ngeneration=1\n";
+        fs::write(&uuid_primary, uuid_dirty).unwrap();
+        let unseen_path = fixture.registry.join("volume-42.lock");
+        assert!(!unseen_path.exists());
+
+        // Emulate shipped v1 lookup: only the current device file is opened.
+        // It never consults a UUID primary, known-device alias or new launcher.
+        let mut old = StdOpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&unseen_path)
+            .unwrap();
+        try_exclusive_lock(&old, &unseen_path).unwrap();
+        let prior = read_marker(old.try_clone().unwrap(), &unseen_path).unwrap();
+        assert!(prior.is_none());
+        let (marker, persist) = next_dirty_marker(prior, "old-profile", true).unwrap();
+        assert!(persist);
+        write_marker(&mut old, &unseen_path, &marker).unwrap();
+
+        // The retained policy makes the cooperating new binary contend on
+        // that same v1 file, rather than admitting under the hypothetical UUID.
+        assert_eq!(lock_file_name(&volume(42)).unwrap(), "volume-42.lock");
+        let rejected = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(42),
+            "new-profile",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            rejected,
+            VolumeOwnershipError::OwnedByAnotherProcess { .. }
+        ));
+        assert_eq!(fs::read(&known_device_path).unwrap(), known_dirty);
+        assert_eq!(fs::read(&uuid_primary).unwrap(), uuid_dirty);
+        drop(old);
+        let old_dirty = fs::read(&unseen_path).unwrap();
+        assert!(matches!(
+            acquire_fixture_for_test(
+                &fixture.descriptor,
+                &fixture.registry,
+                volume(42),
+                "new-profile"
+            ),
+            Err(VolumeOwnershipError::ReconciliationRequired { .. })
+        ));
+        assert_eq!(fs::read(&unseen_path).unwrap(), old_dirty);
     }
 
     #[test]
