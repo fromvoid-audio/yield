@@ -10,7 +10,7 @@ use super::super::snapshot::ArtifactPublishOutcome;
 use super::error::ReadinessError;
 use crate::sample_sources::db::ReadinessOwnership;
 
-fn validate_claim_ownership(
+pub(super) fn validate_claim_ownership(
     connection: &Connection,
     ownership: &ReadinessOwnership<'_>,
     claim: &ClaimedReadinessWork,
@@ -462,8 +462,27 @@ fn complete_readiness_work_inner(
     validate_claim_ownership(&*connection, ownership, claim)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     validate_claim_ownership(&tx, ownership, claim)?;
+    let outcome =
+        complete_readiness_work_in_transaction(&tx, ownership, claim, completed_at, artifact_ref)?;
+    if outcome == ArtifactPublishOutcome::RejectedStale {
+        tx.rollback()?;
+        return Ok(outcome);
+    }
+    validate_claim_ownership(&tx, ownership, claim)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+pub(super) fn complete_readiness_work_in_transaction(
+    tx: &Transaction<'_>,
+    ownership: &ReadinessOwnership<'_>,
+    claim: &ClaimedReadinessWork,
+    completed_at: i64,
+    artifact_ref: Option<&str>,
+) -> Result<ArtifactPublishOutcome, ReadinessError> {
+    validate_claim_ownership(tx, ownership, claim)?;
     let changed = finish_claim_update(
-        &tx,
+        tx,
         claim,
         completed_at,
         "status = 'done', running_at = NULL, retry_at = NULL, failure_kind = NULL, \
@@ -472,7 +491,6 @@ fn complete_readiness_work_inner(
         None,
     )?;
     if changed != 1 {
-        tx.rollback()?;
         return Ok(ArtifactPublishOutcome::RejectedStale);
     }
     let artifact = ReadinessArtifact::for_target(&claim.target, completed_at);
@@ -501,8 +519,7 @@ fn complete_readiness_work_inner(
             artifact.completed_at,
         ],
     )?;
-    validate_claim_ownership(&tx, ownership, claim)?;
-    tx.commit()?;
+    validate_claim_ownership(tx, ownership, claim)?;
     Ok(ArtifactPublishOutcome::Recorded)
 }
 

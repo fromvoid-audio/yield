@@ -4307,3 +4307,4 @@ fn tag_assignment_selection_rejects_replaced_media_root_and_expired_lease() {
         )))
     ));
 }
+mod feature_artifacts;

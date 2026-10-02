@@ -78,6 +78,13 @@ The implementation must document its mapping to existing feature tables; an
 existing payload may be adopted only after exact content/version/digest validation
 and the same claim transaction. Mutable legacy cache rows cannot be its authority.
 
+OPT-2052 adds a private writer-instance-bound feature claim; an ordinary readiness
+claim alone cannot authorize this publication after a new catalog lifecycle.
+Restart target lookup reissues a validated key from persisted bytes and current
+owner authority, never reconstructs a capability from the reference string.
+Lookup returning unavailable requires the consumer to request derived rebuild;
+it does not assert processing completion or delete semantic source truth.
+
 Within one immediate transaction: validate retained physical owner/profile/lease,
 current target and exact claim/lease; validate payload; insert without replacing
 an immutable existing key; persist its exact reference and ready completion;

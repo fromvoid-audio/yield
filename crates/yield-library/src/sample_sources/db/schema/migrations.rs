@@ -50,6 +50,9 @@ fn apply_structural_migrations(connection: &Connection) -> Result<(), SourceDbEr
     ensure_file_ops_journal_optional_columns(connection)?;
     ensure_analysis_jobs_optional_columns(connection)?;
     ensure_source_readiness_schema(connection)?;
+    connection
+        .execute_batch(crate::sample_sources::readiness::FEATURE_ARTIFACT_SCHEMA)
+        .map_err(map_sql_error)?;
     ensure_samples_optional_columns(connection)?;
     ensure_feature_metric_columns(connection, "features")?;
     ensure_feature_metric_columns(connection, "analysis_cache_features")?;

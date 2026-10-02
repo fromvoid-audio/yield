@@ -1127,6 +1127,85 @@ impl SourceWriter {
         })
     }
 
+    /// Claim one feature target and bind the work to this exact retained writer instance.
+    pub fn claim_feature_artifact(
+        &mut self,
+        expected: &SourceRevision,
+        target: &ReadinessTarget,
+        now: i64,
+        lease_duration_seconds: i64,
+    ) -> Result<Option<crate::sample_sources::readiness::FeatureArtifactClaim>, SourceWriterError>
+    {
+        if target.scope_kind != crate::sample_sources::readiness::ReadinessScopeKind::File
+            || target.stage != crate::sample_sources::readiness::ReadinessStage::AnalysisFeatures
+            || target.required_version != "features-v1"
+        {
+            return Err(SourceWriterError::InvalidRequest(
+                "unsupported feature target",
+            ));
+        }
+        let owner = Arc::downgrade(&self.reference_liveness);
+        Ok(self
+            .claim_readiness_target(expected, target, now, lease_duration_seconds)?
+            .map(|claim| crate::sample_sources::readiness::FeatureArtifactClaim { claim, owner }))
+    }
+
+    /// Atomically publish an immutable v1 feature payload and exact claimed completion.
+    /// Vector computation must finish before this owner command begins.
+    pub fn publish_feature_artifact(
+        &mut self,
+        expected: &SourceRevision,
+        claim: &crate::sample_sources::readiness::FeatureArtifactClaim,
+        payload: &crate::sample_sources::readiness::FeatureArtifactPayload,
+        now: i64,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::sample_sources::readiness::FeatureArtifactPublication, SourceWriterError>
+    {
+        if !std::sync::Weak::ptr_eq(&claim.owner, &Arc::downgrade(&self.reference_liveness)) {
+            return Err(SourceWriterError::StaleFence);
+        }
+        let claim = claim.readiness_claim();
+        self.validate_readiness_command(expected, claim.target())?;
+        Ok(self
+            .database
+            .readiness_store()?
+            .publish_feature_artifact(claim, payload, now, cancel)?)
+    }
+
+    /// Lookup validated immutable bytes under the current owner and exact content target.
+    /// Missing, stale or corrupt bytes are unavailable; this command never marks work ready.
+    pub fn lookup_feature_artifact(
+        &mut self,
+        expected: &SourceRevision,
+        key: &crate::sample_sources::readiness::FeatureArtifactKey,
+    ) -> Result<Option<crate::sample_sources::readiness::FeatureArtifactPayload>, SourceWriterError>
+    {
+        self.validate_readiness_command(expected, key.target())?;
+        Ok(self
+            .database
+            .readiness_store()?
+            .lookup_feature_artifact(key)?)
+    }
+
+    /// Reissue a validated key and bounded payload for an exact current target after restart.
+    pub fn lookup_feature_artifact_for_target(
+        &mut self,
+        expected: &SourceRevision,
+        target: &ReadinessTarget,
+    ) -> Result<
+        Option<(
+            crate::sample_sources::readiness::FeatureArtifactKey,
+            crate::sample_sources::readiness::FeatureArtifactPayload,
+        )>,
+        SourceWriterError,
+    > {
+        self.validate_readiness_command(expected, target)?;
+        Ok(self
+            .database
+            .readiness_store()?
+            .lookup_feature_artifact_for_target(target)?)
+    }
+
     /// Record a classified failure for the exact claimed readiness target.
     #[allow(clippy::too_many_arguments)]
     pub fn fail_readiness_work(

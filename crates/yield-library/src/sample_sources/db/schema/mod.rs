@@ -151,6 +151,21 @@ mod tests {
     }
 
     #[test]
+    fn feature_artifact_relation_is_repaired_on_current_stamp() {
+        let connection = Connection::open_in_memory().unwrap();
+        apply_schema_fast(&connection).unwrap();
+        connection
+            .execute("DROP TABLE source_feature_artifacts", [])
+            .unwrap();
+        assert_eq!(
+            apply_schema_fast(&connection).unwrap(),
+            SchemaApplyOutcome::Current
+        );
+        let payload_type: String = connection.query_row("SELECT type FROM pragma_table_info('source_feature_artifacts') WHERE name='payload'", [], |r| r.get(0)).unwrap();
+        assert_eq!(payload_type, "BLOB");
+    }
+
+    #[test]
     fn stamped_databases_skip_repeat_schema_assurance() {
         let connection = Connection::open_in_memory().unwrap();
 

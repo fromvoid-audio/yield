@@ -1,4 +1,6 @@
+pub(crate) use feature_artifact::SCHEMA as FEATURE_ARTIFACT_SCHEMA;
 mod error;
+mod feature_artifact;
 mod persistence;
 mod reconcile;
 mod similarity;
@@ -538,6 +540,38 @@ impl<'connection> ReadinessStore<'connection> {
             artifact_ref,
         )
     }
+    pub(crate) fn publish_feature_artifact(
+        &mut self,
+        claim: &ClaimedReadinessWork,
+        payload: &super::FeatureArtifactPayload,
+        now: i64,
+        cancel: &AtomicBool,
+    ) -> Result<super::FeatureArtifactPublication, ReadinessError> {
+        feature_artifact::publish(
+            self.connection,
+            &self.ownership,
+            claim,
+            payload,
+            now,
+            cancel,
+        )
+    }
+
+    pub(crate) fn lookup_feature_artifact(
+        &self,
+        key: &super::FeatureArtifactKey,
+    ) -> Result<Option<super::FeatureArtifactPayload>, ReadinessError> {
+        feature_artifact::lookup(self.connection, &self.ownership, key)
+    }
+
+    pub(crate) fn lookup_feature_artifact_for_target(
+        &self,
+        target: &ReadinessTarget,
+    ) -> Result<Option<(super::FeatureArtifactKey, super::FeatureArtifactPayload)>, ReadinessError>
+    {
+        feature_artifact::lookup_target(self.connection, &self.ownership, target)
+    }
+
     /// Record a classified failure for a current claim.
     pub fn fail(
         &mut self,
