@@ -10,8 +10,8 @@ use crate::{
         SourceLeaseError, SourcePublicationFenceError,
         readiness::{
             ArtifactPublishOutcome, ClaimedReadinessWork, ReadinessArtifact, ReadinessError,
-            ReadinessFailureClassification, ReadinessRetryPolicy, ReadinessStage, ReadinessStore,
-            ReadinessTarget, ReadinessTargetDeltaPublication, ReadinessTargetPublication,
+            ReadinessFailureClassification, ReadinessRetryPolicy, ReadinessStage, ReadinessTarget,
+            ReadinessTargetDeltaPublication, ReadinessTargetPublication,
             ReadinessWakeQualification, SourceAvailability,
         },
     },
@@ -110,7 +110,9 @@ fn owned_readiness_wake_qualification_requires_coherent_owned_state() {
         qualification
     };
 
-    let error = ReadinessStore::new(&mut database.connection)
+    let error = database
+        .connection
+        .readiness_store(crate::sample_sources::db::ReadinessOwnership::unowned())
         .qualify_readiness_wake("readiness-owned-source")
         .expect_err("unowned readiness connection must not mint qualification");
     assert!(matches!(error, ReadinessError::OwnershipRequired));
@@ -1029,7 +1031,10 @@ fn readiness_claim_fence_rejects_cross_database_claims_and_accepts_own_claims() 
     );
     drop(store_b);
     assert!(matches!(
-        ReadinessStore::new(&mut database_b.connection).complete(&claim_a, 11),
+        database_b
+            .connection
+            .readiness_store(crate::sample_sources::db::ReadinessOwnership::unowned())
+            .complete(&claim_a, 11),
         Err(ReadinessError::OwnershipRequired)
     ));
 
