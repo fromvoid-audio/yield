@@ -242,7 +242,6 @@ impl PreparedExactScan<'_> {
             });
         }
         if batch.get_source_index_revision()? != self.index_revision {
-
             return Err(invalid(db.root(), "prepared index revision changed"));
         }
         for audio in &self.audio {

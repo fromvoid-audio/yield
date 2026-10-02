@@ -494,7 +494,6 @@ pub enum CatalogCommand {
     ConsumeReplay {
         /// Private request/reply/cancellation binding minted by `CatalogService::submit_replay`.
         submission: CatalogReplaySubmission,
-
     },
     /// Register or replace one source lifecycle generation.
     Register {
