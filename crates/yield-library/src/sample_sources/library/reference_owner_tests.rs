@@ -558,3 +558,70 @@ fn reference_owner_edge_only_scope_and_bounded_malformed_receipt() {
         Err(LibraryError::ReferenceMalformedReceipt)
     ));
 }
+
+#[test]
+fn reference_owner_reversed_replies_preserve_immutable_operation_results_across_restart() {
+    let mut f = ReferenceFixture::new();
+    f.seed();
+    let first = f.request(183601);
+    let second = f.request(183602);
+    let first_bytes = first.proposal_bytes().to_vec();
+    let second_bytes = second.proposal_bytes().to_vec();
+    let first_rx = f.global().apply_reference_rekey(first.clone()).unwrap();
+    let second_rx = f.global().apply_reference_rekey(second.clone()).unwrap();
+    let rejected = second_rx
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let applied = first_rx
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        applied.receipt().operation_id(),
+        OperationId::from_uuid(uuid::Uuid::from_u128(183601))
+    );
+    assert_eq!(
+        rejected.receipt().operation_id(),
+        OperationId::from_uuid(uuid::Uuid::from_u128(183602))
+    );
+    assert_eq!(
+        applied.receipt().payload_identity(),
+        first.payload_identity()
+    );
+    assert_eq!(
+        rejected.receipt().payload_identity(),
+        second.payload_identity()
+    );
+    assert_eq!(
+        applied.receipt().disposition(),
+        ReferenceDisposition::Applied
+    );
+    assert_ne!(
+        rejected.receipt().disposition(),
+        ReferenceDisposition::Applied
+    );
+    let replay_second = f.apply(second).unwrap();
+    let replay_first = f.apply(first).unwrap();
+    assert_eq!(replay_second.receipt(), rejected.receipt());
+    assert_eq!(replay_first.receipt(), applied.receipt());
+    assert_eq!(f.count("SELECT COUNT(*) FROM reference_receipts"), 2);
+    f.restart();
+    let (origin, destination) = f.fences();
+    let first = ReferenceRekeyRequest::restore(
+        f.owner(),
+        &first_bytes,
+        origin.clone(),
+        destination.clone(),
+    )
+    .unwrap();
+    let second =
+        ReferenceRekeyRequest::restore(f.owner(), &second_bytes, origin, destination).unwrap();
+    assert_eq!(f.apply(second).unwrap().receipt(), rejected.receipt());
+    assert_eq!(f.apply(first).unwrap().receipt(), applied.receipt());
+    assert_eq!(f.count("SELECT COUNT(*) FROM reference_receipts"), 2);
+    assert_eq!(
+        f.count("SELECT COUNT(*) FROM harvest_files WHERE source_id='origin'"),
+        0
+    );
+}

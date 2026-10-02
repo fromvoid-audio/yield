@@ -5,6 +5,39 @@ historical-head evidence record for OPT-1824. It describes the code that exists 
 that revision and assigns unimplemented target work to the existing issues; it
 does not claim that the target global-library owner is complete.
 
+## OPT-1836 implemented route acceptance (2 October 2026)
+
+The historical gaps below are superseded for the four ordinary mutating routes by
+OPT-2031's route decision and the production implementations in PRs #213, #217 and #222.
+Registry/preferences session proposals now retain acquisition, local revision and exact
+payload identity through `CapturedMutation`; vocabulary producers retain acquisition plus
+persistent CAS inputs through their worker and UI pending state. The retained global owner
+checks live profile/root/lock/database binding before and after commands. Wrong acquisition
+or echoed completion cannot confirm a proposal. Snapshot replay is exactly two acquisition-local
+slots; vocabulary response loss refreshes current state without manufacturing an old result.
+Ordinary settings request IDs are not durable OperationIds.
+
+Implemented operation-registry, cross-source reference and operation-link commands separately
+validate current acquisition and persist immutable OperationId/work-key/payload/results in their
+existing SQLite owner transactions. Old acquisition requests reject even when a receipt exists;
+fresh live authority may observe the historical result without reapplying its metadata effect.
+Receipt observations do not grant file effects or journal completion. Focused owner suites
+cover stale owner, duplicate/conflict, reversed observations, lost result and fresh-owner restart.
+
+The finite route/test matrix and actual producer paths are in
+[GLOBAL_COMMAND_REPLAY_CONTRACT.md](GLOBAL_COMMAND_REPLAY_CONTRACT.md#opt-1836-finite-production-route-matrix).
+`check_source_db_open_roles.sh` now also runs `check_global_command_callers.py`: outside the
+library's compatibility implementation and UI's separately guarded typed facade, production
+method/UFCS calls to the four unframed methods fail the check. Comments/strings and balanced
+inline `cfg(test)` modules are ignored; filenames confer no exemption. This lexical tripwire
+is regression protection, not a Rust type proof or live capability.
+
+OPT-1357 remains open: future Harvest production commands/consumers (OPT-1831/1645),
+configured lifecycle consumers, durable shutdown dispositions (OPT-1838), and other full-owner
+requirements are independently scoped. Their implementation is not supplied by this matrix.
+Native gestures/rendering remain OPT-2009; native participant regression issues retain their
+own acceptance. Neither this evidence nor the fixtures qualify physical effects.
+
 ## OPT-1826 implementation update
 
 OPT-1826 closes the queue, owner-start, and read-only observation gaps listed below.

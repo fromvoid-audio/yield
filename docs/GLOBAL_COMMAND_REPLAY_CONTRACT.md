@@ -243,3 +243,45 @@ tests use real owner-issued acquisition observations but do not qualify native
 interaction; the action register's OPT-2009 gate remains open. The library's existing
 CAS and worker capability checks remain in force; no vocabulary receipt ledger or
 new SQLite owner was added.
+
+## OPT-1836 finite production route matrix
+
+These are implementations through the existing global owner. The earlier OPT-2031
+compatibility-owner fixtures documented policy without implementing captured envelopes. All commands retain the pre/post-command profile capability checks
+in `run_owner`; `ProfileAcquisitionId` is an observation fence, not a replacement lock.
+The ordinary producer contract remains the route policy above. OperationId is required by
+implemented saga-participant routes, not assigned to ordinary preferences or vocabulary.
+
+| Covered production route / consumer | Fence and response-loss/restart result | Actual focused evidence |
+| --- | --- | --- |
+| Configured registry snapshot: session `queue_save` / `SaveInFlight` | Captured acquisition/local revision/exact payload; lower or same-revision conflicting proposals reject, exact local duplicate acknowledges without SQL; restart reloads committed state and rejects old context. | `snapshot_slots_reject_lower_and_conflicting_revisions_replay_without_reapplying`, `snapshot_lost_response_replays_both_series_and_reopen_resets_only_local_fences`; session `snapshot_session_coalesces_new_state_after_valid_stale_ack_and_confirms_only_latest`. |
+| UI preferences snapshot: session `queue_preference_save` / `PreferenceSaveInFlight` | Independent second bounded slot; failed transaction cannot poison acknowledgement; mismatched/disconnected response stays unconfirmed; restart loads current committed payload. | Same two snapshot owner fixtures, `snapshot_failed_transaction_does_not_advance_or_poison_acknowledgement_slot`, session `snapshot_session_preferences_keep_wrong_or_disconnected_completions_unconfirmed`. |
+| Vocabulary Set: session `vocabulary.rs`, UI chooser/drop in `tags.rs` / `tag_library.rs` | Captured originating acquisition and persistent revision CAS; lost changed result is not reconstructed by a fresh current-state no-op. | `captured_mutations_reject_all_old_acquisition_routes_through_fresh_owner`, `captured_mutations_echo_context_and_commit_all_current_routes_with_existing_cas`, actual `vocabulary_service` session tests. |
+| Vocabulary Delete/Undo: session delete and UI `tag_dictionary.rs` | Exact acquisition/CAS; mismatch/unconfirmed reply supplies no removed-row tombstone; Undo requires a received current-acquisition result and is invalidated on reacquisition. | `captured_completion_must_match_acquisition_route_correlation_and_payload`, actual `vocabulary_service` lost-delete/reopen and wrong-context tests, dictionary acquisition projection fixture. |
+| Operation-scoped registry participant (OPT-1642) | Current acquisition before immutable OperationId/work-key/payload receipt lookup; same proposal returns one historical result, conflicting input rejects; rejected snapshot result also remains immutable. | `registry_participant_lost_response_replays_across_new_profile_acquisition_without_reapplying`, `registry_participant_conflict_and_stale_snapshot_have_one_retained_disposition`, `registry_participant_reversed_replies_preserve_applied_and_rejected_operation_identity`. |
+| Cross-source metadata-reference participant (OPT-1643) | Current global acquisition plus genuine retained source reference observations; immutable canonical OperationId/work-key/proposal receipt; old-source/root/revision observations reject. | `reference_owner_lost_reply_self_endpoints_old_key_reuse_and_restart`, `reference_owner_ended_source_and_changed_revision_fail_before_effect`, `reference_owner_reversed_replies_preserve_immutable_operation_results_across_restart`. |
+| Operation-link participant (OPT-1644/1833) | Current acquisition, composite operation/global/source/command key, immutable actual source receipt payload; reversed command/result observations preserve each historical link. | `operation_link_lost_reply_duplicate_multiple_commands_and_restart`, `operation_link_actual_source_receipt_survives_global_failure_and_readback`, `operation_link_reordered_submissions_and_restart_keep_one_result_per_key`. |
+
+`mutation_context_owner_tests.rs` additionally proves bounded queue/route admission, queued
+pre-effect rejection and post-commit profile replacement producing an unconfirmed result.
+Participant owner suites also cover rollback, corrupt/ambiguous retained receipts and bounded
+retention exhaustion. Session completion checks preserve newer dirty state after an older valid
+acknowledgement and reject acquisition/route/correlation/payload mismatches before acceptance.
+
+Run the matrix with `cargo test --locked -p yield-library --lib
+sample_sources::library::owner::tests -- --test-threads=1`, session `snapshot_persistence` and
+`vocabulary_service` filters, the dictionary acquisition projection fixture, and the application
+build/source guards. These are actual owner/storage/producer tests; the original decision/compatibility
+filter alone is insufficient.
+
+`check_global_command_callers.py` is a finite lexical tripwire for unframed mutation method
+calls and conventional type UFCS in non-library, non-UI workspace source. The library retains
+compatibility methods for old fixtures. UI has acquisition-taking session facades and its raw
+owner access is checked by `check_gpui_owner_boundary.py`. The new check does not resolve Rust
+types, exotic UFCS aliases or prove runtime fences; the actual owner and consumer fixtures do.
+No new global route, reply ledger or generic saga coordinator is introduced.
+
+This matrix completes only the named command-fence acceptance when its checks pass. Actual
+future Harvest/family callers must implement their own captured proposals/receipts, admitted
+journal recovery, capacity, and publication rules. Tracking OPT-1357 and those consumer scopes
+remain open; a metadata receipt or model fixture is not physical qualification.

@@ -473,3 +473,82 @@ fn registry_participant_configured_membership_lifecycle_replays_without_resurrec
     // These are configured metadata outcomes only. No physical source, source-database
     // retirement, origin absence, lifecycle generation, or live lease proof is manufactured.
 }
+
+#[test]
+fn registry_participant_reversed_replies_preserve_applied_and_rejected_operation_identity() {
+    let temp = tempdir().unwrap();
+    let _runtime = TestRuntimeGuard::acquire();
+    let (_base, _profile, guard, mut writer) = start_writer(&temp, "registry-reversed-replies");
+    wait_until_available(&writer);
+    let empty = snapshot(&writer);
+    let first = request(
+        guard.owner_identity(),
+        183601,
+        &empty,
+        SourceRegistrySnapshot::new(vec![source(&temp.path().join("first"), "first")]),
+    );
+    let second = request(
+        guard.owner_identity(),
+        183602,
+        &empty,
+        SourceRegistrySnapshot::new(vec![source(&temp.path().join("second"), "second")]),
+    );
+    let first_rx = writer
+        .apply_source_registry_participant(first.clone())
+        .unwrap();
+    let second_rx = writer
+        .apply_source_registry_participant(second.clone())
+        .unwrap();
+    // Observation order cannot relabel a committed result or resurrect a stale proposal.
+    let rejected = second_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    let applied = first_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        applied.operation_id(),
+        OperationId::from_uuid(uuid::Uuid::from_u128(183601))
+    );
+    assert_eq!(
+        rejected.operation_id(),
+        OperationId::from_uuid(uuid::Uuid::from_u128(183602))
+    );
+    assert_eq!(applied.payload_identity(), first.payload_identity());
+    assert_eq!(rejected.payload_identity(), second.payload_identity());
+    assert_eq!(
+        applied.disposition(),
+        SourceRegistryParticipantDisposition::Applied
+    );
+    assert_eq!(
+        rejected.disposition(),
+        SourceRegistryParticipantDisposition::RegistryChanged
+    );
+    assert_eq!(result(&writer, second.clone()).unwrap(), rejected);
+    assert_eq!(result(&writer, first.clone()).unwrap(), applied);
+    assert_eq!(snapshot(&writer).as_slice()[0].id.as_str(), "first");
+    assert!(writer.shutdown());
+    drop(writer);
+    drop(guard);
+    let guard = WritableProfileGuard::acquire_current().unwrap();
+    let mut reopened = GlobalLibraryWriter::start(&guard).unwrap();
+    wait_until_available(&reopened);
+    let first = request(
+        guard.owner_identity(),
+        183601,
+        &empty,
+        SourceRegistrySnapshot::new(vec![source(&temp.path().join("first"), "first")]),
+    );
+    let second = request(
+        guard.owner_identity(),
+        183602,
+        &empty,
+        SourceRegistrySnapshot::new(vec![source(&temp.path().join("second"), "second")]),
+    );
+    assert_eq!(result(&reopened, second).unwrap(), rejected);
+    assert_eq!(result(&reopened, first).unwrap(), applied);
+    assert_eq!(snapshot(&reopened).as_slice()[0].id.as_str(), "first");
+    assert!(reopened.shutdown());
+}
