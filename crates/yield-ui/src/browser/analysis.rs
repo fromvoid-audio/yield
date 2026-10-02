@@ -148,7 +148,10 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let Some(id) = self.feature_analysis.next_request.checked_add(1) else {
-            self.set_playback_status("Feature request identity exhausted");
+            let message = "Feature request identity exhausted";
+            self.job_action_error = Some(message.into());
+            self.set_playback_status(message);
+            cx.notify();
             return;
         };
         self.feature_analysis.next_request = id;
@@ -237,3 +240,6 @@ pub(super) fn apply_catalog_event(
 
 #[cfg(test)]
 include!("analysis_tests.rs");
+
+#[cfg(test)]
+include!("analysis_lifecycle_tests.rs");
