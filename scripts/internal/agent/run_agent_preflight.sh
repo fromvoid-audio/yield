@@ -3,7 +3,7 @@
 # Run mandatory agent-facing preflight checks.
 #
 # This script runs the full guardrail set. Concurrent invocations for one Git
-# repository coalesce to one owner so request startup cannot duplicate Cargo
+# worktree input image coalesce to one owner so request startup cannot duplicate Cargo
 # work with another explicit preflight.
 
 set -euo pipefail
@@ -16,7 +16,7 @@ usage() {
 Usage: scripts/internal/agent/run_agent_preflight.sh
 
 Run the mandatory full preflight checks for an agent request. Concurrent
-invocations for the same Git repository coalesce to one owner.
+invocations for the same worktree and unchanged inputs coalesce to one owner.
 
 Options:
   -h, --help             Show this help text.
@@ -46,6 +46,16 @@ if [[ -z "$STATE_DIR" ]]; then
     STATE_DIR="$ROOT_DIR/$GIT_COMMON_DIR/agent-preflight-state"
   fi
 fi
+CHECKS_COMMAND="${YIELD_AGENT_CI_CHECKS_COMMAND:-$ROOT_DIR/scripts/internal/agent/run_agent_ci_checks.sh}"
+if [[ ! -x "$CHECKS_COMMAND" ]]; then
+  echo "[agent_preflight] ERROR: missing executable full-check command: $CHECKS_COMMAND" >&2
+  exit 1
+fi
+
+FINGERPRINT_COMMAND="$ROOT_DIR/scripts/internal/agent/agent_preflight_fingerprint.py"
+INPUT_FINGERPRINT="$(python3 "$FINGERPRINT_COMMAND" "$ROOT_DIR" "$CHECKS_COMMAND")"
+# Even an explicitly shared state directory must not reuse another worktree/head/dirty image.
+STATE_DIR="$STATE_DIR/$INPUT_FINGERPRINT"
 mkdir -p "$STATE_DIR"
 
 LOCK_FILE="$STATE_DIR/run.lock"
@@ -99,6 +109,10 @@ while :; do
     if [[ -n "$OWNER_RESULT" && -f "$OWNER_RESULT" ]]; then
       OWNER_STATUS="$(<"$OWNER_RESULT")"
       if [[ "$OWNER_STATUS" =~ ^[0-9]+$ ]]; then
+        if [[ "$(python3 "$FINGERPRINT_COMMAND" "$ROOT_DIR" "$CHECKS_COMMAND")" != "$INPUT_FINGERPRINT" ]]; then
+          echo "[agent_preflight] ERROR: worktree inputs changed while waiting; rerun preflight." >&2
+          exit 1
+        fi
         echo "[agent_preflight] coalesced with active full preflight (exit $OWNER_STATUS)."
         trap - EXIT
         exit "$OWNER_STATUS"
@@ -112,13 +126,12 @@ while :; do
   rm -f "$LOCK_FILE"
 done
 
-CHECKS_COMMAND="${YIELD_AGENT_CI_CHECKS_COMMAND:-$ROOT_DIR/scripts/internal/agent/run_agent_ci_checks.sh}"
-if [[ ! -x "$CHECKS_COMMAND" ]]; then
-  echo "[agent_preflight] ERROR: missing executable full-check command: $CHECKS_COMMAND" >&2
-  exit 1
-fi
-
 echo "[agent_preflight] full preflight owner: $$"
 "$CHECKS_COMMAND"
+
+if [[ "$(python3 "$FINGERPRINT_COMMAND" "$ROOT_DIR" "$CHECKS_COMMAND")" != "$INPUT_FINGERPRINT" ]]; then
+  echo "[agent_preflight] ERROR: worktree inputs changed during checks; rerun preflight." >&2
+  exit 1
+fi
 
 echo "[agent_preflight] OK"

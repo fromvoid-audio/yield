@@ -2,8 +2,7 @@
 
 # Run the agent request contract:
 # 1) run mandatory preflight,
-# 2) run the fast local development checks by default, or the full local CI
-#    gate when requested.
+# 2) optionally run the portable regression subset or native macOS full lane.
 #
 # This script is intentionally small and deterministic so it can be used as the
 # first step of each agent request/session.
@@ -17,12 +16,12 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/agent.sh request [--skip-ci] [--quick-ci] [--full-ci]
 
-Run the mandatory agent preflight and optional local development checks.
+Run current portable GPUI preflight and explicitly requested regression checks.
 
 Options:
-  --skip-ci                 Skip ./scripts/ci.sh smoke, ./scripts/ci.sh quick, and ./scripts/ci.sh local.
-  --quick-ci                Run fast filtered tests via ./scripts/ci.sh quick.
-  --full-ci                 Run full ./scripts/ci.sh local --skip-agent-preflight.
+  --skip-ci                 Preflight only (also the default; retained compatibility option).
+  --quick-ci                Run the supported scripts/gpui-development-checks.sh test subset.
+  --full-ci                 Run scripts/gpui-local-ci.sh full (native macOS only).
   -h, --help                Show this help text.
 USAGE
 }
@@ -67,10 +66,8 @@ fi
 
 if (( SKIP_CI == 0 )); then
   if (( FULL_CI == 1 )); then
-    ./scripts/ci.sh local --skip-agent-preflight
+    ./scripts/gpui-local-ci.sh full
   elif (( QUICK_CI == 1 )); then
-    ./scripts/ci.sh quick
-  else
-    ./scripts/ci.sh smoke
+    ./scripts/gpui-development-checks.sh test
   fi
 fi
