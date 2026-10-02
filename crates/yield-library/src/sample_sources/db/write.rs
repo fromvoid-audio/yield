@@ -26,12 +26,12 @@ pub use source_writer::{
     ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
     ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
     SOURCE_LAYOUT_ALGORITHM_V1, SourceCollectionHistoryChange, SourceCollectionHistorySelection,
-    SourceCommandId, SourceFeaturePublicationMetrics, SourceLayoutCapture, SourceLayoutCaptureError,
-    SourceLayoutFeature, SourceRevision, SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage,
-    SourceSnapshotQueueMetrics, SourceTagAdmissionObservation, SourceTagMetadataBudget,
-    SourceTagMetadataPolicy, SourceWalPreparation, SourceWalPreparationError,
-    SourceWalPreparationFailure, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
-    SourceWriterReceipt, SourceWriterRequest,
+    SourceCommandId, SourceFeaturePublicationMetrics, SourceLayoutCapture,
+    SourceLayoutCaptureError, SourceLayoutFeature, SourceRevision, SourceScanFence,
+    SourceSnapshotOwner, SourceSnapshotPage, SourceSnapshotQueueMetrics,
+    SourceTagAdmissionObservation, SourceTagMetadataBudget, SourceTagMetadataPolicy,
+    SourceWalPreparation, SourceWalPreparationError, SourceWalPreparationFailure, SourceWriter,
+    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};
 pub use transaction::{
