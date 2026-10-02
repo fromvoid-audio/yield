@@ -1,6 +1,9 @@
 //! Bounded, backend-neutral admission and lifecycle ownership for watcher evidence.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
+
+use super::telemetry::{ContinuityOutcome, WatcherMetrics};
 
 use crate::sample_sources::SourceId;
 
@@ -928,6 +931,7 @@ fn recent_exact_sequence_record(
 }
 
 struct PendingObservation {
+    admitted_at: Instant,
     lane: AdmissionLaneKey,
     generation: WatcherGeneration,
     envelope: RawObservationEnvelope,
@@ -952,6 +956,7 @@ struct LaneState {
 
 /// Owns registered lanes, bounded admission, lifecycle fences, and retained uncertainty.
 pub struct ReconciliationAdmissionSupervisor {
+    metrics: WatcherMetrics,
     limits: ReconciliationAdmissionLimits,
     lanes: HashMap<AdmissionLaneKey, LaneState>,
     sources: HashMap<SourceId, AdmissionLaneKey>,
@@ -970,6 +975,7 @@ impl ReconciliationAdmissionSupervisor {
     /// Create an empty bounded admission supervisor.
     pub fn new(limits: ReconciliationAdmissionLimits) -> Self {
         Self {
+            metrics: WatcherMetrics::default(),
             limits,
             lanes: HashMap::new(),
             sources: HashMap::new(),
@@ -983,6 +989,16 @@ impl ReconciliationAdmissionSupervisor {
             next_retained_uncertainty_boundary: 0,
             emergency_uncertainty_count: 0,
         }
+    }
+
+    /// Observe bounded lifetime counters and current retained proof gaps.
+    ///
+    /// These observations grant no continuity or mutation authority. Counters saturate and
+    /// remain local to this supervisor; reading them neither clears markers nor resets counts.
+    pub fn watcher_metrics(&self) -> WatcherMetrics {
+        let mut metrics = self.metrics;
+        metrics.retained_proof_gaps = self.retained_uncertainties.len();
+        metrics
     }
 
     /// Return the immutable admission configuration.
@@ -1235,6 +1251,27 @@ impl ReconciliationAdmissionSupervisor {
         envelope: RawObservationEnvelope,
         required_uncertainty: Option<UncertaintyReason>,
     ) -> AdmissionOutcome {
+        let source = self
+            .sources
+            .get(envelope.provenance().source_id())
+            .map(|lane| lane.source_id().clone());
+        let continuity = envelope.proof().watcher_continuity().is_some();
+        let outcome = self.classify_admission(envelope, required_uncertainty);
+        let observed = ContinuityOutcome::admission(&outcome, continuity);
+        self.metrics.observe(
+            observed,
+            source.as_ref(),
+            self.retained_uncertainties.len(),
+            None,
+        );
+        outcome
+    }
+
+    fn classify_admission(
+        &mut self,
+        envelope: RawObservationEnvelope,
+        required_uncertainty: Option<UncertaintyReason>,
+    ) -> AdmissionOutcome {
         let remember_marker_only_sequence = required_uncertainty.is_some();
         let mut envelope_marker_reasons = marker_reasons(&envelope);
         if let Some(reason) = required_uncertainty {
@@ -1395,6 +1432,7 @@ impl ReconciliationAdmissionSupervisor {
         self.pending.insert(
             ticket,
             PendingObservation {
+                admitted_at: Instant::now(),
                 lane: lane.clone(),
                 generation: current_generation,
                 usage,
@@ -1484,6 +1522,33 @@ impl ReconciliationAdmissionSupervisor {
         ticket: DispatchTicket,
         committed_checkpoint: &ReplayPriorToken,
     ) -> Result<(), AdmissionError> {
+        let source = self
+            .pending
+            .get(&ticket)
+            .map(|pending| pending.lane.source_id().clone());
+        let result = self.validate_and_retire_replay_checkpoint(ticket, committed_checkpoint);
+        match &result {
+            Ok(lag) => self.metrics.observe(
+                ContinuityOutcome::Acknowledged,
+                source.as_ref(),
+                self.retained_uncertainties.len(),
+                Some(*lag),
+            ),
+            Err(_) => self.metrics.observe(
+                ContinuityOutcome::CheckpointRejected,
+                source.as_ref(),
+                self.retained_uncertainties.len(),
+                None,
+            ),
+        }
+        result.map(|_| ())
+    }
+
+    fn validate_and_retire_replay_checkpoint(
+        &mut self,
+        ticket: DispatchTicket,
+        committed_checkpoint: &ReplayPriorToken,
+    ) -> Result<std::time::Duration, AdmissionError> {
         let pending = self
             .pending
             .get(&ticket)
@@ -1510,7 +1575,7 @@ impl ReconciliationAdmissionSupervisor {
         }
         let pending = self.pending.remove(&ticket).expect("ticket checked above");
         self.release_usage(&pending.lane, pending.usage);
-        Ok(())
+        Ok(pending.admitted_at.elapsed())
     }
 
     /// Retire an applied live envelope after the proofless audit has been handed off.

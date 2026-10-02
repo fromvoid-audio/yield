@@ -5,6 +5,8 @@ mod admission;
 mod model;
 mod normalize;
 mod owner;
+mod telemetry;
+pub use telemetry::WatcherMetrics;
 
 #[cfg(test)]
 mod tests;

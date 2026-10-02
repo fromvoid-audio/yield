@@ -2211,3 +2211,118 @@ fn adapter_remains_fenced_by_cancellation_restart_and_rebind() {
     assert_eq!(rebound.disposition(), AdapterDisposition::AdmittedUnproven);
     assert!(matches!(rebound.outcome(), AdmissionOutcome::Accepted(_)));
 }
+
+#[test]
+fn watcher_metrics_distinguish_admission_acknowledgement_duplicates_stale_and_gaps() {
+    let mut supervisor = ReconciliationAdmissionSupervisor::new(adapter_admission_limits(4, 8));
+    let source = SourceId::from_string("source-a");
+    let root = RootIdentity::from_bytes(b"root-a".to_vec());
+    let (lane, generation) = adapter_registered(&mut supervisor, &source, &root);
+    let prior = replay_prior("source-a", b"root-a", b"stream-a", generation.get(), 10);
+    let batch = adapter_batch(
+        adapter_capture_provenance(
+            "source-a",
+            Some(b"root-a".to_vec()),
+            Some(b"stream-a".to_vec()),
+            generation.get(),
+            Some(11),
+            Some(11),
+        ),
+        vec![adapter_observation(RawEventKind::Create, "secret-path.wav")],
+    );
+    let ticket = match ReconciliationAdapter::new(&mut supervisor)
+        .admit_replay(batch.clone(), Some(&prior), true)
+        .unwrap()
+        .outcome()
+    {
+        AdmissionOutcome::Accepted(ticket) => *ticket,
+        other => panic!("expected accepted replay, got {other:?}"),
+    };
+    assert_eq!(supervisor.watcher_metrics().admitted_continuity, 1);
+    assert_eq!(supervisor.watcher_metrics().acknowledged_checkpoints, 0);
+    assert!(
+        supervisor
+            .watcher_metrics()
+            .acknowledgement_lag_buckets
+            .iter()
+            .all(|n| *n == 0)
+    );
+    ReconciliationAdapter::new(&mut supervisor)
+        .admit_replay(batch, Some(&prior), true)
+        .unwrap();
+    assert_eq!(supervisor.watcher_metrics().duplicates, 1);
+    supervisor.dispatch_next().unwrap();
+    supervisor.mark_dispatched(ticket).unwrap();
+    supervisor.mark_applied(ticket).unwrap();
+    assert_eq!(supervisor.watcher_metrics().acknowledged_checkpoints, 0);
+
+    // A synthetic opaque prior exercises classification, not actual database durability.
+    assert!(supervisor.mark_replay_checkpointed(ticket, &prior).is_err());
+    assert_eq!(supervisor.watcher_metrics().rejected_checkpoints, 1);
+    assert_eq!(supervisor.in_flight(), 1);
+    let committed = replay_prior("source-a", b"root-a", b"stream-a", generation.get(), 11);
+    supervisor
+        .mark_replay_checkpointed(ticket, &committed)
+        .unwrap();
+    assert_eq!(supervisor.watcher_metrics().acknowledged_checkpoints, 1);
+    assert_eq!(
+        supervisor
+            .watcher_metrics()
+            .acknowledgement_lag_buckets
+            .iter()
+            .sum::<u64>(),
+        1
+    );
+    assert!(
+        supervisor
+            .mark_replay_checkpointed(ticket, &committed)
+            .is_err()
+    );
+    assert_eq!(supervisor.watcher_metrics().acknowledged_checkpoints, 1);
+    assert_eq!(supervisor.watcher_metrics().rejected_checkpoints, 2);
+
+    let gap = adapter_batch(
+        adapter_capture_provenance(
+            "source-a",
+            Some(b"root-a".to_vec()),
+            Some(b"stream-a".to_vec()),
+            generation.get(),
+            Some(13),
+            Some(13),
+        ),
+        vec![adapter_observation(RawEventKind::Modify, "gap.wav")],
+    );
+    ReconciliationAdapter::new(&mut supervisor)
+        .admit_replay(gap, Some(&committed), false)
+        .unwrap();
+    let metrics = supervisor.watcher_metrics();
+    assert_eq!(metrics.admitted_unproven, 1);
+    assert_eq!(
+        metrics.retained_proof_gaps,
+        supervisor.uncertainties().len()
+    );
+    assert!(metrics.retained_proof_gaps > 0);
+    let stale = adapter_batch(
+        adapter_capture_provenance(
+            "source-a",
+            Some(b"root-a".to_vec()),
+            Some(b"stream-a".to_vec()),
+            generation.get() + 1,
+            Some(14),
+            Some(14),
+        ),
+        vec![adapter_observation(RawEventKind::Modify, "stale.wav")],
+    );
+    ReconciliationAdapter::new(&mut supervisor)
+        .admit_replay(stale, Some(&committed), true)
+        .unwrap();
+    assert_eq!(supervisor.watcher_metrics().stale_admissions, 1);
+    let pending = supervisor.dispatch_next().unwrap().ticket();
+    supervisor.mark_dispatched(pending).unwrap();
+    supervisor.mark_applied(pending).unwrap();
+    supervisor.mark_unproven_audit_handed_off(pending).unwrap();
+    assert_eq!(supervisor.watcher_metrics().acknowledged_checkpoints, 1);
+    assert!(supervisor.watcher_metrics().retained_proof_gaps > 0);
+    supervisor.stop_lane(&lane, generation).unwrap();
+    assert!(supervisor.watcher_metrics().retained_proof_gaps > 0);
+}
