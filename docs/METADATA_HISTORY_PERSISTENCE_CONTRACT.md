@@ -193,6 +193,9 @@ old/missing tables return explicitly unsupported without DDL. Maintenance and
 legacy adoption must remain coordinated with OPT-2112/2116/2117; this document
 does not authorize pre-lease schema writes.
 
+OPT-2138 first supplies actual retained-owner bounded confirmed membership
+observations without intent, renewal or a write grant. Later intent preparation
+must still reread/revalidate the before bits inside its admitted owner transition.
 Implement OPT-2127 for admitted finite history preparation and schema,
 OPT-2128 for atomic original/direction persistence and retained reconciliation,
 and OPT-2129 for catalog/session/GPUI restart consumption. None completes OPT-2115 alone. Required
