@@ -15,6 +15,7 @@ pub(super) enum JobKind {
     Catalog,
     Waveform,
     AudioOutput,
+    FeatureAnalysis,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,18 +38,20 @@ impl JobKind {
             Self::Catalog => "Source catalog",
             Self::Waveform => "Waveform",
             Self::AudioOutput => "Audio output",
+            Self::FeatureAnalysis => "Selected-file features",
         }
     }
 }
 
-/// A bounded presentation row. These workers do not currently publish known
-/// semantic totals, so running rows are explicitly indeterminate.
+/// A bounded current presentation row. Feature work carries phase target counts;
+/// other workers and compute phases remain explicitly indeterminate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct JobRow {
     pub(super) kind: JobKind,
     pub(super) source: Option<PathBuf>,
     pub(super) generation: u64,
-    pub(super) work: &'static str,
+    pub(super) work: String,
+    pub(super) completed: bool,
     pub(super) blocked: Option<String>,
     pub(super) action: Option<JobActionKind>,
     pub(super) can_retry: bool,
@@ -61,6 +64,8 @@ impl JobRow {
             "Retry queued · awaiting audit"
         } else if matches!(self.action, Some(JobActionKind::CancelRequested)) {
             "Cancellation requested · awaiting worker"
+        } else if self.completed {
+            "Selected file ready"
         } else if self.blocked.is_some() {
             "Needs attention"
         } else {
@@ -83,7 +88,7 @@ impl JobRow {
     }
 }
 
-fn bounded_text(value: &str, max_chars: usize) -> String {
+pub(super) fn bounded_text(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let mut text: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
@@ -101,12 +106,21 @@ pub(super) struct JobSnapshot {
 
 impl JobSnapshot {
     pub(super) fn active_count(&self) -> usize {
-        self.rows.iter().filter(|row| row.blocked.is_none()).count()
+        self.rows
+            .iter()
+            .filter(|row| row.blocked.is_none() && !row.completed)
+            .count()
     }
 
     pub(super) fn status_label(&self) -> String {
         let count = self.active_count();
-        if count > 0 {
+        if count == 1
+            && let Some(row) = self.rows.iter().find(|row| {
+                row.kind == JobKind::FeatureAnalysis && row.blocked.is_none() && !row.completed
+            })
+        {
+            format!("{} · {}", row.source_label(), row.work)
+        } else if count > 0 {
             format!("{count} job{} running", if count == 1 { "" } else { "s" })
         } else if self.rows.iter().any(|row| row.blocked.is_some()) {
             "Job needs attention".into()
@@ -117,7 +131,10 @@ impl JobSnapshot {
 }
 
 pub(super) fn snapshot(browser: &Browser, cx: &Context<Browser>) -> JobSnapshot {
-    let mut rows = Vec::with_capacity(4);
+    let mut rows = Vec::with_capacity(5);
+    if let Some(row) = browser.feature_job_row() {
+        rows.push(row);
+    }
     let active_root = browser.root.as_ref();
     if browser.scan_cancel.is_some()
         && let Some(root) = active_root
@@ -126,7 +143,8 @@ pub(super) fn snapshot(browser: &Browser, cx: &Context<Browser>) -> JobSnapshot 
             kind: JobKind::SourceScan,
             source: Some(root.clone()),
             generation: browser.scan_generation,
-            work: "Finding audio files",
+            work: "Finding audio files".into(),
+            completed: false,
             blocked: None,
             action: None,
             can_retry: false,
@@ -153,7 +171,8 @@ pub(super) fn snapshot(browser: &Browser, cx: &Context<Browser>) -> JobSnapshot 
                 kind: JobKind::Catalog,
                 source: Some(activation.root.clone()),
                 generation: activation.lifecycle_generation,
-                work: "Checking source catalog",
+                work: "Checking source catalog".into(),
+                completed: false,
                 blocked: None,
                 action,
                 can_retry: false,
@@ -167,7 +186,8 @@ pub(super) fn snapshot(browser: &Browser, cx: &Context<Browser>) -> JobSnapshot 
                 kind: JobKind::Catalog,
                 source: Some(activation.root.clone()),
                 generation: activation.lifecycle_generation,
-                work: "Retry this source audit",
+                work: "Retry this source audit".into(),
+                completed: false,
                 blocked: Some(error.clone()),
                 action,
                 can_retry: action.is_none() && activation.registered && activation.audit_retryable,
@@ -180,7 +200,8 @@ pub(super) fn snapshot(browser: &Browser, cx: &Context<Browser>) -> JobSnapshot 
             kind: JobKind::Waveform,
             source: active_root.cloned(),
             generation: browser.waveform_generation,
-            work: "Loading selected waveform",
+            work: "Loading selected waveform".into(),
+            completed: false,
             blocked: None,
             action: None,
             can_retry: false,
@@ -192,7 +213,8 @@ pub(super) fn snapshot(browser: &Browser, cx: &Context<Browser>) -> JobSnapshot 
             kind: JobKind::AudioOutput,
             source: active_root.cloned(),
             generation: browser.playback_init_generation,
-            work: "Starting audio output",
+            work: "Starting audio output".into(),
+            completed: false,
             blocked: None,
             action: None,
             can_retry: false,
@@ -298,167 +320,4 @@ impl Browser {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-
-    use gpui::TestAppContext;
-    use yield_library::sample_sources::SourceId;
-
-    use super::super::SourceSession;
-    use super::super::catalog::CatalogActivation;
-    use crate::theme::ActiveTheme;
-
-    fn catalog(root: &str, generation: u64, error: Option<&str>) -> CatalogActivation {
-        CatalogActivation {
-            source_id: SourceId::from_string(root),
-            root: PathBuf::from(root),
-            lifecycle_generation: generation,
-            registered: true,
-            registration_admitted: true,
-            root_identity: None,
-            audit_finished: error.is_some(),
-            audit_error: error.map(str::to_owned),
-            audit_retryable: error.is_some(),
-            force_reload: false,
-            fallback_to_scan: false,
-        }
-    }
-
-    #[gpui::test]
-    fn projection_tracks_current_source_and_running_generation(cx: &mut TestAppContext) {
-        cx.set_global(ActiveTheme::default());
-        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
-        browser.update(cx, |view, _| {
-            view.root = Some(PathBuf::from("/sources/first"));
-            view.scan_generation = 7;
-            view.scan_cancel = Some(Arc::new(AtomicBool::new(false)));
-            view.catalog_activation = Some(catalog("/sources/first", 11, None));
-        });
-        let jobs = browser.update(cx, |view, cx| snapshot(view, cx));
-        assert_eq!(jobs.status_label(), "2 jobs running");
-        assert_eq!(jobs.rows[0].generation, 7);
-        assert_eq!(jobs.rows[1].generation, 11);
-        assert!(jobs.rows.iter().all(|row| row.source_label() == "first"));
-
-        browser.update(cx, |view, _| {
-            view.root = Some(PathBuf::from("/sources/second"));
-            view.scan_generation = 8;
-            view.catalog_activation = Some(catalog("/sources/first", 11, None));
-        });
-        let jobs = browser.update(cx, |view, cx| snapshot(view, cx));
-        assert_eq!(jobs.status_label(), "1 job running");
-        assert_eq!(jobs.rows[0].generation, 8);
-        assert_eq!(jobs.rows[0].source_label(), "second");
-        assert!(jobs.rows.iter().all(|row| row.kind != JobKind::Catalog));
-
-        browser.update(cx, |view, _| {
-            view.scan_cancel = None;
-            view.catalog_activation = Some(catalog("/sources/second", 12, Some("Retry needed")));
-        });
-        let jobs = browser.update(cx, |view, cx| snapshot(view, cx));
-        assert_eq!(jobs.status_label(), "Job needs attention");
-        assert_eq!(jobs.rows[0].generation, 12);
-        assert!(jobs.rows[0].can_retry);
-        assert_eq!(
-            jobs.rows[0].blocked_label().as_deref(),
-            Some("Retry needed")
-        );
-
-        browser.update(cx, |view, _| {
-            view.catalog_activation.as_mut().unwrap().audit_retryable = false;
-        });
-        let jobs = browser.update(cx, |view, cx| snapshot(view, cx));
-        assert!(!jobs.rows[0].can_retry);
-
-        browser.update(cx, |view, _| view.catalog_activation = None);
-        assert_eq!(
-            browser
-                .update(cx, |view, cx| snapshot(view, cx))
-                .status_label(),
-            "Jobs idle"
-        );
-    }
-
-    #[gpui::test]
-    fn rejected_actions_retain_recoverable_source_and_stale_actions_disappear(
-        cx: &mut TestAppContext,
-    ) {
-        cx.set_global(ActiveTheme::default());
-        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
-        browser.update(cx, |view, _| {
-            let root = PathBuf::from("/sources/first");
-            let mut session = SourceSession::new(root.clone());
-            session.source_id = Some(SourceId::from_string("/sources/first"));
-            view.source_sessions.push(session);
-            view.active_source = Some(0);
-            view.root = Some(root);
-            view.catalog_activation = Some(catalog("/sources/first", 11, Some("Retry needed")));
-        });
-        browser.update(cx, |view, cx| {
-            assert!(snapshot(view, cx).rows[0].can_retry);
-            view.retry_job_audit(cx);
-            assert_eq!(view.job_action, None);
-            assert!(
-                view.job_action_error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("not accepted"))
-            );
-            assert!(snapshot(view, cx).rows[0].can_retry);
-            view.catalog_activation.as_mut().unwrap().audit_finished = false;
-            view.job_action_error = None;
-            assert!(!snapshot(view, cx).rows[0].can_cancel);
-            view.cancel_job_audit(cx);
-            assert_eq!(view.job_action, None);
-            assert!(
-                view.job_action_error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("no longer cancelable"))
-            );
-            assert!(!snapshot(view, cx).rows[0].can_cancel);
-            view.job_action = Some(JobActionState {
-                source_id: SourceId::from_string("/sources/first"),
-                lifecycle_generation: 11,
-                kind: JobActionKind::CancelRequested,
-            });
-            assert!(!snapshot(view, cx).rows[0].can_cancel);
-            view.root = Some(PathBuf::from("/sources/second"));
-            assert!(snapshot(view, cx).rows.is_empty());
-        });
-    }
-
-    #[test]
-    fn status_counts_only_live_work_and_keeps_blocked_distinct() {
-        let mut snapshot = JobSnapshot::default();
-        assert_eq!(snapshot.status_label(), "Jobs idle");
-        snapshot.rows.push(JobRow {
-            kind: JobKind::Catalog,
-            source: Some(PathBuf::from("/source")),
-            generation: 4,
-            work: "Retry this source audit",
-            blocked: Some("Source unavailable".into()),
-            action: None,
-            can_retry: true,
-            can_cancel: false,
-        });
-        assert_eq!(snapshot.status_label(), "Job needs attention");
-        snapshot.rows.push(JobRow {
-            kind: JobKind::Waveform,
-            source: Some(PathBuf::from("/source")),
-            generation: 8,
-            work: "Loading selected waveform",
-            blocked: None,
-            action: None,
-            can_retry: false,
-            can_cancel: false,
-        });
-        assert_eq!(snapshot.status_label(), "1 job running");
-        assert_eq!(
-            snapshot.rows[1].state_label(),
-            "In progress · time remaining unknown"
-        );
-        assert_eq!(snapshot.rows[0].source_label(), "source");
-        assert_eq!(bounded_text("abcdef", 3), "abc…");
-    }
-}
+include!("job_details_tests.rs");

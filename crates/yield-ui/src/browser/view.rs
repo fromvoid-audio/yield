@@ -2797,7 +2797,8 @@ impl Render for Browser {
                                         0.35
                                     }),
                             )
-                            .child(jobs_status)
+                            .max_w(px(280.0))
+                            .child(div().min_w_0().text_ellipsis().child(jobs_status))
                             .on_click(cx.listener(|view, _, window, cx| {
                                 window.focus(&view.job_details_focus_handle);
                                 view.job_details_open = !view.job_details_open;
@@ -2813,6 +2814,7 @@ impl Render for Browser {
                     .bottom(px(status_bar_height))
                     .right(px(theme.spacing.panel_padding))
                     .w(px(360.0))
+                    .max_w(window.bounds().size.width - px(theme.spacing.panel_padding * 2.0))
                     .max_h(px(300.0))
                     .overflow_y_scroll()
                     .p(px(theme.spacing.panel_padding))
@@ -2836,9 +2838,9 @@ impl Render for Browser {
                         div()
                             .flex()
                             .flex_col()
-                            .child(format!("{} · {source}", row.kind.label()))
+                            .child(div().min_w_0().text_ellipsis().child(format!("{} · {source}", row.kind.label())))
                             .child(row.state_label())
-                            .child(row.work)
+                            .child(row.work.clone())
                             .when_some(row.blocked_label(), |element, error| element.child(error))
                             .when(row.can_retry, |element| {
                                 element.child(
@@ -2848,7 +2850,7 @@ impl Render for Browser {
                                         .cursor_pointer()
                                         .child("Retry")
                                         .on_click(cx.listener(|view, _, window, cx| {
-                                            view.retry_job_audit(cx);
+                                            view.retry_current_job(cx);
                                             window.focus(&view.job_details_focus_handle);
                                         })),
                                 )
@@ -5182,36 +5184,60 @@ mod tests {
     }
 
     #[gpui::test]
-    fn job_details_fit_compact_window(cx: &mut TestAppContext) {
+    fn job_details_fit_compact_and_normal_windows(cx: &mut TestAppContext) {
         use gpui::{AvailableSpace, size};
-
+        use yield_session::FeatureAnalysisPhase as Phase;
+        use yield_session::{FeatureAnalysisBlocker as Blocker, FeatureAnalysisState as State};
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
-        cx.simulate_resize(size(px(960.0), px(560.0)));
-        browser.update(cx, |view, _| {
-            view.job_details_open = true;
-            view.source_registry_status = "Source status ".repeat(100);
-        });
-        cx.draw(
-            point(px(0.0), px(0.0)),
-            size(
-                AvailableSpace::Definite(px(960.0)),
-                AvailableSpace::Definite(px(560.0)),
-            ),
-            |_, _| browser.clone(),
-        );
-        let control = cx
-            .debug_bounds("status-job-details")
-            .expect("job details status control");
-        let panel = cx
-            .debug_bounds("status-job-details-panel")
-            .expect("job details panel");
-        assert!(control.right() <= px(960.0));
-        assert!(control.bottom() <= px(560.0));
-        assert!(panel.left() >= px(0.0));
-        assert!(panel.right() <= px(960.0));
-        assert!(panel.top() >= px(0.0));
-        assert!(panel.bottom() <= control.top());
+        for (width, height) in [(960.0, 560.0), (1280.0, 800.0)] {
+            cx.simulate_resize(size(px(width), px(height)));
+            for state in [
+                State::Preparing {
+                    phase: Phase::ComparingReadiness,
+                },
+                State::Running,
+                State::Blocked {
+                    reason: Blocker::Computation,
+                },
+                State::Blocked {
+                    reason: Blocker::UnsupportedPlatform,
+                },
+            ] {
+                browser.update(cx, |view, _| {
+                    super::super::analysis::tests::install(view, state);
+                    view.job_details_open = true;
+                    view.source_registry_status = "Source status ".repeat(100);
+                });
+                cx.draw(
+                    point(px(0.0), px(0.0)),
+                    size(
+                        AvailableSpace::Definite(px(width)),
+                        AvailableSpace::Definite(px(height)),
+                    ),
+                    |_, _| browser.clone(),
+                );
+                let control = cx
+                    .debug_bounds("status-job-details")
+                    .expect("job details status control");
+                let panel = cx
+                    .debug_bounds("status-job-details-panel")
+                    .expect("job details panel");
+                assert!(control.right() <= px(width));
+                assert!(control.bottom() <= px(height));
+                assert!(control.size.width <= px(280.0));
+                assert!(panel.left() >= px(0.0));
+                assert!(panel.right() <= px(width));
+                assert!(panel.top() >= px(0.0));
+                assert!(panel.bottom() <= control.top());
+                if browser.update(cx, |view, _| view.feature_job_row().unwrap().can_retry) {
+                    let retry = cx
+                        .debug_bounds("status-job-retry")
+                        .expect("feature retry control");
+                    assert!(retry.left() >= panel.left() && retry.right() <= panel.right());
+                }
+            }
+        }
     }
 
     #[gpui::test]
