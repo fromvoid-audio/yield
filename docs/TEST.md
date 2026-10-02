@@ -654,3 +654,19 @@ GitHub CI and local wrappers together cover:
 
 When in doubt, run the wrapper script instead of assembling the command list by
 hand.
+
+
+## Controlled release metadata matrix
+
+Run `python3 scripts/internal/release/test_release_metadata.py` on Linux to
+exercise every channel and target declared in `release_contract.toml`. It runs
+the actual release ZIP packer in its existing skip-build mode in a temporary
+directory, then validates those ZIPs with `verify_published_release.py`.
+Cross-channel/version/target substitution, missing or changed identity fields,
+non-object/duplicate-field JSON, and oversized metadata must be rejected.
+
+The executable contents are explicitly marked placeholder fixture bytes.
+These checks prove the metadata contract, not native binary support, signatures,
+private CI artifacts, installation, physical qualification, or active updater UX.
+Keep OPT-1769, native artifact checks OPT-1865/1994, and the broader GPUI release
+and updater acceptance open until their own evidence exists.
