@@ -532,6 +532,7 @@ pub struct SourceDatabase {
     connection: Connection,
     // Retained with this connection through SourceWriter/catalog ownership handoffs.
     tag_metadata_policy_state: std::cell::Cell<u8>,
+    checkpoint_policy: crate::sqlite_wal::CheckpointPolicy,
     db_path: PathBuf,
     root: PathBuf,
     index_page_binding: Arc<()>,
@@ -1521,9 +1522,8 @@ impl SourceDatabase {
     /// skipped rather than reported as a write failure.
     pub(super) fn maybe_checkpoint_owned_wal(&self) {
         if self.validate_profile_owned_mutation().is_ok() {
-            crate::sqlite_wal::maybe_checkpoint_database_file(
+            self.checkpoint_policy.maybe_checkpoint(
                 &self.connection,
-                &self.db_path,
                 "source_db",
                 self.telemetry_label,
             );
@@ -1693,3 +1693,6 @@ mod source_db_migration_tests;
 
 #[cfg(test)]
 mod bounded_metadata_tests;
+
+#[cfg(test)]
+mod checkpoint_tests;

@@ -40,6 +40,8 @@ fn unavailable(reason: &'static str) -> WalAdmissionError {
 
 /// Observe the actual journal descriptor retained by this connection, without a pathname open.
 /// Call on the sole owning worker while its write transaction holds SQLite's writer lock.
+/// Post-commit maintenance may also take an authority-free size snapshot on that worker;
+/// it must not use that snapshot as admission evidence for a later write.
 pub(crate) fn retained_wal_bytes(connection: &Connection) -> Result<u64, WalAdmissionError> {
     let mode: String = connection
         .pragma_query_value(Some("main"), "journal_mode", |row| row.get(0))
