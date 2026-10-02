@@ -9,6 +9,9 @@ use thiserror::Error;
 
 use super::connection::LibraryDatabase;
 use super::error::LibraryError;
+use super::mutation_context::{
+    GlobalMutationCompletion, GlobalMutationKind, GlobalMutationRequest, ProfileAcquisitionId,
+};
 use super::operation_link_participant::{OperationLinkRequest, OperationLinkResult};
 use super::registry_limits::{
     RegistryBoundError, SOURCE_REGISTRY_MAX_BYTES, SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
@@ -61,7 +64,7 @@ impl SourceRegistrySnapshot {
         self.sources.is_empty()
     }
 
-    fn validate_for_admission(&self) -> Result<(), GlobalLibraryWriterQueueError> {
+    pub(super) fn validate_for_admission(&self) -> Result<(), GlobalLibraryWriterQueueError> {
         validate_sources_encoded(&self.sources)
             .map(|_| ())
             .map_err(GlobalLibraryWriterQueueError::from_registry_bound_error)
@@ -131,6 +134,9 @@ impl std::fmt::Display for GlobalLibraryWriterUnavailable {
 /// Nonblocking command-admission result for the global-library owner.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum GlobalLibraryWriterQueueError {
+    /// A vocabulary-only client cannot submit a different metadata route.
+    #[error("non-vocabulary request submitted through vocabulary client")]
+    InvalidMutationRoute,
     /// The owner is still applying schema and migrations.
     #[error("global library writer is initializing")]
     Initializing,
@@ -203,7 +209,7 @@ pub enum GlobalLibraryWriterQueueError {
 }
 
 impl GlobalLibraryWriterQueueError {
-    fn from_registry_bound_error(error: RegistryBoundError) -> Self {
+    pub(super) fn from_registry_bound_error(error: RegistryBoundError) -> Self {
         match error {
             RegistryBoundError::TooManyDescriptors { actual } => {
                 Self::SourceRegistryTooManyDescriptors {
@@ -264,6 +270,10 @@ pub enum GlobalLibraryWriterStartError {
 }
 
 enum WriterCommand {
+    CapturedMutation {
+        request: GlobalMutationRequest,
+        result: SyncSender<GlobalMutationCompletion>,
+    },
     ApplyOperationLink {
         request: OperationLinkRequest,
         result: SyncSender<Result<OperationLinkResult, LibraryError>>,
@@ -315,6 +325,10 @@ enum WriterCommand {
 }
 
 enum WriterReply {
+    CapturedMutation {
+        value: GlobalMutationCompletion,
+        result: SyncSender<GlobalMutationCompletion>,
+    },
     OperationLink {
         result: SyncSender<Result<OperationLinkResult, LibraryError>>,
         value: Result<OperationLinkResult, LibraryError>,
@@ -364,6 +378,9 @@ enum WriterReply {
 impl WriterReply {
     fn send(self) {
         match self {
+            Self::CapturedMutation { result, value } => {
+                let _ = result.send(value);
+            }
             Self::OperationLink { result, value } => {
                 let _ = result.send(value);
             }
@@ -402,6 +419,9 @@ impl WriterReply {
 
     fn send_error(self, error: LibraryError) {
         match self {
+            Self::CapturedMutation { result, value } => {
+                let _ = result.send(value.replace_result_with_error(error));
+            }
             Self::OperationLink { result, .. } => {
                 let _ = result.send(Err(error));
             }
@@ -452,6 +472,7 @@ struct OwnerHooks {
 /// The handle contains only typed command and lifecycle state. The writable SQLite connection
 /// remains on one owner thread for the handle's lifetime and is never exposed to callers.
 pub struct GlobalLibraryWriter {
+    acquisition: ProfileAcquisitionId,
     commands: Arc<Mutex<Option<SyncSender<WriterCommand>>>>,
     admission_gate: Arc<Mutex<()>>,
     lifecycle: Arc<std::sync::atomic::AtomicU8>,
@@ -467,6 +488,7 @@ pub struct GlobalLibraryWriter {
 /// connection or an owner thread; the [`GlobalLibraryWriter`] remains responsible for shutdown.
 #[derive(Clone)]
 pub struct ProfileTagVocabularyClient {
+    acquisition: ProfileAcquisitionId,
     commands: Arc<Mutex<Option<SyncSender<WriterCommand>>>>,
     admission_gate: Arc<Mutex<()>>,
     lifecycle: Arc<std::sync::atomic::AtomicU8>,
@@ -474,6 +496,23 @@ pub struct ProfileTagVocabularyClient {
 }
 
 impl GlobalLibraryWriter {
+    /// Observe this handle's acquisition before forming a delayed proposal. Not authority.
+    pub fn acquisition_id(&self) -> ProfileAcquisitionId {
+        self.acquisition.clone()
+    }
+
+    /// Submit an already captured immutable proposal without substituting this handle's ID.
+    /// The existing worker validates its retained capability before/after execution.
+    pub fn submit_captured_mutation(
+        &self,
+        request: GlobalMutationRequest,
+    ) -> Result<Receiver<GlobalMutationCompletion>, GlobalLibraryWriterQueueError> {
+        self.ensure_available()?;
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::CapturedMutation { request, result })?;
+        Ok(receiver)
+    }
+
     /// Start an owner using a clone of an already-acquired profile capability.
     ///
     /// Cloning the capability duplicates its retained descriptors without acquiring a second
@@ -527,6 +566,7 @@ impl GlobalLibraryWriter {
             .map_err(GlobalLibraryWriterStartError::ThreadSpawn)?;
 
         Ok(Self {
+            acquisition: ProfileAcquisitionId::from_guard(profile_guard),
             commands: Arc::clone(&commands),
             admission_gate,
             lifecycle,
@@ -584,6 +624,7 @@ impl GlobalLibraryWriter {
         let (commands, blocked_receiver) =
             mpsc::sync_channel(GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY);
         Self {
+            acquisition: ProfileAcquisitionId::test_only(),
             commands: Arc::new(Mutex::new(Some(commands))),
             admission_gate: Arc::new(Mutex::new(())),
             lifecycle: Arc::new(std::sync::atomic::AtomicU8::new(
@@ -611,6 +652,7 @@ impl GlobalLibraryWriter {
     /// Return a cloneable client for the profile-owned tag vocabulary commands.
     pub fn profile_tag_vocabulary_client(&self) -> ProfileTagVocabularyClient {
         ProfileTagVocabularyClient {
+            acquisition: self.acquisition.clone(),
             commands: Arc::clone(&self.commands),
             admission_gate: Arc::clone(&self.admission_gate),
             lifecycle: Arc::clone(&self.lifecycle),
@@ -837,6 +879,29 @@ impl GlobalLibraryWriter {
 }
 
 impl ProfileTagVocabularyClient {
+    /// Observe this handle's acquisition before forming a delayed proposal. Not authority.
+    pub fn acquisition_id(&self) -> ProfileAcquisitionId {
+        self.acquisition.clone()
+    }
+
+    /// Submit an already captured immutable proposal without substituting this handle's ID.
+    /// The existing worker validates its retained capability before/after execution.
+    pub fn submit_captured_mutation(
+        &self,
+        request: GlobalMutationRequest,
+    ) -> Result<Receiver<GlobalMutationCompletion>, GlobalLibraryWriterQueueError> {
+        if !matches!(
+            request.context().kind(),
+            GlobalMutationKind::VocabularySet | GlobalMutationKind::VocabularyDelete
+        ) {
+            return Err(GlobalLibraryWriterQueueError::InvalidMutationRoute);
+        }
+        self.ensure_available()?;
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::CapturedMutation { request, result })?;
+        Ok(receiver)
+    }
+
     /// Return the current shared writer lifecycle without waiting for I/O.
     pub fn status(&self) -> GlobalLibraryWriterStatus {
         writer_status(&self.lifecycle, &self.unavailable)
@@ -1153,6 +1218,10 @@ fn execute_command(
     owner_identity: &str,
 ) -> WriterReply {
     match command {
+        WriterCommand::CapturedMutation { request, result } => WriterReply::CapturedMutation {
+            value: request.execute(database, owner_identity),
+            result,
+        },
         WriterCommand::ApplyOperationLink { request, result } => WriterReply::OperationLink {
             value: database.apply_operation_link(owner_identity, &request),
             result,
@@ -1262,6 +1331,9 @@ fn reject_remaining_profile_change(
 
 fn send_command_error(command: WriterCommand, error: LibraryError) {
     match command {
+        WriterCommand::CapturedMutation { request, result } => {
+            let _ = result.send(request.failed(error));
+        }
         WriterCommand::ApplyOperationLink { result, .. } => {
             let _ = result.send(Err(error));
         }
@@ -1358,6 +1430,10 @@ fn unavailable_from_library_error(error: &LibraryError) -> GlobalLibraryWriterUn
 
 #[cfg(test)]
 mod tests {
+    mod mutation_context_tests {
+        use super::*;
+        include!("mutation_context_owner_tests.rs");
+    }
     mod operation_link_tests {
         use super::*;
         include!("operation_link_owner_tests.rs");

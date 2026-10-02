@@ -11,6 +11,7 @@ mod connection;
 mod error;
 mod harvest;
 mod migrations;
+mod mutation_context;
 mod operation_link_participant;
 mod owner;
 mod read_only;
@@ -38,6 +39,10 @@ pub use harvest::{
     HarvestDerivationOperation, HarvestDerivationRecord, HarvestFileIdentity, HarvestFileKey,
     HarvestFileRecord, HarvestMetadataSnapshot, HarvestSourceRange, HarvestState,
     NewHarvestDerivation,
+};
+pub use mutation_context::{
+    GlobalMutationCompletion, GlobalMutationContext, GlobalMutationKind, GlobalMutationRequest,
+    GlobalMutationValue, ProfileAcquisitionId,
 };
 pub use operation_link_participant::{
     OPERATION_LINK_MAX_BYTES, OPERATION_LINK_MAX_RECEIPTS, OperationLinkReceipt,

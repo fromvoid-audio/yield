@@ -276,7 +276,8 @@ fn map_submit_error(error: GlobalLibraryWriterQueueError) -> VocabularySubmitErr
             VocabularySubmitError::Invalid(error)
         }
         GlobalLibraryWriterQueueError::Closed => VocabularySubmitError::Closed,
-        GlobalLibraryWriterQueueError::PayloadTooLarge { .. }
+        GlobalLibraryWriterQueueError::InvalidMutationRoute
+        | GlobalLibraryWriterQueueError::PayloadTooLarge { .. }
         | GlobalLibraryWriterQueueError::SourceRegistryTooManyDescriptors { .. }
         | GlobalLibraryWriterQueueError::SourceRegistryFieldTooLarge { .. }
         | GlobalLibraryWriterQueueError::SourceRegistrySourceIdTooLarge { .. }
