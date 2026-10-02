@@ -79,6 +79,9 @@ with retained restart payload bounds; existing collection coverage bounds remain
 intact. Evict only oldest settled eligible records;
 never in-flight, unresolved or exclusive partial compound records. If coverage
 cannot fit, report that explicitly while retaining ordinary edit admission.
+Do not evict redo entries merely to retain an uncommitted ordinary candidate;
+if settled undo eviction cannot provide room, leave that candidate uncovered.
+The ordinary edit may clear redo only after its acknowledged commit.
 
 An accepted overlay is pending presentation, not history. Maintain one history
 direction in flight and one chronological top across sample and collection
