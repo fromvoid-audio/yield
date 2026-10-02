@@ -223,6 +223,7 @@ impl Fixture {
                 Some(worker_gate),
                 None,
                 WatcherMode::Detached,
+                None,
                 HashMap::from([(id, source)]),
             )
         });

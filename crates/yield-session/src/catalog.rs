@@ -8,13 +8,15 @@ use yield_catalog::{CatalogAuditCancelError, CatalogSubmitError as CatalogWorker
 pub use yield_catalog::{
     CatalogCommand, CatalogCurationRequestError, CatalogCurationTagFactsRequestError,
     CatalogDelivery, CatalogDisplayLabelsRequestError, CatalogError, CatalogEvent,
-    CatalogIndexEntryHandle, CatalogIndexInspection, CatalogIndexPage, CatalogIndexPageCursor,
-    CatalogIndexPageError, CatalogOperation, CatalogPublicationStatus,
+    CatalogHarvestFacts, CatalogIndexEntryHandle, CatalogIndexInspection, CatalogIndexPage,
+    CatalogIndexPageCursor, CatalogIndexPageError, CatalogOperation, CatalogPublicationStatus,
     CatalogRatingDecayRequestError, CatalogTagAssignmentPreview, CatalogTagAssignmentPreviewSource,
     CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
     CatalogWavMetadataRequestError, FeatureAnalysisBlocker, FeatureAnalysisCancellation,
-    FeatureAnalysisPhase, FeatureAnalysisState, FeaturePhaseMeasurement,
-    IndexInspectionCancellation, MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
+    FeatureAnalysisPhase, FeatureAnalysisState, FeaturePhaseMeasurement, HARVEST_FACTS_MAX_BYTES,
+    HARVEST_FACTS_MAX_PATH_BYTES, HARVEST_FACTS_MAX_PATHS, HarvestFactsCancellation,
+    HarvestFactsEntry, HarvestFactsFailure, HarvestState, IndexInspectionCancellation,
+    MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
     MAX_CURATION_OPERATION_RECEIPT_BYTES, MAX_CURATION_OPERATION_UPDATES,
     MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES, MAX_HELD_INDEX_INSPECTIONS,
     MAX_INDEX_PAGE_PAYLOAD_BYTES, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
@@ -28,9 +30,10 @@ pub use yield_catalog::{
     SimilarityCandidateOutcome, SimilarityDispatchFailure, SourceCurationCommitReceipt,
     SourceCurationOperationFailure, SourceCurationOperationFence, SourceCurationOperationOutcome,
     SourceCurationTagFacts, SourceCurationUpdate, SourceDisplayLabelEntry,
-    SourceIndexInspectionError, SourceSimilarityRequest, SourceSimilarityResult,
-    SourceSimilarityRow, SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage,
-    SourceTagPageCursor, SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
+    SourceHarvestFactsRequest, SourceIndexInspectionError, SourceSimilarityRequest,
+    SourceSimilarityResult, SourceSimilarityRow, SourceTagAssignmentCursor,
+    SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
+    VerifiedSourceRoot, resolve_source_root,
 };
 
 /// Lifecycle state of the independently-owned source catalog worker.
