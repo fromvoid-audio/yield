@@ -7,10 +7,14 @@ use crate::sample_sources::readiness::{
 use std::time::{Duration, Instant};
 
 fn setup() -> (CurationFixture, SourceWriter) {
+    setup_named(&["one.wav", "two.wav"])
+}
+fn setup_named(names: &[&str]) -> (CurationFixture, SourceWriter) {
     let mut fixture = CurationFixture::new_profile_bound();
     let mut batch = fixture.database.write_batch().unwrap();
-    for name in ["one.wav", "two.wav"] {
+    for name in names {
         let path = fixture._source.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, name.as_bytes()).unwrap();
         let metadata = path.metadata().unwrap();
         let identity =
@@ -595,8 +599,7 @@ fn layout_capture_changed_audited_revision_and_physical_owner_scope_reject_old_i
     assert_eq!(persisted(&writer), before);
 }
 
-#[test]
-fn layout_capture_maximum_complete_manifest_uses_actual_published_features() {
+fn setup_max_manifest() -> (CurationFixture, SourceWriter) {
     let (fixture, mut writer) = setup();
     let names: Vec<String> = (0..254)
         .map(|index| format!("extra-{index:03}.wav"))
@@ -641,6 +644,12 @@ fn layout_capture_maximum_complete_manifest_uses_actual_published_features() {
     let mut all: Vec<&str> = names.iter().map(String::as_str).collect();
     all.extend(["one.wav", "two.wav"]);
     publish(&mut writer, &all);
+    (fixture, writer)
+}
+
+#[test]
+fn layout_capture_maximum_complete_manifest_uses_actual_published_features() {
+    let (_fixture, writer) = setup_max_manifest();
     let before = persisted(&writer);
     let start = Instant::now();
     let observed = capture(&writer).unwrap();
@@ -775,3 +784,6 @@ fn layout_capture_never_omits_audio_when_persisted_classification_disagrees_with
         assert_eq!(persisted(&writer), before);
     }
 }
+
+#[path = "layout_generation.rs"]
+mod layout_generation;
