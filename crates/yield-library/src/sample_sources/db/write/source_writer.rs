@@ -1879,6 +1879,8 @@ impl SourceWriter {
             }
 
             ensure_expected_fence(&current, request.expected())?;
+            crate::sqlite_wal::enforce_wal_admission(batch.curation_transaction())
+                .map_err(SourceDbError::from)?;
             let next_source_revision = request.expected().revision.checked_add(1).ok_or(
                 SourceWriterError::InvalidRequest("source revision would overflow"),
             )?;

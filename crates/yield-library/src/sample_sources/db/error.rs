@@ -158,6 +158,9 @@ pub enum SourceDatabaseIdentityError {
 /// Errors returned when managing a source database.
 #[derive(Debug, Error)]
 pub enum SourceDbError {
+    /// New metadata writes require a current retained-owner WAL observation below hard pressure.
+    #[error(transparent)]
+    WalAdmission(#[from] crate::WalAdmissionError),
     /// Writable source database access requires an already-acquired profile ownership capability.
     #[error("profile ownership is required for writable source database access")]
     ProfileOwnershipRequired,

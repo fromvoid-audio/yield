@@ -4358,3 +4358,6 @@ fn bounded_metadata_corruption_rejects_actual_writer_revision_and_tag_selection_
     }
 }
 mod readiness_targets;
+
+#[path = "curation/wal_admission.rs"]
+mod wal_admission;
