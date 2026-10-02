@@ -1,3 +1,7 @@
+mod cross_reference_contract_tests {
+    include!("cross_reference_contract_tests.rs");
+}
+
 use super::*;
 
 type ReopenedDerivationRow = (
