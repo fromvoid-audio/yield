@@ -5,6 +5,13 @@ use super::super::model::{ReadinessScopeKind, ReadinessStage};
 /// Errors returned by the durable readiness contract.
 #[derive(Debug, Error)]
 pub enum ReadinessError {
+    /// A feature artifact had an unsupported identity, shape or immutable conflict.
+    #[error("Invalid feature artifact: {0}")]
+    InvalidFeatureArtifact(&'static str),
+    /// Retained payload capacity is exhausted; the claim remains retryable.
+    #[error("Feature artifact store is full")]
+    FeatureArtifactCapacity,
+
     /// A readiness mutation was attempted without a retained profile-owned database context.
     #[error("Readiness mutation requires retained profile ownership")]
     OwnershipRequired,

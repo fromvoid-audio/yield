@@ -4,10 +4,14 @@
 //! reuse the existing `analysis_jobs` table, while the legacy analysis claimant ignores rows owned
 //! by the readiness coordinator until the bounded supervisor claims them explicitly.
 
+mod feature_artifact;
 mod model;
 mod snapshot;
 mod store;
 
+pub use feature_artifact::{
+    FeatureArtifactClaim, FeatureArtifactKey, FeatureArtifactPayload, FeatureArtifactPublication,
+};
 pub use model::{
     ClaimedReadinessWork, MAX_READINESS_CONTRACT_VERSION_BYTES, MAX_READINESS_TARGET_TEXT_BYTES,
     ReadinessArtifact, ReadinessClaimOrigin, ReadinessEligibility, ReadinessFailureClassification,
@@ -19,9 +23,9 @@ pub use snapshot::{
     ArtifactPublishOutcome, ReadinessActivity, ReadinessClassification, ReadinessDeficit,
     ReadinessEntry, ReadinessProgress, ReadinessSnapshot, ReadinessStageCounts,
 };
-pub(crate) use store::ReadinessWakeQualification;
 #[cfg(test)]
 pub(crate) use store::reconcile_readiness_with_hook;
+pub(crate) use store::{FEATURE_ARTIFACT_SCHEMA, ReadinessWakeQualification};
 pub use store::{
     ReadinessCompatibilityCleanup, ReadinessDeltaPublicationOutcome,
     ReadinessEmbeddingArtifactTarget, ReadinessError, ReadinessPublicationOrigin,
