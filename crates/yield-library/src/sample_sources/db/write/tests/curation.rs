@@ -4400,6 +4400,7 @@ mod tag_metadata_policy;
 #[cfg(test)]
 mod readiness_wal;
 mod snapshot_read_only;
+mod wal_reservation;
 
 mod snapshot_cursor;
 #[path = "curation/tag_admission_observation.rs"]

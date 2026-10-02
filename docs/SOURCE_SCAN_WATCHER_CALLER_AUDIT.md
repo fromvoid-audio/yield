@@ -224,3 +224,18 @@ keeps its existing no-claim result. The test-only unowned store model supplies n
 physical admission evidence. Ownership validation and its existing lease
 maintenance remain unchanged; universal journal pre-intent checks, all other
 writes, reserve-backed recovery and checkpoint scheduling remain OPT-1685/1348.
+
+
+## Retained source WAL preparation (OPT-2133)
+
+`SourceWriter::prepare_wal_reservation` consumes the existing writer into an
+opaque empty SQLite reservation. It performs strict read-only owner/lease and
+exact revision/audit checks, makes one nonblocking writer acquisition, restores
+its timeout, and uses the shared retained-VFS hard/unknown gate. No path reopen,
+metadata/receipt/job change, hidden renewal, journal ID or capacity permit is
+introduced. Failed empty rollback retains an unavailable writer until confirmed
+abort; drop closes its ordinary connection before source lease release. Deadline
+checks are cooperative and do not revoke in-flight SQLite I/O. Actual owned
+regressions run with `cargo test --locked -p yield-library --lib wal_reservation`.
+The multi-owner journal latch and required/recovery permits remain OPT-2136/2137;
+this local primitive does not finish OPT-1685 or qualify physical recovery.
