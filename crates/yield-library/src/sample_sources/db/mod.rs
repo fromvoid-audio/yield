@@ -43,6 +43,14 @@ pub use replay_authority::{
 /// SQLite schema management for sample source databases.
 pub mod schema;
 mod source_authority;
+mod source_registry_reference;
+pub use source_registry_reference::{
+    SOURCE_REGISTRY_REFERENCE_MAX_BYTES, SourceRegistryAuditObservation,
+    SourceRegistryReferenceError, SourceRegistryReferenceExpected,
+    SourceRegistryReferenceObservation, SourceRegistryReferenceProposal,
+    SourceRegistryReferenceSubject, SourceRegistryReferenceTransition,
+    SourceRegistryRegistrationObservation, SourceRegistryRegistrationPhase,
+};
 mod source_file_observation;
 mod source_lease;
 mod source_reference_fence;

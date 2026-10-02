@@ -476,6 +476,25 @@ impl SourceDatabase {
         Ok(state)
     }
 
+    // Generation metadata only; do not allocate any directory entry/path payload.
+    pub(crate) fn source_directory_truth_state_bounded(
+        &self,
+    ) -> Result<SourceDirectoryTruthState, SourceDbError> {
+        if !directory_truth_schema_available(&self.connection)? {
+            return Ok(SourceDirectoryTruthState::Unavailable {
+                reason: SourceDirectoryTruthUnavailableReason::SchemaUnavailable,
+            });
+        }
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(map_sql_error)?;
+        let state =
+            inspect_directory_truth_state(&transaction, DirectoryTruthInspection::BoundedPage)?;
+        transaction.rollback().map_err(map_sql_error)?;
+        Ok(state)
+    }
+
     /// Read one bounded, revision-fenced page of the active directory generation.
     pub fn source_directory_truth_page(
         &self,
