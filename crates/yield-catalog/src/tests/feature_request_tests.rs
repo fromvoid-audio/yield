@@ -505,6 +505,49 @@ mod fixtures {
         let service = CatalogService::start(&f.guard).unwrap();
         let next = register_and_audit(&service, f.root.path(), &source);
         assert!(next.committed_revision > snapshot.committed_revision);
+        assert_eq!(next.source_id, source);
+        assert_eq!(next.lifecycle_generation, snapshot.lifecycle_generation);
+        // Before any new feature request refreshes desired targets, the changed manifest alone
+        // invalidates the old completion. Its immutable bytes remain historical cache evidence.
+        let connection = observer(&f, &source);
+        let readiness = yield_library::sample_sources::readiness::ReadinessView::new(&connection)
+            .reconcile(source.as_str(), 0)
+            .unwrap();
+        let old_target = readiness
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.target.stage
+                    == yield_library::sample_sources::readiness::ReadinessStage::AnalysisFeatures
+            })
+            .unwrap()
+            .target
+            .clone();
+        assert_eq!(
+            readiness
+                .entries
+                .iter()
+                .find(|entry| entry.target == old_target)
+                .unwrap()
+                .classification,
+            yield_library::sample_sources::readiness::ReadinessClassification::StaleByGeneration
+        );
+        assert_eq!(counts(&f, &source), (1, 1));
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision,
+                99,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        assert_eq!(
+            state(&service, 99),
+            FeatureAnalysisState::Blocked {
+                reason: FeatureAnalysisBlocker::StaleSource
+            }
+        );
+        assert_eq!(counts(&f, &source), (1, 1));
         service
             .submit(command(
                 &source,
@@ -519,6 +562,54 @@ mod fixtures {
         let new = state(&service, 2);
         assert!(matches!(new, FeatureAnalysisState::Ready { .. }));
         assert_ne!(new, old);
+        assert_eq!(counts(&f, &source), (2, 1));
+        let readiness = yield_library::sample_sources::readiness::ReadinessView::new(&connection)
+            .reconcile(source.as_str(), 0)
+            .unwrap();
+        let entry = readiness
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.target.stage
+                    == yield_library::sample_sources::readiness::ReadinessStage::AnalysisFeatures
+            })
+            .unwrap();
+        assert_eq!(
+            entry.classification,
+            yield_library::sample_sources::readiness::ReadinessClassification::Current
+        );
+        assert_ne!(
+            entry.target.content_generation,
+            old_target.content_generation
+        );
+        assert!(entry.target.source_generation > old_target.source_generation);
+        assert_eq!(entry.target.scope_id, old_target.scope_id);
+        service.shutdown();
+        // Reopen once more: unchanged current content recovers verified readiness without DSP.
+        let service = CatalogService::start(&f.guard).unwrap();
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source.clone(),
+                canonical_root: f.root.path().into(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        receive_until(&service, |event| {
+            matches!(event, CatalogEvent::Registered { .. })
+        });
+        receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        });
+        service
+            .submit(command(
+                &source,
+                next.committed_revision,
+                3,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        preparation(&service, 3, false);
+        assert_eq!(state(&service, 3), new);
         assert_eq!(counts(&f, &source), (2, 1));
         service.shutdown();
     }
