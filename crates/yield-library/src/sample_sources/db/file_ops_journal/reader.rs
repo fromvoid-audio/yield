@@ -1962,8 +1962,13 @@ mod tests {
             .expect("first cursor page")
             .next_cursor()
             .expect("second cursor page");
-        let database_path = db.db_path.clone();
         drop(db);
+        // A dropped owner's descriptor pathname is not a persisted file identity. Keep
+        // other descriptors open so this test never relies on Linux reusing the old fd.
+        #[cfg(target_os = "linux")]
+        let _descriptor_pressure = (0..64)
+            .map(|_| std::fs::File::open("/dev/null").expect("bounded descriptor fixture"))
+            .collect::<Vec<_>>();
 
         let reopened = SourceDatabase::open_for_source_write_with_profile_guard(
             source_root.path(),
@@ -1973,7 +1978,14 @@ mod tests {
         .expect("reopen source database");
         let error = scan_page(&reopened, Some(cursor)).expect_err("old cursor must be stale");
         assert!(matches!(error, LegacyJournalScanError::StaleCursor { .. }));
-        assert!(database_path.exists());
+        assert!(reopened.db_path.exists());
+        let count: i64 = reopened
+            .connection
+            .query_row("SELECT count(*) FROM file_ops_journal", [], |row| {
+                row.get(0)
+            })
+            .expect("persisted journal rows");
+        assert_eq!(count, 17);
 
         drop(reopened);
         drop(profile);

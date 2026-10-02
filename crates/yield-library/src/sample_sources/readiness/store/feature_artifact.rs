@@ -1,5 +1,6 @@
 //! Real source-owned feature payload publication and validated lookup.
 mod health;
+pub(super) mod reverse_owners;
 pub(super) use health::{Health, admit, health, marker_matches};
 
 use super::super::{
@@ -16,7 +17,17 @@ pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS source_feature_artif
     payload BLOB NOT NULL CHECK(length(payload) = 732),
     digest BLOB NOT NULL CHECK(length(digest) = 32),
     claim_generation INTEGER NOT NULL CHECK(claim_generation > 0)
-) WITHOUT ROWID;";
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS source_feature_reverse_owners (
+ target_key TEXT PRIMARY KEY CHECK(length(target_key)=64),
+ source_id TEXT NOT NULL CHECK(length(CAST(source_id AS BLOB)) BETWEEN 1 AND 1024),
+ file_identity TEXT NOT NULL CHECK(length(CAST(file_identity AS BLOB)) BETWEEN 1 AND 1024),
+ content_generation TEXT NOT NULL CHECK(length(CAST(content_generation AS BLOB)) BETWEEN 1 AND 1024),
+ required_version TEXT NOT NULL CHECK(length(CAST(required_version AS BLOB)) BETWEEN 1 AND 1024)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_source_feature_reverse_source ON source_feature_reverse_owners(source_id,target_key);
+CREATE INDEX IF NOT EXISTS idx_wav_feature_identity_path ON wav_files(file_identity,path);
+CREATE INDEX IF NOT EXISTS idx_analysis_feature_inverse ON analysis_jobs(source_id,readiness_scope_id,artifact_version,content_generation,status);";
 
 fn current_target(
     connection: &Connection,
@@ -92,6 +103,7 @@ pub(super) fn publish(
                 "immutable payload conflict",
             ));
         }
+        reverse_owners::record(&tx, &key)?;
         let exact: bool = tx.query_row(
             "SELECT EXISTS(
             SELECT 1 FROM analysis_jobs j JOIN source_readiness_artifacts a
@@ -173,6 +185,7 @@ pub(super) fn publish(
             claim.claim_generation()
         ],
     )?;
+    reverse_owners::record(&tx, &key)?;
     super::work::validate_claim_ownership(&tx, ownership, claim)?;
     if cancel.load(Ordering::Acquire) {
         return Err(ReadinessError::Cancelled);

@@ -638,6 +638,31 @@ impl<'connection> ReadinessStore<'connection> {
         feature_artifact::inject_fixture_fault(self.connection, &self.ownership, target, fault)
     }
 
+    pub(crate) fn prune_superseded_features(
+        &mut self,
+        fence: &crate::sample_sources::db::SourceReferenceFence,
+        after: &str,
+        limit: u32,
+        cancel: &AtomicBool,
+    ) -> Result<feature_artifact::reverse_owners::Page, ReadinessError> {
+        feature_artifact::reverse_owners::prune(
+            self.connection,
+            &self.ownership,
+            fence,
+            after,
+            limit,
+            cancel,
+        )
+        .map_err(|error| match error {
+            ReadinessError::Sql(rusqlite::Error::SqliteFailure(ref failure, _))
+                if failure.code == rusqlite::ErrorCode::OperationInterrupted =>
+            {
+                ReadinessError::AdmissionBudget("feature maintenance elapsed SQLite work")
+            }
+            other => other,
+        })
+    }
+
     pub(crate) fn admit_feature_rebuild(
         &mut self,
         fence: &crate::sample_sources::db::SourceReferenceFence,
