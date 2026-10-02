@@ -401,7 +401,8 @@ fn preparation_retained_unknown_mode_and_rollback_denial_require_no_fake_complet
             &database,
             guard,
             &lifecycle,
-            writer.preparation_owner().registration()
+            writer.preparation_owner().registration(),
+            &mutation_fence::MutationFence::new()
         ));
         assert!(matches!(
             receiver.recv().unwrap(),
@@ -452,7 +453,8 @@ fn preparation_retained_unknown_mode_and_rollback_denial_require_no_fake_complet
             &database,
             guard,
             &lifecycle,
-            writer.preparation_owner().registration()
+            writer.preparation_owner().registration(),
+            &mutation_fence::MutationFence::new()
         ));
         assert_eq!(
             client.join().unwrap(),
@@ -607,7 +609,8 @@ fn preparation_one_actual_begin_and_timeout_restore_with_no_row_or_checkpoint_sq
             &database,
             guard,
             &lifecycle,
-            writer.preparation_owner().registration()
+            writer.preparation_owner().registration(),
+            &mutation_fence::MutationFence::new()
         ));
         assert_eq!(
             receiver.recv_timeout(Duration::from_secs(1)).unwrap().err(),
@@ -644,7 +647,8 @@ fn preparation_one_actual_begin_and_timeout_restore_with_no_row_or_checkpoint_sq
             &database,
             guard,
             &lifecycle,
-            writer.preparation_owner().registration()
+            writer.preparation_owner().registration(),
+            &mutation_fence::MutationFence::new()
         ));
         client.join().unwrap().unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);

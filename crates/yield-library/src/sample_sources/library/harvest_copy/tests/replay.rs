@@ -4,7 +4,12 @@ fn harvest_copy_owner_applies_one_edge_and_replays_without_touching_later_state(
     let f = Fixture::new();
     let r = f.request();
     let bytes = r.proposal_bytes().to_vec();
+    let dispatch_revision = f.global().observed_mutation_revision_for_test();
     let first = f.apply(r.clone()).unwrap();
+    assert_eq!(
+        f.global().observed_mutation_revision_for_test(),
+        dispatch_revision + 1
+    );
     assert!(matches!(first, HarvestCopyResult::Committed(_)));
     let receipt = first.receipt();
     assert_eq!(receipt.disposition(), HarvestCopyDisposition::Applied);
@@ -15,6 +20,10 @@ fn harvest_copy_owner_applies_one_edge_and_replays_without_touching_later_state(
     assert_eq!(f.count("harvest_derivations"), 1);
     f.db().execute("UPDATE harvest_files SET harvest_state='ignored',ignored_at=77,note='later authored state' WHERE source_id='origin'",[]).unwrap();
     let replay = f.apply(f.restore(&bytes).unwrap()).unwrap();
+    assert_eq!(
+        f.global().observed_mutation_revision_for_test(),
+        dispatch_revision + 2
+    );
     assert!(matches!(replay, HarvestCopyResult::Replayed(_)));
     assert_eq!(replay.receipt().edge_id(), receipt.edge_id());
     assert_eq!(replay.receipt().sequence(), receipt.sequence());

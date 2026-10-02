@@ -13,8 +13,10 @@ fn operation_link_lost_reply_duplicate_multiple_commands_and_restart() {
     let temp = tempdir().unwrap(); let _runtime = TestRuntimeGuard::acquire();
     let (_base, _profile, guard, mut writer) = start_writer(&temp, "link-restart"); wait_until_available(&writer);
     let command = test_request(guard.owner_identity(), 1, 1, 7);
+    let dispatch_revision = writer.observed_mutation_revision_for_test();
     drop(writer.apply_operation_link(command.clone()).unwrap());
     let receipt = result(&writer, command.clone()).unwrap();
+    assert_eq!(writer.observed_mutation_revision_for_test(), dispatch_revision + 2);
     assert!(matches!(receipt, OperationLinkResult::Replayed(_)));
     assert_eq!(result(&writer, command.clone()).unwrap(), receipt);
     let second = result(&writer, test_request(guard.owner_identity(), 1, 2, 7)).unwrap();

@@ -181,8 +181,10 @@ fn reference_owner_lost_reply_self_endpoints_old_key_reuse_and_restart() {
     f.seed();
     let request = f.request(1);
     let bytes = request.proposal_bytes().to_vec();
+    let dispatch_revision = f.global().observed_mutation_revision_for_test();
     drop(f.global().apply_reference_rekey(request.clone()).unwrap());
     let replay = f.apply(request.clone()).unwrap();
+    assert_eq!(f.global().observed_mutation_revision_for_test(), dispatch_revision + 2);
     assert!(matches!(replay, ReferenceRekeyResult::Replayed(_)));
     assert_eq!(
         replay.receipt().disposition(),
