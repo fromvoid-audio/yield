@@ -1,7 +1,7 @@
 //! Exact bounded aspect queries over retained-owner validated feature bytes.
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
-use yield_analysis::aspects::{AspectDescriptorSet, SimilarityAspect};
+use yield_analysis::aspects::{ASPECT_COUNT, AspectDescriptorSet, SimilarityAspect};
 use yield_library::operation_journal::StoredRelativePath;
 use yield_library::sample_sources::db::{
     SourceFileObservation, SourceFileObservationError, SourceFileObservationKind,
@@ -50,7 +50,8 @@ impl SourceSimilarityQuery {
         }
         Ok(Self {
             revision,
-            anchor,
+            // Match the already-copied candidates: retain text, not caller spare capacity.
+            anchor: anchor.clone(),
             aspect,
             generation,
             candidates: candidates.to_vec(),
@@ -110,6 +111,7 @@ pub struct SourceSimilarityRow {
     target: ReadinessTarget,
     key: Option<FeatureArtifactKey>,
     outcome: SimilarityCandidateOutcome,
+    aspect_scores: [Option<f32>; ASPECT_COUNT],
 }
 impl SourceSimilarityRow {
     /// Exact candidate target for display binding; not a filesystem capability.
@@ -119,6 +121,15 @@ impl SourceSimilarityRow {
     /// Validated stored key when bytes were available; not a write grant.
     pub fn key(&self) -> Option<&FeatureArtifactKey> {
         self.key.as_ref()
+    }
+    /// Finite raw cosine for one existing v1 aspect; unavailable descriptors remain None.
+    /// This is retained metadata, not freshness or a write grant.
+    pub fn aspect_score(&self, aspect: SimilarityAspect) -> Option<f32> {
+        self.aspect_scores[aspect.index()]
+    }
+    /// Fixed scores in SimilarityAspect::ORDER; no payload reads or recomputation.
+    pub fn aspect_scores(&self) -> &[Option<f32>; ASPECT_COUNT] {
+        &self.aspect_scores
     }
     /// Score or explicit unavailable result for this candidate only.
     pub fn outcome(&self) -> &SimilarityCandidateOutcome {
@@ -180,21 +191,25 @@ pub fn query_source_similarity(
     for target in &query.candidates {
         check_cancel(cancel)?;
         observations.push(observe(writer, query, target)?);
-        let (key, outcome) = match descriptors(writer, query, target)? {
+        let (key, aspect_scores) = match descriptors(writer, query, target)? {
             Some((key, descriptor)) => {
-                let outcome = descriptor
-                    .cosine_with(&anchor, query.aspect)
-                    .filter(|score| score.is_finite())
-                    .map(SimilarityCandidateOutcome::Scored)
-                    .unwrap_or(SimilarityCandidateOutcome::Unavailable);
-                (Some(key), outcome)
+                let scores = SimilarityAspect::ORDER.map(|aspect| {
+                    descriptor
+                        .cosine_with(&anchor, aspect)
+                        .filter(|score| score.is_finite())
+                });
+                (Some(key), scores)
             }
-            None => (None, SimilarityCandidateOutcome::Unavailable),
+            None => (None, [None; ASPECT_COUNT]),
         };
+        let outcome = aspect_scores[query.aspect.index()]
+            .map(SimilarityCandidateOutcome::Scored)
+            .unwrap_or(SimilarityCandidateOutcome::Unavailable);
         rows.push(SourceSimilarityRow {
             target: target.clone(),
             key,
             outcome,
+            aspect_scores,
         });
     }
     rows.sort_by(|left, right| {

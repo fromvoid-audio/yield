@@ -44,9 +44,22 @@ mod fixtures {
         }
     }
     fn setup() -> (Fixture, CatalogService, SourceId, CatalogSnapshot) {
+        setup_with_candidates(2)
+    }
+    fn setup_with_candidates(count: usize) -> (Fixture, CatalogService, SourceId, CatalogSnapshot) {
         let fixture = Fixture::new("similarity-dispatch");
         for path in ["anchor.wav", "same.wav", "missing.wav"] {
             write_test_wav(&fixture.root.path().join(path), 16_000, 4000);
+        }
+        for index in 2..count {
+            write_test_wav(
+                &fixture
+                    .root
+                    .path()
+                    .join(format!("candidate-{index:02}.wav")),
+                16_000,
+                4000,
+            );
         }
         let source = SourceId::from_string("similarity-dispatch");
         let service = CatalogService::start(&fixture.guard).unwrap();
@@ -128,12 +141,81 @@ mod fixtures {
             result.rows()[1].outcome(),
             &SimilarityCandidateOutcome::Unavailable
         );
+        for aspect in SimilarityAspect::ORDER {
+            assert!((result.rows()[0].aspect_score(aspect).unwrap() - 1.0).abs() < 0.0001);
+        }
+        assert_eq!(result.rows()[1].aspect_scores(), &[None; 5]);
         for (name, previous) in bytes {
             assert_eq!(fs::read(directory.join(name)).unwrap(), previous);
         }
         drained(&service);
         service.shutdown();
     }
+    #[test]
+    fn similarity_dispatch_maximum_actual_rows_keep_fixed_result_credit() {
+        let (_fixture, service, source, snapshot) = setup_with_candidates(64);
+        drained(&service);
+        let candidates: Vec<String> = ["same.wav".to_owned(), "missing.wav".to_owned()]
+            .into_iter()
+            .chain((2..64).map(|index| format!("candidate-{index:02}.wav")))
+            .collect();
+        let request = SourceSimilarityRequest::new(
+            source,
+            1,
+            snapshot.committed_revision,
+            40,
+            "anchor.wav".into(),
+            &candidates,
+            SimilarityAspect::Spectrum,
+        )
+        .unwrap();
+        submit(&service, request, SimilarityCancellation::new());
+        // Real retained result, not a preexecution error or fabricated row fixture.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = service
+                .events
+                .queue
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .events
+                .iter()
+                .any(|queued| {
+                    matches!(&queued.event,
+                    CatalogEvent::SimilarityCompleted { request, .. } if request.generation() == 40)
+                });
+            if ready {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            crate::similarity_dispatch::MAX_RESULT_BYTES
+        );
+        let event = delivery(&service, 40).into_event_if_live().unwrap();
+        let CatalogEvent::SimilarityCompleted {
+            result: Ok(result), ..
+        } = event
+        else {
+            panic!("{event:?}")
+        };
+        assert_eq!(result.rows().len(), 64);
+        assert!(result.rows()[0].aspect_scores().iter().all(Option::is_some));
+        assert!(
+            result.rows()[1..]
+                .iter()
+                .all(|row| row.aspect_scores() == &[None; 5])
+        );
+        drained(&service);
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            0
+        );
+        service.shutdown();
+    }
+
     #[test]
     fn similarity_dispatch_read_does_not_renew_near_expiry_or_expired_owner() {
         let (fixture, service, source, snapshot) = setup();
