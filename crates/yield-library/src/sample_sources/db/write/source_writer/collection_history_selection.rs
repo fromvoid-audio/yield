@@ -1,7 +1,7 @@
 //! Confirmed collection before-state on the retained owner, without history admission.
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::sample_sources::reconciliation::RootRelativePath;
 use crate::sample_sources::{SampleCollection, SourceDbError, normalize_relative_path};
@@ -47,6 +47,8 @@ pub struct SourceCollectionHistorySelection {
     directory_generation: u64,
     collection: SampleCollection,
     changes: Vec<SourceCollectionHistoryChange>,
+    observation_deadline: Instant,
+    lease_expires_at: SystemTime,
 }
 
 impl SourceCollectionHistorySelection {
@@ -61,6 +63,17 @@ impl SourceCollectionHistorySelection {
     /// Return the single targeted collection slot.
     pub const fn collection(&self) -> SampleCollection {
         self.collection
+    }
+    /// Return the conservative in-memory delivery deadline issued by this owner.
+    pub const fn observation_deadline(&self) -> Instant {
+        self.observation_deadline
+    }
+    /// Check only clocks, never SQL or filesystem state.
+    ///
+    /// This timing bound is not ownership, physical qualification or admission authority.
+    /// Consumers must also retain lifecycle/cancellation fences; later admission revalidates.
+    pub fn within_observation_window(&self) -> bool {
+        Instant::now() < self.observation_deadline && SystemTime::now() < self.lease_expires_at
     }
     /// Borrow changed paths in deterministic order; no-op paths are omitted.
     pub fn changes(&self) -> &[SourceCollectionHistoryChange] {
@@ -194,6 +207,35 @@ impl SourceWriter {
                 expected.root_identity(),
                 &paths,
             )?;
+            // Freeze a conservative delivery window from this same pinned lease row.
+            // Generation liveness alone cannot notice elapsed durable lease expiry.
+            let lease = self
+                .database
+                .source_lease
+                .as_deref()
+                .ok_or(SourceDbError::ProfileOwnershipRequired)?;
+            let expires_at: i64 = transaction
+                .query_row(
+                    "SELECT expires_at FROM source_lease WHERE singleton=1 AND owner_identity=?1
+                 AND lease_epoch=?2 AND state='active' AND released_at IS NULL",
+                    rusqlite::params![lease.owner_identity(), lease.epoch()],
+                    |row| row.get(0),
+                )
+                .map_err(map_sql_error)?;
+            let lease_expires_at = UNIX_EPOCH
+                .checked_add(Duration::from_secs(
+                    u64::try_from(expires_at).map_err(|_| SourceDbError::Unexpected)?,
+                ))
+                .ok_or(SourceDbError::Unexpected)?;
+            // Sample monotonic time first so the projection never extends the wall expiry.
+            let sampled_at = Instant::now();
+            let remaining = lease_expires_at
+                .duration_since(SystemTime::now())
+                .map_err(|_| SourceWriterError::StaleFence)?;
+            let observation_deadline = sampled_at
+                .checked_add(remaining)
+                .ok_or(SourceDbError::Unexpected)?
+                .min(deadline);
             let mut statement = transaction
                 .prepare("SELECT collection FROM wav_file_collections WHERE path=?1 LIMIT 7")
                 .map_err(map_sql_error)?;
@@ -231,6 +273,8 @@ impl SourceWriter {
                 directory_generation,
                 collection,
                 changes,
+                observation_deadline,
+                lease_expires_at,
             })
         })();
         if Instant::now() >= deadline {

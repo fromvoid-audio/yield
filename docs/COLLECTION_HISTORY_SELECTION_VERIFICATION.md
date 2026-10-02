@@ -22,7 +22,14 @@ requires current audited root/revision, one complete directory publication, no
 staged audit and supported live paths. Collection slots use integer decoding and
 seven-row lookahead, rejecting malformed/duplicate/out-of-range values.
 
-Complete revision identity is checked before and after the read snapshot. The
+Complete revision identity is checked before and after the read snapshot.
+The same pinned snapshot reads the exact active owner/epoch's integer lease expiry.
+The privately issued observation deadline is no later than that expiry or the
+original two-second SQL deadline. `within_observation_window` checks only monotonic
+and wall clocks, so queued delivery can discard expired data without SQL or
+filesystem calls; it cannot extend validity after a wall-clock shift. This timing
+predicate grants no ownership or admission and does not replace cancellation,
+lifecycle or later owner revalidation. The
 method rolls back its read transaction and never calls mutation-qualified lease
 renewal, DDL, checkpoint, intent creation or curation commit. Later admitted
 history preparation must reread/revalidate these observations in its owner
@@ -41,7 +48,8 @@ cases use real retained SourceWriter/audit transactions, not a model stack.
 Tests execute bounded subprocess cases because optional SQLite extension loading
 taints the process even after failed initialization. The ignored child driver is
 explicitly invoked by each normal parent test; its output must prove the actual
-case ran. No production flag resets extension evidence.
+case ran. A short actual durable lease plus query-only/authorizer control proves
+the returned window expires without SQL or persisted changes. No production flag resets extension evidence.
 
 ```sh
 cargo test --locked -p yield-library collection_history_selection

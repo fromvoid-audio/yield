@@ -86,6 +86,11 @@ fn collection_history_selection_rejects_actual_reacquired_lease_with_same_revisi
 }
 
 #[test]
+fn collection_history_selection_delivery_window_expires_without_sql() {
+    run("delivery-window");
+}
+
+#[test]
 #[ignore = "bounded subprocess driver invoked by actual owner tests"]
 fn collection_history_selection_child() {
     let Ok(case) = std::env::var("YIELD_HISTORY_SELECTION_CASE") else {
@@ -101,6 +106,7 @@ fn collection_history_selection_child() {
         "full-batch" => full_batch(),
         "audit-schema" => audit_schema(),
         "lease-handoff" => lease_handoff(),
+        "delivery-window" => delivery_window(),
         _ => panic!("unknown case"),
     }
 }
@@ -615,4 +621,46 @@ fn lease_handoff() {
             .len(),
         1
     );
+}
+
+fn delivery_window() {
+    let fixture = CurationFixture::new_profile_bound();
+    let writer = writer(fixture.database, 7);
+    let expected = writer.current_revision().unwrap();
+    let connection = &writer.database_for_tests().connection;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    connection
+        .execute("UPDATE source_lease SET expires_at=?1", [now + 2])
+        .unwrap();
+    connection.pragma_update(None, "query_only", true).unwrap();
+    let before = persisted(connection);
+    let changes = connection.total_changes();
+    // A longer private SQL test deadline isolates the real lease bound. The public
+    // worker API still always installs its original two-second deadline.
+    let selection = writer
+        .capture_collection_history_selection_with_deadline(
+            &expected,
+            SampleCollection::new(0).unwrap(),
+            true,
+            &[CurationFixture::path("one.wav")],
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+    assert!(selection.within_observation_window());
+    assert!(selection.observation_deadline() <= Instant::now() + Duration::from_secs(2));
+    assert_eq!(persisted(connection), before);
+    assert_eq!(connection.total_changes(), changes);
+    connection.authorizer(Some(|_: AuthContext<'_>| -> Authorization {
+        panic!("delivery timing check must never run SQL");
+    }));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while selection.within_observation_window() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!selection.within_observation_window());
+    assert_eq!(persisted(connection), before);
+    assert_eq!(connection.total_changes(), changes);
 }
