@@ -75,6 +75,11 @@ mod display_labels;
 mod feature_job;
 mod feature_progress;
 mod feature_request;
+mod history_selection;
+pub use history_selection::{
+    CollectionHistoryCancellation, CollectionHistoryFailure, CollectionHistoryRequest,
+    SourceCollectionHistorySelection,
+};
 mod similarity_dispatch;
 mod similarity_query;
 pub use feature_job::{
@@ -501,6 +506,13 @@ pub enum CatalogCommand {
         request: SourceHarvestFactsRequest,
         /// One-way cancellation retained through queued delivery and cached facts.
         cancellation: HarvestFactsCancellation,
+    },
+    /// Capture confirmed collection before-state on the registered owner.
+    RequestCollectionHistory {
+        /// Immutable bounded selection and caller context.
+        request: CollectionHistoryRequest,
+        /// Cancellation retained through queued delivery.
+        cancellation: CollectionHistoryCancellation,
     },
     /// Read one bounded explicit anchor/aspect set on the retained owner.
     RequestSimilarity {
@@ -1365,6 +1377,15 @@ pub enum CatalogEvent {
         /// Privately produced facts or a bounded fail-closed diagnostic.
         result: Result<CatalogHarvestFacts, HarvestFactsFailure>,
     },
+    /// Collection observation or exact-caller diagnostic; no history admission authority.
+    CollectionHistoryCompleted {
+        /// Original immutable caller context.
+        request: CollectionHistoryRequest,
+        /// Retained cancellation context.
+        cancellation: CollectionHistoryCancellation,
+        /// Sole-owner observation moved without reconstruction.
+        result: Result<SourceCollectionHistorySelection, CollectionHistoryFailure>,
+    },
     /// Exact bounded similarity result or truthful failure; no readiness mutation.
     SimilarityCompleted {
         /// Exact captured request, required to match before rendering.
@@ -1800,7 +1821,7 @@ impl CatalogDelivery {
     pub fn into_parts_if_live(self) -> Option<(CatalogEvent, Option<SourcePublicationFence>)> {
         let CatalogDelivery {
             mut event,
-            publication_fence,
+            mut publication_fence,
             index_query_token,
         } = self;
         if index_query_token.is_some_and(|token| token.load(Ordering::Acquire)) {
@@ -1834,6 +1855,25 @@ impl CatalogDelivery {
         {
             return None;
         }
+        if let CatalogEvent::CollectionHistoryCompleted {
+            cancellation,
+            result,
+            ..
+        } = &mut event
+        {
+            if cancellation.is_cancelled()
+                || publication_fence.as_ref().is_some_and(|f| !f.is_live())
+            {
+                return None;
+            }
+            if result
+                .as_ref()
+                .is_ok_and(|selection| !selection.within_observation_window())
+            {
+                *result = Err(CollectionHistoryFailure::ObservationExpired);
+                publication_fence = None;
+            }
+        }
         if publication_fence
             .as_ref()
             .is_none_or(SourcePublicationFence::is_live)
@@ -1863,6 +1903,7 @@ impl CatalogDelivery {
 }
 
 struct RegisteredSource {
+    collection_history_token: Option<std::sync::Weak<AtomicBool>>,
     replay: Option<replay::ReplayState>,
     root: PathBuf,
     lifecycle_generation: u64,
@@ -2287,7 +2328,8 @@ impl EventReservation<'_> {
 
 fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> {
     match command {
-        CatalogCommand::RequestSimilarity { .. } => {}
+        CatalogCommand::RequestSimilarity { .. }
+        | CatalogCommand::RequestCollectionHistory { .. } => {}
         CatalogCommand::RequestFeatureAnalysis {
             source_id,
             relative_path,
@@ -2693,6 +2735,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
 
         CatalogCommand::Register { .. } | CatalogCommand::RegisterVerified { .. } => 2,
         CatalogCommand::RequestAudit { .. }
+        | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestSimilarity { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestIndexPage { .. }
@@ -2745,6 +2788,7 @@ fn command_curation_update_count(command: &CatalogCommand) -> usize {
 fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
     match command {
         CatalogCommand::RequestHarvestFacts { request, .. } => request.input_bytes(),
+        CatalogCommand::RequestCollectionHistory { request, .. } => request.input_bytes(),
         CatalogCommand::RequestSimilarity { request, .. } => request.input_bytes(),
         CatalogCommand::ConsumeReplay { submission } => submission.input_bytes(),
         CatalogCommand::RequestIndexInspection { handle, .. } => handle.input_bytes(),
@@ -2820,6 +2864,7 @@ fn selected_paths_input_bytes(relative_paths: &[PathBuf]) -> usize {
 fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, CatalogSubmitError> {
     match command {
         CatalogCommand::RequestHarvestFacts { .. } => Ok(harvest_facts::MAX_RESULT_BYTES),
+        CatalogCommand::RequestCollectionHistory { .. } => Ok(history_selection::MAX_RESULT_BYTES),
         CatalogCommand::RequestSimilarity { .. } => Ok(similarity_dispatch::MAX_RESULT_BYTES),
         CatalogCommand::RequestIndexPage { .. } | CatalogCommand::RequestIndexInspection { .. } => {
             Ok(MAX_INDEX_PAGE_PAYLOAD_BYTES)
@@ -2913,6 +2958,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         },
         CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestFeatureAnalysis { .. }
+        | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestSimilarity { .. } => AdmissionAction::RequestWavMetadata,
         CatalogCommand::RequestIndexPage {
             source_id,
@@ -3875,6 +3921,7 @@ fn handle_command(
     watcher_mode: WatcherMode,
     harvest: Option<&HarvestFactsClient>,
 ) -> bool {
+    history_selection::invalidate_before_write(&command, admission, sources);
     match command {
         CatalogCommand::RequestHarvestFacts {
             request,
@@ -3981,6 +4028,13 @@ fn handle_command(
                 test_gate,
                 watcher_mode,
             );
+            false
+        }
+        CatalogCommand::RequestCollectionHistory {
+            request,
+            cancellation,
+        } => {
+            history_selection::dispatch(request, cancellation, reservation, admission, sources);
             false
         }
         CatalogCommand::RequestSimilarity {
@@ -5038,6 +5092,7 @@ fn register_source(
             }
         };
     let mut source = RegisteredSource {
+        collection_history_token: None,
         replay: None,
         root: canonical_root,
         lifecycle_generation,
@@ -9891,6 +9946,7 @@ mod tests {
             },
         );
         let source = RegisteredSource {
+            collection_history_token: None,
             replay: None,
             root: fixture.root.path().to_path_buf(),
             lifecycle_generation: 1,
@@ -9966,6 +10022,7 @@ mod tests {
             },
         );
         let mut source = RegisteredSource {
+            collection_history_token: None,
             replay: None,
             root: replacement_root.path().to_path_buf(),
             lifecycle_generation: 1,
@@ -10148,6 +10205,7 @@ mod tests {
             },
         );
         let source = RegisteredSource {
+            collection_history_token: None,
             replay: None,
             root: replacement_root.path().to_path_buf(),
             lifecycle_generation: 1,
@@ -10270,6 +10328,7 @@ mod tests {
             },
         );
         let source = RegisteredSource {
+            collection_history_token: None,
             replay: None,
             root: fixture.root.path().to_path_buf(),
             lifecycle_generation: 1,
@@ -10971,6 +11030,7 @@ mod tests {
             .source_publication_fence()
             .expect("publication fence for carrier collision guard");
         let replacement_source = RegisteredSource {
+            collection_history_token: None,
             replay: None,
             root: source_root.path().to_path_buf(),
             lifecycle_generation: 2,
@@ -15933,6 +15993,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod feature_request_tests;
     mod harvest_facts_tests;
+    mod history_selection_tests;
     mod similarity_dispatch_tests;
     mod similarity_query_tests;
 }

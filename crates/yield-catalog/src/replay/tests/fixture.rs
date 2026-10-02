@@ -199,6 +199,7 @@ impl Fixture {
             let snapshot =
                 read_snapshot_from_database(&db, &worker_guard, &id, 7, &identity, || false).ok();
             let source = RegisteredSource {
+                collection_history_token: None,
                 root: root.as_path().to_path_buf(),
                 lifecycle_generation: 7,
                 database: db,
