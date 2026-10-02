@@ -9,6 +9,27 @@ use super::tag_vocabulary::ProfileTagVocabularyInputError;
 /// Errors returned when operating on the library database.
 #[derive(Debug, Error)]
 pub enum LibraryError {
+    /// Actual global facts query exceeded its SQLite VM/deadline budget.
+    #[error("Harvest facts query work exhausted; reduce request or audit schema")]
+    HarvestFactsQueryBudget,
+    /// Bounded Harvest facts input is invalid or exceeds a fixed budget.
+    #[error("invalid or over-budget Harvest facts input")]
+    HarvestFactsInput,
+    /// Bounded Harvest facts request was canceled.
+    #[error("Harvest facts read canceled")]
+    HarvestFactsCanceled,
+    /// Bounded Harvest facts source or request belongs to another acquisition.
+    #[error("stale Harvest facts profile acquisition")]
+    HarvestFactsStaleOwner,
+    /// Bounded Harvest facts actual issuing source observations no longer match.
+    #[error("Harvest facts source changed; reacquire observations")]
+    HarvestFactsSourceChanged,
+    /// Bounded Harvest facts rows or graph work are malformed or over budget.
+    #[error("malformed or over-budget Harvest facts metadata")]
+    HarvestFactsMalformed,
+    /// Bounded Harvest facts stored metadata does not identify this exact live content.
+    #[error("Harvest facts identity uncertain; audit required")]
+    HarvestFactsIdentityUncertain,
     /// Explicit authored-state proposal or source context invalid.
     #[error("invalid Harvest authored-state input")]
     HarvestAuthoredInput,

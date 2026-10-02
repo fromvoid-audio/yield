@@ -12,6 +12,7 @@ mod error;
 mod harvest;
 mod harvest_authored;
 mod harvest_copy;
+mod harvest_facts;
 mod migrations;
 mod mutation_context;
 mod operation_link_participant;
@@ -56,6 +57,11 @@ pub use harvest_authored::{
 pub use harvest_copy::{
     HARVEST_COPY_MAX_BYTES, HARVEST_COPY_MAX_RECEIPTS, HarvestCopyDisposition, HarvestCopyReceipt,
     HarvestCopyRequest, HarvestCopyResult,
+};
+pub use harvest_facts::{
+    HARVEST_FACTS_MAX_BYTES, HARVEST_FACTS_MAX_INCIDENT_EDGES, HARVEST_FACTS_MAX_PATH_BYTES,
+    HARVEST_FACTS_MAX_PATHS, HarvestFactsBatch, HarvestFactsCancellation, HarvestFactsClient,
+    HarvestFactsEntry, HarvestFactsRequest,
 };
 pub use mutation_context::{
     GlobalMutationCompletion, GlobalMutationContext, GlobalMutationKind, GlobalMutationRequest,
