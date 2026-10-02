@@ -229,6 +229,11 @@ fn preparation_dropped_delivery_canceled_queue_and_expiry_release_before_reuse()
         );
         drop(held);
         empty(writer);
+        // Lost live handle and lost explicit release response still drive actual rollback.
+        drop(reserve(writer, Duration::from_secs(1)));
+        empty(writer);
+        drop(reserve(writer, Duration::from_secs(1)).abort());
+        empty(writer);
         // Drop the response before receiving it: cancellation remains owned by the worker.
         drop(
             writer
