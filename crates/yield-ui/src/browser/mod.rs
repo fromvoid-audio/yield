@@ -96,6 +96,7 @@ mod general_settings;
 mod handoff;
 mod history;
 mod job_details;
+mod metadata_panel;
 mod metronome;
 mod motion;
 mod normalized_audition;
@@ -386,6 +387,7 @@ pub(crate) struct Browser {
     waveform_viewport: WaveformViewport,
     preferred_sidebar_width: Option<f32>,
     preferred_waveform_height: Option<f32>,
+    preferred_metadata_height: Option<f32>,
     preferred_collections_height: Option<f32>,
     pane_resize_drag: Option<view::PaneResizeDrag>,
     pane_resize_activation: Option<gpui::Subscription>,
@@ -734,6 +736,7 @@ impl Browser {
             waveform_viewport: WaveformViewport::full(),
             preferred_sidebar_width: None,
             preferred_waveform_height: None,
+            preferred_metadata_height: None,
             preferred_collections_height: None,
             pane_resize_drag: None,
             pane_resize_activation: None,
