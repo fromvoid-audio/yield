@@ -1,4 +1,7 @@
 //! Compact observations of both journal families, without retained payload or authority.
+mod action_status;
+pub use action_status::{JournalCancellationBoundary, JournalRetryBlockage, JournalUserStatus};
+
 use super::store::recovery::{
     CoordinatorRecoveryRecord, CoordinatorRecoveryRowOutcome, RecoveryFamily, RecoveryKey,
 };
@@ -61,6 +64,7 @@ pub struct RecoveryStatusEntry {
     operation_id: Option<OperationId>,
     sequence: i64,
     outcome: RecoveryStatusOutcome,
+    retry_blockage: Option<JournalRetryBlockage>,
 }
 impl RecoveryStatusEntry {
     /// Family used to interpret the disposition and deduplicate observations.
@@ -127,6 +131,29 @@ impl OperationJournalStore {
                     RecoveryKey::OperationId(id) => Some(*id),
                     RecoveryKey::Text(_) | RecoveryKey::Invalid { .. } => None,
                 };
+                let retry_blockage = match entry.outcome() {
+                    CoordinatorRecoveryRowOutcome::Consistent(
+                        CoordinatorRecoveryRecord::Legacy(record),
+                    ) => record.retry_observation().map(|r| r.error_class()),
+                    CoordinatorRecoveryRowOutcome::Consistent(
+                        CoordinatorRecoveryRecord::FullProgress(record),
+                    ) => record
+                        .snapshot()
+                        .retry_observation()
+                        .map(|r| r.error_class()),
+                    CoordinatorRecoveryRowOutcome::Retained(_) => None,
+                }
+                .map(|class| match class {
+                    super::coordinator::RetryErrorClass::TransientContention => {
+                        JournalRetryBlockage::Contention
+                    }
+                    super::coordinator::RetryErrorClass::TransientAvailability => {
+                        JournalRetryBlockage::Availability
+                    }
+                    super::coordinator::RetryErrorClass::CapacityUnavailable => {
+                        JournalRetryBlockage::Capacity
+                    }
+                });
                 let outcome = match entry.outcome() {
                     CoordinatorRecoveryRowOutcome::Consistent(
                         CoordinatorRecoveryRecord::Legacy(record),
@@ -168,6 +195,7 @@ impl OperationJournalStore {
                     operation_id,
                     sequence: entry.sequence(),
                     outcome,
+                    retry_blockage,
                 }
             })
             .collect();

@@ -29,3 +29,28 @@ byte-budget, namespace and read-only tests cover the underlying admission route.
 These fixtures do not qualify production reserve bootstrap, physical effects,
 power-loss durability, a crash matrix, user status UI, telemetry or SLOs.
 OPT-1671, OPT-1676 and their tracking parents retain that broader acceptance.
+
+## Stable action categories (OPT-2107)
+
+Every compact entry derives `JournalUserStatus` from its classified persisted
+disposition or retained proof gap. UI adapters own wording and action admission.
+The categories distinguish in-progress, infrastructure retry (including partial
+work), audit, cancellation requested/completed at the exact recorded boundary,
+success with optional artifacts still deferred, rollback, user decision, failure
+with data retained, and unresolved data-loss risk. They never infer an actionable
+retry, capacity readiness, full convergence or successful publication from a
+callback, cancellation after an observed effect, unknown data or retained row.
+
+The scanner copies only the bounded retry error class into a blockage hint:
+contention, participant availability or capacity. A missing retry observation
+leaves the hint unknown. Lease IDs, context, diagnostic text and retry timestamps
+remain private. Status is deterministic across reopen. For a caller partitioned
+by profile, `is_newer_observation_than` accepts only a higher sequence in the same
+family for the same valid OperationId; duplicates, late, foreign or unknown-key
+observations cannot replace a per-operation status. It does not treat a sequence
+as execution authority or a writable-startup permit.
+
+Actual persisted V5 retries, full-progress retries and guarded terminal records
+exercise this projection. Forged observed-effect cancellation stays retained;
+cross-family identity ambiguity stays audit-only. UI adapter/native evidence,
+full status/matrix consumers and OPT-1676/1346 acceptance remain open.
