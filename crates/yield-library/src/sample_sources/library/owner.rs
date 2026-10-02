@@ -14,6 +14,10 @@ use super::mutation_context::{
     SnapshotFences,
 };
 use super::operation_link_participant::{OperationLinkRequest, OperationLinkResult};
+use super::reference_participant::{
+    ReferenceRekeyRequest, ReferenceRekeyResult, ReferenceSnapshotRequest,
+};
+use super::reference_snapshot::ReferenceSnapshot;
 use super::registry_limits::{
     RegistryBoundError, SOURCE_REGISTRY_MAX_BYTES, SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
     SOURCE_REGISTRY_MAX_DESCRIPTORS, SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES, path_bytes,
@@ -271,6 +275,14 @@ pub enum GlobalLibraryWriterStartError {
 }
 
 enum WriterCommand {
+    ReferenceSnapshot {
+        request: ReferenceSnapshotRequest,
+        result: SyncSender<Result<ReferenceSnapshot, LibraryError>>,
+    },
+    ReferenceRekey {
+        request: ReferenceRekeyRequest,
+        result: SyncSender<Result<ReferenceRekeyResult, LibraryError>>,
+    },
     CapturedMutation {
         request: GlobalMutationRequest,
         result: SyncSender<GlobalMutationCompletion>,
@@ -326,6 +338,16 @@ enum WriterCommand {
 }
 
 enum WriterReply {
+    ReferenceSnapshot {
+        request: ReferenceSnapshotRequest,
+        value: Result<ReferenceSnapshot, LibraryError>,
+        result: SyncSender<Result<ReferenceSnapshot, LibraryError>>,
+    },
+    ReferenceRekey {
+        request: ReferenceRekeyRequest,
+        value: Result<ReferenceRekeyResult, LibraryError>,
+        result: SyncSender<Result<ReferenceRekeyResult, LibraryError>>,
+    },
     CapturedMutation {
         value: GlobalMutationCompletion,
         result: SyncSender<GlobalMutationCompletion>,
@@ -382,6 +404,30 @@ impl WriterReply {
             Self::CapturedMutation { result, value } => {
                 let _ = result.send(value);
             }
+            Self::ReferenceSnapshot {
+                result,
+                value,
+                request,
+            } => {
+                let value = if value.is_ok() {
+                    request.validate_sources().and(value)
+                } else {
+                    value
+                };
+                let _ = result.send(value);
+            }
+            Self::ReferenceRekey {
+                result,
+                value,
+                request,
+            } => {
+                let value = if value.is_ok() && request.validate_sources(false).is_err() {
+                    Err(LibraryError::ReferenceCommitUncertain)
+                } else {
+                    value
+                };
+                let _ = result.send(value);
+            }
             Self::OperationLink { result, value } => {
                 let _ = result.send(value);
             }
@@ -422,6 +468,12 @@ impl WriterReply {
         match self {
             Self::CapturedMutation { result, value } => {
                 let _ = result.send(value.replace_result_with_error(error));
+            }
+            Self::ReferenceSnapshot { result, .. } => {
+                let _ = result.send(Err(error));
+            }
+            Self::ReferenceRekey { result, .. } => {
+                let _ = result.send(Err(error));
             }
             Self::OperationLink { result, .. } => {
                 let _ = result.send(Err(error));
@@ -698,6 +750,28 @@ impl GlobalLibraryWriter {
         Ok(result_rx)
     }
 
+    /// Read one complete bounded Harvest reference snapshot through the actual global owner.
+    pub fn reference_snapshot(
+        &self,
+        request: ReferenceSnapshotRequest,
+    ) -> Result<Receiver<Result<ReferenceSnapshot, LibraryError>>, GlobalLibraryWriterQueueError>
+    {
+        self.ensure_available()?;
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::ReferenceSnapshot { request, result })?;
+        Ok(receiver)
+    }
+    /// Persist one rekey disposition per exact operation/work key. Never file completion authority.
+    pub fn apply_reference_rekey(
+        &self,
+        request: ReferenceRekeyRequest,
+    ) -> Result<Receiver<Result<ReferenceRekeyResult, LibraryError>>, GlobalLibraryWriterQueueError>
+    {
+        self.ensure_available()?;
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::ReferenceRekey { request, result })?;
+        Ok(receiver)
+    }
     /// Queue one bounded durable source/global correlation through this existing owner.
     /// The receipt is an observation, never journal or filesystem completion authority.
     pub fn apply_operation_link(
@@ -1230,6 +1304,16 @@ fn execute_command(
             value: request.execute(database, owner_identity, snapshot_fences),
             result,
         },
+        WriterCommand::ReferenceSnapshot { request, result } => WriterReply::ReferenceSnapshot {
+            value: database.reference_snapshot(owner_identity, &request),
+            request,
+            result,
+        },
+        WriterCommand::ReferenceRekey { request, result } => WriterReply::ReferenceRekey {
+            value: database.apply_reference_rekey(owner_identity, &request),
+            request,
+            result,
+        },
         WriterCommand::ApplyOperationLink { request, result } => WriterReply::OperationLink {
             value: database.apply_operation_link(owner_identity, &request),
             result,
@@ -1342,6 +1426,12 @@ fn send_command_error(command: WriterCommand, error: LibraryError) {
         WriterCommand::CapturedMutation { request, result } => {
             let _ = result.send(request.failed(error));
         }
+        WriterCommand::ReferenceSnapshot { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        WriterCommand::ReferenceRekey { result, .. } => {
+            let _ = result.send(Err(error));
+        }
         WriterCommand::ApplyOperationLink { result, .. } => {
             let _ = result.send(Err(error));
         }
@@ -1441,6 +1531,10 @@ mod tests {
     mod snapshot_fence_tests {
         use super::*;
         include!("snapshot_fence_owner_tests.rs");
+    }
+    mod reference_tests {
+        use super::*;
+        include!("reference_owner_tests.rs");
     }
     mod mutation_context_tests {
         use super::*;

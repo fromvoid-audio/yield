@@ -158,3 +158,40 @@ Actual owner tests cover live issuance, source-owner curation changing the revis
 writer handoff/new lifecycle with a reused lease, no renewal, oversized/ambiguous metadata,
 expired lease and portable root/database replacement. Native regression remains separate.
 This prepares OPT-1643; its global snapshot/rekey/immutable receipt is still required.
+
+## Production global owner implementation (OPT-1643)
+
+`GlobalLibraryWriter::reference_snapshot` reads the complete bounded Harvest state in
+one retained-connection transaction. SQLite scalar type/byte-length predicates precede
+field selection; typed streaming fingerprinting enforces the aggregate 64 KiB budget.
+`ReferenceRekeyRequest` binds that snapshot and actual source-owner fences to the frozen
+global work key. Callers retain `proposal_bytes()` durably before dispatch and restore
+the exact canonical historical proposal with fresh current source contexts after restart.
+New effects require exact historical/current observations; existing receipt replay permits
+fresh lifecycle/lease/revision observations only within the same source/root/database scope.
+
+`apply_reference_rekey` rejects destination occupancy and preserves exact file metadata
+by updating only key columns, plus all incoming/outgoing endpoint columns. It retains
+Applied/ReferenceChanged/ReferenceMissing/DestinationOccupied in `reference_receipts`,
+with a versioned digest covering both canonical input and disposition. Rejections commit
+without a rekey. Transaction failures roll back both metadata and receipt. The 8192-row /
+16 MiB budget accounts for all retained command/receipt fields and scalar overhead; no
+implicit eviction occurs. Exact replay precedes capacity and current snapshot checks.
+Source validation surrounds execution, commit and reply; a failed post-commit check reports
+uncertainty and requires exact receipt recovery. The existing profile owner boundary also
+checks before execution and acknowledgement.
+
+Ten actual source/global owner tests cover duplicate/lost acknowledgement/reopen with
+fresh contexts, old-key reuse, complete incoming/outgoing/self-endpoint content, edge-only
+state, missing/changed/colliding retained dispositions, bounded/corrupt/ambiguous evidence,
+changed revision and ended source ownership, post-commit lifecycle uncertainty, SQL rollback,
+and row/byte capacity retaining exact replay. Seeded Harvest rows are storage test inputs;
+these tests do not move files or qualify production physical workflows. The source fence
+regressions and existing global owner suite remain required alongside these focused tests.
+
+The admitted family producer, durable proposal custody and private checkpoint bridge remain
+consumer work under OPT-1341/1358; no UI/session move route is supplied here. Folder-prefix
+manifests, new derivation/state commands, projection/readiness and native filesystem or
+power-loss qualification remain separate. SQLite retains its existing NORMAL synchronous
+policy; process reopen evidence is not sudden-power-loss qualification. Native retained-owner
+regressions are tracked in OPT-2042 (macOS) and OPT-2043 (Windows).
