@@ -68,7 +68,7 @@ fn snapshot_session_rejects_wrong_context_ack_without_clearing_dirty_revision() 
             .try_iter()
             .all(|event| !matches!(event, RegistryEvent::Persisted { .. }))
     );
-    persistence.shutdown();
+    persistence.shutdown().unwrap();
 }
 
 #[test]
@@ -122,7 +122,7 @@ fn snapshot_session_coalesces_new_state_after_valid_stale_ack_and_confirms_only_
         .unwrap()
         .unwrap();
     assert_eq!(stored.as_slice()[0].id.as_str(), "latest-id");
-    persistence.shutdown();
+    persistence.shutdown().unwrap();
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn snapshot_session_disconnected_result_stays_unconfirmed_and_reloads_under_fres
             .try_iter()
             .all(|event| !matches!(event, RegistryEvent::Persisted { .. }))
     );
-    persistence.shutdown();
+    persistence.shutdown().unwrap();
     drop(persistence);
     drop(root_guard);
     drop(profile_guard);
@@ -177,7 +177,7 @@ fn snapshot_session_disconnected_result_stays_unconfirmed_and_reloads_under_fres
     assert!(!reconciled.is_dirty());
     assert!(reconciled.current.is_empty());
     // The obsolete desired proposal was not dispatched or automatically replayed on restart.
-    fresh.shutdown();
+    fresh.shutdown().unwrap();
 }
 
 #[test]
@@ -227,7 +227,7 @@ fn snapshot_session_preferences_keep_wrong_or_disconnected_completions_unconfirm
                 .try_iter()
                 .all(|event| !matches!(event, PreferenceEvent::Persisted { .. }))
         );
-        persistence.shutdown();
+        persistence.shutdown().unwrap();
         drop(persistence);
         drop(root_guard);
         drop(profile_guard);
@@ -245,6 +245,67 @@ fn snapshot_session_preferences_keep_wrong_or_disconnected_completions_unconfirm
             .unwrap();
         // Fresh observation reconciles the actual committed state, without inventing the old ack.
         assert_eq!(payload, preferences.snapshot().to_payload().unwrap());
-        fresh.shutdown();
+        fresh.shutdown().unwrap();
     }
+}
+
+#[test]
+fn global_drain_session_propagates_owner_panic_after_reverse_cleanup() {
+    let temp = TempDir::new().unwrap();
+    let _base = ConfigBaseGuard::set(fs::canonicalize(temp.path()).unwrap());
+    let (mut persistence, _root, _profile) = start_snapshot_fixture(&temp);
+    let lost = persistence
+        .writer
+        .as_ref()
+        .unwrap()
+        .panic_owner_for_test()
+        .unwrap();
+    assert!(lost.recv_timeout(Duration::from_secs(2)).is_err());
+    assert!(matches!(
+        persistence.shutdown(),
+        Err(SessionError::GlobalWriterDrain(
+            GlobalLibraryWriterDrainOutcome::WorkerPanicked
+        ))
+    ));
+    assert!(persistence.writer.is_none());
+    assert!(persistence.catalog.is_none());
+    assert!(persistence.journal.is_none());
+    assert!(persistence.writable.is_none());
+}
+
+#[test]
+fn global_drain_session_joins_panicked_worker_and_retains_failure() {
+    let temp = TempDir::new().unwrap();
+    let _base = ConfigBaseGuard::set(fs::canonicalize(temp.path()).unwrap());
+    let path = profile_root(&temp);
+    let mut service =
+        SourceRegistryService::start_portable_registry_for_test(path.clone()).unwrap();
+    wait_for_event(&service, |event| {
+        matches!(event, RegistryEvent::Snapshot { .. })
+    });
+    service
+        .submit_command(super::super::Command::PanicForTest)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !service.worker.as_ref().unwrap().is_finished() {
+        assert!(Instant::now() < deadline, "session worker panic timeout");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(
+        service.shutdown(),
+        Err(ShutdownError::WorkerPanicked)
+    ));
+    assert!(
+        service.worker.is_none(),
+        "failed acknowledgement must still join"
+    );
+    assert!(matches!(
+        service.shutdown(),
+        Err(ShutdownError::WorkerPanicked)
+    ));
+    let mut fresh = SourceRegistryService::start_portable_registry_for_test(path).unwrap();
+    wait_for_event(&fresh, |event| {
+        matches!(event, RegistryEvent::Snapshot { .. })
+    });
+    fresh.shutdown().unwrap();
 }

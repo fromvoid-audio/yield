@@ -24,9 +24,9 @@ use yield_library::operation_journal::{
     OperationJournalStore,
 };
 use yield_library::sample_sources::{
-    GlobalLibraryWriter, GlobalLibraryWriterQueueError, GlobalLibraryWriterStartError,
-    GlobalLibraryWriterStatus, LibraryError, SampleSource, SourceId, SourceRegistrySnapshot,
-    SourceRole,
+    GlobalLibraryWriter, GlobalLibraryWriterDrainOutcome, GlobalLibraryWriterQueueError,
+    GlobalLibraryWriterStartError, GlobalLibraryWriterStatus, LibraryError, SampleSource, SourceId,
+    SourceRegistrySnapshot, SourceRole,
 };
 
 use yield_library::sample_sources::library::{
@@ -182,6 +182,9 @@ impl RequestId {
 /// Errors reported by a session operation or persistence owner.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SessionError {
+    /// The existing global owner could not confirm a normal shutdown drain.
+    #[error("global library shutdown was unconfirmed: {0:?}")]
+    GlobalWriterDrain(GlobalLibraryWriterDrainOutcome),
     /// Persistence could not be acquired or became unavailable.
     #[error("session persistence unavailable: {0}")]
     Persistence(String),
@@ -222,7 +225,7 @@ pub enum SubmitError {
 }
 
 /// Errors returned when synchronously draining the session worker.
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum ShutdownError {
     /// The worker could not receive the shutdown acknowledgement.
     #[error("source session worker stopped before shutdown acknowledgement: {0}")]
@@ -293,6 +296,7 @@ pub struct SourceRegistryService {
     catalog: Arc<Mutex<CatalogSlot>>,
     vocabulary: Arc<Mutex<VocabularySlot>>,
     worker: Option<JoinHandle<Result<(), SessionError>>>,
+    shutdown_result: Option<Result<(), ShutdownError>>,
 }
 
 impl SourceRegistryService {
@@ -608,41 +612,46 @@ impl SourceRegistryService {
 
     /// Close command admission, drain the final baseline/lookups/save, and synchronously join.
     pub fn shutdown(&mut self) -> Result<(), ShutdownError> {
+        if let Some(result) = &self.shutdown_result {
+            return result.clone();
+        }
         self.closed.store(true, Ordering::Release);
         vocabulary::close(&self.vocabulary);
         catalog::close(&self.catalog);
         let sender = self
             .commands
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|p| p.into_inner())
             .take();
-        let Some(sender) = sender else {
-            let worker_result = self
-                .worker
-                .take()
-                .map(|worker| worker.join().map_err(|_| ShutdownError::WorkerPanicked))
-                .transpose()?
-                .unwrap_or(Ok(()));
-            return worker_result.map_err(ShutdownError::Session);
-        };
-        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-        sender
-            .send(Command::Shutdown {
-                acknowledgement: ack_tx,
+        let acknowledgement = if let Some(sender) = sender {
+            let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+            let submitted = sender
+                .send(Command::Shutdown {
+                    acknowledgement: ack_tx,
+                })
+                .map_err(|error| ShutdownError::WorkerChannel(error.to_string()));
+            drop(sender);
+            submitted.and_then(|()| {
+                ack_rx
+                    .recv()
+                    .map_err(|error| ShutdownError::WorkerChannel(error.to_string()))?
+                    .map_err(ShutdownError::Session)
             })
-            .map_err(|error| ShutdownError::WorkerChannel(error.to_string()))?;
-        drop(sender);
-        let result = ack_rx
-            .recv()
-            .map_err(|error| ShutdownError::WorkerChannel(error.to_string()))?;
-        let worker_result = self
-            .worker
-            .take()
-            .map(|worker| worker.join().map_err(|_| ShutdownError::WorkerPanicked))
-            .transpose()?
-            .unwrap_or(Ok(()));
-        result.map_err(ShutdownError::Session)?;
-        worker_result.map_err(ShutdownError::Session)
+        } else {
+            Ok(())
+        };
+        // Even an acknowledgement-channel failure must join the worker and retain its real
+        // failure before releasing profile/journal custody. Never turn a second call into Ok.
+        let joined = match self.worker.take() {
+            Some(worker) => match worker.join() {
+                Ok(result) => result.map_err(ShutdownError::Session),
+                Err(_) => Err(ShutdownError::WorkerPanicked),
+            },
+            None => Ok(()),
+        };
+        let result = joined.and(acknowledgement);
+        self.shutdown_result = Some(result.clone());
+        result
     }
 
     fn start_inner(app_root_override: Option<PathBuf>) -> Result<Self, StartError> {
@@ -725,6 +734,7 @@ impl SourceRegistryService {
             catalog,
             vocabulary,
             worker: Some(worker),
+            shutdown_result: None,
         })
     }
 
@@ -758,6 +768,8 @@ impl Drop for SourceRegistryService {
 }
 
 enum Command {
+    #[cfg(test)]
+    PanicForTest,
     SetSourcePrimary {
         request: RequestId,
         source_id: SourceId,
@@ -1386,14 +1398,20 @@ impl Persistence {
             .is_some_and(|writer| matches!(writer.status(), GlobalLibraryWriterStatus::Available))
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> Result<(), SessionError> {
         self.maintenance.shutdown();
         if let Some(catalog) = self.catalog.take() {
             catalog.shutdown();
         }
-        if let Some(mut writer) = self.writer.take() {
-            let _ = writer.shutdown();
-        }
+        let global_result = if let Some(mut writer) = self.writer.take() {
+            let report = writer.shutdown_with_report();
+            match report.outcome() {
+                GlobalLibraryWriterDrainOutcome::Drained => Ok(()),
+                outcome => Err(SessionError::GlobalWriterDrain(outcome.clone())),
+            }
+        } else {
+            Ok(())
+        };
         self.save = None;
         self.preference_load = None;
         self.preference_save = None;
@@ -1408,6 +1426,7 @@ impl Persistence {
             let _ = journal.shutdown();
         }
         self.writable.take();
+        global_result
     }
 }
 
@@ -1416,7 +1435,7 @@ impl Drop for Persistence {
         // Keep the shutdown ordering even when the worker exits through an early return or an
         // unwind. Catalog and global-writer workers must stop before the journal's retained child
         // lease and profile clone are released.
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -1561,7 +1580,7 @@ fn run_worker(
                 &mut applied_preference_requests,
                 &mut unfinalized_preference_requests,
             );
-            persistence.shutdown();
+            let result = result.and(persistence.shutdown());
             let _ = event_tx.send(RegistryEvent::Closed);
             let _ = preference_event_tx.send(PreferenceEvent::Closed);
             return result;
@@ -1848,6 +1867,8 @@ fn run_worker(
                     result,
                 );
             }
+            #[cfg(test)]
+            Command::PanicForTest => panic!("session owner panic fixture"),
             Command::Shutdown { acknowledgement } => {
                 vocabulary::close(&vocabulary_slot);
                 catalog::close(&catalog_slot);
@@ -1864,7 +1885,7 @@ fn run_worker(
                     &mut applied_preference_requests,
                     &mut unfinalized_preference_requests,
                 );
-                persistence.shutdown();
+                let result = result.and(persistence.shutdown());
                 let _ = event_tx.send(RegistryEvent::Closed);
                 let _ = preference_event_tx.send(PreferenceEvent::Closed);
                 let _ = acknowledgement.send(result.clone().map_err(|error| error.clone()));
@@ -1895,6 +1916,8 @@ fn can_block_on_command(
 
 fn command_request(command: &Command) -> Option<RequestId> {
     match command {
+        #[cfg(test)]
+        Command::PanicForTest => None,
         Command::AddRoot { request, .. }
         | Command::RemoveRoot { request, .. }
         | Command::ReorderSource { request, .. }
@@ -1908,6 +1931,8 @@ fn command_request(command: &Command) -> Option<RequestId> {
 
 fn preference_command_request(command: &Command) -> Option<PreferenceRequestId> {
     match command {
+        #[cfg(test)]
+        Command::PanicForTest => None,
         Command::PatchPreferences { request, .. } => Some(*request),
         Command::AddRoot { .. }
         | Command::RemoveRoot { .. }
