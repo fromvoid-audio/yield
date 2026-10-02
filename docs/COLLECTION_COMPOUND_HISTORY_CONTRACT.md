@@ -45,6 +45,11 @@ No-op paths do not enter the changed payload. Capture all bounded chunks at one
 exact revision on the same retained owner; discard the entire preparation if a
 chunk, identity, directory or observation window changes before admission.
 The existing exact-revision mutation route still revalidates on the worker.
+Sequential chunks need one explicit preparation cancellation context: retaining
+the same token must not cancel itself, while a distinct replacement or mutation
+must retire it. If the transport is one-shot, implement and test this bounded
+group seam before admitting compound preparation; do not ignore cancellation
+of an earlier chunk to assemble a group. OPT-2160 owns the transport boundary.
 
 Retain two separate subsets: **origin committed** contains only paths covered by
 validated original receipts; **currently applied** contains origin paths whose
