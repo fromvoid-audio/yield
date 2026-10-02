@@ -562,7 +562,19 @@ impl SourceRegistryService {
     }
 
     fn start_inner(app_root_override: Option<PathBuf>) -> Result<Self, StartError> {
-        Self::start_inner_with_initialization_gate(app_root_override, None)
+        Self::start_inner_with_initialization_gate(
+            app_root_override,
+            None,
+            #[cfg(test)]
+            false,
+        )
+    }
+
+    /// Start a portable registry fixture with real profile/SQLite ownership but no reserve.
+    /// This seam is compiled only in this crate's tests; normal startup remains qualified.
+    #[cfg(test)]
+    fn start_portable_registry_for_test(app_root: PathBuf) -> Result<Self, StartError> {
+        Self::start_inner_with_initialization_gate(Some(app_root), None, true)
     }
 
     #[cfg(test)]
@@ -570,12 +582,17 @@ impl SourceRegistryService {
         app_root_override: Option<PathBuf>,
         initialization_gate: Arc<std::sync::Barrier>,
     ) -> Result<Self, StartError> {
-        Self::start_inner_with_initialization_gate(app_root_override, Some(initialization_gate))
+        Self::start_inner_with_initialization_gate(
+            app_root_override,
+            Some(initialization_gate),
+            false,
+        )
     }
 
     fn start_inner_with_initialization_gate(
         app_root_override: Option<PathBuf>,
         initialization_gate: Option<Arc<std::sync::Barrier>>,
+        #[cfg(test)] portable_registry_fixture: bool,
     ) -> Result<Self, StartError> {
         let (command_tx, command_rx) = mpsc::sync_channel(SESSION_COMMAND_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
@@ -598,6 +615,8 @@ impl SourceRegistryService {
                     worker_vocabulary,
                     worker_maintenance_admission,
                     initialization_gate,
+                    #[cfg(test)]
+                    portable_registry_fixture,
                 )
             })
             .map_err(StartError::ThreadSpawn)?;
@@ -1030,13 +1049,17 @@ impl Persistence {
         catalog_slot: Arc<Mutex<CatalogSlot>>,
         vocabulary_slot: Arc<Mutex<VocabularySlot>>,
         maintenance_admission: Arc<MaintenanceAdmission>,
+        #[cfg(test)] portable_registry_fixture: bool,
     ) -> (Self, Option<AppRootGuard>, PersistenceProfileGuard) {
         #[cfg(test)]
-        let fixture_registry = app_root_override.as_ref().and_then(|root| {
-            root.parent()
-                .and_then(Path::parent)
-                .map(|app_root| app_root.join("volume-registry"))
-        });
+        let fixture_registry = app_root_override
+            .as_ref()
+            .filter(|_| !portable_registry_fixture)
+            .and_then(|root| {
+                root.parent()
+                    .and_then(Path::parent)
+                    .map(|app_root| app_root.join("volume-registry"))
+            });
         let profile_guard = PersistenceProfileGuard::named(GPUI_DEVELOPMENT_PROFILE);
         let mut persistence = Self {
             writable: None,
@@ -1082,13 +1105,17 @@ impl Persistence {
                     Ok(journal) => match {
                         #[cfg(test)]
                         {
-                            match fixture_registry {
-                                Some(registry) => {
-                                    OperationJournalOwner::start_with_capacity_fixture_for_test(
-                                        journal, registry,
-                                    )
+                            if portable_registry_fixture {
+                                OperationJournalOwner::start_without_capacity_for_test(journal)
+                            } else {
+                                match fixture_registry {
+                                    Some(registry) => {
+                                        OperationJournalOwner::start_with_capacity_fixture_for_test(
+                                            journal, registry,
+                                        )
+                                    }
+                                    None => OperationJournalOwner::start(journal),
                                 }
-                                None => OperationJournalOwner::start(journal),
                             }
                         }
                         #[cfg(not(test))]
@@ -1290,6 +1317,7 @@ fn run_worker(
     vocabulary_slot: Arc<Mutex<VocabularySlot>>,
     maintenance_admission: Arc<MaintenanceAdmission>,
     initialization_gate: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)] portable_registry_fixture: bool,
 ) -> Result<(), SessionError> {
     if let Some(initialization_gate) = initialization_gate {
         initialization_gate.wait();
@@ -1299,6 +1327,8 @@ fn run_worker(
         Arc::clone(&catalog_slot),
         Arc::clone(&vocabulary_slot),
         maintenance_admission,
+        #[cfg(test)]
+        portable_registry_fixture,
     );
     let mut coordinator = Coordinator::new();
     let mut preference_coordinator = PreferenceCoordinator::new();
@@ -3192,7 +3222,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_event(&service, |event| {
             matches!(event, RegistryEvent::Snapshot { .. })
         });
@@ -3219,8 +3250,8 @@ mod tests {
         assert!(development_db.is_file());
         assert!(!temp.path().join(".yield/library.db").exists());
 
-        let mut reopened =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("reopen service");
         let restored = wait_for_snapshot(&reopened, |snapshot| {
             snapshot
                 .as_slice()
@@ -3231,12 +3262,53 @@ mod tests {
         reopened.shutdown().expect("reopen shutdown");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normal_session_bootstrap_retains_unsupported_reserve_failure() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let mut service = SourceRegistryService::start_inner(Some(profile_root(&temp)))
+            .expect("normal session starts worker");
+        let event = wait_for_event(&service, |event| {
+            matches!(event, RegistryEvent::PersistenceUnavailable { .. })
+        });
+        let RegistryEvent::PersistenceUnavailable { error, .. } = event else {
+            unreachable!()
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("protected reserve namespace Unsupported")
+        );
+        let request = service
+            .reorder_source(
+                SourceId::from_string("missing-a"),
+                SourceId::from_string("missing-b"),
+                true,
+                RegistryRevision::default(),
+            )
+            .expect("request enters bounded queue");
+        wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::RequestFailed { request: failed, .. } if *failed == request),
+        );
+        let error = service
+            .shutdown()
+            .expect_err("shutdown retains the qualification failure");
+        assert!(
+            error
+                .to_string()
+                .contains("protected reserve namespace Unsupported")
+        );
+    }
+
     #[test]
     fn source_reorder_persists_identity_and_rejects_stale_revision() {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile = profile_root(&temp);
-        let mut service = SourceRegistryService::start_inner(Some(profile.clone())).expect("start");
+        let mut service = SourceRegistryService::start_portable_registry_for_test(profile.clone())
+            .expect("start");
         wait_for_event(&service, |event| {
             matches!(event, RegistryEvent::Snapshot { .. })
         });
@@ -3336,7 +3408,8 @@ mod tests {
         );
         service.shutdown().expect("shutdown");
 
-        let mut reopened = SourceRegistryService::start_inner(Some(profile)).expect("reopen");
+        let mut reopened =
+            SourceRegistryService::start_portable_registry_for_test(profile).expect("reopen");
         let restored = wait_for_snapshot(&reopened, |snapshot| snapshot.len() == roots.len());
         assert_eq!(
             restored
@@ -3393,6 +3466,7 @@ mod tests {
             Arc::clone(&catalog_slot),
             Arc::clone(&vocabulary_slot),
             maintenance_admission,
+            false,
         );
         let external_catalog = persistence
             .catalog
