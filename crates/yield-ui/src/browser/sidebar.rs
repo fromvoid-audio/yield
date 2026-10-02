@@ -47,7 +47,7 @@ impl Browser {
         if payload.browser.entity_id() != cx.entity().entity_id()
             || !self.source_registry_loaded
             || self.source_registry_revision != payload.revision
-            || self.source_registry_pending_reorder.is_some()
+            || self.source_registry_pending_edit.is_some()
             || !self.source_registry_pending_adds.is_empty()
             || !self.source_registry_pending_removes.is_empty()
             || !self
@@ -131,7 +131,7 @@ impl Browser {
         };
         match result {
             Ok(request) => {
-                self.source_registry_pending_reorder = Some((request, None));
+                self.source_registry_pending_edit = Some((request, None));
                 self.set_source_registry_status("Saving source order…".to_string());
                 self.start_source_registry_poll(cx);
             }

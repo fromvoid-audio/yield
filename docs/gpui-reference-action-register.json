@@ -759,11 +759,31 @@
     },
     {
       "message": "GuiMessage::ClearContextSourcePrimary",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/source_registry.rs",
+        "symbol": "set_context_source_primary"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-session/src/lib.rs",
+          "symbol": "primary_source_persists_replacement_clear_and_rejects_stale_or_protected_ids"
+        },
+        {
+          "path": "crates/yield-session/src/lib.rs",
+          "symbol": "primary_source_save_failure_retains_prior_durable_roles"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/context_menu.rs",
+          "symbol": "primary_source_menu_requires_confirmed_writable_role"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/source_registry.rs",
+          "symbol": "primary_source_persistence_failure_keeps_role_unconfirmed"
+        }
+      ],
       "owner": "OPT-2005",
-      "note": "Primary-source setting has no verified GPUI producer. Source registration alone is not this preference.",
+      "note": "Source-ID and settled registry-revision-fenced primary set/clear through profile global writer. Protected/ambiguous/stale targets rejected; pending and failed roles remain unconfirmed. No physical import authority or directory creation. Native context-menu/AX acceptance remains open in OPT-2027 under OPT-1953.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
@@ -1672,11 +1692,31 @@
     },
     {
       "message": "GuiMessage::SetContextSourcePrimary",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/source_registry.rs",
+        "symbol": "set_context_source_primary"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-session/src/lib.rs",
+          "symbol": "primary_source_persists_replacement_clear_and_rejects_stale_or_protected_ids"
+        },
+        {
+          "path": "crates/yield-session/src/lib.rs",
+          "symbol": "primary_source_save_failure_retains_prior_durable_roles"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/context_menu.rs",
+          "symbol": "primary_source_menu_requires_confirmed_writable_role"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/source_registry.rs",
+          "symbol": "primary_source_persistence_failure_keeps_role_unconfirmed"
+        }
+      ],
       "owner": "OPT-2005",
-      "note": "Primary-source setting has no verified GPUI producer. Source registration alone is not this preference.",
+      "note": "Source-ID and settled registry-revision-fenced primary set/clear through profile global writer. Protected/ambiguous/stale targets rejected; pending and failed roles remain unconfirmed. No physical import authority or directory creation. Native context-menu/AX acceptance remains open in OPT-2027 under OPT-1953.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {

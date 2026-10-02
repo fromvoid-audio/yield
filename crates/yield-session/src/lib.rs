@@ -26,6 +26,7 @@ use yield_library::operation_journal::{
 use yield_library::sample_sources::{
     GlobalLibraryWriter, GlobalLibraryWriterQueueError, GlobalLibraryWriterStartError,
     GlobalLibraryWriterStatus, LibraryError, SampleSource, SourceId, SourceRegistrySnapshot,
+    SourceRole,
 };
 
 mod catalog;
@@ -328,6 +329,23 @@ impl SourceRegistryService {
             source_id,
             target_id,
             after,
+            expected_revision,
+        })
+    }
+
+    /// Set or clear a source primary role at an exact registry revision.
+    /// Protected targets and registry changes not yet durably settled are rejected by the owner.
+    /// This persists registry metadata only and grants no filesystem mutation authority.
+    pub fn set_source_primary(
+        &self,
+        source_id: SourceId,
+        primary: bool,
+        expected_revision: RegistryRevision,
+    ) -> Result<RequestId, SubmitError> {
+        self.submit(|request| Command::SetSourcePrimary {
+            request,
+            source_id,
+            primary,
             expected_revision,
         })
     }
@@ -668,6 +686,12 @@ impl Drop for SourceRegistryService {
 }
 
 enum Command {
+    SetSourcePrimary {
+        request: RequestId,
+        source_id: SourceId,
+        primary: bool,
+        expected_revision: RegistryRevision,
+    },
     AddRoot {
         request: RequestId,
         root: CanonicalSourceRoot,
@@ -707,6 +731,11 @@ struct PendingAdd {
 
 #[derive(Clone)]
 enum Edit {
+    Primary {
+        request: RequestId,
+        source_id: SourceId,
+        primary: bool,
+    },
     Add {
         request: RequestId,
         root: CanonicalSourceRoot,
@@ -871,6 +900,9 @@ impl Coordinator {
                     after,
                     ..
                 } => reorder_sources(&mut next, source_id, target_id, *after)?,
+                Edit::Primary {
+                    source_id, primary, ..
+                } => set_primary_source(&mut next, source_id, *primary)?,
             }
         }
         let changed = !sources_equal(&previous, &next);
@@ -902,7 +934,10 @@ impl Coordinator {
             Edit::Add {
                 root, source: None, ..
             } => Some(root.as_path().to_path_buf()),
-            Edit::Add { .. } | Edit::Remove { .. } | Edit::Reorder { .. } => None,
+            Edit::Add { .. }
+            | Edit::Remove { .. }
+            | Edit::Reorder { .. }
+            | Edit::Primary { .. } => None,
         }));
         roots.sort();
         roots.dedup();
@@ -932,14 +967,17 @@ impl Coordinator {
                 source: Some(_),
                 ..
             } => Some(*request),
-            Edit::Add { source: None, .. } | Edit::Remove { .. } | Edit::Reorder { .. } => None,
+            Edit::Add { source: None, .. }
+            | Edit::Remove { .. }
+            | Edit::Reorder { .. }
+            | Edit::Primary { .. } => None,
         })
     }
 
     fn remove_requests(&self) -> impl Iterator<Item = RequestId> + '_ {
         self.edits.iter().filter_map(|edit| match edit {
             Edit::Remove { request, .. } => Some(*request),
-            Edit::Add { .. } | Edit::Reorder { .. } => None,
+            Edit::Add { .. } | Edit::Reorder { .. } | Edit::Primary { .. } => None,
         })
     }
 
@@ -951,12 +989,45 @@ impl Coordinator {
             let request = match edit {
                 Edit::Add { request, .. }
                 | Edit::Remove { request, .. }
-                | Edit::Reorder { request, .. } => request,
+                | Edit::Reorder { request, .. }
+                | Edit::Primary { request, .. } => request,
             };
             !requests.contains(request)
         });
         self.rebuild().map(|_| ())
     }
+}
+
+fn set_primary_source(
+    sources: &mut [SampleSource],
+    source_id: &SourceId,
+    primary: bool,
+) -> Result<(), SessionError> {
+    let matches = sources
+        .iter()
+        .filter(|source| &source.id == source_id)
+        .count();
+    if matches != 1
+        || sources
+            .iter()
+            .any(|source| &source.id == source_id && source.role == SourceRole::Protected)
+    {
+        return Err(SessionError::Library(String::from(
+            "primary source requires one current writable source ID",
+        )));
+    }
+    for source in sources {
+        if &source.id == source_id {
+            source.role = if primary {
+                SourceRole::Primary
+            } else {
+                SourceRole::Normal
+            };
+        } else if primary && source.role == SourceRole::Primary {
+            source.role = SourceRole::Normal;
+        }
+    }
+    Ok(())
 }
 
 fn add_source(
@@ -1576,6 +1647,56 @@ fn run_worker(
                 }
                 coordinator.compact_if_resolved(false);
             }
+            Command::SetSourcePrimary {
+                request,
+                source_id,
+                primary,
+                expected_revision,
+            } => {
+                if !coordinator.loaded
+                    || !persistence.pending_adds.is_empty()
+                    || coordinator.is_dirty()
+                    || persistence.save.is_some()
+                    || coordinator.revision() != expected_revision
+                {
+                    fail_request(
+                        &event_tx,
+                        &mut unfinalized_requests,
+                        request,
+                        SessionError::Library(String::from(
+                            "primary source change rejected because the registry changed or is not durably settled",
+                        )),
+                    );
+                    continue;
+                }
+                coordinator.edits.push(Edit::Primary {
+                    request,
+                    source_id,
+                    primary,
+                });
+                match coordinator.rebuild() {
+                    Ok(changed) => {
+                        if changed {
+                            let _ = event_tx.send(RegistryEvent::Snapshot {
+                                revision: coordinator.revision(),
+                                snapshot: coordinator.snapshot(),
+                            });
+                        }
+                        announce_request(
+                            &event_tx,
+                            &mut applied_requests,
+                            &mut unfinalized_requests,
+                            request,
+                            coordinator.revision(),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = coordinator.discard_requests(&HashSet::from([request]));
+                        fail_request(&event_tx, &mut unfinalized_requests, request, error);
+                    }
+                }
+                coordinator.compact_if_resolved(false);
+            }
             Command::PatchPreferences { request, patch } => {
                 if matches!(&patch, PreferencePatch::SetTrashFolder(_))
                     && persistence.maintenance.clear_reserved()
@@ -1702,7 +1823,8 @@ fn command_request(command: &Command) -> Option<RequestId> {
     match command {
         Command::AddRoot { request, .. }
         | Command::RemoveRoot { request, .. }
-        | Command::ReorderSource { request, .. } => Some(*request),
+        | Command::ReorderSource { request, .. }
+        | Command::SetSourcePrimary { request, .. } => Some(*request),
         Command::PatchPreferences { .. }
         | Command::StorageUsage { .. }
         | Command::ClearRebuildableCache { .. }
@@ -1716,6 +1838,7 @@ fn preference_command_request(command: &Command) -> Option<PreferenceRequestId> 
         Command::AddRoot { .. }
         | Command::RemoveRoot { .. }
         | Command::ReorderSource { .. }
+        | Command::SetSourcePrimary { .. }
         | Command::StorageUsage { .. }
         | Command::ClearRebuildableCache { .. }
         | Command::Shutdown { .. } => None,
@@ -3263,6 +3386,204 @@ mod tests {
         });
         assert_eq!(restored.len(), 1);
         reopened.shutdown().expect("reopen shutdown");
+    }
+
+    fn seed_primary_registry(temp: &TempDir) -> (PathBuf, Vec<SourceId>) {
+        let profile = profile_root(temp);
+        let mut service = SourceRegistryService::start_portable_registry_for_test(profile.clone())
+            .expect("start fixture");
+        wait_for_snapshot(&service, |_| true);
+        for name in ["first", "second", "protected"] {
+            let request = service.add_root(root(temp, name)).expect("add fixture");
+            wait_for_event(&service, |event| {
+                matches!(event,
+                RegistryEvent::RequestApplied { request: actual, .. } if *actual == request)
+            });
+            wait_for_event(&service, |event| {
+                matches!(event, RegistryEvent::Persisted { .. })
+            });
+        }
+        service.shutdown().expect("seed shutdown");
+        let connection = Connection::open(profile.join("library.db")).expect("fixture database");
+        let ids = connection
+            .prepare("SELECT id FROM sources ORDER BY sort_order")
+            .expect("query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("ids")
+            .map(|id| SourceId::from_string(id.expect("id")))
+            .collect::<Vec<_>>();
+        connection
+            .execute(
+                "UPDATE sources SET role = 'protected' WHERE id = ?1",
+                [ids[2].as_str()],
+            )
+            .expect("protected fixture");
+        (profile, ids)
+    }
+
+    fn persist_primary_edit(
+        service: &SourceRegistryService,
+        id: &SourceId,
+        primary: bool,
+        revision: RegistryRevision,
+    ) -> RegistryRevision {
+        let request = service
+            .set_source_primary(id.clone(), primary, revision)
+            .expect("submit role");
+        let RegistryEvent::RequestApplied { revision, .. } = wait_for_event(
+            service,
+            |event| matches!(event, RegistryEvent::RequestApplied { request: actual, .. } if *actual == request),
+        ) else {
+            unreachable!()
+        };
+        wait_for_event(
+            service,
+            |event| matches!(event, RegistryEvent::Persisted { revision: actual } if *actual == revision),
+        );
+        revision
+    }
+
+    #[test]
+    fn primary_source_persists_replacement_clear_and_rejects_stale_or_protected_ids() {
+        let temp = TempDir::new().expect("fixture");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let (profile, ids) = seed_primary_registry(&temp);
+        let mut service = SourceRegistryService::start_portable_registry_for_test(profile.clone())
+            .expect("start");
+        let before = wait_for_snapshot(&service, |_| true);
+        let revision = persist_primary_edit(&service, &ids[0], true, RegistryRevision::default());
+        for (id, expected) in [
+            (&ids[1], RegistryRevision::default()),
+            (&ids[2], revision),
+            (&SourceId::from_string("removed-source"), revision),
+        ] {
+            let request = service
+                .set_source_primary(id.clone(), true, expected)
+                .expect("submit rejected role");
+            wait_for_event(
+                &service,
+                |event| matches!(event, RegistryEvent::RequestFailed { request: actual, .. } if *actual == request),
+            );
+        }
+        persist_primary_edit(&service, &ids[1], true, revision);
+        service.shutdown().expect("shutdown");
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(profile.clone())
+            .expect("reopen");
+        let restored = wait_for_snapshot(&reopened, |_| true);
+        let mut expected = before.as_slice().to_vec();
+        expected[1].role = SourceRole::Primary;
+        assert!(
+            sources_equal(restored.as_slice(), &expected),
+            "only role changed; identity, order, roots and metadata survive"
+        );
+        persist_primary_edit(&reopened, &ids[1], false, RegistryRevision::default());
+        reopened.shutdown().expect("clear shutdown");
+        let mut reopened =
+            SourceRegistryService::start_portable_registry_for_test(profile).expect("reopen clear");
+        assert!(sources_equal(
+            wait_for_snapshot(&reopened, |_| true).as_slice(),
+            before.as_slice()
+        ));
+        assert!(
+            !temp.path().join("second").exists(),
+            "role edit creates no directories"
+        );
+        reopened.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn primary_source_removed_and_reregistered_path_rejects_old_revision() {
+        let temp = TempDir::new().expect("fixture");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let (profile, ids) = seed_primary_registry(&temp);
+        let mut service =
+            SourceRegistryService::start_portable_registry_for_test(profile).expect("start");
+        wait_for_snapshot(&service, |_| true);
+        let request = service.remove_root(root(&temp, "first")).expect("remove");
+        wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::RequestApplied { request: actual, .. } if *actual == request),
+        );
+        wait_for_event(&service, |event| {
+            matches!(event, RegistryEvent::Persisted { .. })
+        });
+        let request = service.add_root(root(&temp, "first")).expect("replacement");
+        let restored = wait_for_snapshot(&service, |snapshot| snapshot.len() == 3);
+        let replacement = restored
+            .as_slice()
+            .iter()
+            .find(|source| source.root == root(&temp, "first").as_path())
+            .expect("replacement source");
+        assert_eq!(
+            replacement.id, ids[0],
+            "retained root identity survives re-registration"
+        );
+        let RegistryEvent::RequestApplied { revision, .. } = wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::RequestApplied { request: actual, .. } if *actual == request),
+        ) else {
+            unreachable!()
+        };
+        wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::Persisted { revision: actual } if *actual == revision),
+        );
+        let request = service
+            .set_source_primary(ids[0].clone(), true, RegistryRevision::default())
+            .expect("old target");
+        wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::RequestFailed { request: actual, .. } if *actual == request),
+        );
+        persist_primary_edit(&service, &replacement.id, true, revision);
+        service.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn primary_source_save_failure_retains_prior_durable_roles() {
+        let temp = TempDir::new().expect("fixture");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let (profile, ids) = seed_primary_registry(&temp);
+        Connection::open(profile.join("library.db")).expect("database").execute_batch(
+            "CREATE TRIGGER fail_primary_registry BEFORE DELETE ON sources BEGIN SELECT RAISE(FAIL, 'primary save fault'); END;"
+        ).expect("inject save failure");
+        let mut service = SourceRegistryService::start_portable_registry_for_test(profile.clone())
+            .expect("start");
+        let before = wait_for_snapshot(&service, |_| true);
+        let _request = service
+            .set_source_primary(ids[0].clone(), true, RegistryRevision::default())
+            .expect("submit");
+        let RegistryEvent::PersistenceUnavailable { error, .. } =
+            wait_for_event(&service, |event| {
+                matches!(event, RegistryEvent::PersistenceUnavailable { .. })
+            })
+        else {
+            unreachable!()
+        };
+        assert!(error.to_string().contains("primary save fault"));
+        service
+            .shutdown()
+            .expect_err("failed persistence remains unavailable");
+        let mut reopened =
+            SourceRegistryService::start_portable_registry_for_test(profile).expect("reopen");
+        assert!(sources_equal(
+            wait_for_snapshot(&reopened, |_| true).as_slice(),
+            before.as_slice()
+        ));
+        reopened.shutdown().expect("shutdown without writes");
+    }
+
+    #[test]
+    fn primary_source_ambiguous_identity_is_rejected_without_mutation() {
+        let temp = TempDir::new().expect("fixture");
+        let id = SourceId::from_string("duplicate");
+        let mut sources = vec![
+            source(&root(&temp, "a"), id.as_str()),
+            source(&root(&temp, "b"), id.as_str()),
+        ];
+        let before = sources.clone();
+        assert!(set_primary_source(&mut sources, &id, true).is_err());
+        assert!(sources_equal(&sources, &before));
     }
 
     #[cfg(target_os = "linux")]
