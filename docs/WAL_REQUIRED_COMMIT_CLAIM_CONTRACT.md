@@ -305,8 +305,14 @@ registration/revision/direction, double consumption, overspend/cache spill/SHM,
 failed/uncertain commit, dropped delivery/restart and retained charges. Lease
 tests hold an external writer and exercise near/expired exact rows, no hidden
 renewal, no self-deadlock, one bounded update, hard/unknown rejection and lost reply.
-Synthetic capacity ledgers test logical settlement only; native provider/reserve
-and allocation/durability qualification remain their explicit platform issues.
+Synthetic capacity ledgers test logical settlement only. Actual native
+provider/reserve and forwarding-VFS allocation bounds require
+[OPT-2173](https://linear.app/boostnlvp/issue/OPT-2173) on macOS and
+[OPT-2174](https://linear.app/boostnlvp/issue/OPT-2174) on Windows: genuine retained
+native controls, disposable filesystem volumes, physical allocation/CoW/metadata
+peaks and real reserve provenance. Linux cannot execute those platform runs.
+These scoped resource steps do not block the portable codec/store/VFS work;
+stronger power-loss claims remain the existing durability qualification scope.
 
 Portable baseline commands:
 
