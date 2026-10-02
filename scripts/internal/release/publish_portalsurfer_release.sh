@@ -9,6 +9,7 @@ BUILD_ID=""
 BUILD_NUMBER=""
 RELEASE_VERSION=""
 RELEASED_AT=""
+FULL_COMMIT=""
 
 usage() {
   cat <<'USAGE'
@@ -16,6 +17,8 @@ Usage: publish_portalsurfer_release.sh --channel <nightly|rc|stable> --build-id 
 
 Requires PORTALSURFER_RELEASE_UPLOAD_TOKEN. Uses PORTALSURFER_RELEASE_UPLOAD_URL
 when set, otherwise https://portalsurfer.org/yield/api/v1/release-uploads.
+Validates all contract ZIPs/checksums and derives full commit from their manifests
+before uploading a private snapshot. Server responses must echo complete identity.
 USAGE
 }
 
@@ -103,6 +106,7 @@ curl_args=(
   --retry-delay 2
   --connect-timeout "$PORTALSURFER_RELEASE_CONNECT_TIMEOUT_SECONDS"
   --max-time "$PORTALSURFER_RELEASE_MAX_TIME_SECONDS"
+  --max-filesize 524288
 )
 
 upload_base="${PORTALSURFER_RELEASE_UPLOAD_URL:-https://portalsurfer.org/yield/api/v1/release-uploads}"
@@ -131,9 +135,13 @@ write_portalsurfer_summary() {
   if [[ "$status_code" != "0" ]]; then
     status_text="failure during ${summary_phase}"
   fi
+  local summary_artifact_dir="$ARTIFACT_DIR"
+  if [[ -d "${snapshot_dir:-}" ]]; then
+    summary_artifact_dir="$snapshot_dir"
+  fi
   local checksum_file=""
   shopt -s nullglob
-  local checksum_candidates=("${ARTIFACT_DIR}"/checksums-*.txt)
+  local checksum_candidates=("${summary_artifact_dir}"/checksums-*.txt)
   shopt -u nullglob
   if [[ ${#checksum_candidates[@]} -gt 0 ]]; then
     checksum_file="${checksum_candidates[0]}"
@@ -143,12 +151,12 @@ write_portalsurfer_summary() {
     --status "$status_text" \
     --channel "$CHANNEL" \
     --version "$RELEASE_VERSION" \
-    --commit "${GITHUB_SHA:-}" \
+    --commit "$FULL_COMMIT" \
     --build-id "$BUILD_ID" \
     --build-number "$BUILD_NUMBER" \
     --portal-catalog-url "$catalog_url" \
     --portal-build-id "$BUILD_ID" \
-    --artifact-dir "$ARTIFACT_DIR" \
+    --artifact-dir "$summary_artifact_dir" \
     --checksum-file "$checksum_file" \
     --note "PortalSurfer phase: $summary_phase" || true
 }
@@ -161,14 +169,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-shopt -s nullglob
-files=("${ARTIFACT_DIR}"/*.zip "${ARTIFACT_DIR}"/checksums-*.txt "${ARTIFACT_DIR}"/checksums-*.txt.sig)
-if [[ ${#files[@]} -eq 0 ]]; then
-  echo "No release artifacts found in $ARTIFACT_DIR." >&2
-  exit 1
-fi
+identity_file="$response_dir/packaged-identity.json"
+snapshot_dir="$response_dir/artifacts"
+FULL_COMMIT="$(python3 scripts/internal/release/publisher_identity.py prepare \
+  --artifact-dir "$ARTIFACT_DIR" --snapshot-dir "$snapshot_dir" \
+  --identity-file "$identity_file" --channel "$CHANNEL" --build-id "$BUILD_ID" \
+  --build-number "$BUILD_NUMBER" --version "$RELEASE_VERSION" --released-at "$RELEASED_AT")"
+files=("$snapshot_dir"/*)
 
-uploaded_names=()
 summary_phase="staging release files"
 for file in "${files[@]}"; do
   file_name="$(basename "$file")"
@@ -193,29 +201,14 @@ for file in "${files[@]}"; do
     --header "X-Yield-Release-Channel: $CHANNEL" \
     --header "X-Yield-Release-Version: $RELEASE_VERSION" \
     --header "X-Yield-Released-At: $RELEASED_AT" \
+    --header "X-Yield-Commit: $FULL_COMMIT" \
     --header "X-Yield-Sha256: $sha256" \
     --data-binary "@$file" \
     "$upload_base/$BUILD_ID/staging/files/$encoded_name" > "$response_file"
-  python3 - "$response_file" "$BUILD_ID" "$file_name" "$sha256" "$size_bytes" <<'PY'
-import json
-import sys
-
-response_path, expected_build, expected_name, expected_sha, expected_size = sys.argv[1:]
-response = json.loads(open(response_path, encoding="utf-8").read())
-file = response.get("file") or {}
-if response.get("staged") is not True:
-    raise SystemExit("PortalSurfer did not report a staged upload")
-if response.get("build_id") != expected_build:
-    raise SystemExit(f"Staged release id mismatch: {response.get('build_id')} != {expected_build}")
-if file.get("name") != expected_name:
-    raise SystemExit(f"Staged file name mismatch: {file.get('name')} != {expected_name}")
-if file.get("sha256") != expected_sha:
-    raise SystemExit(f"Staged file sha mismatch: {file.get('sha256')} != {expected_sha}")
-if file.get("size_bytes") != int(expected_size):
-    raise SystemExit(f"Staged file size mismatch: {file.get('size_bytes')} != {expected_size}")
-PY
+  python3 scripts/internal/release/publisher_identity.py verify \
+    --identity-file "$identity_file" --response-file "$response_file" \
+    --phase staging --file-name "$file_name"
   printf "%s\t%s\t%s\n" "$file_name" "$sha256" "$size_bytes" >> "$staged_files_tsv"
-  uploaded_names+=("$file_name")
 done
 
 summary_phase="assembling full changelog"
@@ -231,11 +224,11 @@ scripts/internal/release/assemble_portal_changelog.py \
   --output "$FULL_CHANGELOG_OUT"
 
 commit_request_file="$response_dir/release-commit.json"
-python3 - "$staged_files_tsv" "$RELEASE_LOG" "$FULL_CHANGELOG_OUT" "$RELEASED_AT" "$commit_request_file" <<'PY'
+python3 - "$staged_files_tsv" "$RELEASE_LOG" "$FULL_CHANGELOG_OUT" "$RELEASED_AT" "$FULL_COMMIT" "$commit_request_file" <<'PY'
 import json
 import sys
 
-files_path, release_log_path, full_changelog_path, released_at, out_path = sys.argv[1:]
+files_path, release_log_path, full_changelog_path, released_at, full_commit, out_path = sys.argv[1:]
 files = []
 with open(files_path, encoding="utf-8") as handle:
     for line in handle:
@@ -246,6 +239,7 @@ with open(release_log_path, encoding="utf-8") as handle:
 with open(full_changelog_path, encoding="utf-8") as handle:
     full_changelog = handle.read()
 body = {
+    "commit": full_commit,
     "files": files,
     "changelog": {
         "body": release_log,
@@ -272,8 +266,11 @@ curl "${curl_args[@]}" \
   --header "X-Yield-Release-Channel: $CHANNEL" \
   --header "X-Yield-Release-Version: $RELEASE_VERSION" \
   --header "X-Yield-Released-At: $RELEASED_AT" \
+  --header "X-Yield-Commit: $FULL_COMMIT" \
   --data-binary "@$commit_request_file" \
   "$upload_base/$BUILD_ID/commit" > "$commit_response_file"
+python3 scripts/internal/release/publisher_identity.py verify \
+  --identity-file "$identity_file" --response-file "$commit_response_file" --phase commit
 python3 - "$commit_response_file" "$BUILD_ID" "$BUILD_NUMBER" <<'PY'
 import json
 import sys
@@ -298,17 +295,8 @@ PY
 catalog_file="$response_dir/releases.json"
 summary_phase="verifying public catalog"
 curl "${curl_args[@]}" "$catalog_url" > "$catalog_file"
-catalog_args=(
-  --catalog-file "$catalog_file"
-  --build-id "$BUILD_ID"
-  --build-number "$BUILD_NUMBER"
-  --release-version "$RELEASE_VERSION"
-  --released-at "$RELEASED_AT"
-)
-for uploaded_name in "${uploaded_names[@]}"; do
-  catalog_args+=(--expected-file "$uploaded_name")
-done
-python3 scripts/internal/release/verify_portalsurfer_upload_catalog.py "${catalog_args[@]}"
+python3 scripts/internal/release/verify_portalsurfer_upload_catalog.py \
+  --catalog-file "$catalog_file" --identity-file "$identity_file"
 
 changelog_catalog_file="$response_dir/changelog-catalog.json"
 summary_phase="verifying per-release changelog"
