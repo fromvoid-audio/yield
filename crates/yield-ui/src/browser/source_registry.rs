@@ -203,6 +203,18 @@ impl SourceRegistryGlobal {
             .submit_catalog(command)
     }
 
+    /// Cancel the exact retained-index query using the existing session admission boundary.
+    pub(crate) fn cancel_catalog_index_query(
+        &self,
+        source_id: &SourceId,
+        generation: u64,
+        query_id: u64,
+    ) {
+        if let Some(service) = &self.service {
+            service.cancel_catalog_index_query(source_id, generation, query_id);
+        }
+    }
+
     pub(crate) fn cancel_catalog_audit(
         &self,
         source_id: &SourceId,

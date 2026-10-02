@@ -869,11 +869,23 @@
     },
     {
       "message": "GuiMessage::CloseUnsupportedFiles",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/unsupported_entries.rs",
+        "symbol": "close_unsupported_files"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/unsupported_entries/tests.rs",
+          "symbol": "retained_modal_escape_consumes_background_keys_and_restores_focus"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/unsupported_entries/tests.rs",
+          "symbol": "retained_modal_uses_real_owner_pages_bounded_history_and_held_inspection"
+        }
+      ],
       "owner": "OPT-2008",
-      "note": "Unsupported-file modal and safe row reveal require bounded source-owned unsupported facts; general whole-file reveal does not provide this list.",
+      "note": "Bounded source-owned retained-entry modal, typed open/close actions, eight-page cursor history, owner-only inspection and source/query/request cancellation. Linux GPUI focus and real read-only catalog tests exist; scan completeness stays unknown. No native reveal or physical qualification; macOS AX/runtime acceptance remains open in OPT-2054 under OPT-1953.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
@@ -1235,11 +1247,23 @@
     },
     {
       "message": "GuiMessage::OpenUnsupportedFiles",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/unsupported_entries.rs",
+        "symbol": "open_unsupported_files"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/unsupported_entries/tests.rs",
+          "symbol": "retained_modal_escape_consumes_background_keys_and_restores_focus"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/unsupported_entries/tests.rs",
+          "symbol": "retained_modal_uses_real_owner_pages_bounded_history_and_held_inspection"
+        }
+      ],
       "owner": "OPT-2008",
-      "note": "Unsupported-file modal and safe row reveal require bounded source-owned unsupported facts; general whole-file reveal does not provide this list.",
+      "note": "Bounded source-owned retained-entry modal, typed open/close actions, eight-page cursor history, owner-only inspection and source/query/request cancellation. Linux GPUI focus and real read-only catalog tests exist; scan completeness stays unknown. No native reveal or physical qualification; macOS AX/runtime acceptance remains open in OPT-2054 under OPT-1953.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
@@ -1636,8 +1660,8 @@
       "state": "gap",
       "handler": null,
       "automated_evidence": [],
-      "owner": "OPT-2008",
-      "note": "Unsupported-file modal and safe row reveal require bounded source-owned unsupported facts; general whole-file reveal does not provide this list.",
+      "owner": "OPT-2039",
+      "note": "Production retained-entry modal and owner-held identity inspection exist (OPT-2037/2038). Native reveal is deliberately unavailable: a qualified held-target/resource-identifying adapter is still missing. GPUI pathname dispatch and successful inspection do not complete native reveal; parent OPT-2008 remains open.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
