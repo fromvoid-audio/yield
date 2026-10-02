@@ -1,8 +1,9 @@
 # Collection membership undo contract
 
-This is the portable design prerequisite for OPT-1617, tracked by OPT-2108.
-It specifies the existing owner route and the remaining implementation. It does
-not implement history, complete OPT-1617 or OPT-1476, or qualify physical recovery.
+This contract was established by OPT-2108 for OPT-1617. OPT-2113 implements the
+bounded active GPUI collection adapter described below. Compound operations,
+restart history and native qualification remain separate acceptance; OPT-1617
+and OPT-1476 remain open.
 
 ## Action and existing owners
 
@@ -125,16 +126,18 @@ OPT-1476; adding an in-memory adapter cannot satisfy that acceptance.
 
 ## Concrete implementation and validation
 
-The following leaves preserve the original acceptance rather than completing it
-with a model fixture:
+The following leaves preserve the original acceptance:
 
 1. OPT-2113, production collection history integration: add the bounded candidate/settled
    record to the browser curation lane, capture confirmed before bits, validate
    actual catalog outcomes, and submit undo/redo through the same owner. Include
    real registered-source SQLite commit/undo/redo assertions, selection/viewport
    preservation, no-op, rejection, redo invalidation, duplicate event and stale
-   lifecycle/revision cases. Keep OPT-1617 open until the active GPUI route and
-   focused reference-equivalent fixture pass.
+   lifecycle/revision cases. The implementation is in
+   `browser/curation/collection_history.rs`, integrated with actual admission and
+   receipt consumption in `browser/curation.rs`. Dedicated collection controls
+   submit fresh catalog commands; this does not claim global undo shortcuts or
+   waveform, file, folder, profile-label or dictionary history.
 2. OPT-2114, compound history: define and implement committed-prefix records and retry
    behavior across existing multi-batch operations; test failure at every batch
    boundary with actual owners. No whole-selection success after partial failure.
@@ -152,10 +155,32 @@ cargo test --locked -p yield-ui --lib curation -- --test-threads=1
 bash scripts/internal/agent/run_agent_preflight.sh
 ```
 
-These commands do not substitute for the new production integration cases. The
-reference fixture is the behavioral specification; its native execution remains
-separate from portable GPUI/owner verification. This document was checked against
-source, not qualified as a running adapter or physical recovery implementation.
+The focused integration command is:
+
+```sh
+cargo test --locked -p yield-ui --lib collection_history -- --test-threads=1
+```
+
+Its GPUI fixture clicks the actual collection controls and uses an actual
+registered-source CatalogService and retained SourceWriter, then checks SQLite
+membership, unrelated rating/play history, selection/focus/scroll restoration,
+redo invalidation and duplicate delivery. Reopening the actual catalog verifies
+persisted metadata; it does not restore history. Separate negative cases cover
+malformed/stale receipts, failure/no-op, bounded pending/settled presentation and
+retired source contexts. The cfg(test)-only SourceRegistry harness routes these
+commands/events directly to the actual CatalogService without replacing its
+commit receipts or adding a production bootstrap bypass.
+Late retired completions invalidate only their matching source lifecycle and
+preserve the new active source's history. Unconfirmed pending completion remains
+visible even after the active catalog source is cleared.
+
+Normal Linux session bootstrap rejects this fixture with:
+`shared volume ownership is unsupported at .yield: no qualified identity-safe
+per-user application root`. OPT-2143 retains normal qualified native
+profile/journal bootstrap and active UI qualification. The reference fixture is
+the behavioral specification; portable owner tests do not complete physical
+recovery, native execution, compound history (OPT-2114), or retained restart
+history (OPT-2115).
 
 ## Dependency correction
 

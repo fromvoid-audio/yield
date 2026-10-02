@@ -33,6 +33,8 @@ use crate::theme::{color, transparent};
 
 use super::{Browser, catalog, tag_chips, tag_filter};
 
+mod collection_history;
+
 const COMPACT_FILTER_LABEL_WIDTH: f32 = 82.0;
 const LATEST_CURATION_WINDOW: Duration = Duration::from_millis(40);
 
@@ -119,6 +121,7 @@ struct PendingCurationOperation {
     overlays: BTreeMap<PathBuf, AudioFileCuration>,
     active_overlay: bool,
     trash_required: usize,
+    collection_edit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -155,6 +158,7 @@ struct CurationLineage {
     failed: Option<String>,
     /// A committed receipt was drained after its source fence became stale.
     invalidated: Option<String>,
+    history_unresolved: bool,
     message: Option<String>,
 }
 
@@ -168,6 +172,7 @@ pub(super) struct CurationState {
     next_request_id: u64,
     lineages: HashMap<CurationLifecycleKey, CurationLineage>,
     retired_pending: HashSet<(CurationLifecycleKey, u64)>,
+    collection_history: collection_history::History,
 }
 
 /// One operation ready for immediate catalog admission.
@@ -178,6 +183,7 @@ pub(super) struct CurationOperationPlan {
     pub(super) batches: Vec<Vec<SourceCurationUpdate>>,
     overlays: BTreeMap<PathBuf, AudioFileCuration>,
     trash_required: usize,
+    history_direction: Option<collection_history::Direction>,
 }
 
 impl CurationOperationPlan {
@@ -241,6 +247,7 @@ pub(super) struct CurationOutcomeApplication {
     pub(super) failed: bool,
     /// Whether the receipt may update the active browser projection.
     pub(super) projectable: bool,
+    history_restore: Option<collection_history::Presentation>,
 }
 
 impl CurationState {
@@ -253,6 +260,7 @@ impl CurationState {
         revision: u64,
         entries: &[AudioFile],
     ) {
+        self.collection_history.clear();
         if let Some(previous) = self.lineages.remove(&key) {
             self.retired_pending.extend(
                 previous
@@ -280,6 +288,7 @@ impl CurationState {
                 staged_latest: None,
                 failed: None,
                 invalidated: None,
+                history_unresolved: false,
                 message: None,
             },
         );
@@ -339,6 +348,9 @@ impl CurationState {
             return Some(format!(
                 "Curation committed but cannot update this source: {reason}; refresh the catalog before editing"
             ));
+        }
+        if lineage.history_unresolved {
+            return Some("Collection history completion unconfirmed after source context changed; refresh the catalog".into());
         }
         if !lineage.pending.is_empty() {
             let trash_required = lineage
@@ -450,6 +462,7 @@ impl CurationState {
             batches: vec![staged.updates.values().cloned().collect()],
             overlays: BTreeMap::from([(staged.path.clone(), staged.overlay)]),
             trash_required: staged.trash_required,
+            history_direction: None,
         })
     }
 
@@ -481,6 +494,11 @@ impl CurationState {
     /// Drop completed inactive lifecycle mappings while retaining accepted outcomes still in
     /// flight and the active lifecycle's confirmed metadata.
     pub(super) fn prune_completed_except(&mut self, active: Option<&CurationLifecycleKey>) {
+        if let Some(key) = self.collection_history.retire_except(active)
+            && let Some(lineage) = self.lineages.get_mut(&key)
+        {
+            lineage.history_unresolved = true;
+        }
         self.lineages
             .retain(|key, lineage| active == Some(key) || !lineage.pending.is_empty());
     }
@@ -621,6 +639,7 @@ impl CurationState {
             batches,
             overlays,
             trash_required,
+            history_direction: None,
         })
     }
 
@@ -902,6 +921,7 @@ impl CurationState {
             batches,
             overlays: BTreeMap::new(),
             trash_required: 0,
+            history_direction: None,
         })
     }
 
@@ -957,6 +977,15 @@ impl CurationState {
         key: &CurationLifecycleKey,
         plan: CurationOperationPlan,
     ) -> bool {
+        self.accept_operation_with_presentation(key, plan, None)
+    }
+
+    fn accept_operation_with_presentation(
+        &mut self,
+        key: &CurationLifecycleKey,
+        plan: CurationOperationPlan,
+        presentation: Option<collection_history::Presentation>,
+    ) -> bool {
         let next_request_id = self.next_request_id();
         let Some(lineage) = self.lineages.get_mut(key) else {
             return false;
@@ -970,8 +999,17 @@ impl CurationState {
         if plan.request_id != next_request_id {
             return false;
         }
+        self.collection_history
+            .accept(key, lineage, &plan, presentation);
         self.next_request_id = plan.request_id;
         let tags_may_change = plan.tags_may_change();
+        let collection_edit = plan.batches.iter().flatten().any(|update| {
+            matches!(
+                update,
+                SourceCurationUpdate::AddCollection { .. }
+                    | SourceCurationUpdate::RemoveCollection { .. }
+            )
+        });
         lineage.message = None;
         lineage.pending.push(PendingCurationOperation {
             request_id: plan.request_id,
@@ -980,6 +1018,7 @@ impl CurationState {
             overlays: plan.overlays,
             active_overlay: true,
             trash_required: plan.trash_required,
+            collection_edit,
         });
         true
     }
@@ -1027,6 +1066,7 @@ impl CurationState {
             operation_trash_required,
             operation_active,
             operation_paths,
+            operation_collection_edit,
         ) = {
             let operation = &lineage.pending[operation_index];
             (
@@ -1035,6 +1075,7 @@ impl CurationState {
                 operation.trash_required,
                 operation.active_overlay,
                 operation.overlays.keys().cloned().collect::<HashSet<_>>(),
+                operation.collection_edit,
             )
         };
         let expected_initial = outcome.initial_revision;
@@ -1080,6 +1121,9 @@ impl CurationState {
         {
             valid = false;
         }
+        let (history_restore, history_message) = self
+            .collection_history
+            .complete(&key, request_id, &outcome, valid);
         if !valid {
             receipt_updates.clear();
             next_revision = lineage.revision;
@@ -1110,6 +1154,7 @@ impl CurationState {
         };
         let success = failed.is_none();
         lineage.pending.remove(operation_index);
+        lineage.history_unresolved = false;
         if let Some(error) = failed.as_ref() {
             lineage.failed = Some(error.clone());
             if let Some(staged) = lineage.staged_latest.take() {
@@ -1141,7 +1186,13 @@ impl CurationState {
                 )
             });
         }
+        if let Some(message) = history_message {
+            lineage.message = Some(message);
+        } else if success && operation_collection_edit {
+            lineage.message = Some("Collection saved · Undo unavailable for this edit".into());
+        }
         Some(CurationOutcomeApplication {
+            history_restore,
             root_identity: lineage.root_identity.clone(),
             directory_generation: lineage.directory_generation,
             prior_revision,
@@ -1172,6 +1223,7 @@ impl CurationState {
             self.retired_pending.remove(&(key, request_id));
             return None;
         };
+        self.collection_history.invalidate_key(&key);
         let revision = lineage.revision;
         lineage.pending.remove(operation_index);
         lineage.staged_latest = None;
@@ -1193,6 +1245,7 @@ impl CurationState {
             tags_may_change: false,
             failed: false,
             projectable: false,
+            history_restore: None,
         })
     }
 
@@ -1560,7 +1613,228 @@ pub(super) fn render_collection_filters(
                 .text_color(color(theme.colors.text_muted))
                 .child("SOURCE COLLECTIONS"),
         )
+        .child(render_collection_history(browser, theme, cx))
         .children(rows)
+}
+
+fn render_collection_history(
+    browser: &Browser,
+    theme: Theme,
+    cx: &mut Context<Browser>,
+) -> impl gpui::IntoElement {
+    use collection_history::Direction;
+    let controls = [
+        (
+            Direction::Undo,
+            "collection-history-undo",
+            "Undo collection",
+        ),
+        (
+            Direction::Redo,
+            "collection-history-redo",
+            "Redo collection",
+        ),
+    ]
+    .into_iter()
+    .map(|(direction, id, label)| {
+        let enabled = browser.collection_history_ready(direction);
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .flex_1()
+            .min_w_0()
+            .when(theme.typography.small_size > 16.0, |element| {
+                element.flex_none().w_full()
+            })
+            .px(px(theme.spacing.control_gap))
+            .py(px(theme.spacing.control_gap))
+            .text_size(px(theme.typography.small_size))
+            .text_color(color(theme.colors.text_muted))
+            .when(!enabled, |element| element.opacity(0.45))
+            .when(enabled, |element| element.cursor_pointer())
+            .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
+                if event.standard_click() {
+                    view.submit_collection_history(direction, cx);
+                }
+            }))
+            .child(label)
+    })
+    .collect::<Vec<_>>();
+    div()
+        .flex()
+        .when(theme.typography.small_size > 16.0, |element| {
+            element.flex_col()
+        })
+        .w_full()
+        .px(px(theme.spacing.panel_padding))
+        .children(controls)
+}
+
+impl Browser {
+    fn collection_history_key(&self) -> Option<CurationLifecycleKey> {
+        let activation = self.catalog_activation.as_ref()?;
+        let context = self.catalog_metadata.context()?;
+        let key = CurationLifecycleKey {
+            source_id: activation.source_id.clone(),
+            lifecycle_generation: activation.lifecycle_generation,
+        };
+        (activation.audit_finished
+            && activation.audit_error.is_none()
+            && context.source_id == key.source_id
+            && context.lifecycle_generation == key.lifecycle_generation
+            && context.root == activation.root
+            && self.curation_state.authority_matches(
+                &key,
+                &context.root_identity,
+                context.directory_generation,
+                context.revision,
+            ))
+        .then_some(key)
+    }
+
+    fn collection_history_ready(&self, direction: collection_history::Direction) -> bool {
+        self.collection_history_key().is_some_and(|key| {
+            !tag_filter::scope_pending(self)
+                && self
+                    .curation_state
+                    .lineages
+                    .get(&key)
+                    .is_some_and(|lineage| {
+                        self.curation_state
+                            .collection_history
+                            .ready(&key, lineage, direction)
+                    })
+        })
+    }
+
+    fn submit_collection_history(
+        &mut self,
+        direction: collection_history::Direction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self.collection_history_key() else {
+            self.set_scan_status("Collection history requires current catalog metadata");
+            cx.notify();
+            return;
+        };
+        if !self.collection_history_ready(direction) {
+            return;
+        }
+        let plan = self.curation_state.lineages.get(&key).and_then(|lineage| {
+            self.curation_state.collection_history.plan(
+                &key,
+                lineage,
+                self.curation_state.next_request_id(),
+                direction,
+            )
+        });
+        let Some(plan) = plan else {
+            self.curation_state.set_message(
+                &key,
+                "Collection history changed; refresh the catalog".into(),
+            );
+            cx.notify();
+            return;
+        };
+        if let Err(error) = self.submit_planned_curation(&key, plan, false, cx) {
+            self.curation_state
+                .set_message(&key, format!("Collection history not saved: {error}"));
+        }
+        cx.notify();
+    }
+
+    fn capture_collection_history_presentation(
+        &self,
+        key: &CurationLifecycleKey,
+        plan: &CurationOperationPlan,
+    ) -> Option<collection_history::Presentation> {
+        if plan.history_direction.is_some()
+            || plan.batches.len() != 1
+            || plan.batches[0].len() > MAX_CURATION_UPDATES
+            || !plan.batches[0].iter().all(|update| {
+                matches!(
+                    update,
+                    SourceCurationUpdate::AddCollection { .. }
+                        | SourceCurationUpdate::RemoveCollection { .. }
+                )
+            })
+            || !self
+                .curation_state
+                .lineages
+                .get(key)
+                .is_some_and(|lineage| {
+                    lineage.pending.is_empty() && lineage.staged_latest.is_none()
+                })
+        {
+            return None;
+        }
+        let viewport = self.list_scroll_handle.0.borrow();
+        let top = viewport.base_handle.logical_scroll_top().0;
+        let anchor = self.view_model.rows().get(top).map(|row| &row.id);
+        // Check borrowed identities before cloning potentially large multi-selection payloads.
+        let bytes = self
+            .selection
+            .selected()
+            .iter()
+            .chain(self.selection.anchor())
+            .chain(self.browser_focus_override.iter())
+            .chain(anchor)
+            .fold(1024usize, |bytes, id| {
+                bytes.saturating_add(128 + path_byte_len(id.path()))
+            })
+            .saturating_add(
+                self.selected_audio_path()
+                    .map_or(0, |path| 128 + path_byte_len(path)),
+            )
+            .saturating_add(
+                plan.overlays
+                    .keys()
+                    .map(|path| 256 + path_byte_len(path))
+                    .sum::<usize>(),
+            );
+        if bytes > 16 * 1024 * 1024 / 3 {
+            return None;
+        }
+        Some(collection_history::Presentation {
+            selection: self.selection.clone(),
+            focus: self.browser_focus_id(),
+            viewport_anchor: anchor.cloned(),
+            viewport_offset: viewport.base_handle.offset(),
+            viewport_index: top,
+        })
+    }
+
+    fn restore_collection_history_presentation(
+        &mut self,
+        presentation: collection_history::Presentation,
+        cx: &mut Context<Self>,
+    ) {
+        self.selection = presentation.selection;
+        self.selection.reconcile(&self.visible_selection_ids());
+        if let Some(focus) = presentation.focus
+            && self.view_model.visible_position_for(&focus).is_some()
+        {
+            self.set_browser_focus_override(focus);
+            self.browser_focus_detached = false;
+        }
+        if let Some(position) = presentation
+            .viewport_anchor
+            .as_ref()
+            .and_then(|id| self.view_model.visible_position_for(id))
+        {
+            if position == presentation.viewport_index {
+                self.list_scroll_handle
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(presentation.viewport_offset);
+            } else {
+                self.list_scroll_handle
+                    .scroll_to_item_strict(position, ScrollStrategy::Top);
+            }
+        }
+        cx.notify();
+    }
 }
 
 /// Render the two fixed playback-type filters for the active source.
@@ -2256,6 +2530,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> Result<bool, CatalogSubmitError> {
         let request_id = plan.request_id;
+        let presentation = self.capture_collection_history_presentation(&key, &plan);
         let tags_may_change = plan.tags_may_change();
         let reusable_tag_mask = (!tags_may_change)
             .then(|| tag_filter::capture_ready_mask(self))
@@ -2270,7 +2545,10 @@ impl Browser {
             batches: plan.batches.clone(),
         };
         catalog::submit_catalog_command(command, cx)?;
-        if !self.curation_state.accept_operation(key, plan) {
+        if !self
+            .curation_state
+            .accept_operation_with_presentation(key, plan, presentation)
+        {
             self.curation_state.set_message(
                 key,
                 if playback_history {
@@ -2908,6 +3186,9 @@ impl Browser {
                     cx,
                 );
             }
+            if let Some(presentation) = application.history_restore {
+                self.restore_collection_history_presentation(presentation, cx);
+            }
             if self.curation_state.has_pending(&key) {
                 if let Some(context) = self.catalog_metadata.context()
                     && context.source_id == key.source_id
@@ -2977,6 +3258,14 @@ impl Browser {
     }
 
     pub(super) fn active_curation_status(&self) -> Option<String> {
+        if self
+            .curation_state
+            .lineages
+            .values()
+            .any(|lineage| lineage.history_unresolved)
+        {
+            return Some("Collection edit completion unconfirmed after source context changed; refresh the catalog".into());
+        }
         let activation = self.catalog_activation.as_ref()?;
         self.curation_state.status_for(&CurationLifecycleKey {
             source_id: activation.source_id.clone(),

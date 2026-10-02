@@ -1400,11 +1400,19 @@
     },
     {
       "message": "GuiMessage::RedoTransaction",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
-      "owner": "OPT-1611",
-      "note": "Application-wide committed history/recovery remains open; dictionary-definition undo is narrower.",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/curation.rs",
+        "symbol": "submit_collection_history"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/curation/collection_history/tests.rs",
+          "symbol": "collection_history_real_gpui_owner_commit_undo_redo_and_restart"
+        }
+      ],
+      "owner": "OPT-1617",
+      "note": "Dedicated collection-membership controls only: one bounded atomic batch, acknowledged retained catalog/SQLite owner, committed-only history and redo invalidation. Test uses an explicit actual-catalog harness, not normal qualified session bootstrap (OPT-2143). Global shortcuts, waveform/file/folder/dictionary history, compound commits (OPT-2114) and history across restart (OPT-2115) remain open under OPT-1476.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
@@ -2061,11 +2069,19 @@
     },
     {
       "message": "GuiMessage::UndoTransaction",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
-      "owner": "OPT-1611",
-      "note": "Application-wide committed history/recovery remains open; dictionary-definition undo is narrower.",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/curation.rs",
+        "symbol": "submit_collection_history"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/curation/collection_history/tests.rs",
+          "symbol": "collection_history_real_gpui_owner_commit_undo_redo_and_restart"
+        }
+      ],
+      "owner": "OPT-1617",
+      "note": "Dedicated collection-membership controls only: one bounded atomic batch, acknowledged retained catalog/SQLite owner, committed-only history and redo invalidation. Test uses an explicit actual-catalog harness, not normal qualified session bootstrap (OPT-2143). Global shortcuts, waveform/file/folder/dictionary history, compound commits (OPT-2114) and history across restart (OPT-2115) remain open under OPT-1476.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
