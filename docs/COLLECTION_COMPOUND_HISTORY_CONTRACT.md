@@ -44,7 +44,18 @@ batch boundaries, complete owner identity and audited directory generation.
 No-op paths do not enter the changed payload. Capture all bounded chunks at one
 exact revision on the same retained owner; discard the entire preparation if a
 chunk, identity, directory or observation window changes before admission.
-The existing exact-revision mutation route still revalidates on the worker.
+The existing exact-revision mutation route still revalidates on the worker, but
+`execute_inner` obtains a fresh owner revision rather than comparing it with the
+history preparation's complete identity. The compound consumer must carry the
+captured owner observation into its worker request and compare source, root,
+root binding, database, lifecycle and lease epoch before the first and every
+subsequent batch. Numeric revision follows the exact acknowledged prefix;
+use a fresh owner-issued revision for each write, never a caller-bumped object.
+Bind terminal outcome custody to that prepared request. An owner replacement
+with equal root/numeric revision must reject before SQL, not acquire history
+authority from the ordinary command's newly qualified writer. The observation
+still grants no capacity or mutation authority; ordinary owner admission stays
+required. OPT-2186 supplies this missing production handoff.
 Sequential chunks need one explicit preparation cancellation context: retaining
 the same token must not cancel itself, while a distinct replacement or mutation
 must retire it. If the transport is one-shot, implement and test this bounded
