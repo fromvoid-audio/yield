@@ -1842,10 +1842,12 @@ impl SourceWriter {
             return Err(SourceWriterError::SnapshotBudgetExceeded);
         }
         let before = before?;
-        if expected != &before {
+        if expected != &before
+            || after_cursor.is_some_and(|cursor| !cursor.matches_owner_revision(&before))
+        {
             return Ok(SourceSnapshotPage::Stale { current: before });
         }
-        let page = self
+        let mut page = self
             .database
             .browser_metadata_page_bounded(
                 expected.revision(),
@@ -1888,6 +1890,9 @@ impl SourceWriter {
             || !bytes.is_some_and(|bytes| bytes <= 16 * 1024 * 1024)
         {
             return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        if let Some(cursor) = &mut page.next_cursor {
+            cursor.bind_owner_revision(after.clone());
         }
         Ok(SourceSnapshotPage::FreshAsOf {
             revision: after,
