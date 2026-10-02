@@ -10,6 +10,11 @@ mod fixtures {
     };
 
     fn setup() -> (Fixture, SourceWriter, Vec<ReadinessTarget>) {
+        setup_with_vector(|_, vector| vector)
+    }
+    fn setup_with_vector(
+        transform: impl Fn(usize, Vec<f32>) -> Vec<f32>,
+    ) -> (Fixture, SourceWriter, Vec<ReadinessTarget>) {
         let fixture = Fixture::new("similarity-query");
         let db = SourceDatabase::open_for_catalog_with_profile_guard(
             fixture.root.path(),
@@ -106,7 +111,8 @@ mod fixtures {
                     &fixture.root.path().join(path),
                 )
                 .unwrap();
-                let payload = FeatureArtifactPayload::from_v1_vector(&vector).unwrap();
+                let payload =
+                    FeatureArtifactPayload::from_v1_vector(&transform(index, vector)).unwrap();
                 writer
                     .publish_feature_artifact(&revision, &claim, &payload, 11, &cancel)
                     .unwrap();
@@ -161,6 +167,14 @@ mod fixtures {
             &SimilarityCandidateOutcome::Unavailable
         );
         assert!(result.rows()[2].key().is_none());
+        assert_eq!(result.rows()[2].aspect_scores(), &[None; 5]);
+        for aspect in SimilarityAspect::ORDER {
+            let score = result.rows()[0]
+                .aspect_score(aspect)
+                .expect("real WAV aspect available");
+            assert!(score.is_finite() && (-1.0..=1.0).contains(&score));
+            assert!((score - 1.0).abs() < 1e-5);
+        }
         assert!(!result.matches_query(&query(&writer, &targets, SimilarityAspect::Amplitude, 1)));
         assert!(!result.matches_query(&query(&writer, &targets, SimilarityAspect::Spectrum, 2)));
         assert_eq!(writer.current_revision().unwrap(), *request.revision());
@@ -171,6 +185,123 @@ mod fixtures {
         for (name, before) in retained {
             assert_eq!(fs::read(directory.join(name)).unwrap(), before);
         }
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn similarity_query_retains_partial_aspects_and_preserves_selected_anchor_failure() {
+        let (_fixture, mut writer, targets) = setup_with_vector(|index, mut vector| {
+            if index < 2 {
+                // Zero just the amplitude slice in anchor and identical candidate.
+                for slot in [0, 1, 2, 3, 5, 6, 7, 8] {
+                    vector[slot] = 0.0;
+                }
+            }
+            vector
+        });
+        let request = query(&writer, &targets, SimilarityAspect::Spectrum, 1);
+        let result =
+            query_source_similarity(&mut writer, &request, &AtomicBool::new(false)).unwrap();
+        let same = result
+            .rows()
+            .iter()
+            .find(|row| row.target() == &targets[1])
+            .unwrap();
+        assert_eq!(same.aspect_score(SimilarityAspect::Amplitude), None);
+        for aspect in [
+            SimilarityAspect::Overall,
+            SimilarityAspect::Spectrum,
+            SimilarityAspect::Timbre,
+            SimilarityAspect::Pitch,
+        ] {
+            assert!((same.aspect_score(aspect).unwrap() - 1.0).abs() < 1e-5);
+        }
+        assert_eq!(
+            same.outcome(),
+            &SimilarityCandidateOutcome::Scored(
+                same.aspect_score(SimilarityAspect::Spectrum).unwrap()
+            )
+        );
+        let amplitude = query(&writer, &targets, SimilarityAspect::Amplitude, 2);
+        assert!(matches!(
+            query_source_similarity(&mut writer, &amplitude, &AtomicBool::new(false)),
+            Err(SimilarityQueryError::AnchorUnavailable)
+        ));
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn similarity_query_invalid_candidate_aspects_do_not_hide_other_valid_scores() {
+        let (_fixture, mut writer, targets) = setup_with_vector(|index, mut vector| {
+            if index == 1 {
+                for slot in [0, 1, 2, 3, 5, 6, 7, 8] {
+                    vector[slot] = 0.0;
+                }
+            } else if index == 2 {
+                vector.fill(0.0);
+            }
+            vector
+        });
+        let request = query(&writer, &targets, SimilarityAspect::Amplitude, 1);
+        let result =
+            query_source_similarity(&mut writer, &request, &AtomicBool::new(false)).unwrap();
+        let partial = result
+            .rows()
+            .iter()
+            .find(|row| row.target() == &targets[1])
+            .unwrap();
+        assert_eq!(partial.outcome(), &SimilarityCandidateOutcome::Unavailable);
+        assert_eq!(partial.aspect_score(SimilarityAspect::Amplitude), None);
+        assert!((partial.aspect_score(SimilarityAspect::Spectrum).unwrap() - 1.0).abs() < 1e-5);
+        assert!(partial.key().is_some());
+        let zero = result
+            .rows()
+            .iter()
+            .find(|row| row.target() == &targets[2])
+            .unwrap();
+        assert_eq!(zero.aspect_scores(), &[None; 5]);
+        assert!(zero.key().is_some()); // Valid payload with no normalized descriptor.
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn similarity_query_all_aspects_preserve_ties_and_missing_completion_is_unavailable() {
+        use yield_library::sample_sources::readiness::FeatureArtifactFixtureFault;
+        let (_fixture, mut writer, targets) = setup_with_vector(|_, _| vec![1.0; 183]);
+        for aspect in SimilarityAspect::ORDER {
+            let request = query(&writer, &targets, aspect, 1);
+            let result =
+                query_source_similarity(&mut writer, &request, &AtomicBool::new(false)).unwrap();
+            assert!(result.matches_query(&request));
+            assert_eq!(result.rows()[0].target(), &targets[2]); // other.wav precedes same.wav on equal scores.
+            assert_eq!(result.rows()[1].target(), &targets[1]);
+            for row in &result.rows()[..2] {
+                assert_eq!(
+                    row.outcome(),
+                    &SimilarityCandidateOutcome::Scored(row.aspect_score(aspect).unwrap())
+                );
+                for value in row.aspect_scores() {
+                    assert!((value.unwrap() - 1.0).abs() < 1e-5);
+                }
+            }
+        }
+        let request = query(&writer, &targets, SimilarityAspect::Overall, 2);
+        writer
+            .inject_feature_artifact_fixture_fault(
+                request.revision(),
+                &targets[1],
+                FeatureArtifactFixtureFault::MissingMarker,
+            )
+            .unwrap();
+        let result =
+            query_source_similarity(&mut writer, &request, &AtomicBool::new(false)).unwrap();
+        let stale = result
+            .rows()
+            .iter()
+            .find(|row| row.target() == &targets[1])
+            .unwrap();
+        assert_eq!(stale.aspect_scores(), &[None; 5]);
+        assert!(stale.key().is_none());
         writer.close().unwrap();
     }
 
@@ -275,7 +406,8 @@ mod fixtures {
         let after =
             query_source_similarity(&mut writer, &request, &AtomicBool::new(false)).unwrap();
         assert!(after.rows().iter().any(|row| row.target() == &targets[1]
-            && row.outcome() == &SimilarityCandidateOutcome::Unavailable));
+            && row.outcome() == &SimilarityCandidateOutcome::Unavailable
+            && row.aspect_scores() == &[None; 5]));
         let db = writer.into_catalog_database();
         assert!(
             !first.is_current_for(&request),

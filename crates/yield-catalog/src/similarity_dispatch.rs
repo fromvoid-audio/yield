@@ -11,6 +11,20 @@ use yield_library::sample_sources::readiness::{
 // publication custody is retained by Arc/Weak and is not copied per result.
 pub(super) const MAX_RESULT_BYTES: usize = 1024 * 1024;
 
+// Keep the reservation unchanged as result rows grow. Four path copies share the
+// admitted 64 KiB text budget. Per file, 10 KiB conservatively covers three target
+// identity copies, revision identities, observation facts/publication identity and
+// fixed key/reference text (all bounded before construction). Structural sizes
+// include the five inline Option<f32> scores and vector elements, not shared custody.
+const RESULT_RETAINED_BYTES_BOUND: usize = 4 * 64 * 1024
+    + 65 * (10 * 1024
+        + std::mem::size_of::<SourceSimilarityRow>()
+        + std::mem::size_of::<ReadinessTarget>()
+        + std::mem::size_of::<yield_library::sample_sources::db::SourceFileObservation>())
+    + std::mem::size_of::<SourceSimilarityResult>()
+    + std::mem::size_of::<SourceSimilarityRequest>();
+const _: () = assert!(RESULT_RETAINED_BYTES_BOUND <= MAX_RESULT_BYTES);
+
 /// Immutable admitted request; explicit candidates never imply whole-library completeness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceSimilarityRequest {

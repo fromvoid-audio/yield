@@ -16,6 +16,15 @@ The source owner revalidates every path/object/hash through genuine
 binding. Missing, corrupt or invalid selected descriptors are unavailable; no
 score or Ready state is invented. A missing anchor prevents a result.
 
+Each candidate now retains five optional finite raw cosine scores in
+`SimilarityAspect::ORDER` (OPT-2164), computed from the same once-decoded v1
+descriptor. `aspect_score(aspect)` and `aspect_scores()` read those immutable
+values without SQL or recomputation. Invalid individual aspects remain `None`;
+missing/corrupt/incomplete candidate payloads have no scores. The selected aspect
+still determines the existing outcome and ordering, and an invalid selected anchor
+still rejects the query. Enable/weight/master controls and effective-score reranking
+remain OPT-2159 acceptance.
+
 Results carry exact query context and validated keys. Finite scores descend by
 cosine, with a deterministic path tie-break; unavailable candidates follow.
 They describe only the supplied candidate set. Pitch preserves the existing v1

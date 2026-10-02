@@ -128,6 +128,10 @@ mod fixtures {
             result.rows()[1].outcome(),
             &SimilarityCandidateOutcome::Unavailable
         );
+        for aspect in SimilarityAspect::ORDER {
+            assert!((result.rows()[0].aspect_score(aspect).unwrap() - 1.0).abs() < 0.0001);
+        }
+        assert_eq!(result.rows()[1].aspect_scores(), &[None; 5]);
         for (name, previous) in bytes {
             assert_eq!(fs::read(directory.join(name)).unwrap(), previous);
         }
