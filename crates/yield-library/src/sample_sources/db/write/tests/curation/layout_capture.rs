@@ -547,9 +547,32 @@ fn layout_capture_ambiguous_provenance_and_missing_completion_are_not_repaired()
 
 #[test]
 fn layout_capture_changed_audited_revision_and_physical_owner_scope_reject_old_input() {
-    let (_fixture, mut writer) = setup();
+    let (fixture, mut writer) = setup();
     publish(&mut writer, &["one.wav", "two.wav"]);
     let observed = capture(&writer).unwrap();
+    // A genuine metadata-only owner commit changes the audited revision without
+    // changing any layout input. The historical capture expires; a fresh one must
+    // retain the reusable digest and actual feature keys without publishing again.
+    let receipt = writer
+        .commit_catalog_curation_command(
+            observed.revision(),
+            &fixture.profile_guard,
+            &[SourceCurationUpdate::SetRating {
+                path: CurationFixture::path("one.wav"),
+                rating: Rating::KEEP_3,
+            }],
+        )
+        .unwrap();
+    assert!(receipt.source_revision() > observed.revision().revision());
+    let before = persisted(&writer);
+    assert!(observed.validate_read_fence().is_err());
+    let current = capture(&writer).unwrap();
+    assert_eq!(current.revision().revision(), receipt.source_revision());
+    assert_eq!(current.input_digest(), observed.input_digest());
+    for (new, old) in current.features().iter().zip(observed.features()) {
+        assert_eq!(new.key(), old.key());
+    }
+    assert_eq!(persisted(&writer), before);
     writer
         .database_for_tests()
         .connection
