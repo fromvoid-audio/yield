@@ -33,7 +33,7 @@ use super::model::{
     MAX_USER_STATUS_KEY_BYTES, OperationActor, OperationDisposition, OperationId, OperationIntent,
     OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
-    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, UniversalIntent,
+    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, UniversalIntent,
 };
 use super::namespace_commands::validate_persisted_namespace_command_args_value;
 use super::participants::MAX_PARTICIPANTS;
@@ -340,6 +340,25 @@ impl StoredOperationRecord {
         )
     }
 
+    pub(crate) fn new_v17_recording(
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        full_capacity_plan: FullCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Self {
+        let mut record = Self::new_v16_command(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            full_capacity_plan,
+            timestamp_unix_ms,
+        );
+        record.schema_version = SCHEMA_V17;
+        record
+    }
     pub(crate) fn new_v16_command(
         operation_id: OperationId,
         intent: OperationIntent,
@@ -453,6 +472,7 @@ impl StoredOperationRecord {
                 | SCHEMA_V14
                 | SCHEMA_V15
                 | SCHEMA_V16
+                | SCHEMA_V17
         ) {
             record.schema_version = SCHEMA_V4;
         }
@@ -477,6 +497,7 @@ impl StoredOperationRecord {
                 | SCHEMA_V14
                 | SCHEMA_V15
                 | SCHEMA_V16
+                | SCHEMA_V17
         ) {
             record.schema_version = SCHEMA_V5;
         }
@@ -1482,7 +1503,7 @@ struct PersistedFullCapacityOperationRecordRef<'a> {
 fn persisted_v16_from_record(
     record: &StoredOperationRecord,
 ) -> Result<PersistedFullCapacityOperationRecordRef<'_>, EncodeError> {
-    validate_v16_coordinator_shape(record)
+    validate_full_initial_shape(record)
         .map_err(|reason| EncodeError::InvalidV16Record { reason })?;
     Ok(PersistedFullCapacityOperationRecordRef {
         schema_version: record.schema_version,
@@ -1742,13 +1763,13 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
             validate_v15_coordinator_shape(&record).map_err(malformed)?;
             Ok(record)
         }
-        SCHEMA_V16 => {
+        SCHEMA_V16 | SCHEMA_V17 => {
             validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
             validate_persisted_v16_object_boundaries(&value).map_err(malformed)?;
             let record = serde_json::from_value::<PersistedFullCapacityOperationRecord>(value)
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
-            validate_v16_coordinator_shape(&record).map_err(malformed)?;
+            validate_full_initial_shape(&record).map_err(malformed)?;
             Ok(record)
         }
         version => Err(DecodeError::UnsupportedVersion { version }),
@@ -1963,7 +1984,7 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
             let persisted = persisted_v15_from_record(record)?;
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
-        SCHEMA_V16 => {
+        SCHEMA_V16 | SCHEMA_V17 => {
             let persisted = persisted_v16_from_record(record)?;
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
@@ -3069,10 +3090,12 @@ fn validate_persisted_v16_object_boundaries(value: &Value) -> Result<(), &'stati
         required_field(object, "universal_intent")?,
         true,
     )?;
-    validate_persisted_v16_universal_command_args_value(required_field(
-        object,
-        "universal_command_args",
-    )?)?;
+    let args = required_field(object, "universal_command_args")?;
+    if required_field(object, "schema_version")?.as_u64() == Some(u64::from(SCHEMA_V17)) {
+        validate_persisted_tagged_command_args_value(args, &["Recording"], "schema-v17")?;
+    } else {
+        validate_persisted_v16_universal_command_args_value(args)?;
+    }
     validate_persisted_full_capacity_plan_value(required_field(object, "full_capacity_plan")?)?;
     if let Some(retry) = object.get("retry_observation") {
         if !retry.is_null() {
@@ -3195,6 +3218,14 @@ fn validate_persisted_tagged_command_args_value(
         "Import" => validate_persisted_import_intent_value(arguments),
         "WaveformEdit" => validate_persisted_waveform_edit_value(arguments),
         "DecodedEdit" => validate_persisted_decoded_edit_value(arguments),
+        "Recording" => {
+            let proposal: super::recording_commands::RecordingProposal =
+                serde_json::from_value(arguments.clone())
+                    .map_err(|_| "invalid recording proposal")?;
+            proposal
+                .validate()
+                .map_err(|_| "invalid recording proposal")
+        }
         "Namespace" => validate_persisted_namespace_command_args_value(arguments),
         "Render" => validate_persisted_render_command_args_value(arguments),
         "Removal" => validate_persisted_removal_command_args_value(arguments),
@@ -3264,7 +3295,7 @@ pub(crate) fn validate_v3_initial_shape(record: &StoredOperationRecord) -> Resul
 }
 
 fn validate_universal_intent_envelope_shape(record: &StoredOperationRecord) -> Result<(), String> {
-    if record.schema_version == SCHEMA_V16 {
+    if matches!(record.schema_version, SCHEMA_V16 | SCHEMA_V17) {
         if record.capacity_plan.is_some() {
             return Err(String::from(
                 "schema-v16 universal intent records cannot carry a legacy capacity plan",
@@ -3560,6 +3591,11 @@ pub(crate) fn validate_v6_coordinator_shape(record: &StoredOperationRecord) -> R
         UniversalCommandArgs::Copy(_)
         | UniversalCommandArgs::Import(_)
         | UniversalCommandArgs::DuplicateSame(_) => {}
+        UniversalCommandArgs::Recording(_) => {
+            return Err(String::from(
+                "legacy schema cannot carry recording arguments",
+            ));
+        }
         UniversalCommandArgs::WaveformEdit(_) => {
             return Err(String::from(
                 "schema-v6 cannot carry schema-v7 waveform edit arguments",
@@ -3866,6 +3902,65 @@ pub(crate) fn validate_v15_coordinator_shape(record: &StoredOperationRecord) -> 
     )
 }
 
+pub(crate) fn validate_full_initial_shape(record: &StoredOperationRecord) -> Result<(), String> {
+    if record.schema_version == SCHEMA_V16 {
+        return validate_v16_coordinator_shape(record);
+    }
+    validate_tagged_coordinator_shape(
+        record,
+        SCHEMA_V17,
+        "schema-v17",
+        &["Recording"],
+        OperationActor::User,
+        OperationKind::FileMutation,
+    )?;
+    let Some(UniversalCommandArgs::Recording(proposal)) = record.universal_command_args.as_ref()
+    else {
+        return Err("missing recording proposal".into());
+    };
+    if proposal.operation_id() != record.operation_id {
+        return Err("recording operation identity mismatch".into());
+    }
+    if record.capacity_plan.is_some() {
+        return Err("recording cannot carry legacy capacity plan".into());
+    }
+    let plan = record
+        .full_capacity_plan
+        .as_ref()
+        .ok_or("recording requires full capacity plan")?;
+    plan.validate().map_err(|e| e.to_string())?;
+    let staging = plan
+        .allocations()
+        .iter()
+        .filter(|a| {
+            a.class() == super::full_capacity::FullCapacityAllocationClass::DestinationStaging
+        })
+        .try_fold(0u64, |sum, a| sum.checked_add(a.logical_bytes()))
+        .ok_or("staging capacity overflow")?;
+    let retained = plan
+        .allocations()
+        .iter()
+        .filter(|a| a.class() == super::full_capacity::FullCapacityAllocationClass::JournalRecord)
+        .try_fold(0u64, |sum, a| sum.checked_add(a.logical_bytes()))
+        .ok_or("recording retention capacity overflow")?;
+    let payload_bound = proposal
+        .retained_metadata_bound()
+        .map_err(|e| e.to_string())?;
+    if payload_bound > super::recording_commands::MAX_RECORDING_RETAINED_ENCODED_BYTES {
+        return Err("recording frozen metadata exceeds V17 retention budget".into());
+    }
+    if staging
+        < proposal
+            .format()
+            .max_encoded_bytes()
+            .map_err(|e| e.to_string())?
+        || retained < super::recording_commands::RECORDING_JOURNAL_PEAK_BYTES.max(payload_bound)
+    {
+        return Err("recording allocation does not cover frozen output/journal peak".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_v16_coordinator_shape(record: &StoredOperationRecord) -> Result<(), String> {
     match record.intent.kind {
         OperationKind::FileHistory => validate_tagged_coordinator_shape(
@@ -3966,6 +4061,7 @@ fn validate_tagged_coordinator_shape(
         .as_ref()
         .ok_or_else(|| format!("{schema_name} record requires tagged command arguments"))?;
     let variant = match command_args {
+        UniversalCommandArgs::Recording(_) => "Recording",
         UniversalCommandArgs::Copy(_) => "Copy",
         UniversalCommandArgs::Import(_) => "Import",
         UniversalCommandArgs::DuplicateSame(_) => "DuplicateSame",

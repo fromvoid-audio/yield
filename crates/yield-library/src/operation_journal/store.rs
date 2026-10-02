@@ -49,7 +49,7 @@ use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, OperationActor, OperationDisposition,
     OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
-    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16,
+    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17,
 };
 use super::namespace_commands::NamespaceCommandArgs;
 use super::owner::ChunkUnusedReleaseAuthorization;
@@ -68,6 +68,8 @@ use super::validation::{RecordConsistency, classify_record};
 
 mod chunk_claims;
 mod chunk_staging;
+mod recording_chunks;
+pub(crate) use recording_chunks::{RecordingChunkPage, RecordingChunkReceipt};
 #[allow(dead_code)]
 mod full_progress;
 #[allow(dead_code)]
@@ -98,7 +100,7 @@ pub const JOURNAL_DATABASE_ROOT_NAME: &str = "operation_journal";
 /// The SQLite application id reserved for the operation journal.
 pub const JOURNAL_APPLICATION_ID: u32 = u32::from_be_bytes(*b"WCJ1");
 /// The SQLite user-version written by this journal schema.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 9;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 10;
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -118,7 +120,8 @@ const ORDINARY_CLAIM_SCHEMA_VERSION: u32 = 5;
 const ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION: u32 = 6;
 const CHUNK_CLAIM_SCHEMA_VERSION: u32 = 7;
 const STAGING_CHECKPOINT_SCHEMA_VERSION: u32 = 8;
-const MAX_SCHEMA_OBJECTS: i64 = 10;
+const CHUNK_STAGING_SCHEMA_VERSION: u32 = 9;
+const MAX_SCHEMA_OBJECTS: i64 = 11;
 const MAX_SCHEMA_COLUMNS: usize = 16;
 const MAX_SCHEMA_INDEXES: usize = 8;
 const MAX_REBUILD_DIAGNOSTICS: usize = 32;
@@ -143,6 +146,12 @@ const CREATE_FULL_PROGRESS_TABLE: &str = "CREATE TABLE operation_journal_full_pr
 /// Errors returned by the profile-owned operation journal store.
 #[derive(Debug, Error)]
 pub enum OperationJournalStoreError {
+    /// Retained recording facts are invalid, conflicting, stale or over budget.
+    #[error("recording retention rejected: {reason}")]
+    RecordingRetention {
+        /// Bounded rejection context; bytes remain retained for audit.
+        reason: String,
+    },
     /// The caller did not hold the profile ownership capability, or that capability was replaced.
     #[error(transparent)]
     ProfileOwnership(#[from] ProfileOwnershipError),
@@ -2014,8 +2023,9 @@ impl OperationJournalStore {
                 });
             }
             let has_checkpoint: bool = self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM operation_journal_chunk_staging WHERE chunk_id = ?1)",
-                params![chunk_id.to_string()],
+                "SELECT EXISTS(SELECT 1 FROM operation_journal_chunk_staging WHERE chunk_id = ?1)
+                      OR EXISTS(SELECT 1 FROM operation_journal_recording_chunks WHERE operation_id = ?2)",
+                params![chunk_id.to_string(), operation_id.to_string()],
                 |row| row.get(0),
             )?;
             if has_checkpoint {
@@ -2198,7 +2208,8 @@ impl OperationJournalStore {
             })?;
             let staging_rows: i64 = self.connection.query_row(
                 "SELECT (SELECT COUNT(*) FROM operation_journal_staging_checkpoints)
-                      + (SELECT COUNT(*) FROM operation_journal_chunk_staging)",
+                      + (SELECT COUNT(*) FROM operation_journal_chunk_staging)
+                      + (SELECT COUNT(*) FROM operation_journal_recording_chunks)",
                 [],
                 |row| row.get(0),
             )?;
@@ -3213,6 +3224,16 @@ impl OperationJournalStore {
                     STAGING_CHECKPOINT_SCHEMA_VERSION,
                 )?;
                 migrate_chunk_staging_schema(
+                    &connection,
+                    &database_root,
+                    &database_path,
+                    &database_identity,
+                    profile_guard,
+                    rollback_journal.as_ref(),
+                )?;
+            } else if header_version == CHUNK_STAGING_SCHEMA_VERSION {
+                configure_connection(&connection)?;
+                migrate_recording_chunks_schema(
                     &connection,
                     &database_root,
                     &database_path,
@@ -5242,6 +5263,7 @@ impl OperationJournalStore {
                 | SCHEMA_V14
                 | SCHEMA_V15
                 | SCHEMA_V16
+                | SCHEMA_V17
         ) && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
         {
             if current.record.cancellation_request() == Some(&observation) {
@@ -5276,6 +5298,7 @@ impl OperationJournalStore {
                 | SCHEMA_V14
                 | SCHEMA_V15
                 | SCHEMA_V16
+                | SCHEMA_V17
         ) {
             return Err(OperationJournalStoreError::UnsupportedCancellationSchema {
                 schema_version: current.record.schema_version,
@@ -5338,7 +5361,7 @@ impl OperationJournalStore {
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
-            SCHEMA_V16 => matches!(
+            SCHEMA_V16 | SCHEMA_V17 => matches!(
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
@@ -5357,7 +5380,7 @@ impl OperationJournalStore {
                 SCHEMA_V13 => "V13 IntentDurable/None or RetryPending",
                 SCHEMA_V14 => "V14 IntentDurable/None or RetryPending",
                 SCHEMA_V15 => "V15 IntentDurable/None or RetryPending",
-                SCHEMA_V16 => "V16 IntentDurable/None or RetryPending",
+                SCHEMA_V16 | SCHEMA_V17 => "Full initial intent / None or RetryPending",
                 _ => "V3 IntentDurable/None",
             };
             return Err(OperationJournalStoreError::UnsupportedCancellationState {
@@ -5543,6 +5566,7 @@ impl OperationJournalStore {
                 | SCHEMA_V14
                 | SCHEMA_V15
                 | SCHEMA_V16
+                | SCHEMA_V17
         ) && current.record.disposition == OperationDisposition::RetryPending
             && current.record.retry_observation() == Some(&observation)
         {
@@ -5574,6 +5598,7 @@ impl OperationJournalStore {
                 | SCHEMA_V14
                 | SCHEMA_V15
                 | SCHEMA_V16
+                | SCHEMA_V17
         ) {
             return Err(OperationJournalStoreError::UnsupportedRetrySchema {
                 schema_version: current.record.schema_version,
@@ -5891,6 +5916,10 @@ impl OperationJournalStore {
     ) -> Result<OrdinaryClaimReleaseTransition, OrdinaryClaimReleaseError> {
         self.validate_namespace_without_sidecars()
             .map_err(|source| OrdinaryClaimReleaseError::Persistence { source })?;
+        let retained: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM operation_journal_recording_chunks WHERE operation_id=?1)", params![request.operation_id().to_string()], |r| r.get(0)).map_err(|source| OrdinaryClaimReleaseError::Persistence { source: source.into() })?;
+        if retained {
+            return Err(OrdinaryClaimReleaseError::Persistence { source: OperationJournalStoreError::RecordingRetention { reason: "retained recording prefix forbids capacity release until qualified retirement is implemented".into() } });
+        }
         release_ordinary_claim_transition_inside_transaction(&self.connection, request)
     }
 
@@ -6325,6 +6354,8 @@ impl OperationJournalStore {
                  SELECT sequence FROM operation_journal_staging_checkpoints
                  UNION ALL
                  SELECT sequence FROM operation_journal_chunk_staging
+                 UNION ALL
+                 SELECT sequence FROM operation_journal_recording_chunks
              )",
             [],
             |row| row.get::<_, Option<i64>>(0),
@@ -6844,6 +6875,9 @@ impl OperationJournalStore {
                  UNION ALL
                  SELECT sequence FROM operation_journal_chunk_staging
                  WHERE typeof(sequence) = 'integer' AND sequence = ?1
+                 UNION ALL
+                 SELECT sequence FROM operation_journal_recording_chunks
+                 WHERE typeof(sequence) = 'integer' AND sequence = ?1
              )",
             params![sequence],
             |row| row.get(0),
@@ -7322,6 +7356,7 @@ fn validate_sqlite_header(file: &mut File, path: &Path) -> Result<u32, Operation
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
             | STAGING_CHECKPOINT_SCHEMA_VERSION
+            | CHUNK_STAGING_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -7356,6 +7391,7 @@ fn read_sqlite_user_version(
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
             | STAGING_CHECKPOINT_SCHEMA_VERSION
+            | CHUNK_STAGING_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -7486,7 +7522,10 @@ fn validate_existing_schema(
                 String::from("table"),
             ),
         ],
-        CHUNK_CLAIM_SCHEMA_VERSION | STAGING_CHECKPOINT_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION => {
+        CHUNK_CLAIM_SCHEMA_VERSION
+        | STAGING_CHECKPOINT_SCHEMA_VERSION
+        | CHUNK_STAGING_SCHEMA_VERSION
+        | JOURNAL_SCHEMA_VERSION => {
             let mut expected = vec![
                 (String::from(JOURNAL_TABLE_NAME), String::from("table")),
                 (
@@ -7527,7 +7566,7 @@ fn validate_existing_schema(
                     ),
                 );
             }
-            if schema_version == JOURNAL_SCHEMA_VERSION {
+            if schema_version >= CHUNK_STAGING_SCHEMA_VERSION {
                 expected.insert(
                     2,
                     (
@@ -7535,6 +7574,13 @@ fn validate_existing_schema(
                         String::from("table"),
                     ),
                 );
+            }
+            if schema_version == JOURNAL_SCHEMA_VERSION {
+                expected.push((
+                    String::from(recording_chunks::TABLE_NAME),
+                    String::from("table"),
+                ));
+                expected.sort_unstable();
             }
             expected
         }
@@ -7562,6 +7608,7 @@ fn validate_existing_schema(
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
             | STAGING_CHECKPOINT_SCHEMA_VERSION
+            | CHUNK_STAGING_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7579,6 +7626,7 @@ fn validate_existing_schema(
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
             | STAGING_CHECKPOINT_SCHEMA_VERSION
+            | CHUNK_STAGING_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7601,6 +7649,7 @@ fn validate_existing_schema(
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
             | STAGING_CHECKPOINT_SCHEMA_VERSION
+            | CHUNK_STAGING_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7616,6 +7665,7 @@ fn validate_existing_schema(
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
             | STAGING_CHECKPOINT_SCHEMA_VERSION
+            | CHUNK_STAGING_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7630,6 +7680,7 @@ fn validate_existing_schema(
         ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
             | STAGING_CHECKPOINT_SCHEMA_VERSION
+            | CHUNK_STAGING_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7641,7 +7692,10 @@ fn validate_existing_schema(
     }
     if matches!(
         schema_version,
-        CHUNK_CLAIM_SCHEMA_VERSION | STAGING_CHECKPOINT_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
+            | CHUNK_STAGING_SCHEMA_VERSION
+            | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
             connection,
@@ -7652,7 +7706,7 @@ fn validate_existing_schema(
     }
     if matches!(
         schema_version,
-        STAGING_CHECKPOINT_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        STAGING_CHECKPOINT_SCHEMA_VERSION | CHUNK_STAGING_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
             connection,
@@ -7661,12 +7715,20 @@ fn validate_existing_schema(
             staging_checkpoints::CREATE_TABLE,
         )?;
     }
-    if schema_version == JOURNAL_SCHEMA_VERSION {
+    if schema_version >= CHUNK_STAGING_SCHEMA_VERSION {
         validate_table_schema(
             connection,
             path,
             chunk_staging::TABLE_NAME,
             chunk_staging::CREATE_TABLE,
+        )?;
+    }
+    if schema_version == JOURNAL_SCHEMA_VERSION {
+        validate_table_schema(
+            connection,
+            path,
+            recording_chunks::TABLE_NAME,
+            recording_chunks::CREATE_TABLE,
         )?;
     }
     Ok(())
@@ -7698,6 +7760,13 @@ fn validate_table_schema(
         .take(MAX_SCHEMA_COLUMNS)
         .collect::<Result<Vec<_>, _>>()?;
     let expected_columns = match table_name {
+        recording_chunks::TABLE_NAME => vec![
+            (String::from("chunk_id"), String::from("TEXT"), 1, 1),
+            (String::from("operation_id"), String::from("TEXT"), 1, 0),
+            (String::from("slot"), String::from("INTEGER"), 1, 0),
+            (String::from("sequence"), String::from("INTEGER"), 1, 0),
+            (String::from("record"), String::from("BLOB"), 1, 0),
+        ],
         JOURNAL_TABLE_NAME | FULL_PROGRESS_TABLE_NAME => vec![
             (String::from("operation_id"), String::from("TEXT"), 1, 1),
             (String::from("sequence"), String::from("INTEGER"), 1, 0),
@@ -7891,7 +7960,9 @@ fn validate_table_schema(
         .map(|(_, _, _, origin, _)| origin.clone())
         .collect();
     origins.sort_unstable();
-    let expected_index_count = if matches!(
+    let expected_index_count = if table_name == recording_chunks::TABLE_NAME {
+        3
+    } else if matches!(
         table_name,
         recovery_reserve_binding::TABLE_NAME | ordinary_claims::TABLE_NAME
     ) {
@@ -7901,7 +7972,9 @@ fn validate_table_schema(
     } else {
         2
     };
-    let expected_origins: Vec<String> = if matches!(
+    let expected_origins: Vec<String> = if table_name == recording_chunks::TABLE_NAME {
+        vec![String::from("pk"), String::from("u"), String::from("u")]
+    } else if matches!(
         table_name,
         recovery_reserve_binding::TABLE_NAME | ordinary_claims::TABLE_NAME
     ) {
@@ -7971,6 +8044,7 @@ fn migrate_legacy_schema(
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
         connection.execute_batch(chunk_staging::CREATE_TABLE)?;
+        connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         if let Some(error) =
             migration_failure.and_then(|hook| hook(MigrationTestBoundary::BeforeCommit, connection))
@@ -8042,6 +8116,7 @@ fn migrate_previous_schema(
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
         connection.execute_batch(chunk_staging::CREATE_TABLE)?;
+        connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8106,6 +8181,7 @@ fn migrate_recovery_reserve_schema(
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
         connection.execute_batch(chunk_staging::CREATE_TABLE)?;
+        connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8173,6 +8249,7 @@ fn migrate_ordinary_claim_schema(
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
         connection.execute_batch(chunk_staging::CREATE_TABLE)?;
+        connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8235,6 +8312,7 @@ fn migrate_ordinary_claim_release_schema(
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
         connection.execute_batch(chunk_staging::CREATE_TABLE)?;
+        connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8300,6 +8378,7 @@ fn migrate_chunk_claim_schema(
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
         connection.execute_batch(chunk_staging::CREATE_TABLE)?;
+        connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8360,6 +8439,7 @@ fn migrate_staging_checkpoint_schema(
         validate_existing_schema(connection, database_path, CHUNK_CLAIM_SCHEMA_VERSION)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
         connection.execute_batch(chunk_staging::CREATE_TABLE)?;
+        connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8419,6 +8499,66 @@ fn migrate_chunk_staging_schema(
         )?;
         validate_existing_schema(connection, database_path, STAGING_CHECKPOINT_SCHEMA_VERSION)?;
         connection.execute_batch(chunk_staging::CREATE_TABLE)?;
+        connection.execute_batch(recording_chunks::CREATE_TABLE)?;
+        connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
+        validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            JOURNAL_SCHEMA_VERSION,
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn migrate_recording_chunks_schema(
+    connection: &Connection,
+    database_root: &BoundDatabaseRoot,
+    database_path: &Path,
+    database_identity: &str,
+    profile_guard: &WritableProfileGuard,
+    rollback_journal: Option<&PreexistingRollbackJournal>,
+) -> Result<(), OperationJournalStoreError> {
+    validate_migration_guards(
+        connection,
+        database_root,
+        database_path,
+        database_identity,
+        profile_guard,
+        rollback_journal,
+        CHUNK_STAGING_SCHEMA_VERSION,
+    )?;
+    connection.execute_batch("BEGIN EXCLUSIVE")?;
+    let result = (|| {
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            CHUNK_STAGING_SCHEMA_VERSION,
+        )?;
+        validate_existing_schema(connection, database_path, CHUNK_STAGING_SCHEMA_VERSION)?;
+        connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8503,7 +8643,8 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
              {ordinary_claim_release_table};
              {chunk_claim_table};
              {staging_checkpoint_table};
-             {chunk_staging_table};",
+             {chunk_staging_table};
+             {recording_chunks_table};",
             charge_table = recovery_reserve::CREATE_CHARGE_TABLE,
             transition_table = recovery_reserve::CREATE_TRANSITION_TABLE,
             binding_table = recovery_reserve_binding::CREATE_TABLE,
@@ -8512,6 +8653,7 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
             chunk_claim_table = chunk_claims::CREATE_TABLE,
             staging_checkpoint_table = staging_checkpoints::CREATE_TABLE,
             chunk_staging_table = chunk_staging::CREATE_TABLE,
+            recording_chunks_table = recording_chunks::CREATE_TABLE,
         ))
         .map(|_| ());
     match result {
@@ -8645,6 +8787,7 @@ impl From<EncodeError> for OperationJournalStoreError {
 
 #[cfg(test)]
 mod tests {
+    include!("store/recording_retention_tests.rs");
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]
@@ -13990,6 +14133,10 @@ mod tests {
                     String::from("table")
                 ),
                 (
+                    String::from(recording_chunks::TABLE_NAME),
+                    String::from("table")
+                ),
+                (
                     String::from(recovery_reserve::CHARGE_TABLE_NAME),
                     String::from("table")
                 ),
@@ -14034,7 +14181,8 @@ mod tests {
         let connection = Connection::open(&path).expect("open old schema fixture");
         connection
             .execute_batch(&format!(
-                "DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
+                "DROP TABLE {}; DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
+                recording_chunks::TABLE_NAME,
                 staging_checkpoints::TABLE_NAME,
                 chunk_staging::TABLE_NAME,
                 CHUNK_CLAIM_SCHEMA_VERSION
@@ -14075,7 +14223,8 @@ mod tests {
         let connection = Connection::open(database_path(&fixture.owner)).expect("open v8 fixture");
         connection
             .execute_batch(&format!(
-                "DROP TABLE {}; PRAGMA user_version = {};",
+                "DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
+                recording_chunks::TABLE_NAME,
                 chunk_staging::TABLE_NAME,
                 STAGING_CHECKPOINT_SCHEMA_VERSION
             ))

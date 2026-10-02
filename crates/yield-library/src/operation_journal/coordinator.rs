@@ -1470,6 +1470,8 @@ pub enum WaveformEditValidationError {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub enum UniversalCommandArgs {
+    /// Frozen finite recording; captured bytes are retained separately before dispatch.
+    Recording(super::recording_commands::RecordingProposal),
     /// Copy between two source-database endpoints.
     Copy(CopyIntentArgs),
     /// Import one external regular file into a source-database endpoint.
@@ -1506,6 +1508,7 @@ impl UniversalCommandArgs {
     /// Return the universal command kind represented by these arguments.
     pub const fn command_kind(&self) -> super::model::UniversalCommandKind {
         match self {
+            Self::Recording(_) => super::model::UniversalCommandKind::CreateFile,
             Self::Copy(_) => super::model::UniversalCommandKind::Copy,
             Self::Import(_) => super::model::UniversalCommandKind::Import,
             Self::DuplicateSame(_) => super::model::UniversalCommandKind::Duplicate,
@@ -1530,6 +1533,9 @@ impl UniversalCommandArgs {
         participants: &ParticipantSet,
     ) -> Result<(), UniversalCommandArgsValidationError> {
         match self {
+            Self::Recording(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::Recording),
             Self::Copy(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::Copy),
@@ -1582,6 +1588,9 @@ impl UniversalCommandArgs {
 /// Failure while validating a tagged V6 command argument envelope.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum UniversalCommandArgsValidationError {
+    /// Finite recording observations failed validation.
+    #[error("invalid recording command arguments: {0}")]
+    Recording(#[source] super::recording_commands::RecordingValueError),
     /// A source-to-source Copy argument failed validation.
     #[error("invalid Copy command arguments: {0}")]
     Copy(#[source] CopyIntentValidationError),

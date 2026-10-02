@@ -185,3 +185,48 @@ Implement three separately reviewable leaves under OPT-1339:
    primitives are unqualified. Test collision/symlink/relocation, cancellation barriers and reply
    loss without destructive fallback. Native device/UI and physical durability acceptance is
    scoped separately after portable source work. Keep parent and future recording UI tracking open.
+
+### Durable recording bytes (OPT-2070)
+
+Recording initial intents use V17, the frozen proposal operation UUID, and the existing
+full-capacity/work-plan derivation. The separate full-progress observation also binds that
+UUID. V1–V16 retain their prior command envelope rules. A recording Stage work unit does
+not read a microphone or reconstruct a source pin from persisted observations.
+
+The existing journal owner queues bounded encoded chunks and requires its current source
+registration, an effect pin held across persistence, a matching unreleased chunk claim,
+and the reconciled live capacity owner. Live dispatch additionally matches the actual
+stored bytes, BLAKE3 hash, output, range and live staging-root registration before issuing
+its existing one-shot chunk grant. Recovery returns up to eight immutable chunks per page;
+it cannot authorize capture, recapture microphone input, publication or physical effects.
+
+SQLite schema 10 adds immutable recording rows. Exact replay returns the existing sequence;
+conflicting identities/bytes, prefix gaps, append after a short PCM slot or after a header
+patch, and unknown chunk versions fail while retaining evidence. Global retention is capped
+at 8,192 rows and 128 MiB of encoded bytes. Lost commit acknowledgement stays unconfirmed;
+reopen recovers the original bytes. No eviction or reclamation API exists. Retained recording
+rows block clean handoff, ordinary capacity release and chunk capacity release until genuine
+retirement is implemented. Header rows are byte observations, not proof of a finalized WAV.
+
+Production admission checks the journal's actual descriptor volume against its JournalRecord
+allocation. Its conservative fixed metadata peak is 1,082,261,504 bytes: a capped 512 MiB
+SQLite database plus a full DELETE rollback journal, eight bytes per minimum 512-byte database
+page, and two 65,536-byte sector allowances. This bound requires the bundled SQLite 3.50.2
+(libsqlite3-sys 0.35.0), whose pager clamps sector size to 65,536 and journals each old page
+once with cache spilling disabled. The store enforces max_page_count for its actual page size,
+cache_spill=OFF, temp_store=MEMORY, the exact supported schema, and no temporary schema objects.
+Unknown builds or policy/schema changes fail before capture storage. This conservative bound
+is an admission input; it does not qualify physical allocation, durability or a backend.
+
+Actual Linux SQLite tests cover replay, reopen, transaction/reply faults, replacement roots,
+row exhaustion, unknown retained variants and release/handoff gates. Codec/work-plan fixtures
+use synthetic volume/claim observations and never qualify production physical reservations.
+The default physical backend remains Unsupported. Windows descriptor-capacity support is
+also missing implementation, not a deferred test.
+
+OPT-2058 still must implement the retained file-owner transport, genuine stopped/cancelled
+prefix closure and final-header/loss evidence, physical validation against that prefix,
+no-replace publication, coordinator retirement and reclamation. V17 is deliberately rejected
+by the existing V16 staging/publication checkpoint gate. Recording activation and positive
+Published results remain unavailable until these contracts work. OPT-2057 and OPT-1339 stay
+open. Native capture verification remains separately tracked by OPT-2066 and OPT-2067.

@@ -940,6 +940,10 @@ fn collect_topology(
     collected: &mut CollectedTopology,
 ) -> Result<(), WorkPlanError> {
     match args {
+        UniversalCommandArgs::Recording(command) => {
+            collected.filesystem(command.work_key().participant_id())?;
+            collect_namespace_directory(collected, command.destination().parent(), false, true)?;
+        }
         UniversalCommandArgs::Copy(command) | UniversalCommandArgs::DuplicateSame(command) => {
             collect_copy_endpoint(collected, command.source(), true, false)?;
             collect_copy_endpoint(collected, command.destination(), false, true)?;
@@ -1217,6 +1221,18 @@ fn derive_actions(
     action_spans: &mut Vec<ActionSpan>,
 ) -> Result<(), WorkPlanError> {
     match args {
+        UniversalCommandArgs::Recording(command) => {
+            let mut span = ActionSpan::default();
+            add_staged_mutation_without_source_read(
+                builder,
+                &mut span,
+                0,
+                0,
+                topology.filesystem,
+                command.destination().parent().participant_id(),
+            )?;
+            action_spans.push(span);
+        }
         UniversalCommandArgs::Copy(command) => {
             let mut span = ActionSpan::default();
             let source = required_source(topology, command.source().participant_id())?;

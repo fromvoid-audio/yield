@@ -52,6 +52,7 @@ use super::model::{
     OperationIntent, UniversalIntent,
 };
 use super::participants::ParticipantSet;
+use super::recording_commands::{RecordingCapturedChunk, RecordingProposal};
 use super::store::recovery::{
     CoordinatorRecoveryPage, RecoveryCursor, RecoveryPage, RecoveryScanError,
 };
@@ -60,8 +61,8 @@ use super::store::{
     ChunkStagingReceipt, ChunkWriteIdentity, FullProgressWriteOutcome, InitialClaimSettlementError,
     JournalCancelRequestReceipt, JournalInsertFailure, JournalInsertOutcome, JournalInsertReceipt,
     JournalInsertWriteStage, JournalRetryReceipt, OperationJournalStore,
-    OperationJournalStoreError, OrdinaryClaimReleaseReceipt, SourceReserveBindingFailure,
-    StagingCheckpointAck,
+    OperationJournalStoreError, OrdinaryClaimReleaseReceipt, RecordingChunkPage,
+    RecordingChunkReceipt, SourceReserveBindingFailure, StagingCheckpointAck,
 };
 #[cfg(all(test, target_os = "macos"))]
 use super::store::{ReleaseTestBoundary, ReleaseTestDirective};
@@ -596,6 +597,9 @@ impl PreparedAdmissionInput {
     }
 
     fn validation_operation_id(&self) -> OperationId {
+        if let UniversalCommandArgs::Recording(proposal) = &self.args {
+            return proposal.operation_id();
+        }
         let parent = self.universal_intent.parent_operation_id();
         [
             uuid::Uuid::nil(),
@@ -818,6 +822,19 @@ pub(crate) struct LiveChunkEffectSpec {
     logical_bytes: u64,
     payload_bytes: u64,
     payload_hash: [u8; 32],
+}
+
+fn recording_effect_matches(
+    proposal: &RecordingProposal,
+    captured: &RecordingCapturedChunk,
+    spec: &LiveChunkEffectSpec,
+) -> bool {
+    proposal.matches_staging_root(spec.target)
+        && captured.output_id() == spec.output.as_uuid()
+        && captured.offset() == spec.offset
+        && captured.bytes().len() as u64 == spec.logical_bytes
+        && captured.bytes().len() as u64 == spec.payload_bytes
+        && *blake3::hash(captured.bytes()).as_bytes() == spec.payload_hash
 }
 
 impl LiveChunkEffectSpec {
@@ -1471,6 +1488,10 @@ impl OwnerRuntime {
         self.store()
             .validate_for_admission()
             .map_err(OperationJournalOwnerError::from)?;
+        if let UniversalCommandArgs::Recording(proposal) = &prepared.args {
+            self.store()
+                .validate_recording_capacity_binding(proposal, &prepared.plan)?;
+        }
 
         // Re-read the durable ordinary-claim image for every request. Startup readiness is only
         // a bootstrap observation and cannot authorize a later request after new recovery rows
@@ -1545,12 +1566,16 @@ impl OwnerRuntime {
             .admit_with_live_witness(&prepared.plan, &prepared.claims, witness)
             .map_err(PreparedAdmissionError::from)?;
 
-        // This is the first operation identity allocation in the path. Everything above is
-        // read-only validation or one owner-thread provisional lease creation.
+        // Ordinary commands allocate their identity here; recording retains its frozen
+        // identity. Everything above validates or creates one provisional owner lease.
         #[cfg(test)]
         self.prepared_admission_id_allocations
             .fetch_add(1, Ordering::Relaxed);
-        let operation_id = OperationId::new();
+        let operation_id = if let UniversalCommandArgs::Recording(proposal) = &prepared.args {
+            proposal.operation_id()
+        } else {
+            OperationId::new()
+        };
         let record = prepared_record(operation_id, &prepared)?;
         let settlement = self
             .store()
@@ -1795,6 +1820,114 @@ impl OwnerRuntime {
         Ok(permit)
     }
 
+    fn retain_recording_chunk(
+        &self,
+        chunk: &RecordingCapturedChunk,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+    ) -> Result<RecordingChunkReceipt, OperationJournalOwnerError> {
+        let source = self
+            .source_registrations
+            .get(&registration.registration_id)
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: "recording source is not registered".into(),
+            })?;
+        if source.receipt != registration
+            || !matches!(source.readiness, SourceRegistrationReadiness::Registered)
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: "recording source registration is stale/draining".into(),
+            });
+        }
+        let profile = self.final_profile_guard.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: "recording profile owner is unavailable".into(),
+            }
+        })?;
+        source_pin.validate_for_issuance(&source.request, profile)?;
+        let _source_effect = source_pin.begin_effect()?;
+        let operation = self.store().get(chunk.operation_id())?.ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: "recording operation absent".into(),
+            }
+        })?;
+        let Some(UniversalCommandArgs::Recording(proposal)) = operation.universal_command_args()
+        else {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: "operation is not recording".into(),
+            });
+        };
+        chunk
+            .validate_against(proposal)
+            .map_err(|e| OperationJournalOwnerError::ChunkClaim {
+                reason: e.to_string(),
+            })?;
+        let epoch = u64::try_from(registration.lease_identity.epoch()).map_err(|_| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: "recording lease epoch invalid".into(),
+            }
+        })?;
+        let current = operation.universal_intent.as_ref().is_some_and(|intent| {
+            intent
+                .participants()
+                .descriptors()
+                .iter()
+                .filter_map(|p| p.source_fence())
+                .any(|f| {
+                    f.root_identity() == source.request.media_root().identity()
+                        && f.database_identity() == source.request.database_file_identity()
+                        && f.lease_epoch() == epoch
+                })
+        });
+        if !current {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: "recording source differs from frozen participant".into(),
+            });
+        }
+        let claim = self
+            .store()
+            .read_chunk_claim(ChunkId::from_uuid(chunk.chunk_id()).map_err(|e| {
+                OperationJournalOwnerError::ChunkClaim {
+                    reason: e.to_string(),
+                }
+            })?)?
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: "recording chunk has no admitted durable claim".into(),
+            })?;
+        if !matches!(
+            claim.state(),
+            ChunkClaimState::Claimed | ChunkClaimState::Issued
+        ) || claim.operation_id() != chunk.operation_id()
+            || claim.participant_id() != chunk.work_key().participant_id()
+            || claim.logical_offset() != chunk.offset()
+            || claim.logical_length() != chunk.bytes().len() as u64
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: "recording bytes differ from admitted chunk range".into(),
+            });
+        }
+        self.validate_chunk_operation_state(chunk.operation_id(), "recording retention")?;
+        let snapshot = self.chunk_rebuild_snapshot()?;
+        let provider = self.capacity_provider.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: "recording capacity owner unavailable".into(),
+            }
+        })?;
+        provider.validate_rebuilt_claims(&snapshot).map_err(|e| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: e.to_string(),
+            }
+        })?;
+        provider
+            .validate_recovery_state()
+            .map_err(|e| OperationJournalOwnerError::ChunkClaim {
+                reason: e.to_string(),
+            })?;
+        let receipt = self.store().retain_recording_chunk(chunk)?;
+        source_pin.validate_for_issuance(&source.request, profile)?;
+        Ok(receipt)
+    }
+
     fn issue_live_chunk_effect(
         &mut self,
         chunk_id: ChunkId,
@@ -1886,6 +2019,22 @@ impl OwnerRuntime {
                     "live chunk source or participant is absent from the operation",
                 ),
             });
+        }
+        if let Some(UniversalCommandArgs::Recording(proposal)) = operation.universal_command_args()
+        {
+            let captured = self
+                .store()
+                .get_recording_chunk(operation_id, chunk_id.as_uuid())?
+                .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                    reason: "recording bytes were not retained before dispatch".into(),
+                })?;
+            if !recording_effect_matches(proposal, &captured, &spec)
+                || captured.work_key().participant_id() != record.participant_id()
+            {
+                return Err(OperationJournalOwnerError::ChunkClaim {
+                    reason: "recording effect differs from exact durable bytes/root/output".into(),
+                });
+            }
         }
         let output_key = record.output_key().to_owned();
         let permit = self.issue_chunk(chunk_id, operation_id)?;
@@ -3328,7 +3477,12 @@ fn prepared_record(
         }
         .into());
     }
-    Ok(StoredOperationRecord::new_v16_command(
+    let construct = if matches!(prepared.args, UniversalCommandArgs::Recording(_)) {
+        StoredOperationRecord::new_v17_recording
+    } else {
+        StoredOperationRecord::new_v16_command
+    };
+    Ok(construct(
         operation_id,
         prepared.intent.clone(),
         prepared.universal_intent.clone(),
@@ -4199,6 +4353,51 @@ impl OperationJournalClient {
         })
     }
 
+    /// Retain exact captured bytes under current source ownership and an admitted chunk claim.
+    /// The returned receipt proves storage only, not a live write grant or physical completion.
+    #[allow(dead_code)] // Recording producer integration is OPT-2058.
+    pub(crate) fn retain_recording_chunk(
+        &self,
+        chunk: RecordingCapturedChunk,
+        proposal: &RecordingProposal,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+    ) -> Result<OperationJournalRequest<RecordingChunkReceipt>, OperationJournalOwnerQueueError>
+    {
+        let encoded =
+            chunk
+                .encode(proposal)
+                .map_err(|e| OperationJournalOwnerQueueError::InvalidRecord {
+                    reason: e.to_string(),
+                })?;
+        self.submit(encoded.len(), move |input, result| {
+            JournalCommand::RetainRecording {
+                operation_id: chunk.operation_id(),
+                encoded,
+                registration,
+                source_pin,
+                input,
+                result,
+            }
+        })
+    }
+    /// Recover a bounded page of actual captured bytes, never an execution grant.
+    #[allow(dead_code)] // Recording recovery consumer is OPT-2058.
+    pub(crate) fn recording_chunk_page(
+        &self,
+        operation_id: OperationId,
+        after_sequence: Option<i64>,
+    ) -> Result<OperationJournalRequest<RecordingChunkPage>, OperationJournalOwnerQueueError> {
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::RecordingRecovery {
+                operation_id,
+                after_sequence,
+                input,
+                result,
+            }
+        })
+    }
+
     fn submit<T, F>(
         &self,
         input_bytes: usize,
@@ -4534,6 +4733,20 @@ struct CapacityLedgerTestSnapshot {
 
 #[allow(dead_code)]
 enum JournalCommand {
+    RetainRecording {
+        operation_id: OperationId,
+        encoded: Vec<u8>,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+        input: InputPermit,
+        result: SyncSender<Result<RecordingChunkReceipt, OperationJournalOwnerError>>,
+    },
+    RecordingRecovery {
+        operation_id: OperationId,
+        after_sequence: Option<i64>,
+        input: InputPermit,
+        result: SyncSender<Result<RecordingChunkPage, OperationJournalOwnerError>>,
+    },
     RegisterSource {
         request: SourceAuthorityRegistrationRequest,
         input: InputPermit,
@@ -4911,6 +5124,50 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                 runtime.finalize_source_retirement(receipt, acknowledgement)
             })
         }
+        JournalCommand::RetainRecording {
+            operation_id,
+            encoded,
+            registration,
+            source_pin,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                let operation = runtime.store().get(operation_id)?.ok_or_else(|| {
+                    OperationJournalOwnerError::ChunkClaim {
+                        reason: "recording operation absent".into(),
+                    }
+                })?;
+                let Some(UniversalCommandArgs::Recording(proposal)) =
+                    operation.universal_command_args()
+                else {
+                    return Err(OperationJournalOwnerError::ChunkClaim {
+                        reason: "recording proposal absent".into(),
+                    });
+                };
+                let chunk = RecordingCapturedChunk::decode(&encoded, proposal).map_err(|e| {
+                    OperationJournalOwnerError::ChunkClaim {
+                        reason: e.to_string(),
+                    }
+                })?;
+                runtime.retain_recording_chunk(&chunk, registration, source_pin)
+            })
+        }
+        JournalCommand::RecordingRecovery {
+            operation_id,
+            after_sequence,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                runtime
+                    .store()
+                    .recording_chunk_page(operation_id, after_sequence)
+                    .map_err(OperationJournalOwnerError::from)
+            })
+        }
         JournalCommand::PersistIntent {
             encoded,
             input,
@@ -5247,6 +5504,14 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             drop(input);
             let _ = result.send(Err(error));
         }
+        JournalCommand::RetainRecording { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::RecordingRecovery { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
         JournalCommand::PersistIntent { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
@@ -5342,6 +5607,46 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recording_dispatch_binding_checks_actual_bytes_range_output_and_root() {
+        let (proposal, target) =
+            super::super::recording_commands::recording_proposal_with_root_for_test();
+        let captured = RecordingCapturedChunk::new(
+            &proposal,
+            uuid::Uuid::new_v4(),
+            super::super::recording_commands::RecordingChunkRole::Header { revision: 0 },
+            0,
+            vec![3; 68],
+        )
+        .unwrap();
+        // This pure binding fixture cannot issue a live grant or qualify physical storage.
+        let mut spec = LiveChunkEffectSpec {
+            effect_id: EffectId::new(),
+            output: OutputIdentity::from_uuid(captured.output_id()),
+            target,
+            source_fences: vec![],
+            offset: 0,
+            logical_bytes: 68,
+            payload_bytes: 68,
+            payload_hash: *blake3::hash(captured.bytes()).as_bytes(),
+        };
+        assert!(recording_effect_matches(&proposal, &captured, &spec));
+        spec.payload_hash[0] ^= 1;
+        assert!(!recording_effect_matches(&proposal, &captured, &spec));
+        spec.payload_hash = *blake3::hash(captured.bytes()).as_bytes();
+        spec.offset = 1;
+        assert!(!recording_effect_matches(&proposal, &captured, &spec));
+        spec.offset = 0;
+        spec.logical_bytes = 67;
+        assert!(!recording_effect_matches(&proposal, &captured, &spec));
+        spec.logical_bytes = 68;
+        spec.output = OutputIdentity::new();
+        assert!(!recording_effect_matches(&proposal, &captured, &spec));
+        spec.output = OutputIdentity::from_uuid(captured.output_id());
+        spec.target = RootRegistrationRef::synthetic_for_test();
+        assert!(!recording_effect_matches(&proposal, &captured, &spec));
+    }
+
     use super::*;
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
     #[cfg(target_os = "macos")]

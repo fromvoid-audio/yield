@@ -2,7 +2,7 @@
 //!
 //! This codec does not persist records, authorize dispatch or qualify publication. The journal
 //! owner/store bridge must retain these actual bytes before issuing any live chunk grant.
-use super::codec::{parse_unique_value, validate_json_depth};
+use super::codec::{CappedWriter, parse_unique_value, validate_json_depth};
 use super::coordinator::StoredRelativePath;
 use super::model::OperationId;
 use super::namespace_commands::{CreateFolderIntentArgs, NamespaceTarget};
@@ -24,9 +24,21 @@ pub const MAX_RECORDING_PCM_CHUNKS: u32 = 8192 - MAX_RECORDING_HEADER_CHUNKS;
 pub const MAX_RECORDING_HEADER_CHUNKS: u32 = 16;
 /// Encoded chunk bound includes worst-case JSON byte arrays and the frozen context.
 pub const MAX_RECORDING_VALUE_BYTES: usize = 128 * 1024;
+/// Hard logical database cap while a recording retention transaction enters SQLite.
+pub const MAX_RECORDING_JOURNAL_DATABASE_BYTES: u64 = 512 * 1024 * 1024;
+/// Global retained encoded capture budget; exhaustion retains existing prefixes.
+pub const MAX_RECORDING_RETAINED_ENCODED_BYTES: u64 = 128 * 1024 * 1024;
+/// Conservative complete database plus DELETE rollback-journal peak for bundled SQLite 3.50.2.
+/// With cache spill disabled, no savepoints/triggers/extensions and MEMORY temp storage, the
+/// old-page journal has at most one record per old page (8 bytes plus page bytes). SQLite's
+/// sector-size clamp is 65536; two sectors cover the header/alignment allowance. Existing
+/// database allocation is deliberately counted again rather than credited as free capacity.
+pub const RECORDING_JOURNAL_PEAK_BYTES: u64 = MAX_RECORDING_JOURNAL_DATABASE_BYTES * 2
+    + (MAX_RECORDING_JOURNAL_DATABASE_BYTES / 512) * 8
+    + 2 * 65536;
 
 /// Rejected untrusted observations. No positive filesystem outcome is encoded by this API.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("invalid recording observation: {0}")]
 pub struct RecordingValueError(String);
 fn invalid(detail: impl ToString) -> RecordingValueError {
@@ -110,7 +122,7 @@ impl RecordingFormat {
     fn frame_bytes(self) -> u64 {
         u64::from(self.channels) * 4
     }
-    fn pcm_chunk_bytes(self) -> u64 {
+    pub(crate) fn pcm_chunk_bytes(self) -> u64 {
         MAX_RECORDING_CHUNK_BYTES as u64 / self.frame_bytes() * self.frame_bytes()
     }
     /// Number of complete-frame PCM slots in the frozen maximum graph.
@@ -228,7 +240,35 @@ impl RecordingProposal {
                 return Err(invalid("staging aliases final target"));
             }
         }
-        self.format.validate()
+        self.format.validate()?;
+        encode_value(self).map(|_| ())
+    }
+    /// Validate this frozen inventory against the enclosing initial-intent participants.
+    pub fn validate_against_participants(
+        &self,
+        participants: &ParticipantSet,
+    ) -> Result<(), RecordingValueError> {
+        self.validate()?;
+        if self.participants() != participants {
+            return Err(invalid("recording participant inventory mismatch"));
+        }
+        Ok(())
+    }
+    pub(crate) fn participants(&self) -> &ParticipantSet {
+        &self.participants
+    }
+    pub(crate) fn work_key(&self) -> WorkUnitKey {
+        self.work_key
+    }
+    pub(crate) fn destination(&self) -> &NamespaceTarget {
+        &self.destination
+    }
+    pub(crate) fn retained_metadata_bound(&self) -> Result<u64, RecordingValueError> {
+        // SQLite page/rollback growth still requires enforced journal metadata admission;
+        // this is only the exact finite maximum encoded payload inventory.
+        u64::from(self.format.pcm_slots()? + MAX_RECORDING_HEADER_CHUNKS)
+            .checked_mul(MAX_RECORDING_VALUE_BYTES as u64)
+            .ok_or_else(|| invalid("retained metadata inventory overflow"))
     }
     /// Encode a bounded proposal; caller must persist it through the actual journal owner.
     pub fn encode(&self) -> Result<Vec<u8>, RecordingValueError> {
@@ -240,6 +280,9 @@ impl RecordingProposal {
         let value: Self = decode_value(bytes)?;
         value.validate()?;
         Ok(value)
+    }
+    pub(crate) fn matches_staging_root(&self, root: RootRegistrationRef) -> bool {
+        self.staging_root == RecordingRootObservation::from(root)
     }
     /// Frozen stable operation identity.
     pub fn operation_id(&self) -> OperationId {
@@ -390,17 +433,33 @@ impl RecordingCapturedChunk {
             Err(invalid("conflicting immutable captured chunk replay"))
         }
     }
+    pub(crate) fn output_id(&self) -> Uuid {
+        self.output_id
+    }
+    pub(crate) fn work_key(&self) -> WorkUnitKey {
+        self.work_key
+    }
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
+    }
+    pub(crate) fn chunk_id(&self) -> Uuid {
+        self.chunk_id
+    }
+    pub(crate) fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+    pub(crate) fn role(&self) -> RecordingChunkRole {
+        self.role
+    }
     /// Exact recorded bytes for a later admitted adapter; borrowing confers no dispatch grant.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 }
 fn encode_value(value: &impl Serialize) -> Result<Vec<u8>, RecordingValueError> {
-    let bytes = serde_json::to_vec(value).map_err(invalid)?;
-    if bytes.len() > MAX_RECORDING_VALUE_BYTES {
-        return Err(invalid("encoded value exceeds bound"));
-    }
-    Ok(bytes)
+    let mut writer = CappedWriter::new(MAX_RECORDING_VALUE_BYTES);
+    serde_json::to_writer(&mut writer, value).map_err(invalid)?;
+    Ok(writer.finish())
 }
 fn decode_value<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, RecordingValueError> {
     if bytes.len() > MAX_RECORDING_VALUE_BYTES {
@@ -412,3 +471,13 @@ fn decode_value<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Recor
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn recording_proposal_for_test(channels: u16, frames: u64) -> RecordingProposal {
+    tests::proposal(channels, frames)
+}
+
+#[cfg(test)]
+pub(super) fn recording_proposal_with_root_for_test() -> (RecordingProposal, RootRegistrationRef) {
+    tests::proposal_with_root(2, 100)
+}
