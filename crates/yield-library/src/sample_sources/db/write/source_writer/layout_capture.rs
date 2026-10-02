@@ -176,6 +176,20 @@ fn hash_field(hash: &mut blake3::Hasher, bytes: &[u8]) {
     hash.update(&(bytes.len() as u64).to_le_bytes());
     hash.update(bytes);
 }
+pub(super) fn layout_input_hasher(scope: [&[u8]; 4], count: usize) -> blake3::Hasher {
+    let mut hash = blake3::Hasher::new();
+    for field in [
+        b"yield-source-layout-input-v1".as_slice(),
+        SOURCE_LAYOUT_ALGORITHM_V1.as_bytes(),
+    ]
+    .into_iter()
+    .chain(scope)
+    {
+        hash_field(&mut hash, field);
+    }
+    hash_field(&mut hash, &(count as u64).to_le_bytes());
+    hash
+}
 fn sql_error(
     error: rusqlite::Error,
     cancel: &AtomicBool,
@@ -250,18 +264,15 @@ impl SourceWriter {
                 + 256,
         )?;
         let mut features = Vec::with_capacity(MAX_ROWS);
-        let mut hash = blake3::Hasher::new();
-        for field in [
-            b"yield-source-layout-input-v1".as_slice(),
-            SOURCE_LAYOUT_ALGORITHM_V1.as_bytes(),
-            expected.source_id().as_str().as_bytes(),
-            expected.root_identity().as_bytes(),
-            expected.root_binding_identity().as_bytes(),
-            expected.database_identity().as_bytes(),
-        ] {
-            hash_field(&mut hash, field);
-        }
-        hash_field(&mut hash, &(manifest.len() as u64).to_le_bytes());
+        let mut hash = layout_input_hasher(
+            [
+                expected.source_id().as_str().as_bytes(),
+                expected.root_identity().as_bytes(),
+                expected.root_binding_identity().as_bytes(),
+                expected.database_identity().as_bytes(),
+            ],
+            manifest.len(),
+        );
         for row in manifest {
             checkpoint(cancel, deadline)?;
             if !Path::new(&row.path)
