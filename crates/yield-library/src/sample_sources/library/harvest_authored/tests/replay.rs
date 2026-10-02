@@ -8,7 +8,14 @@ fn harvest_authored_owner_all_states_reset_and_preserve_note_and_discovery() {
         HarvestState::Done,
         HarvestState::Ignored,
     ] {
-        let r = f.apply(f.request(state)).unwrap();
+        let revision = f.global().observed_mutation_revision_for_test();
+        let request = f.request(state);
+        assert_eq!(f.global().observed_mutation_revision_for_test(), revision);
+        let r = f.apply(request).unwrap();
+        assert_eq!(
+            f.global().observed_mutation_revision_for_test(),
+            revision + 1
+        );
         assert_eq!(
             r.receipt().disposition(),
             HarvestAuthoredDisposition::Applied

@@ -48,6 +48,7 @@ use dispatch_metrics::QueuedCommand;
 mod admission_metrics;
 pub use admission_metrics::GlobalAdmissionMetricsSnapshot;
 
+mod mutation_fence;
 mod preparation;
 pub use preparation::{
     GLOBAL_PREPARATION_MAX_BYTES, GLOBAL_PREPARATION_MAX_DATABASES,
@@ -654,6 +655,8 @@ struct OwnerHooks {
     post_command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     #[cfg(test)]
     database_hook: Option<DatabaseHook>,
+    #[cfg(test)]
+    mutation_revision_seed: Option<u64>,
 }
 
 /// Profile-owned asynchronous writer for `library.db`.
@@ -689,6 +692,29 @@ pub struct ProfileTagVocabularyClient {
 }
 
 impl GlobalLibraryWriter {
+    #[cfg(test)]
+    pub(crate) fn observed_mutation_revision_for_test(&self) -> u64 {
+        let request = GlobalPreparationRequest::new(
+            self.preparation_owner(),
+            [0; 32],
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            1,
+            128,
+        )
+        .unwrap();
+        let held = self
+            .submit_preparation(request)
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let revision = held.observation().mutation_revision();
+        held.abort()
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        revision
+    }
     /// Observe this handle's acquisition before forming a delayed proposal. Not authority.
     pub fn acquisition_id(&self) -> ProfileAcquisitionId {
         self.acquisition.clone()
@@ -721,6 +747,8 @@ impl GlobalLibraryWriter {
             None,
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -730,6 +758,7 @@ impl GlobalLibraryWriter {
         binding_open_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
         post_command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
         #[cfg(test)] database_hook: Option<DatabaseHook>,
+        #[cfg(test)] mutation_revision_seed: Option<u64>,
     ) -> Result<Self, GlobalLibraryWriterStartError> {
         let preparation_owner =
             GlobalPreparationOwner::new(ProfileAcquisitionId::from_guard(profile_guard));
@@ -770,6 +799,8 @@ impl GlobalLibraryWriter {
                         post_command_gate,
                         #[cfg(test)]
                         database_hook,
+                        #[cfg(test)]
+                        mutation_revision_seed,
                     },
                     worker_admission_gate,
                 );
@@ -796,8 +827,15 @@ impl GlobalLibraryWriter {
         profile_guard: &WritableProfileGuard,
     ) -> (Self, Arc<std::sync::Barrier>) {
         let gate = Arc::new(std::sync::Barrier::new(2));
-        let writer = Self::start_inner(profile_guard, Some(Arc::clone(&gate)), None, None, None)
-            .expect("writer start");
+        let writer = Self::start_inner(
+            profile_guard,
+            Some(Arc::clone(&gate)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("writer start");
         (writer, gate)
     }
 
@@ -811,6 +849,7 @@ impl GlobalLibraryWriter {
             profile_guard,
             None,
             Some((Arc::clone(&ready), Arc::clone(&release))),
+            None,
             None,
             None,
         )
@@ -830,6 +869,7 @@ impl GlobalLibraryWriter {
             None,
             Some((Arc::clone(&ready), Arc::clone(&release))),
             None,
+            None,
         )
         .expect("writer start");
         (writer, ready, release)
@@ -841,7 +881,14 @@ impl GlobalLibraryWriter {
         hook: DatabaseHook,
         post_command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     ) -> Result<Self, GlobalLibraryWriterStartError> {
-        Self::start_inner(profile_guard, None, None, post_command_gate, Some(hook))
+        Self::start_inner(
+            profile_guard,
+            None,
+            None,
+            post_command_gate,
+            Some(hook),
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -1510,6 +1557,11 @@ fn run_owner(
         std::sync::atomic::Ordering::Acquire,
     );
 
+    let mut mutation_fence = mutation_fence::MutationFence::new();
+    #[cfg(test)]
+    if let Some(seed) = hooks.mutation_revision_seed {
+        mutation_fence = mutation_fence::MutationFence::from_test_seed(seed);
+    }
     let mut snapshot_fences = SnapshotFences::default();
     let mut harvest_generation = harvest_facts::Generation::new();
     loop {
@@ -1549,6 +1601,7 @@ fn run_owner(
                     &profile_guard,
                     &lifecycle,
                     hooks.preparation_registration,
+                    &mutation_fence,
                 ) {
                     let _admission = admission_gate.lock().unwrap_or_else(|p| p.into_inner());
                     *unavailable.lock().unwrap_or_else(|p| p.into_inner()) =
@@ -1573,6 +1626,11 @@ fn run_owner(
             }
             command => command,
         };
+
+        if mutation_fence::potentially_mutates(&command) && mutation_fence.advance().is_err() {
+            send_command_error(command, LibraryError::GlobalMutationFenceExhausted);
+            continue;
+        }
 
         // Invalidate weak read results before a write attempt, including a failed/replayed
         // attempt. Only this actual retained worker owns a strong publication generation.

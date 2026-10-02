@@ -9,6 +9,9 @@ use super::tag_vocabulary::ProfileTagVocabularyInputError;
 /// Errors returned when operating on the library database.
 #[derive(Debug, Error)]
 pub enum LibraryError {
+    /// This worker exhausted its checked registration-local mutation fence before effects.
+    #[error("global mutation fence exhausted; reacquire the global worker")]
+    GlobalMutationFenceExhausted,
     /// Actual global facts query exceeded its SQLite VM/deadline budget.
     #[error("Harvest facts query work exhausted; reduce request or audit schema")]
     HarvestFactsQueryBudget,

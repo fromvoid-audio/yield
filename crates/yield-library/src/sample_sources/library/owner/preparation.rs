@@ -22,6 +22,12 @@ pub enum GlobalPreparationError {
     /// The full handshake exceeds a protocol bound.
     #[error("preparation input exceeds fixed bounds")]
     InputBound,
+    /// An intervening mutating dispatch invalidated the observed registration-local fence.
+    #[error("global preparation mutation fence changed")]
+    StaleMutationFence,
+    /// The checked counter cannot advance for a subsequent effect.
+    #[error("global preparation mutation fence exhausted")]
+    MutationFenceExhausted,
     /// Queue wait/acquisition consumed the original deadline.
     #[error("preparation deadline elapsed")]
     Deadline,
@@ -82,8 +88,28 @@ pub struct GlobalPreparationRequest {
     owner: GlobalPreparationOwner,
     command_digest: [u8; 32],
     deadline: Instant,
+    expected_mutation_revision: Option<u64>,
 }
 impl GlobalPreparationRequest {
+    /// Form a delayed preparation from an actual historical observation. This comparison
+    /// conveys no authority: the current owner and held transaction must validate it again.
+    pub fn from_observation(
+        observation: &GlobalPreparationObservation,
+        command_digest: [u8; 32],
+        deadline: Instant,
+        affected_databases: usize,
+        handshake_bytes: usize,
+    ) -> Result<Self, GlobalPreparationError> {
+        let mut request = Self::new(
+            observation.owner.clone(),
+            command_digest,
+            deadline,
+            affected_databases,
+            handshake_bytes,
+        )?;
+        request.expected_mutation_revision = Some(observation.mutation_revision);
+        Ok(request)
+    }
     /// Use the coordinator's original deadline; never restart it on delayed submission.
     pub fn new(
         owner: GlobalPreparationOwner,
@@ -107,6 +133,7 @@ impl GlobalPreparationRequest {
             owner,
             command_digest,
             deadline,
+            expected_mutation_revision: None,
         })
     }
 }
@@ -119,8 +146,14 @@ pub struct GlobalPreparationObservation {
     command_digest: [u8; 32],
     nonce: uuid::Uuid,
     wal_bytes: u64,
+    mutation_revision: u64,
 }
 impl GlobalPreparationObservation {
+    /// Checked mutation dispatch revision within this exact worker registration.
+    /// It is neither a durable database revision nor a capacity/commit permission.
+    pub fn mutation_revision(&self) -> u64 {
+        self.mutation_revision
+    }
     /// Profile acquisition actually validated by the issuing worker.
     pub fn acquisition(&self) -> &ProfileAcquisitionId {
         self.owner.acquisition()
@@ -301,6 +334,7 @@ pub(super) fn run(
     guard: &WritableProfileGuard,
     lifecycle: &std::sync::atomic::AtomicU8,
     registration: uuid::Uuid,
+    mutation_fence: &mutation_fence::MutationFence,
 ) -> bool {
     let mut began = false;
     let preparation = (|| {
@@ -310,6 +344,8 @@ pub(super) fn run(
         {
             return Err(GlobalPreparationError::StaleOwner);
         }
+        mutation_fence.validate(command.request.expected_mutation_revision)?;
+        let mutation_revision = mutation_fence.current();
         database
             .validate_profile_guard(guard)
             .map_err(|_| GlobalPreparationError::StaleOwner)?;
@@ -353,6 +389,7 @@ pub(super) fn run(
         let wal_bytes =
             crate::sqlite_wal::enforce_wal_admission(&database.connection)?.observed_bytes();
         canceled(&command, lifecycle)?;
+        mutation_fence.validate(Some(mutation_revision))?;
         let (control, controls) = mpsc::sync_channel(1);
         let (released, release_rx) = mpsc::sync_channel(1);
         let reservation = GlobalPreparationReservation {
@@ -362,6 +399,7 @@ pub(super) fn run(
                 command_digest: command.request.command_digest,
                 nonce: uuid::Uuid::new_v4(),
                 wal_bytes,
+                mutation_revision,
             },
             canceled: Arc::clone(&command.canceled),
             control,
@@ -374,6 +412,9 @@ pub(super) fn run(
         // remains alive, and actual owner/path/native binding is rechecked cooperatively.
         let outcome = loop {
             if let Err(error) = canceled(&command, lifecycle) {
+                break error;
+            }
+            if let Err(error) = mutation_fence.validate(Some(mutation_revision)) {
                 break error;
             }
             if let Err(error) = validate(database, guard, &file) {
