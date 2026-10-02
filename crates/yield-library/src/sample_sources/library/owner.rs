@@ -1362,6 +1362,11 @@ mod tests {
         use super::*;
         include!("operation_link_owner_tests.rs");
     }
+    mod global_replay_contract {
+        use super::*;
+        include!("global_replay_contract_tests.rs");
+    }
+
     mod registry_participant_tests {
         use super::*;
         include!("registry_participant_owner_tests.rs");
