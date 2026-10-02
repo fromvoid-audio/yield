@@ -50,3 +50,32 @@ processes so optional extension tests cannot erase or race the production
 process-wide safety fact. Test output is checked to ensure the child executed
 one real fixture. These Linux tests do not qualify native physical capacity,
 filesystem durability or an implemented tag delta/receipt.
+
+The runtime configuration prerequisite OPT2084 adds
+`SourceWriter::begin_tag_metadata_policy`. It consumes no capacity authority;
+OPT2049 must obtain genuine admission before entering its actual participant.
+The returned guard holds the process extension boundary and reads back the
+issued page limit, memory-only temporary store, disabled spill and disabled
+auto-checkpoint. Its explicit `validate_entered` also checks current retained
+profile/root/database/lease authority and compiled schema. Source mutation
+admission validates leases without separate control-writer renewal while the
+policy is entered. An expiring lease must therefore reject, not silently renew
+outside the modeled SQLite transaction.
+
+`finish` restores exact original settings after SQLite reports transaction
+quiescence. Drop follows the same checked restoration. A live transaction,
+unknown schema or failed restoration preserves poisoned state with the actual
+SourceDatabase connection across ownership handoff; new owned mutation
+admission rejects until real close/reopen. Best-effort query_only further fences
+raw SQLite writes. A policy error after a future tag commit must retain that
+command's immutable identity/outcome evidence, not report successful completion.
+This configuration guard still implements no tag delta, receipt or capacity claim.
+
+Pre-admission schema/runtime images use bounded reads without SQL ORDER BY;
+canonical sorting happens only after the owned vector passes its byte/row cap.
+This avoids introducing SQLite temporary-sort disk writes while merely
+observing a prospective allocation plan.
+An optional extension loader request fails fast while a metadata scope holds
+the process gate, including on the same owner thread. That refusal executes no
+initialization and does not taint the bound; an initialization actually started
+after release still makes subsequent allocation observations unknown.

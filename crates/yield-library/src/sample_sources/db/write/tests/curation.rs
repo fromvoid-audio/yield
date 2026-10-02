@@ -4364,3 +4364,6 @@ mod wal_admission;
 
 #[path = "curation/tag_metadata_budget.rs"]
 mod tag_metadata_budget;
+
+#[path = "curation/tag_metadata_policy.rs"]
+mod tag_metadata_policy;

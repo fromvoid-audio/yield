@@ -66,6 +66,11 @@ impl SourceWriter {
         &self,
         expected: &SourceRevision,
     ) -> Result<SourceTagMetadataBudget, SourceWriterError> {
+        if self.database.tag_metadata_policy_state.get()
+            != crate::sample_sources::db::TAG_METADATA_POLICY_IDLE
+        {
+            return Err(unknown());
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         let _progress = SnapshotProgressGuard::install(&self.database.connection, deadline);
         let _extensions =

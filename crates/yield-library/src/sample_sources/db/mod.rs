@@ -132,8 +132,9 @@ pub use write::{
     SourceCurationCommitReceipt, SourceCurationUpdate, SourceDirectoryTruthCommitResult,
     SourceFileWrite, SourceIndexCommitResult, SourceRevision, SourceScanFence, SourceSnapshotOwner,
     SourceSnapshotPage, SourceTagAssignmentMutation, SourceTagAssignmentSelection,
-    SourceTagMetadataBudget, SourceTagWrite, SourceWriteCommand, SourceWriter,
-    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
+    SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceTagWrite, SourceWriteCommand,
+    SourceWriter, SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt,
+    SourceWriterRequest,
 };
 
 /// Hidden filename used for per-source databases.
@@ -520,10 +521,16 @@ impl<'a> ReadinessOwnership<'a> {
     }
 }
 
+pub(super) const TAG_METADATA_POLICY_IDLE: u8 = 0;
+pub(super) const TAG_METADATA_POLICY_ENTERED: u8 = 1;
+pub(super) const TAG_METADATA_POLICY_POISONED: u8 = 2;
+
 /// SQLite wrapper that stores wav metadata for a single source folder.
 pub struct SourceDatabase {
     /// Declared first so the ordinary SQLite connection closes before lease release.
     connection: Connection,
+    // Retained with this connection through SourceWriter/catalog ownership handoffs.
+    tag_metadata_policy_state: std::cell::Cell<u8>,
     db_path: PathBuf,
     root: PathBuf,
     index_page_binding: Arc<()>,
@@ -1142,6 +1149,9 @@ impl SourceDatabase {
     }
 
     pub(crate) fn validate_profile_owned_mutation(&self) -> Result<(), SourceDbError> {
+        if self.tag_metadata_policy_state.get() == TAG_METADATA_POLICY_POISONED {
+            return Err(SourceDbError::MetadataPolicyUnconfirmed);
+        }
         match (&self.profile_guard, &self.database_root_binding) {
             (Some(profile_guard), Some(_)) => {
                 self.validate_profile_guard(profile_guard)?;
@@ -1151,9 +1161,21 @@ impl SourceDatabase {
                             .validate(&self.connection)
                             .map_err(map_database_identity_error)?;
                         match self.source_lease.as_deref() {
-                            Some(source_lease) => source_lease
-                                .prepare_for_mutation(&self.connection)
-                                .map_err(SourceDbError::from),
+                            Some(source_lease) => {
+                                // Entered metadata policy covers this SQLite connection only.
+                                // Do not renew through the separate control writer in this scope.
+                                if self.tag_metadata_policy_state.get()
+                                    == TAG_METADATA_POLICY_ENTERED
+                                {
+                                    source_lease
+                                        .validate_current(&self.connection)
+                                        .map_err(SourceDbError::from)
+                                } else {
+                                    source_lease
+                                        .prepare_for_mutation(&self.connection)
+                                        .map_err(SourceDbError::from)
+                                }
+                            }
                             None => {
                                 #[cfg(any(test, feature = "test-support"))]
                                 {

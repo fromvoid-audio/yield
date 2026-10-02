@@ -21,8 +21,10 @@ pub(super) fn try_extension_free_scope() -> Option<std::sync::RwLockReadGuard<'s
 
 /// Enable SQLite extension loading, load one extension, and disable loading.
 pub(super) fn load_extension(conn: &Connection, path: &Path) -> Result<(), rusqlite::Error> {
+    // Optional initialization must fail fast while metadata scopes hold the gate, including
+    // a same-thread caller. No callback has run yet, so this rejection does not taint the bound.
     let _extension_gate = EXTENSION_GATE
-        .write()
+        .try_write()
         .map_err(|_| rusqlite::Error::InvalidQuery)?;
     EXTENSION_LOAD_ATTEMPTED.store(true, std::sync::atomic::Ordering::Release);
     unsafe {
