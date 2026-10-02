@@ -140,7 +140,8 @@ class PublisherIdentity(unittest.TestCase):
         (case / "release-log.md").write_text(f"# Yield {self.versions[channel]}\n\nControlled local fixture.\n")
         return case
 
-    def run_publisher(self, case, server, channel="stable", number="44", version=None, build_id=None):
+    def run_publisher(self, case, server, channel="stable", number="44", version=None, build_id=None,
+                      extra_env=None):
         version = version or self.versions[channel]
         result = subprocess.run(["bash", str(SCRIPT), "--channel", channel,
             "--build-id", build_id or f"yield-{version}", "--build-number", number,
@@ -151,7 +152,7 @@ class PublisherIdentity(unittest.TestCase):
                  "PORTALSURFER_RELEASE_UPLOAD_URL": server.url, "GITHUB_SHA": "f" * 40,
                  "GITHUB_STEP_SUMMARY": str(case / "summary.md"), "NO_PROXY": "127.0.0.1",
                  "no_proxy": "127.0.0.1", "PORTALSURFER_RELEASE_CONNECT_TIMEOUT_SECONDS": "1",
-                 "PORTALSURFER_RELEASE_MAX_TIME_SECONDS": "3"},
+                 "PORTALSURFER_RELEASE_MAX_TIME_SECONDS": "3", **(extra_env or {})},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
         return result
 
@@ -273,6 +274,26 @@ class PublisherIdentity(unittest.TestCase):
                 self.assertIn("curl: (63)", result.stderr,
                               "transport must cap unknown-length bytes before JSON parsing")
                 self.assertIsNone(server.body, "oversized transfer must never reach commit")
+
+    def test_unsupported_curl_cannot_start_publication(self):
+        real_curl = shutil.which("curl")
+        self.assertIsNotNone(real_curl)
+        for reported in ("curl 8.3.0 fixture", "curl 7.88.1 fixture", "unrecognized version"):
+            with self.subTest(reported=reported):
+                case, server = self.artifacts(), self.server()
+                commands = case / "bin"
+                commands.mkdir()
+                wrapper = commands / "curl"
+                wrapper.write_text(
+                    "#!/usr/bin/env python3\nimport os, sys\n"
+                    f"if sys.argv[1:] == ['--version']:\n    print({reported!r})\n"
+                    f"else:\n    os.execv({real_curl!r}, [{real_curl!r}] + sys.argv[1:])\n")
+                wrapper.chmod(0o700)
+                result = self.run_publisher(case, server,
+                    extra_env={"PATH": str(commands) + os.pathsep + os.environ["PATH"]})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("curl 8.4.0 or newer", result.stderr)
+                self.assertEqual(server.requests, [], "unsupported transport must reject before PUT")
 
     def test_nightly_abbreviated_build_id_uses_full_manifest_identity(self):
         case, server = self.artifacts("nightly"), self.server()

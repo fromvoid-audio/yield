@@ -41,6 +41,8 @@ at most 16. Every publisher metadata GET/PUT, including pre-commit catalog and h
 changelog downloads, uses the existing finite curl connect/total deadlines and retry
 policy. The assembler receives bounded local files in this path; it performs no
 additional network requests. Its standalone URL/local metadata reader also caps bytes.
+Curl 8.4.0 or newer is required before publication begins: older versions cannot
+enforce `--max-filesize` during an unknown-length transfer.
 A failing response after PUT may mean staged or committed server data exists; the
 publisher reports failure and does not assert rollback or remove remote evidence.
 An old server that omits these fields cannot produce successful publication.

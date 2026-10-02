@@ -92,6 +92,12 @@ if [[ ! -s "$RELEASE_LOG" ]]; then
   exit 1
 fi
 
+# Earlier curl only caps responses whose size is advertised before transfer.
+if ! curl --version | python3 -c 'import re, sys; match = re.match(r"curl ([0-9]+)\.([0-9]+)\.([0-9]+)(?:\s|$)", sys.stdin.readline(1024)); sys.exit(0 if match and tuple(map(int, match.groups())) >= (8, 4, 0) else 1)'; then
+  echo "curl 8.4.0 or newer is required to bound unknown-length responses." >&2
+  exit 1
+fi
+
 PORTALSURFER_RELEASE_CONNECT_TIMEOUT_SECONDS="${PORTALSURFER_RELEASE_CONNECT_TIMEOUT_SECONDS:-10}"
 PORTALSURFER_RELEASE_MAX_TIME_SECONDS="${PORTALSURFER_RELEASE_MAX_TIME_SECONDS:-300}"
 for timeout_value in "$PORTALSURFER_RELEASE_CONNECT_TIMEOUT_SECONDS" "$PORTALSURFER_RELEASE_MAX_TIME_SECONDS"; do
