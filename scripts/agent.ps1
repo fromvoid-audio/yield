@@ -49,3 +49,5 @@ if ($scriptName.EndsWith(".sh")) {
 } else {
   & $psExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "internal/agent/$scriptName") @Arguments
 }
+
+exit $LASTEXITCODE

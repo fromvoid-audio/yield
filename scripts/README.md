@@ -2,8 +2,8 @@
 
 For the active GPUI fork, use `scripts/gpui-local-ci.sh` on macOS and
 `scripts/install-gpui-local-ci.sh` for its automatic commit hook; see
-[GPUI local CI](../docs/GPUI_LOCAL_CI.md). Windows and Linux GPUI validation
-are deferred until the macOS release-ready gate OPT-1863 is complete.
+[GPUI local CI](../docs/GPUI_LOCAL_CI.md). Windows and Linux native release qualification
+is deferred until the macOS release-ready gate OPT-1863 is complete.
 The older `scripts/ci.sh` lanes below still target the legacy Radiant app and
 are not GPUI acceptance gates.
 
@@ -16,11 +16,24 @@ executor was qualified with cargo-nextest 0.9.114. Nextest validates stale binar
 selection in a disposable minimal crate, without compiling archived app tests.
 Install it with `cargo install cargo-nextest --version 0.9.114 --locked`.
 
-`scripts/agent.sh preflight` remains the archived Radiant agent contract. Its
-Radiant resolver and old app/readiness guard scopes are not the active GPUI
-preflight. They are retained for their historical lane, not reported as passing
-or skipped GPUI checks. Portable GPUI preflight does not certify native runtime,
-Metal, Finder or release acceptance; those require the macOS lane above.
+`scripts/agent.sh checks` and `preflight` now run active-workflow toolchain pinning
+and this same GPUI workspace preflight. All `.yml.disabled` workflows are deliberately
+inactive; their presence is not a successful CI run. The archived monolith readiness,
+app-core and Radiant resolver guards are no longer mandatory agent checks. Older
+`scripts/ci.sh` lanes remain historical tools, not GPUI acceptance.
+
+`preflight` coalesces only the same worktree, branch, HEAD, tracked/untracked bytes,
+executable modes, check command and relevant Rust build environment. Changed inputs
+during checks fail and require a rerun. Different worktrees never share success even
+with an explicitly shared state directory. This fingerprint coordinates checks; it
+is not a filesystem snapshot lock. Use isolated worktrees and keep inputs stable.
+An explicit state directory must be outside checked inputs (or ignored by Git).
+PowerShell agent wrappers forward to the same Bash runners (Git Bash, Python 3
+and the existing Rust/tool dependencies required on Windows), preserving exit status.
+Windows wrapper execution remains native verification, not a qualification claim.
+`request` runs preflight by default; `--quick-ci` adds the documented portable test
+subset, and `--full-ci` explicitly requests the native macOS lane. Portable checks
+do not certify native runtime, Metal, Finder or release acceptance.
 
 For a reproducible CPU waveform baseline (OPT-1713), use Python 3 on Linux or
 macOS in a clean checkout with the repository's Rust toolchain:

@@ -64,9 +64,11 @@ timeouts, exit behavior, and injected-leak classification, is available with:
 ## Agent preflight and Git hooks
 
 `scripts/agent.sh preflight` / `scripts/agent.sh request` and their PowerShell
-equivalents own the full agent preflight, including Cargo-backed architecture
-checks. Concurrent full-preflight invocations for the same repository coalesce
-to one owner and report the shared result. Branch-changing `post-checkout`
+equivalents own the current portable GPUI preflight, including workspace format,
+locked application build and current source/owner/script guards. Concurrent invocations
+coalesce only for the same unchanged worktree/input image; different worktrees or
+changed inputs cannot reuse the result. `request` defaults to preflight only; explicit
+`--quick-ci` adds portable regression tests and `--full-ci` requests native macOS CI. Branch-changing `post-checkout`
 hooks deliberately run only `run_agent_hook_checks.sh`: bounded
 repository-state checks that preserve reviewed-head validation evidence during
 merge cleanup.

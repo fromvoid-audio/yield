@@ -593,6 +593,27 @@ run_expect_exit_code \
   bash \
   scripts/internal/run/test_sandbox_fixture_dispatch.sh
 
+run_expect_exit_code \
+  "workflow pinning active/disabled fixtures" \
+  0 \
+  "$ROOT_DIR" \
+  bash \
+  scripts/internal/check/test_workflow_toolchain_pinning.sh
+
+run_expect_exit_code \
+  "agent preflight input/worktree coordination fixtures" \
+  0 \
+  "$ROOT_DIR" \
+  bash \
+  scripts/internal/agent/test_agent_preflight_coordination.sh
+
+run_expect_exit_code \
+  "agent canonical workspace/failure routing fixtures" \
+  0 \
+  "$ROOT_DIR" \
+  bash \
+  scripts/internal/agent/test_agent_workspace_routing.sh
+
 if (( failures > 0 )); then
   echo "[guardrails] FAILED: $failures checks failed."
   exit 1

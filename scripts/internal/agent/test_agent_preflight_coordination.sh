@@ -34,6 +34,7 @@ REMOTE_DIR="$FIXTURE_DIR/remote.git"
 mkdir -p "$REPO_DIR/scripts/internal/agent" "$REPO_DIR/scripts/internal/check"
 cp "$ROOT_DIR/scripts/internal/agent/install_agent_preflight_hooks.sh" "$REPO_DIR/scripts/internal/agent/"
 cp "$ROOT_DIR/scripts/internal/agent/run_agent_preflight.sh" "$REPO_DIR/scripts/internal/agent/"
+cp "$ROOT_DIR/scripts/internal/agent/agent_preflight_fingerprint.py" "$REPO_DIR/scripts/internal/agent/"
 cp "$ROOT_DIR/scripts/internal/agent/run_agent_hook_checks.sh" "$REPO_DIR/scripts/internal/agent/"
 
 cat > "$REPO_DIR/scripts/internal/check/check_main_branch.sh" <<'EOF'
@@ -107,6 +108,8 @@ expect_file_count "$HOOK_COUNT" 4
 
 # Two concurrent explicit full-preflight requests coalesce to one owner.
 STATE_DIR="$FIXTURE_DIR/preflight-state"
+image_key="$(python3 "$REPO_DIR/scripts/internal/agent/agent_preflight_fingerprint.py" "$REPO_DIR" "$FAKE_FULL_CHECK")"
+IMAGE_STATE_DIR="$STATE_DIR/$image_key"
 YIELD_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" \
   YIELD_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
   YIELD_AGENT_TEST_SLEEP_SECONDS=1 \
@@ -114,12 +117,12 @@ YIELD_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" \
   "$REPO_DIR/scripts/internal/agent/run_agent_preflight.sh" >"$FIXTURE_DIR/owner.log" 2>&1 &
 owner_pid=$!
 for (( attempt = 0; attempt < 50; attempt++ )); do
-  if [[ -f "$STATE_DIR/run.lock" ]]; then
+  if [[ -f "$IMAGE_STATE_DIR/run.lock" ]]; then
     break
   fi
   sleep 0.1
 done
-if [[ ! -f "$STATE_DIR/run.lock" ]]; then
+if [[ ! -f "$IMAGE_STATE_DIR/run.lock" ]]; then
   fail "single-flight owner did not publish its lock"
 fi
 YIELD_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" \
@@ -134,14 +137,66 @@ if ! rg -q 'coalesced with active full preflight' "$FIXTURE_DIR/joiner.log"; the
 fi
 
 # A dead owner lock cannot suppress the next explicit full preflight.
-printf '999999\t%s\n' "$STATE_DIR/stale-result" > "$STATE_DIR/run.lock"
+printf '999999\t%s\n' "$IMAGE_STATE_DIR/stale-result" > "$IMAGE_STATE_DIR/run.lock"
 YIELD_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" \
   YIELD_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
   "$REPO_DIR/scripts/internal/agent/run_agent_preflight.sh" >/dev/null
 expect_file_count "$FULL_COUNT" 2
-if [[ -e "$STATE_DIR/run.lock" ]]; then
+if [[ -e "$IMAGE_STATE_DIR/run.lock" ]]; then
   fail "stale lock was not cleared"
 fi
+
+# Changed inputs cannot publish a successful result for the original image.
+READY_FILE="$FIXTURE_DIR/changed-ready"
+YIELD_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" YIELD_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
+  YIELD_AGENT_TEST_READY_FILE="$READY_FILE" YIELD_AGENT_TEST_SLEEP_SECONDS=1 \
+  "$REPO_DIR/scripts/internal/agent/run_agent_preflight.sh" >"$FIXTURE_DIR/changed.log" 2>&1 &
+changed_pid=$!
+for (( attempt = 0; attempt < 50; attempt++ )); do
+  [[ -f "$READY_FILE" ]] && break
+  sleep 0.1
+done
+[[ -f "$READY_FILE" ]] || fail "changed-input owner did not start"
+echo changed >> "$REPO_DIR/README.md"
+if wait "$changed_pid"; then fail "changed inputs incorrectly reported success"; fi
+rg -q 'inputs changed during checks' "$FIXTURE_DIR/changed.log" || fail "missing changed-input diagnostic"
+
+# Untracked content, executable mode, branch and check command affect the image.
+fingerprint() { python3 "$REPO_DIR/scripts/internal/agent/agent_preflight_fingerprint.py" "$REPO_DIR" "$FAKE_FULL_CHECK"; }
+first="$(fingerprint)"
+echo first > "$REPO_DIR/untracked.txt"
+second="$(fingerprint)"
+echo second > "$REPO_DIR/untracked.txt"
+third="$(fingerprint)"
+[[ "$first" != "$second" && "$second" != "$third" ]] || fail "untracked bytes not fenced"
+chmod +x "$REPO_DIR/untracked.txt"
+[[ "$(fingerprint)" != "$third" ]] || fail "mode not fenced"
+rm "$REPO_DIR/untracked.txt"
+current="$(fingerprint)"
+[[ "$(RUSTFLAGS=--cfg=fixture fingerprint)" != "$current" ]] || fail "Rust build environment not fenced"
+[[ "$(python3 "$REPO_DIR/scripts/internal/agent/agent_preflight_fingerprint.py" "$REPO_DIR" "$FAKE_HOOK_CHECK")" != "$current" ]] || fail "check command not fenced"
+git -C "$REPO_DIR" branch fingerprint-branch
+original_branch="$(git -C "$REPO_DIR" symbolic-ref HEAD)"
+git -C "$REPO_DIR" symbolic-ref HEAD refs/heads/fingerprint-branch
+[[ "$(fingerprint)" != "$current" ]] || fail "same-head branch change not fenced"
+git -C "$REPO_DIR" symbolic-ref HEAD "$original_branch"
+
+
+# Two linked worktrees with a shared state directory must each run checks.
+# Track the copied harness so the linked worktree has the same source files.
+YIELD_SKIP_AGENT_PREFLIGHT_HOOK=1 git -C "$REPO_DIR" add README.md scripts
+YIELD_SKIP_AGENT_PREFLIGHT_HOOK=1 git -C "$REPO_DIR" commit -m harness >/dev/null
+OTHER_REPO="$FIXTURE_DIR/linked"
+YIELD_AGENT_HOOK_CHECK_COMMAND="$FAKE_HOOK_CHECK" git -C "$REPO_DIR" worktree add -b linked "$OTHER_REPO" >/dev/null
+before_count="$(wc -l < "$FULL_COUNT" | tr -d ' ')"
+for checkout in "$REPO_DIR" "$OTHER_REPO"; do
+  YIELD_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" YIELD_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
+    YIELD_AGENT_TEST_SLEEP_SECONDS=1 "$checkout/scripts/internal/agent/run_agent_preflight.sh" >"$FIXTURE_DIR/$(basename "$checkout").log" 2>&1 &
+  if [[ "$checkout" == "$REPO_DIR" ]]; then first_pid=$!; else second_pid=$!; fi
+done
+wait "$first_pid" || fail "first worktree failed"
+wait "$second_pid" || fail "linked worktree failed"
+expect_file_count "$FULL_COUNT" "$((before_count + 2))"
 
 if (( failures > 0 )); then
   echo "[agent_preflight_test] FAILED: $failures assertion(s) failed." >&2
