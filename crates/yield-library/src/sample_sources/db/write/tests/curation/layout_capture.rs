@@ -787,3 +787,7 @@ fn layout_capture_never_omits_audio_when_persisted_classification_disagrees_with
 
 #[path = "layout_generation.rs"]
 mod layout_generation;
+
+pub(super) fn canonical_blob_budget() {
+    layout_generation::canonical_blob_budget();
+}

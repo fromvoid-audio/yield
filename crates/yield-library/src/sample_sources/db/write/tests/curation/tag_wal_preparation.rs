@@ -77,7 +77,7 @@ pub(super) fn dispatch(case: &str) {
         _ => panic!("unknown tag-owned fixture: {case}"),
     }
 }
-fn writer() -> (SourceWriter, CurationFixture, i64) {
+pub(super) fn writer() -> (SourceWriter, CurationFixture, i64) {
     let mut fixture = CurationFixture::new_profile_bound();
     let old = insert_tag(&fixture.database, "old tag", "Old Tag");
     fixture.revision = fixture
@@ -121,13 +121,13 @@ fn observe(writer: &SourceWriter) -> SourceTagAdmissionObservation {
         )
         .unwrap()
 }
-fn request() -> Instant {
+pub(super) fn request() -> Instant {
     Instant::now() + Duration::from_secs(2)
 }
-fn db(writer: &SourceWriter) -> &Connection {
+pub(super) fn db(writer: &SourceWriter) -> &Connection {
     &writer.database_for_tests().connection
 }
-fn settings(writer: &SourceWriter) -> Vec<u64> {
+pub(super) fn settings(writer: &SourceWriter) -> Vec<u64> {
     [
         "max_page_count",
         "temp_store",
@@ -142,7 +142,7 @@ fn settings(writer: &SourceWriter) -> Vec<u64> {
     })
     .to_vec()
 }
-fn external(writer: &SourceWriter) -> Connection {
+pub(super) fn external(writer: &SourceWriter) -> Connection {
     let c = Connection::open_with_flags(
         &writer.database_for_tests().db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -151,7 +151,7 @@ fn external(writer: &SourceWriter) -> Connection {
     c.busy_timeout(Duration::ZERO).unwrap();
     c
 }
-fn assert_busy(c: &Connection) {
+pub(super) fn assert_busy(c: &Connection) {
     assert_eq!(
         c.execute_batch("BEGIN IMMEDIATE")
             .unwrap_err()
@@ -159,14 +159,14 @@ fn assert_busy(c: &Connection) {
         Some(ErrorCode::DatabaseBusy)
     );
 }
-fn control_changes(writer: &SourceWriter) -> u64 {
+pub(super) fn control_changes(writer: &SourceWriter) -> u64 {
     writer
         .database_for_tests()
         .source_lease_control_total_changes_for_tests()
         .unwrap()
         .unwrap()
 }
-fn expiry(c: &Connection) -> i64 {
+pub(super) fn expiry(c: &Connection) -> i64 {
     c.query_row(
         "SELECT expires_at FROM source_lease WHERE singleton=1",
         [],
@@ -176,7 +176,7 @@ fn expiry(c: &Connection) -> i64 {
 }
 
 // Static callbacks only; SQLite executes them synchronously on the retained owner's thread.
-unsafe extern "C" fn deny(
+pub(super) unsafe extern "C" fn deny(
     _: *mut c_void,
     action: i32,
     a: *const c_char,
@@ -197,7 +197,7 @@ unsafe extern "C" fn deny(
         ffi::SQLITE_OK
     }
 }
-unsafe extern "C" fn deny_begin(
+pub(super) unsafe extern "C" fn deny_begin(
     _: *mut c_void,
     action: i32,
     a: *const c_char,
@@ -214,7 +214,7 @@ unsafe extern "C" fn deny_begin(
         ffi::SQLITE_OK
     }
 }
-unsafe extern "C" fn deny_restore(
+pub(super) unsafe extern "C" fn deny_restore(
     _: *mut c_void,
     action: i32,
     a: *const c_char,
@@ -232,7 +232,7 @@ unsafe extern "C" fn deny_restore(
         ffi::SQLITE_OK
     }
 }
-fn authorizer(
+pub(super) fn authorizer(
     handle: *mut ffi::sqlite3,
     callback: Option<
         unsafe extern "C" fn(

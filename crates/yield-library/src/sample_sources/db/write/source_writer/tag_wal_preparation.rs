@@ -1,8 +1,9 @@
 //! Owned pre-intent tag policy and empty reservation; no mutation/claim authority.
 use super::{
-    SourceRevision, SourceTagAdmissionObservation, SourceWalPreparation, SourceWalPreparationError,
-    SourceWalPreparationFailure, SourceWriter, SourceWriterError,
-    tag_metadata_policy::EnteredTagPolicy, wal_reservation,
+    SourceRevision, SourceTagAdmissionObservation, SourceWalPreparationError, SourceWriter,
+    metadata_policy_state::EnteredMetadataPolicy,
+    metadata_wal_custody::{Custody, Owner},
+    wal_reservation,
 };
 use std::{fmt, time::Instant};
 
@@ -31,120 +32,6 @@ impl fmt::Debug for SourceTagWalPreparationFailure {
         f.debug_struct("SourceTagWalPreparationFailure")
             .field("error", &self.error())
             .finish()
-    }
-}
-
-// Owner drops before the extension guard: uncertain SQL closes before lease release.
-struct Custody {
-    owner: Option<Owner>,
-    policy: Option<EnteredTagPolicy>,
-}
-enum Owner {
-    Unprepared {
-        writer: SourceWriter,
-        created_transaction: bool,
-    },
-    Held(SourceWalPreparation),
-    Failed(SourceWalPreparationFailure),
-}
-impl Custody {
-    fn writer(&self) -> &SourceWriter {
-        match self.owner.as_ref().expect("retained tag owner") {
-            Owner::Unprepared { writer, .. } => writer,
-            Owner::Held(held) => held.writer(),
-            Owner::Failed(failed) => failed.writer(),
-        }
-    }
-    fn track_created_transaction(&mut self) {
-        if let Some(Owner::Unprepared {
-            writer,
-            created_transaction,
-        }) = self.owner.as_mut()
-        {
-            *created_transaction |= !writer.database.connection.is_autocommit();
-        }
-    }
-    fn release(&mut self) -> Result<SourceWriter, SourceWalPreparationError> {
-        let owner = self.owner.take().expect("retained tag owner");
-        let writer = match owner {
-            Owner::Unprepared {
-                writer,
-                created_transaction,
-            } => {
-                // Never adopt a transaction that predates this preparation, and never
-                // return an active connection to ordinary dispatch. Retain it until close.
-                if !created_transaction && !writer.database.connection.is_autocommit() {
-                    self.owner = Some(Owner::Unprepared {
-                        writer,
-                        created_transaction,
-                    });
-                    return Err(SourceWalPreparationError::TransactionActive);
-                }
-                if created_transaction
-                    && (writer
-                        .database
-                        .connection
-                        .execute_batch("ROLLBACK")
-                        .is_err()
-                        || !writer.database.connection.is_autocommit())
-                {
-                    self.owner = Some(Owner::Unprepared {
-                        writer,
-                        created_transaction,
-                    });
-                    return Err(SourceWalPreparationError::RollbackUnconfirmed);
-                }
-                writer
-            }
-            Owner::Held(held) => match held.abort() {
-                Ok(writer) => writer,
-                Err(failed) => {
-                    self.owner = Some(Owner::Failed(failed));
-                    return Err(SourceWalPreparationError::RollbackUnconfirmed);
-                }
-            },
-            Owner::Failed(failed) => match failed.into_writer() {
-                Ok(writer) => writer,
-                Err(failed) => {
-                    self.owner = Some(Owner::Failed(failed));
-                    return Err(SourceWalPreparationError::RollbackUnconfirmed);
-                }
-            },
-        };
-        self.owner = Some(Owner::Unprepared {
-            writer,
-            created_transaction: false,
-        });
-        if self.policy.is_none()
-            && self.writer().database.tag_metadata_policy_state.get()
-                == crate::sample_sources::db::TAG_METADATA_POLICY_POISONED
-        {
-            return Err(SourceWriterError::from(
-                crate::sample_sources::db::SourceDbError::MetadataPolicyUnconfirmed,
-            )
-            .into());
-        }
-        if let Some(policy) = self.policy.as_mut() {
-            let database = match self.owner.as_ref().expect("retained tag owner") {
-                Owner::Unprepared { writer, .. } => &writer.database,
-                _ => unreachable!(),
-            };
-            policy.restore(database).map_err(SourceWriterError::from)?;
-        }
-        self.policy = None;
-        match self.owner.take().expect("retained tag owner") {
-            Owner::Unprepared { writer, .. } => Ok(writer),
-            _ => unreachable!(),
-        }
-    }
-}
-impl Drop for Custody {
-    fn drop(&mut self) {
-        if self.owner.is_some() {
-            // Failure leaves the owner inaccessible. Its connection closes before lease release;
-            // neither a failed rollback nor restoration can return it to ordinary dispatch.
-            let _ = self.release();
-        }
     }
 }
 
@@ -178,9 +65,9 @@ impl SourceWriter {
             custody
                 .writer()
                 .validate_tag_scope_in_connection(&observation, &revision, deadline)?;
-            custody.policy = Some(EnteredTagPolicy::new(
+            custody.policy = Some(EnteredMetadataPolicy::new(
                 &custody.writer().database,
-                observation.budget(),
+                observation.budget().maximum_pages(),
             )?);
             custody
                 .policy

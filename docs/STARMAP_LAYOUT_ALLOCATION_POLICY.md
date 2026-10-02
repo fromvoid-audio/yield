@@ -8,10 +8,12 @@ captured storage fact and preserves its original two-second cooperative deadline
 
 The scalar view exposes page size/count/cap, retained main DB and WAL bytes,
 retained-root SHM bytes, existing fixed-key metadata byte length/digest, the
-512 KiB generation limit and conservative disk peak. Existing text is measured,
+512 KiB generation limit and conservative disk peak. Existing bounded TEXT/BLOB bytes are measured,
 **not validated or adopted as a canonical generation**. Its semantic codec and
 exact previous-generation CAS remain OPT-2154/2155 requirements. Malformed SQL
-values, invalid UTF-8/NUL, empty or oversized evidence are retained and rejected.
+values, invalid UTF-8/NUL in TEXT, empty or oversized evidence are retained and
+rejected. BLOB observation hashes the exact bytes, including NUL/non-UTF8, without
+conversion or semantic adoption (OPT-2204).
 The separately exposed old/new encoding custody is at most 1 MiB.
 
 The physical envelope caps the complete database at 64 MiB, including metadata,
@@ -50,8 +52,9 @@ Actual close/reopen/reconciliation remains the recovery boundary.
 
 This implementation supplies neither capacity claims nor durable intent, ordinary
 layout publication or required-work exceptions above hard watermarks. The admitted
-publisher must compose entered policy and the actual WAL reservation on the same
-retained connection under the publication contract. OPT-2155 and all parent
+publisher can use the owned policy/empty reservation composition from
+[OPT-2204](SOURCE_LAYOUT_WAL_PREPARATION.md) on the same retained connection;
+actual journal admission and publication remain its separate requirements. OPT-2155 and all parent
 production/native/physical acceptance remain open.
 
 Validation commands:

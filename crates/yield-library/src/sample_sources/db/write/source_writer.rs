@@ -37,6 +37,10 @@ mod tag_admission_observation;
 pub use layout_capture::{
     SOURCE_LAYOUT_ALGORITHM_V1, SourceLayoutCapture, SourceLayoutCaptureError, SourceLayoutFeature,
 };
+mod layout_wal_preparation;
+mod metadata_policy_state;
+mod metadata_wal_custody;
+pub use layout_wal_preparation::{SourceLayoutWalPreparation, SourceLayoutWalPreparationFailure};
 mod tag_metadata_budget;
 mod tag_metadata_policy;
 mod tag_wal_preparation;
