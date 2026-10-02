@@ -30,8 +30,18 @@ fn owned_source_post_commit_hook_uses_retained_wal_and_rejects_active_transactio
     database.maybe_checkpoint_owned_wal();
     assert!(!database.checkpoint_policy.has_attempted());
     database.connection.execute_batch("ROLLBACK").unwrap();
-    database.maybe_checkpoint_owned_wal();
+    // Exercise the actual public write/commit route, not only the maintenance helper.
+    database
+        .set_metadata("checkpoint-proof", "committed")
+        .unwrap();
     assert!(database.checkpoint_policy.has_attempted());
+    assert_eq!(
+        database
+            .get_metadata("checkpoint-proof")
+            .unwrap()
+            .as_deref(),
+        Some("committed")
+    );
     let frames: (i64, i64, i64) = database
         .connection
         .query_row("PRAGMA main.wal_checkpoint(PASSIVE)", [], |row| {
