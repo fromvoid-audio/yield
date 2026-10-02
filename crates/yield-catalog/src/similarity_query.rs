@@ -141,6 +141,8 @@ impl SourceSimilarityResult {
     }
     /// Recheck exact captured file facts and retained owner liveness before installation/render.
     /// This is point-in-time metadata freshness, never physical input or overall readiness.
+    /// Performs retained SQL/control validation: call on the background owner/read worker,
+    /// never synchronously from a UI update or render callback.
     pub fn is_current_for(&self, current: &SourceSimilarityQuery) -> bool {
         self.matches_query(current) && self.observations.iter().all(|file| file.validate().is_ok())
     }

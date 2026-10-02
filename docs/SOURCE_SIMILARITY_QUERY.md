@@ -21,8 +21,10 @@ cosine, with a deterministic path tie-break; unavailable candidates follow.
 They describe only the supplied candidate set. Pitch preserves the existing v1
 pitch proxy semantics, rather than claiming true chroma/pitch analysis.
 
-The future GPUI consumer must call `is_current_for` with its current query before
-both installation and rendering. That call checks source/root/database/lease/
+The future GPUI transport must call `is_current_for` on its background owner/read
+worker before publishing a result. UI installation and rendering must use only
+the resulting retained delivery liveness and current immutable query context;
+they must never run SQL/control validation synchronously. The worker call checks source/root/database/lease/
 lifecycle/revision, anchor/content/version, aspect, query generation and the
 candidate set, then revalidates retained exact file observations. Retiring the
 issuing writer or changing exact manifest facts invalidates stored results even
