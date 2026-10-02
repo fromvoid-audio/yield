@@ -9,6 +9,31 @@ use super::tag_vocabulary::ProfileTagVocabularyInputError;
 /// Errors returned when operating on the library database.
 #[derive(Debug, Error)]
 pub enum LibraryError {
+    /// A copy metadata proposal violates exact bounded family/source contracts.
+    #[error("invalid Harvest copy input")]
+    HarvestCopyInput,
+    /// Issuing source/journal/global prerequisite ownership or exact facts failed.
+    #[error("Harvest copy evidence unavailable or changed")]
+    HarvestCopyEvidence,
+    /// A copy request captured another profile acquisition.
+    #[error("stale Harvest copy acquisition")]
+    HarvestCopyStaleOwner,
+    /// An immutable copy key was reused for changed proposal bytes.
+    #[error("Harvest copy replay conflict")]
+    HarvestCopyReplayConflict,
+    /// Retained copy receipt types/canonical bytes/hash/result are invalid.
+    #[error("malformed Harvest copy receipt")]
+    HarvestCopyMalformedReceipt,
+    /// Existing graph facts are ambiguous, malformed or unbounded.
+    #[error("malformed Harvest copy graph")]
+    HarvestCopyMalformedGraph,
+    /// Finite ledger retention cannot accept another immutable result.
+    #[error("Harvest copy receipt capacity exhausted")]
+    HarvestCopyReceiptCapacity,
+    /// A committed copy metadata result lost valid ownership before acknowledgement.
+    #[error("Harvest copy commit acknowledgement uncertain; replay original proposal")]
+    HarvestCopyCommitUncertain,
+
     /// An ordinary snapshot proposal is older than this acquisition's last committed one.
     #[error("global snapshot revision {proposed} is older than committed {committed}")]
     GlobalSnapshotStaleRevision {

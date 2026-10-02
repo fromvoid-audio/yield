@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use super::connection::LibraryDatabase;
 use super::error::LibraryError;
+use super::harvest_copy::{HarvestCopyRequest, HarvestCopyResult};
 use super::mutation_context::{
     GlobalMutationCompletion, GlobalMutationKind, GlobalMutationRequest, ProfileAcquisitionId,
     SnapshotFences,
@@ -281,6 +282,10 @@ pub enum GlobalLibraryWriterStartError {
 }
 
 enum WriterCommand {
+    HarvestCopy {
+        request: HarvestCopyRequest,
+        result: SyncSender<Result<HarvestCopyResult, LibraryError>>,
+    },
     #[cfg(any(test, feature = "test-support"))]
     PanicForTest {
         result: SyncSender<Result<(), LibraryError>>,
@@ -348,6 +353,11 @@ enum WriterCommand {
 }
 
 enum WriterReply {
+    HarvestCopy {
+        request: HarvestCopyRequest,
+        value: Result<HarvestCopyResult, LibraryError>,
+        result: SyncSender<Result<HarvestCopyResult, LibraryError>>,
+    },
     ReferenceSnapshot {
         request: ReferenceSnapshotRequest,
         value: Result<ReferenceSnapshot, LibraryError>,
@@ -411,6 +421,18 @@ enum WriterReply {
 impl WriterReply {
     fn send(self) {
         match self {
+            Self::HarvestCopy {
+                request,
+                result,
+                value,
+            } => {
+                let value = if value.is_ok() && request.validate_live(false).is_err() {
+                    Err(LibraryError::HarvestCopyCommitUncertain)
+                } else {
+                    value
+                };
+                let _ = result.send(value);
+            }
             Self::CapturedMutation { result, value } => {
                 let _ = result.send(value);
             }
@@ -476,6 +498,9 @@ impl WriterReply {
 
     fn send_error(self, error: LibraryError) {
         match self {
+            Self::HarvestCopy { result, .. } => {
+                let _ = result.send(Err(error));
+            }
             Self::CapturedMutation { result, value } => {
                 let _ = result.send(value.replace_result_with_error(error));
             }
@@ -672,8 +697,8 @@ impl GlobalLibraryWriter {
         (writer, ready, release)
     }
 
-    #[cfg(all(test, unix))]
-    fn start_with_post_command_gate_for_test(
+    #[cfg(test)]
+    pub(super) fn start_with_post_command_gate_for_test(
         profile_guard: &WritableProfileGuard,
     ) -> (Self, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
         let ready = Arc::new(std::sync::Barrier::new(2));
@@ -777,6 +802,17 @@ impl GlobalLibraryWriter {
         Ok(result_rx)
     }
 
+    /// Commit one copy metadata outcome using genuine source/journal/global observations.
+    pub fn apply_harvest_copy(
+        &self,
+        request: HarvestCopyRequest,
+    ) -> Result<Receiver<Result<HarvestCopyResult, LibraryError>>, GlobalLibraryWriterQueueError>
+    {
+        self.ensure_available()?;
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::HarvestCopy { request, result })?;
+        Ok(receiver)
+    }
     /// Read one complete bounded Harvest reference snapshot through the actual global owner.
     pub fn reference_snapshot(
         &self,
@@ -1321,6 +1357,11 @@ fn execute_command(
     snapshot_fences: &mut SnapshotFences,
 ) -> WriterReply {
     match command {
+        WriterCommand::HarvestCopy { request, result } => WriterReply::HarvestCopy {
+            value: database.apply_harvest_copy(owner_identity, &request),
+            request,
+            result,
+        },
         #[cfg(any(test, feature = "test-support"))]
         WriterCommand::PanicForTest { .. } => panic!("isolated global owner teardown fixture"),
         WriterCommand::CapturedMutation { request, result } => WriterReply::CapturedMutation {
@@ -1446,6 +1487,9 @@ fn reject_remaining_profile_change(
 
 fn send_command_error(command: WriterCommand, error: LibraryError) {
     match command {
+        WriterCommand::HarvestCopy { result, .. } => {
+            let _ = result.send(Err(error));
+        }
         #[cfg(any(test, feature = "test-support"))]
         WriterCommand::PanicForTest { result } => {
             let _ = result.send(Err(error));
