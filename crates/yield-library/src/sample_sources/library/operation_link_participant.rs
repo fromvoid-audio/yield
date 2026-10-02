@@ -244,6 +244,7 @@ impl LibraryDatabase {
         let receipt =
             read_receipt(&tx, request)?.ok_or(LibraryError::OperationLinkMalformedReceipt)?;
         tx.commit()?;
+        self.note_operation_link_commit();
         Ok(OperationLinkResult::Committed(receipt))
     }
 }
