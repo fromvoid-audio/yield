@@ -95,6 +95,10 @@ impl FullProgressIntentObservation {
         if self.operation_id.as_uuid().is_nil() {
             return Err(FullProgressIntentObservationError::NilOperationId);
         }
+        if matches!(&self.args, UniversalCommandArgs::Recording(proposal) if proposal.operation_id() != self.operation_id)
+        {
+            return Err(FullProgressIntentObservationError::RecordingOperationMismatch);
+        }
         self.participants
             .validate_for_new_intent()
             .map_err(FullProgressIntentObservationError::Participants)?;
@@ -119,6 +123,9 @@ pub enum FullProgressIntentObservationError {
     /// The retained operation identity was nil.
     #[error("full-progress intent observation has a nil operation ID")]
     NilOperationId,
+    /// Recording bytes and progress must retain the same frozen operation identity.
+    #[error("recording proposal and full-progress operation identity differ")]
+    RecordingOperationMismatch,
     /// The retained participant inventory was not a fresh initial intent inventory.
     #[error("invalid full-progress intent participants: {0}")]
     Participants(#[source] ParticipantValidationError),

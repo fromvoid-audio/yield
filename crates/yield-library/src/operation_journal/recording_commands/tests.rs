@@ -11,40 +11,67 @@ use crate::operation_journal::participants::{
 use crate::sample_sources::SourceId;
 use serde_json::Value;
 
-fn proposal(channels: u16, frames: u64) -> RecordingProposal {
+pub(super) fn proposal(channels: u16, frames: u64) -> RecordingProposal {
+    proposal_with_root(channels, frames).0
+}
+pub(super) fn proposal_with_root(
+    channels: u16,
+    frames: u64,
+) -> (RecordingProposal, RootRegistrationRef) {
     let source_id = SourceId::from_string("recording-source");
     let source = ParticipantId::new();
     let fs = ParticipantId::new();
-    let participants = ParticipantSet::new(
-        vec![
+    let fence = StoredSourceFence::new(source_id.clone(), "root", "database", 3, 7, 1).unwrap();
+    let mut descriptors = vec![
+        ParticipantDescriptor::new(
+            source,
+            ParticipantKind::SourceDatabase,
+            ParticipantRequirement::Required,
+            Some(fence.clone()),
+            None,
+        )
+        .unwrap(),
+        ParticipantDescriptor::new(
+            fs,
+            ParticipantKind::Filesystem,
+            ParticipantRequirement::Required,
+            None,
+            None,
+        )
+        .unwrap(),
+        ParticipantDescriptor::new(
+            ParticipantId::new(),
+            ParticipantKind::GlobalLibrary,
+            ParticipantRequirement::Required,
+            None,
+            None,
+        )
+        .unwrap(),
+    ];
+    for kind in [
+        ParticipantKind::Harvest,
+        ParticipantKind::Projection,
+        ParticipantKind::Readiness,
+    ] {
+        descriptors.push(
             ParticipantDescriptor::new(
-                source,
-                ParticipantKind::SourceDatabase,
+                ParticipantId::new(),
+                kind,
                 ParticipantRequirement::Required,
-                Some(
-                    StoredSourceFence::new(source_id.clone(), "root", "database", 3, 7, 1).unwrap(),
-                ),
+                Some(fence.clone()),
                 None,
             )
             .unwrap(),
-            ParticipantDescriptor::new(
-                fs,
-                ParticipantKind::Filesystem,
-                ParticipantRequirement::Required,
-                None,
-                None,
-            )
-            .unwrap(),
-        ],
-        [source, fs]
-            .into_iter()
-            .map(|id| {
-                ParticipantCheckpoint::new(id, ParticipantCheckpointState::Pending, None, None)
-                    .unwrap()
-            })
-            .collect(),
-    )
-    .unwrap();
+        );
+    }
+    let checkpoints = descriptors
+        .iter()
+        .map(|d| {
+            ParticipantCheckpoint::new(d.id(), ParticipantCheckpointState::Pending, None, None)
+                .unwrap()
+        })
+        .collect();
+    let participants = ParticipantSet::new(descriptors, checkpoints).unwrap();
     let parent = NamespaceDirectoryEndpoint::new(
         source,
         source_id,
@@ -53,7 +80,7 @@ fn proposal(channels: u16, frames: u64) -> RecordingProposal {
     )
     .unwrap();
     let root = RootRegistrationRef::synthetic_for_test();
-    RecordingProposal::new(
+    let proposal = RecordingProposal::new(
         OperationId::new(),
         OutputIdentity::new(),
         WorkUnitKey::new(0, 30, fs, WorkUnitRole::Stage),
@@ -64,7 +91,8 @@ fn proposal(channels: u16, frames: u64) -> RecordingProposal {
         StoredRelativePath::new("staging.wav").unwrap(),
         RecordingFormat::new(48_000, channels, frames, 68).unwrap(),
     )
-    .unwrap()
+    .unwrap();
+    (proposal, root)
 }
 #[test]
 fn proposal_codec_freezes_all_identities_and_rejects_untrusted_observations() {

@@ -230,6 +230,10 @@ pub fn estimate_capacity(
     args: &UniversalCommandArgs,
 ) -> Result<CapacityRequirementMatrix, CapacityEstimatorError> {
     match args {
+        UniversalCommandArgs::Recording(_) => Ok(unknown_output_matrix(
+            UniversalCommandKind::CreateFile,
+            CapacityEstimateReason::MetadataBoundNotDefined,
+        )),
         UniversalCommandArgs::Copy(args) => {
             let kind = UniversalCommandKind::Copy;
             let bytes = non_zero(kind, args.expected_source().file_size(), "source file size")?;

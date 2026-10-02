@@ -51,6 +51,8 @@ pub const SCHEMA_V14: u32 = 14;
 pub const SCHEMA_V15: u32 = 15;
 /// The full allocation-plan initial-intent schema.
 pub const SCHEMA_V16: u32 = 16;
+/// Finite recording initial intent with full allocation observations.
+pub const SCHEMA_V17: u32 = 17;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.
