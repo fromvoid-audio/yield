@@ -35,6 +35,9 @@ use super::tag_vocabulary::{
 use crate::app_dirs::{ProfileChildLease, ProfileOwnershipError, WritableProfileGuard};
 use crate::sample_sources::{SampleSource, UI_PREFERENCES_MAX_BYTES};
 
+mod shutdown;
+pub use shutdown::{GlobalLibraryWriterDrainOutcome, GlobalLibraryWriterDrainReport};
+
 /// Maximum number of global-library commands waiting for the owner thread.
 pub const GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY: usize = 32;
 
@@ -107,6 +110,8 @@ pub enum GlobalLibraryWriterStatus {
 /// Fail-closed reasons retained by the global-library owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GlobalLibraryWriterUnavailable {
+    /// The worker unwound; accepted effects and replies may be unconfirmed.
+    WorkerPanicked,
     /// The acquired profile root or lock entry no longer names the owned object.
     ProfileOwnershipChanged {
         /// Profile root whose ownership boundary changed.
@@ -124,6 +129,7 @@ pub enum GlobalLibraryWriterUnavailable {
 impl std::fmt::Display for GlobalLibraryWriterUnavailable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::WorkerPanicked => formatter.write_str("global library owner thread panicked"),
             Self::ProfileOwnershipChanged { path, reason } => write!(
                 formatter,
                 "profile ownership changed at {}: {reason}",
@@ -275,6 +281,10 @@ pub enum GlobalLibraryWriterStartError {
 }
 
 enum WriterCommand {
+    #[cfg(any(test, feature = "test-support"))]
+    PanicForTest {
+        result: SyncSender<Result<(), LibraryError>>,
+    },
     ReferenceSnapshot {
         request: ReferenceSnapshotRequest,
         result: SyncSender<Result<ReferenceSnapshot, LibraryError>>,
@@ -531,6 +541,7 @@ pub struct GlobalLibraryWriter {
     lifecycle: Arc<std::sync::atomic::AtomicU8>,
     unavailable: Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
     worker: Option<JoinHandle<()>>,
+    drain_report: Option<GlobalLibraryWriterDrainReport>,
     #[cfg(test)]
     blocked_receiver: Option<Receiver<WriterCommand>>,
 }
@@ -600,6 +611,10 @@ impl GlobalLibraryWriter {
         let worker = thread::Builder::new()
             .name(String::from("yield-global-library-writer"))
             .spawn(move || {
+                let _exit_status = shutdown::OwnerExitStatus::new(
+                    Arc::clone(&worker_lifecycle),
+                    Arc::clone(&worker_unavailable),
+                );
                 run_owner(
                     worker_profile_guard,
                     global_writer_lease,
@@ -625,6 +640,7 @@ impl GlobalLibraryWriter {
             lifecycle,
             unavailable,
             worker: Some(worker),
+            drain_report: None,
             #[cfg(test)]
             blocked_receiver: None,
         })
@@ -685,8 +701,19 @@ impl GlobalLibraryWriter {
             )),
             unavailable: Arc::new(Mutex::new(None)),
             worker: None,
+            drain_report: None,
             blocked_receiver: Some(blocked_receiver),
         }
+    }
+
+    /// Inject a worker unwind through the real queue for isolated teardown fixtures.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn panic_owner_for_test(
+        &self,
+    ) -> Result<Receiver<Result<(), LibraryError>>, GlobalLibraryWriterQueueError> {
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::PanicForTest { result })?;
+        Ok(receiver)
     }
 
     /// Return the current owner lifecycle without waiting for initialization or I/O.
@@ -909,33 +936,14 @@ impl GlobalLibraryWriter {
             .delete_profile_tag_vocabulary(expected_revision, label)
     }
 
-    /// Stop new admission, drain accepted commands, close `library.db`, and join the owner.
+    /// Synchronously close/join the owner; returns whether closure was initiated here.
+    ///
+    /// This legacy boolean is not a successful-drain acknowledgement. Use
+    /// `shutdown_with_report` for the retained terminal result or begin/poll for pending work.
     pub fn shutdown(&mut self) -> bool {
-        let previous = self.lifecycle.swap(
-            WriterLifecycle::Closing as u8,
-            std::sync::atomic::Ordering::AcqRel,
-        );
-        let sender = {
-            let _admission = self
-                .admission_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.commands
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-        };
-        drop(sender);
-        #[cfg(test)]
-        self.blocked_receiver.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        self.lifecycle.store(
-            WriterLifecycle::Closed as u8,
-            std::sync::atomic::Ordering::Release,
-        );
-        WriterLifecycle::from_u8(previous) != WriterLifecycle::Closed
+        let initiated = self.begin_shutdown();
+        self.finish_shutdown();
+        initiated
     }
 
     fn ensure_available(&self) -> Result<(), GlobalLibraryWriterQueueError> {
@@ -1187,6 +1195,15 @@ fn run_owner(
     if let Some(initialization_gate) = hooks.initialization_gate {
         initialization_gate.wait();
     }
+    if WriterLifecycle::from_u8(lifecycle.load(std::sync::atomic::Ordering::Acquire))
+        == WriterLifecycle::Closing
+    {
+        lifecycle.store(
+            WriterLifecycle::Closed as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+        return;
+    }
     #[cfg(test)]
     let open_result =
         LibraryDatabase::open_for_profile_guard(&profile_guard, hooks.binding_open_gate);
@@ -1225,9 +1242,13 @@ fn run_owner(
         );
         return;
     }
-    lifecycle.store(
+    // Shutdown may have begun while initialization owned its connection. Never reopen
+    // admission/lifecycle after Closing; the existing receiver still drains accepted work.
+    let _ = lifecycle.compare_exchange(
+        WriterLifecycle::Initializing as u8,
         WriterLifecycle::Available as u8,
-        std::sync::atomic::Ordering::Release,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
     );
 
     let mut snapshot_fences = SnapshotFences::default();
@@ -1300,6 +1321,8 @@ fn execute_command(
     snapshot_fences: &mut SnapshotFences,
 ) -> WriterReply {
     match command {
+        #[cfg(any(test, feature = "test-support"))]
+        WriterCommand::PanicForTest { .. } => panic!("isolated global owner teardown fixture"),
         WriterCommand::CapturedMutation { request, result } => WriterReply::CapturedMutation {
             value: request.execute(database, owner_identity, snapshot_fences),
             result,
@@ -1423,6 +1446,10 @@ fn reject_remaining_profile_change(
 
 fn send_command_error(command: WriterCommand, error: LibraryError) {
     match command {
+        #[cfg(any(test, feature = "test-support"))]
+        WriterCommand::PanicForTest { result } => {
+            let _ = result.send(Err(error));
+        }
         WriterCommand::CapturedMutation { request, result } => {
             let _ = result.send(request.failed(error));
         }
@@ -1528,6 +1555,10 @@ fn unavailable_from_library_error(error: &LibraryError) -> GlobalLibraryWriterUn
 
 #[cfg(test)]
 mod tests {
+    mod shutdown_tests {
+        use super::*;
+        include!("shutdown_owner_tests.rs");
+    }
     mod snapshot_fence_tests {
         use super::*;
         include!("snapshot_fence_owner_tests.rs");
@@ -2287,6 +2318,17 @@ mod tests {
         let _ = writer.shutdown();
         let mut replacement = GlobalLibraryWriter::start(&writable_guard)
             .expect("failed initialization releases slot");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(
+            replacement.status(),
+            GlobalLibraryWriterStatus::Unavailable { .. }
+        ) {
+            assert!(
+                Instant::now() < deadline,
+                "replacement initialization timeout"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         let _ = replacement.shutdown();
         assert_eq!(super::super::connection::test_open_count(&path), 2);
         drop(replacement);

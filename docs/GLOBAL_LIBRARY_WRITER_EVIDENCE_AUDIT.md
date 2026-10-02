@@ -33,10 +33,22 @@ inline `cfg(test)` modules are ignored; filenames confer no exemption. This lexi
 is regression protection, not a Rust type proof or live capability.
 
 OPT-1357 remains open: future Harvest production commands/consumers (OPT-1831/1645),
-configured lifecycle consumers, durable shutdown dispositions (OPT-1838), and other full-owner
+configured lifecycle consumers, durable shutdown dispositions, and other full-owner
 requirements are independently scoped. Their implementation is not supplied by this matrix.
 Native gestures/rendering remain OPT-2009; native participant regression issues retain their
 own acceptance. Neither this evidence nor the fixtures qualify physical effects.
+
+## OPT-1838 existing-owner shutdown acceptance (2 October 2026)
+
+The existing bounded global owner now closes admission monotonically, retains custody while
+accepted work is pending, joins before issuing an acquisition-bound terminal drain diagnostic,
+and retains initialization/unavailability or worker-panic failures. Initialization cannot revive
+Closing. Session teardown propagates the global failure, closes resources in reverse order,
+and joins even after a lost acknowledgement; repeat shutdown retains the original failure.
+Actual fixtures cover held initialization, a committed but withheld reply, panic, corrupt SQLite,
+two-process conflicts, migration by the sole writer, and read-only compatibility. Details and
+bounded exceptions are in [GLOBAL_LIBRARY_SHUTDOWN_CONTRACT.md](GLOBAL_LIBRARY_SHUTDOWN_CONTRACT.md).
+This closes the existing-owner drain/diagnostic and compatibility slice; the parent remains open.
 
 ## OPT-1826 implementation update
 
