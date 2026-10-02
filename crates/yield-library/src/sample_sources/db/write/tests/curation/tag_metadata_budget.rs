@@ -84,6 +84,9 @@ fn tag_metadata_budget_child() {
         return;
     };
     match case.as_str() {
+        "metadata-tag-codec-owner" => super::metadata_tag_commands::owner(),
+        "metadata-tag-codec-stale" => super::metadata_tag_commands::stale(),
+        "metadata-tag-codec-bounds" => super::metadata_tag_commands::bounds(),
         "schema-and-handoff" => schema_and_handoff(),
         "existing-limit" => existing_limit(),
         "oversized" => oversized(),
