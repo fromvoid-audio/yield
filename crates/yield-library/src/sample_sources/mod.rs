@@ -38,10 +38,10 @@ pub use db::{
     SourceIndexSnapshot, SourceLeaseError, SourceManifestEntry, SourcePlaybackType,
     SourcePublicationFence, SourcePublicationFenceError, SourceRevision, SourceScanFence,
     SourceSnapshotOwner, SourceSnapshotPage, SourceTag, SourceTagAssignmentCursor,
-    SourceTagAssignmentPage, SourceTagFilterResult, SourceTagPage, SourceTagPageCursor,
-    SourceTagPageEntry, SourceTagUsage, SourceTagWrite, SourceWriteCommand, SourceWriter,
-    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
-    WavEntry,
+    SourceTagAssignmentMutation, SourceTagAssignmentPage, SourceTagAssignmentSelection,
+    SourceTagFilterResult, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
+    SourceTagWrite, SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity,
+    SourceWriterError, SourceWriterReceipt, SourceWriterRequest, WavEntry,
 };
 pub use finalization::{
     StagedFileFinalizationCapabilities, StagedFinalizationAvailability,

@@ -3976,3 +3976,334 @@ fn tag_ids_for_path(database: &SourceDatabase, path: &Path) -> BTreeSet<i64> {
         .collect::<Result<BTreeSet<_>, _>>()
         .expect("tag ids rows")
 }
+
+#[test]
+fn tag_assignment_selection_captures_real_complete_scope_without_writes() {
+    use crate::sample_sources::SourceTagAssignmentMutation;
+    let mut fixture = CurationFixture::new_profile_bound();
+    let old = insert_tag(&fixture.database, "old tag", "Old Tag");
+    let empty = insert_tag(&fixture.database, "empty", "Empty");
+    let receipt = fixture
+        .commit(&[
+            SourceCurationUpdate::AssignExistingTag {
+                path: CurationFixture::path("two.wav"),
+                tag_id: old,
+            },
+            SourceCurationUpdate::AssignExistingTag {
+                path: CurationFixture::path("one.wav"),
+                tag_id: old,
+            },
+        ])
+        .unwrap();
+    fixture.revision = receipt.source_revision();
+    let writer =
+        SourceWriter::new(fixture.database, SourceId::from_string("tag-selection"), 7).unwrap();
+    let revision = writer.current_revision().unwrap();
+    let selected = writer
+        .capture_tag_assignment_selection(
+            &revision,
+            "  OLD   tag ",
+            SourceTagAssignmentMutation::Rename("  NEW  tag ".into()),
+        )
+        .unwrap();
+    assert_eq!(selected.revision(), &revision);
+    assert_eq!(selected.old_tag_id(), old);
+    assert_eq!(selected.old_identity(), "old tag");
+    assert_eq!(
+        selected.mutation(),
+        &SourceTagAssignmentMutation::Rename("new tag".into())
+    );
+    assert_eq!(
+        selected.paths(),
+        &[
+            CurationFixture::path("one.wav"),
+            CurationFixture::path("two.wav")
+        ]
+    );
+    let empty_selection = writer
+        .capture_tag_assignment_selection(&revision, "empty", SourceTagAssignmentMutation::Delete)
+        .unwrap();
+    assert_eq!(empty_selection.old_tag_id(), empty);
+    assert!(empty_selection.paths().is_empty());
+    assert_eq!(writer.current_revision().unwrap(), revision);
+    assert_eq!(
+        tag_ids_for_path(writer.database_for_tests(), Path::new("one.wav")),
+        BTreeSet::from([old])
+    );
+    let owner = SourceSnapshotOwner::start(writer).unwrap();
+    let repeated = owner
+        .capture_tag_assignment_selection(
+            &revision,
+            "old tag",
+            SourceTagAssignmentMutation::Rename("new tag".into()),
+        )
+        .unwrap();
+    assert_eq!(repeated, selected);
+    owner.begin_retirement().join().unwrap().close().unwrap();
+}
+
+#[test]
+fn tag_assignment_selection_rejects_missing_classification_and_colliding_labels() {
+    use crate::sample_sources::SourceTagAssignmentMutation as Mutation;
+    let fixture = CurationFixture::new_profile_bound();
+    insert_tag(&fixture.database, "old", "Old");
+    insert_tag(&fixture.database, "other", "Other");
+    insert_tag(&fixture.database, "loop", "Loop");
+    let writer =
+        SourceWriter::new(fixture.database, SourceId::from_string("tag-reject"), 7).unwrap();
+    let revision = writer.current_revision().unwrap();
+    for (old, mutation) in [
+        ("absent", Mutation::Delete),
+        ("loop", Mutation::Delete),
+        ("old", Mutation::Rename(" OLD ".into())),
+        ("old", Mutation::Rename(" OTHER ".into())),
+        ("old", Mutation::Rename("one - shot".into())),
+        ("old", Mutation::Rename("\0".into())),
+    ] {
+        assert!(
+            writer
+                .capture_tag_assignment_selection(&revision, old, mutation)
+                .is_err()
+        );
+        assert_eq!(writer.current_revision().unwrap(), revision);
+    }
+    assert!(
+        writer
+            .capture_tag_assignment_selection(&revision, &"x".repeat(1025), Mutation::Delete)
+            .is_err()
+    );
+    assert!(
+        writer
+            .capture_tag_assignment_selection(&revision, "old", Mutation::Rename("x".repeat(1025)))
+            .is_err()
+    );
+    let count: usize = writer
+        .database_for_tests()
+        .connection
+        .query_row("SELECT COUNT(*) FROM source_tags", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn tag_assignment_selection_rejects_overflow_without_truncation() {
+    use crate::sample_sources::SourceTagAssignmentMutation as Mutation;
+    let fixture = CurationFixture::new_profile_bound();
+    let tag = insert_tag(&fixture.database, "old", "Old");
+    // Fixture construction populates the real schema before the retained-owner read.
+    for n in 0..129 {
+        let path = format!("{n:03}.wav");
+        fixture
+            .database
+            .connection
+            .execute(
+                "INSERT INTO wav_files(path,file_size,modified_ns,extension) VALUES (?1,1,1,'wav')",
+                [&path],
+            )
+            .unwrap();
+        fixture
+            .database
+            .connection
+            .execute(
+                "INSERT INTO wav_file_tags(path,tag_id) VALUES (?1,?2)",
+                rusqlite::params![path, tag],
+            )
+            .unwrap();
+    }
+    let writer =
+        SourceWriter::new(fixture.database, SourceId::from_string("tag-overflow"), 7).unwrap();
+    let revision = writer.current_revision().unwrap();
+    assert!(matches!(
+        writer.capture_tag_assignment_selection(&revision, "old", Mutation::Delete),
+        Err(SourceWriterError::SnapshotBudgetExceeded)
+    ));
+    writer
+        .database_for_tests()
+        .connection
+        .execute("DELETE FROM wav_file_tags WHERE path='128.wav'", [])
+        .unwrap();
+    assert_eq!(
+        writer
+            .capture_tag_assignment_selection(&revision, "old", Mutation::Delete)
+            .unwrap()
+            .paths()
+            .len(),
+        128
+    );
+    assert!(matches!(
+        writer.capture_tag_assignment_selection(&revision, "old", Mutation::Rename("new".into())),
+        Err(SourceWriterError::SnapshotBudgetExceeded)
+    ));
+    writer
+        .database_for_tests()
+        .connection
+        .execute("DELETE FROM wav_file_tags WHERE path >= '064.wav'", [])
+        .unwrap();
+    assert_eq!(
+        writer
+            .capture_tag_assignment_selection(&revision, "old", Mutation::Rename("new".into()))
+            .unwrap()
+            .paths()
+            .len(),
+        64
+    );
+    assert_eq!(writer.current_revision().unwrap(), revision);
+}
+
+#[test]
+fn tag_assignment_selection_rejects_long_missing_unsupported_and_malformed_members() {
+    use crate::sample_sources::SourceTagAssignmentMutation as Mutation;
+    let fixture = CurationFixture::new_profile_bound();
+    let tag = insert_tag(&fixture.database, "old", "Old");
+    let writer =
+        SourceWriter::new(fixture.database, SourceId::from_string("tag-members"), 7).unwrap();
+    let revision = writer.current_revision().unwrap();
+    for (path, extension, missing) in [
+        (format!("{}.wav", "x".repeat(1024)), "wav", 0),
+        ("absent.wav".into(), "wav", 1),
+        ("unsupported.mp3".into(), "mp3", 0),
+        ("../escape.wav".into(), "wav", 0),
+        ("folder/./alias.wav".into(), "wav", 0),
+    ] {
+        let conn = &writer.database_for_tests().connection;
+        conn.execute("INSERT INTO wav_files(path,file_size,modified_ns,extension,missing) VALUES (?1,1,1,?2,?3)", rusqlite::params![path,extension,missing]).unwrap();
+        conn.execute(
+            "INSERT INTO wav_file_tags(path,tag_id) VALUES (?1,?2)",
+            rusqlite::params![path, tag],
+        )
+        .unwrap();
+        assert!(
+            writer
+                .capture_tag_assignment_selection(&revision, "old", Mutation::Delete)
+                .is_err()
+        );
+        assert_eq!(writer.current_revision().unwrap(), revision);
+        assert_eq!(
+            tag_ids_for_path(writer.database_for_tests(), Path::new(&path)),
+            BTreeSet::from([tag])
+        );
+        conn.execute("DELETE FROM wav_file_tags", []).unwrap();
+    }
+}
+
+#[test]
+fn tag_assignment_selection_rejects_stale_revision_and_lifecycle_and_expired_deadline() {
+    use crate::sample_sources::SourceTagAssignmentMutation as Mutation;
+    let fixture = CurationFixture::new_profile_bound();
+    insert_tag(&fixture.database, "old", "Old");
+    let mut writer =
+        SourceWriter::new(fixture.database, SourceId::from_string("tag-fence"), 7).unwrap();
+    let initial = writer.current_revision().unwrap();
+    let request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::new(),
+        crate::operation_journal::ParticipantId::new(),
+        SourceCommandId::new(),
+        initial.clone(),
+        vec![SourceCurationUpdate::SetRating {
+            path: CurationFixture::path("one.wav"),
+            rating: Rating::KEEP_3,
+        }],
+    )
+    .unwrap();
+    writer.commit_curation(request).unwrap();
+    assert!(matches!(
+        writer.capture_tag_assignment_selection(&initial, "old", Mutation::Delete),
+        Err(SourceWriterError::StaleFence)
+    ));
+    let current = writer.current_revision().unwrap();
+    assert!(matches!(
+        writer.capture_tag_assignment_selection_with_deadline(
+            &current,
+            "old",
+            Mutation::Delete,
+            std::time::Instant::now()
+        ),
+        Err(SourceWriterError::SnapshotBudgetExceeded)
+    ));
+    let replacement = SourceWriter::new(
+        writer.into_catalog_database(),
+        SourceId::from_string("tag-fence"),
+        8,
+    )
+    .unwrap();
+    assert!(matches!(
+        replacement.capture_tag_assignment_selection(&current, "old", Mutation::Delete),
+        Err(SourceWriterError::StaleFence)
+    ));
+}
+
+#[test]
+fn tag_assignment_selection_worker_timeout_retains_custody_and_read_is_discarded() {
+    use crate::sample_sources::SourceTagAssignmentMutation as Mutation;
+    let fixture = CurationFixture::new_profile_bound();
+    insert_tag(&fixture.database, "old", "Old");
+    let writer =
+        SourceWriter::new(fixture.database, SourceId::from_string("tag-worker"), 7).unwrap();
+    let revision = writer.current_revision().unwrap();
+    let owner = SourceSnapshotOwner::start(writer).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    owner.block_for_tests(entered_tx, release_rx);
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        owner.capture_tag_assignment_selection_with_deadline(
+            &revision,
+            "old",
+            Mutation::Delete,
+            started + std::time::Duration::from_millis(30)
+        ),
+        Err(SourceWriterError::SnapshotBudgetExceeded)
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    release_tx.send(()).unwrap();
+    owner.wait_idle_for_tests();
+    assert!(
+        owner
+            .capture_tag_assignment_selection(&revision, "old", Mutation::Delete)
+            .unwrap()
+            .paths()
+            .is_empty()
+    );
+    let writer = owner.begin_retirement().join().unwrap();
+    assert_eq!(writer.current_revision().unwrap(), revision);
+}
+
+#[cfg(unix)]
+#[test]
+fn tag_assignment_selection_rejects_replaced_media_root_and_expired_lease() {
+    use crate::sample_sources::SourceTagAssignmentMutation as Mutation;
+    let fixture = CurationFixture::new_profile_bound();
+    insert_tag(&fixture.database, "old", "Old");
+    let writer = SourceWriter::new(fixture.database, SourceId::from_string("tag-root"), 7).unwrap();
+    let revision = writer.current_revision().unwrap();
+    let before = source_writer_state_snapshot(writer.catalog_database());
+    let root = fixture._source.path();
+    let displaced = root.with_extension("tag-selection-displaced");
+    std::fs::rename(root, &displaced).unwrap();
+    std::fs::create_dir(root).unwrap();
+    assert!(
+        writer
+            .capture_tag_assignment_selection(&revision, "old", Mutation::Delete)
+            .is_err()
+    );
+    std::fs::remove_dir(root).unwrap();
+    std::fs::rename(&displaced, root).unwrap();
+    assert_eq!(
+        source_writer_state_snapshot(writer.catalog_database()),
+        before
+    );
+    writer
+        .database_for_tests()
+        .connection
+        .execute("UPDATE source_lease SET expires_at=acquired_at", [])
+        .unwrap();
+    assert!(matches!(
+        writer.capture_tag_assignment_selection(&revision, "old", Mutation::Delete),
+        Err(SourceWriterError::Database(SourceDbError::SourceLease(
+            SourceLeaseError::Expired { .. }
+        )))
+    ));
+}

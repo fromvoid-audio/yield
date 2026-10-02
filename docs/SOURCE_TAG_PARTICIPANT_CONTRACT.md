@@ -166,3 +166,19 @@ reservation/checkpoint and cross-source finalization adapters. Acceptance must u
 real source writer/SQLite revision and lease tests, fault injection, reopen readback,
 payload conflicts, exact counts and unknown/capacity rejection. Contract fixtures
 do not complete this production leaf, physical qualification or original GUI scope.
+
+## Implemented selection prerequisite (OPT-2051)
+
+`SourceWriter::capture_tag_assignment_selection` now reads the complete bounded
+scope from the real source schema through the retained owner. The public
+`SourceSnapshotOwner` adapter runs it on the sole worker with a two-second caller
+budget, bounded queue and custody retained after timeout. SQL progress checks bound
+query work; a synchronous writer call does not bound an OS identity-check stall.
+
+The selection has private fields and no deserialization constructor. It contains
+an owner-issued revision, source-local old tag ID, canonical identities and exact
+sorted paths; it is an observation, **not** a mutation reservation or capacity grant.
+Tag/manifest eligibility, row/byte overflow and stale owner fences reject the entire
+read. SQL byte guards run before path strings are materialized. Atomic admitted
+delta, receipt codec and durable replay remain OPT-2049; full journal definition
+coordination remains OPT-2012. Selection tests cannot complete those scopes.
