@@ -8732,6 +8732,7 @@ dependencies = [
  "cap-std",
  "directories",
  "filetime",
+ "hound",
  "libc",
  "rusqlite",
  "serde",
