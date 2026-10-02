@@ -110,6 +110,33 @@ impl SourceWalPreparation {
     pub fn is_expired(&self) -> bool {
         Instant::now() >= self.deadline
     }
+    /// Revalidate the retained profile, roots, main-file binding and current lease
+    /// through the existing read-only control connection. This neither queries
+    /// the reserved ordinary connection nor renews the lease or extends expiry.
+    /// Deadline/owner failure leaves custody held until explicit abort or drop;
+    /// success grants no catalog registration, journal or capacity authority.
+    pub fn revalidate_owner(&self) -> Result<(), SourceWalPreparationError> {
+        if self.is_expired() {
+            return Err(SourceWalPreparationError::Deadline);
+        }
+        let lease = self
+            .held
+            .writer()
+            .database
+            .source_lease
+            .as_deref()
+            .ok_or(SourceDbError::ProfileOwnershipRequired)
+            .map_err(SourceWriterError::from)?;
+        let validated = lease
+            .validate_current_owner()
+            .map_err(SourceDbError::from)
+            .map_err(SourceWriterError::from);
+        if self.is_expired() {
+            return Err(SourceWalPreparationError::Deadline);
+        }
+        validated?;
+        Ok(())
+    }
     /// Cancel/release without changing source rows, returning the same writer only on confirmation.
     pub fn abort(mut self) -> Result<SourceWriter, SourceWalPreparationFailure> {
         match self.held.release() {
@@ -184,6 +211,9 @@ impl SourceWriter {
 
 #[cfg(test)]
 mod test_vfs;
+
+#[cfg(test)]
+mod owner_revalidation_tests;
 
 fn finish_preparation(
     held: HeldWriter,
