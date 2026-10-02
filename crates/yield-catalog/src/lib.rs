@@ -10622,6 +10622,11 @@ mod tests {
 
     #[test]
     fn unavailable_journal_client_does_not_block_catalog_reopen_or_removal() {
+        assert_ended_journal_client_catalog_lifecycle(false);
+        assert_ended_journal_client_catalog_lifecycle(true);
+    }
+
+    fn assert_ended_journal_client_catalog_lifecycle(with_capacity: bool) {
         let fixture = Fixture::new("catalog-journal-unavailable");
         let registry_base = tempfile::tempdir().expect("fixture registry root");
         let registry_path =
@@ -10629,11 +10634,52 @@ mod tests {
         let registry_path = registry_path.join("volume-registry");
         fs::create_dir_all(&registry_path).expect("fixture volume registry");
         let store = OperationJournalStore::open(&fixture.guard).expect("journal store");
-        let mut journal_owner =
+        let mut journal_owner = if with_capacity {
             OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
-                .expect("journal owner");
+        } else {
+            // The actual store, child lease, recovery and worker remain installed. This fixture
+            // installs no volume owner, protected reserve or live capacity/source authority.
+            OperationJournalOwner::start_without_capacity_for_test(store)
+        }
+        .expect("journal owner");
         let journal = journal_owner.client();
-        assert!(journal_owner.shutdown(), "fixture owner shutdown");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while journal.status() == OperationJournalOwnerStatus::Initializing {
+            assert!(Instant::now() < deadline, "journal fixture initialization");
+            thread::yield_now();
+        }
+        if !with_capacity {
+            assert_eq!(journal.status(), OperationJournalOwnerStatus::Available);
+        }
+        let ended = match journal.status() {
+            OperationJournalOwnerStatus::Available => {
+                assert!(
+                    journal_owner.shutdown(),
+                    "available fixture must drain cleanly"
+                );
+                assert!(matches!(
+                    journal.get(OperationId::new()),
+                    Err(OperationJournalOwnerQueueError::Closed)
+                ));
+                OperationJournalOwnerStatus::Closed
+            }
+            OperationJournalOwnerStatus::Unavailable { reason } => {
+                // A real bootstrap failure is already an ended, unavailable client. Shutdown
+                // joins its worker but deliberately returns false and preserves the diagnostic.
+                assert!(
+                    !journal_owner.shutdown(),
+                    "failed fixture cannot report a clean drain"
+                );
+                assert!(matches!(
+                    journal.get(OperationId::new()),
+                    Err(OperationJournalOwnerQueueError::Unavailable { reason: observed })
+                        if observed == reason
+                ));
+                OperationJournalOwnerStatus::Unavailable { reason }
+            }
+            status => panic!("unexpected fixture lifecycle before shutdown: {status:?}"),
+        };
+        assert_eq!(journal.status(), ended);
         let service = CatalogService::start_with_journal(&fixture.guard, journal)
             .expect("catalog service with unavailable journal client");
         let source_id = SourceId::from_string("catalog-journal-unavailable-source");
