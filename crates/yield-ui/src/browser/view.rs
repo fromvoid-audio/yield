@@ -117,6 +117,7 @@ const PANE_RESIZE_RAIL: f32 = 6.0;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PaneAxis {
     Sidebar,
+    Filter,
     Waveform,
     Metadata,
     Collections,
@@ -563,6 +564,14 @@ impl Browser {
                 ),
                 self.preferred_collections_height,
             ),
+            PaneAxis::Filter => (
+                super::filter_panel::height(
+                    self.preferred_filter_height,
+                    f32::from(window.viewport_size().height),
+                    theme,
+                ),
+                self.preferred_filter_height,
+            ),
             PaneAxis::Waveform => (
                 waveform_height(
                     self.preferred_waveform_height,
@@ -588,9 +597,10 @@ impl Browser {
             gesture: ResizeDrag::begin(
                 match axis {
                     PaneAxis::Sidebar => f32::from(position.x),
-                    PaneAxis::Waveform | PaneAxis::Metadata | PaneAxis::Collections => {
-                        f32::from(position.y)
-                    }
+                    PaneAxis::Filter
+                    | PaneAxis::Waveform
+                    | PaneAxis::Metadata
+                    | PaneAxis::Collections => f32::from(position.y),
                 },
                 start_size,
                 previous_preference,
@@ -638,6 +648,14 @@ impl Browser {
                     theme,
                 ));
             }
+            PaneAxis::Filter => {
+                let requested = drag.gesture.requested_size(f32::from(position.y));
+                self.preferred_filter_height = Some(super::filter_panel::height(
+                    Some(requested),
+                    f32::from(window.viewport_size().height),
+                    theme,
+                ));
+            }
             PaneAxis::Waveform => {
                 let requested = drag.gesture.requested_size(f32::from(position.y));
                 self.preferred_waveform_height = Some(waveform_height(
@@ -680,6 +698,7 @@ impl Browser {
                 self.preferred_metadata_height = drag.gesture.previous_preference()
             }
             PaneAxis::Sidebar => self.preferred_sidebar_width = drag.gesture.previous_preference(),
+            PaneAxis::Filter => self.preferred_filter_height = drag.gesture.previous_preference(),
             PaneAxis::Collections => {
                 self.preferred_collections_height = drag.gesture.previous_preference()
             }
@@ -2552,7 +2571,7 @@ impl Render for Browser {
                         self,
                         theme.clone(),
                         motion_frame,
-                        f32::from(window.bounds().size.height),
+                        window,
                         cx,
                     ))
                     .child(self.render_sidebar_resize_rail(theme.clone(), cx))

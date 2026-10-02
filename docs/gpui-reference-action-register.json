@@ -355,11 +355,31 @@
     },
     {
       "message": "FolderBrowserMessage::ResizeFilterPanel",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/filter_panel.rs",
+        "symbol": "render_filter_panel"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/filter_panel.rs",
+          "symbol": "pointer_resize_cancel_focus_and_scroll_reachability"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/filter_panel.rs",
+          "symbol": "enlarged_pointer_resize_cancel_and_scroll_reachability"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/filter_panel.rs",
+          "symbol": "resize_context_changes_restore_preference_and_preserve_selection_viewport"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/filter_panel.rs",
+          "symbol": "window_deactivation_retires_filter_drag_without_committing_preview"
+        }
+      ],
       "owner": "OPT-2018",
-      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "note": "Bounded session-only height and independent scrolling for existing playback type/age/rating and tag-filter controls. GPUI fixtures cover pointer commit, Escape/focus, viewport/text-scale/window-deactivation retirement and normal/200% nested-scroll reachability. The compact sidebar retains folder and auxiliary space with an outer-scroll gutter. Native pointer/AX acceptance remains OPT-2020/2009; missing Harvest/source contracts and full browser parity remain open.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
