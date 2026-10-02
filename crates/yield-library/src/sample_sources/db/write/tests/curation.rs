@@ -4402,3 +4402,5 @@ mod readiness_wal;
 mod snapshot_read_only;
 
 mod snapshot_cursor;
+#[path = "curation/tag_admission_observation.rs"]
+mod tag_admission_observation;
