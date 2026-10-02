@@ -30,6 +30,15 @@ pub enum LibraryError {
     /// Explicit authored-state commit may be durable; retry the original proposal.
     #[error("Harvest authored-state acknowledgement uncertain; replay original proposal")]
     HarvestAuthoredCommitUncertain,
+    /// Writer acquisition failed before any ordinary metadata effect. The proposal may be
+    /// resubmitted through its original captured context; no success receipt was issued.
+    #[error("ordinary SQLite writer unavailable after {attempts} attempts (code {sqlite_code})")]
+    OrdinaryWriteContention {
+        /// Number of nonblocking BEGIN IMMEDIATE attempts actually performed.
+        attempts: u8,
+        /// SQLite extended result code, preserving busy/locked distinctions.
+        sqlite_code: i32,
+    },
     /// A copy metadata proposal violates exact bounded family/source contracts.
     #[error("invalid Harvest copy input")]
     HarvestCopyInput,
