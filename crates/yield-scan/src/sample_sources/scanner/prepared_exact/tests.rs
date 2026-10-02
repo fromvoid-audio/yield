@@ -2,6 +2,7 @@
 use super::*;
 use std::{cell::Cell, path::PathBuf};
 use tempfile::{TempDir, tempdir};
+use yield_library::sample_sources::db::META_SOURCE_INDEX_REVISION;
 use yield_library::sample_sources::db::SourceWriteBatch;
 use yield_library::{
     app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard},

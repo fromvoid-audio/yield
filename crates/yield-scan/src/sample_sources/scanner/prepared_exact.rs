@@ -9,6 +9,7 @@ use super::{
     scan_writer::{ScanWritePhase, ScanWriter},
 };
 
+mod enrollment;
 #[cfg(test)]
 mod tests;
 use std::{
@@ -18,7 +19,7 @@ use std::{
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
-use yield_library::sample_sources::db::{META_SOURCE_INDEX_REVISION, ManifestCommitResult};
+use yield_library::sample_sources::db::ManifestCommitResult;
 use yield_library::sample_sources::reconciliation::RootRelativePath;
 use yield_library::sample_sources::{
     SourceEntryFileType, SourceIndexEntry, SourceScanFence, SourceWriter, SourceWriterError,
@@ -104,7 +105,7 @@ pub fn prepare_exact_scan<'a>(
             actual: revision,
         });
     }
-    let index_revision = parse_index_revision(db.get_metadata(META_SOURCE_INDEX_REVISION)?)?;
+    let index_revision = db.get_source_index_revision()?;
     let mut existing = HashMap::new();
     for path in paths {
         if path.as_path().to_str().is_some()
@@ -265,9 +266,7 @@ impl PreparedExactScan<'_> {
                 actual,
             });
         }
-        if parse_index_revision(batch.get_metadata(META_SOURCE_INDEX_REVISION)?)?
-            != self.index_revision
-        {
+        if batch.get_source_index_revision()? != self.index_revision {
             return Err(invalid(db.root(), "prepared index revision changed"));
         }
         let mut held = Vec::with_capacity(self.audio.len());
@@ -290,15 +289,6 @@ impl PreparedExactScan<'_> {
     }
 }
 
-fn parse_index_revision(raw: Option<String>) -> Result<u64, ScanError> {
-    raw.map(|value| {
-        value
-            .parse::<u64>()
-            .map_err(|_| ScanError::SourceOwner("invalid index revision".into()))
-    })
-    .transpose()
-    .map(|v| v.unwrap_or_default())
-}
 fn canceled(cancel: Option<&AtomicBool>) -> Result<(), ScanError> {
     if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
         Err(ScanError::Canceled)

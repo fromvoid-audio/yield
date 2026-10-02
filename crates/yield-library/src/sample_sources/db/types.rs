@@ -344,7 +344,7 @@ pub enum ExistingFileMetadataUpdate {
 }
 
 /// Authoritative identity facts for one live source-manifest row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceManifestEntry {
     /// File path relative to the source root.
     pub relative_path: PathBuf,
