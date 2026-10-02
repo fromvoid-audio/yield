@@ -23,11 +23,12 @@ pub use curation::{
 pub use source_writer::{
     FeaturePruneCursor, FeaturePrunePage, FeatureRebuildMetrics, ManifestEnrollmentEntry,
     ManifestEnrollmentError, ManifestEnrollmentKind, ManifestEnrollmentReceipt,
-    ManifestEnrollmentRequest, ManifestEnrollmentResult, SourceCommandId,
-    SourceFeaturePublicationMetrics, SourceRevision, SourceScanFence, SourceSnapshotOwner,
-    SourceSnapshotPage, SourceSnapshotQueueMetrics, SourceTagAdmissionObservation,
-    SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceWriter, SourceWriterCommandIdentity,
-    SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
+    ManifestEnrollmentRequest, ManifestEnrollmentResult, SourceCollectionHistoryChange,
+    SourceCollectionHistorySelection, SourceCommandId, SourceFeaturePublicationMetrics,
+    SourceRevision, SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage,
+    SourceSnapshotQueueMetrics, SourceTagAdmissionObservation, SourceTagMetadataBudget,
+    SourceTagMetadataPolicy, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
+    SourceWriterReceipt, SourceWriterRequest,
 };
 pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};
 pub use transaction::{
