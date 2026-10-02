@@ -332,6 +332,7 @@ fn open_source_database_with_profile_guard_inner(
 
     let root_binding: Arc<dyn super::DatabaseRootBindingGuard> = database_root.clone();
     let db = SourceDatabase {
+        checkpoint_policy: Default::default(),
         index_page_binding: std::sync::Arc::new(()),
         tag_metadata_policy_state: std::cell::Cell::new(
             crate::sample_sources::db::TAG_METADATA_POLICY_IDLE,
@@ -486,6 +487,7 @@ fn open_source_database_with_flags(
         }
     };
     let db = SourceDatabase {
+        checkpoint_policy: Default::default(),
         index_page_binding: std::sync::Arc::new(()),
         tag_metadata_policy_state: std::cell::Cell::new(
             crate::sample_sources::db::TAG_METADATA_POLICY_IDLE,

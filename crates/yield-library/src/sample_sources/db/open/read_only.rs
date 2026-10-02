@@ -58,6 +58,7 @@ pub(super) fn open_read_only_source_database(
     };
 
     let db = SourceDatabase {
+        checkpoint_policy: Default::default(),
         index_page_binding: std::sync::Arc::new(()),
         tag_metadata_policy_state: std::cell::Cell::new(
             crate::sample_sources::db::TAG_METADATA_POLICY_IDLE,
