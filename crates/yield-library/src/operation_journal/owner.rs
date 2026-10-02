@@ -3448,8 +3448,14 @@ impl OperationJournalOwner {
         )
     }
 
-    #[cfg(test)]
-    fn start_without_capacity_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    /// Start an isolated journal fixture without physical capacity authority.
+    ///
+    /// The real store, profile-child lease, recovery checks and worker are retained, but no
+    /// volume owner, protected reserve or live capacity provider is installed. Physical source
+    /// authority and capacity admission therefore remain unavailable. This constructor is only
+    /// for portable cross-crate tests, never production startup or platform qualification.
+    pub fn start_without_capacity_for_test(
         store: OperationJournalStore,
     ) -> Result<Self, OperationJournalOwnerStartError> {
         Self::start_inner(store, None, false, false, None)
@@ -5431,6 +5437,38 @@ mod tests {
                 _ => thread::sleep(Duration::from_millis(5)),
             }
         }
+    }
+
+    #[test]
+    fn portable_journal_fixture_cannot_register_physical_source_authority() {
+        let (fixture, mut owner) = open_owner("portable-registry-no-physical-authority");
+        let source_root = tempfile::tempdir().expect("source root");
+        let database = crate::sample_sources::SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.owner,
+            "portable-registry-source",
+        )
+        .expect("profile-owned source database");
+        let authority = database
+            .prepare_source_authority()
+            .expect("descriptor-bound source authority request");
+        let request = authority.journal_request().expect("registration request");
+        let error = owner
+            .client()
+            .register_source_authority(request)
+            .expect("registration queues")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("registration responds")
+            .expect_err("non-capacity fixture cannot mint a physical registration receipt");
+        assert!(matches!(
+            error,
+            OperationJournalOwnerError::SourceAuthorityConflict { reason }
+                if reason == "profile volume ownership is unavailable"
+        ));
+        assert_eq!(owner.status(), OperationJournalOwnerStatus::Available);
+        drop(authority);
+        drop(database);
+        assert!(owner.shutdown());
     }
 
     fn wait_until_unavailable(owner: &OperationJournalOwner) -> String {
