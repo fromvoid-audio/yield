@@ -30,15 +30,29 @@ fn ordinary_retry_released_reservation_executes_body_once_and_restores_timeout()
         .unwrap();
     let rival = Connection::open(&path).unwrap();
     rival.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let metrics = metrics::AcquisitionMetrics::new();
     let mut retries = vec![];
-    let transaction = begin_with_backoff(&connection, |attempt| {
-        retries.push(attempt);
-        if attempt == 2 {
-            rival.execute_batch("ROLLBACK").unwrap();
-        }
-    })
+    let transaction = begin_observed(
+        &connection,
+        |attempt| {
+            retries.push(attempt);
+            std::thread::sleep(Duration::from_millis(10));
+            if attempt == 2 {
+                rival.execute_batch("ROLLBACK").unwrap();
+            }
+        },
+        &metrics,
+    )
     .unwrap();
     assert_eq!(retries, [1, 2]);
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        (snapshot.attempts, snapshot.retries, snapshot.acquired),
+        (3, 2, 1)
+    );
+    assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 1);
+    // The measured boundary includes both real pre-effect backoffs.
+    assert_eq!(&snapshot.elapsed_buckets[..2], &[0, 0]);
     assert_eq!(
         connection
             .query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0))
@@ -68,10 +82,19 @@ fn ordinary_retry_exhaustion_and_noncontention_restore_timeout_without_effects()
     connection.busy_timeout(Duration::from_millis(900)).unwrap();
     let rival = Connection::open(&path).unwrap();
     rival.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let metrics = metrics::AcquisitionMetrics::new();
     let mut retries = vec![];
-    assert_busy(begin_with_backoff(&connection, |attempt| {
-        retries.push(attempt)
-    }));
+    assert_busy(begin_observed(
+        &connection,
+        |attempt| retries.push(attempt),
+        &metrics,
+    ));
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        (snapshot.attempts, snapshot.retries, snapshot.busy_exhausted),
+        (3, 2, 1)
+    );
+    assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 1);
     assert_eq!(retries, [1, 2]);
     assert!(connection.is_autocommit());
     assert_eq!(
@@ -84,10 +107,16 @@ fn ordinary_retry_exhaustion_and_noncontention_restore_timeout_without_effects()
     connection.execute_batch("PRAGMA query_only=ON").unwrap();
     let mut retries = 0;
     assert!(matches!(
-        begin_with_backoff(&connection, |_| retries += 1),
+        begin_observed(&connection, |_| retries += 1, &metrics),
         Err(LibraryError::Sql(_))
     ));
     assert_eq!(retries, 0);
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        (snapshot.attempts, snapshot.retries, snapshot.other_failure),
+        (4, 2, 1)
+    );
+    assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 2);
     assert_eq!(
         connection
             .query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0))
@@ -114,7 +143,21 @@ fn ordinary_retry_does_not_retry_effect_errors_or_nested_transaction() {
             .execute("INSERT INTO effects VALUES (1)", [])
             .is_err()
     );
-    assert!(matches!(begin(&connection), Err(LibraryError::Sql(_))));
+    let metrics = metrics::AcquisitionMetrics::new();
+    assert!(matches!(
+        begin_observed(&connection, |_| panic!("nested retry"), &metrics),
+        Err(LibraryError::Sql(_))
+    ));
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        (
+            snapshot.attempts,
+            snapshot.retries,
+            snapshot.nested_transaction
+        ),
+        (0, 0, 1)
+    );
+    assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 1);
     transaction.rollback().unwrap();
     assert_eq!(
         connection
@@ -200,9 +243,18 @@ fn ordinary_retry_real_worker_all_routes_retain_state_and_replay_after_contentio
     .unwrap();
     let delete =
         GlobalMutationRequest::vocabulary_delete(acquisition.clone(), 3, 1, "kick".into()).unwrap();
+    let before = global_acquisition_metrics_snapshot();
     for request in [&prefs, &registry, &set, &delete] {
         assert_busy(complete(&writer, request.clone()));
     }
+    let after = global_acquisition_metrics_snapshot();
+    // Other tests may acquire concurrently; process totals must include all four real routes.
+    assert!(after.attempts >= before.attempts + 12);
+    assert!(after.retries >= before.retries + 8);
+    assert!(after.busy_exhausted >= before.busy_exhausted + 4);
+    assert!(
+        after.elapsed_buckets.iter().sum::<u64>() >= before.elapsed_buckets.iter().sum::<u64>() + 4
+    );
     assert_eq!(
         writer
             .load_ui_preferences_payload()
@@ -288,15 +340,26 @@ fn ordinary_retry_real_shared_cache_locked_preserves_code_and_returns_without_re
     connection.busy_timeout(Duration::from_millis(800)).unwrap();
     let rival = Connection::open_with_flags(&path, flags).unwrap();
     rival.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let metrics = metrics::AcquisitionMetrics::new();
     let mut retries = 0;
     assert!(matches!(
-        begin_with_backoff(&connection, |_| retries += 1),
+        begin_observed(&connection, |_| retries += 1, &metrics),
         Err(LibraryError::OrdinaryWriteContention {
             attempts: 1,
             sqlite_code: ffi::SQLITE_LOCKED_SHAREDCACHE
         })
     ));
     assert_eq!(retries, 0);
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        (
+            snapshot.attempts,
+            snapshot.retries,
+            snapshot.contention_not_retried
+        ),
+        (1, 0, 1)
+    );
+    assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 1);
     assert!(connection.is_autocommit());
     assert_eq!(
         connection
