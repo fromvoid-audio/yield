@@ -35,8 +35,8 @@ matching release with identical identity and file names/hashes/sizes. Existing
 markdown changelog response/link/content checks also remain required.
 
 Missing, shortened, substituted, duplicate, malformed or overflowing fields reject
-publication success. Metadata responses are limited to 512 KiB; parser depth is
-at most 16, strings at most 16 KiB, catalog releases at most 512, and file inventories
+publication success. Metadata responses are limited to 512 KiB; the identity-response
+parser limits depth to 16, strings to 16 KiB, catalog releases to 512, and file inventories
 at most 16. Every publisher metadata GET/PUT, including pre-commit catalog and historical
 changelog downloads, uses the existing finite curl connect/total deadlines and retry
 policy. The assembler receives bounded local files in this path; it performs no
