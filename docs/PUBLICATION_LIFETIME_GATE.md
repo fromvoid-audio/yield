@@ -72,6 +72,28 @@ Staging replacement is rejection or retained uncertainty, never publication of
 the replacement. Root retirement runs on the same file worker, so it cannot
 interleave with a native call; source retirement retains its independent gate.
 
+Retaining a charge is not a fresh physical free-space observation. The shared
+admission state also carries, for each publication's bound volume, a checked
+ledger generation and current aggregate incremental charge total, derived only
+from the actor's actual provider. Capacity mutations mark this mirror pending
+before changing the provider, then publish the exact checked total and advance
+its generation; unknown outcomes keep admission closed. Do not expose a setter
+to callers or copy the provider ledger to a worker. At most 32 bound-volume
+entries fit the slot registry; use the existing allocation-class accounting.
+
+Before slot entry, the worker captures that generation, obtains fresh qualified
+native volume/allocation facts through a private retained descriptor capsule,
+and revalidates it against the same volume/reserve incarnation. Native reads
+occur outside admission/slot mutexes. Final entry requires the mirror not
+pending, unchanged generation, correct allocation unit, full protected floor
+and enough available bytes for the actual current incremental charge total.
+Unknown/replaced/unsupported facts reject entry. The capsule retains genuine
+native provenance; stored facts, a UUID or a decoded qualification result cannot
+construct it. Its owner stays alive through the runtime resource guard. This
+capsule/interface and mirror are required production work in OPT-2215/2218;
+there is no qualified Linux positive provider asserted here. Namespace metadata
+allocation must also have its actual bound/charge; unknown bounds reject entry.
+
 ## State, entry and cancellation
 
 A short slot mutex protects `Issued`, `Entered`, `ClosedBeforeEntry`,
