@@ -330,6 +330,91 @@ impl std::fmt::Debug for SourcePublicationFence {
 }
 
 impl SourcePublicationFence {
+    // Read the complete audit/revision triple through the existing retained control connection.
+    // Length/row limits apply before materialization, including corrupted legacy metadata tables.
+    pub(crate) fn read_reference_audit(
+        &self,
+    ) -> Result<
+        (crate::sample_sources::reconciliation::RootIdentity, u64),
+        super::SourceReferenceFenceError,
+    > {
+        use super::{
+            META_LAST_AUTHORITATIVE_AUDIT_REVISION as AUDIT,
+            META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY as ROOT,
+            SourceReferenceFenceError as Error,
+        };
+        self.validate()?;
+        let lease = self
+            .source_lease
+            .upgrade()
+            .ok_or(SourcePublicationFenceError::LeaseDropped)?;
+        let rows = {
+            let control = lease.control_connection.lock().map_err(|_| {
+                SourcePublicationFenceError::Lease(SourceLeaseError::ControlUnavailable)
+            })?;
+            lease
+                .validate_control_connection(&control)
+                .map_err(SourcePublicationFenceError::Lease)?;
+            let mut stmt = control.prepare("SELECT CASE WHEN length(CAST(key AS BLOB)) <= 64 THEN key END, CASE WHEN length(CAST(value AS BLOB)) BETWEEN 1 AND CASE WHEN key = ?1 THEN 24576 ELSE 20 END THEN value END FROM metadata WHERE key IN (?1, ?2, 'revision') ORDER BY key LIMIT 4").map_err(super::SourceDbError::from)?;
+            let values = stmt
+                .query_map(params![ROOT, AUDIT], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                })
+                .map_err(super::SourceDbError::from)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(super::SourceDbError::from)?;
+            lease
+                .validate_control_connection(&control)
+                .map_err(SourcePublicationFenceError::Lease)?;
+            values
+        };
+        self.validate()?;
+        if rows.len() != 3 {
+            return Err(Error::MalformedAudit);
+        }
+        let mut root = None;
+        let mut audit = None;
+        let mut current = None;
+        for (key, value) in rows {
+            let key = key.ok_or(Error::MalformedAudit)?;
+            let value = value.ok_or(Error::MalformedAudit)?;
+            let slot = match key.as_str() {
+                ROOT => &mut root,
+                AUDIT => &mut audit,
+                "revision" => &mut current,
+                _ => return Err(Error::MalformedAudit),
+            };
+            if slot.replace(value).is_some() {
+                return Err(Error::MalformedAudit);
+            }
+        }
+        let root: Vec<u8> = serde_json::from_str(&root.ok_or(Error::MalformedAudit)?)
+            .map_err(|_| Error::MalformedAudit)?;
+        let parse = |raw: Option<String>| -> Result<u64, Error> {
+            raw.ok_or(Error::MalformedAudit)?
+                .parse::<u64>()
+                .ok()
+                .filter(|v| *v <= i64::MAX as u64)
+                .ok_or(Error::MalformedAudit)
+        };
+        let revision = parse(current)?;
+        if parse(audit)? != revision
+            || root.is_empty()
+            || root.len() > 4096
+            || root.as_slice() != lease.media_root_binding().identity().as_bytes()
+        {
+            return Err(Error::MalformedAudit);
+        }
+        self.validate()?;
+        Ok((
+            crate::sample_sources::reconciliation::RootIdentity::from_bytes(root),
+            revision,
+        ))
+    }
+
     /// Return the durable lease epoch captured by this fence.
     pub(crate) const fn lease_epoch(&self) -> i64 {
         self.lease_epoch

@@ -140,3 +140,21 @@ The compatibility fixture below demonstrates the current helper's lost-result an
 old-key-reuse hazard. It does not implement the proposed receipt or live source fences.
 Linux can build and test all the preparation/global storage work. Native owner and
 filesystem qualification needs scoped macOS/Windows issues after concrete code exists.
+
+## Source read-fence implementation (OPT-2050)
+
+`SourceWriter::reference_read_fence` issues `SourceReferenceFence` from its retained
+source/profile/database ownership and a bounded audit read through the existing source
+lease control connection. A private writer-instance weak token ends the observation on
+handoff/close even if another lifecycle reuses the same database/lease. Metadata row,
+key and value bounds precede allocation; a single read captures current revision and
+complete-audit root/revision, rejects ambiguity/malformed values, and checks the physical
+root and retained ownership before and after readback. Validation neither renews the
+lease nor reopens a path. Current-revision equality and owner liveness remain required
+at each consuming boundary. The source ID and lifecycle are issued by the writer;
+this does not invent a durable source-ID metadata row or grant file effects.
+
+Actual owner tests cover live issuance, source-owner curation changing the revision,
+writer handoff/new lifecycle with a reused lease, no renewal, oversized/ambiguous metadata,
+expired lease and portable root/database replacement. Native regression remains separate.
+This prepares OPT-1643; its global snapshot/rekey/immutable receipt is still required.
