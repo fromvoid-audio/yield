@@ -30,6 +30,7 @@ pub struct GlobalAdmissionMetricsSnapshot {
 
 #[derive(Default)]
 pub(super) struct AdmissionMetrics {
+    pub(super) dispatch: std::sync::Arc<super::dispatch_metrics::DispatchMetrics>,
     outcomes: [AtomicU64; 5],
     waits: [AtomicU64; 5],
 }
