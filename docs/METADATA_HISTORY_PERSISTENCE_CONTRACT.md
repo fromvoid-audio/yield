@@ -37,7 +37,7 @@ projections before allocating Rust payloads. No opaque unbounded JSON field.
 | History identity | Owner-issued random 128-bit ID, format version, stable profile-root identity, source ID, media-root identity, database-root binding and database-object identity. |
 | Membership payload | One fixed collection slot; at most 128 unique validated relative paths; exact before and after bits for that slot only; bounded presentation observations. |
 | Settled state | Original commit revision, latest committed continuation revision, monotonic direction generation, applied/undone position, and eligibility/invalidation reason. |
-| Pending direction | Owner-issued attempt ID, history ID, expected direction generation and revision, apply/undo/redo kind, canonical payload digest and admitted requirement identity. |
+| Pending direction | Journal OperationId/participant/work-unit identity, owner-issued attempt ID, history ID, expected direction generation and revision, apply/undo/redo kind, canonical payload digest and admitted requirement identity. |
 | Receipt | Attempt ID/digest, direction generation, committed revision, audited directory generation, exact resulting membership rows and settled direction. |
 
 Keep at most 128 settled records and 16 MiB of serialized owned payload per source,
@@ -101,8 +101,14 @@ boolean recovery flag or merely retained guard
 substitutes for a registered requirement/reservation. The implementation must
 either provide that admission or return a typed unavailable/rejected outcome.
 
-Prepare one durable pending attempt on the source owner before any membership
-effect. Its bounded payload includes the before bits read by that owner under
+Use an explicit versioned metadata-history command in the existing journal
+preparation/codec/capacity boundary. A history ID is not the journal OperationId;
+do not relabel this command as a tag or physical CreateFile operation. Freeze the
+exact history proposal and settle the existing journal admission/claims first,
+then prepare one durable pending attempt on the source owner before any membership
+effect. Journal intent and source pending state have ordered acknowledgements,
+not a cross-database atomic commit. Lost acknowledgement at either stage must
+reconcile that existing operation, never allocate a replacement identity. Its bounded payload includes the before bits read by that owner under
 the requested exact revision, after bits and presentation observations. Intent
 persistence itself is admitted SQL; it does not change the content revision or
 claim membership committed. Only after intent commit return the admitted attempt
@@ -166,7 +172,8 @@ writable recovery transition separately obtains fresh owner authority.
 | Matching committed receipt and history state | Report the completed direction once; recover projection only if current authority/revision still matches. Never rerun the membership mutation. |
 | Pending intent, no receipt, unchanged expected revision/bits | Report prepared but uncommitted. Offer explicit admitted completion/cancellation; do not auto-execute an edit after restart. |
 | Pending intent with conflicting or malformed evidence | Keep unresolved; block conflicting mutation and expose a fixed recovery reason. Absence of a UI event is not rollback proof. |
-| Missing pending intent before any admitted ID was returned | No history mutation was admitted. Treat lost UI candidate as unavailable, not a durable edit. |
+| No admitted journal intent and no source pending/receipt, with definite pre-ID rejection | No history mutation was admitted. A lost UI candidate does not constitute a durable edit. |
+| Known journal intent, missing source pending/receipt | Retain the admitted operation and reconcile source preparation through its frozen plan. No replacement OperationId, assumed rollback or membership replay. |
 | Stale/replaced/uncertain source or profile | No continuation or replay; retain bounded diagnostic evidence with no authority-bearing paths in metrics. |
 | Receipt read unavailable, schema missing or size overflow | Typed unavailable/unresolved state; never convert to no history or uncommitted success. |
 
