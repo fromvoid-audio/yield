@@ -320,7 +320,7 @@
       "state": "gap",
       "handler": null,
       "automated_evidence": [],
-      "owner": "OPT-2007",
+      "owner": "OPT-2017",
       "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
@@ -346,7 +346,7 @@
       "state": "gap",
       "handler": null,
       "automated_evidence": [],
-      "owner": "OPT-2007",
+      "owner": "OPT-2018",
       "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
@@ -355,7 +355,7 @@
       "state": "gap",
       "handler": null,
       "automated_evidence": [],
-      "owner": "OPT-2007",
+      "owner": "OPT-2019",
       "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
@@ -1469,20 +1469,60 @@
     },
     {
       "message": "GuiMessage::ResizeFolder",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/view.rs",
+        "symbol": "begin_pane_resize"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "workspace_resize_rails_follow_pointer_drags"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "sidebar_resize_retires_on_viewport_or_text_scale_change"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "workspace_resize_focus_loss_restores_preference"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "workspace_resize_window_deactivation_restores_preference"
+        }
+      ],
       "owner": "OPT-2007",
-      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "note": "Existing session-only sidebar/waveform pointer rails use shared bounded drag state. Focus/window loss and viewport/text-scale changes cancel and restore prior preferences. Simulated GPUI fixtures cover these paths; native pointer/AX acceptance remains OPT-2020/2009. Independent collections/filter/metadata section sizing remains OPT-2017/2018/2019.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
       "message": "GuiMessage::ResizeWaveformPanel",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/view.rs",
+        "symbol": "begin_pane_resize"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "workspace_resize_rails_follow_pointer_drags"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "sidebar_resize_retires_on_viewport_or_text_scale_change"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "workspace_resize_focus_loss_restores_preference"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "workspace_resize_window_deactivation_restores_preference"
+        }
+      ],
       "owner": "OPT-2007",
-      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "note": "Existing session-only sidebar/waveform pointer rails use shared bounded drag state. Focus/window loss and viewport/text-scale changes cancel and restore prior preferences. Simulated GPUI fixtures cover these paths; native pointer/AX acceptance remains OPT-2020/2009. Independent collections/filter/metadata section sizing remains OPT-2017/2018/2019.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
