@@ -106,6 +106,13 @@ all origin paths reach the requested endpoint through validated receipts.
 Direction reversal never adds the original uncommitted suffix. An empty eligible
 subset is a local endpoint transition, not a fabricated SQL receipt.
 
+For example, original batches A and B commit and C fails: origin committed is
+A+B. Undo commits A's inverse and fails at B: currently applied is B, and this
+partial record blocks older directions. Resume undo submits only B's inverse;
+reverse that partial undo submits only A's after bits. At the undone endpoint,
+redo covers A+B. C remains outside every direction, even if its current bits
+happen to match the original desired value.
+
 ## Refencing and uncertainty
 
 Known terminal failure and an acknowledged prefix permit preparation of a fresh
