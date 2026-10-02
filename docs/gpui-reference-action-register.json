@@ -352,11 +352,27 @@
     },
     {
       "message": "FolderBrowserMessage::ResizeMetadataPanel",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/metadata_panel.rs",
+        "symbol": "render"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/metadata_panel.rs",
+          "symbol": "metadata_height_keeps_a_scroll_body_and_reserves_sibling_space"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/metadata_panel.rs",
+          "symbol": "metadata_rail_pointer_commit_cancel_and_overflow_are_presentation_only"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/metadata_panel.rs",
+          "symbol": "metadata_resize_escape_and_viewport_changes_restore_preference"
+        }
+      ],
       "owner": "OPT-2019",
-      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "note": "Bounded session-only height for existing tag editor/completion/chip controls; pointer header uses shared pane drag and cancellation fences. Isolated rendered GPUI fixture checks pointer commit/cancel and body scroll reachability at both scales; full Browser fixture checks Escape and viewport retirement. No missing tag mutation contract or full reference metadata parity is claimed. Native pointer/AX acceptance remains OPT-2020/2009.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {

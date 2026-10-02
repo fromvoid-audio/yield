@@ -115,9 +115,10 @@ const MIN_LIST_ROWS: f32 = 4.0;
 const PANE_RESIZE_RAIL: f32 = 6.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PaneAxis {
+pub(super) enum PaneAxis {
     Sidebar,
     Waveform,
+    Metadata,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -512,7 +513,7 @@ impl Browser {
             .into_any_element()
     }
 
-    fn begin_pane_resize(
+    pub(super) fn begin_pane_resize(
         &mut self,
         axis: PaneAxis,
         position: Point<Pixels>,
@@ -522,6 +523,14 @@ impl Browser {
         self.cancel_pane_resize(cx);
         let theme = active(cx);
         let (start_size, previous_preference) = match axis {
+            PaneAxis::Metadata => (
+                super::metadata_panel::height(
+                    self.preferred_metadata_height,
+                    f32::from(window.bounds().size.height),
+                    theme,
+                ),
+                self.preferred_metadata_height,
+            ),
             PaneAxis::Sidebar => (
                 sidebar_width(
                     self.preferred_sidebar_width,
@@ -555,7 +564,7 @@ impl Browser {
             gesture: ResizeDrag::begin(
                 match axis {
                     PaneAxis::Sidebar => f32::from(position.x),
-                    PaneAxis::Waveform => f32::from(position.y),
+                    PaneAxis::Waveform | PaneAxis::Metadata => f32::from(position.y),
                 },
                 start_size,
                 previous_preference,
@@ -565,7 +574,7 @@ impl Browser {
         });
     }
 
-    fn update_pane_resize(
+    pub(super) fn update_pane_resize(
         &mut self,
         position: Point<Pixels>,
         window: &Window,
@@ -580,6 +589,13 @@ impl Browser {
         }
         let theme = active(cx);
         match drag.axis {
+            PaneAxis::Metadata => {
+                self.preferred_metadata_height = Some(super::metadata_panel::height(
+                    Some(drag.gesture.requested_size(f32::from(position.y))),
+                    f32::from(window.bounds().size.height),
+                    theme,
+                ));
+            }
             PaneAxis::Sidebar => {
                 let requested = drag.gesture.requested_size(f32::from(position.x));
                 self.preferred_sidebar_width = Some(sidebar_width(
@@ -611,7 +627,7 @@ impl Browser {
         cx.notify();
     }
 
-    fn finish_pane_resize(
+    pub(super) fn finish_pane_resize(
         &mut self,
         position: Point<Pixels>,
         window: &Window,
@@ -626,6 +642,9 @@ impl Browser {
             return;
         };
         match drag.axis {
+            PaneAxis::Metadata => {
+                self.preferred_metadata_height = drag.gesture.previous_preference()
+            }
             PaneAxis::Sidebar => self.preferred_sidebar_width = drag.gesture.previous_preference(),
             PaneAxis::Waveform => {
                 self.preferred_waveform_height = drag.gesture.previous_preference()
@@ -2450,6 +2469,7 @@ impl Render for Browser {
                         self,
                         theme.clone(),
                         motion_frame,
+                        f32::from(window.bounds().size.height),
                         cx,
                     ))
                     .child(self.render_sidebar_resize_rail(theme.clone(), cx))

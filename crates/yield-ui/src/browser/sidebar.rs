@@ -17,11 +17,8 @@ use crate::theme::{color, transparent};
 
 use super::curation;
 use super::motion::{self, MotionFrame};
-use super::tag_chips;
-use super::tag_completion;
 use super::tag_filter;
 use super::tag_library;
-use super::tags;
 use super::{Browser, SourceReorderDrag};
 
 #[derive(Clone)]
@@ -213,6 +210,7 @@ pub(super) fn render(
     browser: &Browser,
     theme: Theme,
     motion_frame: MotionFrame,
+    viewport_height: f32,
     cx: &mut Context<Browser>,
 ) -> impl gpui::IntoElement {
     if tag_library::is_open(browser) {
@@ -860,9 +858,12 @@ pub(super) fn render(
         .child(curation::render_rating_filters(browser, theme.clone(), cx))
         .child(super::curation_queue::render(browser, theme.clone(), cx))
         .child(tag_filter::render(browser, theme.clone(), cx))
-        .child(tags::render(browser, theme.clone(), cx))
-        .child(tag_completion::render(browser, theme.clone(), cx))
-        .child(tag_chips::render(browser, theme.clone(), cx))
+        .child(super::metadata_panel::render(
+            browser,
+            theme.clone(),
+            viewport_height,
+            cx,
+        ))
         .child(bottom_controls);
     div()
         .flex()
