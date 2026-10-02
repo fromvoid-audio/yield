@@ -316,11 +316,20 @@ fn prepare(
     expected: &SourceRevision,
     deadline: Instant,
 ) -> Result<(SourceRevision, u64), SourceWalPreparationError> {
-    validate(held.writer(), expected, deadline)?;
-    let connection = &held.writer().database.connection;
-    if !connection.is_autocommit() {
+    // Never adopt or roll back a transaction that predates this preparation.
+    if !held.writer().database.connection.is_autocommit() {
         return Err(SourceWalPreparationError::TransactionActive);
     }
+    let validated = validate(held.writer(), expected, deadline);
+    // The standalone bounded audit getter opens its own read transaction. If its
+    // rollback fails, retain that newly created transaction privately too; returning
+    // the writer would otherwise bypass confirmed cleanup before BEGIN IMMEDIATE.
+    held.reservation = !held.writer().database.connection.is_autocommit();
+    validated?;
+    if held.reservation {
+        return Err(SourceWalPreparationError::RollbackUnconfirmed);
+    }
+    let connection = &held.writer().database.connection;
     let timeout: u64 = connection.pragma_query_value(None, "busy_timeout", |r| r.get(0))?;
     held.restore_timeout = Some(Duration::from_millis(timeout));
     held.writer()

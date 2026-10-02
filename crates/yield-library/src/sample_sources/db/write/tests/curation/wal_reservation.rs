@@ -360,4 +360,79 @@ fn wal_reservation_failed_rollback_keeps_writer_inaccessible_until_confirmed_ret
     assert_eq!(writer.current_revision().unwrap(), expected);
 }
 
+#[test]
+fn wal_reservation_initial_audit_rollback_failure_never_returns_an_unconfirmed_writer() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    let (fixture, writer) = fixture();
+    let expected = writer.current_revision().unwrap();
+    let before = source_writer_state_snapshot(writer.catalog_database());
+    let deny = Arc::new(AtomicBool::new(true));
+    let hook_deny = deny.clone();
+    connection(&writer).authorizer(Some(move |context: AuthContext<'_>| {
+        if matches!(
+            context.action,
+            AuthAction::Transaction {
+                operation: TransactionOperation::Rollback
+            }
+        ) && hook_deny.load(Ordering::SeqCst)
+        {
+            Authorization::Deny
+        } else {
+            Authorization::Allow
+        }
+    }));
+    let failure = writer
+        .prepare_wal_reservation(&expected, deadline())
+        .unwrap_err();
+    let failure = match failure.into_writer() {
+        Err(failure) => failure,
+        Ok(_) => panic!("initial audit rollback must be confirmed before writer reuse"),
+    };
+    assert!(matches!(
+        failure.error(),
+        SourceWalPreparationError::RollbackUnconfirmed
+    ));
+    assert_eq!(source_writer_state_snapshot(&fixture.database), before);
+    deny.store(false, Ordering::SeqCst);
+    let writer = failure.into_writer().unwrap();
+    assert!(connection(&writer).is_autocommit());
+    assert_eq!(writer.current_revision().unwrap(), expected);
+    writer
+        .prepare_wal_reservation(&expected, deadline())
+        .unwrap()
+        .abort()
+        .unwrap();
+}
+
+#[test]
+fn wal_reservation_rejects_existing_transaction_without_adopting_or_aborting_it() {
+    let (_fixture, writer) = fixture();
+    let expected = writer.current_revision().unwrap();
+    let before = source_writer_state_snapshot(writer.catalog_database());
+    connection(&writer)
+        .execute_batch("BEGIN IMMEDIATE")
+        .unwrap();
+    let other = external(&writer);
+    let failure = writer
+        .prepare_wal_reservation(&expected, deadline())
+        .unwrap_err();
+    assert!(matches!(
+        failure.error(),
+        SourceWalPreparationError::TransactionActive
+    ));
+    let writer = failure.into_writer().unwrap();
+    assert!(!connection(&writer).is_autocommit());
+    busy(other.execute_batch("BEGIN IMMEDIATE").unwrap_err());
+    connection(&writer).execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        source_writer_state_snapshot(writer.catalog_database()),
+        before
+    );
+    writer
+        .prepare_wal_reservation(&expected, deadline())
+        .unwrap()
+        .abort()
+        .unwrap();
+}
+
 mod vfs;
