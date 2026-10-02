@@ -19,6 +19,8 @@ use yield_session::{
 /// service here means a Browser window can be released without joining the profile-owned worker.
 pub(crate) struct SourceRegistryGlobal {
     service: Option<SourceRegistryService>,
+    #[cfg(test)]
+    catalog_fixture: Option<fixture::Catalog>,
     start_error: Option<String>,
     quit_subscription: Option<Subscription>,
 }
@@ -31,14 +33,29 @@ impl SourceRegistryGlobal {
         match SourceRegistryService::start() {
             Ok(service) => Self {
                 service: Some(service),
+                #[cfg(test)]
+                catalog_fixture: None,
                 start_error: None,
                 quit_subscription: None,
             },
             Err(error) => Self {
                 service: None,
+                #[cfg(test)]
+                catalog_fixture: None,
                 start_error: Some(error.to_string()),
                 quit_subscription: None,
             },
+        }
+    }
+
+    /// Exercise the real retained catalog owner without claiming native journal bootstrap.
+    #[cfg(test)]
+    pub(crate) fn for_catalog_fixture(catalog: fixture::Catalog) -> Self {
+        Self {
+            service: None,
+            catalog_fixture: Some(catalog),
+            start_error: None,
+            quit_subscription: None,
         }
     }
 
@@ -131,6 +148,10 @@ impl SourceRegistryGlobal {
 
     /// Return the current state of the independently-owned source catalog.
     pub(crate) fn catalog_status(&self) -> CatalogStatus {
+        #[cfg(test)]
+        if self.catalog_fixture.is_some() {
+            return CatalogStatus::Ready;
+        }
         self.service
             .as_ref()
             .map(SourceRegistryService::catalog_status)
@@ -214,6 +235,10 @@ impl SourceRegistryGlobal {
 
     /// Submit one typed catalog command through the profile-owned session service.
     pub(crate) fn submit_catalog(&self, command: CatalogCommand) -> Result<(), CatalogSubmitError> {
+        #[cfg(test)]
+        if let Some(catalog) = &self.catalog_fixture {
+            return fixture::submit(catalog, command);
+        }
         self.service
             .as_ref()
             .ok_or(CatalogSubmitError::Closed)?
@@ -256,6 +281,16 @@ impl SourceRegistryGlobal {
     /// Drain catalog events without waiting for the background worker.
     #[allow(dead_code)]
     pub(crate) fn drain_catalog_events(&self, events: &mut Vec<CatalogEvent>) -> bool {
+        #[cfg(test)]
+        if let Some(catalog) = &self.catalog_fixture {
+            for _ in 0..64 {
+                match catalog.try_recv_event() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => return false,
+                }
+            }
+            return true;
+        }
         let Some(service) = self.service.as_ref() else {
             return false;
         };
@@ -271,6 +306,16 @@ impl SourceRegistryGlobal {
 
     /// Drain catalog deliveries while retaining each source-publication fence for the browser.
     pub(crate) fn drain_catalog_deliveries(&self, deliveries: &mut Vec<CatalogDelivery>) -> bool {
+        #[cfg(test)]
+        if let Some(catalog) = &self.catalog_fixture {
+            for _ in 0..64 {
+                match catalog.try_recv_delivery() {
+                    Ok(delivery) => deliveries.push(delivery),
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => return false,
+                }
+            }
+            return true;
+        }
         let Some(service) = self.service.as_ref() else {
             return false;
         };
@@ -312,6 +357,10 @@ impl SourceRegistryGlobal {
 
     /// Request the profile worker to drain and close during application quit.
     pub(crate) fn shutdown(&mut self) {
+        #[cfg(test)]
+        if let Some(catalog) = self.catalog_fixture.take() {
+            catalog.shutdown();
+        }
         if let Some(mut service) = self.service.take() {
             let shutdown_result = service.shutdown();
             log_shutdown_curation_failures(&service);
@@ -1104,4 +1153,25 @@ pub(crate) fn vocabulary_mutation_is_unconfirmed(
             | yield_library::sample_sources::LibraryError::ProfileOwnershipChanged { .. }
             | yield_library::sample_sources::LibraryError::Sql(_)
     )
+}
+
+#[cfg(test)]
+mod fixture {
+    use super::*;
+
+    pub(super) type Catalog = yield_catalog::CatalogService;
+
+    pub(super) fn submit(
+        catalog: &Catalog,
+        command: CatalogCommand,
+    ) -> Result<(), CatalogSubmitError> {
+        catalog.submit(command).map_err(|error| match error {
+            yield_catalog::CatalogSubmitError::Full => CatalogSubmitError::Full,
+            yield_catalog::CatalogSubmitError::Closed => CatalogSubmitError::Closed,
+            yield_catalog::CatalogSubmitError::InvalidCurationRequest(error) => {
+                CatalogSubmitError::InvalidCurationRequest(error)
+            }
+            error => CatalogSubmitError::Unavailable(error.to_string()),
+        })
+    }
 }
