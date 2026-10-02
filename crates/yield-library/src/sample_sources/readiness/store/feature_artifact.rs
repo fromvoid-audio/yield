@@ -189,7 +189,7 @@ pub(super) fn lookup(
     ownership: &ReadinessOwnership<'_>,
     key: &FeatureArtifactKey,
 ) -> Result<Option<FeatureArtifactPayload>, ReadinessError> {
-    ownership.validate(connection)?;
+    ownership.validate_artifact_read_only(connection)?;
     if !current_target(connection, key)? {
         return Ok(None);
     }
@@ -201,7 +201,7 @@ pub(super) fn lookup(
             .then(|| FeatureArtifactPayload::decode(bytes))
             .flatten()
     });
-    ownership.validate(connection)?;
+    ownership.validate_artifact_read_only(connection)?;
     Ok(payload)
 }
 
@@ -212,7 +212,7 @@ pub(super) fn lookup_target(
 ) -> Result<Option<(FeatureArtifactKey, FeatureArtifactPayload)>, ReadinessError> {
     let seed = FeatureArtifactPayload::from_v1_vector(&[0.0; 183])?;
     let probe = FeatureArtifactKey::for_payload(target, &seed)?;
-    ownership.validate(connection)?;
+    ownership.validate_artifact_read_only(connection)?;
     if !current_target(connection, &probe)? {
         return Ok(None);
     }
@@ -220,7 +220,7 @@ pub(super) fn lookup_target(
         Health::Healthy(key, payload) if marker_matches(connection, &key)? => Some((key, payload)),
         _ => None,
     };
-    ownership.validate(connection)?;
+    ownership.validate_artifact_read_only(connection)?;
     Ok(result)
 }
 

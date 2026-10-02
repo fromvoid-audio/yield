@@ -468,6 +468,19 @@ impl<'a> ReadinessOwnership<'a> {
         }
     }
 
+    /// Artifact observations use strict read validation for every owned acquisition.
+    /// Plain unowned SQL fixtures remain test-only observations, never owner qualifications.
+    pub(crate) fn validate_artifact_read_only(
+        &self,
+        connection: &Connection,
+    ) -> Result<(), crate::sample_sources::readiness::ReadinessError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if !self.has_owned_capability() {
+            return self.validate(connection);
+        }
+        self.validate_read_only(connection)
+    }
+
     /// Validate retained ownership without renewing the source lease.
     ///
     /// Read-only source qualifications must use this strict path even in test builds. The

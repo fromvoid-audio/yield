@@ -1297,6 +1297,7 @@ impl SourceWriter {
 
     /// Lookup validated immutable bytes under the current owner and exact content target.
     /// Missing, stale or corrupt bytes are unavailable; this command never marks work ready.
+    /// Read-only owner checks never renew an idle lease through the control writer.
     pub fn lookup_feature_artifact(
         &mut self,
         expected: &SourceRevision,
@@ -1306,7 +1307,7 @@ impl SourceWriter {
         self.validate_readiness_command(expected, key.target())?;
         Ok(self
             .database
-            .readiness_store()?
+            .readiness_store_read_only()?
             .lookup_feature_artifact(key)?)
     }
 
@@ -1325,7 +1326,7 @@ impl SourceWriter {
         self.validate_readiness_command(expected, target)?;
         Ok(self
             .database
-            .readiness_store()?
+            .readiness_store_read_only()?
             .lookup_feature_artifact_for_target(target)?)
     }
 

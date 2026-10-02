@@ -4336,6 +4336,7 @@ fn tag_assignment_selection_rejects_replaced_media_root_and_expired_lease() {
     ));
 }
 mod feature_artifacts;
+mod feature_lookup_read_only;
 
 #[test]
 fn bounded_metadata_corruption_rejects_actual_writer_revision_and_tag_selection_without_edits() {

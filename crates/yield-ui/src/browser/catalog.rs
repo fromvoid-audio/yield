@@ -826,7 +826,7 @@ impl Browser {
                 super::tag_filter::cancel_for_source_change(self);
                 false
             }
-            CatalogEvent::Closed => false,
+            CatalogEvent::SimilarityCompleted { .. } | CatalogEvent::Closed => false,
         }
     }
 
@@ -1125,6 +1125,9 @@ pub(super) fn submit_catalog_command(
 
 fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
     match event {
+        CatalogEvent::SimilarityCompleted { request, .. } => {
+            Some((request.source_id().clone(), request.lifecycle_generation()))
+        }
         CatalogEvent::Registered {
             source_id,
             lifecycle_generation,
@@ -1542,6 +1545,36 @@ mod tests {
             catalog_event_identity(&stale),
             catalog_event_identity(&event)
         );
+    }
+
+    #[test]
+    fn similarity_dispatch_event_uses_exact_captured_source_lifecycle() {
+        use yield_session::{
+            SimilarityAspect, SimilarityCancellation, SimilarityDispatchFailure,
+            SourceSimilarityRequest,
+        };
+        let source = SourceId::from_string("similarity-event");
+        let request = SourceSimilarityRequest::new(
+            source.clone(),
+            8,
+            20,
+            30,
+            "anchor.wav".into(),
+            &["candidate.wav".into()],
+            SimilarityAspect::Timbre,
+        )
+        .unwrap();
+        let event = yield_session::CatalogEvent::SimilarityCompleted {
+            request,
+            cancellation: SimilarityCancellation::new(),
+            result: Err(SimilarityDispatchFailure::AnchorUnavailable),
+        };
+        assert_eq!(catalog_event_identity(&event), Some((source.clone(), 8)));
+        assert_ne!(catalog_event_identity(&event), Some((source, 7)));
+        assert!(
+            project_catalog_event(event, PathBuf::from("/unused"), &AtomicBool::new(false))
+                .is_err()
+        ); // transport alone invents no rendered result
     }
 
     #[test]

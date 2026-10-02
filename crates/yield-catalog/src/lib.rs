@@ -68,6 +68,7 @@ mod display_labels;
 mod feature_job;
 mod feature_progress;
 mod feature_request;
+mod similarity_dispatch;
 mod similarity_query;
 pub use feature_job::{
     ComputedFeatureJob, FeatureJobFailure, FeatureJobOutcome, PreparedFeatureJob,
@@ -76,6 +77,9 @@ pub use feature_job::{
 pub use feature_progress::{FeatureAnalysisPhase, FeaturePhaseMeasurement};
 pub use feature_request::{
     FeatureAnalysisBlocker, FeatureAnalysisCancellation, FeatureAnalysisState,
+};
+pub use similarity_dispatch::{
+    SimilarityCancellation, SimilarityDispatchFailure, SourceSimilarityRequest,
 };
 pub use similarity_query::{
     SimilarityCandidateOutcome, SimilarityQueryError, SourceSimilarityQuery,
@@ -484,6 +488,13 @@ pub use curation::{
 /// A typed operation accepted by the catalog worker.
 #[derive(Debug)]
 pub enum CatalogCommand {
+    /// Read one bounded explicit anchor/aspect set on the retained owner.
+    RequestSimilarity {
+        /// Immutable validated source/path/query binding.
+        request: SourceSimilarityRequest,
+        /// Cancellation retained through queued delivery.
+        cancellation: SimilarityCancellation,
+    },
     /// Compute one bounded WAV feature job at an exact retained source revision.
     RequestFeatureAnalysis {
         /// Stable registered source.
@@ -1328,6 +1339,15 @@ pub enum CatalogPublicationStatus {
 /// Worker output carrying source identity, lifecycle generation, and revision fences.
 #[derive(Debug)]
 pub enum CatalogEvent {
+    /// Exact bounded similarity result or truthful failure; no readiness mutation.
+    SimilarityCompleted {
+        /// Exact captured request, required to match before rendering.
+        request: SourceSimilarityRequest,
+        /// Cheap delivery/render cancellation fence.
+        cancellation: SimilarityCancellation,
+        /// Owner-validated existing descriptor result.
+        result: Result<SourceSimilarityResult, SimilarityDispatchFailure>,
+    },
     /// One request's truthful state; ready requires validated durable feature bytes.
     FeatureAnalysisState {
         /// Stable source.
@@ -1773,6 +1793,10 @@ impl CatalogDelivery {
             {
                 return None;
             }
+        }
+        if matches!(&event, CatalogEvent::SimilarityCompleted { cancellation, .. } if cancellation.is_cancelled())
+        {
+            return None;
         }
         if publication_fence
             .as_ref()
@@ -2227,6 +2251,7 @@ impl EventReservation<'_> {
 
 fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> {
     match command {
+        CatalogCommand::RequestSimilarity { .. } => {}
         CatalogCommand::RequestFeatureAnalysis {
             source_id,
             relative_path,
@@ -2632,6 +2657,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
 
         CatalogCommand::Register { .. } | CatalogCommand::RegisterVerified { .. } => 2,
         CatalogCommand::RequestAudit { .. }
+        | CatalogCommand::RequestSimilarity { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestIndexPage { .. }
         | CatalogCommand::RequestIndexInspection { .. }
@@ -2681,6 +2707,7 @@ fn command_curation_update_count(command: &CatalogCommand) -> usize {
 
 fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
     match command {
+        CatalogCommand::RequestSimilarity { request, .. } => request.input_bytes(),
         CatalogCommand::ConsumeReplay { submission } => submission.input_bytes(),
         CatalogCommand::RequestIndexInspection { handle, .. } => handle.input_bytes(),
         CatalogCommand::RequestIndexPage {
@@ -2754,6 +2781,7 @@ fn selected_paths_input_bytes(relative_paths: &[PathBuf]) -> usize {
 
 fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, CatalogSubmitError> {
     match command {
+        CatalogCommand::RequestSimilarity { .. } => Ok(similarity_dispatch::MAX_RESULT_BYTES),
         CatalogCommand::RequestIndexPage { .. } | CatalogCommand::RequestIndexInspection { .. } => {
             Ok(MAX_INDEX_PAGE_PAYLOAD_BYTES)
         }
@@ -2845,7 +2873,8 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
             cancellation: cancellation.clone(),
         },
         CatalogCommand::RequestWavMetadata { .. }
-        | CatalogCommand::RequestFeatureAnalysis { .. } => AdmissionAction::RequestWavMetadata,
+        | CatalogCommand::RequestFeatureAnalysis { .. }
+        | CatalogCommand::RequestSimilarity { .. } => AdmissionAction::RequestWavMetadata,
         CatalogCommand::RequestIndexPage {
             source_id,
             lifecycle_generation,
@@ -3864,6 +3893,13 @@ fn handle_command(
                 test_gate,
                 watcher_mode,
             );
+            false
+        }
+        CatalogCommand::RequestSimilarity {
+            request,
+            cancellation,
+        } => {
+            similarity_dispatch::dispatch(request, cancellation, reservation, admission, sources);
             false
         }
         CatalogCommand::RequestFeatureAnalysis {
@@ -15762,5 +15798,6 @@ mod tests {
     mod feature_progress_tests;
     #[cfg(target_os = "linux")]
     mod feature_request_tests;
+    mod similarity_dispatch_tests;
     mod similarity_query_tests;
 }
