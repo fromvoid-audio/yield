@@ -330,6 +330,12 @@ impl std::fmt::Debug for SourcePublicationFence {
 }
 
 impl SourcePublicationFence {
+    pub(crate) fn profile_acquisition_identity(&self) -> Option<String> {
+        self.source_lease
+            .upgrade()
+            .map(|lease| lease.profile_guard.owner_identity().to_owned())
+    }
+
     // Read the complete audit/revision triple through the existing retained control connection.
     // Length/row limits apply before materialization, including corrupted legacy metadata tables.
     pub(crate) fn read_reference_audit(

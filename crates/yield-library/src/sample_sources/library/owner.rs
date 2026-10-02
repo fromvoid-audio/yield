@@ -9,6 +9,10 @@ use thiserror::Error;
 
 use super::connection::LibraryDatabase;
 use super::error::LibraryError;
+use super::harvest_authored::{
+    HarvestAuthoredRequest, HarvestAuthoredResult, HarvestAuthoredSnapshot,
+    HarvestAuthoredSnapshotRequest,
+};
 use super::harvest_copy::{HarvestCopyRequest, HarvestCopyResult};
 use super::mutation_context::{
     GlobalMutationCompletion, GlobalMutationKind, GlobalMutationRequest, ProfileAcquisitionId,
@@ -282,6 +286,15 @@ pub enum GlobalLibraryWriterStartError {
 }
 
 enum WriterCommand {
+    HarvestAuthored {
+        request: HarvestAuthoredRequest,
+        result: SyncSender<Result<HarvestAuthoredResult, LibraryError>>,
+    },
+    HarvestAuthoredSnapshot {
+        request: HarvestAuthoredSnapshotRequest,
+        result: SyncSender<Result<HarvestAuthoredSnapshot, LibraryError>>,
+    },
+
     HarvestCopy {
         request: HarvestCopyRequest,
         result: SyncSender<Result<HarvestCopyResult, LibraryError>>,
@@ -353,6 +366,17 @@ enum WriterCommand {
 }
 
 enum WriterReply {
+    HarvestAuthored {
+        request: HarvestAuthoredRequest,
+        result: SyncSender<Result<HarvestAuthoredResult, LibraryError>>,
+        value: Result<HarvestAuthoredResult, LibraryError>,
+    },
+    HarvestAuthoredSnapshot {
+        request: HarvestAuthoredSnapshotRequest,
+        result: SyncSender<Result<HarvestAuthoredSnapshot, LibraryError>>,
+        value: Result<HarvestAuthoredSnapshot, LibraryError>,
+    },
+
     HarvestCopy {
         request: HarvestCopyRequest,
         value: Result<HarvestCopyResult, LibraryError>,
@@ -421,6 +445,30 @@ enum WriterReply {
 impl WriterReply {
     fn send(self) {
         match self {
+            Self::HarvestAuthored {
+                request,
+                result,
+                value,
+            } => {
+                let value = if value.is_ok() && request.validate_sources(false).is_err() {
+                    Err(LibraryError::HarvestAuthoredCommitUncertain)
+                } else {
+                    value
+                };
+                let _ = result.send(value);
+            }
+            Self::HarvestAuthoredSnapshot {
+                request,
+                result,
+                value,
+            } => {
+                let value = if value.is_ok() {
+                    request.validate_sources().and(value)
+                } else {
+                    value
+                };
+                let _ = result.send(value);
+            }
             Self::HarvestCopy {
                 request,
                 result,
@@ -498,6 +546,12 @@ impl WriterReply {
 
     fn send_error(self, error: LibraryError) {
         match self {
+            Self::HarvestAuthored { result, .. } => {
+                let _ = result.send(Err(error));
+            }
+            Self::HarvestAuthoredSnapshot { result, .. } => {
+                let _ = result.send(Err(error));
+            }
             Self::HarvestCopy { result, .. } => {
                 let _ = result.send(Err(error));
             }
@@ -802,6 +856,28 @@ impl GlobalLibraryWriter {
         Ok(result_rx)
     }
 
+    /// Dispatch one bounded source-fenced authored-state operation on the retained owner.
+    pub fn set_harvest_authored_state(
+        &self,
+        request: HarvestAuthoredRequest,
+    ) -> Result<Receiver<Result<HarvestAuthoredResult, LibraryError>>, GlobalLibraryWriterQueueError>
+    {
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::HarvestAuthored { request, result })?;
+        Ok(receiver)
+    }
+    /// Dispatch one bounded source-fenced authored-state operation on the retained owner.
+    pub fn harvest_authored_snapshot(
+        &self,
+        request: HarvestAuthoredSnapshotRequest,
+    ) -> Result<
+        Receiver<Result<HarvestAuthoredSnapshot, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::HarvestAuthoredSnapshot { request, result })?;
+        Ok(receiver)
+    }
     /// Commit one copy metadata outcome using genuine source/journal/global observations.
     pub fn apply_harvest_copy(
         &self,
@@ -1357,6 +1433,18 @@ fn execute_command(
     snapshot_fences: &mut SnapshotFences,
 ) -> WriterReply {
     match command {
+        WriterCommand::HarvestAuthored { request, result } => WriterReply::HarvestAuthored {
+            value: database.apply_harvest_authored(owner_identity, &request),
+            request,
+            result,
+        },
+        WriterCommand::HarvestAuthoredSnapshot { request, result } => {
+            WriterReply::HarvestAuthoredSnapshot {
+                value: database.harvest_authored_snapshot(owner_identity, &request),
+                request,
+                result,
+            }
+        }
         WriterCommand::HarvestCopy { request, result } => WriterReply::HarvestCopy {
             value: database.apply_harvest_copy(owner_identity, &request),
             request,
@@ -1487,6 +1575,12 @@ fn reject_remaining_profile_change(
 
 fn send_command_error(command: WriterCommand, error: LibraryError) {
     match command {
+        WriterCommand::HarvestAuthored { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        WriterCommand::HarvestAuthoredSnapshot { result, .. } => {
+            let _ = result.send(Err(error));
+        }
         WriterCommand::HarvestCopy { result, .. } => {
             let _ = result.send(Err(error));
         }

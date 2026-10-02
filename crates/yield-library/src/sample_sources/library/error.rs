@@ -9,6 +9,27 @@ use super::tag_vocabulary::ProfileTagVocabularyInputError;
 /// Errors returned when operating on the library database.
 #[derive(Debug, Error)]
 pub enum LibraryError {
+    /// Explicit authored-state proposal or source context invalid.
+    #[error("invalid Harvest authored-state input")]
+    HarvestAuthoredInput,
+    /// Explicit authored-state acquisition differs from current owner.
+    #[error("stale Harvest authored-state acquisition")]
+    HarvestAuthoredStaleOwner,
+    /// Explicit authored-state operation reused for changed immutable intent.
+    #[error("Harvest authored-state replay conflict")]
+    HarvestAuthoredReplayConflict,
+    /// Explicit authored-state receipt is malformed or ambiguous.
+    #[error("malformed Harvest authored-state receipt")]
+    HarvestAuthoredMalformedReceipt,
+    /// Explicit authored-state existing metadata malformed or ambiguous.
+    #[error("malformed Harvest authored-state graph")]
+    HarvestAuthoredMalformedGraph,
+    /// Explicit authored-state finite retention exhausted without evidence eviction.
+    #[error("Harvest authored-state receipt capacity exhausted")]
+    HarvestAuthoredReceiptCapacity,
+    /// Explicit authored-state commit may be durable; retry the original proposal.
+    #[error("Harvest authored-state acknowledgement uncertain; replay original proposal")]
+    HarvestAuthoredCommitUncertain,
     /// A copy metadata proposal violates exact bounded family/source contracts.
     #[error("invalid Harvest copy input")]
     HarvestCopyInput,

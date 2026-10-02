@@ -23,6 +23,8 @@ impl LibraryDatabase {
         self.connection
             .execute_batch(super::harvest_copy::CREATE_TABLE)?;
         self.connection
+            .execute_batch(super::harvest_authored::CREATE_TABLE)?;
+        self.connection
             .execute_batch(super::reference_participant::CREATE_TABLE)?;
         self.connection
             .execute_batch(super::operation_link_participant::CREATE_TABLE)?;

@@ -70,6 +70,10 @@ pub struct SourceFileObservation {
     fence: SourceReferenceFence,
 }
 impl SourceFileObservation {
+    pub(crate) fn profile_acquisition_identity(&self) -> Option<String> {
+        self.fence.profile_acquisition_identity()
+    }
+
     /// Exact validated UTF-8 key; no lossy pathname conversion.
     pub fn path(&self) -> &StoredRelativePath {
         &self.path

@@ -858,7 +858,7 @@ fn write_harvest_state_on_transaction(
     Ok(())
 }
 
-fn harvest_state_update_sql() -> &'static str {
+pub(super) fn harvest_state_update_sql() -> &'static str {
     "UPDATE harvest_files
      SET harvest_state = ?1,
          seen_at = CASE
