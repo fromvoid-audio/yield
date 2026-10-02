@@ -4404,3 +4404,6 @@ mod snapshot_read_only;
 mod snapshot_cursor;
 #[path = "curation/tag_admission_observation.rs"]
 mod tag_admission_observation;
+
+#[path = "curation/metadata_tag_commands.rs"]
+mod metadata_tag_commands;
