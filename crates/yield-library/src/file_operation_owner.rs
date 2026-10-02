@@ -5553,6 +5553,112 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual bounded queue/cancellation measurement (OPT-1736)"]
+    fn bounded_queue_cancellation_workload() {
+        use std::time::Instant;
+
+        let started = Instant::now();
+        for cycle in 0..8 {
+            let owner = FileOperationOwner::start().expect("measurement owner");
+            let registration = owner
+                .register_root_for_test(profile_fence(owner.owner_identity()), "profile")
+                .expect("measurement registration");
+            // Retain one owner through two windows, reaching its receipt bound.
+            // Each new owner is retired only after exact synthetic custody ack.
+            for (window, count) in [33, 31].into_iter().enumerate() {
+                owner.pause_before_execute_for_test();
+                let first = unsupported_effect(&owner, registration, EffectId::new());
+                let mut identities = vec![PendingEffectIdentity {
+                    operation_id: first.operation_id,
+                    participant_id: first.participant_id,
+                    effect_id: first.effect_id,
+                }];
+                let mut requests = vec![owner.submit(first).expect("first queues")];
+                owner.wait_until_worker_paused_for_test();
+                for _ in 1..count {
+                    let command = unsupported_effect(&owner, registration, EffectId::new());
+                    identities.push(PendingEffectIdentity {
+                        operation_id: command.operation_id,
+                        participant_id: command.participant_id,
+                        effect_id: command.effect_id,
+                    });
+                    requests.push(owner.submit(command).expect("bounded window queues"));
+                }
+                let pending = owner.pending_effects().len();
+                let charged =
+                    FILE_OPERATION_OWNER_MAX_INPUT_BYTES - owner.input_bytes_remaining_for_test();
+                let rejected = window == 0
+                    && matches!(
+                        owner.submit(unsupported_effect(&owner, registration, EffectId::new())),
+                        Err(FileOperationOwnerQueueError::Full)
+                    );
+                let cancel_started = Instant::now();
+                let cancellations: Vec<_> = identities
+                    .into_iter()
+                    .map(|identity| owner.cancel(identity))
+                    .collect();
+                // Release before asserting so failures cannot strand a paused worker.
+                owner.release_worker_for_test();
+                assert_eq!(pending, if window == 0 { 33 } else { 64 });
+                assert!(charged <= FILE_OPERATION_OWNER_MAX_INPUT_BYTES);
+                assert!(window != 0 || rejected);
+                assert!(
+                    cancellations
+                        .iter()
+                        .all(|result| *result == Ok(FileOperationCancelOutcome::KnownPending))
+                );
+                for mut request in requests {
+                    let result = request
+                        .recv_timeout(Duration::from_secs(1))
+                        .expect("cancel drains within bounded deadline");
+                    assert!(matches!(
+                        result.outcome(),
+                        EffectOutcome::SupersededBeforeEffect { .. }
+                    ));
+                    acknowledge_with_bounded_retry(&mut request);
+                }
+                let retained = owner.retained_evidence_for_test();
+                assert_eq!(retained.len(), if window == 0 { 33 } else { 64 });
+                assert_eq!(owner.execution_count_for_test(), 0);
+                // Acknowledge queues a small control message; wait for its credit to
+                // return before sampling retained (rather than in-flight) input.
+                let ack_deadline = Instant::now() + Duration::from_secs(1);
+                let retained_input = loop {
+                    let bytes = FILE_OPERATION_OWNER_MAX_INPUT_BYTES
+                        - owner.input_bytes_remaining_for_test();
+                    if bytes == charged || Instant::now() >= ack_deadline {
+                        break bytes;
+                    }
+                    std::thread::yield_now();
+                };
+                assert_eq!(retained_input, charged);
+                assert_eq!(
+                    *owner.shared.results_remaining.lock().unwrap(),
+                    FILE_OPERATION_OWNER_RESULT_CAPACITY
+                );
+                eprintln!(
+                    "YIELD_WORKLOAD={{\"kind\":\"file-owner\",\"cycle\":{cycle},\"window\":{window},\"retained_identities\":{pending},\"input_peak_bytes\":{charged},\"retained_rows\":{},\"retained_encoded_bytes\":{},\"input_after_drain_bytes\":{retained_input},\"result_handles_after_drain\":0,\"cancelled\":{count},\"effects_executed\":0,\"cancel_drain_ns\":{}}}",
+                    retained.len(),
+                    retained.iter().map(|row| row.1).sum::<usize>(),
+                    cancel_started.elapsed().as_nanos()
+                );
+            }
+            owner.acknowledge_custody_for_test();
+            assert_eq!(owner.shutdown(), FileOperationOwnerShutdown::DrainedAck);
+            assert_eq!(
+                owner.input_bytes_remaining_for_test(),
+                FILE_OPERATION_OWNER_MAX_INPUT_BYTES
+            );
+            eprintln!(
+                "YIELD_WORKLOAD={{\"kind\":\"file-owner-retired\",\"cycle\":{cycle},\"input_after_custody_bytes\":0,\"retained_after_custody_rows\":{}}}",
+                owner.pending_effects().len()
+            );
+            assert!(owner.pending_effects().is_empty());
+        }
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
     fn dropped_reply_and_acknowledged_tombstone_retain_full_evidence_until_custody() {
         let owner = FileOperationOwner::start().expect("owner starts");
         let registration = owner

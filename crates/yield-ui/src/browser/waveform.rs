@@ -4869,6 +4869,60 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual bounded cache-growth measurement (OPT-1736)"]
+    fn bounded_waveform_cache_workload() {
+        use std::{hint::black_box, time::Instant};
+
+        let started = Instant::now();
+        let cache = WaveformRenderCache::default();
+        let bands = vec![[0.5, 0.4, 0.3, 0.6]; 65_536];
+        let bounds = test_bounds(1_120.0, 180.0);
+        let selection = WaveformEditRegion::new(0.25, 0.75).unwrap();
+        for generation in 0..32 {
+            let iteration = Instant::now();
+            for _ in 0..16 {
+                black_box(cache.paths_for(
+                    generation,
+                    &bands,
+                    1.0,
+                    bounds,
+                    WaveformViewport::full(),
+                    (0.0, 1.0),
+                    generation,
+                ));
+                black_box(cache.gain_preview_paths_for(
+                    generation,
+                    &bands,
+                    1.0,
+                    bounds,
+                    WaveformViewport::full(),
+                    (0.0, 1.0),
+                    generation,
+                    selection,
+                    1.5,
+                ));
+            }
+            let state = cache.state.borrow();
+            let Some(WaveformGainPreviewGeometry::Bands { paths, .. }) =
+                state.gain_preview_geometry.as_ref()
+            else {
+                panic!("expected cached preview");
+            };
+            assert_eq!(state.paths.len(), 4);
+            assert_eq!(paths.len(), 4);
+            assert_eq!(Rc::strong_count(&state.paths), 1);
+            assert_eq!(Rc::strong_count(paths), 1);
+            assert_eq!(state.rebuild_count, generation as usize + 1);
+            assert_eq!(state.gain_preview_rebuild_count, generation as usize + 1);
+            eprintln!(
+                "YIELD_WORKLOAD={{\"kind\":\"waveform-cache\",\"generation\":{generation},\"inputs\":65536,\"width_px\":1120,\"hits_per_generation\":15,\"base_slots\":1,\"preview_slots\":1,\"base_paths\":4,\"preview_paths\":4,\"external_path_refs\":0,\"iteration_ns\":{}}}",
+                iteration.elapsed().as_nanos()
+            );
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    }
+
+    #[test]
     #[ignore = "manual waveform geometry cache benchmark"]
     fn waveform_geometry_cache_benchmark() {
         use std::{hint::black_box, time::Instant};
