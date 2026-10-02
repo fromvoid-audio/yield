@@ -126,15 +126,16 @@ pub use types::{
 };
 pub use util::normalize_relative_path;
 pub use write::{
-    ManifestCommitResult, ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
-    ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
-    SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite, SourceCommandId, SourceContentHashWrite,
-    SourceCurationCommitReceipt, SourceCurationUpdate, SourceDirectoryTruthCommitResult,
-    SourceFeaturePublicationMetrics, SourceFileWrite, SourceIndexCommitResult, SourceRevision,
-    SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage, SourceTagAssignmentMutation,
-    SourceTagAssignmentSelection, SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceTagWrite,
-    SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
-    SourceWriterReceipt, SourceWriterRequest,
+    FeatureRebuildMetrics, ManifestCommitResult, ManifestEnrollmentEntry, ManifestEnrollmentError,
+    ManifestEnrollmentKind, ManifestEnrollmentReceipt, ManifestEnrollmentRequest,
+    ManifestEnrollmentResult, SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite, SourceCommandId,
+    SourceContentHashWrite, SourceCurationCommitReceipt, SourceCurationUpdate,
+    SourceDirectoryTruthCommitResult, SourceFeaturePublicationMetrics, SourceFileWrite,
+    SourceIndexCommitResult, SourceRevision, SourceScanFence, SourceSnapshotOwner,
+    SourceSnapshotPage, SourceTagAssignmentMutation, SourceTagAssignmentSelection,
+    SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceTagWrite, SourceWriteCommand,
+    SourceWriter, SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt,
+    SourceWriterRequest,
 };
 
 /// Hidden filename used for per-source databases.

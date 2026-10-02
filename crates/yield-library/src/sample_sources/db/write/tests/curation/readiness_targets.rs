@@ -1347,4 +1347,297 @@ mod fixtures {
             "running"
         );
     }
+    #[test]
+    fn feature_rebuild_metrics_partition_actual_owned_command_outcomes_and_committed_logical_bytes()
+    {
+        use crate::sample_sources::readiness::{
+            FeatureArtifactFixtureFault as Fault, FeatureArtifactRebuildAdmission as Admission,
+        };
+        let (_f, mut writer) = setup();
+        let target = publish(&mut writer);
+        let revision = writer.current_revision().unwrap();
+        assert_eq!(
+            writer.feature_rebuild_metrics(&revision).unwrap().attempted,
+            0
+        );
+        assert_eq!(
+            writer
+                .admit_feature_artifact_rebuild(&revision, &target, 31, &AtomicBool::new(false))
+                .unwrap(),
+            Admission::Admitted {
+                removed_corrupt_payload: false
+            }
+        );
+        assert_eq!(
+            writer
+                .admit_feature_artifact_rebuild(&revision, &target, 31, &AtomicBool::new(false))
+                .unwrap(),
+            Admission::Unchanged
+        );
+        let claim = writer
+            .claim_feature_artifact(&revision, &target, 32, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            writer
+                .admit_feature_artifact_rebuild(&revision, &target, 33, &AtomicBool::new(false))
+                .unwrap(),
+            Admission::Deferred
+        );
+        writer
+            .publish_feature_artifact(
+                &revision,
+                &claim,
+                &FeatureArtifactPayload::from_v1_vector(&[0.5; 183]).unwrap(),
+                34,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            writer
+                .admit_feature_artifact_rebuild(&revision, &target, 35, &AtomicBool::new(false))
+                .unwrap(),
+            Admission::Ready
+        );
+        writer
+            .inject_feature_artifact_fixture_fault(&revision, &target, Fault::MissingMarker)
+            .unwrap();
+        assert_eq!(
+            writer
+                .admit_feature_artifact_rebuild(&revision, &target, 36, &AtomicBool::new(false))
+                .unwrap(),
+            Admission::Admitted {
+                removed_corrupt_payload: false
+            }
+        );
+        let preserved = writer
+            .catalog_database()
+            .connection
+            .query_row("SELECT payload FROM source_feature_artifacts", [], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .unwrap();
+        complete_feature(&mut writer, &target, 37);
+        assert_eq!(
+            writer
+                .catalog_database()
+                .connection
+                .query_row("SELECT payload FROM source_feature_artifacts", [], |r| r
+                    .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            preserved
+        );
+        writer
+            .inject_feature_artifact_fixture_fault(&revision, &target, Fault::CorruptPayload)
+            .unwrap();
+        assert_eq!(
+            writer
+                .admit_feature_artifact_rebuild(&revision, &target, 39, &AtomicBool::new(false))
+                .unwrap(),
+            Admission::Admitted {
+                removed_corrupt_payload: true
+            }
+        );
+        assert_eq!(
+            writer
+                .catalog_database()
+                .connection
+                .query_row("SELECT count(*) FROM source_feature_artifacts", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        complete_feature(&mut writer, &target, 40);
+        writer
+            .catalog_database()
+            .connection
+            .execute(
+                "UPDATE source_feature_artifacts SET artifact_ref='foreign-reference'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            writer
+                .admit_feature_artifact_rebuild(&revision, &target, 42, &AtomicBool::new(false))
+                .unwrap(),
+            Admission::Ambiguous
+        );
+        let mut stale = target.clone();
+        stale.content_generation = "outdated-content".into();
+        assert_eq!(
+            writer
+                .admit_feature_artifact_rebuild(&revision, &stale, 43, &AtomicBool::new(false))
+                .unwrap(),
+            Admission::RejectedStale
+        );
+        assert!(
+            writer
+                .admit_feature_artifact_rebuild(&revision, &target, 44, &AtomicBool::new(true))
+                .is_err()
+        );
+        let metrics = writer.feature_rebuild_metrics(&revision).unwrap();
+        assert_eq!(metrics.attempted, 9);
+        assert_eq!(
+            (
+                metrics.ready,
+                metrics.admitted,
+                metrics.unchanged,
+                metrics.deferred,
+                metrics.ambiguous,
+                metrics.stale,
+                metrics.cancelled,
+                metrics.failed
+            ),
+            (1, 3, 1, 1, 1, 1, 1, 0)
+        );
+        assert_eq!(metrics.corrupt_payloads_removed, 1);
+        assert_eq!(metrics.logical_payload_bytes_removed, 732);
+        assert!(metrics.total_elapsed_us >= metrics.max_elapsed_us);
+        assert!(!metrics.saturated);
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.len() < 768);
+        assert!(!json.contains("manifest-features"));
+        assert!(!json.contains("foreign-reference"));
+    }
+    #[test]
+    fn feature_rebuild_metrics_reject_foreign_observer_and_reset_on_owner_reacquisition() {
+        let (_f, mut writer) = setup();
+        let target = publish(&mut writer);
+        let revision = writer.current_revision().unwrap();
+        let (_other, foreign_writer) = setup();
+        let foreign = foreign_writer.current_revision().unwrap();
+        assert!(
+            writer
+                .admit_feature_artifact_rebuild(&foreign, &target, 31, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert!(writer.feature_rebuild_metrics(&foreign).is_err());
+        let before = writer.feature_rebuild_metrics(&revision).unwrap();
+        assert_eq!((before.attempted, before.stale), (1, 1));
+        let db = writer.into_catalog_database();
+        let mut writer =
+            SourceWriter::new(db, SourceId::from_string("manifest-features"), 8).unwrap();
+        let current = writer.current_revision().unwrap();
+        assert_eq!(
+            writer.feature_rebuild_metrics(&current).unwrap(),
+            crate::sample_sources::FeatureRebuildMetrics::default()
+        );
+        assert!(writer.feature_rebuild_metrics(&revision).is_err());
+        assert!(
+            writer
+                .admit_feature_artifact_rebuild(&revision, &target, 32, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert_eq!(
+            (
+                writer.feature_rebuild_metrics(&current).unwrap().attempted,
+                writer.feature_rebuild_metrics(&current).unwrap().stale
+            ),
+            (1, 1)
+        );
+    }
+    #[test]
+    fn feature_rebuild_metrics_stale_revision_observation_and_command_reject_without_removal() {
+        let (f, mut writer) = setup();
+        let target = publish(&mut writer);
+        complete_feature(&mut writer, &target, 31);
+        let revision = writer.current_revision().unwrap();
+        let mut batch = writer.catalog_database().write_batch().unwrap();
+        batch
+            .upsert_file_with_hash(Path::new("one.wav"), 7, 2, &target.content_generation)
+            .unwrap();
+        batch.commit().unwrap();
+        audit_current_manifest(&f, &writer);
+        let current = writer.current_revision().unwrap();
+        assert!(current.revision() > revision.revision());
+        assert!(matches!(
+            writer.admit_feature_artifact_rebuild(&revision, &target, 33, &AtomicBool::new(false)),
+            Err(SourceWriterError::StaleRevision { .. })
+        ));
+        assert!(writer.feature_rebuild_metrics(&revision).is_err());
+        let metrics = writer.feature_rebuild_metrics(&current).unwrap();
+        assert_eq!(
+            (
+                metrics.attempted,
+                metrics.stale,
+                metrics.logical_payload_bytes_removed
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(counts(&writer), (7, 3, 1));
+    }
+    #[test]
+    fn feature_rebuild_unconfirmed_or_triggered_removal_rolls_back_and_never_counts_logical_bytes()
+    {
+        use crate::sample_sources::readiness::FeatureArtifactFixtureFault as Fault;
+        for trigger in [
+            "CREATE TRIGGER bad_removal BEFORE DELETE ON source_feature_artifacts BEGIN SELECT RAISE(IGNORE); END",
+            "CREATE TRIGGER bad_removal AFTER DELETE ON source_feature_artifacts BEGIN INSERT INTO source_feature_artifacts VALUES(OLD.target_key,OLD.artifact_ref,OLD.payload,OLD.digest,OLD.claim_generation); END",
+            "CREATE TRIGGER bad_removal AFTER DELETE ON source_feature_artifacts BEGIN DELETE FROM source_feature_artifacts WHERE target_key<>OLD.target_key; END",
+            "CREATE TRIGGER bad_removal BEFORE DELETE ON source_feature_artifacts BEGIN SELECT RAISE(ABORT,'fixture rollback'); END",
+        ] {
+            let (_f, mut writer) = setup();
+            let target = publish(&mut writer);
+            complete_feature(&mut writer, &target, 31);
+            let revision = writer.current_revision().unwrap();
+            let other = writer
+                .prepare_feature_readiness_target(
+                    &revision,
+                    Path::new("two.wav"),
+                    33,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            let other_key = complete_feature(&mut writer, &other, 34);
+            let healthy = writer
+                .lookup_feature_artifact(&revision, &other_key)
+                .unwrap()
+                .unwrap();
+            writer
+                .inject_feature_artifact_fixture_fault(&revision, &target, Fault::CorruptPayload)
+                .unwrap();
+            writer
+                .catalog_database()
+                .connection
+                .execute_batch(trigger)
+                .unwrap();
+            assert!(
+                writer
+                    .admit_feature_artifact_rebuild(&revision, &target, 36, &AtomicBool::new(false))
+                    .is_err()
+            );
+            let metrics = writer.feature_rebuild_metrics(&revision).unwrap();
+            assert_eq!(
+                (
+                    metrics.attempted,
+                    metrics.failed,
+                    metrics.admitted,
+                    metrics.logical_payload_bytes_removed
+                ),
+                (1, 1, 0, 0)
+            );
+            assert_eq!(
+                writer
+                    .lookup_feature_artifact(&revision, &other_key)
+                    .unwrap()
+                    .unwrap(),
+                healthy
+            );
+            assert_eq!(counts(&writer), (7, 4, 1));
+            assert_eq!(
+                writer
+                    .catalog_database()
+                    .connection
+                    .query_row("SELECT count(*) FROM source_feature_artifacts", [], |r| r
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(writer.catalog_database().connection.query_row("SELECT count(*) FROM analysis_jobs WHERE readiness_stage='analysis_features' AND status='done'",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        }
+    }
 }

@@ -21,12 +21,12 @@ pub use curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
 };
 pub use source_writer::{
-    ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
-    ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
-    SourceCommandId, SourceFeaturePublicationMetrics, SourceRevision, SourceScanFence,
-    SourceSnapshotOwner, SourceSnapshotPage, SourceTagMetadataBudget, SourceTagMetadataPolicy,
-    SourceWriter, SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt,
-    SourceWriterRequest,
+    FeatureRebuildMetrics, ManifestEnrollmentEntry, ManifestEnrollmentError,
+    ManifestEnrollmentKind, ManifestEnrollmentReceipt, ManifestEnrollmentRequest,
+    ManifestEnrollmentResult, SourceCommandId, SourceFeaturePublicationMetrics, SourceRevision,
+    SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage, SourceTagMetadataBudget,
+    SourceTagMetadataPolicy, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
+    SourceWriterReceipt, SourceWriterRequest,
 };
 pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};
 pub use transaction::{
