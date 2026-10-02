@@ -73,6 +73,7 @@ impl LibraryDatabase {
         crate::sqlite_wal::enforce_wal_admission(&tx)?;
         Self::set_metadata_in_tx(&tx, UI_PREFERENCES_KEY, payload)?;
         tx.commit().map_err(map_sql_error)?;
+        self.note_ordinary_commit();
         record_library_db_event("library.replace_ui_preferences_payload", started_at, Ok(()));
         Ok(())
     }
@@ -96,6 +97,7 @@ impl LibraryDatabase {
         crate::sqlite_wal::enforce_wal_admission(&tx)?;
         Self::replace_source_registry_in_tx(&tx, snapshot)?;
         tx.commit().map_err(map_sql_error)?;
+        self.note_ordinary_commit();
         record_library_db_event(event, started_at, Ok(()));
         Ok(())
     }

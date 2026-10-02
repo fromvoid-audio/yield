@@ -633,12 +633,17 @@ impl WriterReply {
     }
 }
 
+#[cfg(test)]
+type DatabaseHook = Arc<dyn Fn(&rusqlite::Connection) + Send + Sync>;
+
 struct OwnerHooks {
     initialization_gate: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
     binding_open_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     #[cfg(test)]
     post_command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    #[cfg(test)]
+    database_hook: Option<DatabaseHook>,
 }
 
 /// Profile-owned asynchronous writer for `library.db`.
@@ -698,7 +703,14 @@ impl GlobalLibraryWriter {
     pub fn start(
         profile_guard: &WritableProfileGuard,
     ) -> Result<Self, GlobalLibraryWriterStartError> {
-        Self::start_inner(profile_guard, None, None, None)
+        Self::start_inner(
+            profile_guard,
+            None,
+            None,
+            None,
+            #[cfg(test)]
+            None,
+        )
     }
 
     fn start_inner(
@@ -706,6 +718,7 @@ impl GlobalLibraryWriter {
         initialization_gate: Option<Arc<std::sync::Barrier>>,
         binding_open_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
         post_command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+        #[cfg(test)] database_hook: Option<DatabaseHook>,
     ) -> Result<Self, GlobalLibraryWriterStartError> {
         let global_writer_lease = profile_guard.acquire_named_lease("library.db")?;
         let worker_profile_guard = profile_guard.try_clone()?;
@@ -740,6 +753,8 @@ impl GlobalLibraryWriter {
                         binding_open_gate,
                         #[cfg(test)]
                         post_command_gate,
+                        #[cfg(test)]
+                        database_hook,
                     },
                     worker_admission_gate,
                 );
@@ -765,7 +780,7 @@ impl GlobalLibraryWriter {
         profile_guard: &WritableProfileGuard,
     ) -> (Self, Arc<std::sync::Barrier>) {
         let gate = Arc::new(std::sync::Barrier::new(2));
-        let writer = Self::start_inner(profile_guard, Some(Arc::clone(&gate)), None, None)
+        let writer = Self::start_inner(profile_guard, Some(Arc::clone(&gate)), None, None, None)
             .expect("writer start");
         (writer, gate)
     }
@@ -780,6 +795,7 @@ impl GlobalLibraryWriter {
             profile_guard,
             None,
             Some((Arc::clone(&ready), Arc::clone(&release))),
+            None,
             None,
         )
         .expect("writer start");
@@ -797,9 +813,19 @@ impl GlobalLibraryWriter {
             None,
             None,
             Some((Arc::clone(&ready), Arc::clone(&release))),
+            None,
         )
         .expect("writer start");
         (writer, ready, release)
+    }
+
+    #[cfg(test)]
+    pub(super) fn start_with_database_hook_for_test(
+        profile_guard: &WritableProfileGuard,
+        hook: DatabaseHook,
+        post_command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    ) -> Result<Self, GlobalLibraryWriterStartError> {
+        Self::start_inner(profile_guard, None, None, post_command_gate, Some(hook))
     }
 
     #[cfg(test)]
@@ -1454,6 +1480,10 @@ fn run_owner(
         );
         return;
     }
+    #[cfg(test)]
+    if let Some(hook) = hooks.database_hook.as_ref() {
+        hook(&database.connection);
+    }
     // Shutdown may have begun while initialization owned its connection. Never reopen
     // admission/lifecycle after Closing; the existing receiver still drains accepted work.
     let _ = lifecycle.compare_exchange(
@@ -1518,6 +1548,10 @@ fn run_owner(
             ready.wait();
             release.wait();
         }
+
+        // The marker consumer validates ownership before maintenance; retain the existing
+        // reply check afterwards so replacement during a checkpoint cannot be confirmed.
+        database.maintain_after_ordinary_commit(&profile_guard);
 
         if let Err(error) = database.validate_profile_guard(&profile_guard) {
             reply.send_error(profile_change_library_error(&error, true));

@@ -482,6 +482,7 @@ impl LibraryDatabase {
             .ok_or(LibraryError::ProfileTagVocabularyRevisionOverflow)?;
         set_profile_tag_vocabulary_revision(&transaction, new_revision)?;
         transaction.commit().map_err(map_sql_error)?;
+        self.note_ordinary_commit();
         Ok(ProfileTagVocabularySetReceipt {
             revision: new_revision,
             changed: true,
@@ -548,6 +549,7 @@ impl LibraryDatabase {
             .ok_or(LibraryError::ProfileTagVocabularyRevisionOverflow)?;
         set_profile_tag_vocabulary_revision(&transaction, new_revision)?;
         transaction.commit().map_err(map_sql_error)?;
+        self.note_ordinary_commit();
         Ok(ProfileTagVocabularyDeleteReceipt {
             revision: new_revision,
             removed: Some(removed),
