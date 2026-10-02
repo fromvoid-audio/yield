@@ -81,15 +81,26 @@ Poison, generation overflow, missing binding or conflicting completion closes
 authority and retains charges. Mutex guards never cross SQL, native effects,
 source validation, callbacks, condition waits or queue operations.
 
+An additional shared publication-admission mutex holds the issuer incarnation,
+open/closed flag and checked aggregate physical-in-flight count. It contains
+no provider or native resource. Worker lock order is admission, then slot;
+both are released before effects. Owner unavailable/shutdown closes admission
+under this mutex before publishing its lifecycle transition, so iterating
+individual slots cannot leave a window for another slot to enter. Per-operation
+closure may lock its slot alone; it must never acquire admission afterward.
+All entry requires both gates open. Dropping an entered permit uses the same
+admission-then-slot order and notifies a physical-quiescence condition variable.
+
 1. The file owner admits the canonical command and original envelope. The
    worker resolves primary/duplicate custody and validates its retained roots,
    target and binding before acquiring any source-effect permit.
 2. Acquire `SourceEffectPermit` through the existing source pin. Its current
    implementation validates the source lease; do not hold the slot mutex during
    this call. No journal request/reply is needed at this point.
-3. Under the short slot mutex, compare the exact immutable issuer/binding and
-   require open `Issued`. Transition to `Entered`, set physical-in-flight to
-   one, and take the unique entered permit. Release the mutex immediately.
+3. Under admission then slot mutexes, compare the exact immutable issuer/binding
+   and require open admission and `Issued`. Transition to `Entered`, set slot
+   physical-in-flight to one, increment the checked aggregate counter, and take
+   the unique entered permit. Release both mutexes immediately.
    If closed, drop the source permit and return typed no-effect rejection.
 4. Both opaque permits survive through the bounded native attempt and capture
    of its exact completion evidence. They are custody values, not held locks.
@@ -197,6 +208,18 @@ Resources may be retired only after physical quiescence; failure cannot mark a
 volume clean. Restart reconstructs observations/recovery charges, never a live
 slot or grant. This lifecycle change is required implementation, not a property
 already provided by the current shutdown/join path.
+
+The actor's resource scope also needs an unwind guard. On unexpected exit it
+closes shared publication admission and waits only for aggregate physical
+quiescence before actor-local provider/volume resources can drop. Condition
+waiting releases the admission mutex; no slot/source/control lock is held.
+This exceptional wait cannot depend on actor commands or durable settlement:
+worker permit Drop publishes uncertainty, decrements the counter and wakes it
+without queueing. Catch command panics with the runtime outside the unwind
+scope where possible. Never let an outer catch merely mark Unavailable after
+unwinding has already dropped resources underneath an entered native call.
+If a native call never quiesces, resource custody remains retained and the
+shutdown is deferred; no timeout frees it. This guard is not clean handoff.
 
 ## Executable leaves and qualification
 
