@@ -170,6 +170,7 @@ impl Browser {
     ) -> bool {
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::cancel_for_source_change(self);
+        super::unsupported_entries::cancel_for_source_change(self, cx);
         super::tags::cancel_for_source_change(self);
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
@@ -352,6 +353,7 @@ impl Browser {
         self.job_action_error = None;
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::cancel_for_source_change(self);
+        super::unsupported_entries::cancel_for_source_change(self, cx);
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
@@ -437,6 +439,7 @@ impl Browser {
                 self.catalog_pending_removes.clear();
                 super::source_recovery::cancel_for_source_change(self);
                 super::rating_decay::cancel_for_source_change(self);
+                super::unsupported_entries::cancel_for_source_change(self, cx);
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
@@ -525,6 +528,7 @@ impl Browser {
         }
         let mut changed = self.retry_catalog_metadata(cx);
         changed |= super::rating_decay::retry(self, cx);
+        changed |= super::unsupported_entries::retry(self, cx);
         changed
     }
 
@@ -534,6 +538,7 @@ impl Browser {
             self.catalog_pending_removes.clear();
             super::source_recovery::cancel_for_source_change(self);
             super::rating_decay::cancel_for_source_change(self);
+            super::unsupported_entries::cancel_for_source_change(self, cx);
             super::tag_chips::cancel_for_source_change(self);
             super::tag_completion::cancel_for_source_change(self, cx);
             self.display_labels.cancel_for_source_change();
@@ -545,6 +550,7 @@ impl Browser {
         self.catalog_pending_removes.clear();
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::cancel_for_source_change(self);
+        super::unsupported_entries::cancel_for_source_change(self, cx);
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
@@ -588,10 +594,13 @@ impl Browser {
 
     fn apply_catalog_event_with_fence(
         &mut self,
-        event: CatalogEvent,
+        mut event: CatalogEvent,
         publication_fence: Option<SourcePublicationFence>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if super::unsupported_entries::apply_catalog_event(self, &mut event, cx) {
+            return true;
+        }
         super::rating_decay::observe_snapshot(self, &event);
         if super::rating_decay::apply_catalog_event(self, &event, cx) {
             return true;
@@ -674,6 +683,7 @@ impl Browser {
                 self.job_action_error = None;
                 super::source_recovery::cancel_for_source_change(self);
                 super::rating_decay::cancel_for_source_change(self);
+                super::unsupported_entries::cancel_for_source_change(self, cx);
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
@@ -711,6 +721,7 @@ impl Browser {
                 true
             }
             CatalogEvent::AuditCommitted { .. } => {
+                super::unsupported_entries::cancel_for_source_change(self, cx);
                 self.job_action = None;
                 self.job_action_error = None;
                 super::rating_decay::note_audit_committed(self);
@@ -729,6 +740,7 @@ impl Browser {
                 true
             }
             CatalogEvent::AuditCanceled { .. } => {
+                super::unsupported_entries::cancel_for_source_change(self, cx);
                 self.job_action = None;
                 self.job_action_error = None;
                 if let Some(activation) = self.catalog_activation.as_mut() {
@@ -780,6 +792,7 @@ impl Browser {
                 error, operation, ..
             } => {
                 if *operation == CatalogOperation::Audit {
+                    super::unsupported_entries::cancel_for_source_change(self, cx);
                     self.job_action = None;
                 }
                 super::tag_chips::cancel_for_source_change(self);
@@ -1064,6 +1077,7 @@ impl Browser {
         }
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::invalidate_for_source_publication(self, status);
+        super::unsupported_entries::cancel_for_source_change(self, cx);
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);

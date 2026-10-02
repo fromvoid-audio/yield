@@ -124,6 +124,7 @@ mod tag_pager;
 mod tags;
 mod transient_markers;
 mod transport;
+mod unsupported_entries;
 #[cfg(any(target_os = "macos", test))]
 mod user_shader_runtime;
 mod view;
@@ -504,6 +505,7 @@ pub(crate) struct Browser {
     general_settings: general_settings::GeneralSettings,
     audio_settings_open: bool,
     shortcut_help: shortcut_help::ShortcutHelpState,
+    unsupported_entries: unsupported_entries::UnsupportedEntriesState,
     feedback_issue: feedback_issue::FeedbackIssueState,
     audio_output_focus_handle: FocusHandle,
     audio_output_dropdown: Option<audio_output::AudioOutputDropdown>,
@@ -862,6 +864,7 @@ impl Browser {
             general_settings: general_settings::GeneralSettings::default(),
             audio_settings_open: false,
             shortcut_help: shortcut_help::ShortcutHelpState::new(cx),
+            unsupported_entries: unsupported_entries::UnsupportedEntriesState::new(cx),
             feedback_issue: feedback_issue::FeedbackIssueState::new(cx),
             audio_output_focus_handle: cx.focus_handle(),
             audio_output_dropdown: None,
@@ -2781,6 +2784,9 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+        if self.handle_unsupported_key(event, window, cx) {
+            return;
+        }
         self.suppress_collection_keyboard_click = None;
         if key == "escape" && self.source_reorder_drag.take().is_some() {
             cx.notify();

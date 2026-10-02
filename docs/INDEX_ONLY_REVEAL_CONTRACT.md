@@ -141,3 +141,31 @@ filesystem revalidation or native grant. OPT-2038/2008 remain open for the modal
 and qualified handoff. Tests use real isolated catalog/profile/source leases for
 page-to-handle-to-inspection, with separate bounded DB and descriptor-primitive
 unit tests; none is physical or Finder qualification.
+
+## Bounded modal consumer (OPT-2038)
+
+The GPUI toolbar and `OpenUnsupportedFiles`/`CloseUnsupportedFiles` actions open a
+focus-owned read-only modal for an already registered catalog. It stores one
+128-row page, at most eight opaque continuation cursors, one selected row and one
+pending/held owner inspection. Back traverses the retained eight-page history;
+Restart creates a new query at the first page. Queue pressure retries the same
+non-admitted request. Empty, legacy/unavailable, stale, malformed and over-budget
+states remain distinct, and completeness always stays unknown.
+
+`InspectUnsupportedFile`, Enter or a row click submits the real owner handle.
+Changing row/page, close/Escape, source change, audit/retirement and restart cancel
+pending inspection and drop held results. Rendered row callbacks and native AX row
+IDs carry a page epoch, preventing late input from selecting another delivery's
+row at the same index. Exact Unicode/raw path bytes stay in the bounded owner page;
+raw presentation is explicitly hex-encoded, and long display text is labeled clipped.
+Display strings never reconstruct an OS target.
+
+The macOS accessibility source bridge publishes modal-only controls while open,
+with bounded labels, enabled states, geometry markers and owner-only actions.
+Linux tests verify actual GPUI focus restoration plus a real isolated-profile
+catalog page/handle/inspection round trip, eight-page history, row/page cancellation
+and stale delivery rejection. Other tests are explicitly completion/presentation
+fixtures, without successful filesystem grants. macOS compilation, AppKit AX
+runtime/input and actual native observations remain scoped in OPT-2054. Qualified
+held-target Finder implementation remains OPT-2039. The UI never dispatches native
+reveal and says when it is unavailable; OPT-2008/1953 remain open.

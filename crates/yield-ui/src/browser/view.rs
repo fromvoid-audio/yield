@@ -1891,6 +1891,9 @@ impl Render for Browser {
             .text_size(px(theme.typography.body_size))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_action(cx.listener(Self::open_unsupported_action))
+            .on_action(cx.listener(Self::close_unsupported_action))
+            .on_action(cx.listener(Self::inspect_unsupported_action))
             .capture_any_mouse_down(cx.listener(Self::cancel_file_drag_from_mouse_down))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
                 view.update_column_gesture(
@@ -2376,6 +2379,9 @@ impl Render for Browser {
                                 element.child(marker)
                             }),
                     )
+                    .child(div().id("open-unsupported-entries").debug_selector(|| "open-unsupported-entries".into())
+                        .cursor_pointer().child("Unsupported files")
+                        .on_click(cx.listener(Self::open_unsupported_from_toolbar)))
                     .child(
                         div()
                             .flex_1()
@@ -2877,6 +2883,9 @@ impl Render for Browser {
             })
             .when(self.context_menu.is_some(), |element| {
                 element.child(context_menu::render_overlay(self, &theme, cx))
+            })
+            .when(self.unsupported_entries.is_open(), |element| {
+                element.child(super::unsupported_entries::render(self, &theme, window.bounds().size, cx))
             })
             .when(self.shortcut_help.is_open(), |element| {
                 element.child(shortcut_help::render(

@@ -356,12 +356,22 @@ impl BrowserAccessibility {
             while let Ok(event) = receiver.recv().await {
                 if this
                     .update_in(cx, |view, window, cx| {
+                        if tag_library::is_open(view)
+                            || view
+                                .accessibility
+                                .as_ref()
+                                .is_none_or(|ax| !ax.registry.borrow().contains(&event.id))
+                        {
+                            return;
+                        }
+                        if super::unsupported_entries::handle_accessibility(
+                            view, &event, window, cx,
+                        ) {
+                            return;
+                        }
                         let Some(ax) = view.accessibility.as_ref() else {
                             return;
                         };
-                        if tag_library::is_open(view) || !ax.registry.borrow().contains(&event.id) {
-                            return;
-                        }
                         let focus = if event.id == SEARCH {
                             view.search_input.read(cx).focus_handle()
                         } else if event.id == TAG_FILTER_INPUT {
@@ -1944,6 +1954,16 @@ impl Browser {
                     enabled: !super::tag_filter::scope_pending(self),
                 });
             }
+            if let Some(modal_controls) = super::unsupported_entries::accessibility_controls(self) {
+                controls = modal_controls;
+            } else {
+                controls.push(button(
+                    "open-unsupported-entries",
+                    "Open unsupported files",
+                    None,
+                    true,
+                ));
+            }
             controls
         };
         let controls_changed = *ax.last_controls.borrow() != controls;
@@ -1953,6 +1973,9 @@ impl Browser {
                 return;
             }
             *ax.last_controls.borrow_mut() = controls;
+        }
+        if let Some((id, focused)) = super::unsupported_entries::accessibility_focus(self, window) {
+            let _ = ax.registry.borrow().set_focused(&id, focused);
         }
         let registry = ax.registry.borrow();
         let volume = super::volume::quantize_volume(self.volume);
