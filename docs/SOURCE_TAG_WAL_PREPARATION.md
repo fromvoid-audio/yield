@@ -27,7 +27,8 @@ restriction. Its extension guard remains retained even after partial entry.
 The owning path retains the original busy timeout while the reservation is
 held. Cleanup confirms rollback before restoring timeout, maximum page count,
 temp store, cache spill, and autocheckpoint settings. Only confirmed restoration
-returns the exact writer to normal dispatch. Failed rollback retains custody for
+returns the exact writer to normal dispatch. A pre-existing transaction is never adopted or returned to ordinary dispatch;
+its rejected owner remains inaccessible until actual close. Failed rollback retains custody for
 explicit retry; failed policy restoration is sticky and poisons the retained
 owner until actual close/reopen. Drop attempts cleanup and closes an uncertain
 connection before releasing its source lease and extension guard.

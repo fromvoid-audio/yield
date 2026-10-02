@@ -70,6 +70,7 @@ pub(super) fn dispatch(case: &str) {
         "tag-owned-restore" => restore(),
         "tag-owned-partial" => partial(),
         "tag-owned-drop" => dropped(),
+        "tag-owned-active" => active(),
         "tag-owned-bounds" => bounds(),
         "tag-owned-wal" => wal(),
         "tag-owned-bindings" => bindings(),
@@ -404,6 +405,7 @@ fn lease() {
         let lease_before = expiry(db(&writer));
         let control_before = control_changes(&writer);
         let changes = db(&writer).total_changes();
+        let obs = if offset == 45 { observe(&writer) } else { obs };
         let result = writer.prepare_tag_wal_reservation(obs, request());
         let writer = if offset == 45 {
             result.unwrap().abort().unwrap()
@@ -713,4 +715,37 @@ fn bindings() {
         let writer = held.abort().unwrap();
         assert_eq!(settings(&writer), original);
     }
+}
+
+case!(
+    tag_owned_preparation_never_returns_or_adopts_a_preexisting_transaction,
+    "tag-owned-active"
+);
+fn active() {
+    let (writer, fixture, _) = writer();
+    let other = external(&writer);
+    let obs = observe(&writer);
+    db(&writer).execute_batch("BEGIN IMMEDIATE").unwrap();
+    let failure = writer
+        .prepare_tag_wal_reservation(obs, request())
+        .unwrap_err();
+    assert!(matches!(
+        failure.error(),
+        SourceWalPreparationError::TransactionActive
+    ));
+    let failure = failure
+        .into_writer()
+        .err()
+        .expect("active owner must remain inaccessible");
+    assert_busy(&other);
+    drop(failure);
+    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        fixture._source.path(),
+        &fixture.profile_guard,
+        Path::new("curation-profile-bound"),
+    )
+    .unwrap();
+    let fresh = SourceWriter::new(database, SourceId::from_string("tag-owned"), 7).unwrap();
+    observe(&fresh);
 }

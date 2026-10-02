@@ -29,7 +29,7 @@ impl fmt::Debug for SourceTagWalPreparation {
 impl fmt::Debug for SourceTagWalPreparationFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SourceTagWalPreparationFailure")
-            .field("error", &self.error)
+            .field("error", &self.error())
             .finish()
     }
 }
@@ -71,6 +71,15 @@ impl Custody {
                 writer,
                 created_transaction,
             } => {
+                // Never adopt a transaction that predates this preparation, and never
+                // return an active connection to ordinary dispatch. Retain it until close.
+                if !created_transaction && !writer.database.connection.is_autocommit() {
+                    self.owner = Some(Owner::Unprepared {
+                        writer,
+                        created_transaction,
+                    });
+                    return Err(SourceWalPreparationError::TransactionActive);
+                }
                 if created_transaction
                     && (writer
                         .database
