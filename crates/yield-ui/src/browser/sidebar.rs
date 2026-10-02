@@ -17,7 +17,6 @@ use crate::theme::{color, transparent};
 
 use super::curation;
 use super::motion::{self, MotionFrame};
-use super::tag_filter;
 use super::tag_library;
 use super::{Browser, SourceReorderDrag};
 
@@ -210,9 +209,10 @@ pub(super) fn render(
     browser: &Browser,
     theme: Theme,
     motion_frame: MotionFrame,
-    window_height: f32,
+    window: &Window,
     cx: &mut Context<Browser>,
 ) -> impl gpui::IntoElement {
+    let window_height = f32::from(window.viewport_size().height);
     if tag_library::is_open(browser) {
         return tag_library::render(browser, theme, cx).into_any_element();
     }
@@ -698,7 +698,9 @@ pub(super) fn render(
     };
 
     let folder_list = folder_list
-        .min_h(px(theme.spacing.row_height * 4.0))
+        .min_h(px(
+            (theme.spacing.row_height * 4.0).min(window_height * 0.16)
+        ))
         .debug_selector(|| String::from("sidebar-folder-list"));
     let scope_label = format!("Scope: {}", browser.folder_scope.label());
     let active_label = browser
@@ -835,10 +837,13 @@ pub(super) fn render(
     let auxiliary = div()
         .flex()
         .flex_col()
-        .min_h_0()
+        .flex_1()
+        .min_h(px(theme.spacing.control_height))
         .w_full()
         .debug_selector(|| String::from("sidebar-auxiliary"))
         .id("sidebar-auxiliary")
+        // Keep an outer-scroll hit region beside independently scrolling panels.
+        .pr(px(8.0))
         .overflow_y_scroll()
         .child(
             div()
@@ -872,19 +877,10 @@ pub(super) fn render(
                         )),
                 ),
         )
-        .child(curation::render_playback_type_filters(
-            browser,
-            theme.clone(),
-            cx,
+        .child(super::filter_panel::render_filter_panel(
+            browser, &theme, window, cx,
         ))
-        .child(curation::render_playback_age_filters(
-            browser,
-            theme.clone(),
-            cx,
-        ))
-        .child(curation::render_rating_filters(browser, theme.clone(), cx))
         .child(super::curation_queue::render(browser, theme.clone(), cx))
-        .child(tag_filter::render(browser, theme.clone(), cx))
         .child(super::metadata_panel::render(
             browser,
             theme.clone(),

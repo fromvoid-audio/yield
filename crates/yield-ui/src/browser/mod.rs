@@ -91,6 +91,7 @@ mod display_labels;
 mod feedback_issue;
 mod file_drag;
 mod filter_family;
+mod filter_panel;
 mod folder_keyboard;
 mod general_settings;
 mod handoff;
@@ -386,6 +387,8 @@ pub(crate) struct Browser {
     normalized_audition: normalized_audition::NormalizedAuditionState,
     waveform_viewport: WaveformViewport,
     preferred_sidebar_width: Option<f32>,
+    preferred_filter_height: Option<f32>,
+    filter_panel_scroll: ScrollHandle,
     preferred_waveform_height: Option<f32>,
     preferred_metadata_height: Option<f32>,
     preferred_collections_height: Option<f32>,
@@ -735,6 +738,8 @@ impl Browser {
             normalized_audition: normalized_audition::NormalizedAuditionState::default(),
             waveform_viewport: WaveformViewport::full(),
             preferred_sidebar_width: None,
+            preferred_filter_height: None,
+            filter_panel_scroll: ScrollHandle::new(),
             preferred_waveform_height: None,
             preferred_metadata_height: None,
             preferred_collections_height: None,
