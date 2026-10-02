@@ -10,6 +10,7 @@ use tracing::warn;
 mod connection;
 mod error;
 mod harvest;
+mod harvest_authored;
 mod harvest_copy;
 mod migrations;
 mod mutation_context;
@@ -45,6 +46,11 @@ pub use harvest::{
     HarvestDerivationOperation, HarvestDerivationRecord, HarvestFileIdentity, HarvestFileKey,
     HarvestFileRecord, HarvestMetadataSnapshot, HarvestSourceRange, HarvestState,
     NewHarvestDerivation,
+};
+pub use harvest_authored::{
+    HARVEST_AUTHORED_MAX_BYTES, HARVEST_AUTHORED_MAX_RECEIPTS, HarvestAuthoredDisposition,
+    HarvestAuthoredReceipt, HarvestAuthoredRequest, HarvestAuthoredResult, HarvestAuthoredSnapshot,
+    HarvestAuthoredSnapshotRequest,
 };
 pub use harvest_copy::{
     HARVEST_COPY_MAX_BYTES, HARVEST_COPY_MAX_RECEIPTS, HarvestCopyDisposition, HarvestCopyReceipt,

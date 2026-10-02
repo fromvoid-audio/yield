@@ -38,6 +38,10 @@ pub struct SourceReferenceFence {
     writer: Weak<()>,
 }
 impl SourceReferenceFence {
+    pub(crate) fn profile_acquisition_identity(&self) -> Option<String> {
+        self.publication.profile_acquisition_identity()
+    }
+
     pub(super) fn file_facts(
         &self,
         path: &crate::operation_journal::StoredRelativePath,
