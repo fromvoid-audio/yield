@@ -20,7 +20,13 @@ fn recovery_status_mixed_families_redact_retained_keys_and_survive_reopen() {
         3,
         b"secret-record-bytes",
     );
+    let changes = store.connection.total_changes();
     let page = store.scan_recovery_status_page(None).unwrap();
+    assert_eq!(
+        store.connection.total_changes(),
+        changes,
+        "status scan wrote rows"
+    );
     assert_eq!(page.entries().len(), 3);
     assert_eq!(page.entries()[0].family(), JournalStatusFamily::Legacy);
     assert_eq!(page.entries()[0].operation_id(), Some(legacy.operation_id));
