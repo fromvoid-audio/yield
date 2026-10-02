@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod fixtures {
     use super::super::*;
+    use crate::sample_sources::SourceRevision;
     use crate::sample_sources::readiness::{
         FeatureArtifactPayload, FeatureArtifactPublication, ReadinessClassification,
         ReadinessDeficit, ReadinessEligibility,
@@ -1665,6 +1666,29 @@ mod fixtures {
             assert_eq!(writer.catalog_database().connection.query_row("SELECT count(*) FROM analysis_jobs WHERE readiness_stage='analysis_features' AND status='done'",[],|r|r.get::<_,i64>(0)).unwrap(),2);
         }
     }
+    fn assert_maintenance_metrics(
+        writer: &SourceWriter,
+        revision: &SourceRevision,
+        expected: (u64, u64, u64, u64, u64, u64, u64, u64),
+    ) {
+        let m = writer.feature_maintenance_metrics(revision).unwrap();
+        assert_eq!(
+            (
+                m.attempted,
+                m.committed,
+                m.stale,
+                m.cancelled,
+                m.failed,
+                m.inspected_candidates,
+                m.removed_rows,
+                m.logical_payload_bytes_removed
+            ),
+            expected
+        );
+        assert_eq!(m.attempted, m.committed + m.stale + m.cancelled + m.failed);
+        assert!(m.total_elapsed_us >= m.max_elapsed_us);
+        assert!(!m.saturated);
+    }
     fn feature_owner_counts(writer: &SourceWriter) -> (i64, i64) {
         writer.catalog_database().connection.query_row(
             "SELECT (SELECT count(*) FROM source_feature_artifacts),(SELECT count(*) FROM source_feature_reverse_owners)",
@@ -1710,6 +1734,7 @@ mod fixtures {
             .prune_superseded_feature_artifacts(&revision, None, 64, &AtomicBool::new(false))
             .unwrap();
         assert_eq!((unchanged.observed, unchanged.removed), (2, 0));
+        assert_maintenance_metrics(&writer, &revision, (1, 1, 0, 0, 0, 2, 0, 0));
         let fresh = supersede_feature(&f, &mut writer, &old);
         let fresh_key = complete_feature(&mut writer, &fresh, 41);
         let revision = writer.current_revision().unwrap();
@@ -1726,6 +1751,7 @@ mod fixtures {
             (3, 1, 732)
         );
         assert!(page.next.is_none());
+        assert_maintenance_metrics(&writer, &revision, (2, 2, 0, 0, 0, 5, 1, 732));
         assert_eq!(counts(&writer), readiness_before);
         assert_eq!(feature_owner_counts(&writer), (2, 2));
         assert!(
@@ -1926,6 +1952,9 @@ mod fixtures {
                 .is_err()
         );
         assert_eq!(feature_owner_counts(&writer), (2, 2));
+        assert_maintenance_metrics(&writer, &current, (8, 2, 2, 1, 3, 2, 0, 0));
+        assert_maintenance_metrics(&foreign, &foreign_revision, (1, 0, 1, 0, 0, 0, 0, 0));
+        assert!(writer.feature_maintenance_metrics(&revision).is_err());
     }
     #[test]
     fn feature_inverse_prune_retains_ambiguous_and_active_evidence_and_trigger_failure_rolls_back()
@@ -2034,6 +2063,11 @@ mod fixtures {
                 assert_eq!(result.unwrap().removed, 0, "{fault}");
             }
             assert_eq!(feature_owner_counts(&writer), before, "{fault}");
+            if matches!(fault, "offline" | "trigger") {
+                assert_maintenance_metrics(&writer, &revision, (1, 0, 0, 0, 1, 0, 0, 0));
+            } else {
+                assert_maintenance_metrics(&writer, &revision, (1, 1, 0, 0, 0, 1, 0, 0));
+            }
         }
     }
     #[test]
@@ -2178,6 +2212,11 @@ mod fixtures {
                 ))
             ));
             assert_eq!(feature_owner_counts(&writer), (1, 1));
+            assert_maintenance_metrics(
+                &writer,
+                &current,
+                (1, 0, 0, u64::from(!elapsed), u64::from(elapsed), 0, 0, 0),
+            );
             writer.catalog_database().connection.authorizer(
                 None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
             );
@@ -2188,6 +2227,11 @@ mod fixtures {
                     .unwrap()
                     .removed,
                 1
+            );
+            assert_maintenance_metrics(
+                &writer,
+                &current,
+                (2, 1, 0, u64::from(!elapsed), u64::from(elapsed), 1, 1, 732),
             );
         }
     }
@@ -2228,6 +2272,7 @@ mod fixtures {
             ))
         ));
         assert_eq!(feature_owner_counts(&writer), (1, 1));
+        assert_maintenance_metrics(&writer, &current, (1, 0, 0, 1, 0, 0, 0, 0));
         writer.catalog_database().connection.authorizer(
             None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
         );
@@ -2239,6 +2284,7 @@ mod fixtures {
                 .removed,
             1
         );
+        assert_maintenance_metrics(&writer, &current, (2, 1, 0, 1, 0, 1, 1, 732));
     }
     #[test]
     fn feature_inverse_retained_hard_wal_blocks_delete_but_allows_readonly_retention_then_retry() {
@@ -2313,6 +2359,7 @@ mod fixtures {
         ));
         assert_eq!(feature_owner_counts(&writer), (1, 1));
         assert_eq!(counts(&writer), before);
+        assert_maintenance_metrics(&writer, &current, (2, 1, 0, 0, 1, 1, 0, 0));
         reader.execute_batch("ROLLBACK").unwrap();
         drop(reader);
         writer
@@ -2335,5 +2382,127 @@ mod fixtures {
                 .removed,
             1
         );
+        assert_maintenance_metrics(&writer, &current, (3, 2, 0, 0, 1, 2, 1, 732));
+    }
+    #[test]
+    fn feature_maintenance_metrics_observer_is_readonly_and_resets_on_handoff() {
+        let (_f, mut writer) = setup();
+        let target = publish(&mut writer);
+        complete_feature(&mut writer, &target, 31);
+        let revision = writer.current_revision().unwrap();
+        let (_other_f, foreign) = setup();
+        let foreign_revision = foreign.current_revision().unwrap();
+        assert!(
+            writer
+                .prune_superseded_feature_artifacts(
+                    &foreign_revision,
+                    None,
+                    64,
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+        );
+        assert!(
+            writer
+                .feature_maintenance_metrics(&foreign_revision)
+                .is_err()
+        );
+        writer
+            .prune_superseded_feature_artifacts(&revision, None, 64, &AtomicBool::new(false))
+            .unwrap();
+        assert_maintenance_metrics(&writer, &revision, (2, 1, 1, 0, 0, 1, 0, 0));
+        let db = writer.into_catalog_database();
+        let mut writer =
+            SourceWriter::new(db, SourceId::from_string("manifest-features"), 8).unwrap();
+        let current = writer.current_revision().unwrap();
+        assert_eq!(
+            writer.feature_maintenance_metrics(&current).unwrap(),
+            crate::sample_sources::FeatureMaintenanceMetrics::default()
+        );
+        assert!(writer.feature_maintenance_metrics(&revision).is_err());
+        assert!(
+            writer
+                .prune_superseded_feature_artifacts(&revision, None, 64, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert_maintenance_metrics(&writer, &current, (1, 0, 1, 0, 0, 0, 0, 0));
+
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        writer
+            .catalog_database()
+            .connection
+            .execute(
+                "UPDATE source_lease SET expires_at=?1 WHERE singleton=1",
+                [now + 30],
+            )
+            .unwrap();
+        let persisted = |writer: &SourceWriter| {
+            let file = PathBuf::from(writer.catalog_database().connection.path().unwrap());
+            [
+                file.clone(),
+                PathBuf::from(format!("{}-wal", file.display())),
+            ]
+            .into_iter()
+            .filter_map(|path| std::fs::read(&path).ok().map(|bytes| (path, bytes)))
+            .collect::<Vec<_>>()
+        };
+        let before = persisted(&writer);
+        let changes = writer.catalog_database().connection.total_changes();
+        writer
+            .catalog_database()
+            .connection
+            .pragma_update(None, "query_only", true)
+            .unwrap();
+        assert_maintenance_metrics(&writer, &current, (1, 0, 1, 0, 0, 0, 0, 0));
+        assert_maintenance_metrics(&writer, &current, (1, 0, 1, 0, 0, 0, 0, 0));
+        assert_eq!(
+            writer.catalog_database().connection.total_changes(),
+            changes
+        );
+        assert_eq!(
+            persisted(&writer),
+            before,
+            "observer renewed lease or wrote persistent bytes"
+        );
+        writer
+            .catalog_database()
+            .connection
+            .pragma_update(None, "query_only", false)
+            .unwrap();
+        writer
+            .catalog_database()
+            .connection
+            .execute(
+                "UPDATE source_lease SET expires_at=acquired_at WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        let before = persisted(&writer);
+        let changes = writer.catalog_database().connection.total_changes();
+        assert!(writer.feature_maintenance_metrics(&current).is_err());
+        assert!(
+            writer
+                .prune_superseded_feature_artifacts(&current, None, 64, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert_eq!(
+            writer.catalog_database().connection.total_changes(),
+            changes
+        );
+        assert_eq!(
+            persisted(&writer),
+            before,
+            "expired observation or command renewed lease"
+        );
+        // Explicit mutation admission is the only lease renewal here; then expose the error count.
+        let renewed = writer.current_revision_for_command().unwrap();
+        assert_maintenance_metrics(&writer, &renewed, (2, 0, 1, 0, 1, 0, 0, 0));
+        assert_eq!(feature_owner_counts(&writer), (1, 1));
     }
 }

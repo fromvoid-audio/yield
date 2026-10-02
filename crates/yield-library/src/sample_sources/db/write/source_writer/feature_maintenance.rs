@@ -34,40 +34,55 @@ impl SourceWriter {
         limit: u32,
         cancel: &AtomicBool,
     ) -> Result<FeaturePrunePage, SourceWriterError> {
-        self.validate_readiness_revision(expected)?;
-        if !(1..=64).contains(&limit) {
-            return Err(SourceWriterError::InvalidRequest(
-                "feature maintenance page bound",
-            ));
-        }
-        if let Some(cursor) = cursor {
-            if &cursor.revision != expected
-                || !cursor
-                    .owner
-                    .upgrade()
-                    .is_some_and(|owner| Arc::ptr_eq(&owner, &self.reference_liveness))
-            {
-                return Err(SourceWriterError::StaleFence);
+        let started = Instant::now();
+        let result = (|| {
+            self.validate_readiness_revision(expected)?;
+            if !(1..=64).contains(&limit) {
+                return Err(SourceWriterError::InvalidRequest(
+                    "feature maintenance page bound",
+                ));
             }
-        }
-        let fence = self
-            .reference_read_fence()
-            .map_err(|_| SourceWriterError::StaleFence)?;
-        let result = self.database.readiness_store()?.prune_superseded_features(
-            &fence,
-            cursor.map_or("", |cursor| cursor.after.as_str()),
-            limit,
-            cancel,
-        )?;
-        Ok(FeaturePrunePage {
-            observed: result.observed,
-            removed: result.removed,
-            logical_payload_bytes_removed: u64::from(result.removed) * 732,
-            next: result.next.map(|after| FeaturePruneCursor {
-                revision: expected.clone(),
-                owner: Arc::downgrade(&self.reference_liveness),
-                after,
-            }),
-        })
+            if let Some(cursor) = cursor {
+                if &cursor.revision != expected
+                    || !cursor
+                        .owner
+                        .upgrade()
+                        .is_some_and(|owner| Arc::ptr_eq(&owner, &self.reference_liveness))
+                {
+                    return Err(SourceWriterError::StaleFence);
+                }
+            }
+            let fence = self
+                .reference_read_fence()
+                .map_err(|_| SourceWriterError::StaleFence)?;
+            let result = self.database.readiness_store()?.prune_superseded_features(
+                &fence,
+                cursor.map_or("", |cursor| cursor.after.as_str()),
+                limit,
+                cancel,
+            )?;
+            Ok(FeaturePrunePage {
+                observed: result.observed,
+                removed: result.removed,
+                logical_payload_bytes_removed: u64::from(result.removed) * 732,
+                next: result.next.map(|after| FeaturePruneCursor {
+                    revision: expected.clone(),
+                    owner: Arc::downgrade(&self.reference_liveness),
+                    after,
+                }),
+            })
+        })();
+        self.feature_maintenance_metrics
+            .record(&result, started.elapsed());
+        result
+    }
+    /// Fixed-size diagnostics under strict current read-only owner/revision validation.
+    /// No lease renewal, SQL mutation, recount or cleanup authority is supplied.
+    pub fn feature_maintenance_metrics(
+        &self,
+        expected: &SourceRevision,
+    ) -> Result<FeatureMaintenanceMetrics, SourceWriterError> {
+        self.validate_readiness_revision(expected)?;
+        Ok(self.feature_maintenance_metrics)
     }
 }
