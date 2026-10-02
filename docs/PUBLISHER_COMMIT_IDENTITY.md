@@ -60,7 +60,9 @@ under its existing skip-build mode, then the actual shell publisher and curl/Pyt
 request paths against a loopback HTTP server using a fake local token. All declared
 lanes/targets, pre-PUT mismatch/integrity/overflow rejection, malformed and substituted
 server metadata, complete file identity, and changed-original/snapshot behavior are
-covered. These fixtures are not native binaries, signing, deployment or physical
+covered. Unknown-length oversized staging and pre-commit HTTP responses must be
+rejected by curl during transfer, before JSON parsing or a remote commit request.
+These fixtures are not native binaries, signing, deployment or physical
 qualification. Disabled workflows are not activated or edited.
 
 OPT-2149 implements this portable client contract only. OPT-2123 retains actual server

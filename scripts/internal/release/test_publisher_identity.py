@@ -26,7 +26,7 @@ COMMIT = "12345678" + "a" * 32
 
 
 class Server:
-    def __init__(self, phase=None, mutation=None):
+    def __init__(self, phase=None, mutation=None, content_length=True):
         self.requests = []
         self.files = []
         self.release = None
@@ -43,7 +43,8 @@ class Server:
                 raw = value if isinstance(value, bytes) else json.dumps(value).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
+                if content_length:
+                    self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 try:
                     self.wfile.write(raw)
@@ -154,8 +155,8 @@ class PublisherIdentity(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
         return result
 
-    def server(self, phase=None, mutation=None):
-        server = Server(phase, mutation)
+    def server(self, phase=None, mutation=None, content_length=True):
+        server = Server(phase, mutation, content_length)
         self.addCleanup(server.close)
         return server
 
@@ -260,6 +261,18 @@ class PublisherIdentity(unittest.TestCase):
             result = self.run_publisher(case, server)
             self.assertNotEqual(result.returncode, 0, "oversized pre-commit metadata was accepted")
             self.assertIsNone(server.body, "must reject before remote commit")
+
+    def test_unknown_length_http_response_is_capped_during_transfer(self):
+        for phase in ("staging", "pre_catalog", "pre_changelog"):
+            with self.subTest(phase=phase):
+                case = self.artifacts()
+                server = self.server(phase, lambda r: b" " * (identity.MAX_JSON + 65536),
+                                     content_length=False)
+                result = self.run_publisher(case, server)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("curl: (63)", result.stderr,
+                              "transport must cap unknown-length bytes before JSON parsing")
+                self.assertIsNone(server.body, "oversized transfer must never reach commit")
 
     def test_nightly_abbreviated_build_id_uses_full_manifest_identity(self):
         case, server = self.artifacts("nightly"), self.server()
