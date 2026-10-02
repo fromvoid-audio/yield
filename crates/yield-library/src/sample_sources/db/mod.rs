@@ -859,65 +859,21 @@ impl SourceDatabase {
     pub fn last_authoritative_audit_metadata(
         &self,
     ) -> Result<Option<SourceAuditMetadata>, SourceDbError> {
-        let transaction = self
-            .connection
-            .unchecked_transaction()
-            .map_err(SourceDbError::from)?;
-        // Bound returned bytes before rusqlite allocates Strings. LIMIT 3 detects ambiguity
-        // even for a corrupt legacy metadata table without its normal unique key constraint.
-        let values = {
-            let mut statement = transaction.prepare(
-                "SELECT key, CASE WHEN typeof(value) = 'text'
-                    AND length(CAST(value AS BLOB)) BETWEEN 1 AND
-                        CASE WHEN key = ?1 THEN 24576 ELSE 20 END
-                    THEN value END
-                 FROM metadata WHERE key IN (?1, ?2) LIMIT 3",
-            )?;
-            statement
-                .query_map(
-                    rusqlite::params![
-                        META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY,
-                        META_LAST_AUTHORITATIVE_AUDIT_REVISION
-                    ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-                )?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        transaction.rollback().map_err(SourceDbError::from)?;
-        if values.is_empty() {
-            return Ok(None);
-        }
-        if values.len() != 2 {
+        let transaction = self.connection.unchecked_transaction()?;
+        let values = read_authoritative_audit_values(&transaction)?;
+        transaction.rollback()?;
+        decode_authoritative_audit_values(values)
+    }
+
+    /// Read the same bounded audit pair inside a caller-owned transaction without changing it.
+    /// This returns observations only; the caller must establish its own reservation/authority.
+    pub(crate) fn last_authoritative_audit_metadata_in_transaction(
+        &self,
+    ) -> Result<Option<SourceAuditMetadata>, SourceDbError> {
+        if self.connection.is_autocommit() {
             return Err(SourceDbError::Unexpected);
         }
-        let mut identity = None;
-        let mut revision = None;
-        for (key, value) in values {
-            let slot = match key.as_str() {
-                META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY => &mut identity,
-                META_LAST_AUTHORITATIVE_AUDIT_REVISION => &mut revision,
-                _ => return Err(SourceDbError::Unexpected),
-            };
-            if slot
-                .replace(value.ok_or(SourceDbError::Unexpected)?)
-                .is_some()
-            {
-                return Err(SourceDbError::Unexpected);
-            }
-        }
-        let source_revision = revision
-            .ok_or(SourceDbError::Unexpected)?
-            .parse::<u64>()
-            .map_err(|_| SourceDbError::Unexpected)?;
-        let identity = serde_json::from_str::<Vec<u8>>(&identity.ok_or(SourceDbError::Unexpected)?)
-            .map_err(|_| SourceDbError::Unexpected)?;
-        if identity.is_empty() || identity.len() > 4096 {
-            return Err(SourceDbError::Unexpected);
-        }
-        Ok(Some(SourceAuditMetadata {
-            root_identity: RootIdentity::from_bytes(identity),
-            source_revision,
-        }))
+        decode_authoritative_audit_values(read_authoritative_audit_values(&self.connection)?)
     }
 
     /// Override this connection's SQLite busy timeout for deterministic contention tests.
@@ -1673,6 +1629,71 @@ fn snapshot_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
     let mut path = database.as_os_str().to_os_string();
     path.push(suffix);
     PathBuf::from(path)
+}
+
+fn read_authoritative_audit_values(
+    connection: &Connection,
+) -> Result<Vec<(String, Option<String>)>, SourceDbError> {
+    // Bound returned bytes before rusqlite allocates Strings. LIMIT 3 detects ambiguity
+    // even for a corrupt legacy metadata table without its normal unique key constraint.
+    let values = {
+        let mut statement = connection.prepare(
+            "SELECT key, CASE WHEN typeof(value) = 'text'
+                    AND length(CAST(value AS BLOB)) BETWEEN 1 AND
+                        CASE WHEN key = ?1 THEN 24576 ELSE 20 END
+                    THEN value END
+                 FROM metadata WHERE key IN (?1, ?2) LIMIT 3",
+        )?;
+        statement
+            .query_map(
+                rusqlite::params![
+                    META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY,
+                    META_LAST_AUTHORITATIVE_AUDIT_REVISION
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(values)
+}
+
+fn decode_authoritative_audit_values(
+    values: Vec<(String, Option<String>)>,
+) -> Result<Option<SourceAuditMetadata>, SourceDbError> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.len() != 2 {
+        return Err(SourceDbError::Unexpected);
+    }
+    let mut identity = None;
+    let mut revision = None;
+    for (key, value) in values {
+        let slot = match key.as_str() {
+            META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY => &mut identity,
+            META_LAST_AUTHORITATIVE_AUDIT_REVISION => &mut revision,
+            _ => return Err(SourceDbError::Unexpected),
+        };
+        if slot
+            .replace(value.ok_or(SourceDbError::Unexpected)?)
+            .is_some()
+        {
+            return Err(SourceDbError::Unexpected);
+        }
+    }
+    let source_revision = revision
+        .ok_or(SourceDbError::Unexpected)?
+        .parse::<u64>()
+        .map_err(|_| SourceDbError::Unexpected)?;
+    let identity = serde_json::from_str::<Vec<u8>>(&identity.ok_or(SourceDbError::Unexpected)?)
+        .map_err(|_| SourceDbError::Unexpected)?;
+    if identity.is_empty() || identity.len() > 4096 {
+        return Err(SourceDbError::Unexpected);
+    }
+    Ok(Some(SourceAuditMetadata {
+        root_identity: RootIdentity::from_bytes(identity),
+        source_revision,
+    }))
 }
 
 /// Read a numeric metadata field without allocating an unbounded corrupt SQLite value.

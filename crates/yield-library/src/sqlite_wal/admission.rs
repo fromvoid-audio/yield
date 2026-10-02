@@ -34,6 +34,14 @@ pub(crate) enum WalAdmissionState {
     CheckpointCatchUp { bytes: u64 },
 }
 
+impl WalAdmissionState {
+    pub(crate) fn observed_bytes(self) -> u64 {
+        match self {
+            Self::Normal { bytes } | Self::CheckpointCatchUp { bytes } => bytes,
+        }
+    }
+}
+
 fn unavailable(reason: &'static str) -> WalAdmissionError {
     WalAdmissionError::ObservationUnavailable { reason }
 }

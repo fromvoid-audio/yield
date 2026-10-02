@@ -28,7 +28,8 @@ pub use source_writer::{
     SourceCollectionHistorySelection, SourceCommandId, SourceFeaturePublicationMetrics,
     SourceRevision, SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage,
     SourceSnapshotQueueMetrics, SourceTagAdmissionObservation, SourceTagMetadataBudget,
-    SourceTagMetadataPolicy, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
+    SourceTagMetadataPolicy, SourceWalPreparation, SourceWalPreparationError,
+    SourceWalPreparationFailure, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
     SourceWriterReceipt, SourceWriterRequest,
 };
 pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};

@@ -24,8 +24,12 @@ mod tag_admission_observation;
 mod tag_metadata_budget;
 mod tag_metadata_policy;
 pub use tag_admission_observation::SourceTagAdmissionObservation;
+mod wal_reservation;
 pub use tag_metadata_budget::SourceTagMetadataBudget;
 pub use tag_metadata_policy::SourceTagMetadataPolicy;
+pub use wal_reservation::{
+    SourceWalPreparation, SourceWalPreparationError, SourceWalPreparationFailure,
+};
 #[path = "readiness_targets.rs"]
 mod readiness_targets;
 pub use manifest_enrollment::{
