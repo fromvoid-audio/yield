@@ -63,6 +63,18 @@ impl SourceRegistryGlobal {
             .remove_root(root)
     }
 
+    pub(crate) fn set_source_primary(
+        &self,
+        source_id: SourceId,
+        primary: bool,
+        revision: RegistryRevision,
+    ) -> Result<RequestId, SubmitError> {
+        self.service
+            .as_ref()
+            .ok_or(SubmitError::Closed)?
+            .set_source_primary(source_id, primary, revision)
+    }
+
     pub(crate) fn reorder_source(
         &self,
         source_id: SourceId,
@@ -378,7 +390,7 @@ impl Browser {
         !self.source_registry_loaded
             || !self.source_registry_pending_adds.is_empty()
             || !self.source_registry_pending_removes.is_empty()
-            || self.source_registry_pending_reorder.is_some()
+            || self.source_registry_pending_edit.is_some()
             || catalog_events_capped
             || tags::has_pending(self)
             || tag_chips::has_pending(self)
@@ -431,7 +443,7 @@ impl Browser {
                 self.set_source_registry_status(
                     if self.source_registry_pending_adds.is_empty()
                         && self.source_registry_pending_removes.is_empty()
-                        && self.source_registry_pending_reorder.is_none()
+                        && self.source_registry_pending_edit.is_none()
                     {
                         "Sources saved".to_string()
                     } else {
@@ -441,7 +453,7 @@ impl Browser {
                 true
             }
             RegistryEvent::RequestApplied { request, revision } => {
-                if let Some((pending, applied)) = self.source_registry_pending_reorder.as_mut()
+                if let Some((pending, applied)) = self.source_registry_pending_edit.as_mut()
                     && *pending == request
                 {
                     *applied = Some(revision);
@@ -468,7 +480,7 @@ impl Browser {
                 self.set_source_registry_status(
                     if self.source_registry_pending_adds.is_empty()
                         && self.source_registry_pending_removes.is_empty()
-                        && self.source_registry_pending_reorder.is_none()
+                        && self.source_registry_pending_edit.is_none()
                     {
                         "Sources saved".to_string()
                     } else {
@@ -480,11 +492,19 @@ impl Browser {
             RegistryEvent::RequestFailed { request, error } => {
                 let message = error.to_string();
                 if self
-                    .source_registry_pending_reorder
+                    .source_registry_pending_edit
                     .as_ref()
                     .is_some_and(|(pending, _)| *pending == request)
                 {
-                    self.source_registry_pending_reorder = None;
+                    // A rejected request with no applied revision changed no role and can retry.
+                    if self
+                        .source_registry_pending_edit
+                        .as_ref()
+                        .is_some_and(|(_, revision)| revision.is_none())
+                    {
+                        self.source_primary_unconfirmed = false;
+                    }
+                    self.source_registry_pending_edit = None;
                 }
                 if let Some(mutation) = self.source_registry_pending_adds.remove(&request) {
                     self.set_source_error(&mutation.root, message.clone());
@@ -493,7 +513,14 @@ impl Browser {
                     self.source_registry_removed_roots.remove(&mutation.root);
                     self.set_source_error(&mutation.root, message.clone());
                 }
-                self.set_source_registry_status(format!("Source registry error: {message}"));
+                let suffix = if self.source_primary_unconfirmed {
+                    "; primary changes are unconfirmed"
+                } else {
+                    ""
+                };
+                self.set_source_registry_status(format!(
+                    "Source registry error: {message}{suffix}"
+                ));
                 true
             }
             RegistryEvent::PersistenceUnavailable { revision, error } => {
@@ -514,14 +541,60 @@ impl Browser {
         }
     }
 
+    pub(super) fn set_context_source_primary(
+        &mut self,
+        target: super::directory_open::DirectoryOpenTarget,
+        primary: bool,
+        revision: RegistryRevision,
+        cx: &mut Context<Self>,
+    ) {
+        if target.kind != super::directory_open::DirectoryOpenKind::Source
+            || !super::directory_open::directory_target_is_current(self, &target)
+            || !self.source_registry_loaded
+            || revision != self.source_registry_revision
+            || self.source_registry_pending_edit.is_some()
+            || self.source_primary_unconfirmed
+            || !self.source_registry_pending_adds.is_empty()
+            || !self.source_registry_pending_removes.is_empty()
+            || self.source_sessions[target.source_index].role
+                == yield_library::sample_sources::SourceRole::Protected
+        {
+            self.set_source_registry_status(
+                "Primary source change canceled: source changed or is not writable/settled"
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let result = if cx.has_global::<SourceRegistryGlobal>() {
+            cx.update_global::<SourceRegistryGlobal, _>(|global, _| {
+                global.set_source_primary(target.source_id, primary, revision)
+            })
+        } else {
+            Err(SubmitError::Closed)
+        };
+        match result {
+            Ok(request) => {
+                self.source_registry_pending_edit = Some((request, None));
+                self.source_primary_unconfirmed = true;
+                self.set_source_registry_status("Saving primary source…".to_string());
+                self.start_source_registry_poll(cx);
+            }
+            Err(error) => self
+                .set_source_registry_status(format!("Primary source change unavailable: {error}")),
+        }
+        cx.notify();
+    }
+
     fn clear_persisted_registry_mutations(&mut self) {
         let persisted = self.source_registry_persisted_revision;
         if self
-            .source_registry_pending_reorder
+            .source_registry_pending_edit
             .as_ref()
             .is_some_and(|(_, revision)| revision.is_some_and(|revision| revision <= persisted))
         {
-            self.source_registry_pending_reorder = None;
+            self.source_registry_pending_edit = None;
+            self.source_primary_unconfirmed = false;
         }
         self.source_registry_pending_adds.retain(|_, mutation| {
             !mutation
@@ -549,7 +622,7 @@ impl Browser {
     }
 
     fn fail_pending_registry_mutations(&mut self, message: String) {
-        self.source_registry_pending_reorder = None;
+        self.source_registry_pending_edit = None;
         let add_roots: Vec<PathBuf> = self
             .source_registry_pending_adds
             .drain()
@@ -645,6 +718,7 @@ impl Browser {
                 .unwrap_or_else(|| SourceSession::from_source(source));
             let root_changed = session.root != source.root;
             session.source_id = Some(source.id.clone());
+            session.role = source.role;
             session.root = source.root.clone();
             session.label = source_label(&source.root);
             if root_changed {
@@ -915,6 +989,24 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use yield_library::sample_sources::{SampleSource, SourceId};
+
+    #[gpui::test]
+    fn primary_source_persistence_failure_keeps_role_unconfirmed(cx: &mut gpui::TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| crate::browser::Browser::new(cx));
+        browser.update(cx, |view, cx| {
+            view.source_primary_unconfirmed = true;
+            assert!(view.apply_source_registry_event(
+                yield_session::RegistryEvent::PersistenceUnavailable {
+                    revision: yield_session::RegistryRevision::default(),
+                    error: yield_session::SessionError::Library("injected save failure".into()),
+                },
+                cx
+            ));
+            assert!(view.source_primary_unconfirmed);
+            assert!(view.source_registry_pending_edit.is_none());
+        });
+    }
 
     #[test]
     fn restored_session_matches_by_durable_id_before_root_fallback() {

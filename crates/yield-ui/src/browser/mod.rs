@@ -25,7 +25,7 @@ use yield_core::{
     parse_playmark_frame_range, playmark_selection_label,
 };
 use yield_design::{Motion, Theme, load_theme_file};
-use yield_library::sample_sources::{SampleSource, SourceId};
+use yield_library::sample_sources::{SampleSource, SourceId, SourceRole};
 use yield_media::{
     WaveformPreview, enumerate_audio_files_with_cancel, load_waveform_preview_with_cancel,
 };
@@ -151,6 +151,7 @@ pub(crate) fn install_source_registry(cx: &mut App) {
 #[derive(Clone, Debug)]
 struct SourceSession {
     source_id: Option<SourceId>,
+    role: SourceRole,
     root: PathBuf,
     label: String,
     entries: Vec<AudioFile>,
@@ -180,6 +181,7 @@ impl SourceSession {
             .unwrap_or_else(|| root.display().to_string());
         Self {
             source_id: None,
+            role: SourceRole::Normal,
             root,
             label,
             entries: Vec::new(),
@@ -198,6 +200,7 @@ impl SourceSession {
     fn from_source(source: &SampleSource) -> Self {
         let mut session = Self::new(source.root.clone());
         session.source_id = Some(source.id.clone());
+        session.role = source.role;
         session
     }
 }
@@ -450,7 +453,8 @@ pub(crate) struct Browser {
     source_registry_known_roots: BTreeSet<PathBuf>,
     source_registry_pending_adds: HashMap<RequestId, PendingRegistryMutation>,
     source_registry_pending_removes: HashMap<RequestId, PendingRegistryMutation>,
-    source_registry_pending_reorder: Option<(RequestId, Option<RegistryRevision>)>,
+    source_registry_pending_edit: Option<(RequestId, Option<RegistryRevision>)>,
+    source_primary_unconfirmed: bool,
     source_reorder_drag: Option<SourceReorderDrag>,
     source_registry_removed_roots: BTreeSet<PathBuf>,
     source_registry_status: String,
@@ -801,7 +805,8 @@ impl Browser {
             source_registry_known_roots: BTreeSet::new(),
             source_registry_pending_adds: HashMap::new(),
             source_registry_pending_removes: HashMap::new(),
-            source_registry_pending_reorder: None,
+            source_registry_pending_edit: None,
+            source_primary_unconfirmed: false,
             source_reorder_drag: None,
             source_registry_removed_roots: BTreeSet::new(),
             source_registry_status: "Loading sources…".to_string(),

@@ -30,8 +30,14 @@ enum ContextMenuAction {
     Reveal,
     CopyPath,
     Unlock,
-    RemoveFromCollection { slot: usize },
+    RemoveFromCollection {
+        slot: usize,
+    },
     OpenDirectory,
+    SetSourcePrimary {
+        primary: bool,
+        revision: yield_session::RegistryRevision,
+    },
     RenameCollection,
 }
 
@@ -360,9 +366,28 @@ impl Browser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let mut actions = vec![ContextMenuAction::OpenDirectory];
+        if target.kind == super::directory_open::DirectoryOpenKind::Source
+            && super::directory_open::directory_target_is_current(self, &target)
+        {
+            let ready = self.source_registry_loaded
+                && self.source_registry_pending_edit.is_none()
+                && !self.source_primary_unconfirmed
+                && self.source_registry_pending_adds.is_empty()
+                && self.source_registry_pending_removes.is_empty()
+                && self.source_registry_revision == self.source_registry_persisted_revision;
+            if let Some(primary) =
+                source_primary_menu_action(self.source_sessions[target.source_index].role, ready)
+            {
+                actions.push(ContextMenuAction::SetSourcePrimary {
+                    primary,
+                    revision: self.source_registry_revision,
+                });
+            }
+        }
         self.context_menu = Some(ContextMenuState {
             target: ContextMenuTarget::Directory(target),
-            actions: vec![ContextMenuAction::OpenDirectory],
+            actions,
             selected_action: 0,
         });
         self.start_source_registry_poll(cx);
@@ -455,6 +480,12 @@ impl Browser {
                     Some(vec![target.relative_path]),
                     cx,
                 );
+            }
+            (
+                ContextMenuAction::SetSourcePrimary { primary, revision },
+                ContextMenuTarget::Directory(target),
+            ) => {
+                self.set_context_source_primary(target, primary, revision, cx);
             }
             (ContextMenuAction::OpenDirectory, ContextMenuTarget::Directory(target)) => {
                 self.start_directory_open(target, cx)
@@ -706,12 +737,26 @@ pub(super) fn render_overlay(
         .into_any_element()
 }
 
+fn source_primary_menu_action(
+    role: yield_library::sample_sources::SourceRole,
+    ready: bool,
+) -> Option<bool> {
+    use yield_library::sample_sources::SourceRole;
+    if !ready || role == SourceRole::Protected {
+        None
+    } else {
+        Some(role != SourceRole::Primary)
+    }
+}
+
 fn context_menu_action_label(action: ContextMenuAction) -> &'static str {
     match action {
         ContextMenuAction::Reveal => file_manager_reveal_label(),
         ContextMenuAction::CopyPath => "Copy Path",
         ContextMenuAction::Unlock => "Unlock",
         ContextMenuAction::RemoveFromCollection { .. } => "Remove from collection",
+        ContextMenuAction::SetSourcePrimary { primary: true, .. } => "Set as primary source",
+        ContextMenuAction::SetSourcePrimary { primary: false, .. } => "Clear primary source",
         ContextMenuAction::OpenDirectory => directory_open_label(),
         ContextMenuAction::RenameCollection => "Rename collection",
     }
@@ -760,6 +805,30 @@ mod tests {
         AudioFileCuration, MAX_RATING, PlaybackType, PlaybackTypeFilter, RatingFilter, SortSpec,
     };
     use yield_library::sample_sources::SourceId;
+
+    #[test]
+    fn primary_source_menu_requires_confirmed_writable_role() {
+        use yield_library::sample_sources::SourceRole;
+        assert_eq!(
+            super::source_primary_menu_action(SourceRole::Normal, true),
+            Some(true)
+        );
+        assert_eq!(
+            super::source_primary_menu_action(SourceRole::Primary, true),
+            Some(false)
+        );
+        assert_eq!(
+            super::source_primary_menu_action(SourceRole::Protected, true),
+            None
+        );
+        for role in [
+            SourceRole::Normal,
+            SourceRole::Primary,
+            SourceRole::Protected,
+        ] {
+            assert_eq!(super::source_primary_menu_action(role, false), None);
+        }
+    }
 
     #[test]
     fn copy_path_normalizes_separators_and_quotes_spaces() {
