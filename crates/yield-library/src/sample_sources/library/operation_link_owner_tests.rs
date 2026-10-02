@@ -117,3 +117,41 @@ fn operation_link_ambiguous_retained_rows_are_not_arbitrarily_replayed() {
     assert!(matches!(result(&writer, command), Err(LibraryError::OperationLinkMalformedReceipt)));
     assert!(writer.shutdown());
 }
+
+#[test]
+fn operation_link_reordered_submissions_and_restart_keep_one_result_per_key() {
+    let temp = tempdir().unwrap();
+    let _runtime = TestRuntimeGuard::acquire();
+    let (_base, _profile, guard, mut writer) = start_writer(&temp, "link-reordered");
+    wait_until_available(&writer);
+    // Command IDs describe correlation identity, not a global execution order. A later
+    // source commit may be reported first after response loss; neither link may overwrite
+    // the other's historical revision. This is not a saga or source mutation ordering test.
+    let older = test_request(guard.owner_identity(), 1, 1, 7);
+    let newer = test_request(guard.owner_identity(), 1, 2, 8);
+    let newer_reply = writer.apply_operation_link(newer.clone()).unwrap();
+    let older_reply = writer.apply_operation_link(older.clone()).unwrap();
+    let duplicate_newer = writer.apply_operation_link(newer.clone()).unwrap();
+    let duplicate_older = writer.apply_operation_link(older.clone()).unwrap();
+    let newer_receipt = newer_reply.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+    let older_receipt = older_reply.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+    for (receiver, expected) in [(duplicate_older, &older_receipt), (duplicate_newer, &newer_receipt)] {
+        let replay = receiver.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert!(matches!(replay, OperationLinkResult::Replayed(_)));
+        assert_eq!(replay.receipt(), expected.receipt());
+    }
+    assert_eq!(older_receipt.receipt().operation_id(), newer_receipt.receipt().operation_id());
+    assert_eq!(older_receipt.receipt().source_revision(), 7);
+    assert_eq!(newer_receipt.receipt().source_revision(), 8);
+    assert!(newer_receipt.receipt().sequence() < older_receipt.receipt().sequence());
+    assert!(writer.shutdown()); drop(writer); drop(guard);
+    let fresh = WritableProfileGuard::acquire_current().unwrap();
+    let mut reopened = GlobalLibraryWriter::start(&fresh).unwrap(); wait_until_available(&reopened);
+    for (command, revision, expected) in [(1, 7, &older_receipt), (2, 8, &newer_receipt), (1, 7, &older_receipt)] {
+        let replay = result(&reopened, test_request(fresh.owner_identity(), 1, command, revision)).unwrap();
+        assert!(matches!(replay, OperationLinkResult::Replayed(_)));
+        assert_eq!(replay.receipt(), expected.receipt());
+    }
+    assert_eq!(connection(&fresh).query_row("SELECT COUNT(*) FROM operation_link_receipts", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+    assert!(reopened.shutdown());
+}
