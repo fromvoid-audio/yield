@@ -1,4 +1,4 @@
-//! Ordinary-global post-commit maintenance; no read command supplies this marker.
+//! Eligible global post-commit maintenance; no read or receipt replay supplies this marker.
 use std::cell::Cell;
 
 use super::connection::LibraryDatabase;
@@ -13,6 +13,11 @@ pub(super) struct OrdinaryWalMaintenance {
 impl LibraryDatabase {
     /// Mark only a confirmed ordinary transaction commit, never a replay/no-op acknowledgement.
     pub(super) fn note_ordinary_commit(&self) {
+        self.ordinary_wal_maintenance.committed.set(true);
+    }
+
+    /// A new immutable registry receipt commits even when it records RegistryChanged.
+    pub(super) fn note_registry_participant_commit(&self) {
         self.ordinary_wal_maintenance.committed.set(true);
     }
 
