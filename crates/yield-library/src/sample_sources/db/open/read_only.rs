@@ -58,6 +58,7 @@ pub(super) fn open_read_only_source_database(
     };
 
     let db = SourceDatabase {
+        index_page_binding: std::sync::Arc::new(()),
         connection,
         db_path: db_path.clone(),
         root: root.to_path_buf(),

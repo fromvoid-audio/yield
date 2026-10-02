@@ -332,6 +332,7 @@ fn open_source_database_with_profile_guard_inner(
 
     let root_binding: Arc<dyn super::DatabaseRootBindingGuard> = database_root.clone();
     let db = SourceDatabase {
+        index_page_binding: std::sync::Arc::new(()),
         connection,
         db_path: db_path.clone(),
         root: root.to_path_buf(),
@@ -482,6 +483,7 @@ fn open_source_database_with_flags(
         }
     };
     let db = SourceDatabase {
+        index_page_binding: std::sync::Arc::new(()),
         connection,
         db_path: db_path.clone(),
         root: root.to_path_buf(),

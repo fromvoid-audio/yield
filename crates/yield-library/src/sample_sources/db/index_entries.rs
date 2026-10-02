@@ -13,6 +13,58 @@ use super::{
 };
 use crate::sample_sources::reconciliation::RootRelativePath;
 
+/// Maximum retained index entries returned by one page.
+pub const SOURCE_INDEX_PAGE_MAX_ENTRIES: usize = 128;
+
+/// Opaque, in-memory continuation bound to one open database and index revision.
+///
+/// Reopening the connection requires starting a new traversal. This cursor grants
+/// no source lifecycle authority, scan completeness or filesystem/reveal permission.
+#[derive(Clone, Debug)]
+pub struct SourceIndexPageCursor {
+    binding: std::sync::Arc<()>,
+    root: PathBuf,
+    revision: u64,
+    after: String,
+}
+
+/// Bounded retained index facts, including unsupported and inaccessible entries.
+///
+/// An available schema and exhausted cursor do not prove a complete/current scan.
+#[derive(Clone, Debug)]
+pub struct SourceIndexPage {
+    /// False when the legacy database has no index schema; entries are then unknown.
+    pub schema_available: bool,
+    /// Index revision observed in the same SQLite transaction as these entries.
+    pub revision: u64,
+    /// At most the requested limit, ordered by the lossless storage key.
+    pub entries: Vec<SourceIndexEntry>,
+    /// Continue at this revision, or none if the retained table is exhausted/unavailable.
+    pub next: Option<SourceIndexPageCursor>,
+}
+
+/// Explicit rejected continuation, limit, or database projection outcome.
+#[derive(Debug, thiserror::Error)]
+pub enum SourceIndexPageError {
+    /// The limit is outside one through the fixed page maximum.
+    #[error("source index page limit must be between 1 and {SOURCE_INDEX_PAGE_MAX_ENTRIES}")]
+    InvalidLimit,
+    /// A cursor came from a different/reopened connection or retargeted source root.
+    #[error("source index cursor belongs to a different database connection or source root")]
+    ForeignCursor,
+    /// The retained table changed during a traversal; start a new traversal.
+    #[error("source index cursor expected revision {expected}, found {actual}")]
+    StaleCursor {
+        /// Revision bound to the cursor.
+        expected: u64,
+        /// Revision currently observed by the reader.
+        actual: u64,
+    },
+    /// A read failed or a malformed retained row prevented a trustworthy projection.
+    #[error(transparent)]
+    Database(#[from] SourceDbError),
+}
+
 const REQUIRED_COLUMNS: [&str; 7] = [
     "path",
     "classification",
@@ -24,6 +76,97 @@ const REQUIRED_COLUMNS: [&str; 7] = [
 ];
 
 impl SourceDatabase {
+    /// Read one bounded keyset page without collecting the full retained index.
+    ///
+    /// Revision, schema and rows share one read transaction. A continuation is
+    /// valid only for this open connection/root and unchanged index revision.
+    /// Malformed rows fail the page rather than silently implying absence.
+    /// Callers must separately establish source lifecycle and scan completeness.
+    pub fn source_index_page(
+        &self,
+        cursor: Option<&SourceIndexPageCursor>,
+        limit: usize,
+    ) -> Result<SourceIndexPage, SourceIndexPageError> {
+        if !(1..=SOURCE_INDEX_PAGE_MAX_ENTRIES).contains(&limit) {
+            return Err(SourceIndexPageError::InvalidLimit);
+        }
+        if cursor.is_some_and(|cursor| {
+            !std::sync::Arc::ptr_eq(&cursor.binding, &self.index_page_binding)
+                || cursor.root != self.root
+        }) {
+            return Err(SourceIndexPageError::ForeignCursor);
+        }
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(map_sql_error)?;
+        if !source_index_schema_available(&transaction)? {
+            if cursor.is_some() {
+                return Err(SourceDbError::Unexpected.into());
+            }
+            return Ok(SourceIndexPage {
+                schema_available: false,
+                revision: 0,
+                entries: Vec::new(),
+                next: None,
+            });
+        }
+        let revision = read_index_revision(&transaction)?;
+        if let Some(cursor) = cursor {
+            if cursor.revision != revision {
+                return Err(SourceIndexPageError::StaleCursor {
+                    expected: cursor.revision,
+                    actual: revision,
+                });
+            }
+        }
+        let encoding = if source_index_path_encoding_available(&transaction)? {
+            "path_encoding"
+        } else {
+            "0 AS path_encoding"
+        };
+        let comparison = if cursor.is_some() { ">" } else { ">=" };
+        let sql = format!(
+            "SELECT path, {encoding}, classification, file_size, modified_ns, file_identity,
+                    diagnostic, format_policy_version
+             FROM source_index_entries WHERE path {comparison} ?1 COLLATE BINARY
+             ORDER BY path COLLATE BINARY ASC LIMIT ?2"
+        );
+        let mut statement = transaction.prepare(&sql).map_err(map_sql_error)?;
+        let mut rows = statement
+            .query(params![
+                cursor.map_or("", |cursor| cursor.after.as_str()),
+                (limit + 1) as i64
+            ])
+            .map_err(map_sql_error)?;
+        let mut entries = Vec::with_capacity(limit + 1);
+        let mut keys = Vec::with_capacity(limit + 1);
+        while let Some(row) = rows.next().map_err(map_sql_error)? {
+            keys.push(row.get::<_, String>(0).map_err(map_sql_error)?);
+            entries.push(strict_page_entry(row)?);
+        }
+        drop(rows);
+        drop(statement);
+        let next = if entries.len() > limit {
+            entries.truncate(limit);
+            Some(SourceIndexPageCursor {
+                binding: self.index_page_binding.clone(),
+                root: self.root.clone(),
+                revision,
+                after: keys[limit - 1].clone(),
+            })
+        } else {
+            None
+        };
+        transaction.rollback().map_err(map_sql_error)?;
+        Ok(SourceIndexPage {
+            schema_available: true,
+            revision,
+            entries,
+            next,
+        })
+    }
+
     /// Read index-only entries at exact validated paths and their current index revision.
     ///
     /// The row query remains equality-only and bounded by the supplied paths; the revision is
@@ -435,6 +578,36 @@ fn collect_entries(
     Ok(rows.into_iter().flatten().collect())
 }
 
+fn strict_page_entry(row: &rusqlite::Row<'_>) -> Result<SourceIndexEntry, SourceDbError> {
+    let raw_path = row.get::<_, String>(0).map_err(map_sql_error)?;
+    let encoding = row.get::<_, i64>(1).map_err(map_sql_error)?;
+    let relative_path = parse_source_index_path_from_db(&raw_path, encoding)?;
+    let raw_classification = row.get::<_, String>(2).map_err(map_sql_error)?;
+    let classification = SourceIndexClassification::from_token(&raw_classification)
+        .ok_or(SourceDbError::Unexpected)?;
+    let raw_diagnostic = row.get::<_, Option<String>>(6).map_err(map_sql_error)?;
+    let diagnostic = raw_diagnostic
+        .as_deref()
+        .map(|token| SourceIndexDiagnostic::from_token(token).ok_or(SourceDbError::Unexpected))
+        .transpose()?;
+    let size = row.get::<_, Option<i64>>(3).map_err(map_sql_error)?;
+    let file_size = size
+        .map(|value| u64::try_from(value).map_err(|_| SourceDbError::Unexpected))
+        .transpose()?;
+    let version = row.get::<_, i64>(7).map_err(map_sql_error)?;
+    let entry = SourceIndexEntry {
+        relative_path,
+        classification,
+        file_size,
+        modified_ns: row.get(4).map_err(map_sql_error)?,
+        file_identity: row.get(5).map_err(map_sql_error)?,
+        diagnostic,
+        format_policy_version: u32::try_from(version).map_err(|_| SourceDbError::Unexpected)?,
+    };
+    validate_entry(&entry)?;
+    Ok(entry)
+}
+
 fn validate_entry(entry: &SourceIndexEntry) -> Result<(), SourceDbError> {
     let complete_facts = entry.file_size.is_some() && entry.modified_ns.is_some();
     let valid = match entry.classification {
@@ -464,6 +637,165 @@ mod tests {
 
     use super::*;
     use crate::sample_sources::SOURCE_FORMAT_POLICY_VERSION;
+
+    fn page_entry(path: PathBuf) -> SourceIndexEntry {
+        SourceIndexEntry {
+            relative_path: path,
+            classification: SourceIndexClassification::UnsupportedNonAudio,
+            file_size: Some(5),
+            modified_ns: Some(10),
+            file_identity: None,
+            diagnostic: None,
+            format_policy_version: SOURCE_FORMAT_POLICY_VERSION,
+        }
+    }
+
+    fn page_fixture(entries: &[SourceIndexEntry]) -> (tempfile::TempDir, SourceDatabase) {
+        let directory = tempfile::tempdir().expect("source root");
+        let database =
+            SourceDatabase::open_for_source_write(directory.path()).expect("fixture writer");
+        let mut batch = database.write_batch().expect("batch");
+        for entry in entries {
+            batch
+                .upsert_source_index_entry(entry)
+                .expect("index fixture");
+        }
+        batch.commit_auxiliary_state().expect("commit index");
+        (directory, database)
+    }
+
+    #[test]
+    fn index_page_traversal_is_bounded_ordered_and_unicode_lossless() {
+        let mut entries: Vec<_> = (0..SOURCE_INDEX_PAGE_MAX_ENTRIES + 5)
+            .map(|index| page_entry(PathBuf::from(format!("file-{index:04}.txt"))))
+            .collect();
+        entries.push(page_entry(PathBuf::from("échantillons/日本語.txt")));
+        let (_directory, database) = page_fixture(&entries);
+        let expected = database.source_index_snapshot().expect("oracle");
+        let mut cursor = None;
+        let mut collected = Vec::new();
+        loop {
+            let page = database
+                .source_index_page(cursor.as_ref(), SOURCE_INDEX_PAGE_MAX_ENTRIES)
+                .expect("bounded page");
+            assert!(page.schema_available);
+            assert_eq!(page.revision, expected.revision);
+            assert!(page.entries.len() <= SOURCE_INDEX_PAGE_MAX_ENTRIES);
+            assert!(!page.entries.is_empty());
+            collected.extend(page.entries);
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(collected, expected.entries);
+        assert!(
+            collected
+                .iter()
+                .any(|entry| entry.relative_path == Path::new("échantillons/日本語.txt"))
+        );
+        // A read projection never changes either durable revision.
+        assert_eq!(
+            database.source_index_snapshot().unwrap().revision,
+            expected.revision
+        );
+        assert_eq!(database.get_revision().unwrap(), 0);
+    }
+
+    #[test]
+    fn index_page_rejects_stale_foreign_and_reopened_cursors() {
+        let (directory, database) =
+            page_fixture(&[page_entry("a.txt".into()), page_entry("b.txt".into())]);
+        let cursor = database.source_index_page(None, 1).unwrap().next.unwrap();
+        let foreign_root = tempfile::tempdir().unwrap();
+        let foreign = SourceDatabase::open_for_source_write(foreign_root.path()).unwrap();
+        assert!(matches!(
+            foreign.source_index_page(Some(&cursor), 1),
+            Err(SourceIndexPageError::ForeignCursor)
+        ));
+        let mut batch = database.write_batch().unwrap();
+        batch
+            .upsert_source_index_entry(&page_entry("c.txt".into()))
+            .unwrap();
+        batch.commit_auxiliary_state().unwrap();
+        assert!(matches!(
+            database.source_index_page(Some(&cursor), 1),
+            Err(SourceIndexPageError::StaleCursor {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        let current = database.source_index_page(None, 1).unwrap().next.unwrap();
+        database.close().unwrap();
+        let reopened = SourceDatabase::open_for_ui_read(directory.path()).unwrap();
+        assert!(matches!(
+            reopened.source_index_page(Some(&current), 1),
+            Err(SourceIndexPageError::ForeignCursor)
+        ));
+        assert_eq!(
+            reopened.source_index_page(None, 2).unwrap().entries.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn index_page_invalid_limits_and_malformed_rows_never_imply_empty_success() {
+        let (_directory, database) =
+            page_fixture(&[page_entry("a.txt".into()), page_entry("b.txt".into())]);
+        for limit in [0, SOURCE_INDEX_PAGE_MAX_ENTRIES + 1, usize::MAX] {
+            assert!(matches!(
+                database.source_index_page(None, limit),
+                Err(SourceIndexPageError::InvalidLimit)
+            ));
+        }
+        for update in [
+            "path = '../escape'",
+            "path_encoding = 999",
+            "classification = 'future_unknown'",
+            "diagnostic = 'future_unknown'",
+            "file_size = -1",
+            "format_policy_version = -1",
+        ] {
+            let (_directory, corrupted) =
+                page_fixture(&[page_entry("a.txt".into()), page_entry("b.txt".into())]);
+            corrupted
+                .connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .unwrap();
+            corrupted
+                .connection
+                .execute(
+                    &format!("UPDATE source_index_entries SET {update} WHERE path = 'b.txt'"),
+                    [],
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    corrupted.source_index_page(None, 1),
+                    Err(SourceIndexPageError::Database(_))
+                ),
+                "accepted malformed row: {update}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_page_preserves_raw_path_and_inaccessible_diagnostic() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let raw = PathBuf::from(OsString::from_vec(b"raw-\xFF.bin".to_vec()));
+        let mut entry = page_entry(raw.clone());
+        entry.classification = SourceIndexClassification::Inaccessible;
+        entry.diagnostic = Some(SourceIndexDiagnostic::NonUnicodePath);
+        let (_directory, database) = page_fixture(&[entry.clone(), page_entry("z.txt".into())]);
+        let first = database.source_index_page(None, 1).unwrap();
+        let second = database.source_index_page(first.next.as_ref(), 1).unwrap();
+        let entries: Vec<_> = first.entries.into_iter().chain(second.entries).collect();
+        assert!(entries.contains(&entry));
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.relative_path == raw));
+    }
 
     #[test]
     fn index_only_writes_advance_only_the_index_revision() {

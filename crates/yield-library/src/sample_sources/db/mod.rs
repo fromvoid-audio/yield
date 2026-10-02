@@ -73,6 +73,9 @@ pub use content_audit::{
     ContentAuditReport, ContentAuditRetryCandidate, ContentAuditSkipReason,
 };
 pub use error::{SourceDatabaseIdentityError, SourceDbError, SourceDirectoryTruthError};
+pub use index_entries::{
+    SOURCE_INDEX_PAGE_MAX_ENTRIES, SourceIndexPage, SourceIndexPageCursor, SourceIndexPageError,
+};
 pub(crate) use open::SourceDatabaseOpenMode;
 #[cfg(test)]
 pub(crate) use open::open_source_database;
@@ -501,6 +504,7 @@ pub struct SourceDatabase {
     connection: Connection,
     db_path: PathBuf,
     root: PathBuf,
+    index_page_binding: Arc<()>,
     telemetry_label: &'static str,
     database_root_binding: Option<Arc<dyn DatabaseRootBindingGuard>>,
     database_file_binding: Option<Arc<sqlite_identity::DatabaseFileBinding>>,
