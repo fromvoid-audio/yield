@@ -167,3 +167,116 @@ fn recovery_status_preserves_guarded_terminal_dispositions_without_publication_a
         }
     )));
 }
+
+#[test]
+fn action_status_real_guarded_terminals_keep_user_blockage_and_data_risk_distinct() {
+    use crate::operation_journal::recovery_status::JournalUserStatus as S;
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let snapshots =
+        crate::operation_journal::work_progress::test_guarded_terminal_store_snapshots();
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        let record = StoredFullProgressRecord::new(snapshot.clone()).unwrap();
+        insert_full_raw(
+            &store,
+            &snapshot.intent().operation_id().to_string(),
+            index as i64 + 1,
+            &encode_full_progress(&record).unwrap(),
+        );
+    }
+    let page = store.scan_recovery_status_page(None).unwrap();
+    assert_eq!(
+        page.entries()
+            .iter()
+            .map(|e| e.user_status())
+            .collect::<Vec<_>>(),
+        vec![
+            S::RolledBack,
+            S::BlockedByUser,
+            S::FailedPreservingData,
+            S::FailedDataLossRisk
+        ]
+    );
+    drop(store);
+    assert_eq!(
+        OperationJournalStore::open(&fixture.owner)
+            .unwrap()
+            .scan_recovery_status_page(None)
+            .unwrap(),
+        page
+    );
+}
+
+#[test]
+fn action_status_forged_effect_cancellation_and_cross_family_keys_stay_audit_only() {
+    use crate::operation_journal::recovery_status::JournalUserStatus as S;
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let full = full_progress_fixture();
+    let id = full.snapshot().intent().operation_id();
+    let mut value = serde_json::to_value(&full).unwrap();
+    value["snapshot"]["disposition"] = serde_json::json!("CancelledAfterObservedEffect");
+    insert_full_raw(
+        &store,
+        &id.to_string(),
+        1,
+        &serde_json::to_vec(&value).unwrap(),
+    );
+    let page = store.scan_recovery_status_page(None).unwrap();
+    assert!(matches!(
+        page.entries()[0].user_status(),
+        S::AuditRequired { retained: Some(_) }
+    ));
+    // Same identity in another family is ambiguous and cannot overwrite per-family status.
+    let legacy = intent_record(id);
+    insert_raw(&store, &id.to_string(), 2, &encode(&legacy).unwrap());
+    let page = store.scan_recovery_status_page(None).unwrap();
+    assert!(
+        page.entries()
+            .iter()
+            .all(|entry| matches!(entry.user_status(), S::AuditRequired { retained: Some(_) }))
+    );
+    assert!(!page.entries()[1].is_newer_observation_than(&page.entries()[0]));
+    assert!(!page.entries()[0].is_newer_observation_than(&page.entries()[1]));
+}
+
+#[test]
+fn action_status_full_progress_retry_uses_its_persisted_family_and_blockage() {
+    use crate::operation_journal::recovery_status::{
+        JournalRetryBlockage as B, JournalUserStatus as S,
+    };
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let (initial, retry) =
+        crate::operation_journal::work_progress::test_full_progress_store_snapshots();
+    let initial = StoredFullProgressRecord::new(initial).unwrap();
+    let retry = StoredFullProgressRecord::new(retry).unwrap();
+    store.persist_full(&initial, None).unwrap();
+    let first = store.scan_recovery_status_page(None).unwrap();
+    assert_eq!(first.entries()[0].user_status(), S::InProgress);
+    store
+        .persist_full(&retry, Some(first.entries()[0].sequence()))
+        .unwrap();
+    let second = store.scan_recovery_status_page(None).unwrap();
+    assert_eq!(
+        second.entries()[0].family(),
+        JournalStatusFamily::FullProgress
+    );
+    assert_eq!(
+        second.entries()[0].user_status(),
+        S::RetryPending {
+            partial: false,
+            blockage: Some(B::Availability)
+        }
+    );
+    assert!(second.entries()[0].is_newer_observation_than(&first.entries()[0]));
+    assert!(!first.entries()[0].is_newer_observation_than(&second.entries()[0]));
+    drop(store);
+    assert_eq!(
+        OperationJournalStore::open(&fixture.owner)
+            .unwrap()
+            .scan_recovery_status_page(None)
+            .unwrap(),
+        second
+    );
+}

@@ -8878,6 +8878,8 @@ mod tests {
             .expect("read full-progress raw row")
     }
 
+    include!("store/action_status_tests.rs");
+
     struct Fixture {
         owner: WritableProfileGuard,
         _profile: PersistenceProfileGuard,
