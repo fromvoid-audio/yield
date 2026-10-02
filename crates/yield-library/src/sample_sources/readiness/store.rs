@@ -629,6 +629,25 @@ impl<'connection> ReadinessStore<'connection> {
         feature_artifact::lookup_target(self.connection, &self.ownership, target)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn inject_feature_artifact_fixture_fault(
+        &mut self,
+        target: &ReadinessTarget,
+        fault: super::FeatureArtifactFixtureFault,
+    ) -> Result<(), ReadinessError> {
+        feature_artifact::inject_fixture_fault(self.connection, &self.ownership, target, fault)
+    }
+
+    pub(crate) fn admit_feature_rebuild(
+        &mut self,
+        fence: &crate::sample_sources::db::SourceReferenceFence,
+        target: &ReadinessTarget,
+        now: i64,
+        cancel: &AtomicBool,
+    ) -> Result<super::FeatureArtifactRebuildAdmission, ReadinessError> {
+        feature_artifact::admit(self.connection, &self.ownership, fence, target, now, cancel)
+    }
+
     /// Record a classified failure for a current claim.
     pub fn fail(
         &mut self,

@@ -1,4 +1,6 @@
 //! Real source-owned feature payload publication and validated lookup.
+mod health;
+pub(super) use health::{Health, admit, health, marker_matches};
 
 use super::super::{
     ArtifactPublishOutcome, ClaimedReadinessWork, FeatureArtifactKey, FeatureArtifactPayload,
@@ -98,7 +100,26 @@ pub(super) fn publish(
             |r| r.get(0),
         )?;
         if generation != i64::from(claim.claim_generation()) || !exact {
-            return Ok(FeatureArtifactPublication::RejectedStale);
+            let outcome = super::work::complete_readiness_work_in_transaction(
+                &tx,
+                ownership,
+                claim,
+                now,
+                Some(key.reference()),
+            )?;
+            if outcome != ArtifactPublishOutcome::Recorded {
+                return Ok(FeatureArtifactPublication::RejectedStale);
+            }
+            tx.execute(
+                "UPDATE source_feature_artifacts SET claim_generation=?2 WHERE target_key=?1",
+                params![key.target_key, claim.claim_generation()],
+            )?;
+            super::work::validate_claim_ownership(&tx, ownership, claim)?;
+            if cancel.load(Ordering::Acquire) {
+                return Err(ReadinessError::Cancelled);
+            }
+            tx.commit()?;
+            return Ok(FeatureArtifactPublication::Recorded(key));
         }
         super::work::validate_claim_ownership(&tx, ownership, claim)?;
         if cancel.load(Ordering::Acquire) {
@@ -173,31 +194,48 @@ pub(super) fn lookup_target(
     if !current_target(connection, &probe)? {
         return Ok(None);
     }
-    let row = connection
-        .query_row(
-            "SELECT payload, digest, substr(artifact_ref, 1, 161)
-        FROM source_feature_artifacts WHERE target_key = ?1
-        AND length(payload) = 732 AND length(digest) = 32",
-            [&probe.target_key],
-            |r| {
-                Ok((
-                    r.get::<_, Vec<u8>>(0)?,
-                    r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()?;
-    let result = if let Some((bytes, digest, reference)) = row {
-        if let Some(payload) = FeatureArtifactPayload::decode(bytes) {
-            let key = FeatureArtifactKey::for_payload(target, &payload)?;
-            (digest == key.digest && reference == key.reference).then_some((key, payload))
-        } else {
-            None
-        }
-    } else {
-        None
+    let result = match health(connection, target)? {
+        Health::Healthy(key, payload) if marker_matches(connection, &key)? => Some((key, payload)),
+        _ => None,
     };
     ownership.validate(connection)?;
     Ok(result)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn inject_fixture_fault(
+    connection: &Connection,
+    ownership: &ReadinessOwnership<'_>,
+    target: &super::super::ReadinessTarget,
+    fault: super::super::FeatureArtifactFixtureFault,
+) -> Result<(), ReadinessError> {
+    ownership.validate(connection)?;
+    use super::super::FeatureArtifactFixtureFault;
+    let key = FeatureArtifactKey::for_payload(
+        target,
+        &FeatureArtifactPayload::from_v1_vector(&[0.0; 183])?,
+    )?;
+    if !current_target(connection, &key)? {
+        return Err(ReadinessError::InvalidFeatureArtifact(
+            "fixture target changed",
+        ));
+    }
+    match fault {
+        FeatureArtifactFixtureFault::MissingPayload => {
+            connection.execute(
+                "DELETE FROM source_feature_artifacts WHERE target_key=?1",
+                [&key.target_key],
+            )?;
+        }
+        FeatureArtifactFixtureFault::CorruptPayload => {
+            connection.execute(
+                "UPDATE source_feature_artifacts SET payload=zeroblob(732) WHERE target_key=?1",
+                [&key.target_key],
+            )?;
+        }
+        FeatureArtifactFixtureFault::MissingMarker => {
+            connection.execute("DELETE FROM source_readiness_artifacts WHERE source_id=?1 AND scope_kind='file' AND scope_id=?2 AND stage='analysis_features' AND artifact_version=?3 AND content_generation=?4", params![target.source_id,target.scope_id,target.required_version,target.content_generation])?;
+        }
+    }
+    Ok(())
 }

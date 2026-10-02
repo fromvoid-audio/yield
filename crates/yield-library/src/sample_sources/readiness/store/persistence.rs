@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::atomic::{AtomicBool, Ordering},
 };
-pub(super) use streamed_manifest::publish;
+pub(super) use streamed_manifest::{publish, validate_audit};
 
 use blake3::Hasher;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
@@ -2347,4 +2347,14 @@ fn upsert_target(
             updated_at,
         ],
     )
+}
+
+// Only the exact source-feature health transaction calls this internal admission bridge.
+pub(super) fn persist_feature_rebuild_deficit(
+    tx: &Transaction<'_>,
+    target: &ReadinessTarget,
+    now: i64,
+) -> Result<(), ReadinessError> {
+    persist_deficit(tx, target, &target.scope_id, now)?;
+    Ok(())
 }

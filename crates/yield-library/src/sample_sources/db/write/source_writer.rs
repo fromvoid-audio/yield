@@ -1295,6 +1295,47 @@ impl SourceWriter {
             .lookup_feature_artifact_for_target(target)?)
     }
 
+    /// Inject a bounded fault into this owner's current feature cache for integration tests.
+    /// This accepts no SQL/path/database capability and is absent from production builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_feature_artifact_fixture_fault(
+        &mut self,
+        expected: &SourceRevision,
+        target: &crate::sample_sources::readiness::ReadinessTarget,
+        fault: crate::sample_sources::readiness::FeatureArtifactFixtureFault,
+    ) -> Result<(), SourceWriterError> {
+        self.validate_readiness_command(expected, target)?;
+        Ok(self
+            .database
+            .readiness_store()?
+            .inject_feature_artifact_fixture_fault(target, fault)?)
+    }
+
+    /// Admit bounded repair of an exact current source-feature entry under this owner.
+    /// Healthy bytes, live claims and ambiguous provenance are retained; no other scope is pruned.
+    pub fn admit_feature_artifact_rebuild(
+        &mut self,
+        expected: &SourceRevision,
+        target: &ReadinessTarget,
+        now: i64,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::sample_sources::readiness::FeatureArtifactRebuildAdmission, SourceWriterError>
+    {
+        self.validate_readiness_command(expected, target)?;
+        if target.source_generation
+            != i64::try_from(expected.revision()).map_err(|_| SourceWriterError::StaleFence)?
+        {
+            return Err(SourceWriterError::StaleFence);
+        }
+        let fence = self
+            .reference_read_fence()
+            .map_err(|_| SourceWriterError::StaleFence)?;
+        Ok(self
+            .database
+            .readiness_store()?
+            .admit_feature_rebuild(&fence, target, now, cancel)?)
+    }
+
     /// Record a classified failure for the exact claimed readiness target.
     #[allow(clippy::too_many_arguments)]
     pub fn fail_readiness_work(
