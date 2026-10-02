@@ -40,6 +40,7 @@ pub mod namespace_commands;
 pub mod owner;
 pub mod participants;
 pub mod readiness_scheduling;
+pub mod recording_commands;
 pub mod removal_commands;
 pub mod render_commands;
 pub mod retained_resolution_commands;
