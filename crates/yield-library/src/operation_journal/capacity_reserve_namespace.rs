@@ -24,6 +24,7 @@ use super::capacity_reserve::{
     allocate_protected_reserve, revalidate_existing_owned_file,
     revalidate_existing_partial_owned_file,
 };
+use super::reserve_telemetry::{ReserveAttempt, observe};
 
 /// Reserved direct child name for the owner-created recovery-reserve namespace.
 pub(super) const RESERVE_FILE_NAME: &str = "recovery-reserve.bin";
@@ -680,6 +681,16 @@ pub(super) fn create_owned_reserve<'a>(
     root: &'a BoundDatabaseRoot,
     profile_guard: &'a WritableProfileGuard,
 ) -> Result<BoundReserve<'a>, ReserveNamespaceFailure> {
+    observe(
+        ReserveAttempt::Create,
+        create_owned_reserve_unobserved(root, profile_guard),
+    )
+}
+
+fn create_owned_reserve_unobserved<'a>(
+    root: &'a BoundDatabaseRoot,
+    profile_guard: &'a WritableProfileGuard,
+) -> Result<BoundReserve<'a>, ReserveNamespaceFailure> {
     #[cfg(not(target_os = "macos"))]
     {
         // Keep this check first: unsupported targets must not create or inspect a namespace entry.
@@ -812,6 +823,17 @@ pub(super) fn reopen_owned_reserve<'a>(
     profile_guard: &'a WritableProfileGuard,
     expected: &ReserveNamespaceObservation,
 ) -> Result<BoundReserve<'a>, ReserveNamespaceFailure> {
+    observe(
+        ReserveAttempt::Reopen,
+        reopen_owned_reserve_unobserved(root, profile_guard, expected),
+    )
+}
+
+fn reopen_owned_reserve_unobserved<'a>(
+    root: &'a BoundDatabaseRoot,
+    profile_guard: &'a WritableProfileGuard,
+    expected: &ReserveNamespaceObservation,
+) -> Result<BoundReserve<'a>, ReserveNamespaceFailure> {
     #[cfg(not(target_os = "macos"))]
     {
         // Keep this check first: unsupported targets must not inspect or create a namespace entry.
@@ -828,6 +850,18 @@ pub(super) fn reopen_owned_reserve<'a>(
 /// durably spent. The caller supplies the minimum logical extent derived from the durable ledger;
 /// this helper never constructs that authority from the stored observation itself.
 pub(super) fn reopen_owned_reserve_partial<'a>(
+    root: &'a BoundDatabaseRoot,
+    profile_guard: &'a WritableProfileGuard,
+    expected: &ReserveNamespaceObservation,
+    minimum_length: u64,
+) -> Result<BoundReserve<'a>, ReserveNamespaceFailure> {
+    observe(
+        ReserveAttempt::ReopenPartial,
+        reopen_owned_reserve_partial_unobserved(root, profile_guard, expected, minimum_length),
+    )
+}
+
+fn reopen_owned_reserve_partial_unobserved<'a>(
     root: &'a BoundDatabaseRoot,
     profile_guard: &'a WritableProfileGuard,
     expected: &ReserveNamespaceObservation,
@@ -1596,13 +1630,59 @@ mod tests {
         let fixture = fixture();
         let root = root(&fixture, "reserve-root-unsupported");
         let child = root.path().join(RESERVE_FILE_NAME);
-        let failure = create_owned_reserve(&root, &fixture.owner)
-            .err()
-            .expect("unsupported target must fail closed");
-        assert_eq!(failure.stage(), ReserveNamespaceFailureStage::Unsupported);
+        use super::super::reserve_telemetry::{
+            ReserveAttempt, ReserveDecision, reserve_telemetry_snapshot, tests::Capture,
+        };
+        let before = reserve_telemetry_snapshot();
+        let expected = synthetic_observation("private-root-identity", "private-file-identity");
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            for result in [
+                create_owned_reserve(&root, &fixture.owner),
+                reopen_owned_reserve(&root, &fixture.owner, &expected),
+                reopen_owned_reserve_partial(&root, &fixture.owner, &expected, 1),
+            ] {
+                let failure = result.err().expect("unsupported target must fail closed");
+                assert_eq!(failure.stage(), ReserveNamespaceFailureStage::Unsupported);
+                assert_eq!(
+                    failure.reason(),
+                    &ReserveNamespaceFailureReason::Unsupported
+                );
+                assert!(failure.observation().is_none());
+                assert!(failure.observed_allocation().is_none());
+                assert!(failure.into_file().is_none());
+            }
+        });
+        let after = reserve_telemetry_snapshot();
+        for attempt in [
+            ReserveAttempt::Create,
+            ReserveAttempt::Reopen,
+            ReserveAttempt::ReopenPartial,
+        ] {
+            // Counts aggregate across other concurrently tested owners; do not reset them.
+            assert!(
+                after.count(attempt, ReserveDecision::Unsupported)
+                    >= before
+                        .count(attempt, ReserveDecision::Unsupported)
+                        .saturating_add(1)
+            );
+        }
         assert_eq!(
-            failure.reason(),
-            &ReserveNamespaceFailureReason::Unsupported
+            *capture.0.lock().unwrap(),
+            vec![
+                vec![
+                    ("reserve_attempt".into(), "create".into()),
+                    ("reserve_decision".into(), "unsupported".into())
+                ],
+                vec![
+                    ("reserve_attempt".into(), "reopen".into()),
+                    ("reserve_decision".into(), "unsupported".into())
+                ],
+                vec![
+                    ("reserve_attempt".into(), "reopen_partial".into()),
+                    ("reserve_decision".into(), "unsupported".into())
+                ],
+            ]
         );
         assert!(!child.exists());
     }
