@@ -24,8 +24,8 @@ pub use source_writer::{
     ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
     ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
     SourceCommandId, SourceRevision, SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage,
-    SourceTagMetadataBudget, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
-    SourceWriterReceipt, SourceWriterRequest,
+    SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceWriter, SourceWriterCommandIdentity,
+    SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};
 pub use transaction::{

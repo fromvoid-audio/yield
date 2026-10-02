@@ -56,6 +56,7 @@ fn reference_image() -> Result<(SchemaImage, Vec<String>), SourceDbError> {
     Ok((image(&reference)?, runtime_image(&reference)?))
 }
 
+// Sort bounded owned vectors in Rust; no SQLite temporary-sort disk writes before admission.
 fn image(connection: &Connection) -> Result<SchemaImage, SourceDbError> {
     let mut query = connection
         .prepare(
@@ -64,7 +65,7 @@ fn image(connection: &Connection) -> Result<SchemaImage, SourceDbError> {
                 CASE WHEN length(CAST(tbl_name AS BLOB))<=128 THEN tbl_name ELSE NULL END,
                 CASE WHEN sql IS NULL OR length(CAST(sql AS BLOB))<=16384 THEN sql ELSE NULL END,
                 sql IS NOT NULL AND length(CAST(sql AS BLOB))>16384
-         FROM sqlite_master ORDER BY type,name LIMIT 513",
+         FROM sqlite_master LIMIT 513",
         )
         .map_err(map_sql_error)?;
     let mut rows = query.query([]).map_err(map_sql_error)?;
@@ -91,6 +92,7 @@ fn image(connection: &Connection) -> Result<SchemaImage, SourceDbError> {
         }
         result.push((kind, name, table, sql));
     }
+    result.sort();
     Ok(result)
 }
 
@@ -118,11 +120,11 @@ fn runtime_image(connection: &Connection) -> Result<Vec<String>, SourceDbError> 
     for sql in [
         "SELECT CASE WHEN length(CAST(name AS BLOB))<=128 THEN name ELSE NULL END,
          builtin,type,enc,narg,flags FROM pragma_function_list
-         ORDER BY name,builtin,type,enc,narg,flags LIMIT 513",
+         LIMIT 513",
         "SELECT CASE WHEN length(CAST(name AS BLOB))<=128 THEN name ELSE NULL END,
-         0,'module','',0,0 FROM pragma_module_list ORDER BY name LIMIT 513",
+         0,'module','',0,0 FROM pragma_module_list LIMIT 513",
         "SELECT CASE WHEN length(CAST(name AS BLOB))<=128 THEN name ELSE NULL END,
-         0,'collation','',0,0 FROM pragma_collation_list ORDER BY name LIMIT 513",
+         0,'collation','',0,0 FROM pragma_collation_list LIMIT 513",
     ] {
         let mut statement = connection.prepare(sql).map_err(map_sql_error)?;
         let mut rows = statement.query([]).map_err(map_sql_error)?;
@@ -146,5 +148,6 @@ fn runtime_image(connection: &Connection) -> Result<Vec<String>, SourceDbError> 
             ));
         }
     }
+    result.sort();
     Ok(result)
 }

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 // Optional extension initialization taints the entire process, including failed initialization.
 // Exercise real owners in fresh processes instead of resetting that production safety fact.
-fn run_case(case: &str) {
+pub(super) fn run_case(case: &str) {
     let test_name = concat!(module_path!(), "::tag_metadata_budget_child")
         .strip_prefix("yield_library::")
         .unwrap();
@@ -91,6 +91,10 @@ fn tag_metadata_budget_child() {
         "revision" => revision(),
         "extension" => extension(),
         "runtime" => runtime(),
+        "policy-restoration" => super::tag_metadata_policy::restoration(),
+        "policy-full" => super::tag_metadata_policy::full(),
+        "policy-poison" => super::tag_metadata_policy::poison(),
+        "policy-restore-failure" => super::tag_metadata_policy::restore_failure(),
         _ => panic!("unknown fixture case"),
     }
 }

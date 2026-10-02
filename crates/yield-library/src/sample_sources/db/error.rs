@@ -158,6 +158,11 @@ pub enum SourceDatabaseIdentityError {
 /// Errors returned when managing a source database.
 #[derive(Debug, Error)]
 pub enum SourceDbError {
+    /// The SQLite policy could not restore after a quiescent transaction; close/reopen required.
+    #[error(
+        "source metadata policy restoration is unconfirmed; retain outcome evidence and close/reopen this database before new mutations"
+    )]
+    MetadataPolicyUnconfirmed,
     /// New metadata writes require a current retained-owner WAL observation below hard pressure.
     #[error(transparent)]
     WalAdmission(#[from] crate::WalAdmissionError),
