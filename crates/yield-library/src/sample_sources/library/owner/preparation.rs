@@ -350,8 +350,8 @@ pub(super) fn run(
         begin?;
         validate(database, guard, &file)?;
         canceled(&command, lifecycle)?;
-        crate::sqlite_wal::enforce_wal_admission(&database.connection)?;
-        let wal_bytes = crate::sqlite_wal::retained_wal_bytes(&database.connection)?;
+        let wal_bytes =
+            crate::sqlite_wal::enforce_wal_admission(&database.connection)?.observed_bytes();
         canceled(&command, lifecycle)?;
         let (control, controls) = mpsc::sync_channel(1);
         let (released, release_rx) = mpsc::sync_channel(1);
