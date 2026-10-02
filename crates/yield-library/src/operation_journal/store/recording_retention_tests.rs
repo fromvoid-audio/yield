@@ -342,7 +342,7 @@ fn recording_schema9_migrates_preserving_existing_intent_and_capped_policy_rejec
     store.insert_intent(&legacy).unwrap();
     store
         .connection
-        .execute_batch("DROP TABLE operation_journal_recording_chunks; PRAGMA user_version=9;")
+        .execute_batch("DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; DROP TABLE operation_journal_recording_chunks; PRAGMA user_version=9;")
         .unwrap();
     drop(store);
     let store = OperationJournalStore::open(&fixture.owner).unwrap();
@@ -642,10 +642,20 @@ fn recording_retention_blocks_ordinary_charge_release_before_retirement_implemen
     )
     .unwrap();
     // Reserved-only metadata already prevents release before any captured bytes exist.
-    assert!(store.persist_ordinary_claim_release(release_request(
-        proposal.operation_id(), claim_id, Uuid::new_v4()
-    )).is_err());
-    assert!(ordinary_claims::read_release(&store.connection, claim_id).unwrap().is_none());
+    assert!(
+        store
+            .persist_ordinary_claim_release(release_request(
+                proposal.operation_id(),
+                claim_id,
+                Uuid::new_v4()
+            ))
+            .is_err()
+    );
+    assert!(
+        ordinary_claims::read_release(&store.connection, claim_id)
+            .unwrap()
+            .is_none()
+    );
     store
         .retain_recording_chunk(&initial_recording_header(&proposal))
         .unwrap();
