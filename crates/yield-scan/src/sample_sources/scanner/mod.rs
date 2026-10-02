@@ -1,4 +1,5 @@
 mod manifest;
+mod prepared_exact;
 mod scan;
 mod scan_capability;
 mod scan_db_sync;
@@ -12,6 +13,10 @@ mod scan_walk;
 mod scan_writer;
 mod wav_metadata;
 
+pub use prepared_exact::{
+    EXACT_SCAN_MAX_ENTRIES, EXACT_SCAN_MAX_HASH_BYTES, EXACT_SCAN_MAX_PATH_BYTES,
+    PreparedExactScan, prepare_exact_scan,
+};
 pub use scan::{
     CatalogManifestAudit, ChangedSample, CommittedScanBatch, CommittedSourceDelta,
     CommittedSourceIndexDelta, ContentAuditActivity, ContentAuditBudget, ContentAuditStorage,

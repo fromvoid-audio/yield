@@ -40,6 +40,32 @@ global/journal/artifact inventory and broader import-direction enforcement.
 
 ## Remaining exceptions and retirement criteria
 
+### Atomic exact preparation prerequisite (OPT-2059)
+
+`yield-scan::sample_sources::scanner::prepare_exact_scan` now accepts a retained
+`SourceWriter` and up to 64 distinct exact regular entries. Private prepared state
+borrows that exact owner, retains its root and files, and captures generic/index
+revisions. Limits are 1024 bytes and 32 components per locator, 32 KiB aggregate
+locator bytes, and 64 MiB aggregate audio hash reads. Hash reads stop at the
+observed byte count; shortened or changed content fails closed. Missing, link,
+directory, inaccessible, oversized or substituted targets produce no partial
+mutations. Unicode remains exact; raw locators remain diagnostic index facts.
+
+`PreparedExactScan::commit` revalidates the held content/path/root and owner before
+acquiring the supplied `ScanWriter` mutation guard, then applies audio and index
+facts in **one** revision-fenced `SourceWriteBatch` through the existing
+`commit_bounded_manifest_batch` hook. It advances no audit/scan-completion marker.
+Real temporary filesystem/profile-owned SQLite/retained-writer tests cover one
+revision, rollback, foreign owner, stale generic/index revision, cancellation,
+substitution, root replacement and bounded/raw inputs. These are Linux source
+regressions, not live replay or native/physical qualification.
+
+This is the actual scanner API prerequisite, not an active catalog replay caller.
+OPT-2053 remains open for the production batch consumer, bounded subtree/recovery
+handling, reconciliation admission and durable checkpoint/acknowledgement/retirement.
+Its catalog writer can attach the separately admitted replay proof and prior using
+`SourceWriter::commit_watcher_replay_manifest_batch` in this same commit hook.
+
 * **OPT-1787**, behind OPT-1634/1632: committed file-effect reconciliation has
   no qualified publication checkpoint/owner receipt to consume. The source
   delta route must bind that exact durable effect evidence, cancellation,
@@ -100,4 +126,3 @@ Representative source tests include
 The 14-opening tripwire and its negative self-tests provide finite lexical
 evidence only. Physical publication/cleanup, macOS captures and full parent
 acceptance remain open.
-
