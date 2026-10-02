@@ -173,6 +173,10 @@ fn retained_source_owner_workload() {
     };
     let owner = SourceSnapshotOwner::start(writer).expect("existing bounded worker transport");
     let (first_hash, first_pages) = pages(&owner, &revision);
+    let page_queue = owner.queue_metrics();
+    assert_eq!(page_queue.accepted, first_pages.len() as u64);
+    assert_eq!(page_queue.dequeued, first_pages.len() as u64);
+    assert_eq!(page_queue.pending_dispatch, 0);
     let close_start = Instant::now();
     owner
         .begin_retirement()
@@ -203,6 +207,10 @@ fn retained_source_owner_workload() {
         SourceSnapshotPage::Stale { current } if current == reopened_revision)
     );
     let (second_hash, second_pages) = pages(&owner, &reopened_revision);
+    let reopened_page_queue = owner.queue_metrics();
+    assert_eq!(reopened_page_queue.accepted, second_pages.len() as u64 + 1);
+    assert_eq!(reopened_page_queue.dequeued, second_pages.len() as u64 + 1);
+    assert_eq!(reopened_page_queue.pending_dispatch, 0);
     owner
         .begin_retirement()
         .join()
@@ -221,11 +229,12 @@ fn retained_source_owner_workload() {
         "batch_size": BATCH, "page_size": BATCH, "fixture_blake3": expected_hash,
         "initial_revision": initial_revision, "final_revision": revision.revision(),
         "reopened_revision": reopened_revision.revision(), "restart_rows_match": true, "old_lifecycle_stale": true,
-        "storage": storage, "timings": {"open_ns": open_ns, "manifest_batches": distribution(&mutations),
+        "storage": storage, "page_queue": page_queue, "reopened_page_queue": reopened_page_queue,
+        "timings": {"open_ns": open_ns, "manifest_batches": distribution(&mutations),
             "audit_ns": audit_ns, "pages": distribution(&first_pages), "close_ns": close_ns,
             "reopen_ns": reopen_ns, "reopened_pages": distribution(&second_pages)},
         "limits": ["synthetic metadata only; no physical media traversal or hashing", "no journal/capacity claim or crash qualification",
-            "owner request timing includes queue and SQL; components are not independently attributed", "audit uses existing full-manifest acceptance API",
+            "page dispatch wait measured separately; SQL/checkpoint time unmeasured", "audit uses existing full-manifest acceptance API",
             "debug/test build; no SLO threshold or native GPUI measurement"]});
     println!("SOURCE_OWNER_WORKLOAD_JSON={evidence}");
 }

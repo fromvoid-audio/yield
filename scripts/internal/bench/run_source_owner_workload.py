@@ -59,7 +59,7 @@ def main():
               "host": host, "reproducible_identity": stable, "runs": evidence,
               "qualification": "portable-metadata-owner-measurement-only",
               "unmeasured_components": ["physical filesystem publication", "physical content hashing",
-                   "journal capacity admission", "independent queue wait", "independent SQL/checkpoint time",
+                   "journal capacity admission", "non-snapshot queue wait", "independent SQL/checkpoint time",
                    "power-loss/crash recovery", "native GPUI latency", "SLO thresholds"]}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(bundle, indent=2) + "\n", encoding="utf-8")

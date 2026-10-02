@@ -38,11 +38,11 @@ pub use db::{
     SourceIndexCommitResult, SourceIndexDiagnostic, SourceIndexEntry, SourceIndexSnapshot,
     SourceLeaseError, SourceManifestEntry, SourcePlaybackType, SourcePublicationFence,
     SourcePublicationFenceError, SourceRevision, SourceScanFence, SourceSnapshotOwner,
-    SourceSnapshotPage, SourceTag, SourceTagAssignmentCursor, SourceTagAssignmentMutation,
-    SourceTagAssignmentPage, SourceTagAssignmentSelection, SourceTagFilterResult, SourceTagPage,
-    SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage, SourceTagWrite, SourceWriteCommand,
-    SourceWriter, SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt,
-    SourceWriterRequest, WavEntry,
+    SourceSnapshotPage, SourceSnapshotQueueMetrics, SourceTag, SourceTagAssignmentCursor,
+    SourceTagAssignmentMutation, SourceTagAssignmentPage, SourceTagAssignmentSelection,
+    SourceTagFilterResult, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
+    SourceTagWrite, SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity,
+    SourceWriterError, SourceWriterReceipt, SourceWriterRequest, WavEntry,
 };
 pub use finalization::{
     StagedFileFinalizationCapabilities, StagedFinalizationAvailability,

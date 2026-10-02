@@ -6,6 +6,9 @@
 //! owner; their persisted DTOs never construct or reacquire an authority.
 
 use super::super::{SourceReferenceFence, SourceReferenceFenceError};
+mod snapshot_metrics;
+pub use snapshot_metrics::SourceSnapshotQueueMetrics;
+use snapshot_metrics::{SnapshotCounters, SnapshotSender};
 mod feature_metrics;
 pub use feature_metrics::SourceFeaturePublicationMetrics;
 mod feature_rebuild_metrics;
@@ -24,7 +27,7 @@ pub use manifest_enrollment::{
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -192,8 +195,9 @@ enum SnapshotCommand {
 /// A timed-out request does not release or duplicate source authority. The worker keeps the
 /// writer until its current OS operation finishes; subsequent requests cannot overtake it.
 pub struct SourceSnapshotOwner {
-    requests: Option<SyncSender<SnapshotCommand>>,
+    requests: Option<SnapshotSender>,
     worker: Option<JoinHandle<SourceWriter>>,
+    queue_metrics: Arc<SnapshotCounters>,
 }
 
 impl SourceSnapshotOwner {
@@ -258,11 +262,12 @@ impl SourceSnapshotOwner {
 
     /// Transfer the existing source writer to a single snapshot worker.
     pub fn start(writer: SourceWriter) -> io::Result<Self> {
-        let (requests, receiver) = mpsc::sync_channel::<SnapshotCommand>(1);
+        let (requests, receiver, queue_metrics) = SnapshotSender::channel();
         let worker = thread::Builder::new()
             .name("yield-source-snapshot".to_owned())
             .spawn(move || {
-                while let Ok(command) = receiver.recv() {
+                while let Ok(envelope) = receiver.recv() {
+                    let command = envelope.dispatch();
                     match command {
                         SnapshotCommand::TagSelection(request) => {
                             let result = writer.capture_tag_assignment_selection_with_deadline(
@@ -304,7 +309,14 @@ impl SourceSnapshotOwner {
         Ok(Self {
             requests: Some(requests),
             worker: Some(worker),
+            queue_metrics,
         })
+    }
+
+    /// Copy fixed aggregate channel observations without SQL, request labels or event traffic.
+    /// These independently sampled counters confer no freshness or source authority.
+    pub fn queue_metrics(&self) -> SourceSnapshotQueueMetrics {
+        self.queue_metrics.snapshot()
     }
 
     /// Return within the two-second request budget even if an OS identity check blocks.
