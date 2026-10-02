@@ -105,7 +105,7 @@ def parse_records(log):
     return sorted(records, key=lambda record: (record["kind"], record["input_columns"]))
 
 
-def run_benchmark(command, timeout):
+def run_benchmark(command, timeout, parser=parse_records):
     # Cargo/test output stays on disk. Timeout kills the process group, including test children.
     with tempfile.TemporaryFile() as log:
         process = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=log,
@@ -136,7 +136,7 @@ def run_benchmark(command, timeout):
             raise ValueError(reason)
         if process.returncode != 0:
             raise ValueError("benchmark command failed (exit %s)" % process.returncode)
-        return parse_records(output)
+        return parser(output)
 
 
 def capture(profile, timeout):
