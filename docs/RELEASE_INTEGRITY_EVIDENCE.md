@@ -1,4 +1,4 @@
-# Portable release integrity verification (OPT-2093)
+# Portable release integrity verification (OPT-2093, OPT-2103)
 
 Run from the repository root:
 
@@ -7,7 +7,7 @@ python3 scripts/internal/release/test_release_integrity.py
 ```
 
 Python 3 and OpenSSL with Ed25519 support are required. Missing OpenSSL fails
-the suite; it does not skip signature verification. The nine tests exercise
+the suite; it does not skip signature verification. The fourteen tests exercise
 the production `validate_downloaded_assets` path using the current
 `release_contract.toml`, archive layout and manifest checks.
 
@@ -20,6 +20,18 @@ asset names fail instead of silently accepting the last entry. Non-UTF-8
 checksum/signature input returns a verification error.
 The full offline CLI returns zero for valid assets and nonzero for signed
 duplicate entries without changing the files or installed-app sentinel.
+
+ZIP members are checked before manifest reads. Signed archives with duplicate
+payload paths, absolute paths, backslashes, drive/stream colons, empty/dot/parent
+components, special/link types or file/directory collisions are rejected.
+File/directory collision checks do not depend on archive member order.
+Canonical explicit directory records and archives without directory records
+remain supported. The actual packer metadata matrix verifies compatibility
+across all declared channels and targets:
+
+```sh
+python3 scripts/internal/release/test_release_metadata.py
+```
 
 Each validation snapshots the downloaded files and installed-app sentinel and
 asserts they remain unchanged. Fixtures perform no network request, extraction,

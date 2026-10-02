@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -709,6 +710,9 @@ def validate_zip_manifest(
     errors: list[str] = []
     try:
         with zipfile.ZipFile(zip_path) as archive:
+            member_errors = validate_archive_members(archive, zip_asset.name)
+            if member_errors:
+                return member_errors
             archive_entries = normalized_archive_entries(archive)
             archive_files = sorted(archive_entries)
             manifest_names = [name for name in archive_files if name.endswith("update-manifest.json")]
@@ -756,6 +760,44 @@ def validate_zip_manifest(
         errors.append(f"{zip_asset.name} manifest files must include update-manifest.json")
     else:
         errors.extend(validate_manifest_file_list(zip_asset, archive_layout, archive_files, files))
+    return errors
+
+
+def validate_archive_members(archive: zipfile.ZipFile, asset_name: str) -> list[str]:
+    """Reject member names/types that cannot denote one unambiguous payload tree."""
+    errors: list[str] = []
+    members: dict[str, bool] = {}
+    for entry in archive.infolist():
+        name = entry.orig_filename
+        directory = entry.is_dir()
+        path = name[:-1] if directory else name
+        components = path.split("/")
+        if (
+            name != entry.filename or "\\" in name or ":" in name
+            or any(component in ("", ".", "..") for component in components)
+        ):
+            errors.append(f"{asset_name} contains non-canonical archive member {name!r}")
+            continue
+        kind = stat.S_IFMT(entry.external_attr >> 16)
+        allowed_kind = stat.S_IFDIR if directory else stat.S_IFREG
+        if kind not in (0, allowed_kind):
+            errors.append(f"{asset_name} contains special or inconsistent archive member {name!r}")
+            continue
+        if path in members:
+            errors.append(f"{asset_name} contains duplicate archive member {path!r}")
+            continue
+        members[path] = directory
+
+    # Explicit directory records are optional, but every parent of a member must
+    # be a directory. Check after collecting members so ZIP ordering cannot hide
+    # a file/directory collision.
+    for path in members:
+        components = path.split("/")
+        for index in range(1, len(components)):
+            parent = "/".join(components[:index])
+            if members.get(parent) is False:
+                errors.append(f"{asset_name} archive file {parent!r} is also a parent directory")
+                break
     return errors
 
 
