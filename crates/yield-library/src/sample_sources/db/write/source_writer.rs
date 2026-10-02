@@ -6,6 +6,8 @@
 //! owner; their persisted DTOs never construct or reacquire an authority.
 
 use super::super::{SourceReferenceFence, SourceReferenceFenceError};
+mod feature_metrics;
+pub use feature_metrics::SourceFeaturePublicationMetrics;
 mod manifest_enrollment;
 mod tag_metadata_budget;
 mod tag_metadata_policy;
@@ -692,6 +694,7 @@ pub enum SourceWriterError {
 
 /// Owner of one already-profile-bound source database.
 pub struct SourceWriter {
+    feature_publication_metrics: SourceFeaturePublicationMetrics,
     reference_liveness: Arc<()>,
     database: SourceDatabase,
     source_id: SourceId,
@@ -1256,15 +1259,25 @@ impl SourceWriter {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<crate::sample_sources::readiness::FeatureArtifactPublication, SourceWriterError>
     {
-        if !std::sync::Weak::ptr_eq(&claim.owner, &Arc::downgrade(&self.reference_liveness)) {
-            return Err(SourceWriterError::StaleFence);
-        }
-        let claim = claim.readiness_claim();
-        self.validate_readiness_command(expected, claim.target())?;
-        Ok(self
-            .database
-            .readiness_store()?
-            .publish_feature_artifact(claim, payload, now, cancel)?)
+        let started = Instant::now();
+        let result = (|| {
+            self.validate_feature_artifact_claim(expected, claim)?;
+            Ok(self.database.readiness_store()?.publish_feature_artifact(
+                claim.readiness_claim(),
+                payload,
+                now,
+                cancel,
+            )?)
+        })();
+        self.feature_publication_metrics
+            .record(&result, payload.bytes().len(), started.elapsed());
+        result
+    }
+
+    /// Copy bounded diagnostic counters for this writer acquisition, without SQL or event traffic.
+    /// Counters reset on handoff/reacquisition; they never establish durable or physical evidence.
+    pub fn feature_publication_metrics(&self) -> SourceFeaturePublicationMetrics {
+        self.feature_publication_metrics
     }
 
     /// Lookup validated immutable bytes under the current owner and exact content target.
@@ -1441,6 +1454,7 @@ impl SourceWriter {
     ) -> Result<Self, SourceWriterError> {
         validate_source_id(&source_id)?;
         let writer = Self {
+            feature_publication_metrics: SourceFeaturePublicationMetrics::default(),
             reference_liveness: Arc::new(()),
             database,
             source_id,

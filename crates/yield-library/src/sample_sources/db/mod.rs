@@ -130,11 +130,11 @@ pub use write::{
     ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
     SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite, SourceCommandId, SourceContentHashWrite,
     SourceCurationCommitReceipt, SourceCurationUpdate, SourceDirectoryTruthCommitResult,
-    SourceFileWrite, SourceIndexCommitResult, SourceRevision, SourceScanFence, SourceSnapshotOwner,
-    SourceSnapshotPage, SourceTagAssignmentMutation, SourceTagAssignmentSelection,
-    SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceTagWrite, SourceWriteCommand,
-    SourceWriter, SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt,
-    SourceWriterRequest,
+    SourceFeaturePublicationMetrics, SourceFileWrite, SourceIndexCommitResult, SourceRevision,
+    SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage, SourceTagAssignmentMutation,
+    SourceTagAssignmentSelection, SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceTagWrite,
+    SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
+    SourceWriterReceipt, SourceWriterRequest,
 };
 
 /// Hidden filename used for per-source databases.
