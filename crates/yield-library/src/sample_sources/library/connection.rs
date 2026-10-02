@@ -20,7 +20,7 @@ const LIBRARY_DB_WAL_FILE_NAME: &str = "library.db-wal";
 const LIBRARY_DB_SHM_FILE_NAME: &str = "library.db-shm";
 
 pub(super) struct LibraryDatabase {
-    pub(super) connection: Connection,
+    pub(super) connection: crate::sqlite_budget::OwnedConnection,
     pub(super) ordinary_wal_maintenance: super::wal_maintenance::OrdinaryWalMaintenance,
     _database_root_binding: Option<BoundDatabaseRoot>,
 }
@@ -47,7 +47,7 @@ impl LibraryDatabase {
         }
         #[cfg(test)]
         let db_path = binding.path().join(LIBRARY_DB_FILE_NAME);
-        let connection = binding.open_sqlite(
+        let connection = binding.open_owned_sqlite(
             Path::new(LIBRARY_DB_FILE_NAME),
             OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
@@ -67,11 +67,11 @@ impl LibraryDatabase {
         let connection = Connection::open(db_path)?;
         #[cfg(test)]
         record_test_open(db_path);
-        Self::initialize(connection, None)
+        Self::initialize(connection.into(), None)
     }
 
     fn initialize(
-        connection: Connection,
+        connection: crate::sqlite_budget::OwnedConnection,
         database_root_binding: Option<BoundDatabaseRoot>,
     ) -> Result<Self, LibraryError> {
         let mut db = Self {
@@ -108,8 +108,8 @@ impl LibraryDatabase {
         self._database_root_binding.as_ref()
     }
 
-    pub(super) fn into_connection(self) -> Connection {
-        self.connection
+    pub(super) fn into_connection(self) -> Result<Connection, LibraryError> {
+        self.connection.into_legacy().map_err(LibraryError::from)
     }
 }
 
