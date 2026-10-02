@@ -9,8 +9,11 @@ use yield_library::sample_sources::library::{
     HarvestFactsBatch, HarvestFactsClient, ProfileAcquisitionId,
 };
 mod dispatch;
+mod filter;
 mod read;
 pub(super) use dispatch::dispatch;
+pub(super) use filter::dispatch as dispatch_filter;
+pub use filter::{CatalogHarvestFilter, HarvestFilterChoice, SourceHarvestFilterRequest};
 
 pub(super) const MAX_RESULT_BYTES: usize = HARVEST_FACTS_MAX_BYTES * 2
     + HARVEST_FACTS_MAX_PATH_BYTES
@@ -41,16 +44,16 @@ impl SourceHarvestFactsRequest {
         request_id: u64,
         paths: &[String],
     ) -> Result<Self, HarvestFactsFailure> {
-        if source_id.as_str().is_empty()
-            || source_id.as_str().len() > 256
-            || root.as_bytes().is_empty()
-            || root.as_bytes().len() > 256
-            || lifecycle == 0
-            || directory == 0
-            || request_id == 0
-            || paths.is_empty()
-            || paths.len() > HARVEST_FACTS_MAX_PATHS
-        {
+        Self::context(
+            profile.clone(),
+            source_id.clone(),
+            lifecycle,
+            root.clone(),
+            directory,
+            revision,
+            request_id,
+        )?;
+        if paths.is_empty() || paths.len() > HARVEST_FACTS_MAX_PATHS {
             return Err(HarvestFactsFailure::InvalidInput);
         }
         let mut bytes = 0usize;
@@ -83,6 +86,36 @@ impl SourceHarvestFactsRequest {
             revision,
             request_id,
             paths: captured,
+        })
+    }
+    fn context(
+        profile: ProfileAcquisitionId,
+        source_id: SourceId,
+        lifecycle: u64,
+        root: RootIdentity,
+        directory: u64,
+        revision: u64,
+        request_id: u64,
+    ) -> Result<Self, HarvestFactsFailure> {
+        if source_id.as_str().is_empty()
+            || source_id.as_str().len() > 256
+            || root.as_bytes().is_empty()
+            || root.as_bytes().len() > 256
+            || lifecycle == 0
+            || directory == 0
+            || request_id == 0
+        {
+            return Err(HarvestFactsFailure::InvalidInput);
+        }
+        Ok(Self {
+            profile,
+            source_id,
+            lifecycle,
+            root,
+            directory,
+            revision,
+            request_id,
+            paths: Vec::new(),
         })
     }
     /// Actual captured profile acquisition; diagnostic context, not a write grant.

@@ -10,6 +10,27 @@ pub(super) fn read(
     guard: &WritableProfileGuard,
     client: Option<&HarvestFactsClient>,
 ) -> Result<HarvestFactsBatch, HarvestFactsFailure> {
+    read_until(
+        source,
+        request,
+        cancellation,
+        token,
+        admission,
+        guard,
+        client,
+        Instant::now() + Duration::from_secs(2),
+    )
+}
+pub(super) fn read_until(
+    source: &RegisteredSource,
+    request: &SourceHarvestFactsRequest,
+    cancellation: &HarvestFactsCancellation,
+    token: &Arc<AtomicBool>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    guard: &WritableProfileGuard,
+    client: Option<&HarvestFactsClient>,
+    deadline: Instant,
+) -> Result<HarvestFactsBatch, HarvestFactsFailure> {
     let client = client.ok_or(HarvestFactsFailure::OwnerUnavailable)?;
     if request.profile.as_str() != guard.owner_identity()
         || client.acquisition_id() != request.profile
@@ -21,6 +42,9 @@ pub(super) fn read(
     for path in &request.paths {
         if canceled(cancellation, token) {
             return Err(HarvestFactsFailure::Canceled);
+        }
+        if Instant::now() >= deadline {
+            return Err(HarvestFactsFailure::QueryBudget);
         }
         let observation = source
             .database
@@ -42,12 +66,7 @@ pub(super) fn read(
     let receiver = client
         .read(query)
         .map_err(|_| HarvestFactsFailure::OwnerUnavailable)?;
-    let batch = await_batch(
-        receiver,
-        cancellation,
-        token,
-        Instant::now() + Duration::from_secs(2),
-    )?;
+    let batch = await_batch(receiver, cancellation, token, deadline)?;
     check(source, request, cancellation, token, admission, guard)?;
     let current = source
         .database
@@ -105,7 +124,7 @@ fn await_batch(
 fn canceled(cancellation: &HarvestFactsCancellation, token: &Arc<AtomicBool>) -> bool {
     cancellation.is_canceled() || token.load(Ordering::Acquire)
 }
-fn check(
+pub(super) fn check(
     source: &RegisteredSource,
     request: &SourceHarvestFactsRequest,
     cancellation: &HarvestFactsCancellation,

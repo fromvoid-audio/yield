@@ -1441,6 +1441,7 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        super::harvest_filter::invalidate_if_stale(self, cx);
         self.reconcile_pane_resize(window, cx);
         self.reconcile_shipped_visual_effect(window, cx);
         self.refresh_user_shader_review_token();
@@ -1489,6 +1490,9 @@ impl Render for Browser {
             format!("Source error: {error}")
         } else if tag_filter::scope_pending(self) {
             tag_filter::status_label(self).unwrap_or_else(|| "Filtering tags…".to_string())
+        } else if self.view_model.harvest_filter().is_pending() {
+            super::harvest_filter::status_label(self)
+                .unwrap_or_else(|| "Loading Harvest filter…".into())
         } else if self.view_model.curation_queue_pending() {
             super::curation_queue::status_label(self)
                 .unwrap_or_else(|| "Loading Curation queue…".to_string())

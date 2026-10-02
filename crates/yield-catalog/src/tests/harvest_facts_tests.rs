@@ -307,4 +307,5 @@ mod fixtures {
         global.shutdown();
     }
     include!("harvest_facts_tests/invalidation.rs");
+    include!("harvest_filter_tests.rs");
 }

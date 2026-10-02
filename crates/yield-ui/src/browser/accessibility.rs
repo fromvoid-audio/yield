@@ -25,6 +25,8 @@ pub(super) const SHOW_EMPTY_FOLDERS: &str = "browser-show-empty-folders";
 pub(super) const SEARCH: &str = "browser-search";
 pub(super) const TAG_FILTER_INPUT: &str = "browser-tag-filter-input";
 pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
+pub(super) const HARVEST_FILTER_TOGGLE: &str = "browser-harvest-filter-toggle";
+pub(super) const HARVEST_FILTER_SCOPE: &str = "browser-harvest-filter-scope";
 pub(super) const CURATION_QUEUE_TOGGLE: &str = "browser-curation-queue-toggle";
 pub(super) const CURATION_QUEUE_SCOPE: &str = "browser-curation-queue-scope";
 pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
@@ -172,6 +174,10 @@ pub(super) fn rating_filter_id(index: usize) -> String {
     format!("browser-rating-filter-{index}")
 }
 
+pub(super) fn harvest_choice_id(index: usize) -> String {
+    format!("browser-harvest-filter-choice-{index}")
+}
+
 pub(super) fn curation_queue_choice_id(index: usize) -> String {
     format!("browser-curation-queue-choice-{index}")
 }
@@ -276,6 +282,8 @@ impl BrowserAccessibility {
             SHOW_EMPTY_FOLDERS,
             NAME_VIEW_MODE,
             TAG_FILTER_TOGGLE,
+            HARVEST_FILTER_TOGGLE,
+            HARVEST_FILTER_SCOPE,
             CURATION_QUEUE_TOGGLE,
             CURATION_QUEUE_SCOPE,
             PLAY,
@@ -325,6 +333,9 @@ impl BrowserAccessibility {
         }
         for index in 0..RATING_FILTER_LEVELS.len() {
             control_focus.insert(rating_filter_id(index), cx.focus_handle());
+        }
+        for index in 0..9 {
+            control_focus.insert(harvest_choice_id(index), cx.focus_handle());
         }
         for index in 0..3 {
             control_focus.insert(curation_queue_choice_id(index), cx.focus_handle());
@@ -459,6 +470,18 @@ impl BrowserAccessibility {
                                 .find_map(|(index, &level)| {
                                     (event.id == rating_filter_id(index)).then_some(level)
                                 });
+                        let harvest_choice_action = view
+                            .harvest_filter
+                            .menu_open
+                            .then(|| {
+                                yield_session::HarvestFilterChoice::ALL
+                                    .into_iter()
+                                    .enumerate()
+                                    .find_map(|(i, c)| {
+                                        (event.id == harvest_choice_id(i)).then_some(c)
+                                    })
+                            })
+                            .flatten();
                         let curation_scope_action = super::curation_queue::scope_menu_open(view)
                             .then(|| {
                                 [
@@ -481,6 +504,8 @@ impl BrowserAccessibility {
                             TAG_FILTER_INPUT
                                 | COLLECTION_RENAME
                                 | TAG_FILTER_TOGGLE
+                                | HARVEST_FILTER_TOGGLE
+                                | HARVEST_FILTER_SCOPE
                                 | CURATION_QUEUE_TOGGLE
                                 | CURATION_QUEUE_SCOPE
                                 | RANDOM_NAVIGATION
@@ -494,6 +519,7 @@ impl BrowserAccessibility {
                             || playback_age_action.is_some()
                             || rating_action.is_some();
                         let extra_action = extra_action
+                            || harvest_choice_action.is_some()
                             || curation_scope_action.is_some()
                             || filter_family_action.is_some();
                         let transport_action = matches!(
@@ -536,6 +562,7 @@ impl BrowserAccessibility {
                             && (collection_action.is_some()
                                 || playback_type_action.is_some()
                                 || rating_action.is_some()
+                                || harvest_choice_action.is_some()
                                 || curation_scope_action.is_some())
                         {
                             return;
@@ -709,6 +736,10 @@ impl BrowserAccessibility {
                                 REFRESH_SOURCE => view.refresh_active_source(cx),
                                 SHOW_EMPTY_FOLDERS => view.toggle_empty_folder_visibility(cx),
                                 TAG_FILTER_TOGGLE => super::tag_filter::toggle(view, cx),
+                                HARVEST_FILTER_TOGGLE => super::harvest_filter::toggle(view, cx),
+                                HARVEST_FILTER_SCOPE => {
+                                    super::harvest_filter::toggle_menu(view, cx)
+                                }
                                 CURATION_QUEUE_TOGGLE => super::curation_queue::toggle(view, cx),
                                 CURATION_QUEUE_SCOPE => {
                                     super::curation_queue::toggle_scope_menu(view, cx)
@@ -767,6 +798,13 @@ impl BrowserAccessibility {
                                                     );
                                                 } else if let Some(level) = rating_action {
                                                     view.toggle_rating_filter(level, cx);
+                                                } else if let Some(choice) = harvest_choice_action {
+                                                    super::harvest_filter::select(view, choice, cx);
+                                                    if let Some(focus) =
+                                                        view.ax_focus(HARVEST_FILTER_SCOPE)
+                                                    {
+                                                        window.focus(&focus);
+                                                    }
                                                 } else if let Some(scope) = curation_scope_action {
                                                     super::curation_queue::set_scope(
                                                         view, scope, cx,
@@ -1854,6 +1892,42 @@ impl Browser {
                         ),
                         value: Some(
                             if self.view_model.curation_queue().scope == scope {
+                                "Selected"
+                            } else {
+                                "Not selected"
+                            }
+                            .into(),
+                        ),
+                        enabled: active_source,
+                    });
+                }
+            }
+            let harvest = super::harvest_filter::mode(self);
+            controls.push(AxChild {
+                id: HARVEST_FILTER_TOGGLE.into(),
+                role: AxRole::CheckBox,
+                label: "Harvest filter".into(),
+                value: Some(if harvest.enabled { "On" } else { "Off" }.into()),
+                enabled: active_source,
+            });
+            controls.push(AxChild {
+                id: HARVEST_FILTER_SCOPE.into(),
+                role: AxRole::Button,
+                label: "Choose the Harvest queue to show".into(),
+                value: Some(harvest.choice.label().into()),
+                enabled: active_source,
+            });
+            if self.harvest_filter.menu_open {
+                for (index, choice) in yield_session::HarvestFilterChoice::ALL
+                    .into_iter()
+                    .enumerate()
+                {
+                    controls.push(AxChild {
+                        id: harvest_choice_id(index),
+                        role: AxRole::Button,
+                        label: format!("Harvest {}", choice.label()),
+                        value: Some(
+                            if harvest.choice == choice {
                                 "Selected"
                             } else {
                                 "Not selected"

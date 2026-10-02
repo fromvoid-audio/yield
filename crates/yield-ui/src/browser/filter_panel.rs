@@ -57,7 +57,8 @@ pub(super) fn render_filter_panel(
             cx,
         ))
         .child(curation::render_rating_filters(browser, theme.clone(), cx))
-        .child(tag_filter::render(browser, theme.clone(), cx));
+        .child(tag_filter::render(browser, theme.clone(), cx))
+        .child(super::harvest_filter::render(browser, theme.clone(), cx));
     let rail = div()
         .id("sidebar-filter-resize")
         .debug_selector(|| "sidebar-filter-resize".into())
