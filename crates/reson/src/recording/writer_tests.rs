@@ -214,3 +214,8 @@ fn recorder_worker_budget_failure_is_visible_and_subsequent_callbacks_do_not_wri
     assert_eq!(health.snapshot().writer_dropped_samples, 1);
     assert!(samples(&output).is_empty());
 }
+
+mod terminal_accounting {
+    use super::*;
+    include!("terminal_accounting_tests.rs");
+}

@@ -5,6 +5,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// Observable health counters for one recording session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecordingHealth {
+    /// Samples accepted into the writer ring, including any later abandoned samples.
+    pub writer_accepted_samples: u64,
+    /// Samples encoded in successful whole batches; this is not durable acknowledgement.
+    pub writer_encoded_samples: u64,
+    /// Accepted ring samples discarded without a codec attempt on cancellation or error.
+    pub writer_abandoned_samples: u64,
+    /// Samples in a failed codec batch; some may have been encoded before failure.
+    pub writer_unconfirmed_samples: u64,
+    /// The worker settled capture submissions and accounted for all accepted samples.
+    /// This does not confirm finalization, native input shutdown or publication.
+    pub writer_accounting_complete: bool,
+    /// A writer counter saturated; exact sample/loss totals are unavailable.
+    pub writer_accounting_overflowed: bool,
     /// Samples dropped because the bounded writer ring was full, stopped or failed.
     pub writer_dropped_samples: u64,
     /// Capture callbacks that encountered a full WAV-writer ring.
@@ -25,6 +38,14 @@ pub struct RecordingHealth {
 
 #[derive(Default)]
 pub(super) struct RecordingHealthState {
+    pub(super) writer_accepted_samples: AtomicU64,
+    pub(super) writer_encoded_samples: AtomicU64,
+    pub(super) writer_abandoned_samples: AtomicU64,
+    pub(super) writer_unconfirmed_samples: AtomicU64,
+    pub(super) writer_accounting_complete: AtomicBool,
+    pub(super) writer_accounting_overflowed: AtomicBool,
+    // RecorderCapture has one exclusively borrowed producer. The worker waits; capture never does.
+    pub(super) capture_in_flight: AtomicBool,
     pub(super) writer_dropped_samples: AtomicU64,
     pub(super) writer_overrun_events: AtomicU64,
     pub(super) monitor_dropped_samples: AtomicU64,
@@ -36,8 +57,27 @@ pub(super) struct RecordingHealthState {
 }
 
 impl RecordingHealthState {
+    pub(super) fn add_writer_count(&self, counter: &AtomicU64, count: u64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            Some(old.checked_add(count).unwrap_or_else(|| {
+                self.writer_accounting_overflowed
+                    .store(true, Ordering::Release);
+                u64::MAX
+            }))
+        });
+    }
+
     pub(super) fn snapshot(&self) -> RecordingHealth {
+        // Read the release marker before the counters. Live snapshots are observations, not an
+        // atomic partition; after join, accepted/encoded/abandoned/unconfirmed are stable.
+        let complete = self.writer_accounting_complete.load(Ordering::Acquire);
         RecordingHealth {
+            writer_accepted_samples: self.writer_accepted_samples.load(Ordering::Relaxed),
+            writer_encoded_samples: self.writer_encoded_samples.load(Ordering::Relaxed),
+            writer_abandoned_samples: self.writer_abandoned_samples.load(Ordering::Relaxed),
+            writer_unconfirmed_samples: self.writer_unconfirmed_samples.load(Ordering::Relaxed),
+            writer_accounting_complete: complete,
+            writer_accounting_overflowed: self.writer_accounting_overflowed.load(Ordering::Acquire),
             writer_dropped_samples: self.writer_dropped_samples.load(Ordering::Relaxed),
             writer_overrun_events: self.writer_overrun_events.load(Ordering::Relaxed),
             monitor_dropped_samples: self.monitor_dropped_samples.load(Ordering::Relaxed),
