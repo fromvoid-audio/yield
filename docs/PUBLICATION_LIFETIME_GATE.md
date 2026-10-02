@@ -232,7 +232,7 @@ Decision-reference commands (not new production tests):
 
 ```sh
 cargo test --locked -p yield-library --lib staging_checkpoint -- --test-threads=1
-cargo test --locked -p yield-library --lib cancelled_operation_blocks_chunk_issue_and_entry_but_allows_unused_release -- --test-threads=1
+cargo test --locked -p yield-library --lib v16_copy_retry_and_cancel_preserve_full_plan_through_store_cas_and_restart -- --test-threads=1
 cargo test --locked -p yield-library --lib file_operation_owner::tests -- --test-threads=1
 cargo test --locked -p yield-library --lib source_authority::tests -- --test-threads=1
 bash scripts/agent.sh preflight
@@ -242,3 +242,7 @@ git diff --check
 These are foundation/reference checks. Record exact head, commands, pass/skip
 counts, limits and complete merged-tree verification on OPT-2183. They complete
 this decision only; the production and physical leaves above remain open.
+The existing `cancelled_operation_blocks_chunk_issue_and_entry_but_allows_unused_release`
+case is macOS-only and its Linux filter runs zero tests. It is not a Linux
+pass. The V16 store test above provides portable cancellation/restart evidence,
+not the new cross-owner entry/release race acceptance required by OPT-2215.
