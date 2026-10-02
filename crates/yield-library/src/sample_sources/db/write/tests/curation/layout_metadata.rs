@@ -204,7 +204,6 @@ fn generation() {
         }
     }
     for sql in [
-        "UPDATE metadata SET value=zeroblob(10) WHERE key=?1",
         "UPDATE metadata SET value=CAST(x'80' AS TEXT) WHERE key=?1",
         "UPDATE metadata SET value=char(0) WHERE key=?1",
     ] {

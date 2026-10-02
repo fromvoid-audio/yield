@@ -27,6 +27,29 @@ pub struct SourceLayoutMetadataBudget {
     required_bytes: u64,
 }
 impl SourceLayoutMetadataBudget {
+    fn same_facts(&self, other: &Self) -> bool {
+        (
+            self.page_size,
+            self.page_count,
+            self.database_bytes,
+            self.max_pages,
+            self.wal_bytes,
+            self.shm_bytes,
+            self.old_bytes,
+            self.old_digest,
+            self.required_bytes,
+        ) == (
+            other.page_size,
+            other.page_count,
+            other.database_bytes,
+            other.max_pages,
+            other.wal_bytes,
+            other.shm_bytes,
+            other.old_bytes,
+            other.old_digest,
+            other.required_bytes,
+        )
+    }
     /// Exact retained source scope whose storage was observed.
     pub fn revision(&self) -> &SourceRevision {
         &self.revision
@@ -105,6 +128,21 @@ impl SourceWriter {
         if expected != &before {
             return Err(SourceWriterError::StaleFence);
         }
+        let budget = self.read_layout_metadata_facts(before, deadline)?;
+        if expected != &self.current_revision()? {
+            return Err(SourceWriterError::StaleFence);
+        }
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        Ok(budget)
+    }
+
+    fn read_layout_metadata_facts(
+        &self,
+        revision: SourceRevision,
+        deadline: Instant,
+    ) -> Result<SourceLayoutMetadataBudget, SourceWriterError> {
         let connection = &self.database.connection;
         crate::sample_sources::db::schema::require_known_metadata_schema(connection)
             .map_err(|_| unknown())?;
@@ -155,14 +193,8 @@ impl SourceWriter {
         let (old_bytes, old_digest) = generation_observation(connection)?;
         let required_bytes =
             checked_peak(page_size, max_pages, wal_bytes, shm_bytes).ok_or_else(unknown)?;
-        if expected != &self.current_revision()? {
-            return Err(SourceWriterError::StaleFence);
-        }
-        if Instant::now() >= deadline {
-            return Err(SourceWriterError::SnapshotBudgetExceeded);
-        }
         Ok(SourceLayoutMetadataBudget {
-            revision: before,
+            revision,
             owner: Arc::downgrade(&self.reference_liveness),
             deadline,
             page_size,
@@ -175,6 +207,39 @@ impl SourceWriter {
             old_digest,
             required_bytes,
         })
+    }
+
+    // Read-only original-issuer/fact check on the caller's already held connection. No BEGIN.
+    pub(super) fn validate_layout_metadata_facts(
+        &self,
+        budget: &SourceLayoutMetadataBudget,
+        revision: &SourceRevision,
+        deadline: Instant,
+    ) -> Result<(), SourceWriterError> {
+        if Instant::now() >= deadline.min(budget.deadline) {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        let owner = budget
+            .owner
+            .upgrade()
+            .ok_or(SourceWriterError::StaleFence)?;
+        if !Arc::ptr_eq(&owner, &self.reference_liveness) || revision != budget.revision() {
+            return Err(SourceWriterError::StaleFence);
+        }
+        let _progress = SnapshotProgressGuard::install(
+            &self.database.connection,
+            deadline.min(budget.deadline),
+        );
+        let _extensions =
+            crate::sqlite_ext::try_extension_free_metadata_scope().ok_or_else(unknown)?;
+        let current = self.read_layout_metadata_facts(revision.clone(), budget.deadline)?;
+        if !current.same_facts(budget) {
+            return Err(unknown());
+        }
+        if Instant::now() >= deadline.min(budget.deadline) {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        Ok(())
     }
 
     /// Recheck all captured facts without extending the original observation deadline.
@@ -193,27 +258,7 @@ impl SourceWriter {
             return Err(SourceWriterError::StaleFence);
         }
         let current = self.capture_layout_metadata_budget(&budget.revision)?;
-        if (
-            current.page_size,
-            current.page_count,
-            current.database_bytes,
-            current.max_pages,
-            current.wal_bytes,
-            current.shm_bytes,
-            current.old_bytes,
-            current.old_digest,
-            current.required_bytes,
-        ) != (
-            budget.page_size,
-            budget.page_count,
-            budget.database_bytes,
-            budget.max_pages,
-            budget.wal_bytes,
-            budget.shm_bytes,
-            budget.old_bytes,
-            budget.old_digest,
-            budget.required_bytes,
-        ) {
+        if !current.same_facts(budget) {
             return Err(unknown());
         }
         if Instant::now() >= budget.deadline {
@@ -228,7 +273,7 @@ pub(super) fn generation_observation(
 ) -> Result<(u64, Option<[u8; 32]>), SourceWriterError> {
     let mut statement = connection
         .prepare(
-            "SELECT typeof(value), length(CAST(value AS BLOB)), CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB)) BETWEEN 1 AND 524288 THEN value ELSE NULL END FROM metadata WHERE key=?1",
+            "SELECT typeof(value), length(CAST(value AS BLOB)), CASE WHEN typeof(value) IN ('text','blob') AND length(CAST(value AS BLOB)) BETWEEN 1 AND 524288 THEN value ELSE NULL END FROM metadata WHERE key=?1",
         )
         .map_err(|_| unknown())?;
     let mut rows = statement
@@ -239,18 +284,28 @@ pub(super) fn generation_observation(
     };
     let kind: String = row.get(0).map_err(|_| unknown())?;
     let bytes: u64 = row.get(1).map_err(|_| unknown())?;
-    if kind != "text" || bytes == 0 || bytes > SOURCE_LAYOUT_GENERATION_MAX_BYTES {
+    if !matches!(kind.as_str(), "text" | "blob")
+        || bytes == 0
+        || bytes > SOURCE_LAYOUT_GENERATION_MAX_BYTES
+    {
         return Err(unknown());
     }
-    let raw = row
-        .get_ref(2)
-        .map_err(|_| unknown())?
-        .as_str()
-        .map_err(|_| unknown())?;
-    if raw.len() as u64 != bytes || raw.contains('\0') {
+    let value = row.get_ref(2).map_err(|_| unknown())?;
+    let raw = match kind.as_str() {
+        "text" => {
+            let text = value.as_str().map_err(|_| unknown())?;
+            if text.contains('\0') {
+                return Err(unknown());
+            }
+            text.as_bytes()
+        }
+        "blob" => value.as_blob().map_err(|_| unknown())?,
+        _ => return Err(unknown()),
+    };
+    if raw.len() as u64 != bytes {
         return Err(unknown());
     }
-    Ok((bytes, Some(*blake3::hash(raw.as_bytes()).as_bytes())))
+    Ok((bytes, Some(*blake3::hash(raw).as_bytes())))
 }
 
 fn checked_peak(page_size: u64, max_pages: u64, wal: u64, shm: u64) -> Option<u64> {

@@ -531,3 +531,60 @@ fn layout_generation_historical_origin_corruption_cannot_hide_outside_content_di
         "historical origin corruption must fail closed"
     );
 }
+
+// Exact canonical producer bytes in a test-owned row are allocation evidence only;
+// inserting them here does not exercise or complete admitted production publication.
+pub(super) fn canonical_blob_budget() {
+    let (_fixture, mut writer) = setup();
+    publish(&mut writer, &["one.wav", "two.wav"]);
+    let input = capture(&writer).unwrap();
+    let prepared = prepare(&writer, &input).unwrap();
+    assert!(prepared.bytes().contains(&0));
+    writer
+        .database_for_tests()
+        .connection
+        .execute(
+            "INSERT INTO metadata(key,value) VALUES ('source_starmap_generation_v1',?1)",
+            [prepared.bytes()],
+        )
+        .unwrap();
+    let before = source_writer_state_snapshot(writer.database_for_tests());
+    let changes = writer.database_for_tests().connection.total_changes();
+    let control = writer
+        .database_for_tests()
+        .source_lease_control_total_changes_for_tests()
+        .unwrap()
+        .unwrap();
+    let rev = writer.current_revision().unwrap();
+    let budget = writer.capture_layout_metadata_budget(&rev).unwrap();
+    assert_eq!(
+        budget.existing_generation_bytes(),
+        prepared.bytes().len() as u64
+    );
+    assert_eq!(
+        budget.existing_generation_digest(),
+        Some(*prepared.bytes_digest())
+    );
+    let held = writer
+        .prepare_layout_wal_reservation(budget, Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    held.revalidate().unwrap();
+    let writer = held.abort().unwrap();
+    assert_eq!(
+        writer.database_for_tests().connection.total_changes(),
+        changes
+    );
+    assert_eq!(
+        source_writer_state_snapshot(writer.database_for_tests()),
+        before
+    );
+    assert_eq!(
+        writer
+            .database_for_tests()
+            .source_lease_control_total_changes_for_tests()
+            .unwrap()
+            .unwrap(),
+        control
+    );
+    assert_eq!(writer.current_revision().unwrap(), rev);
+}
