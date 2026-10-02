@@ -143,3 +143,11 @@ Harvest/projection and filesystem/source-retirement evidence remain independent.
 The SQLite connection retains the existing `synchronous=NORMAL` policy; these tests
 prove transactional replay and process reopen, not power-loss durability. Native
 macOS/Windows owner and descriptor-bound SQLite regression remains separately scoped.
+
+OPT-1833 additionally exercises reordered submissions: two source command correlations
+under the same operation arrive in reverse source-revision order, duplicate observations
+are collected in the opposite order, then both are replayed in the other order after
+profile reacquisition. The actual owner retains exactly one immutable result per composite
+key. Ledger order describes global correlation commit order, not source mutation order.
+This test's source payloads are synthetic storage input; the separate actual-source test
+above proves the receipt constructor and source-commit/global-failure recovery boundary.
