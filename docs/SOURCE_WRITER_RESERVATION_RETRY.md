@@ -26,9 +26,10 @@ reservation success does not mean a caller mutation or durable receipt succeeded
 
 One INFO event on `yield::source_writer_acquisition` contains only `attempts`,
 `retries`, `sqlite_code` and a fixed `outcome` category. Attempts are actual BEGIN
-calls (0..3); retries are scheduled waits (0..2). The code is the last SQLite
-failure observed by this helper, or zero when no SQLite failure was observed; a
-successful third attempt can therefore report the preceding BUSY code. Outcomes
+calls (0..3); retries are scheduled waits (0..2). The code is the last BEGIN or timeout-restoration SQLite
+failure observed by this helper, or zero when neither failed; a
+successful third attempt can therefore report the preceding BUSY code. Initial
+ownership/setup rejection records zero attempts and no acquisition code. Outcomes
 are `rejected`, `ownership_rejected`, `acquired`, `busy_exhausted`,
 `contention_not_retryable`, `sqlite_error` and `timeout_restore_failed`. No path,
 profile/source/operation identity, SQL text, raw error message or owned evidence
