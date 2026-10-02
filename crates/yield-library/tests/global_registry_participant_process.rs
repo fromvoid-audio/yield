@@ -335,6 +335,26 @@ fn committed_registry_receipt_survives_process_death_and_refenced_replay() {
     assert_registry(&writer, profile.path(), true);
     assert_persisted(profile.path(), &original, true);
     assert!(writer.shutdown());
+    // Public metadata-only evidence appears only after every actual owner/SQLite
+    // assertion and cleanup above. Never emit private receipt or profile data.
+    println!(
+        "\nYIELD_GLOBAL_RECOVERY_CASE={} ",
+        serde_json::json!({
+            "schema": "yield.global-recovery-case.v1",
+            "case": "committed_registry_receipt_process_death",
+            "provenance": "actual_normal_build_owned_process_sqlite",
+            "outcome": "observed_metadata_replay",
+            "observations": [
+                "committed_receipt_survived_owned_process_death",
+                "competing_profile_ownership_denied",
+                "old_acquisition_rejected",
+                "refenced_replay_preserved_historical_receipt",
+                "changed_payload_and_work_rejected",
+                "later_registry_edit_preserved",
+                "one_receipt_retained"
+            ]
+        })
+    );
 }
 
 #[test]
