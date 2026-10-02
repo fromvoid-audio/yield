@@ -8690,6 +8690,7 @@ dependencies = [
  "rusqlite",
  "tempfile",
  "thiserror 2.0.20",
+ "yield-analysis",
  "yield-library",
  "yield-scan",
  "yield-source-watcher",

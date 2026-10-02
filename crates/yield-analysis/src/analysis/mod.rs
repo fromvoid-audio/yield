@@ -155,3 +155,17 @@ mod tests {
         assert!(features.iter().all(|value| value.is_finite()));
     }
 }
+
+/// Compute the existing v1 vector from bounded, already verified WAV bytes.
+/// No filesystem path or database connection is accepted.
+pub fn compute_feature_vector_v1_for_wav_bytes(
+    bytes: &[u8],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<f32>, String> {
+    let decoded = audio::decode_feature_wav_bytes(bytes, cancel)?;
+    let vector = compute_feature_vector_v1_for_decoded_audio(&decoded)?;
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("Cancelled".into());
+    }
+    Ok(vector)
+}
