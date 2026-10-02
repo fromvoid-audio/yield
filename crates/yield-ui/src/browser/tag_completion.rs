@@ -431,6 +431,7 @@ fn submit_source_page(
             | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
             | CatalogSubmitError::InvalidCurationTagFactsRequest(_)
             | CatalogSubmitError::InvalidTagFilterRequest(_)
+            | CatalogSubmitError::InvalidIndexPageRequest(_)
             | CatalogSubmitError::InvalidRatingDecayRequest(_),
         ) => {
             browser.tag_completion.source_target = None;

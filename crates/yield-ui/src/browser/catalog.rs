@@ -468,6 +468,7 @@ impl Browser {
                     | CatalogSubmitError::InvalidTagFilterRequest(_)
                     | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
                     | CatalogSubmitError::InvalidCurationTagFactsRequest(_)
+                    | CatalogSubmitError::InvalidIndexPageRequest(_)
                     | CatalogSubmitError::InvalidRatingDecayRequest(_),
                 ) => {
                     return false;
@@ -517,6 +518,7 @@ impl Browser {
                     | CatalogSubmitError::InvalidTagFilterRequest(_)
                     | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
                     | CatalogSubmitError::InvalidCurationTagFactsRequest(_)
+                    | CatalogSubmitError::InvalidIndexPageRequest(_)
                     | CatalogSubmitError::InvalidRatingDecayRequest(_),
                 ) => return false,
             }
@@ -757,6 +759,8 @@ impl Browser {
             CatalogEvent::CurationCommitted { .. }
             | CatalogEvent::CurationFailed { .. }
             | CatalogEvent::CurationOperationCompleted { .. }
+            | CatalogEvent::IndexPageReady { .. }
+            | CatalogEvent::IndexPageFailed { .. }
             | CatalogEvent::TagPageReady { .. }
             | CatalogEvent::TagPageFailed { .. }
             | CatalogEvent::TagAssignmentsReady { .. }
@@ -1121,6 +1125,16 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             ..
         }
         | CatalogEvent::WavMetadataFailed {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::IndexPageReady {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::IndexPageFailed {
             source_id,
             lifecycle_generation,
             ..

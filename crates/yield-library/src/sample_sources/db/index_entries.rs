@@ -16,6 +16,9 @@ use crate::sample_sources::reconciliation::RootRelativePath;
 /// Maximum retained index entries returned by one page.
 pub const SOURCE_INDEX_PAGE_MAX_ENTRIES: usize = 128;
 
+/// Maximum aggregate stored variable-field bytes read per page, including lookahead.
+pub const SOURCE_INDEX_PAGE_MAX_BYTES: usize = 128 * 1024;
+
 /// Opaque, in-memory continuation bound to one open database and index revision.
 ///
 /// Reopening the connection requires starting a new traversal. This cursor grants
@@ -26,6 +29,17 @@ pub struct SourceIndexPageCursor {
     root: PathBuf,
     revision: u64,
     after: String,
+}
+
+impl SourceIndexPageCursor {
+    /// Retained variable input bytes for bounded owner admission, without exposing its key.
+    pub fn input_bytes(&self) -> usize {
+        self.root
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            .saturating_add(self.after.len())
+    }
 }
 
 /// Bounded retained index facts, including unsupported and inaccessible entries.
@@ -49,6 +63,9 @@ pub enum SourceIndexPageError {
     /// The limit is outside one through the fixed page maximum.
     #[error("source index page limit must be between 1 and {SOURCE_INDEX_PAGE_MAX_ENTRIES}")]
     InvalidLimit,
+    /// Stored row fields or continuation exceed the bounded projection budget.
+    #[error("source index page exceeds its variable-field byte budget")]
+    ByteLimit,
     /// A cursor came from a different/reopened connection or retargeted source root.
     #[error("source index cursor belongs to a different database connection or source root")]
     ForeignCursor,
@@ -139,9 +156,25 @@ impl SourceDatabase {
                 (limit + 1) as i64
             ])
             .map_err(map_sql_error)?;
+        let mut field_bytes = self.root.as_os_str().as_encoded_bytes().len();
+        if field_bytes > SOURCE_INDEX_PAGE_MAX_BYTES {
+            return Err(SourceIndexPageError::ByteLimit);
+        }
         let mut entries = Vec::with_capacity(limit + 1);
         let mut keys = Vec::with_capacity(limit + 1);
         while let Some(row) = rows.next().map_err(map_sql_error)? {
+            // Borrow SQLite values before any String/path allocation, including lookahead.
+            for column in [0, 2, 5, 6] {
+                let bytes = match row.get_ref(column).map_err(map_sql_error)? {
+                    rusqlite::types::ValueRef::Text(value)
+                    | rusqlite::types::ValueRef::Blob(value) => value.len(),
+                    _ => 0,
+                };
+                field_bytes = field_bytes.saturating_add(bytes);
+                if field_bytes > SOURCE_INDEX_PAGE_MAX_BYTES {
+                    return Err(SourceIndexPageError::ByteLimit);
+                }
+            }
             keys.push(row.get::<_, String>(0).map_err(map_sql_error)?);
             entries.push(strict_page_entry(row)?);
         }
@@ -662,6 +695,34 @@ mod tests {
         }
         batch.commit_auxiliary_state().expect("commit index");
         (directory, database)
+    }
+
+    #[test]
+    fn index_page_bounds_variable_fields_before_allocation_including_lookahead() {
+        let (_root, database) = page_fixture(&[
+            page_entry(PathBuf::from("a.txt")),
+            page_entry(PathBuf::from("b.txt")),
+        ]);
+        // The second row is lookahead, not returned. It must still be bounded.
+        database
+            .connection
+            .execute(
+                "UPDATE source_index_entries SET file_identity = ?1 WHERE path = 'b.txt'",
+                params!["x".repeat(SOURCE_INDEX_PAGE_MAX_BYTES + 1)],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.source_index_page(None, 1),
+            Err(SourceIndexPageError::ByteLimit)
+        ));
+        database
+            .connection
+            .execute("UPDATE source_index_entries SET file_identity = NULL", [])
+            .unwrap();
+        assert_eq!(
+            database.source_index_page(None, 2).unwrap().entries.len(),
+            2
+        );
     }
 
     #[test]

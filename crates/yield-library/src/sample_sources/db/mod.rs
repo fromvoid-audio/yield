@@ -74,7 +74,8 @@ pub use content_audit::{
 };
 pub use error::{SourceDatabaseIdentityError, SourceDbError, SourceDirectoryTruthError};
 pub use index_entries::{
-    SOURCE_INDEX_PAGE_MAX_ENTRIES, SourceIndexPage, SourceIndexPageCursor, SourceIndexPageError,
+    SOURCE_INDEX_PAGE_MAX_BYTES, SOURCE_INDEX_PAGE_MAX_ENTRIES, SourceIndexPage,
+    SourceIndexPageCursor, SourceIndexPageError,
 };
 pub(crate) use open::SourceDatabaseOpenMode;
 #[cfg(test)]

@@ -8,22 +8,24 @@ use yield_catalog::{CatalogAuditCancelError, CatalogSubmitError as CatalogWorker
 pub use yield_catalog::{
     CatalogCommand, CatalogCurationRequestError, CatalogCurationTagFactsRequestError,
     CatalogDelivery, CatalogDisplayLabelsRequestError, CatalogError, CatalogEvent,
-    CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError,
-    CatalogTagAssignmentPreview, CatalogTagAssignmentPreviewSource, CatalogTagFilterRequestError,
-    CatalogTagPageQuery, CatalogTagPageRequestError, CatalogWavMetadataRequestError,
-    MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
-    MAX_CURATION_OPERATION_RECEIPT_BYTES, MAX_CURATION_OPERATION_UPDATES,
-    MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
+    CatalogIndexPage, CatalogIndexPageCursor, CatalogIndexPageError, CatalogOperation,
+    CatalogPublicationStatus, CatalogRatingDecayRequestError, CatalogTagAssignmentPreview,
+    CatalogTagAssignmentPreviewSource, CatalogTagFilterRequestError, CatalogTagPageQuery,
+    CatalogTagPageRequestError, CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
+    MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
+    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES,
+    MAX_INDEX_PAGE_PAYLOAD_BYTES, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
     MAX_TAG_ASSIGNMENT_PREVIEW_PATHS, MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES,
     MAX_TAG_FILTER_MASK_BYTES, MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES,
-    MAX_WAV_METADATA_REQUEST_PATHS, SOURCE_CURATION_TAG_FACTS_MAX_PATHS,
+    MAX_WAV_METADATA_REQUEST_PATHS, RetainedIndexCompleteness, SOURCE_CURATION_TAG_FACTS_MAX_PATHS,
     SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
-    SOURCE_DISPLAY_LABEL_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
-    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS,
-    SourceCurationCommitReceipt, SourceCurationOperationFailure, SourceCurationOperationFence,
-    SourceCurationOperationOutcome, SourceCurationTagFacts, SourceCurationUpdate,
-    SourceDisplayLabelEntry, SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage,
-    SourceTagPageCursor, SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
+    SOURCE_DISPLAY_LABEL_MAX_PATHS, SOURCE_INDEX_PAGE_MAX_ENTRIES, SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
+    SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
+    SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceCurationCommitReceipt, SourceCurationOperationFailure,
+    SourceCurationOperationFence, SourceCurationOperationOutcome, SourceCurationTagFacts,
+    SourceCurationUpdate, SourceDisplayLabelEntry, SourceTagAssignmentCursor,
+    SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
+    VerifiedSourceRoot, resolve_source_root,
 };
 
 /// Lifecycle state of the independently-owned source catalog worker.
@@ -63,6 +65,9 @@ pub enum CatalogSubmitError {
     /// A lazy tag-page request failed bounded input admission.
     #[error("invalid source catalog tag-page request: {0}")]
     InvalidTagPageRequest(CatalogTagPageRequestError),
+    /// An index page exceeds bounded input admission.
+    #[error("invalid source catalog index page request: {0}")]
+    InvalidIndexPageRequest(CatalogIndexPageError),
     /// A source tag-filter request failed bounded input admission.
     #[error("invalid source catalog tag-filter request: {0}")]
     InvalidTagFilterRequest(CatalogTagFilterRequestError),
@@ -272,6 +277,9 @@ fn mark_closed(slot: &Arc<Mutex<CatalogSlot>>, service: &Arc<CatalogService>) {
 
 fn map_submit_error(error: CatalogWorkerSubmitError) -> CatalogSubmitError {
     match error {
+        CatalogWorkerSubmitError::InvalidIndexPageRequest(error) => {
+            CatalogSubmitError::InvalidIndexPageRequest(error)
+        }
         CatalogWorkerSubmitError::Full => CatalogSubmitError::Full,
         CatalogWorkerSubmitError::Closed => CatalogSubmitError::Closed,
         CatalogWorkerSubmitError::InvalidWavMetadataRequest(error) => {
