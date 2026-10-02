@@ -42,7 +42,7 @@ mod vocabulary;
 pub use catalog::{
     CatalogCancelError, CatalogCommand, CatalogCurationRequestError,
     CatalogCurationTagFactsRequestError, CatalogDelivery, CatalogDisplayLabelsRequestError,
-    CatalogError, CatalogEvent, CatalogHarvestFacts, CatalogIndexEntryHandle,
+    CatalogError, CatalogEvent, CatalogHarvestFacts, CatalogHarvestFilter, CatalogIndexEntryHandle,
     CatalogIndexInspection, CatalogIndexPage, CatalogIndexPageCursor, CatalogIndexPageError,
     CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError, CatalogStatus,
     CatalogSubmitError, CatalogTagAssignmentPreview, CatalogTagAssignmentPreviewSource,
@@ -51,8 +51,8 @@ pub use catalog::{
     CollectionHistoryRequest, FeatureAnalysisBlocker, FeatureAnalysisCancellation,
     FeatureAnalysisPhase, FeatureAnalysisState, FeaturePhaseMeasurement, HARVEST_FACTS_MAX_BYTES,
     HARVEST_FACTS_MAX_PATH_BYTES, HARVEST_FACTS_MAX_PATHS, HarvestFactsCancellation,
-    HarvestFactsEntry, HarvestFactsFailure, HarvestState, IndexInspectionCancellation,
-    MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
+    HarvestFactsEntry, HarvestFactsFailure, HarvestFilterChoice, HarvestState,
+    IndexInspectionCancellation, MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
     MAX_CURATION_OPERATION_RECEIPT_BYTES, MAX_CURATION_OPERATION_UPDATES,
     MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES, MAX_HELD_INDEX_INSPECTIONS,
     MAX_INDEX_PAGE_PAYLOAD_BYTES, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
@@ -66,10 +66,10 @@ pub use catalog::{
     SimilarityCandidateOutcome, SimilarityDispatchFailure, SourceCollectionHistorySelection,
     SourceCurationCommitReceipt, SourceCurationOperationFailure, SourceCurationOperationFence,
     SourceCurationOperationOutcome, SourceCurationTagFacts, SourceCurationUpdate,
-    SourceDisplayLabelEntry, SourceHarvestFactsRequest, SourceIndexInspectionError,
-    SourceSimilarityRequest, SourceSimilarityResult, SourceSimilarityRow,
-    SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor,
-    SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
+    SourceDisplayLabelEntry, SourceHarvestFactsRequest, SourceHarvestFilterRequest,
+    SourceIndexInspectionError, SourceSimilarityRequest, SourceSimilarityResult,
+    SourceSimilarityRow, SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage,
+    SourceTagPageCursor, SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
 };
 use catalog::{CatalogService, CatalogSlot};
 use maintenance::{

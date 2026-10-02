@@ -462,16 +462,28 @@
         }
       ],
       "owner": "OPT-1907",
-      "note": "Name/Type/Rating and existing Tag/Curation controls exist; Harvest family still depends on exact facts.",
+      "note": "Independent Name/Type/Rating and Tag/Curation controls plus source-scoped Harvest enable and nine-choice dropdown. Harvest uses actual coherent owner facts under OPT-1898; full family/native parity remains OPT-1907/2009/2224.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
       "message": "FolderBrowserMessage::SetHarvestFilter",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/harvest_filter.rs",
+        "symbol": "select"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/harvest_filter/tests.rs",
+          "symbol": "harvest_filter_actual_controls_owner_mask_all_disable_and_source_scoping"
+        },
+        {
+          "path": "crates/yield-catalog/src/tests/harvest_filter_tests.rs",
+          "symbol": "harvest_filter_actual_owner_exact_nine_reference_choices_and_read_only_sql"
+        }
+      ],
       "owner": "OPT-1898",
-      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "note": "Actual source-scoped enable/dropdown and coherent bounded catalog mask over genuine source/global owner facts; exact nine reference rules, All bypass, retained context/cancellation/global fences and composed positional filtering. Portable owner/GPUI fixtures are not native or physical qualification. Native pointer/keyboard/AX acceptance remains OPT-2224.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
@@ -829,11 +841,23 @@
     },
     {
       "message": "GuiMessage::CloseHarvestFilterDropdown",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/harvest_filter.rs",
+        "symbol": "close_menu"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/harvest_filter/tests.rs",
+          "symbol": "harvest_filter_actual_controls_owner_mask_all_disable_and_source_scoping"
+        },
+        {
+          "path": "crates/yield-catalog/src/tests/harvest_filter_tests.rs",
+          "symbol": "harvest_filter_actual_owner_exact_nine_reference_choices_and_read_only_sql"
+        }
+      ],
       "owner": "OPT-1898",
-      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "note": "Actual source-scoped enable/dropdown and coherent bounded catalog mask over genuine source/global owner facts; exact nine reference rules, All bypass, retained context/cancellation/global fences and composed positional filtering. Portable owner/GPUI fixtures are not native or physical qualification. Native pointer/keyboard/AX acceptance remains OPT-2224.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
@@ -1922,11 +1946,23 @@
     },
     {
       "message": "GuiMessage::ToggleHarvestFilterDropdown",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/harvest_filter.rs",
+        "symbol": "toggle_menu"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/harvest_filter/tests.rs",
+          "symbol": "harvest_filter_actual_controls_owner_mask_all_disable_and_source_scoping"
+        },
+        {
+          "path": "crates/yield-catalog/src/tests/harvest_filter_tests.rs",
+          "symbol": "harvest_filter_actual_owner_exact_nine_reference_choices_and_read_only_sql"
+        }
+      ],
       "owner": "OPT-1898",
-      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "note": "Actual source-scoped enable/dropdown and coherent bounded catalog mask over genuine source/global owner facts; exact nine reference rules, All bypass, retained context/cancellation/global fences and composed positional filtering. Portable owner/GPUI fixtures are not native or physical qualification. Native pointer/keyboard/AX acceptance remains OPT-2224.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {

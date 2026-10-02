@@ -289,6 +289,7 @@ pub struct BrowserViewModel {
     playback_age_filter: PlaybackAgeFilter,
     playback_type_filter: PlaybackTypeFilter,
     tag_filter: TagFilterState,
+    harvest_filter: TagFilterState,
     curation_queue: CurationQueueMode,
     curation_tag_facts: Option<Vec<CurationTagFacts>>,
     reveal_id: Option<AudioFileId>,
@@ -311,6 +312,7 @@ impl BrowserViewModel {
             playback_age_filter: PlaybackAgeFilter::disabled(),
             playback_type_filter: PlaybackTypeFilter::disabled(),
             tag_filter: TagFilterState::disabled(),
+            harvest_filter: TagFilterState::disabled(),
             curation_queue: CurationQueueMode::default(),
             curation_tag_facts: None,
             reveal_id: None,
@@ -458,6 +460,11 @@ impl BrowserViewModel {
         &self.rows
     }
 
+    /// Independent Harvest positional filter; disabled contributes no exclusion.
+    pub fn harvest_filter(&self) -> &TagFilterState {
+        &self.harvest_filter
+    }
+
     /// Replace the search query and rebuild visible rows.
     pub fn set_query(&mut self, entries: &[AudioFile], query: impl Into<String>) {
         self.reveal_id = None;
@@ -468,6 +475,7 @@ impl BrowserViewModel {
     /// Replace the scan while preserving the current query and sort choice.
     pub fn set_entries(&mut self, entries: &[AudioFile]) {
         self.invalidate_tag_filter_result();
+        self.invalidate_harvest_filter_result();
         self.curation_tag_facts = None;
         self.clear_reveal_if_missing(entries);
         self.rebuild(entries);
@@ -527,6 +535,66 @@ impl BrowserViewModel {
     /// Invalidate an enabled tag-filter result while preserving its reveal and enabled state.
     pub fn invalidate_tag_filter(&mut self, entries: &[AudioFile]) -> bool {
         let changed = self.invalidate_tag_filter_result();
+        if changed {
+            self.rebuild(entries);
+        }
+        changed
+    }
+
+    /// Begin an enabled Harvest filter while its external positional result is being computed.
+    ///
+    /// The temporary reveal is cleared because this is an explicit filter edit. Until a
+    /// validated mask is applied, an enabled filter contributes no matching rows.
+    pub fn begin_harvest_filter(&mut self, entries: &[AudioFile]) -> bool {
+        let changed =
+            !matches!(self.harvest_filter, TagFilterState::Pending) || self.reveal_id.is_some();
+        self.reveal_id = None;
+        self.harvest_filter = TagFilterState::Pending;
+        if changed {
+            self.rebuild(entries);
+        }
+        changed
+    }
+
+    /// Disable Harvest filtering and rebuild the projection without its external match mask.
+    pub fn disable_harvest_filter(&mut self, entries: &[AudioFile]) -> bool {
+        let changed =
+            !matches!(self.harvest_filter, TagFilterState::Disabled) || self.reveal_id.is_some();
+        self.reveal_id = None;
+        self.harvest_filter = TagFilterState::Disabled;
+        if changed {
+            self.rebuild(entries);
+        }
+        changed
+    }
+
+    /// Apply a validated positional Harvest filter result while the filter is enabled.
+    ///
+    /// The mask must address exactly `entries.len()` entries. Applying a result preserves any
+    /// existing reveal and rebuilds the projection; a disabled filter or mismatched mask leaves
+    /// the current state untouched.
+    pub fn apply_harvest_filter(
+        &mut self,
+        entries: &[AudioFile],
+        mask: TagFilterMask,
+    ) -> Result<(), TagFilterApplyError> {
+        if !self.harvest_filter.is_enabled() {
+            return Err(TagFilterApplyError::Disabled);
+        }
+        if mask.entry_count() != entries.len() {
+            return Err(TagFilterApplyError::EntryCountMismatch {
+                expected: entries.len(),
+                actual: mask.entry_count(),
+            });
+        }
+        self.harvest_filter = TagFilterState::Ready(mask);
+        self.rebuild(entries);
+        Ok(())
+    }
+
+    /// Invalidate an enabled Harvest filter result while preserving its reveal and enabled state.
+    pub fn invalidate_harvest_filter(&mut self, entries: &[AudioFile]) -> bool {
+        let changed = self.invalidate_harvest_filter_result();
         if changed {
             self.rebuild(entries);
         }
@@ -722,7 +790,8 @@ impl BrowserViewModel {
         let now_unix_secs = current_unix_epoch_seconds();
         let mut counts = [0; COLLECTION_COUNT];
         for (entry_index, entry) in entries.iter().enumerate() {
-            if !self.entry_matches_tag_filter(entry_index)
+            if !self.entry_matches_harvest_filter(entry_index)
+                || !self.entry_matches_tag_filter(entry_index)
                 || !self.entry_matches_scope(entry, &query)
                 || !self.entry_matches_rating(entry)
                 || !self.entry_matches_playback_age(entry, now_unix_secs)
@@ -802,6 +871,15 @@ impl BrowserViewModel {
             }
         }
     }
+    fn invalidate_harvest_filter_result(&mut self) -> bool {
+        match self.harvest_filter {
+            TagFilterState::Disabled | TagFilterState::Pending => false,
+            TagFilterState::Ready(_) => {
+                self.harvest_filter = TagFilterState::Pending;
+                true
+            }
+        }
+    }
 
     fn rebuild_with_now(&mut self, entries: &[AudioFile], now_epoch_seconds: i64) {
         let query = self.query.trim().to_ascii_lowercase();
@@ -815,7 +893,8 @@ impl BrowserViewModel {
                 });
                 in_folder
                     && (reveal_id.is_some_and(|reveal_id| entry.path.as_path() == reveal_id.path())
-                        || (self.entry_matches_tag_filter(*entry_index)
+                        || (self.entry_matches_harvest_filter(*entry_index)
+                            && self.entry_matches_tag_filter(*entry_index)
                             && (!self.name_filter_enabled
                                 || audio_file_matches_name_query(entry, &query))
                             && self.collection_filter.is_none_or(|slot| {
@@ -934,6 +1013,13 @@ impl BrowserViewModel {
 
     fn entry_matches_tag_filter(&self, entry_index: usize) -> bool {
         match &self.tag_filter {
+            TagFilterState::Disabled => true,
+            TagFilterState::Pending => false,
+            TagFilterState::Ready(mask) => mask.contains(entry_index),
+        }
+    }
+    fn entry_matches_harvest_filter(&self, entry_index: usize) -> bool {
+        match &self.harvest_filter {
             TagFilterState::Disabled => true,
             TagFilterState::Pending => false,
             TagFilterState::Ready(mask) => mask.contains(entry_index),
@@ -1769,6 +1855,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn harvest_filter_independent_tag_intersection_reveal_and_replacement() {
+        let entries = vec![
+            model_entry("kit/kick.wav", 1),
+            model_entry("kit/snare.wav", 1),
+            model_entry("other/kick.wav", 1),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.begin_harvest_filter(&entries);
+        model
+            .apply_harvest_filter(
+                &entries,
+                TagFilterMask::try_from_vec(3, vec![0b101]).unwrap(),
+            )
+            .unwrap();
+        model.begin_tag_filter(&entries);
+        model
+            .apply_tag_filter(
+                &entries,
+                TagFilterMask::try_from_vec(3, vec![0b110]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(model.rows().len(), 1);
+        model.set_folder_scope(&entries, Some("kit".into()), FolderScope::DirectOnly);
+        assert!(model.rows().is_empty());
+        model.set_reveal(&entries, Some(entries[1].stable_id()));
+        assert_eq!(model.rows().len(), 1);
+        model.set_reveal(&entries, Some(entries[2].stable_id()));
+        assert!(model.rows().is_empty());
+        model.set_entries(&entries);
+        assert!(model.harvest_filter().is_pending());
+        assert!(model.tag_filter().is_pending());
+        model.disable_harvest_filter(&entries);
+        assert!(model.rows().is_empty()); // Independent pending tag scope remains.
+        model.disable_tag_filter(&entries);
+        assert_eq!(model.rows().len(), 2);
     }
 
     #[test]

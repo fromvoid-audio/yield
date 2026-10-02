@@ -21,6 +21,8 @@ pub(crate) struct SourceRegistryGlobal {
     service: Option<SourceRegistryService>,
     #[cfg(test)]
     catalog_fixture: Option<fixture::Catalog>,
+    #[cfg(test)]
+    harvest_fixture_profile: Option<yield_session::ProfileAcquisitionId>,
     start_error: Option<String>,
     quit_subscription: Option<Subscription>,
 }
@@ -35,6 +37,8 @@ impl SourceRegistryGlobal {
                 service: Some(service),
                 #[cfg(test)]
                 catalog_fixture: None,
+                #[cfg(test)]
+                harvest_fixture_profile: None,
                 start_error: None,
                 quit_subscription: None,
             },
@@ -42,6 +46,8 @@ impl SourceRegistryGlobal {
                 service: None,
                 #[cfg(test)]
                 catalog_fixture: None,
+                #[cfg(test)]
+                harvest_fixture_profile: None,
                 start_error: Some(error.to_string()),
                 quit_subscription: None,
             },
@@ -54,9 +60,21 @@ impl SourceRegistryGlobal {
         Self {
             service: None,
             catalog_fixture: Some(catalog),
+            harvest_fixture_profile: None,
             start_error: None,
             quit_subscription: None,
         }
+    }
+
+    /// Exercise genuine catalog/global owner forwarding with its actual acquisition identity.
+    #[cfg(test)]
+    pub(crate) fn for_harvest_fixture(
+        catalog: fixture::Catalog,
+        profile: yield_session::ProfileAcquisitionId,
+    ) -> Self {
+        let mut global = Self::for_catalog_fixture(catalog);
+        global.harvest_fixture_profile = Some(profile);
+        global
     }
 
     /// Return a startup failure, if the worker could not be created.
@@ -170,6 +188,10 @@ impl SourceRegistryGlobal {
     pub(crate) fn vocabulary_acquisition_id(
         &self,
     ) -> Result<yield_session::ProfileAcquisitionId, VocabularySubmitError> {
+        #[cfg(test)]
+        if let Some(profile) = &self.harvest_fixture_profile {
+            return Ok(profile.clone());
+        }
         self.service
             .as_ref()
             .ok_or(VocabularySubmitError::Closed)?
@@ -459,6 +481,7 @@ impl Browser {
         changed |= tag_completion::poll(self, cx);
         changed |= tag_filter::poll(self, cx);
         changed |= curation_queue::poll(self, cx);
+        changed |= super::harvest_filter::poll(self, cx);
         changed |= tag_library::poll(self, cx);
         changed |= self.poll_display_labels(cx);
         changed |= self.poll_file_drag();

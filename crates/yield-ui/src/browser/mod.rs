@@ -43,6 +43,8 @@ mod accessibility {
 
     pub(super) const TAG_FILTER_INPUT: &str = "browser-tag-filter-input";
     pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
+    pub(super) const HARVEST_FILTER_TOGGLE: &str = "browser-harvest-filter-toggle";
+    pub(super) const HARVEST_FILTER_SCOPE: &str = "browser-harvest-filter-scope";
     pub(super) const CURATION_QUEUE_TOGGLE: &str = "browser-curation-queue-toggle";
     pub(super) const CURATION_QUEUE_SCOPE: &str = "browser-curation-queue-scope";
     pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
@@ -72,6 +74,9 @@ mod accessibility {
     pub(super) fn rating_filter_id(index: usize) -> String {
         format!("browser-rating-filter-{index}")
     }
+    pub(super) fn harvest_choice_id(index: usize) -> String {
+        format!("browser-harvest-filter-choice-{index}")
+    }
     pub(super) fn curation_queue_choice_id(index: usize) -> String {
         format!("browser-curation-queue-choice-{index}")
     }
@@ -96,6 +101,7 @@ mod filter_panel;
 mod folder_keyboard;
 mod general_settings;
 mod handoff;
+mod harvest_filter;
 mod history;
 mod job_details;
 mod metadata_panel;
@@ -164,6 +170,7 @@ struct SourceSession {
     expanded_folders: BTreeSet<PathBuf>,
     folder_scope: FolderScope,
     curation_queue_mode: yield_core::CurationQueueMode,
+    harvest_mode: harvest_filter::HarvestMode,
     selected_audio_id: Option<AudioFileId>,
     catalog_facts: HashMap<PathBuf, catalog::CatalogFileFacts>,
     catalog_lifecycle_generation: Option<u64>,
@@ -194,6 +201,7 @@ impl SourceSession {
             expanded_folders: BTreeSet::from([PathBuf::from(".")]),
             folder_scope: FolderScope::DirectOnly,
             curation_queue_mode: yield_core::CurationQueueMode::default(),
+            harvest_mode: harvest_filter::HarvestMode::default(),
             selected_audio_id: None,
             catalog_facts: HashMap::new(),
             catalog_lifecycle_generation: None,
@@ -477,6 +485,7 @@ pub(crate) struct Browser {
     curation_state: curation::CurationState,
     latest_curation_task: Option<Task<()>>,
     curation_queue: curation_queue::CurationQueueState,
+    harvest_filter: harvest_filter::HarvestRuntime,
     tag_editor: tags::TagEditorState,
     tag_completion: tag_completion::TagCompletionState,
     tag_dictionary: tag_dictionary::TagDictionaryState,
@@ -832,6 +841,7 @@ impl Browser {
             curation_state: curation::CurationState::default(),
             latest_curation_task: None,
             curation_queue: curation_queue::CurationQueueState::default(),
+            harvest_filter: harvest_filter::HarvestRuntime::default(),
             tag_editor: tags::TagEditorState::default(),
             tag_completion: tag_completion::TagCompletionState::default(),
             tag_dictionary: tag_dictionary::TagDictionaryState::default(),
@@ -1489,6 +1499,7 @@ impl Browser {
         );
         tag_filter::reinstall_after_projection(self, cx);
         curation_queue::reinstall_after_projection(self, cx);
+        harvest_filter::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.set_scan_status(format!(
@@ -1554,6 +1565,7 @@ impl Browser {
                 .set_curation_queue(&self.entries, yield_core::CurationQueueMode::default());
             tag_filter::reinstall_after_projection(self, cx);
             curation_queue::reinstall_after_projection(self, cx);
+            harvest_filter::reinstall_after_projection(self, cx);
             self.reset_collection_filter();
             self.set_scan_status(error);
             self.selected = None;
@@ -1599,6 +1611,7 @@ impl Browser {
         );
         tag_filter::reinstall_after_projection(self, cx);
         curation_queue::reinstall_after_projection(self, cx);
+        harvest_filter::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.set_scan_status(if is_refresh {
@@ -2919,6 +2932,17 @@ impl Browser {
             return;
         }
         if curation_queue::handle_key_down(
+            self,
+            key,
+            event.is_held,
+            secondary || alt || shift || function,
+            window,
+            cx,
+        ) {
+            cx.stop_propagation();
+            return;
+        }
+        if harvest_filter::handle_key_down(
             self,
             key,
             event.is_held,

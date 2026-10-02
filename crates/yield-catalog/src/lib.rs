@@ -70,6 +70,7 @@ pub use harvest_facts::{
     HARVEST_FACTS_MAX_PATHS, HarvestFactsCancellation, HarvestFactsEntry, HarvestFactsFailure,
     HarvestState, SourceHarvestFactsRequest,
 };
+pub use harvest_facts::{CatalogHarvestFilter, HarvestFilterChoice, SourceHarvestFilterRequest};
 use yield_library::sample_sources::library::HarvestFactsClient;
 mod display_labels;
 mod feature_analysis_metrics;
@@ -572,6 +573,13 @@ pub use curation::{
 /// A typed operation accepted by the catalog worker.
 #[derive(Debug)]
 pub enum CatalogCommand {
+    /// Compute a bounded, coherent Harvest mask over the exact retained manifest.
+    RequestHarvestFilter {
+        /// Immutable bounded source/profile projection context.
+        request: SourceHarvestFilterRequest,
+        /// One-way cancellation retained through cached mask publication.
+        cancellation: HarvestFactsCancellation,
+    },
     /// Read bounded exact Harvest state/count facts through the retained global owner.
     RequestHarvestFacts {
         /// Validated immutable profile/source/browser/path context.
@@ -1440,6 +1448,15 @@ pub enum CatalogPublicationStatus {
 /// Worker output carrying source identity, lifecycle generation, and revision fences.
 #[derive(Debug)]
 pub enum CatalogEvent {
+    /// Completion of one source-scoped coherent Harvest mask.
+    HarvestFilterCompleted {
+        /// Exact pending request and projection binding.
+        request: SourceHarvestFilterRequest,
+        /// Retained caller cancellation.
+        cancellation: HarvestFactsCancellation,
+        /// Actual owner-produced mask or bounded fail-closed diagnostic.
+        result: Result<CatalogHarvestFilter, HarvestFactsFailure>,
+    },
     /// Completion of one bounded exact Harvest query; no mutation or filtering.
     HarvestFactsCompleted {
         /// Exact request and caller projection context.
@@ -1898,6 +1915,16 @@ impl CatalogDelivery {
         } = self;
         if index_query_token.is_some_and(|token| token.load(Ordering::Acquire)) {
             return None;
+        }
+        if let CatalogEvent::HarvestFilterCompleted {
+            cancellation,
+            result,
+            ..
+        } = &event
+        {
+            if cancellation.is_canceled() || result.as_ref().is_ok_and(|mask| !mask.is_live()) {
+                return None;
+            }
         }
         if let CatalogEvent::HarvestFactsCompleted {
             cancellation,
@@ -2820,6 +2847,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestTagFilter { .. }
         | CatalogCommand::RequestDisplayLabels { .. }
         | CatalogCommand::RequestCurationTagFacts { .. }
+        | CatalogCommand::RequestHarvestFilter { .. }
         | CatalogCommand::RequestHarvestFacts { .. }
         | CatalogCommand::ApplyCuration { .. }
         | CatalogCommand::ApplyCurationOperation { .. }
@@ -2861,6 +2889,7 @@ fn command_curation_update_count(command: &CatalogCommand) -> usize {
 
 fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
     match command {
+        CatalogCommand::RequestHarvestFilter { request, .. } => request.input_bytes(),
         CatalogCommand::RequestHarvestFacts { request, .. } => request.input_bytes(),
         CatalogCommand::RequestCollectionHistory { request, .. } => request.input_bytes(),
         CatalogCommand::RequestSimilarity { request, .. } => request.input_bytes(),
@@ -2937,6 +2966,9 @@ fn selected_paths_input_bytes(relative_paths: &[PathBuf]) -> usize {
 
 fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, CatalogSubmitError> {
     match command {
+        CatalogCommand::RequestHarvestFilter { request, .. } => {
+            Ok(request.entry_count().div_ceil(64) * 8 + harvest_facts::MAX_RESULT_BYTES)
+        }
         CatalogCommand::RequestHarvestFacts { .. } => Ok(harvest_facts::MAX_RESULT_BYTES),
         CatalogCommand::RequestCollectionHistory { .. } => Ok(history_selection::MAX_RESULT_BYTES),
         CatalogCommand::RequestSimilarity { .. } => Ok(similarity_dispatch::MAX_RESULT_BYTES),
@@ -3050,6 +3082,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         CatalogCommand::RequestTagFilter { .. } => AdmissionAction::RequestTagFilter,
         CatalogCommand::RequestDisplayLabels { .. } => AdmissionAction::RequestDisplayLabels,
         CatalogCommand::RequestCurationTagFacts { .. }
+        | CatalogCommand::RequestHarvestFilter { .. }
         | CatalogCommand::RequestHarvestFacts { .. } => AdmissionAction::RequestCurationTagFacts,
         CatalogCommand::ApplyCuration { .. } => AdmissionAction::ApplyCuration,
         CatalogCommand::ApplyCurationOperation {
@@ -4009,6 +4042,21 @@ fn handle_command(
 ) -> bool {
     history_selection::invalidate_before_write(&command, admission, sources);
     match command {
+        CatalogCommand::RequestHarvestFilter {
+            request,
+            cancellation,
+        } => {
+            harvest_facts::dispatch_filter(
+                request,
+                cancellation,
+                profile_guard,
+                harvest,
+                reservation,
+                admission,
+                sources,
+            );
+            false
+        }
         CatalogCommand::RequestHarvestFacts {
             request,
             cancellation,

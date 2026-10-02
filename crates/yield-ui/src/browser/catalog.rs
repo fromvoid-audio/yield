@@ -177,6 +177,7 @@ impl Browser {
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
         super::curation_queue::cancel_for_source_change(self);
+        super::harvest_filter::cancel_for_source_change(self);
         self.collection_rename_editor = None;
         self.display_labels.cancel_for_source_change();
         self.reset_browser_focus_state();
@@ -281,6 +282,7 @@ impl Browser {
         );
         super::tag_filter::reinstall_after_projection(self, cx);
         super::curation_queue::reinstall_after_projection(self, cx);
+        super::harvest_filter::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
 
@@ -360,6 +362,7 @@ impl Browser {
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
         super::curation_queue::cancel_for_source_change(self);
+        super::harvest_filter::cancel_for_source_change(self);
         self.display_labels.cancel_for_source_change();
         self.reset_catalog_metadata();
         let activation = self.catalog_activation.take();
@@ -649,6 +652,9 @@ impl Browser {
         {
             return true;
         }
+        if matches!(&event, CatalogEvent::HarvestFilterCompleted { .. }) {
+            return super::harvest_filter::apply_catalog_event(self, event, cx);
+        }
         if matches!(
             &event,
             CatalogEvent::TagFilterReady { .. } | CatalogEvent::TagFilterFailed { .. }
@@ -806,6 +812,7 @@ impl Browser {
             | CatalogEvent::DisplayLabelsFailed { .. }
             | CatalogEvent::CurationTagFactsReady { .. }
             | CatalogEvent::CurationTagFactsFailed { .. }
+            | CatalogEvent::HarvestFilterCompleted { .. }
             | CatalogEvent::HarvestFactsCompleted { .. }
             | CatalogEvent::RatingDecayProgress { .. }
             | CatalogEvent::RatingDecayFailed { .. } => false,
@@ -864,6 +871,7 @@ impl Browser {
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
         super::curation_queue::cancel_for_source_change(self);
+        super::harvest_filter::cancel_for_source_change(self);
         self.reset_catalog_metadata();
         self.cancel_catalog_projection();
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -1055,6 +1063,7 @@ impl Browser {
         );
         super::tag_filter::reinstall_after_projection(self, cx);
         super::curation_queue::reinstall_after_projection(self, cx);
+        super::harvest_filter::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         super::tag_chips::invalidate(self);
@@ -1106,6 +1115,7 @@ impl Browser {
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
         super::curation_queue::cancel_for_source_change(self);
+        super::harvest_filter::cancel_for_source_change(self);
         self.display_labels.cancel_for_source_change();
         self.catalog_pending_command = None;
         self.cancel_catalog_projection();
@@ -1143,6 +1153,10 @@ pub(super) fn submit_catalog_command(
 
 fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
     match event {
+        CatalogEvent::HarvestFilterCompleted { request, .. } => Some((
+            request.context().source_id().clone(),
+            request.context().lifecycle_generation(),
+        )),
         CatalogEvent::HarvestFactsCompleted { request, .. } => {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
