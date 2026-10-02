@@ -112,3 +112,37 @@ fn harvest_copy_owner_fresh_source_context_replay_keeps_historical_content() {
         .unwrap();
     assert_eq!(hash, "a".repeat(64));
 }
+
+#[test]
+fn harvest_facts_owner_actual_copy_and_replay_invalidate_weak_read_generation() {
+    use super::super::super::{HarvestFactsCancellation, HarvestFactsRequest};
+    let f = Fixture::new();
+    let read = || {
+        f.global()
+            .read_harvest_facts(
+                HarvestFactsRequest::new(
+                    f.guard(),
+                    vec![content(&f.sources()[0], "one.wav").file().clone()],
+                    HarvestFactsCancellation::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap()
+    };
+    let before = read();
+    let r = f.request();
+    f.apply(r.clone()).unwrap();
+    assert!(!before.is_current_global_generation());
+    let after = read();
+    assert_eq!(after.entries()[0].immediate_derivative_count(), 1);
+    assert_eq!(
+        after.entries()[0].state(),
+        super::super::super::HarvestState::Touched
+    );
+    f.apply(r).unwrap();
+    assert!(!after.is_current_global_generation());
+    assert_eq!(read().entries()[0].immediate_derivative_count(), 1);
+}

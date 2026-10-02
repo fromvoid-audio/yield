@@ -14,6 +14,7 @@ use super::harvest_authored::{
     HarvestAuthoredSnapshotRequest,
 };
 use super::harvest_copy::{HarvestCopyRequest, HarvestCopyResult};
+use super::harvest_facts::{self, HarvestFactsBatch, HarvestFactsRequest};
 use super::mutation_context::{
     GlobalMutationCompletion, GlobalMutationKind, GlobalMutationRequest, ProfileAcquisitionId,
     SnapshotFences,
@@ -289,6 +290,10 @@ pub enum GlobalLibraryWriterStartError {
 }
 
 enum WriterCommand {
+    HarvestFacts {
+        request: HarvestFactsRequest,
+        result: SyncSender<Result<HarvestFactsBatch, LibraryError>>,
+    },
     HarvestAuthored {
         request: HarvestAuthoredRequest,
         result: SyncSender<Result<HarvestAuthoredResult, LibraryError>>,
@@ -369,6 +374,11 @@ enum WriterCommand {
 }
 
 enum WriterReply {
+    HarvestFacts {
+        request: HarvestFactsRequest,
+        value: Result<HarvestFactsBatch, LibraryError>,
+        result: SyncSender<Result<HarvestFactsBatch, LibraryError>>,
+    },
     HarvestAuthored {
         request: HarvestAuthoredRequest,
         result: SyncSender<Result<HarvestAuthoredResult, LibraryError>>,
@@ -448,6 +458,18 @@ enum WriterReply {
 impl WriterReply {
     fn send(self) {
         match self {
+            Self::HarvestFacts {
+                request,
+                result,
+                value,
+            } => {
+                let value = if value.is_ok() {
+                    request.validate_sources().and(value)
+                } else {
+                    value
+                };
+                let _ = result.send(value);
+            }
             Self::HarvestAuthored {
                 request,
                 result,
@@ -549,6 +571,9 @@ impl WriterReply {
 
     fn send_error(self, error: LibraryError) {
         match self {
+            Self::HarvestFacts { result, .. } => {
+                let _ = result.send(Err(error));
+            }
             Self::HarvestAuthored { result, .. } => {
                 let _ = result.send(Err(error));
             }
@@ -864,6 +889,20 @@ impl GlobalLibraryWriter {
         Ok(result_rx)
     }
 
+    /// Clone a read-only facade over the same retained command transport and closing state.
+    pub fn harvest_facts_client(&self) -> harvest_facts::HarvestFactsClient {
+        harvest_facts::HarvestFactsClient::from_queue(self.profile_tag_vocabulary_client())
+    }
+    /// Read a bounded coherent source-fenced Harvest snapshot on the retained worker.
+    pub fn read_harvest_facts(
+        &self,
+        request: HarvestFactsRequest,
+    ) -> Result<Receiver<Result<HarvestFactsBatch, LibraryError>>, GlobalLibraryWriterQueueError>
+    {
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::HarvestFacts { request, result })?;
+        Ok(receiver)
+    }
     /// Dispatch one bounded source-fenced authored-state operation on the retained owner.
     pub fn set_harvest_authored_state(
         &self,
@@ -1093,6 +1132,16 @@ impl GlobalLibraryWriter {
 }
 
 impl ProfileTagVocabularyClient {
+    pub(super) fn read_harvest_facts(
+        &self,
+        request: HarvestFactsRequest,
+    ) -> Result<Receiver<Result<HarvestFactsBatch, LibraryError>>, GlobalLibraryWriterQueueError>
+    {
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::HarvestFacts { request, result })?;
+        Ok(receiver)
+    }
+
     /// Observe this handle's acquisition before forming a delayed proposal. Not authority.
     pub fn acquisition_id(&self) -> ProfileAcquisitionId {
         self.acquisition.clone()
@@ -1404,6 +1453,7 @@ fn run_owner(
     );
 
     let mut snapshot_fences = SnapshotFences::default();
+    let mut harvest_generation = harvest_facts::Generation::new();
     loop {
         if let Err(error) = database.validate_profile_guard(&profile_guard) {
             close_after_profile_change(
@@ -1432,11 +1482,22 @@ fn run_owner(
             break;
         }
 
+        // Invalidate weak read results before a write attempt, including a failed/replayed
+        // attempt. Only this actual retained worker owns a strong publication generation.
+        if matches!(
+            &command,
+            WriterCommand::HarvestAuthored { .. }
+                | WriterCommand::HarvestCopy { .. }
+                | WriterCommand::ReferenceRekey { .. }
+        ) {
+            harvest_generation = harvest_facts::Generation::new();
+        }
         let reply = execute_command(
             command,
             &mut database,
             profile_guard.owner_identity(),
             &mut snapshot_fences,
+            &harvest_generation,
         );
 
         #[cfg(test)]
@@ -1471,8 +1532,14 @@ fn execute_command(
     database: &mut LibraryDatabase,
     owner_identity: &str,
     snapshot_fences: &mut SnapshotFences,
+    harvest_generation: &Arc<harvest_facts::Generation>,
 ) -> WriterReply {
     match command {
+        WriterCommand::HarvestFacts { request, result } => WriterReply::HarvestFacts {
+            value: database.harvest_facts(owner_identity, &request, harvest_generation),
+            request,
+            result,
+        },
         WriterCommand::HarvestAuthored { request, result } => WriterReply::HarvestAuthored {
             value: database.apply_harvest_authored(owner_identity, &request),
             request,
@@ -1615,6 +1682,9 @@ fn reject_remaining_profile_change(
 
 fn send_command_error(command: WriterCommand, error: LibraryError) {
     match command {
+        WriterCommand::HarvestFacts { result, .. } => {
+            let _ = result.send(Err(error));
+        }
         WriterCommand::HarvestAuthored { result, .. } => {
             let _ = result.send(Err(error));
         }
@@ -1744,6 +1814,7 @@ mod tests {
     mod reference_tests {
         use super::*;
         include!("reference_owner_tests.rs");
+        include!("reference_owner_tests/harvest_facts.rs");
     }
     mod mutation_context_tests {
         use super::*;
