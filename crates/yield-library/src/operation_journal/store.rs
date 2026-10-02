@@ -70,8 +70,10 @@ mod chunk_claims;
 mod chunk_staging;
 mod recording_chunks;
 pub(crate) use recording_chunks::{RecordingChunkPage, RecordingChunkReceipt};
+mod frozen_copy;
 #[allow(dead_code)]
 mod full_progress;
+pub(crate) use frozen_copy::FrozenCopyData;
 #[allow(dead_code)]
 mod ordinary_claims;
 mod recovery_reserve;

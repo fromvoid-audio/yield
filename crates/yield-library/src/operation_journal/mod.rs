@@ -245,10 +245,11 @@ pub use render_commands::{
 };
 
 pub use owner::{
-    OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY, OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES,
-    OPERATION_JOURNAL_OWNER_RESULT_CAPACITY, OperationJournalClient, OperationJournalOwner,
-    OperationJournalOwnerError, OperationJournalOwnerQueueError, OperationJournalOwnerStartError,
-    OperationJournalOwnerStatus, OperationJournalRequest, OperationJournalRequestError,
+    FrozenCopyObservation, FrozenCopyValidationError, OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY,
+    OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES, OPERATION_JOURNAL_OWNER_RESULT_CAPACITY,
+    OperationJournalClient, OperationJournalOwner, OperationJournalOwnerError,
+    OperationJournalOwnerQueueError, OperationJournalOwnerStartError, OperationJournalOwnerStatus,
+    OperationJournalRequest, OperationJournalRequestError,
 };
 
 pub use participants::{

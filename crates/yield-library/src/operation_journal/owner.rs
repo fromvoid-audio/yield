@@ -6,6 +6,8 @@
 //! worker. It does not grant operation admission, filesystem authority, capacity authority, or a
 //! tentative persistence receipt.
 
+mod frozen_copy;
+pub use frozen_copy::{FrozenCopyObservation, FrozenCopyValidationError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -4894,6 +4896,13 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<RecoveryPage, OperationJournalOwnerError>>,
     },
+    ObserveCopy {
+        operation_id: OperationId,
+        harvest_key: super::work_plan::WorkUnitKey,
+        observer_owner: std::sync::Weak<OwnerShared>,
+        input: InputPermit,
+        result: SyncSender<Result<Option<FrozenCopyObservation>, OperationJournalOwnerError>>,
+    },
     GetFull {
         operation_id: OperationId,
         input: InputPermit,
@@ -5435,6 +5444,18 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             drop(input);
             execute_store_result(result, || runtime.store().scan_recovery_page(cursor))
         }
+        JournalCommand::ObserveCopy {
+            operation_id,
+            harvest_key,
+            observer_owner,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                frozen_copy::execute(runtime, operation_id, harvest_key, observer_owner)
+            })
+        }
         JournalCommand::GetFull {
             operation_id,
             input,
@@ -5591,6 +5612,10 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             let _ = result.send(Err(error));
         }
         JournalCommand::Recovery { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::ObserveCopy { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
         }
