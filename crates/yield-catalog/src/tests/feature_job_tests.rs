@@ -3,8 +3,8 @@ mod fixtures {
     use super::super::*;
     use crate::{FeatureJobFailure, FeatureJobOutcome, prepare_feature_job};
     use yield_library::sample_sources::readiness::{
-        FeatureArtifactPublication, ReadinessStage, ReadinessTarget, ReadinessTargetPublication,
-        SourceAvailability, SourceFeatureInputError,
+        FeatureArtifactPublication, ReadinessClassification, ReadinessDeficit, ReadinessTarget,
+        SourceFeatureInputError,
     };
     use yield_library::sample_sources::{SourceDatabaseConnectionRole, SourceWriter};
 
@@ -47,7 +47,7 @@ mod fixtures {
         let writer =
             SourceWriter::new_for_scan(db, SourceId::from_string("feature-job-source"), 1).unwrap();
         let root = writer.current_scan_fence().unwrap().root_identity().clone();
-        let mut db = writer.into_catalog_database();
+        let db = writer.into_catalog_database();
         let mut batch = db.write_batch().unwrap();
         batch
             .upsert_file_with_hash(Path::new("tone.wav"), meta.len(), modified, &content)
@@ -62,51 +62,28 @@ mod fixtures {
             .unwrap()
             .commit_manifest_audit_with_staged_directory_truth(1, revision, 1, root, None)
             .unwrap();
-        let mut targets = Vec::new();
-        for stage in [
-            ReadinessStage::IndexedIdentity,
-            ReadinessStage::AnalysisFeatures,
-            ReadinessStage::EmbeddingAspects,
-        ] {
-            targets.push(ReadinessTarget::file(
-                "feature-job-source",
-                &identity,
-                "tone.wav",
-                stage,
-                "features-v1",
+        let mut writer =
+            SourceWriter::new(db, SourceId::from_string("feature-job-source"), 1).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let target = writer
+            .prepare_feature_readiness_target(
+                &revision,
+                Path::new("tone.wav"),
                 1,
-                &content,
-            ));
-        }
-        targets.push(ReadinessTarget::source(
-            "feature-job-source",
-            ReadinessStage::SimilarityLayout,
-            "layout-v1",
-            1,
-            "membership-one",
-        ));
-        let target = targets[1].clone();
-        {
-            let mut store = db.readiness_store().unwrap();
-            let origin = store.capture_publication_origin().unwrap();
-            store
-                .publish_targets(
-                    &origin,
-                    &ReadinessTargetPublication::new(
-                        "feature-job-source",
-                        1,
-                        1,
-                        SourceAvailability::Active,
-                        "feature-jobs-v1",
-                        &targets,
-                        1,
-                    ),
-                )
-                .unwrap();
-            let deficits = store.reconcile("feature-job-source", 10).unwrap().deficits;
-            store.persist_deficits(&deficits, 10).unwrap();
-        }
-        let writer = SourceWriter::new(db, SourceId::from_string("feature-job-source"), 1).unwrap();
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        writer
+            .enqueue_readiness_jobs(
+                &revision,
+                &[ReadinessDeficit {
+                    target: target.clone(),
+                    reason: ReadinessClassification::Pending,
+                    enqueued_at: None,
+                }],
+                10,
+            )
+            .unwrap();
         (fixture, writer, target)
     }
 

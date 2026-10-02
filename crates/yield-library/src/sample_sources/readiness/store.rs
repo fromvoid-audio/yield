@@ -355,6 +355,7 @@ impl<'connection> ReadinessStore<'connection> {
             publication.targets,
             publication.updated_at,
             None,
+            false,
         )
     }
 
@@ -377,6 +378,31 @@ impl<'connection> ReadinessStore<'connection> {
             publication.targets,
             publication.updated_at,
             Some(cancel),
+            false,
+        )
+    }
+
+    /// Internal audited-manifest publication; callers must derive the complete matrix
+    /// from the retained source's bounded, current authoritative manifest.
+    pub(crate) fn publish_audited_manifest_targets(
+        &mut self,
+        origin: &ReadinessPublicationOrigin,
+        publication: &ReadinessTargetPublication<'_>,
+        cancel: &AtomicBool,
+    ) -> Result<(), ReadinessError> {
+        persistence::replace_readiness_targets_owned(
+            self.connection,
+            &self.ownership,
+            origin,
+            publication.source_id,
+            publication.source_generation,
+            publication.readiness_revision,
+            publication.availability,
+            publication.contract_version,
+            publication.targets,
+            publication.updated_at,
+            Some(cancel),
+            true,
         )
     }
 
