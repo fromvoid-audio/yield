@@ -317,11 +317,23 @@
     },
     {
       "message": "FolderBrowserMessage::ResizeCollectionsPanel",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/view.rs",
+        "symbol": "render_collections_resize_rail"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/sidebar.rs",
+          "symbol": "collections_panel_resize_commits_and_escape_preserves_focus"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/sidebar.rs",
+          "symbol": "collections_panel_scroll_reaches_last_row_at_both_text_scales"
+        }
+      ],
       "owner": "OPT-2017",
-      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "note": "Bounded session-only collection panel height and independent scroll viewport from PR #184. GPUI fixtures cover pointer commit, Escape/focus preservation and reaching the last row at both scales. Native pointer/AX acceptance remains OPT-2020/2009; no full browser parity is claimed.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {

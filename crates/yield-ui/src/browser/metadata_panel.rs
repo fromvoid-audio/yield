@@ -102,6 +102,9 @@ pub(super) fn render(
                 .min_h_0()
                 .w_full()
                 .overflow_y_scroll()
+                .on_scroll_wheel(cx.listener(|_, _: &gpui::ScrollWheelEvent, _, cx| {
+                    cx.stop_propagation();
+                }))
                 .child(
                     div()
                         .flex()
