@@ -595,7 +595,121 @@ impl fmt::Display for BoundDatabaseRootError {
     }
 }
 
+/// Descriptor chain for one bounded nested index locator. Never exposes a native pathname.
+pub(crate) struct HeldIndexFile {
+    #[cfg(target_os = "linux")]
+    chain: Vec<fs::File>,
+    #[cfg(target_os = "linux")]
+    names: Vec<std::ffi::OsString>,
+}
+impl HeldIndexFile {
+    pub(crate) fn validate(
+        &self,
+        entry: &super::super::SourceIndexEntry,
+    ) -> Result<(), super::super::SourceIndexInspectionError> {
+        use super::super::SourceIndexInspectionError as E;
+        #[cfg(target_os = "linux")]
+        {
+            for (i, name) in self.names.iter().enumerate() {
+                let current = open_index_component(&self.chain[i], name, i + 1 < self.names.len())?;
+                let current_identity =
+                    stable_filesystem_identity_from_open_file(&current).ok_or(E::Unavailable)?;
+                let held_identity = stable_filesystem_identity_from_open_file(&self.chain[i + 1])
+                    .ok_or(E::Unavailable)?;
+                if current_identity != held_identity {
+                    return Err(E::ChangedEntry);
+                }
+            }
+            let file = self.chain.last().ok_or(E::Unavailable)?;
+            let metadata = file.metadata().map_err(|_| E::Unavailable)?;
+            if !metadata.is_file() {
+                return Err(E::Unavailable);
+            }
+            let identity = stable_filesystem_identity_from_open_file(file).ok_or(E::Unavailable)?;
+            let modified =
+                system_time_to_unix_nanos(metadata.modified().map_err(|_| E::Unavailable)?);
+            if entry.file_identity.as_deref() != Some(&identity)
+                || entry.file_size != Some(metadata.len())
+                || entry.modified_ns != Some(modified)
+            {
+                return Err(E::ChangedEntry);
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = entry;
+            Err(E::Unsupported)
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+fn open_index_component(
+    parent: &fs::File,
+    name: &OsStr,
+    directory: bool,
+) -> Result<fs::File, super::super::SourceIndexInspectionError> {
+    use super::super::SourceIndexInspectionError as E;
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    };
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| E::InvalidPath)?;
+    // O_PATH never reads data or blocks on FIFO/device open. Each name is one validated
+    // normal component, rooted in a held parent descriptor; symlinks are never followed.
+    let flags = libc::O_PATH
+        | libc::O_NOFOLLOW
+        | libc::O_CLOEXEC
+        | if directory { libc::O_DIRECTORY } else { 0 };
+    let descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if descriptor < 0 {
+        return Err(E::Unavailable);
+    }
+    // The successful openat returns a new descriptor, uniquely owned by this File.
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let metadata = file.metadata().map_err(|_| E::Unavailable)?;
+    if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
+        return Err(E::Unavailable);
+    }
+    Ok(file)
+}
+
 impl BoundDatabaseRoot {
+    /// Hold a bounded normal-component chain without data access or symlink traversal.
+    pub(crate) fn inspect_index_file(
+        &self,
+        relative: &Path,
+    ) -> Result<HeldIndexFile, super::super::SourceIndexInspectionError> {
+        use super::super::SourceIndexInspectionError as E;
+        if relative.as_os_str().as_encoded_bytes().len() > 1024 {
+            return Err(E::ByteLimit);
+        }
+        let names = relative
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => Ok(name.to_os_string()),
+                _ => Err(E::InvalidPath),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if names.is_empty() || names.len() > 32 {
+            return Err(E::InvalidPath);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut chain = vec![self._capability.try_clone().map_err(|_| E::Unavailable)?];
+            for (i, name) in names.iter().enumerate() {
+                let next = open_index_component(chain.last().unwrap(), name, i + 1 < names.len())?;
+                chain.push(next);
+            }
+            Ok(HeldIndexFile { chain, names })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = names;
+            Err(E::Unsupported)
+        }
+    }
+
     /// Open a direct database child without resolving the retained Linux root to an ambient path.
     /// The caller must retain this root until the connection closes and keep its existing
     /// profile/main-file identity checks before and after opening.
@@ -1555,5 +1669,71 @@ mod tests {
             std::fs::read(temp.path().join("published.wav")).unwrap(),
             b"staged"
         );
+    }
+}
+
+#[cfg(test)]
+mod index_inspection_primitive_tests {
+    #![cfg(target_os = "linux")]
+    use super::super::super::{
+        SourceIndexClassification, SourceIndexEntry, SourceIndexInspectionError as E,
+    };
+    use super::*;
+    fn facts(path: &Path, relative: &Path) -> SourceIndexEntry {
+        let file = fs::File::open(path).unwrap();
+        let metadata = file.metadata().unwrap();
+        SourceIndexEntry {
+            relative_path: relative.to_path_buf(),
+            classification: SourceIndexClassification::UnsupportedNonAudio,
+            file_size: Some(metadata.len()),
+            modified_ns: Some(system_time_to_unix_nanos(metadata.modified().unwrap())),
+            file_identity: stable_filesystem_identity_from_open_file(&file),
+            diagnostic: None,
+            format_policy_version: 1,
+        }
+    }
+    #[test]
+    fn held_index_inspection_revalidates_parent_edges_and_held_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("nested")).unwrap();
+        let relative = Path::new("nested/child.txt");
+        let path = root.path().join(relative);
+        fs::write(&path, b"facts").unwrap();
+        let entry = facts(&path, relative);
+        // Filesystem primitive test only: the production catalog tests separately exercise real profile/lease admission.
+        let binding = BoundDatabaseRoot {
+            path: root.path().into(),
+            _capability: open_root_nofollow(root.path()).unwrap(),
+            identity: String::new(),
+            profile_identity: String::new(),
+            named_path: None,
+            namespace_kind: BoundDatabaseRootNamespace::ExternalSource,
+            _lease: None,
+        };
+        let held = binding.inspect_index_file(relative).unwrap();
+        held.validate(&entry).unwrap();
+        fs::rename(root.path().join("nested"), root.path().join("old")).unwrap();
+        fs::create_dir(root.path().join("nested")).unwrap();
+        fs::write(&path, b"facts").unwrap();
+        assert_eq!(held.validate(&entry).unwrap_err(), E::ChangedEntry);
+        fs::remove_dir_all(root.path().join("nested")).unwrap();
+        fs::rename(root.path().join("old"), root.path().join("nested")).unwrap();
+        held.validate(&entry).unwrap();
+        fs::write(&path, b"changed facts").unwrap();
+        assert_eq!(held.validate(&entry).unwrap_err(), E::ChangedEntry);
+        for invalid in ["", "../escape", "/absolute", "./nested/child.txt"] {
+            assert!(matches!(
+                binding.inspect_index_file(Path::new(invalid)),
+                Err(E::InvalidPath)
+            ));
+        }
+        assert!(matches!(
+            binding.inspect_index_file(Path::new(&"x".repeat(1025))),
+            Err(E::ByteLimit)
+        ));
+        assert!(matches!(
+            binding.inspect_index_file(Path::new(&vec!["x"; 33].join("/"))),
+            Err(E::InvalidPath)
+        ));
     }
 }

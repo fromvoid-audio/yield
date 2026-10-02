@@ -21,6 +21,7 @@ mod error;
 pub mod file_ops_journal;
 pub(crate) use file_ops_journal::BoundDatabaseRoot;
 mod index_entries;
+mod index_inspection;
 mod open;
 mod open_profiles;
 /// Private rename-recovery metadata retained after immediate file pruning.
@@ -76,6 +77,10 @@ pub use error::{SourceDatabaseIdentityError, SourceDbError, SourceDirectoryTruth
 pub use index_entries::{
     SOURCE_INDEX_PAGE_MAX_BYTES, SOURCE_INDEX_PAGE_MAX_ENTRIES, SourceIndexPage,
     SourceIndexPageCursor, SourceIndexPageError,
+};
+pub use index_inspection::{
+    MAX_HELD_INDEX_INSPECTIONS, SourceIndexEntryHandle, SourceIndexInspection,
+    SourceIndexInspectionError,
 };
 pub(crate) use open::SourceDatabaseOpenMode;
 #[cfg(test)]

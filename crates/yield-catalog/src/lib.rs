@@ -63,6 +63,7 @@ mod curation;
 mod curation_tag_facts;
 mod display_labels;
 mod index_pages;
+mod index_reveal;
 mod index_reveal_contract;
 mod rating_decay;
 mod root;
@@ -75,6 +76,13 @@ pub use index_pages::{
     RetainedIndexCompleteness,
 };
 pub use yield_library::sample_sources::db::SOURCE_INDEX_PAGE_MAX_ENTRIES;
+
+pub use index_reveal::{
+    CatalogIndexEntryHandle, CatalogIndexInspection, IndexInspectionCancellation,
+};
+pub use yield_library::sample_sources::db::{
+    MAX_HELD_INDEX_INSPECTIONS, SourceIndexInspectionError,
+};
 
 pub use index_reveal_contract::{
     INDEX_REVEAL_MAX_BINDING_BYTES, INDEX_REVEAL_MAX_OBJECT_BYTES, INDEX_REVEAL_MAX_PATH_BYTES,
@@ -502,6 +510,15 @@ pub enum CatalogCommand {
         after_cursor: Option<CatalogIndexPageCursor>,
         /// One through SOURCE_INDEX_PAGE_MAX_ENTRIES.
         page_limit: usize,
+    },
+    /// Inspect one opaque owner-delivered index entry; no native reveal is dispatched.
+    RequestIndexInspection {
+        /// Opaque source/query/page/connection/row binding.
+        handle: CatalogIndexEntryHandle,
+        /// Caller request identity for late result rejection.
+        request_id: u64,
+        /// Per-request cancellation, separate from the owner query fence.
+        cancellation: IndexInspectionCancellation,
     },
     /// Read one bounded page of source tags at an exact retained revision.
     ///
@@ -1336,6 +1353,21 @@ pub enum CatalogEvent {
         /// Typed failure, without unbounded database diagnostic text.
         error: CatalogIndexPageError,
     },
+    /// Held-object inspection or typed failure. Never a qualified native reveal grant.
+    IndexInspectionCompleted {
+        /// Stable source.
+        source_id: SourceId,
+        /// Registered lifecycle.
+        lifecycle_generation: u64,
+        /// Page query identity.
+        query_id: u64,
+        /// Caller request identity.
+        request_id: u64,
+        /// Request cancellation fence, also checked at queued delivery.
+        cancellation: IndexInspectionCancellation,
+        /// Held descriptor custody on success; no target/path dispatch API.
+        result: Result<CatalogIndexInspection, SourceIndexInspectionError>,
+    },
     /// A bounded source-tag page completed.
     TagPageReady {
         /// Stable source identifier.
@@ -1656,6 +1688,20 @@ impl CatalogDelivery {
         if index_query_token.is_some_and(|token| token.load(Ordering::Acquire)) {
             return None;
         }
+        if let CatalogEvent::IndexInspectionCompleted {
+            cancellation,
+            result,
+            ..
+        } = &event
+        {
+            if cancellation.is_canceled()
+                || result
+                    .as_ref()
+                    .is_ok_and(|inspection| !inspection.is_live())
+            {
+                return None;
+            }
+        }
         if publication_fence
             .as_ref()
             .is_none_or(SourcePublicationFence::is_live)
@@ -1787,6 +1833,7 @@ struct AdmissionState {
     sources: HashMap<SourceId, DesiredSource>,
     active_audits: HashMap<SourceId, (u64, Arc<AtomicBool>)>,
     index_queries: HashMap<SourceId, (u64, u64, Arc<AtomicBool>)>,
+    index_inspections: HashMap<SourceId, IndexInspectionCancellation>,
 }
 
 impl AdmissionState {
@@ -1802,10 +1849,14 @@ impl AdmissionState {
             sources: HashMap::new(),
             active_audits: HashMap::new(),
             index_queries: HashMap::new(),
+            index_inspections: HashMap::new(),
         }
     }
 
     fn invalidate_all(&mut self) {
+        for (_, cancellation) in self.index_inspections.drain() {
+            cancellation.cancel();
+        }
         self.active_audits.clear();
         for (_, _, token) in self.index_queries.drain().map(|(_, query)| query) {
             token.store(true, Ordering::Release);
@@ -2101,6 +2152,11 @@ impl EventReservation<'_> {
 
 fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> {
     match command {
+        CatalogCommand::RequestIndexInspection { handle, .. } => {
+            if handle.input_bytes() > SOURCE_INDEX_PAGE_MAX_ENTRIES * 1024 {
+                return Err(CatalogIndexPageError::InputTooLarge.into());
+            }
+        }
         CatalogCommand::RequestIndexPage {
             source_id,
             after_cursor,
@@ -2488,6 +2544,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestIndexPage { .. }
+        | CatalogCommand::RequestIndexInspection { .. }
         | CatalogCommand::RequestTagPage { .. }
         | CatalogCommand::RequestTagAssignments { .. }
         | CatalogCommand::RequestTagAssignmentPreview { .. }
@@ -2534,6 +2591,7 @@ fn command_curation_update_count(command: &CatalogCommand) -> usize {
 
 fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
     match command {
+        CatalogCommand::RequestIndexInspection { handle, .. } => handle.input_bytes(),
         CatalogCommand::RequestIndexPage {
             source_id,
             after_cursor,
@@ -2605,7 +2663,9 @@ fn selected_paths_input_bytes(relative_paths: &[PathBuf]) -> usize {
 
 fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, CatalogSubmitError> {
     match command {
-        CatalogCommand::RequestIndexPage { .. } => Ok(MAX_INDEX_PAGE_PAYLOAD_BYTES),
+        CatalogCommand::RequestIndexPage { .. } | CatalogCommand::RequestIndexInspection { .. } => {
+            Ok(MAX_INDEX_PAGE_PAYLOAD_BYTES)
+        }
         CatalogCommand::RequestTagFilter {
             expected_manifest_len,
             ..
@@ -2639,6 +2699,10 @@ enum AdmissionAction {
         source_id: SourceId,
     },
     RequestWavMetadata,
+    RequestIndexInspection {
+        handle: CatalogIndexEntryHandle,
+        cancellation: IndexInspectionCancellation,
+    },
     RequestTagPage,
     RequestIndexPage {
         source_id: SourceId,
@@ -2679,6 +2743,14 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         },
         CatalogCommand::RequestAudit { source_id, .. } => AdmissionAction::RequestAudit {
             source_id: source_id.clone(),
+        },
+        CatalogCommand::RequestIndexInspection {
+            handle,
+            cancellation,
+            ..
+        } => AdmissionAction::RequestIndexInspection {
+            handle: handle.clone(),
+            cancellation: cancellation.clone(),
         },
         CatalogCommand::RequestWavMetadata { .. } => AdmissionAction::RequestWavMetadata,
         CatalogCommand::RequestIndexPage {
@@ -2721,6 +2793,31 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
 
 fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
     match action {
+        AdmissionAction::RequestIndexInspection {
+            handle,
+            cancellation,
+        } => {
+            let current =
+                state
+                    .index_queries
+                    .get(&handle.source_id)
+                    .is_some_and(|(g, q, token)| {
+                        *g == handle.lifecycle_generation
+                            && *q == handle.query_id
+                            && Arc::ptr_eq(token, &handle.query_token)
+                            && !token.load(Ordering::Acquire)
+                    });
+            if current {
+                if let Some(old) = state
+                    .index_inspections
+                    .insert(handle.source_id, cancellation)
+                {
+                    old.cancel();
+                }
+            } else {
+                cancellation.cancel();
+            }
+        }
         AdmissionAction::RequestIndexPage {
             source_id,
             lifecycle_generation,
@@ -2737,6 +2834,9 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                             *generation == lifecycle_generation && *id == query_id
                         });
                 if !same {
+                    if let Some(cancellation) = state.index_inspections.remove(&source_id) {
+                        cancellation.cancel();
+                    }
                     if let Some((_, _, token)) = state.index_queries.remove(&source_id) {
                         token.store(true, Ordering::Release);
                     }
@@ -2761,6 +2861,9 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .is_none_or(|source| lifecycle_generation > source.lifecycle_generation);
             if replace {
                 state.active_audits.remove(&source_id);
+                if let Some(cancellation) = state.index_inspections.remove(&source_id) {
+                    cancellation.cancel();
+                }
                 if let Some((_, _, token)) = state.index_queries.remove(&source_id) {
                     token.store(true, Ordering::Release);
                 }
@@ -2790,6 +2893,9 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .is_none_or(|source| lifecycle_generation >= source.lifecycle_generation);
             if replace {
                 state.active_audits.remove(&source_id);
+                if let Some(cancellation) = state.index_inspections.remove(&source_id) {
+                    cancellation.cancel();
+                }
                 if let Some((_, _, token)) = state.index_queries.remove(&source_id) {
                     token.store(true, Ordering::Release);
                 }
@@ -2814,6 +2920,9 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
             state.invalidate_all();
         }
         AdmissionAction::RequestAudit { source_id } => {
+            if let Some(cancellation) = state.index_inspections.remove(&source_id) {
+                cancellation.cancel();
+            }
             if let Some((_, _, token)) = state.index_queries.remove(&source_id) {
                 token.store(true, Ordering::Release);
             }
@@ -3194,6 +3303,23 @@ impl CatalogService {
                     .saturating_sub(tag_read_payload_bytes);
                 admission.closed = true;
                 Err(CatalogSubmitError::Closed)
+            }
+        }
+    }
+
+    /// Cancel a retained-index query and all its delivered handles, without filesystem work.
+    pub fn cancel_index_query(&self, source_id: &SourceId, generation: u64, query_id: u64) {
+        let mut state = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+        if state
+            .index_queries
+            .get(source_id)
+            .is_some_and(|(g, q, _)| *g == generation && *q == query_id)
+        {
+            if let Some((_, _, token)) = state.index_queries.remove(source_id) {
+                token.store(true, Ordering::Release);
+            }
+            if let Some(cancellation) = state.index_inspections.remove(source_id) {
+                cancellation.cancel();
             }
         }
     }
@@ -3623,6 +3749,22 @@ fn handle_command(
                 query_id,
                 after_cursor,
                 page_limit,
+                profile_guard,
+                reservation,
+                admission,
+                sources,
+            );
+            false
+        }
+        CatalogCommand::RequestIndexInspection {
+            handle,
+            request_id,
+            cancellation,
+        } => {
+            index_reveal::request(
+                handle,
+                request_id,
+                cancellation,
                 profile_guard,
                 reservation,
                 admission,
@@ -4838,14 +4980,15 @@ fn request_audit(
             root_stale: false,
         };
     }
-    // Watcher-triggered audits also invalidate retained index query generations before writes.
-    if let Some((_, _, token)) = admission
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .index_queries
-        .remove(&source_id)
+    // Watcher-triggered audits invalidate query and inspection generations before writes.
     {
-        token.store(true, Ordering::Release);
+        let mut state = admission.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, _, token)) = state.index_queries.remove(&source_id) {
+            token.store(true, Ordering::Release);
+        }
+        if let Some(cancellation) = state.index_inspections.remove(&source_id) {
+            cancellation.cancel();
+        }
     }
     if let Some(source) = sources.get_mut(&source_id) {
         // An audit is an independent revision authority. A later compound command must not
@@ -7417,6 +7560,7 @@ mod tests {
     }
 
     include!("index_pages_tests.rs");
+    include!("index_reveal_tests.rs");
 
     #[test]
     fn bounded_tag_pages_publish_selected_and_literal_vocabulary_results() {

@@ -106,3 +106,38 @@ The four proposal contract tests are portable model/type evidence, not real
 filesystem admission, native dispatch, physical qualification or completion of
 OPT-2037/2038/2008. Do not replace the production inspection/adapter tests with
 synthetic root identities or successful proposal fixtures.
+
+## Linux production inspection (OPT-2037)
+
+`SourceIndexPage::inspection_handles` and `CatalogIndexPage::inspection_handles`
+now mint private connection/page/row and registered lifecycle/query bindings.
+The corresponding display rows remain observations; editing them cannot mint or
+retarget a handle. `CatalogCommand::RequestIndexInspection` takes one opaque
+handle, request ID and denial-only `IndexInspectionCancellation`. Session exposes
+these types and `cancel_catalog_index_query`; cancellation requires no I/O.
+
+The registered owner re-reads the exact row at its independent revision, with
+borrowed SQLite fields limited before allocation, and validates its real retained
+profile/database/source/root custody. Linux inspection uses descriptor-relative
+`O_PATH | O_NOFOLLOW | O_CLOEXEC` lookups and `O_DIRECTORY` for intermediate
+components. Final entries must be regular files. It never opens data streams,
+reads a FIFO/device, or follows symlinks. Before publication it rechecks every
+parent/name edge, held identity/size/mtime, exact row/revision and custody.
+
+Fixed bounds are 1 KiB lossless locator, 512-byte object identity, 32 components,
+eight outstanding inspections globally (queued and consumer-held), at most 33
+retained descriptors per inspection plus one temporary revalidation descriptor.
+Shared catalog command/event/input/output credits also apply. New requests cancel
+older inspections of the same source; query close/supersession, audit, replacement,
+retirement and shutdown invalidate delivered handles. Cancellation denies
+projection; descriptors release on queued discard or consumer drop, rather than
+being closed while still retained. Results expose facts and cheap cancellation
+status, never a file handle, absolute target or native dispatch function.
+
+This implements actual Linux held-object inspection. Other platforms explicitly
+return `Unsupported` until equivalent nonblocking descriptor primitives exist;
+OPT-2039 owns macOS native implementation/qualification. Cheap `is_live` is not a
+filesystem revalidation or native grant. OPT-2038/2008 remain open for the modal
+and qualified handoff. Tests use real isolated catalog/profile/source leases for
+page-to-handle-to-inspection, with separate bounded DB and descriptor-primitive
+unit tests; none is physical or Finder qualification.
