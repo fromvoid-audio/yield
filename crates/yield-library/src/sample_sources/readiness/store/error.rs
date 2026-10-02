@@ -5,6 +5,9 @@ use super::super::model::{ReadinessScopeKind, ReadinessStage};
 /// Errors returned by the durable readiness contract.
 #[derive(Debug, Error)]
 pub enum ReadinessError {
+    /// New source-owned work cannot be claimed while retained WAL health rejects admission.
+    #[error(transparent)]
+    WalAdmission(#[from] crate::WalAdmissionError),
     /// Bounded streamed admission could not complete; no partial generation becomes visible.
     #[error("Readiness admission budget exhausted: {0}")]
     AdmissionBudget(&'static str),

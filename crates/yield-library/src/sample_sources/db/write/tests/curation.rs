@@ -4394,6 +4394,8 @@ mod tag_metadata_budget;
 #[path = "curation/tag_metadata_policy.rs"]
 mod tag_metadata_policy;
 
+#[cfg(test)]
+mod readiness_wal;
 mod snapshot_read_only;
 
 mod snapshot_cursor;

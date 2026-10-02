@@ -213,3 +213,14 @@ SQL checkpoint failure rollback. Database-only synthetic directory-label fixture
 check ownership/commit rejection; they are not physical qualification. Native
 FSEvents capture-to-consumer/GPUI integration remains OPT-2080 and Finder/native
 qualification remains OPT-1981/1953. OPT-2053/1355 tracking acceptance remains open.
+
+### Source readiness claim admission (OPT-2102)
+
+The retained source readiness claim transaction checks the actual SQLite WAL VFS
+size under its existing immediate writer reservation before changing job status,
+claim generation or lease fields. Hard-watermark and unavailable observations
+reject new pending/retry/expired claims; an already-running or absent candidate
+keeps its existing no-claim result. The test-only unowned store model supplies no
+physical admission evidence. Ownership validation and its existing lease
+maintenance remain unchanged; universal journal pre-intent checks, all other
+writes, reserve-backed recovery and checkpoint scheduling remain OPT-1685/1348.
