@@ -120,7 +120,7 @@ pub(super) fn capture(
         "SELECT CASE WHEN length(CAST(wft.path AS BLOB)) <= 1024 THEN wft.path ELSE NULL END,
         wf.path IS NOT NULL AND wf.missing=0 AND ({supported})
         FROM wav_file_tags AS wft LEFT JOIN wav_files AS wf ON wf.path=wft.path
-        WHERE wft.tag_id=?1 ORDER BY wft.path LIMIT ?2",
+        WHERE wft.tag_id=?1 LIMIT ?2",
         supported = crate::sample_sources::supported_audio_where_clause()
             .replace("extension", "wf.extension")
             .replace("path", "wf.path")
@@ -152,6 +152,14 @@ pub(super) fn capture(
                 .map_err(|_| SourceWriterError::InvalidRequest("assignment path is malformed"))?,
         );
     }
+    // All accepted assignments fit the finite set. Sort owned locators without asking SQLite
+    // to spill a temporary sorter before any capacity claim/entered MEMORY policy exists.
+    paths.sort_by(|a, b| {
+        a.as_path()
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(b.as_path().as_os_str().as_encoded_bytes())
+    });
     Ok(SourceTagAssignmentSelection {
         revision,
         old_tag_id,
