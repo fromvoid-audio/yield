@@ -15,6 +15,8 @@ mod mutation_context;
 mod operation_link_participant;
 mod owner;
 mod read_only;
+mod reference_participant;
+mod reference_snapshot;
 mod registry_limits;
 mod registry_participant;
 mod schema_checks;
@@ -54,6 +56,11 @@ pub use owner::{
     ProfileTagVocabularyClient, SourceRegistrySnapshot,
 };
 pub use read_only::load_source_registry_snapshot_read_only;
+pub use reference_participant::{
+    REFERENCE_MAX_BYTES, REFERENCE_MAX_RECEIPTS, ReferenceDisposition, ReferenceFileKey,
+    ReferenceReceipt, ReferenceRekeyRequest, ReferenceRekeyResult, ReferenceSnapshotRequest,
+};
+pub use reference_snapshot::ReferenceSnapshot;
 pub use registry_limits::{
     SOURCE_REGISTRY_MAX_BYTES, SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
     SOURCE_REGISTRY_MAX_DESCRIPTORS, SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES,

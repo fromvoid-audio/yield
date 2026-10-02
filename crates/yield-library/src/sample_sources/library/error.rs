@@ -23,6 +23,30 @@ pub enum LibraryError {
         /// Conflicting acquisition-local proposal revision.
         revision: u64,
     },
+    /// Bounded reference command or historical/current source scopes are invalid.
+    #[error("invalid cross-source reference input")]
+    ReferenceInput,
+    /// Captured acquisition differs from the current retained profile.
+    #[error("stale reference profile owner")]
+    ReferenceStaleOwner,
+    /// Complete reference observation is malformed or exceeds its finite scope budget.
+    #[error("invalid or over-budget reference snapshot")]
+    ReferenceSnapshotInvalid,
+    /// Immutable command differs under the same operation/work obligation.
+    #[error("reference replay conflict")]
+    ReferenceReplayConflict,
+    /// Receipt evidence is malformed or ambiguous.
+    #[error("malformed reference receipt")]
+    ReferenceMalformedReceipt,
+    /// Ledger capacity is exhausted; existing replay evidence remains retained.
+    #[error("reference receipt capacity reached")]
+    ReferenceReceiptCapacity,
+    /// Source ownership changed after commit: recover exact durable identity before proceeding.
+    #[error("reference commit ownership uncertain; disposition may be committed")]
+    ReferenceCommitUncertain,
+    /// Live source read context failed; no new commit unless explicitly reported uncertain.
+    #[error(transparent)]
+    ReferenceSource(#[from] crate::sample_sources::db::SourceReferenceFenceError),
     /// Captured ordinary mutation belongs to a different acquisition; no transaction ran.
     #[error("stale global mutation acquisition")]
     GlobalMutationStaleAcquisition,
