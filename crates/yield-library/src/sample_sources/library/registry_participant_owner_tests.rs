@@ -382,3 +382,94 @@ fn registry_participant_ambiguous_retained_relation_preserves_later_registry_edi
             .is_empty()
     );
 }
+
+#[test]
+fn registry_participant_configured_membership_lifecycle_replays_without_resurrection() {
+    let temp = tempdir().expect("base");
+    let _runtime = TestRuntimeGuard::acquire();
+    let (_base, _profile, guard, mut writer) = start_writer(&temp, "participant-membership");
+    wait_until_available(&writer);
+    let root = temp.path().join("configured-source");
+    let empty = snapshot(&writer);
+    let original = source(&root, "stable-configured-id");
+    let mut updated = original.clone();
+    updated.role = SourceRole::Primary;
+    updated.primary_import_folder = PathBuf::from("incoming");
+    let original_snapshot = SourceRegistrySnapshot::new(vec![original]);
+    let updated_snapshot = SourceRegistrySnapshot::new(vec![updated]);
+    let create = request(
+        guard.owner_identity(),
+        10,
+        &empty,
+        original_snapshot.clone(),
+    );
+    let update = request(
+        guard.owner_identity(),
+        11,
+        &original_snapshot,
+        updated_snapshot.clone(),
+    );
+    let remove = request(guard.owner_identity(), 12, &updated_snapshot, empty.clone());
+    let mut receipts = Vec::new();
+    for command in [&create, &update, &remove] {
+        let receipt = result(&writer, command.clone()).expect("configured membership command");
+        assert_eq!(
+            receipt.disposition(),
+            SourceRegistryParticipantDisposition::Applied
+        );
+        assert_eq!(receipt.payload_identity(), command.payload_identity());
+        receipts.push(receipt);
+        let active = snapshot(&writer);
+        match receipts.len() {
+            1 => {
+                assert_eq!(active.as_slice()[0].id.as_str(), "stable-configured-id");
+                assert_eq!(active.as_slice()[0].role, SourceRole::Normal);
+            }
+            2 => {
+                assert_eq!(active.as_slice()[0].id.as_str(), "stable-configured-id");
+                assert_eq!(active.as_slice()[0].role, SourceRole::Primary);
+                assert_eq!(
+                    active.as_slice()[0].primary_import_folder,
+                    PathBuf::from("incoming")
+                );
+            }
+            3 => assert!(active.is_empty()),
+            _ => unreachable!(),
+        }
+    }
+    assert!(
+        receipts
+            .windows(2)
+            .all(|pair| pair[0].sequence() < pair[1].sequence())
+    );
+    assert!(
+        receipts
+            .windows(2)
+            .all(|pair| pair[0].operation_id() != pair[1].operation_id())
+    );
+    assert!(writer.shutdown());
+    let mut reopened = GlobalLibraryWriter::start(&guard).expect("reopen");
+    wait_until_available(&reopened);
+    // Reordered old completions must not restore an entry removed by the later operation.
+    for index in [1, 0, 2, 0] {
+        let command = [&create, &update, &remove][index].clone();
+        assert_eq!(
+            result(&reopened, command).expect("historical replay"),
+            receipts[index]
+        );
+        assert!(snapshot(&reopened).is_empty());
+    }
+    let retained = reopened
+        .lookup_retained_source_for_root(root)
+        .expect("retained lookup")
+        .recv_timeout(Duration::from_secs(2))
+        .expect("lookup response")
+        .expect("lookup")
+        .expect("retained descriptor");
+    assert_eq!(retained.id.as_str(), "stable-configured-id");
+    assert_eq!(retained.role, SourceRole::Primary);
+    assert_eq!(retained.primary_import_folder, PathBuf::from("incoming"));
+    assert!(reopened.shutdown());
+    // These are configured metadata outcomes only. No physical source, source-database
+    // retirement, origin absence, lifecycle generation, or live lease proof is manufactured.
+}
