@@ -126,6 +126,7 @@ mod tags;
 mod transient_markers;
 mod transport;
 mod unsupported_entries;
+mod update_check;
 #[cfg(any(target_os = "macos", test))]
 mod user_shader_runtime;
 mod view;

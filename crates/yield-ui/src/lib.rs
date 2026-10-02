@@ -18,6 +18,8 @@ pub(crate) mod external_clipboard;
 mod multiline_text_input;
 mod search_input;
 mod theme;
+/// Read-only asynchronous update metadata port and typed outcomes.
+pub mod update_check;
 
 actions!(
     yield_ui,
