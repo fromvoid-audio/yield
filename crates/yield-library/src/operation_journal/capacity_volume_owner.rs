@@ -1195,6 +1195,11 @@ pub(super) fn acquire_fixture_with_clean_marker_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod process_isolation {
+        include!("capacity_volume_owner/tests/process_isolation.rs");
+    }
+
     use super::*;
     use std::{
         fs::{self, OpenOptions as StdOpenOptions},
@@ -1375,6 +1380,12 @@ mod tests {
 
     #[test]
     fn same_volume_profiles_contend_and_dirty_marker_requires_reconciliation() {
+        #[cfg(target_os = "linux")]
+        if process_isolation::run_in_child(
+            "same_volume_profiles_contend_and_dirty_marker_requires_reconciliation",
+        ) {
+            return;
+        }
         let fixture = fixture();
         let first = acquire_fixture_for_test(
             &fixture.descriptor,
@@ -1415,6 +1426,12 @@ mod tests {
 
     #[test]
     fn same_profile_dirty_marker_reacquires_without_rewriting_generation() {
+        #[cfg(target_os = "linux")]
+        if process_isolation::run_in_child(
+            "same_profile_dirty_marker_reacquires_without_rewriting_generation",
+        ) {
+            return;
+        }
         let fixture = fixture();
         let first = acquire_fixture_for_test(
             &fixture.descriptor,
@@ -1469,6 +1486,10 @@ mod tests {
 
     #[test]
     fn test_only_clean_release_advances_generation() {
+        #[cfg(target_os = "linux")]
+        if process_isolation::run_in_child("test_only_clean_release_advances_generation") {
+            return;
+        }
         let fixture = fixture();
         let mut first = acquire_fixture_for_test(
             &fixture.descriptor,
@@ -1497,6 +1518,10 @@ mod tests {
 
     #[test]
     fn clean_handoff_fences_the_runtime_before_unlock() {
+        #[cfg(target_os = "linux")]
+        if process_isolation::run_in_child("clean_handoff_fences_the_runtime_before_unlock") {
+            return;
+        }
         let fixture = fixture();
         let mut first = acquire_fixture_for_test(
             &fixture.descriptor,
@@ -1529,6 +1554,12 @@ mod tests {
 
     #[test]
     fn uncertain_registry_sync_keeps_lock_and_never_reports_clean_success() {
+        #[cfg(target_os = "linux")]
+        if process_isolation::run_in_child(
+            "uncertain_registry_sync_keeps_lock_and_never_reports_clean_success",
+        ) {
+            return;
+        }
         let fixture = fixture();
         let mut first = acquire_fixture_for_test(
             &fixture.descriptor,
@@ -1581,6 +1612,12 @@ mod tests {
 
     #[test]
     fn prewrite_handoff_failure_fences_retained_context_clones_and_keeps_lock() {
+        #[cfg(target_os = "linux")]
+        if process_isolation::run_in_child(
+            "prewrite_handoff_failure_fences_retained_context_clones_and_keeps_lock",
+        ) {
+            return;
+        }
         let fixture = fixture();
         let mut first = acquire_fixture_for_test(
             &fixture.descriptor,
