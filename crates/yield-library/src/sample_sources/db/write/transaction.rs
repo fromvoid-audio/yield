@@ -1056,17 +1056,7 @@ fn manifest_snapshot(
 }
 
 fn manifest_revision(connection: &rusqlite::Connection) -> Result<u64, SourceDbError> {
-    connection
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'revision'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(map_sql_error)?
-        .map(|raw| raw.parse::<u64>().map_err(|_| SourceDbError::Unexpected))
-        .transpose()
-        .map(|revision| revision.unwrap_or_default())
+    super::super::read_bounded_numeric_metadata(connection, "revision")
 }
 
 fn manifest_entry_for_path(
