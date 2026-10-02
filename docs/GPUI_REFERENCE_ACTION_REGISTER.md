@@ -265,5 +265,5 @@ GPUI additions outside the archived reference inventory:
 | Volume pointer capture | `browser/view.rs`, `browser/transport.rs`; source counterpart listed above; window/OS capture unverified | OPT-1936 |
 
 | InspectUnsupportedFile | [inspect_unsupported_action](../crates/yield-ui/src/browser/unsupported_entries.rs#L270); real read-only owner inspection, bounded modal and cancellation; no native reveal grant | OPT-2039 / OPT-1953 |
-| Analyze features sample menu | [request_feature_analysis](../crates/yield-ui/src/browser/analysis.rs#L47); one real source-owned WAV job; exact request/source/revision/path/cancel fence; overall embedding/layout and rich progress remain open | OPT-2075 / OPT-2061 |
+| Analyze features sample menu | [request_feature_analysis](../crates/yield-ui/src/browser/analysis.rs#L64); one real source-owned WAV job; exact request/source/revision/path/cancel fence; overall embedding/layout and rich progress remain open | OPT-2075 / OPT-2061 |
 See [source index scope](GPUI_REFERENCE_CONTROL_INDEX.md), [destructive action decision](GPUI_REFERENCE_EDIT_ACTIONS.md), and [migration evidence](GPUI_MIGRATION.md).

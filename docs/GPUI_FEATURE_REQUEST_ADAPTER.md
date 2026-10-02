@@ -24,7 +24,8 @@ automatic corruption/eviction repair stays under OPT-1657. Unavailable native
 held input returns UnsupportedPlatform, retaining retry evidence. Native adapters
 OPT-2061/2062 remain actual implementation gates, never waived by a model.
 
-Each accepted request reserves at most three bounded events. Relative path/source
+Each accepted request reserves at most six bounded events (including the three
+indeterminate preparation phases described in [semantic progress](SOURCE_FEATURE_PROCESSING_PHASES.md)). Relative path/source
 input is bounded to 1024/256 bytes and invalid paths reject before queue admission.
 The existing command/event capacities provide backpressure. No vectors or source
 handles escape in event output; a typed immutable key is a value, not mutation

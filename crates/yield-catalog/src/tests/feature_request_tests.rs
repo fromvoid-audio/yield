@@ -2,6 +2,7 @@
 mod fixtures {
     use super::super::*;
     use crate::{FeatureAnalysisBlocker, FeatureAnalysisCancellation, FeatureAnalysisState};
+    use crate::{FeatureAnalysisPhase, FeaturePhaseMeasurement};
     use yield_library::sample_sources::SourceDatabaseConnectionRole;
 
     fn command(
@@ -27,6 +28,48 @@ mod fixtures {
             CatalogEvent::FeatureAnalysisState { state, .. } => state,
             _ => unreachable!(),
         }
+    }
+    fn preparation(service: &CatalogService, id: u64, unfinished: bool) {
+        let mut phases = vec![
+            FeatureAnalysisPhase::InspectingManifest,
+            FeatureAnalysisPhase::ComparingReadiness,
+        ];
+        if unfinished {
+            phases.push(FeatureAnalysisPhase::QueueingUnfinishedWork);
+        }
+        for phase in phases {
+            assert_eq!(phase.measurement(), FeaturePhaseMeasurement::Indeterminate);
+            assert_eq!(
+                state(service, id),
+                FeatureAnalysisState::Preparing { phase }
+            );
+        }
+    }
+    #[test]
+    fn feature_request_phase_reducer_noop_retry_and_terminal_are_monotonic() {
+        use FeatureAnalysisPhase::*;
+        let inspecting = FeatureAnalysisState::Preparing {
+            phase: InspectingManifest,
+        };
+        let comparing = FeatureAnalysisState::Preparing {
+            phase: ComparingReadiness,
+        };
+        let queueing = FeatureAnalysisState::Preparing {
+            phase: QueueingUnfinishedWork,
+        };
+        let blocked = FeatureAnalysisState::Blocked {
+            reason: FeatureAnalysisBlocker::NotClaimable,
+        };
+        assert!(inspecting.follows(None));
+        assert!(comparing.follows(Some(&inspecting)));
+        assert!(queueing.follows(Some(&comparing)));
+        assert!(!inspecting.follows(Some(&comparing)));
+        assert!(!comparing.follows(Some(&comparing)));
+        assert!(blocked.follows(Some(&comparing))); // no queued-work promise needed
+        assert!(!queueing.follows(Some(&blocked)));
+        assert!(!inspecting.follows(Some(&blocked))); // retry needs a fresh request
+        assert!(inspecting.follows(None)); // fresh request/source revision reset
+        assert!(!FeatureAnalysisState::Queued.follows(Some(&FeatureAnalysisState::Running)));
     }
     fn observer(f: &Fixture, source: &SourceId) -> rusqlite::Connection {
         SourceDatabase::open_connection_with_role_and_database_root(
@@ -62,6 +105,7 @@ mod fixtures {
                 FeatureAnalysisCancellation::new(),
             ))
             .unwrap();
+        preparation(&service, 1, true);
         assert_eq!(state(&service, 1), FeatureAnalysisState::Queued);
         assert_eq!(state(&service, 1), FeatureAnalysisState::Running);
         let ready = state(&service, 1);
@@ -83,6 +127,7 @@ mod fixtures {
                 FeatureAnalysisCancellation::new(),
             ))
             .unwrap();
+        preparation(&service, 2, false);
         assert_eq!(state(&service, 2), ready);
         assert_eq!(counts(&f, &source), (1, 1));
         service.shutdown();
@@ -102,6 +147,7 @@ mod fixtures {
                 FeatureAnalysisCancellation::new(),
             ))
             .unwrap();
+        preparation(&service, 1, true);
         assert_eq!(state(&service, 1), FeatureAnalysisState::Queued);
         assert_eq!(state(&service, 1), FeatureAnalysisState::Running);
         assert_eq!(
@@ -113,6 +159,33 @@ mod fixtures {
         assert_eq!(counts(&f, &source), (0, 0));
         let retained: (String,String) = observer(&f,&source).query_row("SELECT status,failure_kind FROM analysis_jobs WHERE readiness_stage='analysis_features'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(retained, ("failed".into(), "retryable".into()));
+        // A fresh request publishes preparation again. The actual clock may cross the
+        // retained one-second deadline: either defer, or genuinely retry and fail decoding.
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision,
+                2,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        preparation(&service, 2, true);
+        match state(&service, 2) {
+            FeatureAnalysisState::Blocked {
+                reason: FeatureAnalysisBlocker::NotClaimable,
+            } => {}
+            FeatureAnalysisState::Queued => {
+                assert_eq!(state(&service, 2), FeatureAnalysisState::Running);
+                assert_eq!(
+                    state(&service, 2),
+                    FeatureAnalysisState::Blocked {
+                        reason: FeatureAnalysisBlocker::Computation,
+                    }
+                );
+            }
+            other => panic!("retry must defer or perform real failed computation: {other:?}"),
+        }
+        assert_eq!(counts(&f, &source), (0, 0));
         service.shutdown();
     }
     #[test]
@@ -251,6 +324,7 @@ mod fixtures {
                 FeatureAnalysisCancellation::new(),
             ))
             .unwrap();
+        preparation(&service, 2, true);
         assert_eq!(
             state(&service, 2),
             FeatureAnalysisState::Blocked {
