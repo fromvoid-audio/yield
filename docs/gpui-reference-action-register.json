@@ -1,0 +1,3892 @@
+{
+  "schema_version": 1,
+  "issue": "OPT-1867",
+  "baseline": "006e92fd58437fbe0d3e6951d0c47becfa6fa707",
+  "rows": [
+    {
+      "message": "FolderBrowserMessage::ActivateCollection",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/curation.rs",
+        "symbol": "toggle_collection_filter"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1499",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source-owned collection/rating metadata counterpart; reference collection missing-file cleanup and ordering are not all established by this test.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ActivateFolder",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "select_folder"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1480",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Nondestructive folder focus/disclosure/listing only; mutations and drag destinations remain separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::AddSource",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/source_registry.rs",
+        "symbol": "submit_source_add"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1495",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source registry/scan lifecycle counterpart; reorder/primary/protection semantics need their own source checks and native sessions.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::BeginCreateSubfolder",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1580",
+      "note": "Missing GPUI folder create producer; pre-intent capacity/owner contract is OPT-1997/1692.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::BeginRenameSelected",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1581",
+      "note": "Filesystem rename differs from collection-label rename; production admission/effect handoff is OPT-1998/1700.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::CancelFileColumnDrag",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/column_layout.rs",
+        "symbol": "reorder_visible"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/column_layout.rs",
+          "symbol": "hidden_columns_keep_their_relative_order_during_visible_reorder"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Session-scoped column widths/order. Native drag cancellation and resize acceptance are separate.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::CancelRename",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1581",
+      "note": "Filesystem rename differs from collection-label rename; production admission/effect handoff is OPT-1998/1700.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ClearDropTarget",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1588",
+      "note": "Drag target feedback is part of the still-missing typed folder/source transfer workflow.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ClearDropTargetUnless",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1588",
+      "note": "Drag target feedback is part of the still-missing typed folder/source transfer workflow.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ClearSourceDropTargetUnless",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/source_registry.rs",
+        "symbol": "submit_source_add"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/source_registry.rs",
+          "symbol": "restored_session_matches_by_durable_id_before_root_fallback"
+        }
+      ],
+      "owner": "OPT-1495",
+      "note": "Source registry/scan lifecycle counterpart; reorder/primary/protection semantics need their own source checks and native sessions.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::DragFileColumn",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/column_layout.rs",
+        "symbol": "reorder_visible"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/column_layout.rs",
+          "symbol": "hidden_columns_keep_their_relative_order_during_visible_reorder"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Session-scoped column widths/order. Native drag cancellation and resize acceptance are separate.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::DragFolder",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1588",
+      "note": "Destination publication and identity/collision handling require production file-operation ownership.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::DragSource",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-2006",
+      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::DropOnCollection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1499",
+      "note": "Source-owned collection membership editing exists, but this cleanup/drag producer has no verified equivalent. Do not infer it from collection assignment shortcuts.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::DropOnFolder",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1588",
+      "note": "Destination publication and identity/collision handling require production file-operation ownership.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::DropOnSource",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1588",
+      "note": "Destination publication and identity/collision handling require production file-operation ownership.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ExitCollectionFocus",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/curation.rs",
+        "symbol": "reset_collection_filter"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1499",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source-owned collection/rating metadata counterpart; reference collection missing-file cleanup and ordering are not all established by this test.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::HoverCollectionDropTarget",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1499",
+      "note": "Source-owned collection membership editing exists, but this cleanup/drag producer has no verified equivalent. Do not infer it from collection assignment shortcuts.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::HoverDropTarget",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1588",
+      "note": "Drag target feedback is part of the still-missing typed folder/source transfer workflow.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::HoverSourceDropTarget",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/source_registry.rs",
+        "symbol": "submit_source_add"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/source_registry.rs",
+          "symbol": "restored_session_matches_by_durable_id_before_root_fallback"
+        }
+      ],
+      "owner": "OPT-1495",
+      "note": "Source registry/scan lifecycle counterpart; reorder/primary/protection semantics need their own source checks and native sessions.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::NameFilterInput",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/filter_family.rs",
+        "symbol": "toggle_filter_family"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/filter_family.rs",
+          "symbol": "family_choices_survive_source_retirement_but_only_filter_replacement_rows"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Filter/projection counterpart; native multi-family and dropdown interactions remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::NavigateSource",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1495",
+      "note": "Source registry add/remove/selection exists; this distinct protection/process/refresh/navigation producer is not established by submit_source_add.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::OpenCollectionContextMenu",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/context_menu.rs",
+        "symbol": "open_collection_context_menu"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Context target/focus lifecycle only. Available action list is intentionally smaller; absent physical effects stay separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::OpenFolderContextMenu",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/context_menu.rs",
+        "symbol": "open_directory_context_menu"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Context target/focus lifecycle only. Available action list is intentionally smaller; absent physical effects stay separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::OpenSourceContextMenu",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/context_menu.rs",
+        "symbol": "open_directory_context_menu"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Context target/focus lifecycle only. Available action list is intentionally smaller; absent physical effects stay separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::RenameCollection",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/collection_rename.rs",
+        "symbol": "commit_collection_rename"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/collection_rename.rs",
+          "symbol": "inline_rename_cancels_empty_input_and_fences_source_switch"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Source counterpart exists; full reference behavior and native acceptance remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::RenameInput",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1581",
+      "note": "Filesystem rename differs from collection-label rename; production admission/effect handoff is OPT-1998/1700.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ResizeCollectionsPanel",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-2007",
+      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ResizeFileColumn",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/column_layout.rs",
+        "symbol": "reorder_visible"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/column_layout.rs",
+          "symbol": "hidden_columns_keep_their_relative_order_during_visible_reorder"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Session-scoped column widths/order. Native drag cancellation and resize acceptance are separate.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ResizeFilterPanel",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-2007",
+      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ResizeMetadataPanel",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-2007",
+      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::SelectSource",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "select_source"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1495",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source registry/scan lifecycle counterpart; reorder/primary/protection semantics need their own source checks and native sessions.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::SetCurationScope",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/filter_family.rs",
+        "symbol": "toggle_filter_family"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/filter_family.rs",
+          "symbol": "family_choices_survive_source_retirement_but_only_filter_replacement_rows"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Filter/projection counterpart; native multi-family and dropdown interactions remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::SetFilterFamilyEnabled",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/filter_family.rs",
+        "symbol": "toggle_filter_family"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/filter_family.rs",
+          "symbol": "family_actions_require_an_active_source_and_preserve_disabled_drafts"
+        }
+      ],
+      "owner": "OPT-1907",
+      "note": "Name/Type/Rating and existing Tag/Curation controls exist; Harvest family still depends on exact facts.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::SetHarvestFilter",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1898",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::SortFileColumn",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_sort"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1499",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Session-scoped column widths/order. Native drag cancellation and resize acceptance are separate.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::TagFilterInput",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/filter_family.rs",
+        "symbol": "toggle_filter_family"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/filter_family.rs",
+          "symbol": "family_choices_survive_source_retirement_but_only_filter_replacement_rows"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Filter/projection counterpart; native multi-family and dropdown interactions remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ToggleEmptyFolderVisibility",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_empty_folder_visibility"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1480",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Nondestructive folder focus/disclosure/listing only; mutations and drag destinations remain separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ToggleFolderExpansion",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_folder_expanded"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1480",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Nondestructive folder focus/disclosure/listing only; mutations and drag destinations remain separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ToggleFolderSubtreeListing",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_folder_scope"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1480",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Nondestructive folder focus/disclosure/listing only; mutations and drag destinations remain separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::TogglePlaybackTypeFilter",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/curation.rs",
+        "symbol": "toggle_playback_type_filter"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1499",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Filter/projection counterpart; native multi-family and dropdown interactions remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ToggleRatingFilter",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/curation.rs",
+        "symbol": "toggle_rating_filter"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1499",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Filter/projection counterpart; native multi-family and dropdown interactions remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "FolderBrowserMessage::ToggleSimilarityAnchor",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1719",
+      "note": "Similarity-browser anchor/aspect queries differ from the implemented Similar Sections overlay.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::AddProtectedExtractionTargetSource",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1610",
+      "note": "Region output/destination/conflict ownership is missing; extraction preparation alone is not a completed route.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::AdjustSelectedRatingWithoutAdvance",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/curation.rs",
+        "symbol": "submit_curation_action"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/curation.rs",
+          "symbol": "remove_collection_action_targets_only_the_active_slot"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Source-owned collection/rating metadata counterpart; reference collection missing-file cleanup and ordering are not all established by this test.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::AssignSelectedCollection",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/curation.rs",
+        "symbol": "submit_curation_action"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/curation.rs",
+          "symbol": "remove_collection_action_targets_only_the_active_slot"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Source-owned collection/rating metadata counterpart; reference collection missing-file cleanup and ordering are not all established by this test.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::BeginStarmapAuditionDrag",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1709",
+      "note": "No GPUI starmap render/selection/audition surface. Read-only backend projection is not UI parity.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::BrowserScrollAccepted",
+      "state": "internal",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1491",
+      "note": "Forwarding, frame or viewport protocol; not a separate business action. Containing controls are reviewed individually.",
+      "native_evidence": "not a standalone action"
+    },
+    {
+      "message": "GuiMessage::CancelActiveSourceScan",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/source_registry.rs",
+        "symbol": "submit_source_add"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/source_registry.rs",
+          "symbol": "restored_session_matches_by_durable_id_before_root_fallback"
+        }
+      ],
+      "owner": "OPT-1495",
+      "note": "Source registry/scan lifecycle counterpart; reorder/primary/protection semantics need their own source checks and native sessions.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CancelBrowserDragOnSampleList",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1588",
+      "note": "Drag target feedback is part of the still-missing typed folder/source transfer workflow.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CancelContextFolderDelete",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1589",
+      "note": "Retained folder deletion needs the production owner/journal producer; portable handoff contract is OPT-1999.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CancelFileMoveConflicts",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1595",
+      "note": "Typed file copy/cut/move/conflict workflow remains open. Copying pathname text in handoff.rs is not physical CopySelectedFiles.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CancelPendingWaveformDestructiveEdit",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1598",
+      "note": "Prepared DSP is separate from durable source command/publication. Shared dispatcher is missing; macOS capability remains OPT-1868.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CancelProtectedExtractionTargetSource",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1610",
+      "note": "Region output/destination/conflict ownership is missing; extraction preparation alone is not a completed route.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CancelTrashFolderSetup",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1595",
+      "note": "Typed file copy/cut/move/conflict workflow remains open. Copying pathname text in handoff.rs is not physical CopySelectedFiles.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ChangeBeatGuideCountInput",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_bpm_snap"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1492",
+      "note": "Timing/snap/metronome controls exist; playmark parser/application test does not certify every control or audible click.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ChangeStarmapViewport",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1709",
+      "note": "No GPUI starmap render/selection/audition surface. Read-only backend projection is not UI parity.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ChooseTrashFolderForPendingMove",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1595",
+      "note": "Typed file copy/cut/move/conflict workflow remains open. Copying pathname text in handoff.rs is not physical CopySelectedFiles.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CleanMissingContextSampleFromCollection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1499",
+      "note": "Source-owned collection membership editing exists, but this cleanup/drag producer has no verified equivalent. Do not infer it from collection assignment shortcuts.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CleanMissingFilesFromActiveCollection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1499",
+      "note": "Source-owned collection membership editing exists, but this cleanup/drag producer has no verified equivalent. Do not infer it from collection assignment shortcuts.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ClearContextSourcePrimary",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-2005",
+      "note": "Primary-source setting has no verified GPUI producer. Source registration alone is not this preference.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CloseContextMenu",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/context_menu.rs",
+        "symbol": "close_context_menu"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Context target/focus lifecycle only. Available action list is intentionally smaller; absent physical effects stay separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CloseCurationFilterDropdown",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/filter_family.rs",
+        "symbol": "toggle_filter_family"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/filter_family.rs",
+          "symbol": "family_choices_survive_source_retirement_but_only_filter_replacement_rows"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Filter/projection counterpart; native multi-family and dropdown interactions remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CloseHarvestFilterDropdown",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1898",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CloseJobDetails",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/job_details.rs",
+        "symbol": "retry_job_audit"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/source_registry.rs",
+          "symbol": "in_flight_scan_session_survives_initial_registry_snapshot"
+        }
+      ],
+      "owner": "OPT-1807",
+      "note": "Audit retry/cancel and job details exist; analysis job readiness/progress remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CloseShortcutHelp",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/shortcut_help.rs",
+        "symbol": "key_action"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/shortcut_help.rs",
+          "symbol": "open_modal_consumes_background_keys_and_closes_on_escape_or_toggle"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Source counterpart exists; full reference behavior and native acceptance remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CloseTransactionList",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1611",
+      "note": "Application-wide committed history/recovery remains open; dictionary-definition undo is narrower.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CloseUnsupportedFiles",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-2008",
+      "note": "Unsupported-file modal and safe row reveal require bounded source-owned unsupported facts; general whole-file reveal does not provide this list.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CollapseSelectedFolder",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "select_folder"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/folder_keyboard.rs",
+          "symbol": "folder_keys_route_selection_disclosure_and_marks"
+        }
+      ],
+      "owner": "OPT-1480",
+      "note": "Nondestructive folder focus/disclosure/listing only; mutations and drag destinations remain separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CommitBeatGuideCountInput",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_bpm_snap"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1492",
+      "note": "Timing/snap/metronome controls exist; playmark parser/application test does not certify every control or audible click.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ConfirmContextFolderDelete",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1589",
+      "note": "Retained folder deletion needs the production owner/journal producer; portable handoff contract is OPT-1999.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ConfirmPendingWaveformDestructiveEdit",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1598",
+      "note": "Prepared DSP is separate from durable source command/publication. Shared dispatcher is missing; macOS capability remains OPT-1868.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CopyContextPath",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/context_menu.rs",
+        "symbol": "activate_context_menu_action"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1478",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Whole-file/path handoff only; opening an external default application and delayed region consumers need distinct native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CopySelectedFiles",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1595",
+      "note": "Typed file copy/cut/move/conflict workflow remains open. Copying pathname text in handoff.rs is not physical CopySelectedFiles.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CreateFolderAtContextTarget",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1580",
+      "note": "Missing GPUI folder create producer; pre-intent capacity/owner contract is OPT-1997/1692.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::CutSelectedFiles",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1595",
+      "note": "Typed file copy/cut/move/conflict workflow remains open. Copying pathname text in handoff.rs is not physical CopySelectedFiles.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::DeleteSelectedItem",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1579",
+      "note": "Physical trash/delete path remains unsupported until qualified staging/cleanup and retained recovery exist.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::DragSampleFile",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1478",
+      "note": "Default-application open/OS file drag route is not established by clipboard copy or Finder reveal. Native handoff acceptance and a production producer remain required.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::DropWaveformSelectionOnSampleList",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1610",
+      "note": "Region output/destination/conflict ownership is missing; extraction preparation alone is not a completed route.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::DuplicateContextSampleDouble",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1578",
+      "note": "Destination publication and identity/collision handling require production file-operation ownership.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::DuplicateContextSampleSame",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1578",
+      "note": "Destination publication and identity/collision handling require production file-operation ownership.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ExtractPlaymarkedRange",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1610",
+      "note": "Region output/destination/conflict ownership is missing; extraction preparation alone is not a completed route.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ExtractPlaymarkedRangeToHarvestDestination",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1600",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::FinishStarmapAuditionDrag",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1709",
+      "note": "No GPUI starmap render/selection/audition surface. Read-only backend projection is not UI parity.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::FocusLoadedFile",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "move_selection"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/mod.rs",
+          "symbol": "selection_modifiers_route_autoplay_only_for_plain_focus"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Source counterpart exists; full reference behavior and native acceptance remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::FocusSelectedStarmapNode",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1709",
+      "note": "No GPUI starmap render/selection/audition surface. Read-only backend projection is not UI parity.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::FolderBrowser",
+      "state": "internal",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1491",
+      "note": "Forwarding, frame or viewport protocol; not a separate business action. Containing controls are reviewed individually.",
+      "native_evidence": "not a standalone action"
+    },
+    {
+      "message": "GuiMessage::FolderTreeWindowChanged",
+      "state": "internal",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1491",
+      "note": "Forwarding, frame or viewport protocol; not a separate business action. Containing controls are reviewed individually.",
+      "native_evidence": "not a standalone action"
+    },
+    {
+      "message": "GuiMessage::Frame",
+      "state": "internal",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1491",
+      "note": "Forwarding, frame or viewport protocol; not a separate business action. Containing controls are reviewed individually.",
+      "native_evidence": "not a standalone action"
+    },
+    {
+      "message": "GuiMessage::MarkContextSampleHarvestDone",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1600",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::MarkContextSampleHarvestIgnored",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1600",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::Metadata",
+      "state": "internal",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1491",
+      "note": "Forwarding, frame or viewport protocol; not a separate business action. Containing controls are reviewed individually.",
+      "native_evidence": "not a standalone action"
+    },
+    {
+      "message": "GuiMessage::MoveContextTargetToTrash",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1579",
+      "note": "Physical trash/delete path remains unsupported until qualified staging/cleanup and retained recovery exist.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::MoveUnsupportedFileToTrash",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1579",
+      "note": "Physical trash/delete path remains unsupported until qualified staging/cleanup and retained recovery exist.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::NavigateBrowser",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "move_selection"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/mod.rs",
+          "symbol": "selection_modifiers_route_autoplay_only_for_plain_focus"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Source counterpart exists; full reference behavior and native acceptance remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::NormalizeSelectedSamples",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1598",
+      "note": "Prepared DSP is separate from durable source command/publication. Shared dispatcher is missing; macOS capability remains OPT-1868.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::OpenContextMenu",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/context_menu.rs",
+        "symbol": "open_context_menu"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/context_menu.rs",
+          "symbol": "stale_projection_fence_rejects_source_or_index_map_changes"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Context target/focus lifecycle only. Available action list is intentionally smaller; absent physical effects stay separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::OpenContextSampleHarvestDestination",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1600",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::OpenContextTarget",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1478",
+      "note": "Default-application open/OS file drag route is not established by clipboard copy or Finder reveal. Native handoff acceptance and a production producer remain required.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::OpenReleaseDownloadPage",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1775",
+      "note": "GPUI update states/download channel workflow not yet connected to qualified controlled artifacts.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::OpenSampleContextMenu",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/context_menu.rs",
+        "symbol": "open_context_menu"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/context_menu.rs",
+          "symbol": "stale_projection_fence_rejects_source_or_index_map_changes"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Context target/focus lifecycle only. Available action list is intentionally smaller; absent physical effects stay separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::OpenSelectedSampleHarvestDestination",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1600",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::OpenUnsupportedFiles",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-2008",
+      "note": "Unsupported-file modal and safe row reveal require bounded source-owned unsupported facts; general whole-file reveal does not provide this list.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::PasteCutFiles",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1595",
+      "note": "Typed file copy/cut/move/conflict workflow remains open. Copying pathname text in handoff.rs is not physical CopySelectedFiles.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::PlayFromCurrentPlayStart",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/transport.rs",
+        "symbol": "play_from_current_play_start"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1492",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Transport counterpart; asynchronous output fence test is not audible start/stop/loop signoff.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::PlayNextPlaybackHistory",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/history.rs",
+        "symbol": "navigate_playback_history"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/history.rs",
+          "symbol": "history_activation_rejects_completion_from_canceled_scan"
+        }
+      ],
+      "owner": "OPT-1492",
+      "note": "Source counterpart exists; full reference behavior and native acceptance remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::PlayPreviousPlaybackHistory",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/history.rs",
+        "symbol": "navigate_playback_history"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/history.rs",
+          "symbol": "history_activation_rejects_completion_from_canceled_scan"
+        }
+      ],
+      "owner": "OPT-1492",
+      "note": "Source counterpart exists; full reference behavior and native acceptance remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::PlayRandomListedSampleRange",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/random_audition.rs",
+        "symbol": "request_random_audition"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/random_audition.rs",
+          "symbol": "pending_random_audition_rejects_stale_generation_and_path"
+        }
+      ],
+      "owner": "OPT-1492",
+      "note": "Random audition/navigation counterparts are distinct; selection test covers origin policy only. Native audible acceptance remains open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::PlayRandomSampleRange",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/random_audition.rs",
+        "symbol": "request_random_audition"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/random_audition.rs",
+          "symbol": "pending_random_audition_rejects_stale_generation_and_path"
+        }
+      ],
+      "owner": "OPT-1492",
+      "note": "Random audition/navigation counterparts are distinct; selection test covers origin policy only. Native audible acceptance remains open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::PlaySelectedSample",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/transport.rs",
+        "symbol": "play_selected_sample"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/transport.rs",
+          "symbol": "playback_reducer_requires_the_runtime_applied_plan_before_promoting_state"
+        }
+      ],
+      "owner": "OPT-1492",
+      "note": "Transport counterpart; asynchronous output fence test is not audible start/stop/loop signoff.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::PlaymarkLabel",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "commit_playmark_timing_edit"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_escape_cancels_and_ime_enter_does_not_commit"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Playmark duration/BPM text editing, fenced by current selection; native IME/focus session remains required.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ProcessContextSource",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1495",
+      "note": "Source registry add/remove/selection exists; this distinct protection/process/refresh/navigation producer is not established by submit_source_add.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RedoTransaction",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1611",
+      "note": "Application-wide committed history/recovery remains open; dictionary-definition undo is narrower.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RedoTransactionsThrough",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1611",
+      "note": "Application-wide committed history/recovery remains open; dictionary-definition undo is narrower.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RefreshContextSource",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1495",
+      "note": "Source registry add/remove/selection exists; this distinct protection/process/refresh/navigation producer is not established by submit_source_add.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RemoveContextSampleFromCollection",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/curation.rs",
+        "symbol": "submit_curation_action"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/curation.rs",
+          "symbol": "remove_collection_action_targets_only_the_active_slot"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Source-owned collection/rating metadata counterpart; reference collection missing-file cleanup and ordering are not all established by this test.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RemoveContextSource",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/source_registry.rs",
+        "symbol": "submit_source_remove"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1495",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source registry/scan lifecycle counterpart; reorder/primary/protection semantics need their own source checks and native sessions.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RenameContextFolder",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1581",
+      "note": "Filesystem rename differs from collection-label rename; production admission/effect handoff is OPT-1998/1700.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RequestApplyEditSelectionEffects",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1598",
+      "note": "Prepared DSP is separate from durable source command/publication. Shared dispatcher is missing; macOS capability remains OPT-1868.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RequestCropPlaymarkSelection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1598",
+      "note": "Prepared DSP is separate from durable source command/publication. Shared dispatcher is missing; macOS capability remains OPT-1868.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RequestCropWaveformSelection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1598",
+      "note": "Prepared DSP is separate from durable source command/publication. Shared dispatcher is missing; macOS capability remains OPT-1868.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RequestDeleteContextFolder",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1589",
+      "note": "Retained folder deletion needs the production owner/journal producer; portable handoff contract is OPT-1999.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RequestExtractAndTrimPlaymarkSelection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1610",
+      "note": "Region output/destination/conflict ownership is missing; extraction preparation alone is not a completed route.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RequestExtractAndTrimWaveformSelection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1610",
+      "note": "Region output/destination/conflict ownership is missing; extraction preparation alone is not a completed route.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RequestMuteWaveformSelection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1598",
+      "note": "Prepared DSP is separate from durable source command/publication. Shared dispatcher is missing; macOS capability remains OPT-1868.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RequestReversePlaymarkSelection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1598",
+      "note": "Prepared DSP is separate from durable source command/publication. Shared dispatcher is missing; macOS capability remains OPT-1868.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RequestReverseWaveformSelection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1598",
+      "note": "Prepared DSP is separate from durable source command/publication. Shared dispatcher is missing; macOS capability remains OPT-1868.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RequestTrimPlaymarkSelection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1598",
+      "note": "Prepared DSP is separate from durable source command/publication. Shared dispatcher is missing; macOS capability remains OPT-1868.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RequestTrimWaveformSelection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1598",
+      "note": "Prepared DSP is separate from durable source command/publication. Shared dispatcher is missing; macOS capability remains OPT-1868.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ResetContextSampleHarvest",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1600",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ResizeFolder",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-2007",
+      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ResizeWaveformPanel",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-2007",
+      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ResolveFileMoveConflict",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1595",
+      "note": "Typed file copy/cut/move/conflict workflow remains open. Copying pathname text in handoff.rs is not physical CopySelectedFiles.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RetryActiveSourceScan",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/source_registry.rs",
+        "symbol": "submit_source_add"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/source_registry.rs",
+          "symbol": "restored_session_matches_by_durable_id_before_root_fallback"
+        }
+      ],
+      "owner": "OPT-1495",
+      "note": "Source registry/scan lifecycle counterpart; reorder/primary/protection semantics need their own source checks and native sessions.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::RevealUnsupportedFile",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-2008",
+      "note": "Unsupported-file modal and safe row reveal require bounded source-owned unsupported facts; general whole-file reveal does not provide this list.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::SampleBrowserWindowChanged",
+      "state": "internal",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1491",
+      "note": "Forwarding, frame or viewport protocol; not a separate business action. Containing controls are reviewed individually.",
+      "native_evidence": "not a standalone action"
+    },
+    {
+      "message": "GuiMessage::SelectAllSamples",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "select_all_visible"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source counterpart exists; full reference behavior and native acceptance remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::SelectSampleWithModifiers",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "select_entry_from_click"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source counterpart exists; full reference behavior and native acceptance remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::SetBeatGuideCount",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_bpm_snap"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1492",
+      "note": "Timing/snap/metronome controls exist; playmark parser/application test does not certify every control or audible click.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::SetContextSourcePrimary",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-2005",
+      "note": "Primary-source setting has no verified GPUI producer. Source registration alone is not this preference.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::SetFileMoveConflictApplyToRemaining",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1595",
+      "note": "Typed file copy/cut/move/conflict workflow remains open. Copying pathname text in handoff.rs is not physical CopySelectedFiles.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::SetSimilarityAspectEnabled",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1719",
+      "note": "Similarity-browser anchor/aspect queries differ from the implemented Similar Sections overlay.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::SetSimilarityAspectWeight",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1719",
+      "note": "Similarity-browser anchor/aspect queries differ from the implemented Similar Sections overlay.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::SetSimilarityAspectWeightingEnabled",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1719",
+      "note": "Similarity-browser anchor/aspect queries differ from the implemented Similar Sections overlay.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::Settings",
+      "state": "internal",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1491",
+      "note": "Forwarding, frame or viewport protocol; not a separate business action. Containing controls are reviewed individually.",
+      "native_evidence": "not a standalone action"
+    },
+    {
+      "message": "GuiMessage::ShowContextSampleHarvestDerivatives",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1600",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ShowContextSampleHarvestOrigin",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1600",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ShowSelectedSampleHarvestDerivatives",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1600",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ShowSelectedSampleHarvestOrigin",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1600",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::StopPlayback",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/transport.rs",
+        "symbol": "stop_playback"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1492",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Transport counterpart; asynchronous output fence test is not audible start/stop/loop signoff.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleBeatGuides",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_beat_guides_from_toolbar"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1492",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Timing/snap/metronome controls exist; playmark parser/application test does not certify every control or audible click.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleBpmSnap",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_bpm_snap"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1492",
+      "note": "Timing/snap/metronome controls exist; playmark parser/application test does not certify every control or audible click.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleContextFolderLock",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1480",
+      "note": "Folder-specific lock mutation is not established by source protection or sample locking.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleContextSourceProtection",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1495",
+      "note": "Source registry add/remove/selection exists; this distinct protection/process/refresh/navigation producer is not established by submit_source_add.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleCurationFilterDropdown",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/filter_family.rs",
+        "symbol": "toggle_filter_family"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/filter_family.rs",
+          "symbol": "family_choices_survive_source_retirement_but_only_filter_replacement_rows"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Filter/projection counterpart; native multi-family and dropdown interactions remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleHarvestFilterDropdown",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1898",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleJobDetails",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/job_details.rs",
+        "symbol": "retry_job_audit"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/source_registry.rs",
+          "symbol": "in_flight_scan_session_survives_initial_registry_snapshot"
+        }
+      ],
+      "owner": "OPT-1807",
+      "note": "Audit retry/cancel and job details exist; analysis job readiness/progress remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleLoopPlayback",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_loop_from_toolbar"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1492",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Transport counterpart; asynchronous output fence test is not audible start/stop/loop signoff.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleMetronome",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/transport.rs",
+        "symbol": "toggle_metronome"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1492",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Timing/snap/metronome controls exist; playmark parser/application test does not certify every control or audible click.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleRandomNavigationMode",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_random_navigation"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1492",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Random audition/navigation counterparts are distinct; selection test covers origin policy only. Native audible acceptance remains open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleSampleBrowserMapView",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1709",
+      "note": "No GPUI starmap render/selection/audition surface. Read-only backend projection is not UI parity.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleSelectedHarvestDone",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1600",
+      "note": "Harvest state/facts, physical derivatives and cross-source command ownership remain open; no label-based substitute.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleSelectedSampleAndAdvance",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_focused_selection"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source counterpart exists; full reference behavior and native acceptance remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleShortcutHelp",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/shortcut_help.rs",
+        "symbol": "key_action"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/shortcut_help.rs",
+          "symbol": "open_modal_consumes_background_keys_and_closes_on_escape_or_toggle"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Source counterpart exists; full reference behavior and native acceptance remain unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleSimilarSections",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/similar_sections.rs",
+        "symbol": "toggle"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/similar_sections.rs",
+          "symbol": "similar_results_are_fenced_by_generation_path_and_raw_anchor"
+        }
+      ],
+      "owner": "OPT-1484",
+      "note": "Implemented waveform Similar Sections overlay; full similarity-browser aspect query remains separate.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleStickyRandomSampleRangePlayback",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/random_audition.rs",
+        "symbol": "toggle_sticky_random_audition"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1492",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Random audition/navigation counterparts are distinct; selection test covers origin policy only. Native audible acceptance remains open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleTransactionList",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1611",
+      "note": "Application-wide committed history/recovery remains open; dictionary-definition undo is narrower.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::ToggleZeroCrossingSnap",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_zero_crossing_from_toolbar"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1492",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Timing/snap/metronome controls exist; playmark parser/application test does not certify every control or audible click.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::UndoTransaction",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1611",
+      "note": "Application-wide committed history/recovery remains open; dictionary-definition undo is narrower.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::UndoTransactionsThrough",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1611",
+      "note": "Application-wide committed history/recovery remains open; dictionary-definition undo is narrower.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::UnlockContextSample",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/curation.rs",
+        "symbol": "submit_curation_action"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/curation.rs",
+          "symbol": "remove_collection_action_targets_only_the_active_slot"
+        }
+      ],
+      "owner": "OPT-1499",
+      "note": "Source-owned collection/rating metadata counterpart; reference collection missing-file cleanup and ordering are not all established by this test.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::UpdateStarmapAuditionDrag",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1709",
+      "note": "No GPUI starmap render/selection/audition surface. Read-only backend projection is not UI parity.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "GuiMessage::Waveform",
+      "state": "internal",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1491",
+      "note": "Forwarding, frame or viewport protocol; not a separate business action. Containing controls are reviewed individually.",
+      "native_evidence": "not a standalone action"
+    },
+    {
+      "message": "GuiMessage::WaveformFileDrop",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1588",
+      "note": "Drag target feedback is part of the still-missing typed folder/source transfer workflow.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::CancelMetadataTagEntry",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tags.rs",
+        "symbol": "cancel_tag_editor"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1486",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::ClearMetadataTagDropCategoryUnless",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tags.rs",
+        "symbol": "submit_tag_editor"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/tags.rs",
+          "symbol": "source_page_reply_requires_the_captured_identity_and_revision"
+        }
+      ],
+      "owner": "OPT-1486",
+      "note": "Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::DeleteContextMetadataTag",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1722",
+      "note": "Definition plus persisted assignment deletion is not vocabulary-only dictionary removal; boundary is OPT-2000.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::DeleteSelectedMetadataTag",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1722",
+      "note": "Definition plus persisted assignment deletion is not vocabulary-only dictionary removal; boundary is OPT-2000.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::DragMetadataTag",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tag_library.rs",
+        "symbol": "begin_tag_category_drag"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1486",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::DropMetadataTagOnCategory",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tag_library.rs",
+        "symbol": "drop_tag_category"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1486",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::FocusMetadataTagInput",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tags.rs",
+        "symbol": "submit_tag_editor"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/tags.rs",
+          "symbol": "source_page_reply_requires_the_captured_identity_and_revision"
+        }
+      ],
+      "owner": "OPT-1486",
+      "note": "Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::HoverMetadataTagCompletion",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tags.rs",
+        "symbol": "submit_tag_editor"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/tags.rs",
+          "symbol": "source_page_reply_requires_the_captured_identity_and_revision"
+        }
+      ],
+      "owner": "OPT-1486",
+      "note": "Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::HoverMetadataTagDropCategory",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tags.rs",
+        "symbol": "submit_tag_editor"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/tags.rs",
+          "symbol": "source_page_reply_requires_the_captured_identity_and_revision"
+        }
+      ],
+      "owner": "OPT-1486",
+      "note": "Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::MetadataTagInput",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tags.rs",
+        "symbol": "submit_tag_editor"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/tags.rs",
+          "symbol": "source_page_reply_requires_the_captured_identity_and_revision"
+        }
+      ],
+      "owner": "OPT-1486",
+      "note": "Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::MoveMetadataTagCompletion",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tags.rs",
+        "symbol": "submit_tag_editor"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/tags.rs",
+          "symbol": "source_page_reply_requires_the_captured_identity_and_revision"
+        }
+      ],
+      "owner": "OPT-1486",
+      "note": "Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::OpenMetadataTagContextMenu",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/context_menu.rs",
+        "symbol": "open_context_menu"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/context_menu.rs",
+          "symbol": "stale_projection_fence_rejects_source_or_index_map_changes"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Context target/focus lifecycle only. Available action list is intentionally smaller; absent physical effects stay separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::RemoveMetadataTag",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/curation.rs",
+        "symbol": "submit_remove_tag"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1486",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::SelectMetadataTag",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tags.rs",
+        "symbol": "submit_tag_editor"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/tags.rs",
+          "symbol": "source_page_reply_requires_the_captured_identity_and_revision"
+        }
+      ],
+      "owner": "OPT-1486",
+      "note": "Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::SelectMetadataTagCompletion",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tags.rs",
+        "symbol": "submit_tag_editor"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/tags.rs",
+          "symbol": "source_page_reply_requires_the_captured_identity_and_revision"
+        }
+      ],
+      "owner": "OPT-1486",
+      "note": "Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::ToggleMetadataTag",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tag_library.rs",
+        "symbol": "toggle_tag_library_candidate"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1486",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::ToggleMetadataTagCategory",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tag_library.rs",
+        "symbol": "toggle_tag_library_category"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1486",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::ToggleMetadataTagLibrary",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tag_library.rs",
+        "symbol": "toggle_tag_library_from_click"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1486",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "MetadataMessage::ToggleSampleNameViewMode",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/tags.rs",
+        "symbol": "submit_tag_editor"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/tags.rs",
+          "symbol": "source_page_reply_requires_the_captured_identity_and_revision"
+        }
+      ],
+      "owner": "OPT-1486",
+      "note": "Source-owned tag input/category/completion counterpart; dictionary-wide assignment rename/delete/undo remain open.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "PlaymarkLabelMessage::BeginEdit",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "commit_playmark_timing_edit"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_escape_cancels_and_ime_enter_does_not_commit"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Playmark duration/BPM text editing, fenced by current selection; native IME/focus session remains required.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "PlaymarkLabelMessage::Cancel",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "commit_playmark_timing_edit"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_escape_cancels_and_ime_enter_does_not_commit"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Playmark duration/BPM text editing, fenced by current selection; native IME/focus session remains required.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "PlaymarkLabelMessage::Changed",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "commit_playmark_timing_edit"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_escape_cancels_and_ime_enter_does_not_commit"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Playmark duration/BPM text editing, fenced by current selection; native IME/focus session remains required.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "PlaymarkLabelMessage::Commit",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "commit_playmark_timing_edit"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_escape_cancels_and_ime_enter_does_not_commit"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Playmark duration/BPM text editing, fenced by current selection; native IME/focus session remains required.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::ClearRebuildableCaches",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/general_settings.rs",
+        "symbol": "clear_rebuildable_cache"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1489",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Profile-owned maintenance/settings counterpart; No direct control test is claimed in this row; native trash picker and full maintenance acceptance remain required.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::ClearTrashFolder",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/general_settings.rs",
+        "symbol": "clear_trash_folder_from_accessibility"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1480",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Nondestructive folder focus/disclosure/listing only; mutations and drag destinations remain separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::CloseAudioSettings",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/audio_output.rs",
+        "symbol": "toggle_audio_output_settings"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/audio_output.rs",
+          "symbol": "preference_config_round_trip_preserves_cascade_fields"
+        }
+      ],
+      "owner": "OPT-1489",
+      "note": "Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::CloseAudioSettingsDropdowns",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/audio_output.rs",
+        "symbol": "toggle_audio_output_settings"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/audio_output.rs",
+          "symbol": "preference_config_round_trip_preserves_cascade_fields"
+        }
+      ],
+      "owner": "OPT-1489",
+      "note": "Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::OpenGeneralSettings",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/audio_output.rs",
+        "symbol": "toggle_audio_output_settings"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/audio_output.rs",
+          "symbol": "preference_config_round_trip_preserves_cascade_fields"
+        }
+      ],
+      "owner": "OPT-1489",
+      "note": "Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::PickTrashFolder",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/general_settings.rs",
+        "symbol": "choose_trash_folder_from_accessibility"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1480",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Nondestructive folder focus/disclosure/listing only; mutations and drag destinations remain separate gaps.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::SelectSettingsTab",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/audio_output.rs",
+        "symbol": "toggle_audio_output_settings"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/audio_output.rs",
+          "symbol": "preference_config_round_trip_preserves_cascade_fields"
+        }
+      ],
+      "owner": "OPT-1489",
+      "note": "Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::SetAudioOutputDevice",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/audio_output.rs",
+        "symbol": "toggle_audio_output_settings"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/audio_output.rs",
+          "symbol": "preference_config_round_trip_preserves_cascade_fields"
+        }
+      ],
+      "owner": "OPT-1489",
+      "note": "Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::SetAudioOutputHost",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/audio_output.rs",
+        "symbol": "toggle_audio_output_settings"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/audio_output.rs",
+          "symbol": "preference_config_round_trip_preserves_cascade_fields"
+        }
+      ],
+      "owner": "OPT-1489",
+      "note": "Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::SetAudioOutputSampleRate",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/audio_output.rs",
+        "symbol": "toggle_audio_output_settings"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/audio_output.rs",
+          "symbol": "preference_config_round_trip_preserves_cascade_fields"
+        }
+      ],
+      "owner": "OPT-1489",
+      "note": "Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::SetNormalizedAuditionEnabled",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/normalized_audition.rs",
+        "symbol": "toggle_normalized_audition"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/normalized_audition.rs",
+          "symbol": "stale_completion_after_newer_fence_is_discarded"
+        }
+      ],
+      "owner": "OPT-1492",
+      "note": "Normalized audition toggle and stale-result fencing exist. Audible gain/device behavior still requires native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::SetRatingDecayWeeks",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/general_settings.rs",
+        "symbol": "change_rating_decay"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1489",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Profile-owned maintenance/settings counterpart; No direct control test is claimed in this row; native trash picker and full maintenance acceptance remain required.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::SetVolume",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/transport.rs",
+        "symbol": "set_volume"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/transport.rs",
+          "symbol": "pending_playback_intent_tracks_the_latest_quantized_volume"
+        }
+      ],
+      "owner": "OPT-1936",
+      "note": "Volume updates feed pending playback intent. Pointer capture and audible acceptance remain native.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::ToggleAudioBackendDropdown",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/audio_output.rs",
+        "symbol": "toggle_audio_output_settings"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/audio_output.rs",
+          "symbol": "preference_config_round_trip_preserves_cascade_fields"
+        }
+      ],
+      "owner": "OPT-1489",
+      "note": "Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::ToggleAudioOutputDropdown",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/audio_output.rs",
+        "symbol": "toggle_audio_output_settings"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/audio_output.rs",
+          "symbol": "preference_config_round_trip_preserves_cascade_fields"
+        }
+      ],
+      "owner": "OPT-1489",
+      "note": "Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::ToggleAudioSampleRateDropdown",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/audio_output.rs",
+        "symbol": "toggle_audio_output_settings"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/audio_output.rs",
+          "symbol": "preference_config_round_trip_preserves_cascade_fields"
+        }
+      ],
+      "owner": "OPT-1489",
+      "note": "Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::ToggleAudioSettings",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/audio_output.rs",
+        "symbol": "toggle_audio_output_settings"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/audio_output.rs",
+          "symbol": "preference_config_round_trip_preserves_cascade_fields"
+        }
+      ],
+      "owner": "OPT-1489",
+      "note": "Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "SettingsMessage::ToggleHelpTooltips",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/mod.rs",
+        "symbol": "toggle_help_tooltips"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1489",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Audio/settings panel counterpart; dropdown cascades and real host/device availability require native evidence.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::BeginEditFade",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "begin_edit_fade"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::BeginEditFadeOuterGain",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "begin_edit_fade_outer_gain"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::BeginEditGain",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "begin_edit_gain"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::BeginPan",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "begin_waveform_pan"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/waveform.rs",
+          "symbol": "middle_pan_drag_uses_captured_viewport_and_generation"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Pan generation or wheel direction fixture only; full viewport gesture/native acceptance remains unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::BeginSampleSlide",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1608",
+      "note": "Captured whole-file audio slide requires durable publication; moving a selection marker is not that effect.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::BeginSelection",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "update_waveform_region_drag"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::BeginSelectionMove",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "update_waveform_region_drag"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::BeginSelectionResize",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "update_waveform_region_drag"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::ClearEditFadeSilence",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "clear_edit_fade_silence"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::DragLoadedSample",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1478",
+      "note": "Default-application open/OS file drag route is not established by clipboard copy or Finder reveal. Native handoff acceptance and a production producer remain required.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::DragPlaySelectionExport",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1623",
+      "note": "Region drag requires a retained source-owned artifact and delayed consumer lifetime.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::FinishEditFadeOuterGain",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "update_waveform_region_drag"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::FinishEditGain",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "update_waveform_region_drag"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::FinishSampleSlide",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1608",
+      "note": "Captured whole-file audio slide requires durable publication; moving a selection marker is not that effect.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::FinishSelection",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "finish_waveform_region_drag"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::Frame",
+      "state": "internal",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1491",
+      "note": "Waveform frame protocol; not a separate business action.",
+      "native_evidence": "not a standalone action"
+    },
+    {
+      "message": "WaveformInteraction::ScrollTo",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "update_waveform_region_drag"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::SelectSimilarSection",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "update_waveform_region_drag"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::SetPlaySelectionFrameRange",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "update_waveform_region_drag"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::SlidePlaySelection",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "slide_waveform_region"
+      },
+      "automated_evidence": [],
+      "owner": "OPT-1493",
+      "note": "Production source control anchor. No direct test is claimed here; behavior, cancellation and native acceptance require review under the owner/native issues. Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::UpdateEditFadeOuterGain",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "update_waveform_region_drag"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::UpdateEditGain",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "update_waveform_region_drag"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::UpdateSampleSlide",
+      "state": "gap",
+      "handler": null,
+      "automated_evidence": [],
+      "owner": "OPT-1608",
+      "note": "Captured whole-file audio slide requires durable publication; moving a selection marker is not that effect.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::UpdateSelection",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "update_waveform_region_drag"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/view.rs",
+          "symbol": "playmark_timing_duration_and_bpm_commit_update_stopped_selection"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Waveform gesture/edit-handle/viewport source counterpart; timing test covers selection application only, not every gesture or native pointer behavior.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::Wheel",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "handle_waveform_wheel"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/waveform.rs",
+          "symbol": "gpui_native_wheel_sign_routes_up_to_zoom_in_and_down_to_zoom_out"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Pan generation or wheel direction fixture only; full viewport gesture/native acceptance remains unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::ZoomFull",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "reset_waveform_viewport"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/waveform.rs",
+          "symbol": "gpui_native_wheel_sign_routes_up_to_zoom_in_and_down_to_zoom_out"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Pan generation or wheel direction fixture only; full viewport gesture/native acceptance remains unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    },
+    {
+      "message": "WaveformInteraction::ZoomToPlaySelection",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/waveform.rs",
+        "symbol": "zoom_waveform_to_selection"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/waveform.rs",
+          "symbol": "gpui_native_wheel_sign_routes_up_to_zoom_in_and_down_to_zoom_out"
+        }
+      ],
+      "owner": "OPT-1493",
+      "note": "Pan generation or wheel direction fixture only; full viewport gesture/native acceptance remains unverified.",
+      "native_evidence": "unverified \u2014 OPT-2009"
+    }
+  ],
+  "source_inputs": [
+    {
+      "path": "crates/yield-ui/src/beat_count_input.rs",
+      "sha256": "da5bf6b220f53a0089b801bf84c0569c29fe8210c804e0bc5ac720ec753f688d"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/accessibility.rs",
+      "sha256": "d4b7eae92d2225e14e74325122b0e19631edef3e67e6911a2d0d21dd5b3a77b4"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/audio_output.rs",
+      "sha256": "f4d02c3fe498f3901e2de5993f70fa5b8f8eabc7eee880acd867955dfd693c0d"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/catalog.rs",
+      "sha256": "cf13d144787193cb0eb68629a90e98f5b763d6eb68941110429fa50c438fc82a"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/catalog_metadata.rs",
+      "sha256": "d6e15d5ccd468ddaf247833398a85ce150ce85e18a8c593402021c8d21db3f80"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/collection_rename.rs",
+      "sha256": "1c857b577bbe89a8d94d6cdd021a90d79bea13cc2a656f28569742b612dd3208"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/column_layout.rs",
+      "sha256": "cc4a575618593d90d2f477721f87611bf0f5069b1012a516a752a62589b27ca5"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/compare_anchor.rs",
+      "sha256": "cdba0e433461644df48def13906382263f4ce4550b0572f30223d41f55452531"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/context_menu.rs",
+      "sha256": "14e0fcd0fa160d24d18fa0fa9b5f5ac57ace7277f64fd995c6cb4280cb17c478"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/curation.rs",
+      "sha256": "88fe40f33e93e843115a61c1837c5d2614e2ee1283ff30e2d3feff5c8c420c42"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/curation_queue.rs",
+      "sha256": "2d4bf9ed92c2ec17976593092f55b80fb07f00347a52d1c5ca1a7873b60dc828"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/direct_random.rs",
+      "sha256": "7a2044450ead003bfdfb2c019dd51acc6b1e36bb5890c352f31b96791acc38da"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/directory_open.rs",
+      "sha256": "434373579f4468a0f6566b17880b544b7450b56ce7ad81028b2f480af1ae3999"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/display_labels.rs",
+      "sha256": "df4850dfcc750a4796ef90be8757ecbe22f817d72cf6aee7e394465118398086"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/feedback_issue.rs",
+      "sha256": "6ebac2bab1d91c3ce6c577810bc0f7d2632df969617b3b1c9f1bd7025d1997a7"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/file_drag.rs",
+      "sha256": "7c11dad77d0f7c6e28235ae21ddf95cb863783230f2597a265e7ae4e2e77d003"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/filter_family.rs",
+      "sha256": "bd5b6c750f51ce439240717194e778ac7009187648034d9818922dbd0bc246f0"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/folder_keyboard.rs",
+      "sha256": "49f0deb19500ba6370a8568c06a1557eaa5cd3ed775353a0c8b182ef54cf38db"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/general_settings.rs",
+      "sha256": "fdbfc656c5285255100c36656d6987007cbd5b9644fbc37087970ee074707b17"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/handoff.rs",
+      "sha256": "0d3dcd8a66441554e5d4fa0021cc7d9c1d68d76fcb16bff1a3fcd4f15d1201cd"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/history.rs",
+      "sha256": "dfa8fdffb38ad8623271edad24efd7249b101d5ebca0249ef343d0ccdea0b111"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/job_details.rs",
+      "sha256": "308c4049aab43cb75aaf6ed1fc4d19ea4e4805eab75cef8533f130469baf5583"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/metronome.rs",
+      "sha256": "b1514ad9a04aed63708de360ca6c21b3b982546de9772ca550e2720bca0a2d16"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/mod.rs",
+      "sha256": "03194c0e0de8362f69181b873a4c0581f987f7261eee70066eb3b25198c7491d"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/motion.rs",
+      "sha256": "5524ebb47060477ef6d92eeeb9fcd267eb91a45e8855f1000aac30d41aedbed6"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/normalized_audition.rs",
+      "sha256": "2237998a791807b3add47c7f337d4a15a76bbab5a9b1c7e4ff4ecfcfd92b3ad3"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/panel_focus.rs",
+      "sha256": "4a2c3815c9fb17fa33ff929c462c58ef550e01f5622fa4df226722658a92b81c"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/playback_age.rs",
+      "sha256": "d982060c2b608b8dc8d7ca3f6dff67fd8eda537893a261b93df1994a222ff860"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/played_ranges.rs",
+      "sha256": "c12ce3ededcd0357edc4f45a23afc9de6a1be8868a0fdd49e2eb0bb1b4b8fc11"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/playmark_timing.rs",
+      "sha256": "234b48c42ed1be8b9718b049482ee5bac5a3aa229eb97310c59647246ad6b85a"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/preferences.rs",
+      "sha256": "e3401a8da89c181c5087cf2ff5e419865e83e8a0491b23754c6d936ad20393a5"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/random_audition.rs",
+      "sha256": "94324c9f1429f7fe6c1cafca082554abaa56ad823922c5d29d2bde97c136508e"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/rating_decay.rs",
+      "sha256": "ff8b2a18d058d9e21e37d7c1f76ad876e89e5dae6a34e63e668872cf5a473713"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/shortcut_help.rs",
+      "sha256": "276583a2613694fa01f29fda97048fad8350f1f5a389cdacb678c48511989f6a"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/sidebar.rs",
+      "sha256": "6a492f7a4b5e588714fcb0fcad74f22c1197a77d4dc62e5022a1492907b94f0e"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/similar_sections.rs",
+      "sha256": "40db11204411499ba7888b41f1caa688d4ef7a111765f43682113ae49c34156b"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/source_recovery.rs",
+      "sha256": "e71a414064df7fbe7970dacb7e0d4bf245f4e23a8a2e35a0e3bfd37d1f3ac238"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/source_registry.rs",
+      "sha256": "d2ea2dc20ca3605510ba92e4c53b1e8ef2e7a52c23ba17289e886311088b1069"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/status_log.rs",
+      "sha256": "29d1fabcfd2a32f71d04093ec46fe21eba1474d1f59b0a3888f1370326d803ec"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/tag_chips.rs",
+      "sha256": "3453d0846129e87a73f550e94456d82f6d849964fd419872cbd196b3488d4c36"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/tag_completion.rs",
+      "sha256": "322672aaa11fe983ad95862109827ef4128871afabebf1c6568f12cb7be312a6"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/tag_dictionary.rs",
+      "sha256": "11084df6848179331091d0d0238e6aaf8bd5bbc3d2aae662798b45fa2cdd4f89"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/tag_filter.rs",
+      "sha256": "549cf05f44feacd15012d3404b7a8899a2245928962d9828055791e83ec12669"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/tag_library.rs",
+      "sha256": "891285353850f222ebe2e70bb83b2a596765ff6a38e19d07c48e23dba90041b4"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/tag_pager.rs",
+      "sha256": "fb1b40e603266a6593718b4bf45e056b8729f267221610f2df128616e5d52867"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/tags.rs",
+      "sha256": "5f9f5fdd66e897de6f6f7a6b497938328093d3b29f8fc682fce62a932812f80b"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/transient_markers.rs",
+      "sha256": "bc70c940e7f5b9fa61d51c392cb234120968cbb33a934f9d496b0ed251b8b846"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/transport.rs",
+      "sha256": "492b24c3e176f59a3031478d90885c4eef7b098639e3175cd66f8b5ec6f85aab"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/user_shader_runtime.rs",
+      "sha256": "d0347a3a21ada6e02051bd7cea7f19c377de3b9cf8735ff3b21e8b2ab18c327a"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/view.rs",
+      "sha256": "3b15e8694301a6bc13da993417dde260a0bf26110ba2e0f896c3c98c48c9ae2d"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/volume.rs",
+      "sha256": "437e69ce03af28a12f76a6cf997871f579beba5870b841b49065da1a8fce5e23"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/waveform.rs",
+      "sha256": "680d500ce82a0fdf9439de83db43e848f834d8482ac9a080aec2be665434f2b7"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/waveform_detail.rs",
+      "sha256": "9cc02eb5b6b7ee5d628f0241f1c518276f935d0ed40aceb63ab8d08e09624eff"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/waveform_fades.rs",
+      "sha256": "178de7b5fb39fa81ae24abd91400e4320a6be0a0ab4167d62d493b03e6edc865"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/waveform_scrollbar.rs",
+      "sha256": "2db8313344c4b9aa9739c49bfc4b1219e2a2e25811b5c8335180bb38d932fa09"
+    },
+    {
+      "path": "crates/yield-ui/src/browser/zero_crossing.rs",
+      "sha256": "66cf7037fce46ae63ffa6e0295b80730438bf87adcc75217b86cd656f79a42da"
+    },
+    {
+      "path": "crates/yield-ui/src/external_clipboard/macos.rs",
+      "sha256": "1b7cd7a04ec147d27beaf2782279eb33ca8cea3334c8aa1188e253aa9d5ceb9d"
+    },
+    {
+      "path": "crates/yield-ui/src/external_clipboard/mod.rs",
+      "sha256": "eabeae98cd0e48908b774cbf2bb974971c292d1bffb093d19f8dae15f70243a6"
+    },
+    {
+      "path": "crates/yield-ui/src/external_clipboard/unsupported.rs",
+      "sha256": "e423a0283054f86c0727774fc7993373ee955559f48d4d6098eb9b4c2e19b55b"
+    },
+    {
+      "path": "crates/yield-ui/src/external_clipboard/windows.rs",
+      "sha256": "dad53d5e4914cff89a33cfee6e19063cac51ffca41920598e9bc29d7b4f78a43"
+    },
+    {
+      "path": "crates/yield-ui/src/external_clipboard/windows/handle.rs",
+      "sha256": "296321d857d44dea7eff895b1fd447d24fcaa68403dc5e1777160191062ea2df"
+    },
+    {
+      "path": "crates/yield-ui/src/external_clipboard/windows/hdrop.rs",
+      "sha256": "2ea536bf84a4211ab38c96512d0302bf11c3a4735e468e84b97da4895e209e7b"
+    },
+    {
+      "path": "crates/yield-ui/src/lib.rs",
+      "sha256": "62e5416a7da1a21b0d0fc29d86fd8dd4f6dddf448786d320044e70ef42df4a45"
+    },
+    {
+      "path": "crates/yield-ui/src/multiline_text_input.rs",
+      "sha256": "73774d965c174814d1c9ab834031dc2bbbd74d12203f74b8afe2bdf1a8e33675"
+    },
+    {
+      "path": "crates/yield-ui/src/search_input.rs",
+      "sha256": "edd4c2c2c7dcbb3148e91096a258b4718896fd57c1bdd2ffbf9b4e330adc8aeb"
+    },
+    {
+      "path": "crates/yield-ui/src/theme.rs",
+      "sha256": "5cc419bdb38d458d27c9065d47d6f6ef0319d42227cc80bd14db0e6c40b137e7"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome.rs",
+      "sha256": "3fc7b2717c58862fae4ed35b819c821ca09382242da7086e723384bce3364e05"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/browser_context_menu.rs",
+      "sha256": "f8cc4376d28eaa635859a43af9d68bcf2ca629de83d0e030074c869a5905b196"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/center_panel.rs",
+      "sha256": "7ffe63e044981c67eb286a31355d84b81816b178461e49df719b8f853e56d02d"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/layout.rs",
+      "sha256": "e90a4b44b8bb94b5c7b94d6f623b22d2eb492bccef723f47a00c47472c1e5afa"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser.rs",
+      "sha256": "ed039480a7ee2a1c11918af12316838811163ce41fd8e41dd17ff5080197ab51"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar.rs",
+      "sha256": "ce70fe77411d57712dd1237db94a6c74b80d450764c24b08c2ccb41fc29172ba"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/collections_section.rs",
+      "sha256": "5e8912ef5c4c9088de8566b2b3715b596e535380f50d7be524cda6feb933d7df"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/collections_section/identity.rs",
+      "sha256": "4bbcb89b975385d0e724949bdeb2a1634fdb4ef55c79747fade1ce0cee225a5b"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/collections_section/rows.rs",
+      "sha256": "c923796d33e7ce36a0624b336e77c216e25abdecf93971363957687627bafbe9"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/filter_section.rs",
+      "sha256": "b30cd91597e1775571c37c1563785a99cb0c0b52ca2bc9467d85d36ff03b9879"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/filter_section/rows.rs",
+      "sha256": "000c2b4f08e8c7a6329992a967c981af60b43ef9dcab68a02ce8a1bc8297ba62"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/filter_section/rows/projection.rs",
+      "sha256": "db1ca84ef8c7f278a3c6b79794dc2a25427371c4bcf128f2ba233f2da9d20b8a"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/folder_tree.rs",
+      "sha256": "3408a3e9834e939b1fa72d3a5fe6bf50b5a6d644a15de096ef1992db5557cd26"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/folder_tree/identity.rs",
+      "sha256": "4613ad2dc086898e9a0f843fb2ad3e147e953a8dcf2738d1c6fe8722d39e611f"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/folder_tree/rows.rs",
+      "sha256": "1edf02dfe4ca41bba0437cdf7f0bb7e3c668db9ac0f7f090da41c04e05ae60e0"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/folder_tree/status.rs",
+      "sha256": "afea3adb14ad12437c4373636efa47de4efe6a6e19b586e02f6bb7e233f9bf7d"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/harvest_family.rs",
+      "sha256": "e0614773a0ca1bddef51de8d543fbecf43afb002872af5d832c5ba9e4e4d1d4d"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/overflow_fade.rs",
+      "sha256": "0796da42428c8736eff5f5afad944c25ca0f1938e6a20826e6f4a3ccc84a45f6"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/sidebar_row.rs",
+      "sha256": "6ddaaaebb57286125a73c05b735d66540fa67a90485c61b77eb5bd47f3df9455"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/source_section.rs",
+      "sha256": "c0f33720ec50769451bd57d6c0495fb8e698178e118d304a7e0cd18b218d699c"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/source_section/identity.rs",
+      "sha256": "a558f4299fe83a9a3a90f73314c9288d850bed3ae4737894715bc81e4cb5034a"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/source_section/rows.rs",
+      "sha256": "fb1e2cbf549c7514e6d4331b0b573308eefc1dadbcbc52cd720db124e8b565e5"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/tag_completion.rs",
+      "sha256": "e80f492dd600447e94ff5d2bd5c18ba5f397f14ad9dc5652dc6adb72864a325b"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/tag_editor.rs",
+      "sha256": "73151054eb8e4f4745043f3fe0ff4a57acaa6d4cf246e69fabaf19542d4aa158"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/tag_editor/identity.rs",
+      "sha256": "230607734476b7851d4f8a8d94cb52ffe6fbbd336bea5efa380208782a492682"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/tag_editor/projection.rs",
+      "sha256": "f3eb19ca54271a76d874659b6fb95b5d57b0c018074d4d17482872663ca38c88"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/tag_editor/rows.rs",
+      "sha256": "369ff17c919208f2f8cd9c5235c291f843244e6fe77a2335457d80c9ee855b2e"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/tag_entry_layout.rs",
+      "sha256": "2d844d739acb7f8e0b91b19581e772877a4f186ffe9faff9e7bc17f4edb03df7"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view.rs",
+      "sha256": "bc10d103ff11ca12f7fb478f57abceb99fb199134a0a0bac797e3ac91e57a58b"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/cells.rs",
+      "sha256": "fcfa81c6a4c7476561a92872ac7ffaf03843f00a119972e7438616b4ae250c5f"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/cells/projection.rs",
+      "sha256": "94918ecde65cf374c3048464e1da68bd2e0a2fc36642b3d5897f0afc422b1d93"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/header.rs",
+      "sha256": "8bde251913cb8863e43748beeb4d1993322168acef157e0c08f64db60b66aa87"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/header/projection.rs",
+      "sha256": "d38d5f67664462384c8949942b8dff74984f64ce1f6cedc9550576a3c42c9efb"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/hit_target.rs",
+      "sha256": "46fbeaa22771e21c81c28ef4776f9722e348624826ab64be52ef46b2ef59cba7"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/hit_target_tests.rs",
+      "sha256": "4803e07b5a52c7f758f80f70d91cbfe798e0bcac0304d5da4a2f5c2f9d6aa1ef"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/identity.rs",
+      "sha256": "d612ff6629dce4f9c84714a4ba5a4c11e6843219976a4534089f0e0272207a7e"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/row_projection.rs",
+      "sha256": "321aee57a0cc5b4aaef17adb297c4381c54dd991bf8ef93019ff41d7a0078876"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/row_widgets.rs",
+      "sha256": "6acd2acd77370ee3efec53d4ca6c292e9637963debe8fdf66e03aba264129dc3"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/rows.rs",
+      "sha256": "95136d90eca3593ace483922ab28e7a94da64368400d1860c8bf20b86085bb65"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/rows_tests.rs",
+      "sha256": "c1dba33359195dd15f126f89efe07f168137863cc0d2e3233ed1c13ef1cccf08"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/starmap_view.rs",
+      "sha256": "854fd6dc7151ced538eeaaea40b6e99fc9f83f13ac093e4f8c5c24f5abf5debf"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/starmap_view/hit_targets.rs",
+      "sha256": "89f83ea253bfd3f89c82472255e25868f71b307808b15afe1556ac9ac124b1d3"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/starmap_view/overlays.rs",
+      "sha256": "a7a5da89656a4767411fbe0885b18aef2794718e994a752a722e96db9c375fc7"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/metadata_tag_library.rs",
+      "sha256": "06d2e8733154c1b3ec7fbb45d5a9db1f267387e233f805e8fa9f05b408e325fe"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/metadata_tag_library/identity.rs",
+      "sha256": "09e36dc26d2e6dbfac8a9606656f5af6f1a68b21da11138e42218fbbfd70fe43"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/metadata_tag_library/projection.rs",
+      "sha256": "cdb3dd21c89802c2cb8eb05f40b682ca2296bb5051f412f411cdb39557eef06c"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/metadata_tag_library/projection/tests.rs",
+      "sha256": "b53331f97452d5da43de518add1b465188a8b30bfba184d8d4ca498735e5c27b"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/modals.rs",
+      "sha256": "8782325fcd489282f464dca43157bc1431939ec7686ade1b7d3edefb9cb5ec0f"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/modals/identity.rs",
+      "sha256": "9ccae1521dfb87b1e1afbd1bb43cd112477881c279d60b62d6d674f5d175a5c8"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/modals/projection.rs",
+      "sha256": "7227ab64e89b0f730bbda2e544aab9ac3fccfa8a9d560566e0c1fb6ca52976f8"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/palette.rs",
+      "sha256": "d80e65e014b6a9a8ec2bbfff77f10ee25af1fbbcf7b413f0b7c1efc40a2baaad"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/sample_workspace.rs",
+      "sha256": "30ce454dab59114b7fb8e9e0ab0bc65cab3a662ce2b7e88aa6310c93ece62169"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/scene.rs",
+      "sha256": "6a00c257c24c1ebeb5f7282c5b88401e23d8f3c8016e1349359b30b9e8832523"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/settings/mod.rs",
+      "sha256": "54f2aa81752b716badff0b71663414f5e2122ceebd339d9379aaebaa666d4905"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/settings/top_bar.rs",
+      "sha256": "0c482d0eb2aa9f345c4277fb3636021cb8d59e8f3a42bdca4f19e335a40764e7"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/settings/top_bar/projection.rs",
+      "sha256": "27f171f912d7b78627197e8a9a4be68330d75f5f88eebce4aabaa660e6a0123a"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/settings/window.rs",
+      "sha256": "c2b6d3cd6b74faa8577914cb8d880d91226fe530e669f83edeba9579ef20f143"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/settings/window/dropdowns.rs",
+      "sha256": "01a9ce0510840f56af26ca3d7022675ff313402a35c007729fbbbe052065f123"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/settings/window/dropdowns/projection.rs",
+      "sha256": "d911c4f5e6c368dbfa89d359dfed55ab38c04ee424cd5ce88a8e016b5136c8e4"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/settings/window/panels.rs",
+      "sha256": "cece4f34987cf5385b55f620f7fbe3f9d5a1d997f6c3ab0e7d9527d8f840b23f"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/settings/window/panels/projection.rs",
+      "sha256": "c837ed8c65ec98b90410f6626e3643c28a1b20e99139e6e9036c93acd6bcfad0"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/settings/window/sidebar.rs",
+      "sha256": "9e9fbb54d05709a45a66b362444f77168881ac0777e080eefeee3cea7a324cf0"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/settings/window/sidebar/projection.rs",
+      "sha256": "c496ec2433a854205fd04481572090351554b587c146a85c29fbb9beadea43f8"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/status_bar.rs",
+      "sha256": "fd2ffae7ea971eb04ba946963411f38264a834362448ab6bb933e421ed1b7996"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/status_bar/identity.rs",
+      "sha256": "bc8d4da6108000219041d7cac91d90997d263161413c98f4145a6349d8c545a3"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/status_bar/progress_indicator.rs",
+      "sha256": "6b35e1e21d546f94bb8e5461c4efd274fb87d54abd87e10195e16f5601dd280b"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/status_bar/projection.rs",
+      "sha256": "3d8e80f0123ea61c09eccd3991b16403dfb08eee73089f4a4acb3e840ec66132"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/toolbar.rs",
+      "sha256": "d49ad8d0fd4fd53661426028f443afef90066ee1a48c14f764568d887319a864"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/toolbar/beat_count_input.rs",
+      "sha256": "81a19162091ccc9de4f6a5b97a22ecfbcfddddc2b900cbba115a63e3117ae33f"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/toolbar/icons.rs",
+      "sha256": "2e4e64150b656d46844d8a517e8b944b5d6a3086c5946970741629edbd5b849e"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/toolbar/identity.rs",
+      "sha256": "315bca5ffd40b77e0b938a2861e3dee82c20c3ddbda799beba1ec5d8bc50842e"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/toolbar/projection.rs",
+      "sha256": "9f42ba71f4fe5103608c5ae02fda7a93e3f8157cec6912f5b3aa60edd6c77670"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/view_models.rs",
+      "sha256": "2f900d95669f79b46f1519e0f0e9883f8306556f23e1c3bb08129f9bfaf5c87f"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/view_models/library_sidebar.rs",
+      "sha256": "8dc120a5e5f2db534584bc9e0d77fccc0727609dc7d732684970534a58019568"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/view_models/sample_browser.rs",
+      "sha256": "1d2fb7643443ca14baf5b3be731be71611328cdfd8aa975cfe4ec6e556ddfb11"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/view_models/sample_workspace.rs",
+      "sha256": "63a8c2373f096ebce2db3fb8caea1ead86ae082673bef9765ed533097882bb4e"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/view_models/settings.rs",
+      "sha256": "d209db3562f62172637ef0642e24b9fbe7f79cde66d20a842b1e69d854f2312d"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/view_models/status_bar.rs",
+      "sha256": "a69822a072aa104ff5eaa83937e6295342a840b9fc4358fb6ff55d8dfc4110f2"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/view_models/toolbar.rs",
+      "sha256": "655c563884b526d89454356d339fde70927a34f0262b6543de3d2bd5ee50f528"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/view_models/waveform_panel.rs",
+      "sha256": "71412ce549ca72807f3970406d1714fd18853c035785645359b2ad9f27a9b578"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/waveform_context_menu.rs",
+      "sha256": "f57fa9c2c3e0abb1b26848aec4eed159b1ff44a4dcc3e3272ecea725e60952c3"
+    },
+    {
+      "path": "reference/radiant/src/native_app/app_chrome/waveform_panel.rs",
+      "sha256": "57ad2c277307098694a066e35c0a534b9d33487ebb5fcf32549b0b2b4769db69"
+    },
+    {
+      "path": "reference/radiant/src/native_app/shell/shortcuts.rs",
+      "sha256": "7a7917be4ec0421050c0e111dfbdb743435be51a6d7f310ee3d1154b9c129ef1"
+    },
+    {
+      "path": "reference/radiant/src/native_app/shell/shortcuts/help/context.rs",
+      "sha256": "e2d9931219ecfc08466873558a665779cd70c5edf5de8eb7565c8fb03d8e2428"
+    },
+    {
+      "path": "reference/radiant/src/native_app/shell/shortcuts/help/defaults.rs",
+      "sha256": "cdaedfbbe3ff2e4f072fa9f1ffe555963b8fcd30d6a31ac1cb8ad9948de22d55"
+    },
+    {
+      "path": "reference/radiant/src/native_app/shell/shortcuts/help/editing.rs",
+      "sha256": "52fe5eadb27a9e5761a455ecb42ded8e317027d75225cc8109d49bb67c8d40c8"
+    },
+    {
+      "path": "reference/radiant/src/native_app/shell/shortcuts/help/metadata.rs",
+      "sha256": "3d26dbb33e14410ad9b1d567893d232f5edbc157e40a3e2d1d7d7e5460eeffde"
+    },
+    {
+      "path": "reference/radiant/src/native_app/shell/shortcuts/help/mod.rs",
+      "sha256": "e8a4a113c0fc0c430ac711dd800bc2f9afec8882d27bb7b3483b5ce8a284acc5"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform.rs",
+      "sha256": "d4cc189e166af4a753bf103256c8c63a0a0fefd1b6b6f29fd9c4b3c4722e1900"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file.rs",
+      "sha256": "9d6fb9bca460ebaf9f3469f22841f12522146990463e50fa3ef8c93cf09ecdb0"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/cache_facade.rs",
+      "sha256": "3f34b2e0bb6cb4c4a87ca6dbfc5b06a422fb0c0a3a5f6cccdf81b3dba39ea76c"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/construction.rs",
+      "sha256": "90a2e9b9d878072de80c2afce92908238cd44fc76daa01a75cf84648bb2dca8b"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/diagnostics.rs",
+      "sha256": "53e6d9b1935909f7c7a574d28de3f59665f46bc98feb9b66efe8d9950efec8c2"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/downmix.rs",
+      "sha256": "ae963cc39a5b35e339d414925625e039199162b9dc45b32c9b983b3b48af281f"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/extraction.rs",
+      "sha256": "625ea8ce949c958abd5b5a896094e2f6e80cc03f4d99f1e7e0cb69b0b29eb77a"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/extraction/output.rs",
+      "sha256": "7046b4b70ba98fbd4ec2197b9bc6d48c8486797c24492050469bc72f1b1b2215"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/extraction/raw_wav.rs",
+      "sha256": "abb9684a0987e73bcf8e38780900b77448432dde612dcdfb392c7295b77021ad"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/extraction/raw_wav/fade.rs",
+      "sha256": "3c0e76358f488f3373af92ab763153cc0bac77c54a1baa5f00794c8e464cf8a5"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/file_io.rs",
+      "sha256": "1befc27b6b491a7e5f1084d414fd333a13adc3ed5046ba97f0aafeccfa62f275"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/loader.rs",
+      "sha256": "afcdd5bc5e488cbd9cdde0cef0eb437eaa1b7af0daf30cdc6f7f220d40ee0a58"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/model.rs",
+      "sha256": "311b2b796f919de86ef9f90bfb3d867490fd63038b3be2cab22e2ceb60bd0c21"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/preview.rs",
+      "sha256": "4ac67d1ea984f72b1670de1ed00fe7f0119e9981309ae13373e73372d1540e6e"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/progress.rs",
+      "sha256": "02e5cd631f459013312e12282e4e07d3e37a7906115c70fb96322b2839e6dd49"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/signal_summary.rs",
+      "sha256": "45b77a2eea90ef896a505f1124d8f7efaee8f20be38f905767e148bf27f3e6dc"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/visual_bands.rs",
+      "sha256": "7aa6bd29967f2a32d9583539fc5f365b5ea5f3b5b00b605b03bcbb482fc74628"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/visual_preview.rs",
+      "sha256": "556f29c0f92cf2c7df134095dbc4c6370a82fc227df90b69fd1f8f3a710aa71a"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/wav_decode.rs",
+      "sha256": "d727ec4f22a9369f99cfd524fc6a43215eea8b66be675bf3a19943fb363a2e27"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/wav_format.rs",
+      "sha256": "4c09f488ef71ddf69d91867798e2b6cd67cf5e09b8635b3bdda5ef1717795197"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/wav_summary.rs",
+      "sha256": "e7054cc091615a64f7116b3d7fcfb8a9a296692031243345794b7dd41bba01c5"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/wav_summary_builder.rs",
+      "sha256": "ea6a99742aac30c2d23a0ba56adfdceb233676229936f78b7b22d27a16395810"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/wav_summary_hound.rs",
+      "sha256": "c7780580777fbe09288e57a9a75f569e555735343c0da3ad31e563ec1a901368"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache.rs",
+      "sha256": "8177eadada3b277ea64a0764d9cf3de7efacf429c812609e7d2255531b1f403e"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/diagnostics.rs",
+      "sha256": "a63b7cfbf291bb91d8f4cd1222d4ef0ff1e8a3e569b83ac2a22e4ef39995ffcc"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/format.rs",
+      "sha256": "4d90fafd314f43113db455a518b9e15d79bb4cd557203d696ed054f20208785c"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/identity.rs",
+      "sha256": "579536f0b9ef4a3a39d93fefa2542ad190cf519dc2d5e80088b79c8da1b8b391"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/invalidation.rs",
+      "sha256": "79f10f4b49dbc5302e6e43b38ef01406fe4e033f58107cbb7cb733084b08dc43"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/playback_load.rs",
+      "sha256": "dd3d513a022ecda416b3fa285d8f8516603733dbe5d6ccb1c509e7b384681665"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/prune.rs",
+      "sha256": "157784a682eb90c9e112ab3fa3745ed8f5dff5bd6b2554b4cf13f0bdee5d144f"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/read.rs",
+      "sha256": "430f90f8a23027ce99299e74548971f8a88a1eb60127e4e22fbb4cb5c3cce199"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/remap.rs",
+      "sha256": "94da598903299b208c790f591691d3e3ccfa88dbdc5ecb501be8e49aa8a35c26"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/store_queue.rs",
+      "sha256": "63532e20df227a7474a8aeedd2f839f7756fa46ad2754eb51b20c4731380888f"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/store_queue/diagnostics.rs",
+      "sha256": "a96eb46675d254bdb6caf672ec4bc4077390a30dafe420a10957d5c12b5c82fb"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/store_queue/prune_schedule.rs",
+      "sha256": "69bb178c277ef284c1fda07eebd9c5010c2bbd8246bf9022867041eb3307f6b7"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/write.rs",
+      "sha256": "6649b48daa2e57fa02c47fbbb13c822c4d259fcf94df4246c77660b988522b67"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/write/outcome.rs",
+      "sha256": "ca954305e6c011e5a00ec54fc8e154b8270e7c9c1c66c2856985eee2441f0369"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/bpm_snap.rs",
+      "sha256": "7da34f9ab6f78d287830ec555f45b508a882aa97f3b5c209fb01b67fcafb775b"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/edit_fade_curve_paint.rs",
+      "sha256": "0ec0c49841af6fced6712356cb7cdb88ed54ecb0506fd0befd2b870cf6386af8"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/edit_fade_geometry.rs",
+      "sha256": "fe89436664d0091c95fa04d0e454ffa1960589e748905f035ef7783a60d7d5fb"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/edit_fade_paint.rs",
+      "sha256": "da5296305ddce79dad0e7bebf60f20b0c2b25d84c9539dc14d175b54c02b5e1f"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/interaction.rs",
+      "sha256": "004c8b39a8957f0391709a4f5e57ff4b942864f93cbe392ebfc542a923a929cf"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/interaction/edit_fade_drag.rs",
+      "sha256": "48e21fed4ac46e817a3ab30b9d5635f46efd3c26739d69b9f421d5d1a504f752"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/interaction/edit_fade_resize.rs",
+      "sha256": "b8b12bd31524965fca6693f217e83ad8caa036b3f1d4071ff941614fc6f8a20c"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/played_range_paint.rs",
+      "sha256": "4dd2421743936a2036b867c2b3fa28f70b5c2daf3d604ac5797597db41660b22"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/playmark_label.rs",
+      "sha256": "e4f731940a52dd35f28ea816a27bfc91acc2dd6295ab7ace8ea18a356110c916"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/playmark_label_editor.rs",
+      "sha256": "96d5722a25073b479e30431a59864b957bbc689c52215ce8460023ab486a71ec"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/selection_paint.rs",
+      "sha256": "700593abf2dbe150f5f762d4a79c71b050480b03a3a7f8f00fbc84dc12f48bf2"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/similar_sections.rs",
+      "sha256": "88a112aa4c7163b03411ac83e1628370975cd38fc561a253c7f1a45560d81372"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/similar_sections/source_loading.rs",
+      "sha256": "be7e346af26c29d354410679f922a3b977caf0179292c26cef307c8f23824de0"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state.rs",
+      "sha256": "2cbb3998f6857a59f0300fd416ee624946ab216d3a290630024d507c3602ecd1"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_extraction.rs",
+      "sha256": "2cb1a0c2e0c74557d6e2091408568691bb4d82141219e582db254c0c3ed1c250"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_file.rs",
+      "sha256": "73ad53af035618223989969ff29e25936ef78f5c56bd29a61ec1980ee8e1bf00"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_interaction.rs",
+      "sha256": "8fda51dda9dab30fc2083f707c4378e953443ef174467f2022d13fe6d3b81a83"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_loading.rs",
+      "sha256": "0859a8cfb3b49a732b4dd9e5cb235ea87951d23e306f7452245a1ef63b618fab"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_marked_ranges.rs",
+      "sha256": "1fbc5b51ee066f43de0d2cb25be3b2751df694829d417baa4e70a4e2ed1629ff"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_playback.rs",
+      "sha256": "7d643ec2175da6b49afd8a1245d7fcf32f9d4ce91b31af2f255946bc4b97dc28"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_preserved_marks.rs",
+      "sha256": "87e69d97c37cb393da31fe3f0dca039f7e7ae255972b0697bf6bb2d8d591a30e"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_range_history.rs",
+      "sha256": "00183267e76b6280120fd1c0b1e4fc2dc78fd8743af2a74e243bb9e5dc20ab5d"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_selection.rs",
+      "sha256": "52e9202f8dbd928f2f0f9f35b6f7adfccefd8f4121e26f218f27a94ca264a0ee"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_transient.rs",
+      "sha256": "463bfbc62c527daa97df41777a394521c6c0aefbab2b9d9d438fc6f661acb849"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_viewport.rs",
+      "sha256": "5dffd937295b1fd09e239c7017b233fc2ceed4801684571ebaa9e5412be7e2ae"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/state_viewport_access.rs",
+      "sha256": "33dacecd1c625c2bddc57a1ff71031c21f0fabaef3b2ef4a690f71cc077c4571"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/types.rs",
+      "sha256": "9c0163e0ebd1dc6a9b39ee18b6c1d5df530e32be2428c9af17ef35817ec0d433"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/viewport.rs",
+      "sha256": "c15a466c7ebcc6f250509932fd15104f933ffc78ac0ceb9a90c964732632e306"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/widget.rs",
+      "sha256": "c339ab9d426efea6e9b14fbcf8f0d6fc5da362af4230db04a484e60f773fda58"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/widget_geometry.rs",
+      "sha256": "3cef9172bc073df63d9c6f972bd059a8548edc177bc05739d3fad48842bb7bdc"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/widget_input.rs",
+      "sha256": "8e6e3ec19852eab9acf7b5c274ba30de1c02008f717cf4ac3500aacf743860c4"
+    },
+    {
+      "path": "reference/radiant/src/native_app/waveform/zero_crossing_snap.rs",
+      "sha256": "1757d0d406d8b25cc1ee715f68217a59e7871c666225d7b1e1f91695df414a13"
+    }
+  ],
+  "excluded_test_inputs": [
+    "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/collections_section/tests.rs",
+    "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/filter_section/tests.rs",
+    "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/filter_section/tests/layout.rs",
+    "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/filter_section/tests/row_projection.rs",
+    "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/folder_tree/tests.rs",
+    "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/source_section/tests.rs",
+    "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/tag_entry_layout/tests.rs",
+    "reference/radiant/src/native_app/app_chrome/library_browser/library_sidebar/test_support.rs",
+    "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/header/tests.rs",
+    "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/row_projection/tests.rs",
+    "reference/radiant/src/native_app/app_chrome/library_browser/sample_browser_view/starmap_view/tests.rs",
+    "reference/radiant/src/native_app/app_chrome/modals/tests.rs",
+    "reference/radiant/src/native_app/app_chrome/settings/top_bar/tests.rs",
+    "reference/radiant/src/native_app/waveform/audio_file/extraction_output_tests.rs",
+    "reference/radiant/src/native_app/waveform/audio_file/extraction_tests.rs",
+    "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/tests/failures.rs",
+    "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/tests/format_payload.rs",
+    "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/tests/identity_staleness.rs",
+    "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/tests/mod.rs",
+    "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/tests/prune_behavior.rs",
+    "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/tests/remap_behavior.rs",
+    "reference/radiant/src/native_app/waveform/audio_file/waveform_cache/tests/store_queue_behavior.rs",
+    "reference/radiant/src/native_app/waveform/tests/audio.rs",
+    "reference/radiant/src/native_app/waveform/tests/edit_fade.rs",
+    "reference/radiant/src/native_app/waveform/tests/edit_fade_edge_cases.rs",
+    "reference/radiant/src/native_app/waveform/tests/edit_gain.rs",
+    "reference/radiant/src/native_app/waveform/tests/extraction.rs",
+    "reference/radiant/src/native_app/waveform/tests/mod.rs",
+    "reference/radiant/src/native_app/waveform/tests/paint.rs",
+    "reference/radiant/src/native_app/waveform/tests/signal_widget.rs",
+    "reference/radiant/src/native_app/waveform/tests/state.rs",
+    "reference/radiant/src/native_app/waveform/tests/widget_input.rs",
+    "reference/radiant/src/native_app/waveform/tests/zero_crossing_snap.rs"
+  ]
+}
