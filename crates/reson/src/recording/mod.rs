@@ -5,6 +5,9 @@ mod health;
 mod monitor;
 mod writer;
 
+#[cfg(test)]
+mod sink_contract_tests;
+
 use std::path::{Path, PathBuf};
 
 use cpal::Stream;
