@@ -99,6 +99,7 @@ impl ProductionChecker {
         if candidate.channel != channel(request.channel)
             || candidate.platform != platform(request.platform)
             || candidate.version.map(u64::from) != [version.major, version.minor, version.patch]
+            || !canonical_candidate_version(&version, &candidate)
         {
             return UpdateCheckOutcome::Failed;
         }
@@ -122,6 +123,59 @@ impl ProductionChecker {
             platform: request.platform,
         }
     }
+}
+
+fn canonical_candidate_version(version: &semver::Version, candidate: &Candidate) -> bool {
+    match candidate.channel {
+        Channel::Stable => version.pre.is_empty() && version.build.is_empty(),
+        Channel::Rc => {
+            version.build.is_empty()
+                && version
+                    .pre
+                    .as_str()
+                    .strip_prefix("rc.")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .is_some_and(|number| number > 0)
+        }
+        Channel::Nightly => {
+            let Some(date) = version.pre.as_str().strip_prefix("nightly.") else {
+                return false;
+            };
+            let hash = version.build.as_str();
+            valid_date(date)
+                && hash.len() == 8
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && u32::from_str_radix(hash, 16).ok()
+                    == Some(u32::from_be_bytes(
+                        candidate.commit[..4].try_into().unwrap(),
+                    ))
+        }
+    }
+}
+
+fn valid_date(date: &str) -> bool {
+    let bytes = date.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(i, b)| i != 4 && i != 7 && !b.is_ascii_digit())
+    {
+        return false;
+    }
+    let year = date[..4].parse::<u16>().unwrap_or(0);
+    let month = date[5..7].parse::<u8>().unwrap_or(0);
+    let day = date[8..].parse::<u8>().unwrap_or(0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    year > 0 && day > 0 && day <= days
 }
 
 fn channel(channel: UpdateChannel) -> Channel {

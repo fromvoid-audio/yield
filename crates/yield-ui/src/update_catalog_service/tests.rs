@@ -138,6 +138,42 @@ fn complete_prerelease_identity_is_checked_before_core_only_ui_projection() {
 }
 
 #[test]
+fn malformed_candidate_rc_nightly_date_and_commit_relation_fail_closed() {
+    for (channel, lane, installed, malformed) in [
+        (UpdateChannel::Rc, Channel::Rc, "19.1.0-rc.1", "19.1.0-rc.0"),
+        (
+            UpdateChannel::Nightly,
+            Channel::Nightly,
+            "19.1.0-nightly.2026-10-02+01010101",
+            "19.1.0-nightly.2026-02-30+02020202",
+        ),
+        (
+            UpdateChannel::Nightly,
+            Channel::Nightly,
+            "19.1.0-nightly.2026-10-02+01010101",
+            "19.1.0-nightly.2026-10-03+abcdef01",
+        ),
+        (
+            UpdateChannel::Nightly,
+            Channel::Nightly,
+            "19.1.0-nightly.2026-10-02+01010101",
+            "19.1.0-nightly.future",
+        ),
+    ] {
+        let installed = context(installed, channel);
+        let request = installed.request;
+        let checker = ProductionChecker {
+            installed,
+            catalog: CatalogService::default(),
+        };
+        assert_eq!(
+            checker.classify(request, candidate(malformed, 45, [2; 20], lane)),
+            UpdateCheckOutcome::Failed
+        );
+    }
+}
+
+#[test]
 fn immutable_installed_request_substitution_and_cancellation_reject_before_io() {
     let installed = context("19.1.0", UpdateChannel::Stable);
     let request = installed.request;
@@ -224,6 +260,10 @@ fn startup_registration_requires_compiled_identity_and_retains_exact_fixture_con
         let service = app.try_global::<UpdateCheckService>().unwrap();
         assert_eq!(service.installed_build.number, 44);
         assert_eq!(service.channel, UpdateChannel::Rc);
+    });
+    cx.update(|app| {
+        register_context(app, None, CatalogService::default());
+        assert!(app.try_global::<UpdateCheckService>().is_none());
     });
     // The ordinary Linux development artifact has no qualified packaged release target.
     #[cfg(target_os = "linux")]
