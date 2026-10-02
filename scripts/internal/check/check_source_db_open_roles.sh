@@ -50,3 +50,5 @@ python3 scripts/internal/check/check_source_db_competing_writers.py --self-test
 python3 scripts/internal/check/check_source_db_competing_writers.py
 python3 scripts/internal/check/check_gpui_owner_boundary.py --self-test
 python3 scripts/internal/check/check_gpui_owner_boundary.py
+python3 scripts/internal/check/check_filesystem_producers.py --self-test
+python3 scripts/internal/check/check_filesystem_producers.py
