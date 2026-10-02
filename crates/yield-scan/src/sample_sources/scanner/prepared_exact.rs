@@ -1,19 +1,19 @@
 //! A held, bounded exact scan prepared before one source-owner transaction.
 use super::{
-    scan::{ScanContext, ScanError, ScanMode},
+    scan::ScanError,
     scan_capability::{SourcePathBinding, SourceRootCapability},
-    scan_diff::{PreparedFile, apply_diff},
-    scan_diff_phase::prepare_diff_from_facts,
     scan_fs::{FileFacts, compute_content_hash_with_reader, read_facts_from_open_file},
     scan_index::{index_entry_from_file_facts, non_unicode_index_entry},
     scan_writer::{ScanWritePhase, ScanWriter},
 };
 
 mod enrollment;
+mod parents;
+
 #[cfg(test)]
 mod tests;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     fs::File,
     io::{self, Read},
     path::Path,
@@ -33,6 +33,12 @@ pub const EXACT_SCAN_MAX_PATH_BYTES: usize = 32 * 1024;
 /// Maximum aggregate audio bytes hashed during one preparation.
 pub const EXACT_SCAN_MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
 
+struct AudioFile {
+    facts: FileFacts,
+    file: File,
+    hash: String,
+}
+
 struct IndexFile {
     facts: FileFacts,
     file: File,
@@ -49,9 +55,10 @@ pub struct PreparedExactScan<'a> {
     fence: SourceScanFence,
     index_revision: u64,
     root: SourceRootCapability,
-    audio: Vec<PreparedFile>,
+    audio: Vec<AudioFile>,
     index: Vec<IndexFile>,
-    context: ScanContext,
+    tracked_paths: Vec<std::path::PathBuf>,
+    parents: Vec<parents::ParentDirectory>,
 }
 
 /// Prepare at most 64 exact regular entries without holding a mutation guard or SQL transaction.
@@ -91,41 +98,20 @@ pub fn prepare_exact_scan<'a>(
             "source root differs from retained owner",
         ));
     }
-    // Audio manifest keys are Unicode-only; raw locators belong exclusively to the lossless
-    // index table. Do not coerce a raw locator into an audio key.
-    let audio_keys = paths
-        .iter()
-        .filter(|p| p.as_path().to_str().is_some())
-        .cloned()
-        .collect::<Vec<_>>();
-    let (revision, manifest) = db.manifest_snapshot_with_revision_for_exact_paths(&audio_keys)?;
-    if revision != fence.revision() {
-        return Err(ScanError::StaleRevision {
-            expected: fence.revision(),
-            actual: revision,
-        });
-    }
-    let index_revision = db.get_source_index_revision()?;
-    let mut existing = HashMap::new();
-    for path in paths {
-        if path.as_path().to_str().is_some()
-            && let Some(entry) = db.entry_for_path(path.as_path())?
-        {
-            existing.insert(entry.relative_path.clone(), entry);
-        }
-    }
-    let mut context = ScanContext::from_existing(existing, ScanMode::Targeted, revision, manifest);
-    context.disable_rename_candidates();
-    let policy = db.source_traversal_policy()?;
-    context.set_traversal_policy(policy);
+    // Only scalar/existence facts are needed: preserve curation in SQL, never hydrate tags.
+    let observed = db.exact_scan_database_facts_at_revision(paths, fence.revision())?;
+    let parents = parents::hold_parents(owner, paths, &root, fence.revision())?;
+    let policy = observed.policy;
+
     let mut prepared = PreparedExactScan {
         owner,
         fence,
-        index_revision,
+        index_revision: observed.index_revision,
         root,
         audio: Vec::new(),
         index: Vec::new(),
-        context,
+        tracked_paths: observed.tracked_paths,
+        parents,
     };
     let mut hash_bytes = 0u64;
     for path in paths {
@@ -146,27 +132,20 @@ pub fn prepare_exact_scan<'a>(
             if hash_bytes > EXACT_SCAN_MAX_HASH_BYTES {
                 return Err(invalid(path, "exact scan hash byte limit exceeded"));
             }
-            let mut audio = prepare_diff_from_facts(facts, &prepared.context);
-            // Fully prepare every audio content hash; exact work must not reconcile another path.
-            audio.hash_required = true;
-            audio.needs_hash = true;
             let mut file = file;
             // A growing file must not expand the admitted content budget. Hash only the exact
             // observed byte count, then reject short reads or any changed content snapshot.
-            let mut bounded = file.by_ref().take(audio.facts.size);
+            let mut bounded = file.by_ref().take(facts.size);
             let hash =
                 compute_content_hash_with_reader(&db.root().join(path), &mut bounded, cancel)?;
             if bounded.limit() != 0 {
                 return Err(invalid(path, "exact entry shortened during hashing"));
             }
             let after = read_facts_from_open_file(db.root(), &db.root().join(path), &file)?;
-            if !audio.facts.same_content_snapshot(&after) {
+            if !facts.same_content_snapshot(&after) {
                 return Err(invalid(path, "exact entry changed during hashing"));
             }
-            audio.content_hash = Some(hash);
-            audio.source_file = Some(file);
-            audio.source_handle_verified = true;
-            prepared.audio.push(audio);
+            prepared.audio.push(AudioFile { facts, file, hash });
         } else {
             let entry = if path.to_str().is_none() {
                 non_unicode_index_entry(
@@ -214,15 +193,11 @@ impl PreparedExactScan<'_> {
             .map_err(owner_error)?;
         let db = self.owner.catalog_database();
         self.root.ensure_current_generation()?;
+        parents::revalidate(&self.parents, &self.root, cancel)?;
         for (facts, file) in self
             .audio
             .iter()
-            .map(|a| {
-                (
-                    &a.facts,
-                    a.source_file.as_ref().expect("private prepared file"),
-                )
-            })
+            .map(|a| (&a.facts, &a.file))
             .chain(self.index.iter().map(|i| (&i.facts, &i.file)))
         {
             canceled(cancel)?;
@@ -247,7 +222,7 @@ impl PreparedExactScan<'_> {
     /// The existing `commit_bounded_manifest_batch` hook owns the single transaction outcome.
     /// No last-scan/audit completion marker is advanced by this exact observation.
     pub fn commit(
-        mut self,
+        self,
         writer: &impl ScanWriter,
         cancel: Option<&AtomicBool>,
     ) -> Result<ManifestCommitResult, ScanError> {
@@ -267,19 +242,23 @@ impl PreparedExactScan<'_> {
             });
         }
         if batch.get_source_index_revision()? != self.index_revision {
+
             return Err(invalid(db.root(), "prepared index revision changed"));
         }
-        let mut held = Vec::with_capacity(self.audio.len());
-        for mut audio in self.audio.drain(..) {
-            held.push(audio.source_file.take().expect("private prepared file"));
-            apply_diff(db, &mut batch, audio, &mut self.context)?;
+        for audio in &self.audio {
+            canceled(cancel)?;
+            let path = &audio.facts.relative;
+            batch.remove_source_index_entry(path)?;
+            batch.upsert_file_with_hash(
+                path,
+                audio.facts.size,
+                audio.facts.modified_ns,
+                &audio.hash,
+            )?;
+            batch.set_file_identity(path, audio.facts.file_identity.as_deref())?;
         }
         for index in &self.index {
-            if self
-                .context
-                .existing
-                .contains_key(&index.entry.relative_path)
-            {
+            if self.tracked_paths.contains(&index.entry.relative_path) {
                 batch.set_missing(&index.entry.relative_path, true)?;
             }
             batch.upsert_source_index_entry(&index.entry)?;

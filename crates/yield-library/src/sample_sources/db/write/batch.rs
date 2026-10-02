@@ -35,12 +35,12 @@ const CLEAR_LAST_CURATED_AT_SQL: &str =
 impl<'conn> SourceWriteBatch<'conn> {
     /// Read coordination metadata under this batch's immediate writer reservation.
     pub(super) fn coordination_metadata(&self, key: &str) -> Result<Option<String>, SourceDbError> {
-        self.tx
-            .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(map_sql_error)
+        use super::super::replay_authority::{MetadataValue, read_metadata};
+        match read_metadata(&self.tx, key)? {
+            MetadataValue::Absent => Ok(None),
+            MetadataValue::Value(value) => Ok(Some(value)),
+            MetadataValue::Invalid => Err(SourceDbError::Unexpected),
+        }
     }
 
     /// Check that an existing live row is present without changing scanner-owned facts.
@@ -238,9 +238,14 @@ impl<'conn> SourceWriteBatch<'conn> {
         let previous_identity = self
             .tx
             .query_row(
-                "SELECT file_identity FROM wav_files WHERE path = ?1",
+                "SELECT CASE WHEN typeof(file_identity) = 'text' AND length(CAST(file_identity AS BLOB)) <= 1024 THEN file_identity END,
+                        file_identity IS NULL OR (typeof(file_identity) = 'text' AND length(CAST(file_identity AS BLOB)) <= 1024)
+                 FROM wav_files WHERE path = ?1",
                 [relative_path.to_string_lossy().as_ref()],
-                |row| row.get::<_, Option<String>>(0),
+                |row| {
+                    if !row.get::<_, bool>(1)? { return Err(rusqlite::Error::InvalidQuery); }
+                    row.get::<_, Option<String>>(0)
+                },
             )
             .optional()
             .map_err(map_sql_error)?

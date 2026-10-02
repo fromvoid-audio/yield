@@ -29,7 +29,7 @@ impl PreparedExactScan<'_> {
                     .file_identity
                     .clone()
                     .ok_or(ManifestEnrollmentError::Input)?,
-                content_hash: audio.content_hash.clone(),
+                content_hash: Some(audio.hash.clone()),
             });
         }
         for index in &self.index {

@@ -4,6 +4,8 @@ use yield_library::sample_sources::reconciliation::WatcherGeneration;
 use yield_source_watcher::replay::{ReplayEventCondition, ReplayIngress, ReplayPathKind};
 mod failures;
 mod fixture;
+mod namespace;
+mod recovery;
 use fixture::Fixture;
 
 #[test]
@@ -35,6 +37,13 @@ fn ordered_audio_index_commit_and_duplicate_are_atomic() {
     assert!(!receipt.matches_interval(12, 19));
     assert_eq!(receipt.source_revision(), delta.revision);
     assert_eq!(f.read().get_revision().unwrap(), delta.revision);
+    let entry = f
+        .read()
+        .entry_for_path(Path::new("one.wav"))
+        .unwrap()
+        .unwrap();
+    assert!(entry.looped && entry.locked && entry.tag_named);
+    assert_eq!(entry.user_tag.as_deref(), Some("retained curation"));
     let duplicate = service.submit_replay(batch, 7, before).unwrap();
     assert!(matches!(
         Fixture::receive(&duplicate),
@@ -61,20 +70,13 @@ fn restart_and_lost_receiver_use_persisted_receipt_without_new_delta() {
     f.put("one.wav", b"lost response");
     let batch = f.batch(10, &[(Some(17), "one.wav")]);
     let before = f.read().get_revision().unwrap();
-    let (reply, receiver) = mpsc::sync_channel(1);
-    drop(receiver);
-    service
-        .submit(CatalogCommand::ConsumeReplay {
-            submission: CatalogReplaySubmission {
-                batch: batch.clone(),
-                lifecycle_generation: 7,
-                expected_revision: before,
-                cancellation: Arc::new(AtomicBool::new(false)),
-                reply,
-                permit: Permit::acquire().unwrap(),
-            },
-        })
-        .unwrap();
+    let lost = service.submit_replay(batch.clone(), 7, before).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while f.read().get_revision().unwrap() == before {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(2));
+    }
+    drop(lost); // Discard the public response after actual SQL commit, before receiving it.
     let retry = service.submit_replay(batch.clone(), 7, before).unwrap();
     assert!(matches!(
         Fixture::receive(&retry),

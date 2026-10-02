@@ -13,6 +13,8 @@ use crate::sample_sources::reconciliation::{
 use crate::sample_sources::{SourceDatabase, SourceId};
 
 use super::{META_SOURCE_WATCHER_CHECKPOINT, META_SOURCE_WATCHER_UNCERTAINTY, SourceDbError};
+mod bounded;
+pub(super) use bounded::{MetadataValue, read_metadata};
 
 const UNCERTAINTY_FORMAT_VERSION: u8 = 1;
 const MAX_UNCERTAINTY_BYTES: usize = 16 * 1024;
@@ -373,13 +375,18 @@ impl SourceDatabase {
     pub fn read_durable_replay_uncertainty(
         &self,
     ) -> Result<DurableReplayUncertaintyState, SourceDbError> {
-        let Some(value) = self.get_metadata(META_SOURCE_WATCHER_UNCERTAINTY)? else {
-            return Ok(DurableReplayUncertaintyState::Absent);
+        let transaction = self.connection.unchecked_transaction()?;
+        let value = match read_metadata(&transaction, META_SOURCE_WATCHER_UNCERTAINTY)? {
+            MetadataValue::Absent => return Ok(DurableReplayUncertaintyState::Absent),
+            MetadataValue::Invalid => return Ok(DurableReplayUncertaintyState::Invalid),
+            MetadataValue::Value(value) => value,
         };
         let Some(marker) = DurableReplayUncertainty::decode(&value) else {
             return Ok(DurableReplayUncertaintyState::Invalid);
         };
-        if marker.source_revision() > self.get_revision()? {
+        if marker.source_revision()
+            > super::read_bounded_numeric_metadata(&transaction, "revision")?
+        {
             return Ok(DurableReplayUncertaintyState::Invalid);
         }
         Ok(DurableReplayUncertaintyState::Retained(marker))
@@ -420,22 +427,22 @@ impl SourceDatabase {
         owner_watcher_generation: WatcherGeneration,
     ) -> Result<Option<DurableReplayReceipt>, SourceDbError> {
         // Any unresolved or malformed marker blocks replay, including after a restart.
-        if self
-            .get_metadata(META_SOURCE_WATCHER_UNCERTAINTY)?
-            .is_some()
-        {
+        let transaction = self.connection.unchecked_transaction()?;
+        if !matches!(
+            read_metadata(&transaction, META_SOURCE_WATCHER_UNCERTAINTY)?,
+            MetadataValue::Absent
+        ) {
             return Ok(None);
         }
-        let Some(value) = self.get_metadata(META_SOURCE_WATCHER_CHECKPOINT)? else {
+        let MetadataValue::Value(value) =
+            read_metadata(&transaction, META_SOURCE_WATCHER_CHECKPOINT)?
+        else {
             return Ok(None);
         };
-        if value.len() > 16 * 1024 {
-            return Ok(None);
-        }
         // A checkpoint cannot claim coverage of a source revision that has not committed.
         // Later unrelated source writes may advance the revision without invalidating the
         // watcher cursor, so require an existing revision rather than exact equality.
-        let committed_revision = self.get_revision()?;
+        let committed_revision = super::read_bounded_numeric_metadata(&transaction, "revision")?;
         let checkpoint_revision = parse_object(&value)
             .ok()
             .and_then(|object| u64_field(&object, "source_revision"));

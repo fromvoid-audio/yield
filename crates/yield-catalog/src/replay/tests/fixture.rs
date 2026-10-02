@@ -113,6 +113,27 @@ impl Fixture {
                     owner: Some(&db.writer),
                     lifecycle: None,
                 };
+                let _initial = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+                    &db,
+                    None,
+                    now_epoch_seconds(),
+                    &mut |_, _| {},
+                    &writer,
+                    None,
+                )
+                .unwrap();
+                let previous = db.writer.current_scan_fence().unwrap().revision();
+                let mut curation = db.write_batch().unwrap();
+                let path = Path::new("one.wav");
+                curation.set_looped(path, true).unwrap();
+                curation.set_locked(path, true).unwrap();
+                curation.set_tag_named(path, true).unwrap();
+                curation
+                    .set_user_tag(path, Some("retained curation"))
+                    .unwrap();
+                db.writer
+                    .commit_bounded_manifest_batch(curation, previous)
+                    .unwrap();
                 let audit = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
                     &db,
                     None,
@@ -160,7 +181,7 @@ impl Fixture {
                         .join(yield_library::sample_sources::db::DB_FILE_NAME),
                 )
                 .unwrap();
-                fault.execute_batch("CREATE TRIGGER replay_fault BEFORE UPDATE OF content_hash ON wav_files BEGIN SELECT RAISE(ABORT, 'replay fixture rollback'); END").unwrap();
+                fault.execute_batch("CREATE TRIGGER replay_fault BEFORE UPDATE ON metadata WHEN NEW.key = 'source_watcher_checkpoint_v1' BEGIN SELECT RAISE(ABORT, 'replay fixture rollback'); END").unwrap();
             }
             let snapshot =
                 read_snapshot_from_database(&db, &worker_guard, &id, 7, &identity, || false).ok();

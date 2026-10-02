@@ -134,6 +134,7 @@ struct CatalogTestGate {
     audit_state: Mutex<CatalogTestAuditState>,
     watcher_signals: Mutex<HashMap<(SourceId, u64), WatcherSignal>>,
     watcher_install_counts: Mutex<HashMap<(SourceId, u64), usize>>,
+    cancel_on_audit_progress: AtomicBool,
 }
 
 #[cfg(test)]
@@ -166,6 +167,7 @@ impl CatalogTestGate {
             }),
             watcher_signals: Mutex::new(HashMap::new()),
             watcher_install_counts: Mutex::new(HashMap::new()),
+            cancel_on_audit_progress: AtomicBool::new(false),
         }
     }
 
@@ -228,6 +230,12 @@ impl CatalogTestGate {
         }
         state.at_boundary = false;
         self.wake.notify_all();
+    }
+
+    fn audit_progress(&self, token: &AtomicBool) {
+        if self.cancel_on_audit_progress.load(Ordering::Acquire) {
+            token.store(true, Ordering::Release);
+        }
     }
 
     fn arm_next_audit(&self) -> CatalogTestAuditPause<'_> {
@@ -381,6 +389,7 @@ impl CatalogTestGate {
     fn before_receive(&self) {}
 
     fn before_audit(&self) {}
+    fn audit_progress(&self, _token: &AtomicBool) {}
 
     fn install_watcher_signal(
         &self,
@@ -5153,6 +5162,7 @@ fn request_audit(
                 &token,
                 admission,
                 watcher_mode,
+                test_gate.map(Arc::as_ref),
             )
         });
     let disposition = match result {
@@ -6374,6 +6384,7 @@ fn audit_source(
     token: &Arc<AtomicBool>,
     admission: &Arc<Mutex<AdmissionState>>,
     watcher_mode: WatcherMode,
+    test_gate: Option<&CatalogTestGate>,
 ) -> Result<CatalogSnapshot, CatalogError> {
     profile_guard.validate_current().map_err(|error| {
         catalog_error_from_db_for_source(source_id, SourceDbError::ProfileOwnership(error))
@@ -6444,7 +6455,11 @@ fn audit_source(
         &source.database,
         Some(token),
         now_epoch_seconds(),
-        &mut |_, _| {},
+        &mut |_, _| {
+            if let Some(gate) = test_gate {
+                gate.audit_progress(token);
+            }
+        },
         &writer,
         replay_audit_request.as_ref(),
     )
