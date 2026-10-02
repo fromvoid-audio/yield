@@ -9306,6 +9306,11 @@ impl From<CancellationRequestValidationError> for WorkProgressError {
 
 #[cfg(test)]
 mod tests {
+    mod participant_contract {
+        use super::*;
+        include!("participant_contract_tests.rs");
+    }
+
     use super::terminal_outcomes::{
         BlockedByUserActionKind, FailedParticipantObservation, SafetyEscalationReason,
     };
