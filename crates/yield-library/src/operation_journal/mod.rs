@@ -294,3 +294,6 @@ pub use work_progress::{
     ProgressEvidenceError, ProgressStepStatus, SourceRevisionObservation, StoredStepEvidence,
     WorkProgress, WorkProgressError, WorkProgressStep,
 };
+
+#[cfg(test)]
+mod mixed_batch_contract_tests;
