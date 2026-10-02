@@ -77,11 +77,11 @@ mod feature_job;
 mod feature_progress;
 mod feature_request;
 mod history_selection;
+pub use feature_analysis_metrics::FeatureAnalysisMetrics;
 pub use history_selection::{
     CollectionHistoryCancellation, CollectionHistoryFailure, CollectionHistoryRequest,
     SourceCollectionHistorySelection,
 };
-pub use feature_analysis_metrics::FeatureAnalysisMetrics;
 mod similarity_dispatch;
 mod similarity_query;
 pub use feature_job::{
