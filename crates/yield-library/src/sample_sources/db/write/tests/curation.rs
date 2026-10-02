@@ -8,6 +8,8 @@ use std::sync::{
 use tempfile::TempDir;
 
 use super::helpers::revision_value;
+#[path = "curation/snapshot_queue_metrics.rs"]
+mod snapshot_queue_metrics;
 use crate::app_dirs::{
     ConfigBaseGuard, PersistenceProfileGuard, ProfileOwnershipError, WritableProfileGuard,
 };
