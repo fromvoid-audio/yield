@@ -104,6 +104,10 @@ impl LibraryDatabase {
         }
     }
 
+    pub(super) fn preparation_root(&self) -> Option<&BoundDatabaseRoot> {
+        self._database_root_binding.as_ref()
+    }
+
     pub(super) fn into_connection(self) -> Connection {
         self.connection
     }
