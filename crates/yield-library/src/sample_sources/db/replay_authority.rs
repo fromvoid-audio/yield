@@ -340,7 +340,33 @@ impl ValidatedReplayAuthority {
     }
 }
 
-/// Read a durable replay prior from the source database's existing watcher checkpoint.
+/// Opaque persisted replay outcome, read under source/root/lifecycle validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableReplayReceipt {
+    prior: ReplayPriorToken,
+    source_revision: u64,
+    replay_first: Option<u64>,
+}
+impl DurableReplayReceipt {
+    /// Validated durable checkpoint authority; not native or filesystem-effect permission.
+    pub fn prior(&self) -> &ReplayPriorToken {
+        &self.prior
+    }
+    /// Exact source revision covered by this checkpoint.
+    pub const fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+    /// Match an exact replay interval, or an exact-terminal bootstrap audit coverage.
+    /// Changed-path evidence is not reconstructed from a cursor or returned as a new delta.
+    pub fn matches_interval(&self, first: u64, last: u64) -> bool {
+        first != 0
+            && first <= last
+            && last == self.prior.acknowledged_sequence()
+            && self.replay_first.is_none_or(|stored| stored == first)
+    }
+}
+
+/// Read durable replay authority from the source database's existing watcher checkpoint.
 impl SourceDatabase {
     /// Read the bounded source-owned uncertainty that requires an authoritative audit.
     /// Malformed state remains an explicit blocking outcome instead of disappearing.
@@ -374,6 +400,25 @@ impl SourceDatabase {
         expected_source_lifecycle_generation: WatcherGeneration,
         owner_watcher_generation: WatcherGeneration,
     ) -> Result<Option<ReplayPriorToken>, SourceDbError> {
+        Ok(self
+            .read_durable_replay_receipt(
+                expected_source_id,
+                expected_root_identity,
+                expected_source_lifecycle_generation,
+                owner_watcher_generation,
+            )?
+            .map(|receipt| receipt.prior))
+    }
+
+    /// Read a validated, bounded receipt for retry after a lost acknowledgement or restart.
+    /// Uncertainty/malformed metadata and unknown or future source revisions fail closed.
+    pub fn read_durable_replay_receipt(
+        &self,
+        expected_source_id: &SourceId,
+        expected_root_identity: &RootIdentity,
+        expected_source_lifecycle_generation: WatcherGeneration,
+        owner_watcher_generation: WatcherGeneration,
+    ) -> Result<Option<DurableReplayReceipt>, SourceDbError> {
         // Any unresolved or malformed marker blocks replay, including after a restart.
         if self
             .get_metadata(META_SOURCE_WATCHER_UNCERTAINTY)?
@@ -384,6 +429,9 @@ impl SourceDatabase {
         let Some(value) = self.get_metadata(META_SOURCE_WATCHER_CHECKPOINT)? else {
             return Ok(None);
         };
+        if value.len() > 16 * 1024 {
+            return Ok(None);
+        }
         // A checkpoint cannot claim coverage of a source revision that has not committed.
         // Later unrelated source writes may advance the revision without invalidating the
         // watcher cursor, so require an existing revision rather than exact equality.
@@ -396,13 +444,29 @@ impl SourceDatabase {
         {
             return Ok(None);
         }
-        Ok(parse_durable_replay_prior(
+        let Some(prior) = parse_durable_replay_prior(
             &value,
             expected_source_id,
             expected_root_identity,
             expected_source_lifecycle_generation,
             owner_watcher_generation,
-        ))
+        ) else {
+            return Ok(None);
+        };
+        let object = parse_object(&value).map_err(|_| SourceDbError::Unexpected)?;
+        let replay_first = if string_field(&object, "cause") == Some("targeted_replay") {
+            object
+                .get("continuity_proof")
+                .and_then(Value::as_object)
+                .and_then(|proof| u64_field(proof, "replay_coverage_start_event_id"))
+        } else {
+            None
+        };
+        Ok(Some(DurableReplayReceipt {
+            prior,
+            source_revision: checkpoint_revision.expect("validated committed revision"),
+            replay_first,
+        }))
     }
 }
 

@@ -1029,6 +1029,38 @@ impl ReconciliationAdmissionSupervisor {
         Ok((lane, generation))
     }
 
+    /// Restore a fresh replay lane only from opaque, durably validated database authority.
+    pub(crate) fn restore_replay_lane(
+        &mut self,
+        prior: &ReplayPriorToken,
+    ) -> Result<(AdmissionLaneKey, WatcherGeneration), AdmissionError> {
+        if self.lanes.len() >= self.limits.max_lanes {
+            return Err(AdmissionError::LaneLimitReached);
+        }
+        if self.sources.contains_key(prior.source_id()) {
+            return Err(AdmissionError::SourceAlreadyRegistered);
+        }
+        let generation = prior.watcher_generation();
+        if generation.get() == 0 || generation.get() == u64::MAX {
+            return Err(AdmissionError::GenerationExhausted);
+        }
+        self.next_generation = self.next_generation.max(generation.get());
+        let lane = AdmissionLaneKey::new(prior.source_id().clone(), prior.root_identity().clone());
+        self.sources.insert(prior.source_id().clone(), lane.clone());
+        self.lanes.insert(
+            lane.clone(),
+            LaneState {
+                generation,
+                lifecycle: ReconciliationLifecycle::Starting,
+                queue: VecDeque::new(),
+                live_tickets: 0,
+                usage: Usage::default(),
+                recent_sequences: VecDeque::new(),
+            },
+        );
+        Ok((lane, generation))
+    }
+
     /// Begin capturing for a registered lane and generation.
     pub fn begin_capture(
         &mut self,

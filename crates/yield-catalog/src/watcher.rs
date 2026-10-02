@@ -52,6 +52,14 @@ enum RootProbeIssue {
 }
 
 impl WatcherSchedule {
+    pub(super) fn queue_replay_audit(&mut self) {
+        let now = Instant::now();
+        self.merge_pending(PendingWatcherHint {
+            first_observed: now,
+            last_observed: now,
+            evidence: WatchHintEvidence::FULL_RESCAN,
+        });
+    }
     pub(super) fn new(initial_audit_pending: bool) -> Self {
         Self {
             pending: None,

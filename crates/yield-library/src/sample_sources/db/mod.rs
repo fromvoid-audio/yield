@@ -32,7 +32,9 @@ mod rename_destinations;
 mod rename_metadata;
 mod replay_authority;
 pub(crate) use replay_authority::ValidatedReplayAuthority;
-pub use replay_authority::{DurableReplayUncertainty, DurableReplayUncertaintyState};
+pub use replay_authority::{
+    DurableReplayReceipt, DurableReplayUncertainty, DurableReplayUncertaintyState,
+};
 /// SQLite schema management for sample source databases.
 pub mod schema;
 mod source_authority;
