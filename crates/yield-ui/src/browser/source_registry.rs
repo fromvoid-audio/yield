@@ -145,6 +145,16 @@ impl SourceRegistryGlobal {
             .unwrap_or(VocabularyStatus::Closed)
     }
 
+    /// Observe the active vocabulary acquisition without granting write authority.
+    pub(crate) fn vocabulary_acquisition_id(
+        &self,
+    ) -> Result<yield_session::ProfileAcquisitionId, VocabularySubmitError> {
+        self.service
+            .as_ref()
+            .ok_or(VocabularySubmitError::Closed)?
+            .vocabulary_acquisition_id()
+    }
+
     /// Submit an exact profile tag vocabulary lookup.
     pub(crate) fn lookup_profile_tag_categories(
         &self,
@@ -173,6 +183,7 @@ impl SourceRegistryGlobal {
     /// Submit one revision-fenced profile tag category assignment.
     pub(crate) fn set_profile_tag_category(
         &self,
+        acquisition: yield_session::ProfileAcquisitionId,
         expected_revision: u64,
         label: String,
         category: ProfileTagCategory,
@@ -180,19 +191,25 @@ impl SourceRegistryGlobal {
         self.service
             .as_ref()
             .ok_or(VocabularySubmitError::Closed)?
-            .set_profile_tag_category(expected_revision, label, category)
+            .set_profile_tag_category_for_acquisition(
+                acquisition,
+                expected_revision,
+                label,
+                category,
+            )
     }
 
     /// Submit deletion of one exact profile vocabulary label at a matching revision.
     pub(crate) fn delete_profile_tag_vocabulary(
         &self,
+        acquisition: yield_session::ProfileAcquisitionId,
         expected_revision: u64,
         label: String,
     ) -> Result<VocabularyRequest<ProfileTagVocabularyDeleteReceipt>, VocabularySubmitError> {
         self.service
             .as_ref()
             .ok_or(VocabularySubmitError::Closed)?
-            .delete_profile_tag_vocabulary(expected_revision, label)
+            .delete_profile_tag_vocabulary_for_acquisition(acquisition, expected_revision, label)
     }
 
     /// Submit one typed catalog command through the profile-owned session service.
@@ -1061,4 +1078,30 @@ mod tests {
             Some(root.as_path()),
         ));
     }
+}
+
+/// Check a captured vocabulary intent against the currently installed session owner.
+pub(crate) fn vocabulary_acquisition_is_current(
+    acquisition: &yield_session::ProfileAcquisitionId,
+    cx: &gpui::App,
+) -> bool {
+    cx.has_global::<SourceRegistryGlobal>()
+        && cx
+            .global::<SourceRegistryGlobal>()
+            .vocabulary_acquisition_id()
+            .ok()
+            .as_ref()
+            == Some(acquisition)
+}
+
+/// Errors that cannot confirm whether an admitted vocabulary effect committed.
+pub(crate) fn vocabulary_mutation_is_unconfirmed(
+    error: &yield_library::sample_sources::LibraryError,
+) -> bool {
+    matches!(
+        error,
+        yield_library::sample_sources::LibraryError::GlobalMutationCompletionMismatch
+            | yield_library::sample_sources::LibraryError::ProfileOwnershipChanged { .. }
+            | yield_library::sample_sources::LibraryError::Sql(_)
+    )
 }

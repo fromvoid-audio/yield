@@ -61,6 +61,7 @@ pub(super) struct TagSubmissionContext {
 }
 
 struct PendingTagOperation {
+    acquisition: yield_session::ProfileAcquisitionId,
     draft_generation: u64,
     context: TagSubmissionContext,
     labels: Vec<String>,
@@ -474,6 +475,13 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
         return true;
     }
 
+    if !super::source_registry::vocabulary_acquisition_is_current(&pending.acquisition, cx) {
+        browser.tag_editor.message = Some(String::from(
+            "Profile changed; tag operation unconfirmed. Refresh and try again",
+        ));
+        super::tag_completion::invalidate_profile_vocabulary(browser, cx);
+        return true;
+    }
     let mut changed = false;
     let mut terminal = false;
     match &mut pending.stage {
@@ -535,8 +543,14 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
                         }
                     } else {
                         let label = pending.labels[0].clone();
-                        match submit_category_write(browser, &label, lookup.revision, category, cx)
-                        {
+                        match submit_category_write(
+                            browser,
+                            pending.acquisition.clone(),
+                            &label,
+                            lookup.revision,
+                            category,
+                            cx,
+                        ) {
                             Ok(request) => {
                                 pending.stage = TagStage::WritingCategory {
                                     request,
@@ -559,8 +573,16 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    browser.tag_editor.message =
-                        Some(String::from("Profile vocabulary request disconnected"));
+                    super::tag_library::dictionary_mutation_failed(
+                        browser,
+                        String::from(
+                            "Tag category outcome unconfirmed; refreshing authoritative tags",
+                        ),
+                        cx,
+                    );
+                    browser.tag_editor.message = Some(String::from(
+                        "Tag category outcome unconfirmed; refresh and try again",
+                    ));
                     changed = true;
                     terminal = true;
                 }
@@ -586,6 +608,17 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
                     }
                 }
                 Ok(Err(error)) => {
+                    if super::source_registry::vocabulary_mutation_is_unconfirmed(&error) {
+                        super::tag_library::dictionary_mutation_failed(
+                            browser,
+                            format!("Tag category outcome unconfirmed; refreshing tags: {error}"),
+                            cx,
+                        );
+                        browser.tag_editor.message = Some(String::from(
+                            "Tag category outcome unconfirmed; refresh and try again",
+                        ));
+                        return true;
+                    }
                     let stage = std::mem::replace(&mut pending.stage, TagStage::LookingUp);
                     let TagStage::WritingCategory {
                         category,
@@ -625,8 +658,16 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    browser.tag_editor.message =
-                        Some(String::from("Profile vocabulary request disconnected"));
+                    super::tag_library::dictionary_mutation_failed(
+                        browser,
+                        String::from(
+                            "Tag category outcome unconfirmed; refreshing authoritative tags",
+                        ),
+                        cx,
+                    );
+                    browser.tag_editor.message = Some(String::from(
+                        "Tag category outcome unconfirmed; refresh and try again",
+                    ));
                     changed = true;
                     terminal = true;
                 }
@@ -877,6 +918,7 @@ impl Browser {
         }
         self.tag_editor.message = Some(String::from("Looking up tag…"));
         self.tag_editor.pending = Some(PendingTagOperation {
+            acquisition: profile_request.acquisition_id().clone(),
             draft_generation,
             context,
             labels,
@@ -917,7 +959,14 @@ impl Browser {
         }
         let profile_category = profile_category(category);
         let label = pending.labels[0].clone();
-        match submit_category_write(self, &label, revision, profile_category, cx) {
+        match submit_category_write(
+            self,
+            pending.acquisition.clone(),
+            &label,
+            revision,
+            profile_category,
+            cx,
+        ) {
             Ok(request) => {
                 pending.stage = TagStage::WritingCategory {
                     request,
@@ -1128,6 +1177,7 @@ fn profile_category_for_inference(category: TagCategory) -> Option<ProfileTagCat
 
 fn submit_category_write(
     browser: &Browser,
+    acquisition: yield_session::ProfileAcquisitionId,
     label: &str,
     revision: u64,
     category: ProfileTagCategory,
@@ -1141,7 +1191,7 @@ fn submit_category_write(
         return Err(String::from("Profile vocabulary is unavailable"));
     };
     global
-        .set_profile_tag_category(revision, label.to_owned(), category)
+        .set_profile_tag_category(acquisition, revision, label.to_owned(), category)
         .map_err(|error| format!("Could not save tag category: {error}"))
 }
 

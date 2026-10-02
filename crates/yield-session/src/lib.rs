@@ -85,10 +85,11 @@ pub use preferences::{
 use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};
 
 pub use vocabulary::{
-    MAX_VOCABULARY_REQUESTS_IN_FLIGHT, ProfileTagCategory, ProfileTagVocabularyDeleteReceipt,
-    ProfileTagVocabularyEntry, ProfileTagVocabularyInputError, ProfileTagVocabularyLookup,
-    ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt,
-    VocabularyRequest, VocabularyRequestId, VocabularyStatus, VocabularySubmitError,
+    MAX_VOCABULARY_REQUESTS_IN_FLIGHT, ProfileAcquisitionId, ProfileTagCategory,
+    ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyEntry, ProfileTagVocabularyInputError,
+    ProfileTagVocabularyLookup, ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor,
+    ProfileTagVocabularySetReceipt, VocabularyRequest, VocabularyRequestId, VocabularyStatus,
+    VocabularySubmitError,
 };
 
 /// The non-live profile used by the GPUI application session.
@@ -433,6 +434,54 @@ impl SourceRegistryService {
         vocabulary::status(&self.vocabulary)
     }
 
+    /// Observe the vocabulary owner's acquisition before retaining a delayed UI intent.
+    pub fn vocabulary_acquisition_id(
+        &self,
+    ) -> Result<yield_library::sample_sources::library::ProfileAcquisitionId, VocabularySubmitError>
+    {
+        vocabulary::acquisition_id(&self.vocabulary)
+    }
+
+    /// Submit a category proposal using its original acquisition, even through a fresh client.
+    pub fn set_profile_tag_category_for_acquisition(
+        &self,
+        acquisition: yield_library::sample_sources::library::ProfileAcquisitionId,
+        expected_revision: u64,
+        label: String,
+        category: ProfileTagCategory,
+    ) -> Result<VocabularyRequest<ProfileTagVocabularySetReceipt>, VocabularySubmitError> {
+        let request = VocabularyRequestId::from_raw(
+            self.next_vocabulary_request.fetch_add(1, Ordering::Relaxed),
+        );
+        vocabulary::set_category(
+            &self.vocabulary,
+            request,
+            Some(acquisition),
+            expected_revision,
+            label,
+            category,
+        )
+    }
+
+    /// Delete using the acquisition observed by the originating dictionary row or intent.
+    pub fn delete_profile_tag_vocabulary_for_acquisition(
+        &self,
+        acquisition: yield_library::sample_sources::library::ProfileAcquisitionId,
+        expected_revision: u64,
+        label: String,
+    ) -> Result<VocabularyRequest<ProfileTagVocabularyDeleteReceipt>, VocabularySubmitError> {
+        let request = VocabularyRequestId::from_raw(
+            self.next_vocabulary_request.fetch_add(1, Ordering::Relaxed),
+        );
+        vocabulary::delete_profile_tag_vocabulary(
+            &self.vocabulary,
+            request,
+            Some(acquisition),
+            expected_revision,
+            label,
+        )
+    }
+
     /// Submit an exact lookup of bounded profile vocabulary labels.
     pub fn lookup_profile_tag_categories(
         &self,
@@ -478,6 +527,7 @@ impl SourceRegistryService {
         vocabulary::set_category(
             &self.vocabulary,
             request,
+            None,
             expected_revision,
             label,
             category,
@@ -496,6 +546,7 @@ impl SourceRegistryService {
         vocabulary::delete_profile_tag_vocabulary(
             &self.vocabulary,
             request,
+            None,
             expected_revision,
             label,
         )
@@ -4292,6 +4343,158 @@ mod tests {
         service
             .shutdown()
             .expect("shutdown joins cancelled maintenance");
+    }
+
+    #[test]
+    fn vocabulary_service_rejects_old_acquisition_redirected_through_fresh_client() {
+        let temp = TempDir::new().unwrap();
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).unwrap());
+        let root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_portable_registry_for_test(root.clone()).unwrap();
+        wait_for_vocabulary_available(&service);
+        let original = service.vocabulary_acquisition_id().unwrap();
+        let mut set = service
+            .set_profile_tag_category_for_acquisition(
+                original.clone(),
+                0,
+                "keep".into(),
+                ProfileTagCategory::Character,
+            )
+            .unwrap();
+        assert_eq!(set.acquisition_id(), &original);
+        assert_eq!(
+            set.mutation_context().unwrap().correlation(),
+            set.id().get()
+        );
+        assert!(receive_vocabulary(&mut set).unwrap().changed);
+        service.shutdown().unwrap();
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(root).unwrap();
+        wait_for_vocabulary_available(&reopened);
+        assert_ne!(reopened.vocabulary_acquisition_id().unwrap(), original);
+        let mut delayed_set = reopened
+            .set_profile_tag_category_for_acquisition(
+                original.clone(),
+                1,
+                "ghost".into(),
+                ProfileTagCategory::Prefix,
+            )
+            .unwrap();
+        let mut delayed_delete = reopened
+            .delete_profile_tag_vocabulary_for_acquisition(original, 1, "keep".into())
+            .unwrap();
+        assert!(matches!(
+            receive_vocabulary(&mut delayed_set),
+            Err(LibraryError::GlobalMutationStaleAcquisition)
+        ));
+        assert!(matches!(
+            receive_vocabulary(&mut delayed_delete),
+            Err(LibraryError::GlobalMutationStaleAcquisition)
+        ));
+        let mut lookup = reopened
+            .lookup_profile_tag_categories(vec!["keep".into(), "ghost".into()])
+            .unwrap();
+        let state = receive_vocabulary(&mut lookup).unwrap();
+        assert_eq!(state.revision, 1);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].label, "keep");
+        reopened.shutdown().unwrap();
+    }
+
+    #[test]
+    fn vocabulary_service_lost_mutation_response_refreshes_without_recovering_receipt() {
+        let temp = TempDir::new().unwrap();
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).unwrap());
+        let root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_portable_registry_for_test(root.clone()).unwrap();
+        wait_for_vocabulary_available(&service);
+        let set = service
+            .set_profile_tag_category(0, "keep".into(), ProfileTagCategory::Character)
+            .unwrap();
+        drop(set); // accepted changed result is never received
+        service.shutdown().unwrap();
+        let mut reopened =
+            SourceRegistryService::start_portable_registry_for_test(root.clone()).unwrap();
+        wait_for_vocabulary_available(&reopened);
+        let mut lookup = reopened
+            .lookup_profile_tag_categories(vec!["keep".into()])
+            .unwrap();
+        let refreshed = receive_vocabulary(&mut lookup).unwrap();
+        assert_eq!(refreshed.entries.len(), 1);
+        let mut current_noop = reopened
+            .set_profile_tag_category(
+                refreshed.revision,
+                "keep".into(),
+                ProfileTagCategory::Character,
+            )
+            .unwrap();
+        assert!(!receive_vocabulary(&mut current_noop).unwrap().changed);
+        let deletion = reopened
+            .delete_profile_tag_vocabulary(refreshed.revision, "keep".into())
+            .unwrap();
+        drop(deletion); // accepted tombstone is likewise not received or durable Undo
+        reopened.shutdown().unwrap();
+        let mut final_service =
+            SourceRegistryService::start_portable_registry_for_test(root).unwrap();
+        wait_for_vocabulary_available(&final_service);
+        let mut lookup = final_service
+            .lookup_profile_tag_categories(vec!["keep".into()])
+            .unwrap();
+        let refreshed = receive_vocabulary(&mut lookup).unwrap();
+        assert!(refreshed.entries.is_empty());
+        let mut missing = final_service
+            .delete_profile_tag_vocabulary(refreshed.revision, "keep".into())
+            .unwrap();
+        let current = receive_vocabulary(&mut missing).unwrap();
+        assert_eq!(current.revision, refreshed.revision);
+        assert!(
+            current.removed.is_none(),
+            "current no-op cannot recover the lost tombstone"
+        );
+        final_service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn vocabulary_service_mismatched_completion_releases_permit_without_receipt() {
+        let temp = TempDir::new().unwrap();
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).unwrap());
+        let mut service =
+            SourceRegistryService::start_portable_registry_for_test(profile_root(&temp)).unwrap();
+        wait_for_vocabulary_available(&service);
+        let mut first = service
+            .set_profile_tag_category(0, "keep".into(), ProfileTagCategory::Character)
+            .unwrap();
+        let mut other = service
+            .set_profile_tag_category(0, "other".into(), ProfileTagCategory::Prefix)
+            .unwrap();
+        first.inject_wrong_context_for_test(other.mutation_context().unwrap().clone());
+        assert!(matches!(
+            receive_vocabulary(&mut first),
+            Err(LibraryError::GlobalMutationCompletionMismatch)
+        ));
+        assert!(matches!(
+            receive_vocabulary(&mut other),
+            Err(LibraryError::ProfileTagVocabularyStaleRevision { .. })
+        ));
+        let mut lookup = service
+            .lookup_profile_tag_categories(vec!["keep".into()])
+            .unwrap();
+        assert_eq!(receive_vocabulary(&mut lookup).unwrap().entries.len(), 1);
+
+        let handles = (0..MAX_VOCABULARY_REQUESTS_IN_FLIGHT)
+            .map(|_| {
+                service
+                    .lookup_profile_tag_categories(vec!["keep".into()])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            service.lookup_profile_tag_categories(vec!["keep".into()]),
+            Err(VocabularySubmitError::Full)
+        ));
+        drop(handles);
+        service.shutdown().unwrap();
     }
 
     #[test]

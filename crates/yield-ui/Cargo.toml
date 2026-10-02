@@ -23,6 +23,7 @@ yield-session.workspace = true
 yield-platform.workspace = true
 
 [dev-dependencies]
+yield-library = { workspace = true, features = ["test-support"] }
 naga = { version = "=25.0.1", features = ["wgsl-in"] }
 gpui = { workspace = true, features = ["test-support"] }
 yield-catalog = { path = "../yield-catalog" }

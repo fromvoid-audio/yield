@@ -24,6 +24,7 @@ use super::source_registry::SourceRegistryGlobal;
 pub(super) struct TagDictionaryState {
     pending: Option<DictionaryMutation>,
     last_removed: Option<LastRemovedDefinition>,
+    undo_acquisition: Option<yield_session::ProfileAcquisitionId>,
     preview: Option<AssignmentPreviewState>,
 }
 
@@ -34,6 +35,7 @@ impl Default for TagDictionaryState {
         Self {
             pending: None,
             last_removed: None,
+            undo_acquisition: None,
             preview: None,
         }
     }
@@ -152,10 +154,11 @@ impl TagDictionaryState {
     pub(super) fn submit_remove(
         &mut self,
         global: &SourceRegistryGlobal,
+        acquisition: yield_session::ProfileAcquisitionId,
         revision: u64,
         label: String,
     ) -> Result<(), VocabularySubmitError> {
-        let request = global.delete_profile_tag_vocabulary(revision, label.clone())?;
+        let request = global.delete_profile_tag_vocabulary(acquisition, revision, label.clone())?;
         self.pending = Some(DictionaryMutation::Remove { label, request });
         Ok(())
     }
@@ -163,17 +166,43 @@ impl TagDictionaryState {
     pub(super) fn submit_restore(
         &mut self,
         global: &SourceRegistryGlobal,
+        acquisition: yield_session::ProfileAcquisitionId,
         revision: u64,
         label: String,
         category: ProfileTagCategory,
     ) -> Result<(), VocabularySubmitError> {
-        let request = global.set_profile_tag_category(revision, label.clone(), category)?;
+        let request =
+            global.set_profile_tag_category(acquisition, revision, label.clone(), category)?;
         self.pending = Some(DictionaryMutation::Restore {
             label,
             category,
             request,
         });
         Ok(())
+    }
+
+    fn clear_undo_for_changed_acquisition(
+        &mut self,
+        current: Option<&yield_session::ProfileAcquisitionId>,
+    ) -> bool {
+        if self
+            .undo_acquisition
+            .as_ref()
+            .is_some_and(|acquisition| Some(acquisition) != current)
+        {
+            self.invalidate_unconfirmed();
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn undo_acquisition(&self) -> Option<&yield_session::ProfileAcquisitionId> {
+        self.undo_acquisition.as_ref()
+    }
+
+    fn invalidate_unconfirmed(&mut self) {
+        self.last_removed = None;
+        self.undo_acquisition = None;
     }
 
     pub(super) fn undo_details(&self) -> Option<(u64, String, ProfileTagCategory)> {
@@ -207,6 +236,7 @@ impl TagDictionaryState {
 
     fn complete_restore(&mut self) -> DictionaryCompletion {
         self.last_removed = None;
+        self.undo_acquisition = None;
         DictionaryCompletion::Restored
     }
 }
@@ -361,9 +391,35 @@ pub(super) fn render_undo(
 
 /// Poll the one profile dictionary mutation, including after the panel closes.
 pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
+    let current_acquisition = cx
+        .has_global::<SourceRegistryGlobal>()
+        .then(|| {
+            cx.global::<SourceRegistryGlobal>()
+                .vocabulary_acquisition_id()
+                .ok()
+        })
+        .flatten();
+    let undo_invalidated = browser
+        .tag_dictionary
+        .clear_undo_for_changed_acquisition(current_acquisition.as_ref());
     let Some(mutation) = browser.tag_dictionary.take_pending() else {
-        return false;
+        return undo_invalidated;
     };
+    let acquisition = match &mutation {
+        DictionaryMutation::Remove { request, .. } => request.acquisition_id(),
+        DictionaryMutation::Restore { request, .. } => request.acquisition_id(),
+    };
+    if !super::source_registry::vocabulary_acquisition_is_current(acquisition, cx) {
+        browser.tag_dictionary.invalidate_unconfirmed();
+        super::tag_library::dictionary_mutation_failed(
+            browser,
+            String::from(
+                "Profile changed; dictionary operation unconfirmed. Refresh and try again",
+            ),
+            cx,
+        );
+        return true;
+    }
     match mutation {
         DictionaryMutation::Remove { label, mut request } => match request.try_recv() {
             Err(TryRecvError::Empty) => {
@@ -373,15 +429,23 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
                 false
             }
             Err(TryRecvError::Disconnected) => {
+                browser.tag_dictionary.invalidate_unconfirmed();
                 super::tag_library::dictionary_mutation_failed(
                     browser,
-                    String::from("Tag definition removal disconnected"),
+                    String::from(
+                        "Tag definition removal unconfirmed; refreshing authoritative tags",
+                    ),
                     cx,
                 );
                 true
             }
             Ok(Ok(receipt)) => {
+                let removed = receipt.removed.is_some();
                 let completion = browser.tag_dictionary.complete_remove(receipt);
+                if removed {
+                    browser.tag_dictionary.undo_acquisition =
+                        Some(request.acquisition_id().clone());
+                }
                 let message = match completion {
                     DictionaryCompletion::Removed => {
                         "Tag definition removed · Undo removal available"
@@ -393,9 +457,16 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
                 true
             }
             Ok(Err(error)) => {
+                if matches!(error, yield_library::sample_sources::LibraryError::GlobalMutationCompletionMismatch | yield_library::sample_sources::LibraryError::GlobalMutationStaleAcquisition) {
+                    browser.tag_dictionary.invalidate_unconfirmed();
+                }
                 super::tag_library::dictionary_mutation_failed(
                     browser,
-                    format!("Could not remove tag definition: {error}"),
+                    if super::source_registry::vocabulary_mutation_is_unconfirmed(&error) {
+                        format!("Tag definition removal unconfirmed; refreshing tags: {error}")
+                    } else {
+                        format!("Could not remove tag definition: {error}")
+                    },
                     cx,
                 );
                 true
@@ -415,9 +486,12 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
                 false
             }
             Err(TryRecvError::Disconnected) => {
+                browser.tag_dictionary.invalidate_unconfirmed();
                 super::tag_library::dictionary_mutation_failed(
                     browser,
-                    String::from("Tag definition restoration disconnected"),
+                    String::from(
+                        "Tag definition restoration unconfirmed; refreshing authoritative tags",
+                    ),
                     cx,
                 );
                 true
@@ -433,9 +507,16 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
                 true
             }
             Ok(Err(error)) => {
+                if matches!(error, yield_library::sample_sources::LibraryError::GlobalMutationCompletionMismatch | yield_library::sample_sources::LibraryError::GlobalMutationStaleAcquisition) {
+                    browser.tag_dictionary.invalidate_unconfirmed();
+                }
                 super::tag_library::dictionary_mutation_failed(
                     browser,
-                    format!("Could not restore tag definition: {error}"),
+                    if super::source_registry::vocabulary_mutation_is_unconfirmed(&error) {
+                        format!("Tag definition restoration unconfirmed; refreshing tags: {error}")
+                    } else {
+                        format!("Could not restore tag definition: {error}")
+                    },
                     cx,
                 );
                 true
@@ -578,5 +659,59 @@ mod tests {
             DictionaryCompletion::Restored
         ));
         assert_eq!(state.undo_details(), None);
+    }
+
+    #[test]
+    fn unconfirmed_removal_and_profile_change_never_create_or_redirect_undo() {
+        use yield_library::app_dirs::{
+            ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard,
+        };
+        use yield_library::sample_sources::GlobalLibraryWriter;
+        let _runtime = yield_library::test_runtime::TestRuntimeGuard::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(std::fs::canonicalize(temp.path()).unwrap());
+        let _profile = PersistenceProfileGuard::named("ui-vocabulary-context-fixture");
+        let capture = || {
+            let guard = WritableProfileGuard::acquire_current().unwrap();
+            let mut writer = GlobalLibraryWriter::start(&guard).unwrap();
+            let acquisition = writer.profile_tag_vocabulary_client().acquisition_id();
+            writer.shutdown();
+            acquisition
+        };
+        let original = capture();
+        let replacement = capture();
+        assert_ne!(original, replacement);
+        let mut state = TagDictionaryState::default();
+        state.complete_remove(ProfileTagVocabularyDeleteReceipt {
+            revision: 7,
+            removed: Some(ProfileTagVocabularyEntry {
+                label: "keep".into(),
+                category: ProfileTagCategory::Character,
+            }),
+        });
+        state.undo_acquisition = Some(original.clone());
+        assert!(!state.clear_undo_for_changed_acquisition(Some(&original)));
+        assert!(state.has_undo());
+        assert!(state.clear_undo_for_changed_acquisition(Some(&replacement)));
+        assert!(!state.has_undo());
+        state.complete_remove(ProfileTagVocabularyDeleteReceipt {
+            revision: 7,
+            removed: None,
+        });
+        assert!(
+            state.undo_details().is_none(),
+            "a fresh no-op cannot fabricate the prior tombstone"
+        );
+        state.complete_remove(ProfileTagVocabularyDeleteReceipt {
+            revision: 8,
+            removed: Some(ProfileTagVocabularyEntry {
+                label: "other".into(),
+                category: ProfileTagCategory::Prefix,
+            }),
+        });
+        state.undo_acquisition = Some(replacement);
+        state.invalidate_unconfirmed();
+        assert!(state.undo_details().is_none());
+        assert!(state.undo_acquisition().is_none());
     }
 }

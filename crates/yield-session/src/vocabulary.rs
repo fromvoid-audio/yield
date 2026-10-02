@@ -7,6 +7,11 @@ use yield_library::sample_sources::{
     ProfileTagVocabularyClient,
 };
 
+pub use yield_library::sample_sources::library::ProfileAcquisitionId;
+use yield_library::sample_sources::library::{
+    GlobalMutationCompletion, GlobalMutationContext, GlobalMutationRequest, GlobalMutationValue,
+};
+
 pub use yield_library::sample_sources::{
     ProfileTagCategory, ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyEntry,
     ProfileTagVocabularyInputError, ProfileTagVocabularyLookup, ProfileTagVocabularyPage,
@@ -74,14 +79,45 @@ pub enum VocabularySubmitError {
 /// result permit.
 pub struct VocabularyRequest<T> {
     id: VocabularyRequestId,
-    receiver: Receiver<Result<T, LibraryError>>,
+    receiver: VocabularyReceiver<T>,
+    acquisition: ProfileAcquisitionId,
     permit: Option<OutstandingVocabularyPermit>,
 }
 
+enum VocabularyReceiver<T> {
+    Read(Receiver<Result<T, LibraryError>>),
+    Mutation {
+        receiver: Receiver<GlobalMutationCompletion>,
+        context: GlobalMutationContext,
+        project: fn(GlobalMutationValue) -> Result<T, LibraryError>,
+    },
+}
+
 impl<T> VocabularyRequest<T> {
+    /// Acquisition captured for this read or immutable mutation proposal; not authority.
+    pub fn acquisition_id(&self) -> &ProfileAcquisitionId {
+        &self.acquisition
+    }
+
+    /// Exact proposal context retained for mutation completion checking.
+    pub fn mutation_context(&self) -> Option<&GlobalMutationContext> {
+        match &self.receiver {
+            VocabularyReceiver::Read(_) => None,
+            VocabularyReceiver::Mutation { context, .. } => Some(context),
+        }
+    }
+
     /// Return the request id assigned at admission.
     pub fn id(&self) -> VocabularyRequestId {
         self.id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_wrong_context_for_test(&mut self, replacement: GlobalMutationContext) {
+        let VocabularyReceiver::Mutation { context, .. } = &mut self.receiver else {
+            panic!("mutation request fixture");
+        };
+        *context = replacement;
     }
 
     /// Poll the request result without blocking the caller.
@@ -89,7 +125,17 @@ impl<T> VocabularyRequest<T> {
     /// The outstanding-result permit is released once a terminal result or disconnection is
     /// observed. An empty poll retains the permit for a later poll.
     pub fn try_recv(&mut self) -> Result<Result<T, LibraryError>, TryRecvError> {
-        match self.receiver.try_recv() {
+        let received = match &self.receiver {
+            VocabularyReceiver::Read(receiver) => receiver.try_recv(),
+            VocabularyReceiver::Mutation {
+                receiver,
+                context,
+                project,
+            } => receiver
+                .try_recv()
+                .map(|completion| completion.into_result_for(context).and_then(project)),
+        };
+        match received {
             Ok(result) => {
                 self.permit.take();
                 Ok(result)
@@ -161,7 +207,9 @@ pub(crate) fn lookup(
     labels: Vec<String>,
 ) -> Result<VocabularyRequest<ProfileTagVocabularyLookup>, VocabularySubmitError> {
     submit(slot, id, move |client| {
-        client.lookup_profile_tag_categories(labels)
+        client
+            .lookup_profile_tag_categories(labels)
+            .map(VocabularyReceiver::Read)
     })
 }
 
@@ -174,30 +222,67 @@ pub(crate) fn page(
     requested_limit: usize,
 ) -> Result<VocabularyRequest<ProfileTagVocabularyPage>, VocabularySubmitError> {
     submit(slot, id, move |client| {
-        client.profile_tag_vocabulary_page(expected_revision, prefix, after_cursor, requested_limit)
+        client
+            .profile_tag_vocabulary_page(expected_revision, prefix, after_cursor, requested_limit)
+            .map(VocabularyReceiver::Read)
     })
 }
 
 pub(crate) fn set_category(
     slot: &Arc<Mutex<VocabularySlot>>,
     id: VocabularyRequestId,
+    acquisition: Option<ProfileAcquisitionId>,
     expected_revision: u64,
     label: String,
     category: ProfileTagCategory,
 ) -> Result<VocabularyRequest<ProfileTagVocabularySetReceipt>, VocabularySubmitError> {
     submit(slot, id, move |client| {
-        client.set_profile_tag_category(expected_revision, label, category)
+        let request = GlobalMutationRequest::vocabulary_set(
+            acquisition.unwrap_or_else(|| client.acquisition_id()),
+            id.get(),
+            expected_revision,
+            label,
+            category,
+        )?;
+        let context = request.context().clone();
+        client
+            .submit_captured_mutation(request)
+            .map(|receiver| VocabularyReceiver::Mutation {
+                receiver,
+                context,
+                project: |value| match value {
+                    GlobalMutationValue::VocabularySet(receipt) => Ok(receipt),
+                    _ => Err(LibraryError::GlobalMutationCompletionMismatch),
+                },
+            })
     })
 }
 
 pub(crate) fn delete_profile_tag_vocabulary(
     slot: &Arc<Mutex<VocabularySlot>>,
     id: VocabularyRequestId,
+    acquisition: Option<ProfileAcquisitionId>,
     expected_revision: u64,
     label: String,
 ) -> Result<VocabularyRequest<ProfileTagVocabularyDeleteReceipt>, VocabularySubmitError> {
     submit(slot, id, move |client| {
-        client.delete_profile_tag_vocabulary(expected_revision, label)
+        let request = GlobalMutationRequest::vocabulary_delete(
+            acquisition.unwrap_or_else(|| client.acquisition_id()),
+            id.get(),
+            expected_revision,
+            label,
+        )?;
+        let context = request.context().clone();
+        client
+            .submit_captured_mutation(request)
+            .map(|receiver| VocabularyReceiver::Mutation {
+                receiver,
+                context,
+                project: |value| match value {
+                    GlobalMutationValue::VocabularyDelete(receipt) => Ok(receipt),
+                    _ => Err(LibraryError::GlobalMutationCompletionMismatch),
+                },
+            })
     })
 }
 
@@ -206,8 +291,7 @@ fn submit<T>(
     id: VocabularyRequestId,
     operation: impl FnOnce(
         &ProfileTagVocabularyClient,
-    )
-        -> Result<Receiver<Result<T, LibraryError>>, GlobalLibraryWriterQueueError>,
+    ) -> Result<VocabularyReceiver<T>, GlobalLibraryWriterQueueError>,
 ) -> Result<VocabularyRequest<T>, VocabularySubmitError> {
     // Keep this lock through the bounded, nonblocking library admission. A successful request
     // therefore linearizes before session shutdown closes the slot, while no SQL or owner join
@@ -235,9 +319,14 @@ fn submit<T>(
             return Err(map_submit_error(error));
         }
     };
+    let acquisition = match &receiver {
+        VocabularyReceiver::Read(_) => client.acquisition_id(),
+        VocabularyReceiver::Mutation { context, .. } => context.acquisition().clone(),
+    };
     Ok(VocabularyRequest {
         id,
         receiver,
+        acquisition,
         permit: Some(OutstandingVocabularyPermit {
             slot: Arc::clone(slot),
         }),
@@ -299,5 +388,21 @@ impl Drop for OutstandingVocabularyPermit {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         slot.outstanding = slot.outstanding.saturating_sub(1);
+    }
+}
+
+pub(crate) fn acquisition_id(
+    slot: &Arc<Mutex<VocabularySlot>>,
+) -> Result<ProfileAcquisitionId, VocabularySubmitError> {
+    let slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match slot_status(&slot) {
+        VocabularyStatus::Available => slot
+            .client
+            .as_ref()
+            .map(ProfileTagVocabularyClient::acquisition_id)
+            .ok_or(VocabularySubmitError::Initializing),
+        VocabularyStatus::Initializing => Err(VocabularySubmitError::Initializing),
+        VocabularyStatus::Unavailable { reason } => Err(VocabularySubmitError::Unavailable(reason)),
+        VocabularyStatus::Closed => Err(VocabularySubmitError::Closed),
     }
 }
