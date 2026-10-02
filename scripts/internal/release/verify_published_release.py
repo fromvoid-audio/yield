@@ -24,6 +24,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+MAX_UPDATE_MANIFEST_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -677,6 +678,16 @@ def verify_checksum_signature(checksum_path: Path, signature_path: Path, checksu
     return []
 
 
+def reject_duplicate_manifest_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """One field has one meaning; last-key-wins JSON is not release evidence."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate update manifest field")
+        result[key] = value
+    return result
+
+
 def validate_zip_manifest(
     zip_path: Path,
     zip_asset: ExpectedZip,
@@ -695,11 +706,22 @@ def validate_zip_manifest(
             if len(manifest_archive_names) != 1:
                 return [f"{zip_asset.name} must contain exactly one update-manifest.json"]
             errors.extend(validate_archive_layout(zip_asset, archive_layout, archive_files, manifest_names[0]))
-            manifest = json.loads(archive.read(manifest_archive_names[0]).decode("utf-8"))
+            info = archive.getinfo(manifest_archive_names[0])
+            if info.file_size > MAX_UPDATE_MANIFEST_BYTES:
+                return [f"{zip_asset.name} update manifest exceeds the 1 MiB metadata limit"]
+            with archive.open(info) as source:
+                raw = source.read(MAX_UPDATE_MANIFEST_BYTES + 1)
+            if len(raw) > MAX_UPDATE_MANIFEST_BYTES:
+                return [f"{zip_asset.name} update manifest exceeds the 1 MiB metadata limit"]
+            manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_manifest_fields)
+            if not isinstance(manifest, dict):
+                return [f"{zip_asset.name} update manifest must be a JSON object"]
     except zipfile.BadZipFile:
         return [f"{zip_asset.name} is not a valid zip file"]
-    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+    except ValueError as error:
         return [f"{zip_asset.name} contains an invalid update-manifest.json: {error}"]
+    except RecursionError:
+        return [f"{zip_asset.name} update manifest nesting exceeds the metadata parser limit"]
 
     expected = {
         "app": "yield",
