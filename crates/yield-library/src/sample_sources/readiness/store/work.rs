@@ -223,6 +223,11 @@ pub(super) fn claim_readiness_target_owned(
         .ok_or(ReadinessError::TimestampOverflow)?;
     let failure_attempts = decode_counter("attempts", stored_failure_attempts)?;
     let origin = decode_claim_origin(&stored_status, stored_lease_expires_at)?;
+    // The production path requires this retained physical owner. Unowned in-memory contract
+    // stores exist only in test/test-support builds and do not establish physical admission.
+    if publication_fence.is_some() {
+        crate::sqlite_wal::enforce_wal_admission(&tx)?;
+    }
     let changed = tx.execute(
         "UPDATE analysis_jobs
          SET status = 'running',

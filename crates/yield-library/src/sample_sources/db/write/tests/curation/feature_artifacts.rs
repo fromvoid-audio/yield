@@ -3,7 +3,7 @@ use crate::sample_sources::readiness::{
     FeatureArtifactPayload, FeatureArtifactPublication, ReadinessError,
 };
 
-fn prepare() -> (CurationFixture, ReadinessTarget) {
+pub(super) fn prepare() -> (CurationFixture, ReadinessTarget) {
     let mut fixture = CurationFixture::new_profile_bound();
     fixture
         .database
@@ -79,7 +79,7 @@ fn payload(value: f32) -> FeatureArtifactPayload {
     FeatureArtifactPayload::from_v1_vector(&vec![value; 183]).unwrap()
 }
 
-fn owner(fixture: &mut CurationFixture) -> SourceWriter {
+pub(super) fn owner(fixture: &mut CurationFixture) -> SourceWriter {
     let file: String = fixture
         .database
         .connection
