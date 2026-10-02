@@ -642,6 +642,13 @@ impl Browser {
     }
 
     fn reconcile_pane_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pane_resize_environment_subscriptions.is_empty() {
+            let focus = self.focus_handle.clone();
+            self.pane_resize_environment_subscriptions = vec![
+                cx.observe_window_bounds(window, |view, _, cx| view.cancel_pane_resize(cx)),
+                cx.on_focus_out(&focus, window, |view, _, _, cx| view.cancel_pane_resize(cx)),
+            ];
+        }
         if self.pane_resize_activation.is_none() {
             self.pane_resize_activation =
                 Some(cx.observe_window_activation(window, |view, window, cx| {
@@ -4904,6 +4911,59 @@ mod tests {
                 assert_eq!(view.selected, selected);
                 assert_eq!(view.playback_epoch, playback_epoch);
             });
+        });
+    }
+
+    #[gpui::test]
+    fn workspace_resize_focus_loss_restores_preference(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.refresh().expect("install focus observer");
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, app| browser.update(app, |view, _| window.focus(&view.focus_handle)));
+        cx.refresh().expect("focus browser");
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                view.preferred_sidebar_width = Some(260.0);
+                view.begin_pane_resize(PaneAxis::Sidebar, point(px(260.0), px(200.0)), window, cx);
+                view.update_pane_resize(point(px(390.0), px(200.0)), window, cx);
+                window.blur();
+            })
+        });
+        cx.run_until_parked();
+        cx.refresh().expect("dispatch focus loss");
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.pane_resize_drag.is_none());
+            assert_eq!(view.preferred_sidebar_width, Some(260.0));
+        });
+    }
+
+    #[gpui::test]
+    fn workspace_resize_window_deactivation_restores_preference(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.refresh().expect("install activation observer");
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                view.preferred_sidebar_width = Some(260.0);
+                view.begin_pane_resize(PaneAxis::Sidebar, point(px(260.0), px(200.0)), window, cx);
+                view.update_pane_resize(point(px(390.0), px(200.0)), window, cx);
+            })
+        });
+        let other = cx.cx.add_window(|_, cx| Browser::new(cx));
+        other
+            .update(&mut cx.cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.pane_resize_drag.is_none());
+            assert_eq!(view.preferred_sidebar_width, Some(260.0));
         });
     }
 
