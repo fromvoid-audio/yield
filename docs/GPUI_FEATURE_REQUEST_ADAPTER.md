@@ -20,7 +20,10 @@ Ready is emitted only after the current retained owner validates actual stored
 feature bytes and reissues their typed key. Existing cached completion also needs
 that lookup; a marker or process-local artifact string cannot fabricate Ready.
 Unclaimable retained work or missing/corrupt payload rebuild remains Blocked;
-automatic corruption/eviction repair stays under OPT-1657. Unavailable native
+automatic corruption/eviction repair stays under OPT-1657. Larger audited manifests
+use the same request through [bounded streamed readiness publication](SOURCE_STREAMED_READINESS_PUBLICATION.md).
+Its work-limit rejection produces an explicit AdmissionBudget blocker and retains
+the prior visible generation; it never reports a partially published source. Unavailable native
 held input returns UnsupportedPlatform, retaining retry evidence. Native adapters
 OPT-2061/2062 remain actual implementation gates, never waived by a model.
 

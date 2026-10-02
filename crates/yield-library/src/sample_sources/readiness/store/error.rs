@@ -5,6 +5,9 @@ use super::super::model::{ReadinessScopeKind, ReadinessStage};
 /// Errors returned by the durable readiness contract.
 #[derive(Debug, Error)]
 pub enum ReadinessError {
+    /// Bounded streamed admission could not complete; no partial generation becomes visible.
+    #[error("Readiness admission budget exhausted: {0}")]
+    AdmissionBudget(&'static str),
     /// A feature artifact had an unsupported identity, shape or immutable conflict.
     #[error("Invalid feature artifact: {0}")]
     InvalidFeatureArtifact(&'static str),
