@@ -4357,3 +4357,4 @@ fn bounded_metadata_corruption_rejects_actual_writer_revision_and_tag_selection_
         assert_eq!(writer.current_revision().unwrap(), revision);
     }
 }
+mod readiness_targets;

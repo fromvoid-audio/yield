@@ -84,6 +84,7 @@ pub(super) fn replace_readiness_targets_inner(
         targets,
         updated_at,
         cancel,
+        false,
     )
 }
 
@@ -100,6 +101,7 @@ pub(super) fn replace_readiness_targets_owned(
     targets: &[ReadinessTarget],
     updated_at: i64,
     cancel: Option<&AtomicBool>,
+    audited_index_evidence: bool,
 ) -> Result<(), ReadinessError> {
     validate_publication_ownership(&*connection, ownership, origin)?;
     validate_publication_text_bounds(source_id, contract_version, targets, &[])?;
@@ -170,6 +172,22 @@ pub(super) fn replace_readiness_targets_owned(
         insert_target(&tx, target, updated_at)?;
         if target.scope_kind == ReadinessScopeKind::File {
             refresh_work_metadata(&tx, target)?;
+        }
+        if audited_index_evidence && target.stage == ReadinessStage::IndexedIdentity {
+            cancellation_checkpoint(cancel)?;
+            tx.execute(
+                "INSERT INTO source_readiness_artifacts (
+                    source_id, scope_kind, scope_id, relative_path, stage,
+                    artifact_version, source_generation, content_generation, artifact_ref, completed_at
+                 ) VALUES (?1, 'file', ?2, NULL, 'indexed_identity', ?3, ?4, ?5, NULL, ?6)
+                 ON CONFLICT(source_id, scope_kind, scope_id, stage) DO UPDATE SET
+                    relative_path = NULL, artifact_version = excluded.artifact_version,
+                    source_generation = excluded.source_generation,
+                    content_generation = excluded.content_generation,
+                    artifact_ref = NULL, completed_at = excluded.completed_at",
+                params![target.source_id, target.scope_id, target.required_version,
+                    target.source_generation, target.content_generation, updated_at],
+            )?;
         }
     }
     cancellation_checkpoint(cancel)?;

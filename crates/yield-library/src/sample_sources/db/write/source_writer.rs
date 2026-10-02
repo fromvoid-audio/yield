@@ -6,6 +6,8 @@
 //! owner; their persisted DTOs never construct or reacquire an authority.
 
 use super::super::{SourceReferenceFence, SourceReferenceFenceError};
+#[path = "readiness_targets.rs"]
+mod readiness_targets;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
