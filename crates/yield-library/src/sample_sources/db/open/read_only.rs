@@ -63,7 +63,7 @@ pub(super) fn open_read_only_source_database(
         tag_metadata_policy_state: std::cell::Cell::new(
             crate::sample_sources::db::TAG_METADATA_POLICY_IDLE,
         ),
-        connection,
+        connection: connection.into(),
         db_path: db_path.clone(),
         root: root.to_path_buf(),
         telemetry_label: role.label(),

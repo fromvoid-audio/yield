@@ -163,7 +163,7 @@ pub fn open_connection() -> Result<Connection, LibraryError> {
     let started_at = Instant::now();
     let _guard = lock_library();
     let db = LibraryDatabase::open()?;
-    let result = Ok(db.into_connection());
+    let result = db.into_connection();
     record_library_db_event(
         "library.open_connection",
         started_at,

@@ -39,6 +39,8 @@ SOURCE_EXCEPTIONS = {
 # Source owner, lease control, snapshot destination, global library, and journal
 # opens are separate reviewed boundaries. New raw opens need an explicit review.
 RAW_EXCEPTIONS = {
+    # Connection-owned budget VFS, same retained root/no-follow source/global/control boundary.
+    ("crates/yield-library/src/sqlite_budget.rs", "open_owned", "open_with_flags_and_vfs"): 1,
     # Bundled in-memory schema/runtime reference; no source path or durable writer is opened.
     ("crates/yield-library/src/sample_sources/db/schema/metadata_budget.rs", "reference_image", "open_in_memory"): 1,
     ("crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs", "open_sqlite", "open_with_flags"): 1,
@@ -140,6 +142,10 @@ def self_test() -> None:
     assert not validate(reviewed)
     assert inventory_label(reviewed[0]) == "retained-root-sqlite"
     assert validate(reviewed + reviewed)
+    owned, _ = calls_in("crates/yield-library/src/sqlite_budget.rs", "fn open_owned() { Connection::open_with_flags_and_vfs(); }")
+    assert not validate(owned)
+    assert inventory_label(owned[0]) == "retained-root-sqlite"
+    assert validate(owned + owned)
     fixture, _ = calls_in(
         source,
         "fn production() {}\n#[cfg(test)]\nmod tests {\n"
@@ -151,7 +157,9 @@ def self_test() -> None:
 
 
 def inventory_label(call: Call) -> str:
-    if call.kind == "raw" and call.path.endswith("/file_ops_journal/recovery_io.rs") and call.function == "open_sqlite":
+    if call.kind == "raw" and call.path == "crates/yield-library/src/sqlite_budget.rs" and call.function == "open_owned":
+        return "retained-root-sqlite"
+    if call.kind == "raw" and call.path.endswith("/file_ops_journal/recovery_io.rs") and call.function in {"open_sqlite", "open_owned_sqlite"}:
         return "retained-root-sqlite"
     if call.kind == "source":
         if call.opener in READ_ONLY_SOURCE_OPENS:

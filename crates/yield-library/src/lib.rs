@@ -22,6 +22,7 @@ pub mod filesystem_identity;
 pub mod operation_journal;
 /// Sample-source identifiers and persistent storage helpers.
 pub mod sample_sources;
+mod sqlite_budget;
 /// Optional SQLite extension loader shared by storage code.
 pub mod sqlite_ext;
 #[cfg(target_os = "linux")]

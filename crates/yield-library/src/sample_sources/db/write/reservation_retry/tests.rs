@@ -135,7 +135,9 @@ fn reservation_retry_locked_extended_errors_and_body_errors_are_not_replayed() {
     let (_root, mut database) = plain();
     let flags =
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_SHARED_CACHE;
-    database.connection = rusqlite::Connection::open_with_flags(&database.db_path, flags).unwrap();
+    database.connection = rusqlite::Connection::open_with_flags(&database.db_path, flags)
+        .unwrap()
+        .into();
     database
         .connection
         .busy_timeout(Duration::from_millis(800))
