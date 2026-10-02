@@ -128,7 +128,7 @@ fn recording_controls_unknown_conflicting_and_partial_rows_are_retained_not_filt
         controls::{ControlRole, RecordingControlReservation},
         recording_proposal_for_test,
     };
-    for case in 0..6 {
+    for case in 0..8 {
         let f = fixture();
         let store = OperationJournalStore::open(&f.owner).unwrap();
         let proposal = recording_proposal_for_test(2, 100);
@@ -172,6 +172,13 @@ fn recording_controls_unknown_conflicting_and_partial_rows_are_retained_not_filt
                     )
                     .unwrap();
             }
+            6 => {
+                store.connection.execute("UPDATE operation_journal_recording_chunks SET sequence=1000 WHERE chunk_id=?1", params![control.id().to_string()]).unwrap();
+            }
+            7 => {
+                // Keep four controls contiguous but put them after already captured bytes.
+                store.connection.execute("UPDATE operation_journal_recording_chunks SET sequence=sequence+1000 WHERE slot BETWEEN 20000 AND 20003", []).unwrap();
+            }
             _ => {
                 let other = recording_proposal_for_test(2, 100);
                 let wrong = RecordingControlReservation::new(&other, ControlRole::Frozen).unwrap();
@@ -184,13 +191,13 @@ fn recording_controls_unknown_conflicting_and_partial_rows_are_retained_not_filt
                     .unwrap();
             }
         }
-        let before: Vec<(String, Vec<u8>)> = store
+        let before: Vec<(String, String, i64, i64, Vec<u8>)> = store
             .connection
             .prepare(
-                "SELECT chunk_id,record FROM operation_journal_recording_chunks ORDER BY chunk_id",
+                "SELECT chunk_id,operation_id,slot,sequence,record FROM operation_journal_recording_chunks ORDER BY chunk_id",
             )
             .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
@@ -207,13 +214,13 @@ fn recording_controls_unknown_conflicting_and_partial_rows_are_retained_not_filt
         );
         assert!(store.retain_recording_chunk(&header).is_err());
         assert!(store.prove_clean_handoff_durable().is_err());
-        let after: Vec<(String, Vec<u8>)> = store
+        let after: Vec<(String, String, i64, i64, Vec<u8>)> = store
             .connection
             .prepare(
-                "SELECT chunk_id,record FROM operation_journal_recording_chunks ORDER BY chunk_id",
+                "SELECT chunk_id,operation_id,slot,sequence,record FROM operation_journal_recording_chunks ORDER BY chunk_id",
             )
             .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();

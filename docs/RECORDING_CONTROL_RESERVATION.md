@@ -35,7 +35,8 @@ Each strict version-1 reservation binds the complete encoded proposal hash,
 operation, output, work key, role, and deterministic domain-separated control ID.
 Its JSON is bounded to 4096 bytes and rejects duplicate/unknown fields, unknown
 versions, and conflicting bindings. Target reservations must contain exactly the
-four expected rows with valid keys, positive sequences, and exact decoded bytes.
+four expected rows with valid keys, consecutive positive role sequences preceding
+any captured chunk, and exact decoded bytes.
 Partial, corrupt, extra, and future terminal states stay retained and reject
 capture and recovery observation; none is treated as vacant capacity.
 

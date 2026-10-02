@@ -71,6 +71,7 @@ impl OperationJournalStore {
                 "recording has no complete reserved terminal inventory",
             ));
         }
+        let mut previous_sequence: Option<i64> = None;
         for role in ControlRole::ALL {
             let expected = RecordingControlReservation::new(proposal, role).map_err(error)?;
             let row: Option<(String, i64, String, i64)> = self.connection.query_row(
@@ -87,12 +88,30 @@ impl OperationJournalStore {
             {
                 return Err(error("unsupported recording control row shape/identity"));
             }
+            if previous_sequence.is_some_and(|previous| previous.checked_add(1) != Some(sequence)) {
+                return Err(error(
+                    "reserved recording controls have conflicting sequence order",
+                ));
+            }
+            previous_sequence = Some(sequence);
             let bytes: Vec<u8> = self.connection.query_row("SELECT record FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=?2",
                 params![proposal.operation_id().to_string(), role.slot()], |r|r.get(0))?;
             let observed = RecordingControlReservation::decode(&bytes, proposal).map_err(error)?;
             if observed != expected {
                 return Err(error("conflicting reserved recording control"));
             }
+        }
+        let first_capture: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT sequence FROM operation_journal_recording_chunks WHERE operation_id=?1
+             AND slot NOT BETWEEN 20000 AND 20003 ORDER BY sequence LIMIT 1",
+                params![proposal.operation_id().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if first_capture.is_some_and(|sequence| sequence <= previous_sequence.unwrap()) {
+            return Err(error("recording capture precedes its terminal reservation"));
         }
         Ok(true)
     }
