@@ -42,30 +42,3 @@ pub fn waveform_cache_dir() -> Result<PathBuf, AppDirError> {
     })?;
     Ok(path)
 }
-
-/// Clear all rebuildable cache payloads without touching logs, handoff staging,
-/// source databases, or durable user metadata.
-pub fn clear_rebuildable_cache_payloads() -> Result<PathBuf, String> {
-    let path = app_root_dir().map_err(|err| err.to_string())?.join("cache");
-    if path.exists() {
-        if !path.is_dir() {
-            return Err(format!(
-                "Rebuildable cache path is not a directory: {}",
-                path.display()
-            ));
-        }
-        std::fs::remove_dir_all(&path).map_err(|err| {
-            format!(
-                "Failed to clear rebuildable caches at {}: {err}",
-                path.display()
-            )
-        })?;
-    }
-    std::fs::create_dir_all(&path).map_err(|err| {
-        format!(
-            "Failed to recreate rebuildable cache directory at {}: {err}",
-            path.display()
-        )
-    })?;
-    Ok(path)
-}
