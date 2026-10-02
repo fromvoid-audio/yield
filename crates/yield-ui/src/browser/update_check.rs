@@ -104,7 +104,14 @@ impl UpdateCheck {
                 build,
             } if channel != request.channel
                 || platform != request.platform
-                || version < request.installed
+                || !yield_platform::update_catalog::release_core_is_admissible(
+                    [
+                        request.installed.0,
+                        request.installed.1,
+                        request.installed.2,
+                    ],
+                    [version.0, version.1, version.2],
+                )
                 || !build.known() =>
             {
                 State::Mismatch

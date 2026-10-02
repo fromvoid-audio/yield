@@ -8,7 +8,10 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use yield_platform::update_catalog::{Candidate, CatalogService, Channel, Outcome, Platform};
+use yield_platform::update_catalog::{
+    Candidate, CatalogService, Channel, Outcome, Platform, is_legacy_renumbering_transition,
+    release_core_is_admissible,
+};
 
 struct InstalledContext {
     request: UpdateCheckRequest,
@@ -72,9 +75,11 @@ impl UpdateChecker for ProductionChecker {
         {
             return UpdateCheckOutcome::Failed;
         }
-        let result = match self.catalog.check(
+        let UpdateVersion(major, minor, patch) = self.installed.request.installed;
+        let result = match self.catalog.check_for_installed(
             channel(request.channel),
             platform(request.platform),
+            [major, minor, patch],
             cancelled,
         ) {
             Outcome::Candidate(candidate) => self.classify(request, candidate),
@@ -100,15 +105,21 @@ impl ProductionChecker {
             || candidate.platform != platform(request.platform)
             || candidate.version.map(u64::from) != [version.major, version.minor, version.patch]
             || !canonical_candidate_version(&version, &candidate)
+            || candidate.build_number == 0
+            || candidate.commit == [0; 20]
         {
             return UpdateCheckOutcome::Failed;
         }
         let exact = candidate.release_version == installed.full_version
             && candidate.build_number == request.build.number
             && candidate.commit == request.build.commit;
+        let UpdateVersion(major, minor, patch) = installed.request.installed;
+        let installed_core = [major, minor, patch];
         let newer = candidate.build_number > request.build.number
             && candidate.commit != request.build.commit
-            && !version.cmp_precedence(&installed.semantic_version).is_lt();
+            && release_core_is_admissible(installed_core, candidate.version)
+            && (!version.cmp_precedence(&installed.semantic_version).is_lt()
+                || is_legacy_renumbering_transition(installed_core, candidate.version));
         if !exact && !newer {
             return UpdateCheckOutcome::Failed;
         }

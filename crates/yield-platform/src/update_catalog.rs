@@ -16,6 +16,30 @@ const ENDPOINT: &str = "https://portalsurfer.org/yield/api/v1/releases";
 const MAX_BYTES: u64 = 512 * 1024;
 const DEADLINE: Duration = Duration::from_secs(10);
 
+/// Whether the colliding legacy 19.1.x line may move to the new pre-1.0 line.
+/// This changes version ordering only, never build, commit, lane or target checks.
+pub fn is_legacy_renumbering_transition(installed: [u32; 3], candidate: [u32; 3]) -> bool {
+    installed[0] == 19
+        && installed[1] == 1
+        && candidate[0] == 0
+        && (candidate[1], candidate[2]) >= (19, 1)
+}
+
+/// Whether a new-line installation must ignore a historical colliding release.
+pub fn is_historical_legacy_candidate(installed: [u32; 3], candidate: [u32; 3]) -> bool {
+    installed[0] == 0
+        && (installed[1], installed[2]) >= (19, 1)
+        && candidate[0] == 19
+        && candidate[1] == 1
+}
+
+/// Core version eligibility shared by the catalog adapter and UI projection.
+/// Full prerelease precedence and immutable packaged identity still need checking.
+pub fn release_core_is_admissible(installed: [u32; 3], candidate: [u32; 3]) -> bool {
+    !is_historical_legacy_candidate(installed, candidate)
+        && (candidate >= installed || is_legacy_renumbering_transition(installed, candidate))
+}
+
 /// Release lane. Catalog versions must agree with this lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Channel {
@@ -118,6 +142,29 @@ impl CatalogService {
     /// Call this from the UI's background worker. Cancellation returns promptly;
     /// the bounded transport worker retains admission until its I/O ends.
     pub fn check(&self, channel: Channel, platform: Platform, cancelled: &AtomicBool) -> Outcome {
+        self.check_context(channel, platform, None, cancelled)
+    }
+
+    /// Select metadata for the retained installed version, filtering the historical
+    /// colliding line before highest-build selection. Installed context must come
+    /// from the immutable packaged identity in the production adapter.
+    pub fn check_for_installed(
+        &self,
+        channel: Channel,
+        platform: Platform,
+        installed: [u32; 3],
+        cancelled: &AtomicBool,
+    ) -> Outcome {
+        self.check_context(channel, platform, Some(installed), cancelled)
+    }
+
+    fn check_context(
+        &self,
+        channel: Channel,
+        platform: Platform,
+        installed: Option<[u32; 3]>,
+        cancelled: &AtomicBool,
+    ) -> Outcome {
         if cancelled.load(Ordering::Acquire)
             || self
                 .busy
@@ -140,7 +187,7 @@ impl CatalogService {
                     }
                 }
                 let _release = Release(busy);
-                let _ = sender.send(fetch(&endpoint, deadline, channel, platform));
+                let _ = sender.send(fetch(&endpoint, deadline, channel, platform, installed));
             });
         if spawned.is_err() {
             self.busy.store(false, Ordering::Release);
@@ -169,7 +216,13 @@ impl CatalogService {
     }
 }
 
-fn fetch(endpoint: &str, deadline: Duration, channel: Channel, platform: Platform) -> Outcome {
+fn fetch(
+    endpoint: &str,
+    deadline: Duration,
+    channel: Channel,
+    platform: Platform,
+    installed: Option<[u32; 3]>,
+) -> Outcome {
     // TLS root validation is ureq/rustls's default. Redirects are rejected, so
     // catalog authority cannot move to another origin (including localhost).
     let agent = ureq::AgentBuilder::new()
@@ -218,7 +271,7 @@ fn fetch(endpoint: &str, deadline: Duration, channel: Channel, platform: Platfor
     {
         return Outcome::Failed;
     }
-    select(&bytes, channel, platform)
+    select_for_installed(&bytes, channel, platform, installed)
 }
 
 #[derive(Deserialize)]
@@ -241,7 +294,17 @@ struct Asset {
     name: String,
 }
 
+#[cfg(test)]
 fn select(bytes: &[u8], channel: Channel, platform: Platform) -> Outcome {
+    select_for_installed(bytes, channel, platform, None)
+}
+
+fn select_for_installed(
+    bytes: &[u8],
+    channel: Channel,
+    platform: Platform,
+    installed: Option<[u32; 3]>,
+) -> Outcome {
     // Bound nesting even for ignored server fields, before serde traverses them.
     if !bounded_json(bytes) {
         return Outcome::Failed;
@@ -337,6 +400,14 @@ fn select(bytes: &[u8], channel: Channel, platform: Platform) -> Outcome {
         let [Ok(major), Ok(minor), Ok(patch)] = core else {
             return Outcome::Failed;
         };
+        if installed.is_some_and(|installed| {
+            is_historical_legacy_candidate(installed, [major, minor, patch])
+        }) {
+            // Valid historical identities cannot mask a new-line candidate.
+            // Parsing/identity bounds above still apply; no ordinary fallback
+            // from an incomplete latest allowed entry is introduced.
+            continue;
+        }
         let candidate = commit.map(|commit| Candidate {
             version: [major, minor, patch],
             release_version: release.version,

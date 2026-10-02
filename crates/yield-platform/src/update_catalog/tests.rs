@@ -288,3 +288,48 @@ fn offline_timeout_cancellation_and_single_inflight_are_bounded() {
     assert!(start.elapsed() < Duration::from_secs(1));
     thread.join().unwrap();
 }
+
+#[test]
+fn renumbering_filter_precedes_actual_transport_selection_for_each_target() {
+    for (platform, suffix) in [
+        (Platform::MacArm64, "macos-aarch64"),
+        (Platform::MacX64, "macos-x86_64"),
+        (Platform::WindowsX64, "windows-x86_64"),
+    ] {
+        let body = catalog(vec![
+            release("19.1.99", 999, &format!("yield-19.1.99-{suffix}.zip")),
+            release("0.20.0", 45, &format!("yield-0.20.0-{suffix}.zip")),
+        ]);
+        let (service, thread) = serve("200 OK", "", body, Duration::ZERO);
+        let Outcome::Candidate(candidate) = service.check_for_installed(
+            Channel::Stable,
+            platform,
+            [0, 19, 1],
+            &AtomicBool::new(false),
+        ) else {
+            panic!("new-line candidate required")
+        };
+        thread.join().unwrap();
+        assert_eq!(candidate.version, [0, 20, 0]);
+        assert_eq!(candidate.release_version, "0.20.0");
+        assert_eq!(candidate.build_number, 45);
+        assert_eq!(candidate.platform, platform);
+    }
+}
+
+#[test]
+fn renumbering_does_not_fall_back_from_incomplete_allowed_latest_identity() {
+    let old = release("19.1.99", 999, "yield-19.1.99-macos-aarch64.zip");
+    let older = release("0.19.1", 44, "yield-0.19.1-macos-aarch64.zip");
+    let mut incomplete = release("0.20.0", 45, "yield-0.20.0-macos-aarch64.zip");
+    incomplete["build_id"] = json!("yield-b45-abcdef0");
+    assert_eq!(
+        select_for_installed(
+            &catalog(vec![old, older, incomplete]),
+            Channel::Stable,
+            Platform::MacArm64,
+            Some([0, 19, 1])
+        ),
+        Outcome::Unavailable
+    );
+}

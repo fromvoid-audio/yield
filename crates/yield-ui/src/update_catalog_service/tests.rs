@@ -3,9 +3,14 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 fn context(version: &'static str, channel: UpdateChannel) -> InstalledContext {
+    let semantic_version = semver::Version::parse(version).unwrap();
     InstalledContext {
         request: UpdateCheckRequest {
-            installed: UpdateVersion(19, 1, 0),
+            installed: UpdateVersion(
+                semantic_version.major.try_into().unwrap(),
+                semantic_version.minor.try_into().unwrap(),
+                semantic_version.patch.try_into().unwrap(),
+            ),
             build: UpdateBuild {
                 number: 44,
                 commit: [1; 20],
@@ -14,7 +19,7 @@ fn context(version: &'static str, channel: UpdateChannel) -> InstalledContext {
             platform: UpdatePlatform::MacArm64,
         },
         full_version: version,
-        semantic_version: semver::Version::parse(version).unwrap(),
+        semantic_version,
     }
 }
 
@@ -69,8 +74,9 @@ pub(crate) fn server(status: &str, body: Vec<u8>) -> (CatalogService, std::threa
 }
 
 fn candidate(version: &str, number: u64, commit: [u8; 20], channel: Channel) -> Candidate {
+    let semantic = semver::Version::parse(version).unwrap();
     Candidate {
-        version: [19, 1, 0],
+        version: [semantic.major, semantic.minor, semantic.patch].map(|v| v.try_into().unwrap()),
         release_version: version.into(),
         build_number: number,
         commit,

@@ -465,3 +465,305 @@ fn update_check_completed_projection_never_reuses_another_service_lane() {
         State::Unavailable
     );
 }
+
+fn run_catalog_case(
+    cx: &mut TestAppContext,
+    installed: &'static str,
+    lane: UpdateChannel,
+    releases: Vec<String>,
+    expected: State,
+) {
+    use crate::update_catalog_service::tests::{fixture_service, server};
+    let bytes = format!(r#"{{"releases":[{}]}}"#, releases.join(",")).into_bytes();
+    let (catalog, thread) = server("200 OK", bytes);
+    cx.set_global(crate::theme::ActiveTheme::default());
+    let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+    cx.update(|_, app| {
+        app.set_global(fixture_service(installed, lane, catalog));
+        browser.update(app, |view, cx| {
+            view.theme_settings_open = true;
+            view.check_for_updates(cx);
+            assert_eq!(view.general_settings.updates.state, State::Checking);
+        });
+    });
+    cx.run_until_parked();
+    thread.join().unwrap();
+    cx.update(|_, app| {
+        let updates = &browser.read(app).general_settings.updates;
+        assert_eq!(updates.state, expected, "installed {installed}");
+        assert!(updates.task.is_none());
+        if let State::Newer(version, _) = expected {
+            assert!(updates.state.message().contains(&version.to_string()));
+        }
+    });
+    cx.refresh().unwrap();
+    assert!(cx.debug_bounds("update-check-panel").is_some());
+}
+
+fn catalog_release(version: &str, build: u64, commit: &str, asset: &str) -> String {
+    let bytes = crate::update_catalog_service::tests::body(version, build, commit, asset);
+    String::from_utf8(bytes)
+        .unwrap()
+        .strip_prefix(r#"{"releases":["#)
+        .unwrap()
+        .strip_suffix("]}")
+        .unwrap()
+        .to_owned()
+}
+
+#[gpui::test]
+fn renumbering_legacy_install_reaches_actual_catalog_adapter_and_browser_worker(
+    cx: &mut TestAppContext,
+) {
+    run_catalog_case(
+        cx,
+        "19.1.9",
+        UpdateChannel::Stable,
+        vec![catalog_release(
+            "0.19.1",
+            45,
+            &"02".repeat(20),
+            "yield-0.19.1-macos-aarch64.zip",
+        )],
+        State::Newer(UpdateVersion(0, 19, 1), 45),
+    );
+}
+
+#[gpui::test]
+fn renumbering_mixed_catalog_cannot_mask_new_line_with_higher_historical_build(
+    cx: &mut TestAppContext,
+) {
+    run_catalog_case(
+        cx,
+        "0.19.1",
+        UpdateChannel::Stable,
+        vec![
+            catalog_release(
+                "0.20.0",
+                45,
+                &"02".repeat(20),
+                "yield-0.20.0-macos-aarch64.zip",
+            ),
+            catalog_release(
+                "19.1.99",
+                999,
+                &"03".repeat(20),
+                "yield-19.1.99-macos-aarch64.zip",
+            ),
+        ],
+        State::Newer(UpdateVersion(0, 20, 0), 45),
+    );
+}
+
+#[gpui::test]
+fn renumbering_actual_worker_preserves_ordinary_order_and_ignores_only_colliding_line(
+    cx: &mut TestAppContext,
+) {
+    for (installed, candidate, expected) in [
+        ("19.1.9", "0.19.0", State::Failed),
+        ("19.2.0", "0.20.0", State::Failed),
+        ("19.0.0", "0.20.0", State::Failed),
+        ("20.0.0", "0.20.0", State::Failed),
+        ("0.20.0", "0.19.1", State::Failed),
+        (
+            "0.19.1",
+            "19.2.0",
+            State::Newer(UpdateVersion(19, 2, 0), 45),
+        ),
+        (
+            "18.9.0",
+            "19.1.0",
+            State::Newer(UpdateVersion(19, 1, 0), 45),
+        ),
+        (
+            "0.19.0",
+            "19.1.0",
+            State::Newer(UpdateVersion(19, 1, 0), 45),
+        ),
+    ] {
+        run_catalog_case(
+            cx,
+            installed,
+            UpdateChannel::Stable,
+            vec![catalog_release(
+                candidate,
+                45,
+                &"02".repeat(20),
+                &format!("yield-{candidate}-macos-aarch64.zip"),
+            )],
+            expected,
+        );
+    }
+    for releases in [
+        vec![catalog_release(
+            "19.1.99",
+            999,
+            &"03".repeat(20),
+            "yield-19.1.99-macos-aarch64.zip",
+        )],
+        vec![
+            catalog_release(
+                "19.1.99",
+                999,
+                &"03".repeat(20),
+                "yield-19.1.99-macos-aarch64.zip",
+            ),
+            catalog_release(
+                "0.19.1",
+                44,
+                &"01".repeat(20),
+                "yield-0.19.1-macos-aarch64.zip",
+            ),
+        ],
+    ] {
+        let expected = if releases.len() == 1 {
+            State::Unavailable
+        } else {
+            State::Current
+        };
+        run_catalog_case(cx, "0.19.1", UpdateChannel::Stable, releases, expected);
+    }
+}
+
+#[gpui::test]
+fn renumbering_actual_worker_cannot_reset_build_or_reuse_full_commit_identity(
+    cx: &mut TestAppContext,
+) {
+    for (build, commit, expected) in [
+        (0, "02".repeat(20), State::Failed),
+        (43, "02".repeat(20), State::Failed),
+        (44, "02".repeat(20), State::Failed),
+        (45, "01".repeat(20), State::Failed),
+        (45, "00".repeat(20), State::Failed),
+        (45, "02020202".into(), State::Failed),
+        (
+            45,
+            "01".repeat(4) + &"02".repeat(16),
+            State::Newer(UpdateVersion(0, 19, 1), 45),
+        ),
+    ] {
+        run_catalog_case(
+            cx,
+            "19.1.9",
+            UpdateChannel::Stable,
+            vec![catalog_release(
+                "0.19.1",
+                build,
+                &commit,
+                "yield-0.19.1-macos-aarch64.zip",
+            )],
+            expected,
+        );
+    }
+    run_catalog_case(
+        cx,
+        "19.1.9",
+        UpdateChannel::Stable,
+        vec![catalog_release(
+            "0.19.1",
+            45,
+            &"02".repeat(20),
+            "yield-0.19.1-windows-x86_64.zip",
+        )],
+        State::Unavailable,
+    );
+}
+
+#[gpui::test]
+fn renumbering_actual_worker_keeps_full_prerelease_lane_and_nightly_identity(
+    cx: &mut TestAppContext,
+) {
+    for (installed, candidate, lane, build, commit, expected) in [
+        (
+            "19.1.9-rc.9",
+            "0.19.1-rc.2",
+            UpdateChannel::Rc,
+            45,
+            "02".repeat(20),
+            State::Newer(UpdateVersion(0, 19, 1), 45),
+        ),
+        (
+            "0.19.1-rc.2",
+            "0.19.1-rc.1",
+            UpdateChannel::Rc,
+            45,
+            "02".repeat(20),
+            State::Failed,
+        ),
+        (
+            "0.19.1-rc.2",
+            "0.19.1-rc.2",
+            UpdateChannel::Rc,
+            44,
+            "01".repeat(20),
+            State::Current,
+        ),
+        (
+            "0.19.1-rc.2",
+            "0.19.1-rc.3",
+            UpdateChannel::Rc,
+            45,
+            "02".repeat(20),
+            State::Newer(UpdateVersion(0, 19, 1), 45),
+        ),
+        (
+            "19.1.9",
+            "0.19.1-rc.2",
+            UpdateChannel::Stable,
+            45,
+            "02".repeat(20),
+            State::Unavailable,
+        ),
+        (
+            "19.1.9-nightly.2026-10-02+01010101",
+            "0.19.1-nightly.2026-10-03+02020202",
+            UpdateChannel::Nightly,
+            45,
+            "02".repeat(20),
+            State::Newer(UpdateVersion(0, 19, 1), 45),
+        ),
+        (
+            "0.19.1-nightly.2026-10-02+01010101",
+            "0.19.1-nightly.2026-10-01+02020202",
+            UpdateChannel::Nightly,
+            45,
+            "02".repeat(20),
+            State::Failed,
+        ),
+        (
+            "19.1.9-nightly.2026-10-02+01010101",
+            "0.19.1-nightly.2026-02-30+02020202",
+            UpdateChannel::Nightly,
+            45,
+            "02".repeat(20),
+            State::Failed,
+        ),
+        (
+            "19.1.9-nightly.2026-10-02+01010101",
+            "0.19.1-nightly.2026-10-03+abcdef01",
+            UpdateChannel::Nightly,
+            45,
+            "02".repeat(20),
+            State::Failed,
+        ),
+    ] {
+        let semantic = semver::Version::parse(candidate).unwrap();
+        let asset = if candidate.contains("nightly") {
+            "yield-nightly-macos-aarch64.zip".into()
+        } else if !semantic.pre.is_empty() {
+            format!(
+                "yield-{}.{}.{}-{}-macos-aarch64.zip",
+                semantic.major, semantic.minor, semantic.patch, semantic.pre
+            )
+        } else {
+            format!("yield-{candidate}-macos-aarch64.zip")
+        };
+        run_catalog_case(
+            cx,
+            installed,
+            lane,
+            vec![catalog_release(candidate, build, &commit, &asset)],
+            expected,
+        );
+    }
+}
