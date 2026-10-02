@@ -1624,6 +1624,57 @@ mod tests {
         fs::remove_file(alias).expect("remove test hardlink alias");
     }
 
+    #[test]
+    fn telemetry_preserves_success_and_failure_ownership_without_private_fields() {
+        use super::super::reserve_telemetry::{ReserveAttempt, observe, tests::Capture};
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let capture = Capture::default();
+        let stages = [
+            ReserveNamespaceFailureStage::Unsupported,
+            ReserveNamespaceFailureStage::RootValidation,
+            ReserveNamespaceFailureStage::Open,
+            ReserveNamespaceFailureStage::Allocation,
+            ReserveNamespaceFailureStage::Sync,
+            ReserveNamespaceFailureStage::Binding,
+            ReserveNamespaceFailureStage::Observation,
+        ];
+        tracing::subscriber::with_default(capture.clone(), || {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(b"retained evidence").unwrap();
+            let file = observe(ReserveAttempt::Create, Ok(file)).unwrap();
+            for stage in stages {
+                let observation = synthetic_observation("private-root", "private-file");
+                let reason = ReserveNamespaceFailureReason::RootValidation("private-error".into());
+                let failure = ReserveNamespaceFailure::new(
+                    stage,
+                    reason.clone(),
+                    Some(OwnedFailureFile::Raw(file.try_clone().unwrap())),
+                    Some(observation.clone()),
+                    Some(123),
+                );
+                let failure = observe::<File>(ReserveAttempt::Reopen, Err(failure)).unwrap_err();
+                assert_eq!(failure.stage(), stage);
+                assert_eq!(failure.reason(), &reason);
+                assert_eq!(failure.observation(), Some(&observation));
+                assert_eq!(failure.observed_allocation(), Some(123));
+                let mut retained = failure.into_file().unwrap();
+                retained.seek(SeekFrom::Start(0)).unwrap();
+                let mut bytes = Vec::new();
+                retained.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"retained evidence");
+            }
+        });
+        let records = capture.0.lock().unwrap();
+        assert_eq!(records.len(), 8);
+        for fields in &*records {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].0, "reserve_attempt");
+            assert_eq!(fields[1].0, "reserve_decision");
+            assert!(!format!("{fields:?}").contains("private"));
+            assert!(!format!("{fields:?}").contains("123"));
+        }
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn unsupported_target_rejects_before_namespace_effects() {
