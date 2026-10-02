@@ -134,6 +134,10 @@ pub struct SourceSimilarityResult {
     observations: Vec<SourceFileObservation>,
 }
 impl SourceSimilarityResult {
+    /// Exact owner-derived query binding; comparing it performs no SQL or filesystem reads.
+    pub fn query(&self) -> &SourceSimilarityQuery {
+        &self.query
+    }
     /// Require exact source/root/lifecycle/lease/revision, anchor, aspect, generation and set.
     /// The consumer must also obtain current owner context; a saved request is not freshness.
     pub fn matches_query(&self, current: &SourceSimilarityQuery) -> bool {
