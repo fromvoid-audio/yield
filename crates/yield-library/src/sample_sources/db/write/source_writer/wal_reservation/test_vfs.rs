@@ -57,8 +57,8 @@ impl SourceWriter {
             original,
             _copy: copy,
         };
-        let result = prepare(&mut held, expected, deadline);
+        let result = prepare(&mut held, expected, deadline, true);
         drop(restore);
-        finish_preparation(held, result, deadline)
+        finish_preparation(held, result, deadline, false)
     }
 }

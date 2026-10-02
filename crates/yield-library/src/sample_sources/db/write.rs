@@ -34,7 +34,8 @@ pub use source_writer::{
     SourceLayoutMetadataPolicy, SourcePreparedLayoutGeneration, SourceRevision, SourceScanFence,
     SourceSnapshotOwner, SourceSnapshotPage, SourceSnapshotQueueMetrics,
     SourceTagAdmissionObservation, SourceTagMetadataBudget, SourceTagMetadataPolicy,
-    SourceWalPreparation, SourceWalPreparationError, SourceWalPreparationFailure, SourceWriter,
+    SourceTagWalPreparation, SourceTagWalPreparationFailure, SourceWalPreparation,
+    SourceWalPreparationError, SourceWalPreparationFailure, SourceWriter,
     SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};

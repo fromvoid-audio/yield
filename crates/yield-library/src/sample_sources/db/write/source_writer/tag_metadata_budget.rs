@@ -19,8 +19,12 @@ pub struct SourceTagMetadataBudget {
     resident_wal_bytes: u64,
     resident_shm_bytes: u64,
     required_bytes: u64,
+    deadline: Instant,
 }
 impl SourceTagMetadataBudget {
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline
+    }
     /// Exact owner-issued source scope whose facts were measured.
     pub fn revision(&self) -> &SourceRevision {
         &self.revision
@@ -79,6 +83,24 @@ impl SourceWriter {
         if expected != &before {
             return Err(SourceWriterError::StaleFence);
         }
+        let budget = self.read_tag_metadata_facts(before, deadline)?;
+        if expected != &self.current_revision()? {
+            return Err(SourceWriterError::StaleFence);
+        }
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        Ok(budget)
+    }
+
+    pub(super) fn read_tag_metadata_facts(
+        &self,
+        revision: SourceRevision,
+        deadline: Instant,
+    ) -> Result<SourceTagMetadataBudget, SourceWriterError> {
+        let _progress = SnapshotProgressGuard::install(&self.database.connection, deadline);
+        let _extensions =
+            crate::sqlite_ext::try_extension_free_metadata_scope().ok_or_else(unknown)?;
         crate::sample_sources::db::schema::require_known_metadata_schema(&self.database.connection)
             .map_err(|_| unknown())?;
         let connection = &self.database.connection;
@@ -142,14 +164,11 @@ impl SourceWriter {
         let required_bytes =
             checked_peak(page_size, max_pages, resident_wal_bytes, resident_shm_bytes)
                 .ok_or_else(unknown)?;
-        if expected != &self.current_revision()? {
-            return Err(SourceWriterError::StaleFence);
-        }
         if Instant::now() >= deadline {
             return Err(SourceWriterError::SnapshotBudgetExceeded);
         }
         Ok(SourceTagMetadataBudget {
-            revision: before,
+            revision,
             owner: Arc::downgrade(&self.reference_liveness),
             page_size,
             page_count,
@@ -158,7 +177,43 @@ impl SourceWriter {
             resident_wal_bytes,
             resident_shm_bytes,
             required_bytes,
+            deadline,
         })
+    }
+
+    pub(super) fn validate_tag_metadata_facts(
+        &self,
+        budget: &SourceTagMetadataBudget,
+        deadline: Instant,
+    ) -> Result<(), SourceWriterError> {
+        let owner = budget
+            .owner
+            .upgrade()
+            .ok_or(SourceWriterError::StaleFence)?;
+        if !Arc::ptr_eq(&owner, &self.reference_liveness) {
+            return Err(SourceWriterError::StaleFence);
+        }
+        let current = self.read_tag_metadata_facts(budget.revision.clone(), deadline)?;
+        if (
+            current.page_size,
+            current.page_count,
+            current.database_bytes,
+            current.max_pages,
+            current.resident_wal_bytes,
+            current.resident_shm_bytes,
+            current.required_bytes,
+        ) != (
+            budget.page_size,
+            budget.page_count,
+            budget.database_bytes,
+            budget.max_pages,
+            budget.resident_wal_bytes,
+            budget.resident_shm_bytes,
+            budget.required_bytes,
+        ) {
+            return Err(unknown());
+        }
+        Ok(())
     }
 
     /// Revalidate the captured owner and current facts before constructing a real admission plan.

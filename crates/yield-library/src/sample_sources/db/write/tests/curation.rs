@@ -4413,3 +4413,6 @@ mod metadata_tag_commands;
 
 #[path = "curation/layout_metadata.rs"]
 mod layout_metadata;
+
+#[path = "curation/tag_wal_preparation.rs"]
+mod tag_wal_preparation;

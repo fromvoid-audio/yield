@@ -144,9 +144,10 @@ pub use write::{
     SourceIndexCommitResult, SourceLayoutMetadataBudget, SourceLayoutMetadataPolicy,
     SourceRevision, SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage,
     SourceSnapshotQueueMetrics, SourceTagAdmissionObservation, SourceTagAssignmentMutation,
-    SourceTagAssignmentSelection, SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceTagWrite,
-    SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
-    SourceWriterReceipt, SourceWriterRequest,
+    SourceTagAssignmentSelection, SourceTagMetadataBudget, SourceTagMetadataPolicy,
+    SourceTagWalPreparation, SourceTagWalPreparationFailure, SourceTagWrite, SourceWriteCommand,
+    SourceWriter, SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt,
+    SourceWriterRequest,
 };
 
 /// Hidden filename used for per-source databases.
