@@ -16,7 +16,7 @@ pub use analysis::{
     compute_similarity_embedding_for_path, decode_f32_le_blob, light_dsp_from_features_v1,
     preprocess_mono_for_embedding, rebuild_exact_similarity_artifacts,
 };
-pub use analysis::{ann_index, aspects, hdbscan, similarity, vector};
+pub use analysis::{ann_index, aspects, hdbscan, similarity, starmap_layout, vector};
 
 /// Fixed sample rate used during analysis.
 pub use analysis::audio::ANALYSIS_SAMPLE_RATE;

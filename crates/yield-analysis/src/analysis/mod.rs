@@ -12,6 +12,8 @@ pub(crate) mod frequency_domain;
 pub mod hdbscan;
 pub mod similarity;
 mod similarity_artifacts;
+/// Bounded pure Starmap computation over captured feature vectors.
+pub mod starmap_layout;
 pub(crate) mod time_domain;
 pub(crate) mod umap;
 /// Feature vector encoding/decoding helpers.
