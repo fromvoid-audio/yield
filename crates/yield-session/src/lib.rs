@@ -598,6 +598,15 @@ impl SourceRegistryService {
         Self::start_inner_with_initialization_gate(Some(app_root), None, true)
     }
 
+    /// Gate the real owner within the portable metadata-only test fixture.
+    #[cfg(test)]
+    fn start_portable_vocabulary_with_gate_for_test(
+        app_root: PathBuf,
+        initialization_gate: Arc<std::sync::Barrier>,
+    ) -> Result<Self, StartError> {
+        Self::start_inner_with_initialization_gate(Some(app_root), Some(initialization_gate), true)
+    }
+
     #[cfg(test)]
     fn start_inner_with_initialization_gate_for_test(
         app_root_override: Option<PathBuf>,
@@ -4032,8 +4041,8 @@ mod tests {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let gate = Arc::new(std::sync::Barrier::new(2));
-        let mut service = SourceRegistryService::start_inner_with_initialization_gate_for_test(
-            Some(profile_root(&temp)),
+        let mut service = SourceRegistryService::start_portable_vocabulary_with_gate_for_test(
+            profile_root(&temp),
             Arc::clone(&gate),
         )
         .expect("service start");
@@ -4223,7 +4232,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_vocabulary_available(&service);
 
         let mut initial = service
@@ -4279,8 +4289,8 @@ mod tests {
         ));
 
         service.shutdown().expect("shutdown");
-        let mut reopened =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("reopen service");
         wait_for_vocabulary_available(&reopened);
         let mut restored = reopened
             .lookup_profile_tag_categories(vec![String::from("kick")])
@@ -4297,7 +4307,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_vocabulary_available(&service);
 
         let mut set = service
@@ -4344,8 +4355,8 @@ mod tests {
         assert_eq!(restore.revision, 3);
 
         service.shutdown().expect("shutdown");
-        let mut reopened =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("reopen service");
         wait_for_vocabulary_available(&reopened);
         let mut lookup = reopened
             .lookup_profile_tag_categories(vec![String::from("restore-me")])
@@ -4367,7 +4378,8 @@ mod tests {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root(&temp))).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root(&temp))
+                .expect("service start");
         wait_for_vocabulary_available(&service);
 
         assert!(matches!(
@@ -4423,7 +4435,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_vocabulary_available(&service);
 
         let mut retained = service
@@ -4438,7 +4451,8 @@ mod tests {
         ));
 
         let mut reopened =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("reopen service");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("reopen service");
         wait_for_vocabulary_available(&reopened);
         let dropped = reopened
             .set_profile_tag_category(1, String::from("dropped"), ProfileTagCategory::Character)
@@ -4447,7 +4461,8 @@ mod tests {
         reopened.shutdown().expect("second shutdown");
 
         let mut final_service =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("final service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root)
+                .expect("final service start");
         wait_for_vocabulary_available(&final_service);
         let mut restored = final_service
             .lookup_profile_tag_categories(vec![String::from("retained"), String::from("dropped")])
@@ -4464,7 +4479,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_vocabulary_available(&service);
 
         let mut set = service
@@ -4482,8 +4498,8 @@ mod tests {
         drop(delete);
         service.shutdown().expect("shutdown");
 
-        let mut reopened =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("reopen service");
         wait_for_vocabulary_available(&reopened);
         let mut lookup = reopened
             .lookup_profile_tag_categories(vec![String::from("drop-delete")])
