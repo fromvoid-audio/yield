@@ -629,6 +629,14 @@ impl<'connection> ReadinessStore<'connection> {
         feature_artifact::lookup_target(self.connection, &self.ownership, target)
     }
 
+    pub(crate) fn lookup_layout_feature_target_owned(
+        connection: &Connection,
+        ownership: &ReadinessOwnership<'_>,
+        target: &ReadinessTarget,
+    ) -> Result<(super::FeatureArtifactKey, super::FeatureArtifactPayload), ReadinessError> {
+        feature_artifact::lookup_layout_target(connection, ownership, target)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn inject_feature_artifact_fixture_fault(
         &mut self,

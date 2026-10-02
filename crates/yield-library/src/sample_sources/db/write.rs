@@ -25,11 +25,12 @@ pub use source_writer::{
     FeatureMaintenanceMetrics, FeaturePruneCursor, FeaturePrunePage, FeatureRebuildMetrics,
     ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
     ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
-    SourceCollectionHistoryChange, SourceCollectionHistorySelection, SourceCommandId,
-    SourceFeaturePublicationMetrics, SourceRevision, SourceScanFence, SourceSnapshotOwner,
-    SourceSnapshotPage, SourceSnapshotQueueMetrics, SourceTagAdmissionObservation,
-    SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceWalPreparation,
-    SourceWalPreparationError, SourceWalPreparationFailure, SourceWriter,
+    SOURCE_LAYOUT_ALGORITHM_V1, SourceCollectionHistoryChange, SourceCollectionHistorySelection,
+    SourceCommandId, SourceFeaturePublicationMetrics, SourceLayoutCapture,
+    SourceLayoutCaptureError, SourceLayoutFeature, SourceRevision, SourceScanFence,
+    SourceSnapshotOwner, SourceSnapshotPage, SourceSnapshotQueueMetrics,
+    SourceTagAdmissionObservation, SourceTagMetadataBudget, SourceTagMetadataPolicy,
+    SourceWalPreparation, SourceWalPreparationError, SourceWalPreparationFailure, SourceWriter,
     SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};

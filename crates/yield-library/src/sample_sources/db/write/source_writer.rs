@@ -20,9 +20,13 @@ pub use feature_maintenance_metrics::FeatureMaintenanceMetrics;
 mod feature_metrics;
 pub use feature_metrics::SourceFeaturePublicationMetrics;
 mod feature_rebuild_metrics;
+mod layout_capture;
 mod manifest_enrollment;
 pub use feature_rebuild_metrics::FeatureRebuildMetrics;
 mod tag_admission_observation;
+pub use layout_capture::{
+    SOURCE_LAYOUT_ALGORITHM_V1, SourceLayoutCapture, SourceLayoutCaptureError, SourceLayoutFeature,
+};
 mod tag_metadata_budget;
 mod tag_metadata_policy;
 pub use tag_admission_observation::SourceTagAdmissionObservation;

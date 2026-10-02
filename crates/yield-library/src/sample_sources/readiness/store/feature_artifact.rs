@@ -1,7 +1,9 @@
 //! Real source-owned feature payload publication and validated lookup.
 mod health;
+mod layout_lookup;
 pub(super) mod reverse_owners;
 pub(super) use health::{Health, admit, health, marker_matches};
+pub(super) use layout_lookup::lookup_layout_target;
 
 use super::super::{
     ArtifactPublishOutcome, ClaimedReadinessWork, FeatureArtifactKey, FeatureArtifactPayload,
