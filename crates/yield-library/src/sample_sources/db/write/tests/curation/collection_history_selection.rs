@@ -91,6 +91,11 @@ fn collection_history_selection_delivery_window_expires_without_sql() {
 }
 
 #[test]
+fn collection_history_selection_rejects_wrong_source_before_sql() {
+    run("wrong-source");
+}
+
+#[test]
 #[ignore = "bounded subprocess driver invoked by actual owner tests"]
 fn collection_history_selection_child() {
     let Ok(case) = std::env::var("YIELD_HISTORY_SELECTION_CASE") else {
@@ -107,6 +112,7 @@ fn collection_history_selection_child() {
         "audit-schema" => audit_schema(),
         "lease-handoff" => lease_handoff(),
         "delivery-window" => delivery_window(),
+        "wrong-source" => wrong_source(),
         _ => panic!("unknown case"),
     }
 }
@@ -663,4 +669,31 @@ fn delivery_window() {
     assert!(!selection.within_observation_window());
     assert_eq!(persisted(connection), before);
     assert_eq!(connection.total_changes(), changes);
+}
+
+fn wrong_source() {
+    let fixture = CurationFixture::new_profile_bound();
+    let writer = writer(fixture.database, 7);
+    let expected = writer.current_revision().unwrap();
+    let other = CurationFixture::new_profile_bound();
+    let writer = SourceWriter::new(
+        other.database,
+        SourceId::from_string("another-history-source"),
+        7,
+    )
+    .unwrap();
+    writer.database_for_tests().connection.authorizer(Some(
+        |_: AuthContext<'_>| -> Authorization {
+            panic!("wrong source must reject before SQL or owner revision materialization");
+        },
+    ));
+    assert!(matches!(
+        writer.capture_collection_history_selection(
+            &expected,
+            SampleCollection::new(0).unwrap(),
+            true,
+            &[CurationFixture::path("one.wav")],
+        ),
+        Err(SourceWriterError::StaleFence)
+    ));
 }

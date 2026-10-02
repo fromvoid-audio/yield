@@ -14,7 +14,8 @@ or start another source writer.
 
 Input is at most 128 distinct paths, 4,096 bytes/path, one valid collection slot and
 1 MiB of conservatively counted owned input/result payload. Counting precedes
-normalization and retention. The method holds the existing process extension
+normalization and retention. A source-ID mismatch rejects before SQL;
+the existing owner constructor already bounds source identity. The method holds the existing process extension
 exclusion and verifies the compiled known schema/runtime; unsupported callbacks
 or schema are rejected. Inside one read transaction, metadata strings are bounded
 before the existing curation-precondition validator reads them. That validator

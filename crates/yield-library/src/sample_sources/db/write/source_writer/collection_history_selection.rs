@@ -158,6 +158,10 @@ impl SourceWriter {
         if bytes > MAX_PAYLOAD_BYTES {
             return Err(SourceWriterError::SnapshotBudgetExceeded);
         }
+        // A request for another source cannot inspect this owner's schema or rows.
+        if self.source_id != expected.source_id {
+            return Err(SourceWriterError::StaleFence);
+        }
         let mut normalized = BTreeSet::new();
         for path in paths {
             let key = normalize_relative_path(path.as_path())?;
