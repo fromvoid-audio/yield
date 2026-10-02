@@ -76,7 +76,16 @@ fn actual_engines_are_complete_repeatable_and_bound_to_ordered_features() {
 
 #[test]
 fn maximum_workload_produces_every_finite_point_within_owned_bound() {
-    let (ids, features) = fixture(STARMAP_COMPUTE_MAX_SAMPLES);
+    let (_, features) = fixture(STARMAP_COMPUTE_MAX_SAMPLES);
+    // A valid capture's manifest charge excludes its repeated source prefix.
+    // These paths + short file IDs + 64-byte hashes fit its 128 KiB manifest;
+    // the CPU identities are larger and must still compute the complete source.
+    let ids: Vec<_> = (0..STARMAP_COMPUTE_MAX_SAMPLES)
+        .map(|i| format!("{}::{}{i:03}.wav", "s".repeat(256), "p".repeat(400)))
+        .collect();
+    let manifest_bytes: usize = ids.iter().map(|id| id.len() - 258 + 8 + 64).sum();
+    assert!(manifest_bytes < 128 * 1024);
+    assert!(ids.iter().map(String::len).sum::<usize>() > 128 * 1024);
     let start = std::time::Instant::now();
     let result =
         compute_starmap_layout(&borrowed(&ids, &features), &AtomicBool::new(false)).unwrap();
@@ -173,11 +182,11 @@ fn row_and_aggregate_identity_limits_reject_without_projection() {
         compute_starmap_layout(&borrowed(&ids, &features), &cancel),
         Err(StarmapComputationError::InputLimit)
     );
-    let long_ids: Vec<_> = (0..128)
-        .map(|i| format!("{i:03}{}", "x".repeat(1024)))
+    let long_ids: Vec<_> = (0..256)
+        .map(|i| format!("{i:03}{}", "x".repeat(800)))
         .collect();
     assert_eq!(
-        compute_starmap_layout(&borrowed(&long_ids, &features[..128]), &cancel),
+        compute_starmap_layout(&borrowed(&long_ids, &features[..256]), &cancel),
         Err(StarmapComputationError::InputLimit)
     );
 }

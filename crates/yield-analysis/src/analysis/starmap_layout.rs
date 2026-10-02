@@ -13,8 +13,9 @@ pub const SOURCE_LAYOUT_ALGORITHM_V1: &str =
 pub const STARMAP_COMPUTE_MAX_SAMPLES: usize = 256;
 /// Maximum UTF-8 bytes in a source ID, separator and relative sample path.
 pub const STARMAP_COMPUTE_MAX_SAMPLE_ID_BYTES: usize = 1_282;
-/// Aggregate sample identity bytes accepted before any input copying.
-pub const STARMAP_COMPUTE_MAX_IDENTITY_BYTES: usize = 128 * 1024;
+/// Capture's 128 KiB manifest budget plus its repeated bounded `source_id::` prefix.
+pub const STARMAP_COMPUTE_MAX_IDENTITY_BYTES: usize =
+    128 * 1024 + STARMAP_COMPUTE_MAX_SAMPLES * (256 + 2);
 /// Conservative directly owned buffers, excluding existing engines' internal workspace.
 pub const STARMAP_COMPUTE_MAX_OWNED_BYTES: usize = 1024 * 1024;
 
@@ -233,7 +234,8 @@ fn validate(
             return Err(StarmapComputationError::InvalidFeatures);
         }
     }
-    // Conservative overlap of three identity copies, f32 embeddings, the flattened
+    // Strings are allocated once and moved from embeddings to identities to points.
+    // Conservatively allow two identity copies, f32 embeddings, the flattened
     // f64 matrix, tuple/vector/output headers, raw points and clustering input/labels.
     // Engine-owned PCA/t-SNE/HDBSCAN workspace is bounded by the shapes and measured
     // separately; it is not concealed inside this directly owned-buffer estimate.
@@ -242,7 +244,7 @@ fn validate(
         .and_then(|bytes| bytes.checked_add(160))
         .ok_or(StarmapComputationError::InputLimit)?;
     identity_bytes
-        .checked_mul(3)
+        .checked_mul(2)
         .and_then(|bytes| inputs.len().checked_mul(per_row)?.checked_add(bytes))
         .filter(|bytes| *bytes <= STARMAP_COMPUTE_MAX_OWNED_BYTES)
         .ok_or(StarmapComputationError::InputLimit)
