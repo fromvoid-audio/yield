@@ -551,7 +551,7 @@ pub(super) const TAG_METADATA_POLICY_POISONED: u8 = 2;
 /// SQLite wrapper that stores wav metadata for a single source folder.
 pub struct SourceDatabase {
     /// Declared first so the ordinary SQLite connection closes before lease release.
-    connection: Connection,
+    connection: crate::sqlite_budget::OwnedConnection,
     // Retained with this connection through SourceWriter/catalog ownership handoffs.
     tag_metadata_policy_state: std::cell::Cell<u8>,
     checkpoint_policy: crate::sqlite_wal::CheckpointPolicy,
@@ -570,7 +570,7 @@ pub struct SourceDatabase {
 /// Dropping the fence releases the SQLite `BEGIN IMMEDIATE` transaction without changing data.
 pub struct SourceDatabaseWriteFence {
     /// Declared first so rollback/connection close precedes lease release during implicit drop.
-    connection: Connection,
+    connection: crate::sqlite_budget::OwnedConnection,
     _database_root_binding: Option<Arc<dyn DatabaseRootBindingGuard>>,
     _database_file_binding: Option<Arc<sqlite_identity::DatabaseFileBinding>>,
     _source_lease: Option<Arc<source_lease::SourceLease>>,
@@ -773,12 +773,7 @@ impl SourceDatabase {
             self.database_file_binding.as_deref(),
             self.source_lease.as_ref(),
         );
-        Ok(
-            crate::sample_sources::readiness::ReadinessStore::from_owned_connection(
-                &mut self.connection,
-                ownership,
-            ),
-        )
+        Ok(self.connection.readiness_store(ownership))
     }
 
     /// Borrow an owned readiness store for read-only source qualification.
@@ -800,12 +795,7 @@ impl SourceDatabase {
             self.database_file_binding.as_deref(),
             self.source_lease.as_ref(),
         );
-        Ok(
-            crate::sample_sources::readiness::ReadinessStore::from_owned_connection(
-                &mut self.connection,
-                ownership,
-            ),
-        )
+        Ok(self.connection.readiness_store(ownership))
     }
 
     /// Mint a weak source-publication fence from this profile-owned database.
@@ -1432,7 +1422,7 @@ impl SourceDatabase {
         role: SourceDatabaseConnectionRole,
     ) -> Result<Connection, SourceDbError> {
         let db = Self::open_with_role(root, role)?;
-        Ok(db.into_connection())
+        db.into_connection()
     }
 
     /// Open a raw SQLite connection using one explicit role and database root.
@@ -1444,7 +1434,7 @@ impl SourceDatabase {
         role: SourceDatabaseConnectionRole,
     ) -> Result<Connection, SourceDbError> {
         let db = Self::open_with_role_and_database_root(root, database_root, role)?;
-        Ok(db.into_connection())
+        db.into_connection()
     }
 
     /// Open an external metadata database while its audio source root is unavailable.
@@ -1459,7 +1449,7 @@ impl SourceDatabase {
     ) -> Result<Connection, SourceDbError> {
         let database_root = database_root.as_ref();
         let db = Self::open_with_role_and_database_root(database_root, database_root, role)?;
-        Ok(db.into_connection())
+        db.into_connection()
     }
 
     /// Return the path to the root folder backing this database.
@@ -1558,8 +1548,8 @@ impl SourceDatabase {
         schema::apply_schema_fast(&self.connection).map(|_| ())
     }
 
-    fn into_connection(self) -> Connection {
-        self.connection
+    fn into_connection(self) -> Result<Connection, SourceDbError> {
+        self.connection.into_legacy().map_err(SourceDbError::from)
     }
 }
 
