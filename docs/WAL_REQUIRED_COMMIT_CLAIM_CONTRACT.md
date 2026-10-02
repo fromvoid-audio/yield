@@ -107,6 +107,9 @@ bindings by verified `(volume, main-file identity, role)` and slices by
 The header contains profile identity string, acquisition identity string, positive
 profile ownership generation (u64), decision nonce (UUID), binding count (u16) and
 slice count (u16). It is followed by every sorted binding, then every sorted slice.
+Validate SQLite storage ranges before identity allocation: persisted generations,
+revisions and byte ceilings must fit positive/nonnegative i64 fields as applicable.
+Volume IDs retain the existing canonical u64-text storage, not a lossy i64 cast.
 A binding encodes UUID, role (u8), volume (u64), allocation unit (u64), main-file
 identity string, owner registration UUID, owner generation (u64), lifecycle (u64),
 database-root identity string and root-binding identity string. Source role then
