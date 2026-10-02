@@ -9,6 +9,8 @@ pub mod app_dirs;
 pub mod diagnostics;
 #[cfg(not(windows))]
 mod directory_sync;
+/// Non-authoritative durability qualification vocabulary and evidence matrix.
+pub mod durability_matrix;
 /// Pre-intent durable capacity discovery and accounting.
 pub mod durable_capacity;
 mod env_flags;
