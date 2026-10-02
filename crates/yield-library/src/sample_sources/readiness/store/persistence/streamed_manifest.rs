@@ -38,7 +38,10 @@ impl Drop for SqlDeadline<'_> {
 
 // Check both the externally retained owner's audit and the transaction's own metadata. The
 // latter also catches corrupted triggers changing revision/audit inside this transaction.
-fn validate_audit(tx: &Connection, fence: &SourceReferenceFence) -> Result<(), ReadinessError> {
+pub(in crate::sample_sources::readiness::store) fn validate_audit(
+    tx: &Connection,
+    fence: &SourceReferenceFence,
+) -> Result<(), ReadinessError> {
     fence
         .validate()
         .map_err(|_| invalid_persisted_value("audit", "retained audited owner changed"))?;

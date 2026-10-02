@@ -334,7 +334,7 @@ mod fixtures {
                 FeatureAnalysisCancellation::new(),
             ))
             .unwrap();
-        preparation(&service, 2, true);
+        preparation(&service, 2, false);
         assert_eq!(
             state(&service, 2),
             FeatureAnalysisState::Blocked {
@@ -377,6 +377,149 @@ mod fixtures {
         assert_eq!(counts(&f, &source), (1, 1));
         let (targets,indexes):(i64,i64)=observer(&f,&source).query_row("SELECT (SELECT count(*) FROM source_readiness_targets),(SELECT count(*) FROM source_readiness_artifacts WHERE stage='indexed_identity')",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!((targets, indexes), (904, 301));
+        service.shutdown();
+    }
+    #[test]
+    fn feature_request_rebuilds_missing_corrupt_and_unmarked_real_payload_after_restart() {
+        use yield_library::sample_sources::readiness::FeatureArtifactFixtureFault as Fault;
+        for fault in [
+            Fault::MissingPayload,
+            Fault::CorruptPayload,
+            Fault::MissingMarker,
+        ] {
+            let f = Fixture::new("feature-request-real-rebuild");
+            write_test_wav(&f.root.path().join("tone.wav"), 16_000, 16_000);
+            let source = SourceId::from_string("feature-request-real-rebuild");
+            let service = CatalogService::start(&f.guard).unwrap();
+            let snapshot = register_and_audit(&service, f.root.path(), &source);
+            service
+                .submit(command(
+                    &source,
+                    snapshot.committed_revision,
+                    1,
+                    FeatureAnalysisCancellation::new(),
+                ))
+                .unwrap();
+            preparation(&service, 1, true);
+            assert_eq!(state(&service, 1), FeatureAnalysisState::Queued);
+            assert_eq!(state(&service, 1), FeatureAnalysisState::Running);
+            let ready = state(&service, 1);
+            assert!(matches!(ready, FeatureAnalysisState::Ready { .. }));
+            let original: Vec<u8> = observer(&f, &source)
+                .query_row("SELECT payload FROM source_feature_artifacts", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            service.shutdown();
+            let db = SourceDatabase::open_for_catalog_with_profile_guard(
+                f.root.path(),
+                &f.guard,
+                &catalog_profile_child(&source),
+            )
+            .unwrap();
+            let mut writer = SourceWriter::new(db, source.clone(), 1).unwrap();
+            let revision = writer.current_revision().unwrap();
+            let target = writer
+                .prepare_feature_readiness_target(
+                    &revision,
+                    Path::new("tone.wav"),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            // The fault hook only mutates this retained owner's exact current target in fixture
+            // builds. Rebuild admission, held WAV decode/DSP and publication are production code.
+            writer
+                .inject_feature_artifact_fixture_fault(&revision, &target, fault)
+                .unwrap();
+            drop(writer);
+            let service = CatalogService::start(&f.guard).unwrap();
+            service
+                .submit(CatalogCommand::Register {
+                    source_id: source.clone(),
+                    canonical_root: f.root.path().into(),
+                    lifecycle_generation: 1,
+                })
+                .unwrap();
+            receive_until(&service, |e| matches!(e, CatalogEvent::Registered { .. }));
+            receive_until(&service, |e| {
+                matches!(e, CatalogEvent::SnapshotReady { .. })
+            });
+            service
+                .submit(command(
+                    &source,
+                    snapshot.committed_revision,
+                    2,
+                    FeatureAnalysisCancellation::new(),
+                ))
+                .unwrap();
+            preparation(&service, 2, true);
+            assert_eq!(state(&service, 2), FeatureAnalysisState::Queued);
+            assert_eq!(state(&service, 2), FeatureAnalysisState::Running);
+            assert_eq!(state(&service, 2), ready);
+            assert_eq!(counts(&f, &source), (1, 1));
+            let repaired: Vec<u8> = observer(&f, &source)
+                .query_row("SELECT payload FROM source_feature_artifacts", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(repaired, original);
+            service
+                .submit(command(
+                    &source,
+                    snapshot.committed_revision,
+                    3,
+                    FeatureAnalysisCancellation::new(),
+                ))
+                .unwrap();
+            preparation(&service, 3, false);
+            assert_eq!(state(&service, 3), ready);
+            service.shutdown();
+        }
+    }
+    #[test]
+    fn feature_request_changed_real_content_recomputes_and_preserves_old_immutable_payload() {
+        let f = Fixture::new("feature-request-changed-content");
+        write_test_wav(&f.root.path().join("tone.wav"), 16_000, 16_000);
+        let source = SourceId::from_string("feature-request-changed-content");
+        let service = CatalogService::start(&f.guard).unwrap();
+        let snapshot = register_and_audit(&service, f.root.path(), &source);
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision,
+                1,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        preparation(&service, 1, true);
+        state(&service, 1);
+        state(&service, 1);
+        let old = state(&service, 1);
+        assert!(matches!(old, FeatureAnalysisState::Ready { .. }));
+        service.shutdown();
+        write_test_wav(&f.root.path().join("tone.wav"), 16_000, 8_000);
+        let service = CatalogService::start(&f.guard).unwrap();
+        let next = register_and_audit(&service, f.root.path(), &source);
+        assert!(next.committed_revision > snapshot.committed_revision);
+        service
+            .submit(command(
+                &source,
+                next.committed_revision,
+                2,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        preparation(&service, 2, true);
+        assert_eq!(state(&service, 2), FeatureAnalysisState::Queued);
+        assert_eq!(state(&service, 2), FeatureAnalysisState::Running);
+        let new = state(&service, 2);
+        assert!(matches!(new, FeatureAnalysisState::Ready { .. }));
+        assert_ne!(new, old);
+        assert_eq!(counts(&f, &source), (2, 1));
         service.shutdown();
     }
 }

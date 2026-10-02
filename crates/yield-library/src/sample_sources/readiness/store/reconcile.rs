@@ -109,9 +109,10 @@ fn reconcile_readiness_snapshot_for_scopes(
     if !readiness_schema_available(connection)? {
         return Err(ReadinessError::SchemaUnavailable);
     }
-    let (source_generation, readiness_revision, availability) = connection
+    let (source_generation, readiness_revision, availability, feature_bytes_contract) = connection
         .query_row(
-            "SELECT source_generation, readiness_revision, availability
+            "SELECT source_generation, readiness_revision, availability,
+                contract_version = 'yield-audited-feature-matrix-v1'
              FROM source_readiness_sources
              WHERE source_id = ?1",
             [source_id],
@@ -120,6 +121,7 @@ fn reconcile_readiness_snapshot_for_scopes(
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             },
         )
@@ -135,12 +137,14 @@ fn reconcile_readiness_snapshot_for_scopes(
         generation: source_generation,
         readiness_revision,
         availability,
+        feature_bytes_contract,
     };
     after_source_state();
     let targets = load_targets(connection, source_id, scope_ids, cancel, progress)?;
     let artifacts = load_artifacts(connection, source_id, scope_ids, cancel, progress)?;
     let work = load_work(connection, source_id, scope_ids, cancel, progress)?;
     build_snapshot(
+        connection,
         source_id,
         source_state,
         targets,
@@ -172,6 +176,7 @@ struct StoredSourceState {
     generation: i64,
     readiness_revision: i64,
     availability: SourceAvailability,
+    feature_bytes_contract: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -367,6 +372,7 @@ fn cancellation_checkpoint(cancel: Option<&AtomicBool>) -> Result<(), ReadinessE
 
 #[allow(clippy::too_many_arguments)]
 fn build_snapshot(
+    connection: &Connection,
     source_id: &str,
     source_state: StoredSourceState,
     targets: Vec<ReadinessTarget>,
@@ -388,13 +394,41 @@ fn build_snapshot(
     for (index, target) in targets.into_iter().enumerate() {
         cancellation_checkpoint(cancel)?;
         let key = target.key();
-        let classification = classify_target(
+        let mut classification = classify_target(
             &target,
             source_state.availability,
             artifacts.get(&key),
             work.get(&key),
             now,
         );
+        if source_state.feature_bytes_contract
+            && target.scope_kind == ReadinessScopeKind::File
+            && target.stage == ReadinessStage::AnalysisFeatures
+            && target.required_version == "features-v1"
+            && target.eligibility == ReadinessEligibility::Eligible
+            && source_state.availability == SourceAvailability::Active
+        {
+            use super::feature_artifact::{Health, health, marker_matches};
+            match health(connection, &target)? {
+                Health::Healthy(ref artifact_key, _)
+                    if marker_matches(connection, artifact_key)? => {}
+                Health::Ambiguous => {
+                    classification = ReadinessClassification::PermanentFailure {
+                        code: "feature_artifact_ownership".into(),
+                        reason: "Feature payload provenance is ambiguous; evidence retained".into(),
+                    }
+                }
+                _ => {
+                    classification = classify_target(
+                        &target,
+                        source_state.availability,
+                        None,
+                        work.get(&key),
+                        now,
+                    )
+                }
+            }
+        }
         record_count(&mut stage_counts, target.stage, &classification);
         if classification.is_actionable(now) {
             deficits.push(ReadinessDeficit {

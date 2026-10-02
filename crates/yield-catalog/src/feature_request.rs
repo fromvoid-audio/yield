@@ -1,7 +1,8 @@
 //! Production single-job request through the retained catalog owner, with bounded output.
 use super::*;
 use yield_library::sample_sources::readiness::{
-    FeatureArtifactKey, ReadinessClassification, ReadinessDeficit, SourceFeatureInputError,
+    FeatureArtifactKey, FeatureArtifactRebuildAdmission, ReadinessClassification, ReadinessDeficit,
+    SourceFeatureInputError,
 };
 
 /// Cancellation of one analysis request, independent of a readiness artifact identity.
@@ -39,6 +40,8 @@ pub enum FeatureAnalysisBlocker {
     Computation,
     /// A current claim is unavailable, including a retained retry/lease or missing-payload rebuild.
     NotClaimable,
+    /// Exact payload/work provenance cannot be safely repaired; evidence is retained.
+    ArtifactOwnership,
     /// Explicit cancellation or source retirement stopped this request.
     Cancelled,
     /// Durable source publication or validated artifact lookup failed.
@@ -55,6 +58,7 @@ impl FeatureAnalysisBlocker {
             Self::InputChanged => "The file changed or could not be read",
             Self::Computation => "Feature analysis failed for this file",
             Self::NotClaimable => "Feature work is waiting for retry or rebuild",
+            Self::ArtifactOwnership => "Feature payload ownership needs review; evidence retained",
             Self::Cancelled => "The feature request was cancelled",
             Self::Publication => "The feature result could not be verified",
         }
@@ -235,6 +239,53 @@ pub(super) fn request(
             return;
         }
         _ => {}
+    }
+    match source
+        .database
+        .writer
+        .admit_feature_artifact_rebuild(&revision, &target, now(), &token)
+    {
+        Ok(
+            FeatureArtifactRebuildAdmission::Ready
+            | FeatureArtifactRebuildAdmission::Admitted { .. }
+            | FeatureArtifactRebuildAdmission::Unchanged,
+        ) => {}
+        Ok(FeatureArtifactRebuildAdmission::Deferred) => {
+            emit(
+                reservation,
+                source,
+                blocked(FeatureAnalysisBlocker::NotClaimable),
+            );
+            return;
+        }
+        Ok(FeatureArtifactRebuildAdmission::Ambiguous) => {
+            emit(
+                reservation,
+                source,
+                blocked(FeatureAnalysisBlocker::ArtifactOwnership),
+            );
+            return;
+        }
+        Ok(FeatureArtifactRebuildAdmission::RejectedStale) => {
+            emit(
+                reservation,
+                source,
+                blocked(FeatureAnalysisBlocker::StaleSource),
+            );
+            return;
+        }
+        Err(_) => {
+            emit(
+                reservation,
+                source,
+                blocked(if cancellation.is_cancelled() {
+                    FeatureAnalysisBlocker::Cancelled
+                } else {
+                    FeatureAnalysisBlocker::Publication
+                }),
+            );
+            return;
+        }
     }
     emit(
         reservation,

@@ -134,3 +134,35 @@ impl FeatureArtifactClaim {
         &self.claim
     }
 }
+
+/// Result of one retained owner's exact current feature rebuild admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FeatureArtifactRebuildAdmission {
+    /// Verified bytes and matching completion already exist.
+    Ready,
+    /// An exact broken completion/work entry was made actionable atomically.
+    Admitted {
+        /// Whether a demonstrably corrupt current-key payload was removed.
+        removed_corrupt_payload: bool,
+    },
+    /// Ordinary absent work retains its existing queue/retry policy.
+    Unchanged,
+    /// An exact unexpired running claim must finish or expire before rebuilding.
+    Deferred,
+    /// Ownership/control provenance is ambiguous; evidence was retained.
+    Ambiguous,
+    /// Current authoritative target/manifest no longer matches.
+    RejectedStale,
+}
+
+/// Bounded fault injection on one retained owner's current feature target, for real integration tests.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug)]
+pub enum FeatureArtifactFixtureFault {
+    /// Simulate a cache row disappearing after completion.
+    MissingPayload,
+    /// Corrupt the payload while retaining its immutable reference and digest.
+    CorruptPayload,
+    /// Remove completion evidence while retaining healthy immutable bytes.
+    MissingMarker,
+}

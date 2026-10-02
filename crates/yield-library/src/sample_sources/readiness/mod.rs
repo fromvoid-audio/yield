@@ -12,6 +12,7 @@ mod store;
 
 pub use feature_artifact::{
     FeatureArtifactClaim, FeatureArtifactKey, FeatureArtifactPayload, FeatureArtifactPublication,
+    FeatureArtifactRebuildAdmission,
 };
 pub(crate) use feature_input::InputPermit;
 pub use feature_input::{FEATURE_INPUT_MAX_BYTES, SourceFeatureInput, SourceFeatureInputError};
@@ -47,3 +48,6 @@ pub(crate) use store::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use feature_artifact::FeatureArtifactFixtureFault;
