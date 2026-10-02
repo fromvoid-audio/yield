@@ -261,6 +261,25 @@ pub(super) fn dispatch(
     if cancellation.is_cancelled() {
         return;
     }
+    if result.is_err() {
+        // A bounded diagnostic is not a source projection or read qualification.
+        // Keep it available for the exact live caller even when physical custody
+        // has expired; otherwise an accepted read would remain pending forever.
+        let state = admission.lock().unwrap_or_else(|p| p.into_inner());
+        if publication_is_current_state(
+            &state,
+            &request.source_id,
+            request.lifecycle,
+            Some(&cancellation.0),
+        ) {
+            reservation.publish(CatalogEvent::SimilarityCompleted {
+                request,
+                cancellation,
+                result,
+            });
+        }
+        return;
+    }
     publish_source_if_current(
         admission,
         reservation,

@@ -211,9 +211,16 @@ mod fixtures {
             request(&source, snapshot.committed_revision, 17),
             SimilarityCancellation::new(),
         );
-        wait_for_tag_page_input_release(&service);
-        wait_for_tag_read_payload(&service, 0);
-        assert!(service.try_recv_delivery().is_err()); // expired custody cannot project a success
+        let (event, fence) = delivery(&service, 17).into_parts_if_live().unwrap();
+        assert!(fence.is_none()); // diagnostic, never a source-qualified successful projection
+        assert!(matches!(
+            event,
+            CatalogEvent::SimilarityCompleted {
+                result: Err(SimilarityDispatchFailure::StaleSource),
+                ..
+            }
+        ));
+        drained(&service);
         assert_eq!(
             sql.query_row(
                 "SELECT expires_at FROM source_lease WHERE singleton=1",
