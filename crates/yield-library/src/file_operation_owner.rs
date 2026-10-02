@@ -18,7 +18,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod telemetry;
+use telemetry::FileOwnerTelemetry;
+pub use telemetry::{FileOwnerAdmissionOutcome, FileOwnerTelemetrySnapshot};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -1914,6 +1918,11 @@ impl FileOperationOwner {
         self.shared.status()
     }
 
+    /// Return fixed aggregate effect-queue observations without request data.
+    pub fn telemetry_snapshot(&self) -> FileOwnerTelemetrySnapshot {
+        self.shared.telemetry.snapshot()
+    }
+
     /// Queue one validated bounded effect command.
     pub fn submit(
         &self,
@@ -1941,6 +1950,19 @@ impl FileOperationOwner {
     }
 
     fn submit_inner(
+        &self,
+        command: FileOperationCommand,
+        grant: Option<LiveChunkEffectGrant>,
+    ) -> Result<FileOperationRequest, (FileOperationOwnerQueueError, Option<LiveChunkEffectGrant>)>
+    {
+        let result = self.submit_observed(command, grant);
+        self.shared
+            .telemetry
+            .record_admission(result.as_ref().err().map(|(error, _)| error));
+        result
+    }
+
+    fn submit_observed(
         &self,
         mut command: FileOperationCommand,
         mut grant: Option<LiveChunkEffectGrant>,
@@ -2053,6 +2075,7 @@ impl FileOperationOwner {
         };
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let envelope = OwnerCommand::Execute {
+            enqueued_at: Instant::now(),
             command,
             grant: grant.take(),
             canonical,
@@ -2088,7 +2111,7 @@ impl FileOperationOwner {
                 return Err((error, grant));
             }
         };
-        match sender.try_send(envelope) {
+        match self.shared.telemetry.enqueue(|| sender.try_send(envelope)) {
             Ok(()) => Ok(FileOperationRequest {
                 receiver: result_rx,
                 shared: Arc::clone(&self.shared),
@@ -2755,6 +2778,7 @@ impl WorkerState {
     fn handle(&mut self, command: OwnerCommand, shared: &Arc<OwnerShared>) {
         match command {
             OwnerCommand::Execute {
+                enqueued_at,
                 command,
                 grant,
                 canonical,
@@ -2763,17 +2787,20 @@ impl WorkerState {
                 input,
                 primary,
                 result,
-            } => self.execute(
-                command,
-                grant,
-                canonical,
-                fingerprint,
-                key,
-                input,
-                primary,
-                result,
-                shared,
-            ),
+            } => {
+                shared.telemetry.dispatch(enqueued_at.elapsed());
+                self.execute(
+                    command,
+                    grant,
+                    canonical,
+                    fingerprint,
+                    key,
+                    input,
+                    primary,
+                    result,
+                    shared,
+                );
+            }
             OwnerCommand::Acknowledge {
                 key,
                 fingerprint,
@@ -3105,6 +3132,7 @@ impl WorkerState {
 
 enum OwnerCommand {
     Execute {
+        enqueued_at: Instant,
         command: FileOperationCommand,
         grant: Option<LiveChunkEffectGrant>,
         canonical: Arc<[u8]>,
@@ -3142,6 +3170,7 @@ enum OwnerCommand {
 }
 
 struct OwnerShared {
+    telemetry: FileOwnerTelemetry,
     owner: OwnerIdentity,
     commands: Mutex<Option<SyncSender<OwnerCommand>>>,
     admission_gate: Mutex<()>,
@@ -3217,6 +3246,7 @@ impl OwnerLifecycle {
 impl OwnerShared {
     fn new(owner: OwnerIdentity, command_sender: SyncSender<OwnerCommand>) -> Self {
         Self {
+            telemetry: FileOwnerTelemetry::default(),
             owner,
             commands: Mutex::new(Some(command_sender)),
             admission_gate: Mutex::new(()),
@@ -3809,6 +3839,8 @@ fn worker_main(
             state.handle(command, &shared);
         }
     }));
+    drop(receiver);
+    shared.telemetry.abandon_waiting();
     match run {
         Ok(()) => finish_worker(shared, state),
         Err(_) => {
@@ -4308,6 +4340,8 @@ impl fmt::Display for OwnerIdentity {
 
 #[cfg(test)]
 mod tests {
+    mod telemetry_tests;
+
     use super::*;
     #[cfg(target_os = "macos")]
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
