@@ -145,26 +145,6 @@
     },
     {
       "path": "crates/yield-library/src/app_dirs/paths.rs",
-      "function": "clear_rebuildable_cache_payloads",
-      "operation": "fs::create_dir_all",
-      "count": 1,
-      "classification": "compatibility",
-      "issue": "OPT-1663",
-      "reason": "Older ambient disposable-cache clear API remains compiled; current session maintenance uses capability-relative storage_usage::clear instead.",
-      "retirement": "Retire this ambient API after the finite global/artifact caller audit confirms no remaining caller."
-    },
-    {
-      "path": "crates/yield-library/src/app_dirs/paths.rs",
-      "function": "clear_rebuildable_cache_payloads",
-      "operation": "fs::remove_dir_all",
-      "count": 1,
-      "classification": "compatibility",
-      "issue": "OPT-1663",
-      "reason": "Older ambient disposable-cache clear API remains compiled; current session maintenance uses capability-relative storage_usage::clear instead.",
-      "retirement": "Retire this ambient API after the finite global/artifact caller audit confirms no remaining caller."
-    },
-    {
-      "path": "crates/yield-library/src/app_dirs/paths.rs",
       "function": "create_app_subdir",
       "operation": "fs::create_dir_all",
       "count": 1,
