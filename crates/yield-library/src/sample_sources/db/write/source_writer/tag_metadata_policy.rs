@@ -46,24 +46,24 @@ impl Settings {
     }
 }
 
-/// SQLite settings retained on one source connection until its transaction is quiescent.
-///
-/// This is neither a capacity claim nor a tag mutation grant. The actual participant must
-/// obtain genuine owner admission before entering, retain that admission through its transaction,
-/// and reconcile its immutable outcome if policy restoration returns an error after commit.
+/// SQLite settings retained on one source connection until transaction quiescence.
 #[must_use = "finish only after the SQLite transaction has committed or rolled back"]
 pub struct SourceTagMetadataPolicy<'a> {
     database: &'a SourceDatabase,
+    state: EnteredTagPolicy,
+}
+
+// Owns settings and the extension gate, never a pointer/reference into its moving writer.
+// The borrowing adapter and owned preparation both restore through the same state machine.
+pub(super) struct EnteredTagPolicy {
     original: Settings,
     entered: Settings,
     finished: bool,
-    // Kept on this owner thread until transaction quiescence and checked restoration.
     _extensions: RwLockReadGuard<'static, ()>,
 }
 
 impl SourceWriter {
-    /// Revalidate a real observation and enter the capped SQLite runtime policy.
-    /// This configures this existing connection; it does not grant writes or issue a journal ID.
+    /// Enter a runtime restriction, never capacity or tag mutation authority.
     pub fn begin_tag_metadata_policy<'a>(
         &'a self,
         budget: &SourceTagMetadataBudget,
@@ -72,13 +72,35 @@ impl SourceWriter {
             return Err(SourceWriterError::MetadataBoundNotDefined);
         }
         self.validate_tag_metadata_budget(budget)?;
+        let policy = SourceTagMetadataPolicy {
+            database: &self.database,
+            state: EnteredTagPolicy::new(&self.database, budget)?,
+        };
+        policy.state.install(&self.database)?;
+        policy.validate_entered()?;
+        if budget.revision() != &self.current_revision()? {
+            return Err(SourceWriterError::StaleFence);
+        }
+        Ok(policy)
+    }
+}
+
+impl EnteredTagPolicy {
+    pub(super) fn new(
+        database: &SourceDatabase,
+        budget: &SourceTagMetadataBudget,
+    ) -> Result<Self, SourceWriterError> {
+        if !database.connection.is_autocommit()
+            || database.tag_metadata_policy_state.get() != TAG_METADATA_POLICY_IDLE
+        {
+            return Err(SourceWriterError::MetadataBoundNotDefined);
+        }
         let extensions = crate::sqlite_ext::try_extension_free_metadata_scope()
             .ok_or(SourceWriterError::MetadataBoundNotDefined)?;
-        schema::require_known_metadata_schema(&self.database.connection)
+        schema::require_known_metadata_schema(&database.connection)
             .map_err(|_| SourceWriterError::MetadataBoundNotDefined)?;
-        let original = Settings::read(&self.database.connection)?;
-        let query_only: bool = self
-            .database
+        let original = Settings::read(&database.connection)?;
+        let query_only: bool = database
             .connection
             .pragma_query_value(None, "query_only", |r| r.get(0))
             .map_err(map_sql_error)?;
@@ -95,49 +117,40 @@ impl SourceWriter {
             cache_spill: 0,
             auto_checkpoint: 0,
         };
-        let mut policy = SourceTagMetadataPolicy {
-            database: &self.database,
+        let state = Self {
             original,
             entered,
             finished: false,
             _extensions: extensions,
         };
-        self.database
+
+        Ok(state)
+    }
+
+    pub(super) fn install(&self, database: &SourceDatabase) -> Result<(), SourceWriterError> {
+        database
             .tag_metadata_policy_state
             .set(TAG_METADATA_POLICY_ENTERED);
-        if let Err(error) = entered.install(&self.database.connection) {
-            // Partial installation is not an entered grant. Failed cleanup poisons the incarnation.
-            policy.restore()?;
-            return Err(error.into());
-        }
-        policy.validate_entered()?;
-        if budget.revision() != &self.current_revision()? {
-            return Err(SourceWriterError::StaleFence);
-        }
-        Ok(policy)
+        self.entered
+            .install(&database.connection)
+            .map_err(SourceWriterError::from)
     }
-}
 
-impl SourceTagMetadataPolicy<'_> {
-    /// Check the finite runtime policy immediately before the actual participant's effect.
-    /// Logical selection, current source authority and genuine capacity claims remain its duty.
-    pub fn validate_entered(&self) -> Result<(), SourceWriterError> {
-        self.database.validate_profile_owned_mutation()?;
+    pub(super) fn validate(&self, database: &SourceDatabase) -> Result<(), SourceWriterError> {
+        database.validate_profile_owned_mutation()?;
         if self.finished
-            || self.database.tag_metadata_policy_state.get() != TAG_METADATA_POLICY_ENTERED
-            || Settings::read(&self.database.connection)? != self.entered
+            || database.tag_metadata_policy_state.get() != TAG_METADATA_POLICY_ENTERED
+            || Settings::read(&database.connection)? != self.entered
         {
             return Err(SourceWriterError::MetadataBoundNotDefined);
         }
-        schema::require_known_metadata_schema(&self.database.connection)
+        schema::require_known_metadata_schema(&database.connection)
             .map_err(|_| SourceWriterError::MetadataBoundNotDefined)?;
-        let page_size: u64 = self
-            .database
+        let page_size: u64 = database
             .connection
             .pragma_query_value(None, "page_size", |r| r.get(0))
             .map_err(map_sql_error)?;
-        let page_count: u64 = self
-            .database
+        let page_count: u64 = database
             .connection
             .pragma_query_value(None, "page_count", |r| r.get(0))
             .map_err(map_sql_error)?;
@@ -151,41 +164,45 @@ impl SourceTagMetadataPolicy<'_> {
         Ok(())
     }
 
-    /// Restore only after confirmed transaction quiescence. An error preserves poisoned state;
-    /// it must never turn an uncertain tag commit into a successful completion.
-    pub fn finish(mut self) -> Result<(), SourceWriterError> {
-        self.restore().map_err(SourceWriterError::from)
-    }
-
-    fn restore(&mut self) -> Result<(), SourceDbError> {
+    pub(super) fn restore(&mut self, database: &SourceDatabase) -> Result<(), SourceDbError> {
         if self.finished {
             return Err(SourceDbError::MetadataPolicyUnconfirmed);
         }
         self.finished = true;
-        let connection = &self.database.connection;
+        let connection = &database.connection;
         let restored = connection.is_autocommit()
             && schema::require_known_metadata_schema(connection).is_ok()
             && self.original.install(connection).is_ok();
         if restored {
-            self.database
+            database
                 .tag_metadata_policy_state
                 .set(TAG_METADATA_POLICY_IDLE);
             Ok(())
         } else {
-            self.database
+            database
                 .tag_metadata_policy_state
                 .set(TAG_METADATA_POLICY_POISONED);
-            // Defense in depth for internal raw SQLite access; the owned admission hook also
-            // rejects. This does not roll back or claim completion of an unfinished transaction.
             let _ = connection.pragma_update(None, "query_only", true);
             Err(SourceDbError::MetadataPolicyUnconfirmed)
         }
     }
 }
 
+impl SourceTagMetadataPolicy<'_> {
+    /// Revalidate the restriction; actual admission remains a separate requirement.
+    pub fn validate_entered(&self) -> Result<(), SourceWriterError> {
+        self.state.validate(self.database)
+    }
+    /// Restore only after confirmed transaction quiescence.
+    pub fn finish(mut self) -> Result<(), SourceWriterError> {
+        self.state
+            .restore(self.database)
+            .map_err(SourceWriterError::from)
+    }
+}
 impl Drop for SourceTagMetadataPolicy<'_> {
     fn drop(&mut self) {
-        if !self.finished && self.restore().is_err() {
+        if !self.state.finished && self.state.restore(self.database).is_err() {
             tracing::warn!(
                 "source metadata policy restoration unconfirmed; database close/reopen required"
             );

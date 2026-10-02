@@ -9,6 +9,7 @@ use std::sync::Weak;
 /// This observation does not issue capacity, journal identity, source writes or completion.
 pub struct SourceTagAdmissionObservation {
     selection: SourceTagAssignmentSelection,
+    deadline: Instant,
     budget: SourceTagMetadataBudget,
     directory_generation: u64,
     descriptor: File,
@@ -17,6 +18,9 @@ pub struct SourceTagAdmissionObservation {
     lease: Weak<SourceLease>,
 }
 impl SourceTagAdmissionObservation {
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline.min(self.budget.deadline())
+    }
     /// Full bounded assignment scope, not a file-operation locator/capability.
     pub fn selection(&self) -> &SourceTagAssignmentSelection {
         &self.selection
@@ -92,6 +96,46 @@ impl SourceWriter {
         Ok(())
     }
 
+    // Direct reads on the retained connection. The caller provides the owner-validated
+    // revision and keeps the empty immediate transaction held; no nested BEGIN or renewal.
+    pub(super) fn validate_tag_scope_in_connection(
+        &self,
+        observation: &SourceTagAdmissionObservation,
+        revision: &SourceRevision,
+        deadline: Instant,
+    ) -> Result<(), SourceWriterError> {
+        let owner = observation
+            .owner
+            .upgrade()
+            .ok_or(SourceWriterError::StaleFence)?;
+        if !Arc::ptr_eq(&owner, &self.reference_liveness)
+            || revision != observation.selection.revision()
+        {
+            return Err(SourceWriterError::StaleFence);
+        }
+        observation.validate_live_origin()?;
+        self.validate_tag_metadata_facts(&observation.budget, deadline)?;
+        let _progress = SnapshotProgressGuard::install(&self.database.connection, deadline);
+        let selected = &observation.selection;
+        let current = tag_assignment_selection::capture(
+            &self.database.connection,
+            revision.clone(),
+            selected.old_identity(),
+            selected.mutation().clone(),
+        )?;
+        if current != *selected
+            || active_generation(&self.database.connection, revision.revision())?
+                != observation.directory_generation
+        {
+            return Err(SourceWriterError::StaleFence);
+        }
+        observation.validate_live_origin()?;
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        Ok(())
+    }
+
     /// Capture source-only journal preparation input without creating an intent or write grant.
     pub fn capture_tag_admission_observation(
         &self,
@@ -143,6 +187,7 @@ impl SourceWriter {
             .map_err(|_| SourceWriterError::MetadataBoundNotDefined)?;
         let observation = SourceTagAdmissionObservation {
             selection,
+            deadline,
             budget,
             directory_generation,
             descriptor,

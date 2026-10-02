@@ -39,7 +39,9 @@ pub use layout_capture::{
 };
 mod tag_metadata_budget;
 mod tag_metadata_policy;
+mod tag_wal_preparation;
 pub use tag_admission_observation::SourceTagAdmissionObservation;
+pub use tag_wal_preparation::{SourceTagWalPreparation, SourceTagWalPreparationFailure};
 mod wal_reservation;
 pub use tag_metadata_budget::SourceTagMetadataBudget;
 pub use tag_metadata_policy::SourceTagMetadataPolicy;

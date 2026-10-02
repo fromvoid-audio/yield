@@ -54,6 +54,9 @@ impl fmt::Debug for SourceWalPreparationFailure {
 }
 
 impl SourceWalPreparationFailure {
+    pub(super) fn writer(&self) -> &SourceWriter {
+        self.held.writer()
+    }
     /// Inspect the bounded typed rejection; it grants no retry authority.
     pub fn error(&self) -> &SourceWalPreparationError {
         &self.error
@@ -94,6 +97,9 @@ impl fmt::Debug for SourceWalPreparation {
 }
 
 impl SourceWalPreparation {
+    pub(super) fn writer(&self) -> &SourceWriter {
+        self.held.writer()
+    }
     /// Opaque local preparation identity, never durable acceptance.
     pub fn nonce(&self) -> Uuid {
         self.nonce
@@ -204,8 +210,21 @@ impl SourceWriter {
             reservation: false,
             restore_timeout: None,
         };
-        let prepared = prepare(&mut held, expected, deadline);
-        finish_preparation(held, prepared, deadline)
+        let prepared = prepare(&mut held, expected, deadline, true);
+        finish_preparation(held, prepared, deadline, false)
+    }
+    pub(super) fn prepare_policy_wal_reservation(
+        self,
+        expected: &SourceRevision,
+        deadline: Instant,
+    ) -> Result<SourceWalPreparation, SourceWalPreparationFailure> {
+        let mut held = HeldWriter {
+            writer: Some(self),
+            reservation: false,
+            restore_timeout: None,
+        };
+        let prepared = prepare(&mut held, expected, deadline, false);
+        finish_preparation(held, prepared, deadline, true)
     }
 }
 
@@ -219,6 +238,7 @@ fn finish_preparation(
     held: HeldWriter,
     prepared: Result<(SourceRevision, u64), SourceWalPreparationError>,
     deadline: Instant,
+    rollback_before_timeout: bool,
 ) -> Result<SourceWalPreparation, SourceWalPreparationFailure> {
     match prepared {
         Ok((revision, wal_bytes)) => Ok(SourceWalPreparation {
@@ -240,7 +260,11 @@ fn finish_preparation(
                     failure.error = SourceWalPreparationError::RollbackUnconfirmed;
                 }
             }
-            if let Some(timeout) = failure.held.restore_timeout {
+            if let Some(timeout) = failure
+                .held
+                .restore_timeout
+                .filter(|_| !rollback_before_timeout || !failure.held.reservation)
+            {
                 if failure
                     .held
                     .writer()
@@ -257,7 +281,7 @@ fn finish_preparation(
     }
 }
 
-fn validate(
+pub(super) fn validate(
     writer: &SourceWriter,
     expected: &SourceRevision,
     deadline: Instant,
@@ -345,6 +369,7 @@ fn prepare(
     held: &mut HeldWriter,
     expected: &SourceRevision,
     deadline: Instant,
+    restore_while_held: bool,
 ) -> Result<(SourceRevision, u64), SourceWalPreparationError> {
     // Never adopt or roll back a transaction that predates this preparation.
     if !held.writer().database.connection.is_autocommit() {
@@ -373,11 +398,13 @@ fn prepare(
         .execute_batch("BEGIN IMMEDIATE");
     held.reservation = !held.writer().database.connection.is_autocommit();
     // Restore even when BEGIN fails; never leave the ordinary owner's timeout disabled.
-    held.writer()
-        .database
-        .connection
-        .busy_timeout(Duration::from_millis(timeout))?;
-    held.restore_timeout = None;
+    if restore_while_held {
+        held.writer()
+            .database
+            .connection
+            .busy_timeout(Duration::from_millis(timeout))?;
+        held.restore_timeout = None;
+    }
     acquired?;
     let revision = validate(held.writer(), expected, deadline)?;
     let state = enforce_wal_admission(&held.writer().database.connection)?;
