@@ -91,6 +91,51 @@ Its catalog writer can attach the separately admitted replay proof and prior usi
   claiming end-to-end proof-bearing replay; do not relocate source-local state
   into another writer or report a replay candidate as continuity proof.
 
+### Exact replay consumer update (OPT-2073)
+
+The inventory above predates `CatalogService::submit_replay`. That production
+entrypoint now queues a genuine bounded `ReplayObservationBatch` to the existing
+catalog worker. It restores a reconciliation lane only from the database-issued
+prior, using the retained source lifecycle for watcher generation. Exact targets
+use OPT-2059's held, prepared scanner transaction through `CatalogScanWriter` and
+the existing source-owned replay checkpoint commit. Audio/index changes, source
+revision and checkpoint share that transaction; the reply contains its bounded
+delta and a read-back opaque interval/revision receipt. Restart or lost replies
+can return that persisted receipt without inventing a new delta.
+
+Eight global request permits cover queued/caller-held requests and retained
+failed source state. Producer events/locators and identity bytes remain bounded;
+each exact transaction holds at most 64 entries, 32KiB locator bytes and hashes
+at most 64MiB. SQL coordination reads preflight the 16KiB text/type limit and
+reject ambiguous duplicate metadata before materialization. Checkpoint,
+uncertainty and source revision are read in one database snapshot. Source
+retirement/cancellation still invalidates the catalog mutation guard.
+Exact preparation reads scalar/existence facts rather than full `WavEntry` tag
+lists; its existing batch upserts preserve curation in SQL. Up to 64 non-root
+parents (32KiB locators, 64KiB stored identities) are read from the owned active
+directory generation and held without following links. Known parent identities
+must still match before mutation. New, unknown or replaced parents require an
+audit rather than checkpointing stale directory truth; nested known parents
+remain usable after a cold replay restart without whole-source hydration.
+
+Invalid coverage/identity, missing or stale prior, unsupported targets and
+overflow retain a correlated uncertainty and queue an authoritative source audit.
+Only the actual covering complete `SourceAuditCommit` receipt releases that raw
+boundary; partial/canceled/failed audits retain it. Denied or uncertain replies
+return the original bounded envelope for producer retry. A confirmed commit with
+uncertain readback retains its exact pending work rather than poisoning the
+receipt with a new uncertainty marker. Last-good projection is retained on
+failure; successful exact deltas patch cached rows and preserve curation facts.
+
+This implements the exact-entry portable leaf, not all of OPT-2053. Directory
+scopes currently require a conservative full audit: OPT-2074 must implement the
+atomic bounded subtree/directory-truth bridge. The existing native producer is
+not wired into this new entrypoint by this leaf. Live macOS capture, producer
+integration and qualification remain separate requirements under OPT-1981 and
+the watcher tracking issues. Real worker/owned SQLite/FS regressions inject the
+genuine producer envelope as a harness; they do not qualify FSEvents, native
+filesystem effects, or physical durability. OPT-2053/1355/1352 remain open.
+
 ## Focused verification
 
 Existing tests exercise actual temporary source/profile SQLite databases and

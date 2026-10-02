@@ -20,6 +20,7 @@ mod error;
 /// Persistent file operation journal for crash recovery.
 pub mod file_ops_journal;
 pub(crate) use file_ops_journal::BoundDatabaseRoot;
+mod exact_scan;
 mod index_entries;
 mod index_inspection;
 mod open;
@@ -31,8 +32,12 @@ pub mod read;
 mod rename_destinations;
 mod rename_metadata;
 mod replay_authority;
+mod replay_parents;
+pub use exact_scan::ExactScanDatabaseFacts;
 pub(crate) use replay_authority::ValidatedReplayAuthority;
-pub use replay_authority::{DurableReplayUncertainty, DurableReplayUncertaintyState};
+pub use replay_authority::{
+    DurableReplayReceipt, DurableReplayUncertainty, DurableReplayUncertaintyState,
+};
 /// SQLite schema management for sample source databases.
 pub mod schema;
 mod source_authority;

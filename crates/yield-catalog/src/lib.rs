@@ -77,6 +77,7 @@ mod index_pages;
 mod index_reveal;
 mod index_reveal_contract;
 mod rating_decay;
+mod replay;
 mod root;
 mod tags;
 mod watcher;
@@ -100,6 +101,10 @@ pub use index_reveal_contract::{
     IndexRevealPageIdentity, IndexRevealProposal, IndexRevealRejection, propose_index_reveal,
 };
 
+pub use replay::{
+    CatalogReplayError, CatalogReplayOutcome, CatalogReplayRequest, CatalogReplaySubmission,
+    CatalogReplaySubmitError, MAX_CATALOG_REPLAY_REQUESTS,
+};
 pub use root::{VerifiedSourceRoot, resolve_source_root};
 
 use watcher::{
@@ -129,6 +134,7 @@ struct CatalogTestGate {
     audit_state: Mutex<CatalogTestAuditState>,
     watcher_signals: Mutex<HashMap<(SourceId, u64), WatcherSignal>>,
     watcher_install_counts: Mutex<HashMap<(SourceId, u64), usize>>,
+    cancel_on_audit_progress: AtomicBool,
 }
 
 #[cfg(test)]
@@ -161,6 +167,7 @@ impl CatalogTestGate {
             }),
             watcher_signals: Mutex::new(HashMap::new()),
             watcher_install_counts: Mutex::new(HashMap::new()),
+            cancel_on_audit_progress: AtomicBool::new(false),
         }
     }
 
@@ -223,6 +230,12 @@ impl CatalogTestGate {
         }
         state.at_boundary = false;
         self.wake.notify_all();
+    }
+
+    fn audit_progress(&self, token: &AtomicBool) {
+        if self.cancel_on_audit_progress.load(Ordering::Acquire) {
+            token.store(true, Ordering::Release);
+        }
     }
 
     fn arm_next_audit(&self) -> CatalogTestAuditPause<'_> {
@@ -376,6 +389,7 @@ impl CatalogTestGate {
     fn before_receive(&self) {}
 
     fn before_audit(&self) {}
+    fn audit_progress(&self, _token: &AtomicBool) {}
 
     fn install_watcher_signal(
         &self,
@@ -475,6 +489,11 @@ pub enum CatalogCommand {
         relative_path: PathBuf,
         /// Per-request cancellation; the owner also binds it to source retirement.
         cancellation: FeatureAnalysisCancellation,
+    },
+    /// Consume one bounded genuine replay envelope on the retained catalog worker.
+    ConsumeReplay {
+        /// Private request/reply/cancellation binding minted by `CatalogService::submit_replay`.
+        submission: CatalogReplaySubmission,
     },
     /// Register or replace one source lifecycle generation.
     Register {
@@ -1775,6 +1794,7 @@ impl CatalogDelivery {
 }
 
 struct RegisteredSource {
+    replay: Option<replay::ReplayState>,
     root: PathBuf,
     lifecycle_generation: u64,
     database: CatalogSourceDatabase,
@@ -2597,6 +2617,8 @@ fn encoded_path_len(path: &Path) -> usize {
 fn command_event_budget(command: &CatalogCommand) -> usize {
     match command {
         CatalogCommand::RequestFeatureAnalysis { .. } => 6,
+        CatalogCommand::ConsumeReplay { .. } => 0,
+
         CatalogCommand::Register { .. } | CatalogCommand::RegisterVerified { .. } => 2,
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestWavMetadata { .. }
@@ -2648,6 +2670,7 @@ fn command_curation_update_count(command: &CatalogCommand) -> usize {
 
 fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
     match command {
+        CatalogCommand::ConsumeReplay { submission } => submission.input_bytes(),
         CatalogCommand::RequestIndexInspection { handle, .. } => handle.input_bytes(),
         CatalogCommand::RequestIndexPage {
             source_id,
@@ -2785,6 +2808,7 @@ enum AdmissionAction {
 
 fn admission_action(command: &CatalogCommand) -> AdmissionAction {
     match command {
+        CatalogCommand::ConsumeReplay { .. } => AdmissionAction::ReadSnapshot,
         CatalogCommand::Register {
             source_id,
             lifecycle_generation,
@@ -3544,7 +3568,28 @@ fn run_worker(
     journal: Option<OperationJournalClient>,
     watcher_mode: WatcherMode,
 ) {
-    let mut sources = HashMap::new();
+    run_worker_with_sources(
+        profile_guard,
+        command_rx,
+        events,
+        admission,
+        test_gate,
+        journal,
+        watcher_mode,
+        HashMap::new(),
+    );
+}
+
+fn run_worker_with_sources(
+    profile_guard: WritableProfileGuard,
+    command_rx: Receiver<CatalogCommand>,
+    events: Arc<EventHub>,
+    admission: Arc<Mutex<AdmissionState>>,
+    test_gate: Option<Arc<CatalogTestGate>>,
+    journal: Option<OperationJournalClient>,
+    watcher_mode: WatcherMode,
+    mut sources: HashMap<SourceId, RegisteredSource>,
+) {
     let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
     loop {
         if let Some(test_gate) = test_gate.as_ref() {
@@ -3684,6 +3729,10 @@ fn handle_command(
     watcher_mode: WatcherMode,
 ) -> bool {
     match command {
+        CatalogCommand::ConsumeReplay { submission } => {
+            replay::consume(submission, profile_guard, admission, sources);
+            false
+        }
         CatalogCommand::Register {
             source_id,
             canonical_root,
@@ -4820,6 +4869,7 @@ fn register_source(
             }
         };
     let mut source = RegisteredSource {
+        replay: None,
         root: canonical_root,
         lifecycle_generation,
         database,
@@ -5111,6 +5161,7 @@ fn request_audit(
                 &token,
                 admission,
                 watcher_mode,
+                test_gate.map(Arc::as_ref),
             )
         });
     let disposition = match result {
@@ -6332,6 +6383,7 @@ fn audit_source(
     token: &Arc<AtomicBool>,
     admission: &Arc<Mutex<AdmissionState>>,
     watcher_mode: WatcherMode,
+    test_gate: Option<&CatalogTestGate>,
 ) -> Result<CatalogSnapshot, CatalogError> {
     profile_guard.validate_current().map_err(|error| {
         catalog_error_from_db_for_source(source_id, SourceDbError::ProfileOwnership(error))
@@ -6394,13 +6446,21 @@ fn audit_source(
             token,
         }),
     };
+    let replay_audit_request = source
+        .replay
+        .as_ref()
+        .and_then(|state| state.audit_request.clone());
     let audit = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
         &source.database,
         Some(token),
         now_epoch_seconds(),
-        &mut |_, _| {},
+        &mut |_, _| {
+            if let Some(gate) = test_gate {
+                gate.audit_progress(token);
+            }
+        },
         &writer,
-        None,
+        replay_audit_request.as_ref(),
     )
     .map_err(|error| scan_error(source_id, error))?;
     if token.load(Ordering::Acquire) {
@@ -6429,6 +6489,13 @@ fn audit_source(
         Some(token),
     ) {
         return Err(CatalogError::Canceled);
+    }
+    if source
+        .replay
+        .as_mut()
+        .is_some_and(|state| state.acknowledge_audit(&audit.audit_commit))
+    {
+        source.replay = None; // Correlated complete owner audit acknowledged the retained boundary.
     }
     #[cfg(target_os = "macos")]
     if let Some(capture) = bootstrap_capture {
@@ -7166,17 +7233,17 @@ mod tests {
 
     static TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 
-    struct Fixture {
+    pub(super) struct Fixture {
         _serial: MutexGuard<'static, ()>,
         _base: ConfigBaseGuard,
         _config_root: TempDir,
         _profile: PersistenceProfileGuard,
-        guard: WritableProfileGuard,
-        root: TempDir,
+        pub(super) guard: WritableProfileGuard,
+        pub(super) root: TempDir,
     }
 
     impl Fixture {
-        fn new(name: &str) -> Self {
+        pub(super) fn new(name: &str) -> Self {
             let serial = TEST_LOCK
                 .get_or_init(|| std::sync::Mutex::new(()))
                 .lock()
@@ -9655,6 +9722,7 @@ mod tests {
             },
         );
         let source = RegisteredSource {
+            replay: None,
             root: fixture.root.path().to_path_buf(),
             lifecycle_generation: 1,
             database: CatalogSourceDatabase::new(database, source_id.clone(), 1)
@@ -9729,6 +9797,7 @@ mod tests {
             },
         );
         let mut source = RegisteredSource {
+            replay: None,
             root: replacement_root.path().to_path_buf(),
             lifecycle_generation: 1,
             database: CatalogSourceDatabase::new(database, source_id.clone(), 1)
@@ -9910,6 +9979,7 @@ mod tests {
             },
         );
         let source = RegisteredSource {
+            replay: None,
             root: replacement_root.path().to_path_buf(),
             lifecycle_generation: 1,
             database: CatalogSourceDatabase::new(database, source_id.clone(), 1)
@@ -10031,6 +10101,7 @@ mod tests {
             },
         );
         let source = RegisteredSource {
+            replay: None,
             root: fixture.root.path().to_path_buf(),
             lifecycle_generation: 1,
             database: CatalogSourceDatabase::new(database, source_id.clone(), 1)
@@ -10685,6 +10756,7 @@ mod tests {
             .source_publication_fence()
             .expect("publication fence for carrier collision guard");
         let replacement_source = RegisteredSource {
+            replay: None,
             root: source_root.path().to_path_buf(),
             lifecycle_generation: 2,
             database: CatalogSourceDatabase::new(database, source_id.clone(), 2)

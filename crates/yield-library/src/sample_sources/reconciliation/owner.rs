@@ -236,6 +236,28 @@ impl ReconciliationAdmissionOwner {
         ))
     }
 
+    /// Retain the current lane's already-issued uncertainty when an invalid retry is suppressed.
+    /// No uncertainty-free lane or caller-created request can mint a durable audit marker.
+    pub fn current_durable_audit_marker(
+        &self,
+        source_id: &SourceId,
+    ) -> Option<RetainedUncertainty> {
+        let request = self.source_audit_request_for_current_lane(source_id)?;
+        let reasons = self
+            .supervisor
+            .retained_uncertainties()
+            .iter()
+            .filter(|marker| marker.source_id() == Some(source_id))
+            .flat_map(|marker| marker.reasons().iter().copied())
+            .collect::<Vec<_>>();
+        if reasons.is_empty() {
+            return None;
+        }
+        Some(RetainedUncertainty::for_source_audit_request(
+            &request, reasons,
+        ))
+    }
+
     /// Select the next admitted envelope using the supervisor's fair lane scheduler.
     pub fn dispatch_next(&mut self) -> Option<DispatchedObservation> {
         self.supervisor.dispatch_next()
@@ -373,6 +395,41 @@ impl ReconciliationAdmissionOwner {
             .begin_capture(&existing_lane, generation)
             .map_err(AdmissionOwnerError::Supervisor)?;
         self.snapshot(&existing_lane)
+    }
+
+    /// Restore a capturing replay lane from a database-issued durable prior after restart.
+    ///
+    /// The caller must read the prior under its current physical source/lifecycle owner. This
+    /// method consumes its opaque generation; it never derives continuity from a hint or audit.
+    /// Existing incompatible or stopped lanes reject restoration rather than losing raw tickets.
+    pub fn restore_replay_source(
+        &mut self,
+        prior: &ReplayPriorToken,
+    ) -> Result<OwnedAdmissionLane, AdmissionOwnerError> {
+        if let Some(lane) = self.lane(prior.source_id()) {
+            if lane.root_identity() != prior.root_identity() {
+                return Err(AdmissionOwnerError::SourceRootMismatch);
+            }
+            if lane.generation() != prior.watcher_generation() {
+                return Err(AdmissionOwnerError::Supervisor(
+                    AdmissionError::GenerationMismatch,
+                ));
+            }
+            if lane.lifecycle() != ReconciliationLifecycle::Capturing {
+                return Err(AdmissionOwnerError::Supervisor(
+                    AdmissionError::InvalidLifecycleTransition,
+                ));
+            }
+            return Ok(lane);
+        }
+        let (lane, generation) = self
+            .supervisor
+            .restore_replay_lane(prior)
+            .map_err(AdmissionOwnerError::Supervisor)?;
+        self.supervisor
+            .begin_capture(&lane, generation)
+            .map_err(AdmissionOwnerError::Supervisor)?;
+        self.snapshot(&lane)
     }
 
     /// Stop the current lane for a source and return its stopped snapshot.

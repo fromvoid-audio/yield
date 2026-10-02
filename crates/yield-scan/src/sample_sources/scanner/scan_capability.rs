@@ -68,6 +68,20 @@ impl SourceRootCapability {
         })
     }
 
+    /// Hold a source-relative directory without following any component.
+    pub(super) fn open_directory_file(&self, relative: &Path) -> Result<fs::File, ScanError> {
+        let Some((parent, name)) = self.open_parent(relative)? else {
+            return Err(ScanError::InvalidRoot(self.root.join(relative)));
+        };
+        parent
+            .open_dir_nofollow(name)
+            .map(Dir::into_std_file)
+            .map_err(|source| ScanError::Io {
+                path: self.root.join(relative),
+                source,
+            })
+    }
+
     /// Borrow the physical identity captured by the held source-root capability.
     pub(super) fn generation(&self) -> &str {
         &self.generation
