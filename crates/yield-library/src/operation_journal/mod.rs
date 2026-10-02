@@ -35,6 +35,7 @@ pub(crate) mod full_progress_codec;
 pub mod full_progress_record;
 pub mod full_status;
 pub mod history_commands;
+pub mod metadata_tag_commands;
 pub mod model;
 pub mod namespace_commands;
 pub mod owner;
@@ -305,4 +306,10 @@ mod mixed_batch_contract_tests;
 pub use recovery_status::{
     JournalRetentionKind, JournalStatusFamily, RecoveryStatusEntry, RecoveryStatusOutcome,
     RecoveryStatusPage,
+};
+
+pub use metadata_tag_commands::{
+    MAX_METADATA_TAG_SOURCE_ARGS_BYTES, METADATA_TAG_SOURCE_ARGS_VERSION, MetadataTagArgsError,
+    MetadataTagHistoricalScope, MetadataTagMutation, MetadataTagSourceIntentArgs,
+    StoredMetadataTagSourceIntent, decode_metadata_tag_source_intent,
 };
