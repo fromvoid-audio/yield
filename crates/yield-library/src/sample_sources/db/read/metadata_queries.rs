@@ -665,11 +665,7 @@ impl SourceDatabase {
     }
     /// Return the numeric metadata value for `key` (0 if missing).
     fn get_numeric_metadata(&self, key: &str) -> Result<u64, SourceDbError> {
-        let value = self.get_metadata(key)?;
-        match value {
-            Some(raw) => raw.parse::<u64>().map_err(|_| SourceDbError::Unexpected),
-            None => Ok(0),
-        }
+        super::super::read_bounded_numeric_metadata(&self.connection, key)
     }
 
     /// Find the sorted index for a tracked wav path.

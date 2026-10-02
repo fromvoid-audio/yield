@@ -4308,3 +4308,52 @@ fn tag_assignment_selection_rejects_replaced_media_root_and_expired_lease() {
     ));
 }
 mod feature_artifacts;
+
+#[test]
+fn bounded_metadata_corruption_rejects_actual_writer_revision_and_tag_selection_without_edits() {
+    use crate::sample_sources::SourceTagAssignmentMutation;
+    let fixture = CurationFixture::new_profile_bound();
+    insert_tag(&fixture.database, "old", "Old");
+    let writer =
+        SourceWriter::new(fixture.database, SourceId::from_string("bounded-audit"), 7).unwrap();
+    let revision = writer.current_revision().unwrap();
+    for (key, invalid) in [
+        (
+            crate::sample_sources::db::META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY,
+            " ".repeat(24577),
+        ),
+        (
+            crate::sample_sources::db::META_LAST_AUTHORITATIVE_AUDIT_REVISION,
+            "0".repeat(21),
+        ),
+        ("revision", "0".repeat(21)),
+    ] {
+        let db = writer.database_for_tests();
+        let original = db.get_metadata(key).unwrap().unwrap();
+        db.connection
+            .execute(
+                "UPDATE metadata SET value=?1 WHERE key=?2",
+                rusqlite::params![invalid, key],
+            )
+            .unwrap();
+        let before = db.connection.total_changes();
+        assert!(writer.current_revision().is_err());
+        assert!(
+            writer
+                .capture_tag_assignment_selection(
+                    &revision,
+                    "old",
+                    SourceTagAssignmentMutation::Delete
+                )
+                .is_err()
+        );
+        assert_eq!(db.connection.total_changes(), before);
+        db.connection
+            .execute(
+                "UPDATE metadata SET value=?1 WHERE key=?2",
+                rusqlite::params![original, key],
+            )
+            .unwrap();
+        assert_eq!(writer.current_revision().unwrap(), revision);
+    }
+}

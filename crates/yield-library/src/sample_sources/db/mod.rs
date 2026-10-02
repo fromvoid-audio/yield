@@ -824,34 +824,61 @@ impl SourceDatabase {
             .connection
             .unchecked_transaction()
             .map_err(SourceDbError::from)?;
-        let (identity, revision): (Option<String>, Option<String>) = transaction
-            .query_row(
-                "SELECT
-                    (SELECT value FROM metadata WHERE key = ?1),
-                    (SELECT value FROM metadata WHERE key = ?2)",
-                rusqlite::params![
-                    META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY,
-                    META_LAST_AUTHORITATIVE_AUDIT_REVISION
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(SourceDbError::from)?;
+        // Bound returned bytes before rusqlite allocates Strings. LIMIT 3 detects ambiguity
+        // even for a corrupt legacy metadata table without its normal unique key constraint.
+        let values = {
+            let mut statement = transaction.prepare(
+                "SELECT key, CASE WHEN typeof(value) = 'text'
+                    AND length(CAST(value AS BLOB)) BETWEEN 1 AND
+                        CASE WHEN key = ?1 THEN 24576 ELSE 20 END
+                    THEN value END
+                 FROM metadata WHERE key IN (?1, ?2) LIMIT 3",
+            )?;
+            statement
+                .query_map(
+                    rusqlite::params![
+                        META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY,
+                        META_LAST_AUTHORITATIVE_AUDIT_REVISION
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         transaction.rollback().map_err(SourceDbError::from)?;
-        match (identity, revision) {
-            (None, None) => Ok(None),
-            (Some(identity), Some(revision)) => {
-                let source_revision = revision
-                    .parse::<u64>()
-                    .map_err(|_| SourceDbError::Unexpected)?;
-                let identity = serde_json::from_str::<Vec<u8>>(&identity)
-                    .map_err(|_| SourceDbError::Unexpected)?;
-                Ok(Some(SourceAuditMetadata {
-                    root_identity: RootIdentity::from_bytes(identity),
-                    source_revision,
-                }))
-            }
-            _ => Err(SourceDbError::Unexpected),
+        if values.is_empty() {
+            return Ok(None);
         }
+        if values.len() != 2 {
+            return Err(SourceDbError::Unexpected);
+        }
+        let mut identity = None;
+        let mut revision = None;
+        for (key, value) in values {
+            let slot = match key.as_str() {
+                META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY => &mut identity,
+                META_LAST_AUTHORITATIVE_AUDIT_REVISION => &mut revision,
+                _ => return Err(SourceDbError::Unexpected),
+            };
+            if slot
+                .replace(value.ok_or(SourceDbError::Unexpected)?)
+                .is_some()
+            {
+                return Err(SourceDbError::Unexpected);
+            }
+        }
+        let source_revision = revision
+            .ok_or(SourceDbError::Unexpected)?
+            .parse::<u64>()
+            .map_err(|_| SourceDbError::Unexpected)?;
+        let identity = serde_json::from_str::<Vec<u8>>(&identity.ok_or(SourceDbError::Unexpected)?)
+            .map_err(|_| SourceDbError::Unexpected)?;
+        if identity.is_empty() || identity.len() > 4096 {
+            return Err(SourceDbError::Unexpected);
+        }
+        Ok(Some(SourceAuditMetadata {
+            root_identity: RootIdentity::from_bytes(identity),
+            source_revision,
+        }))
     }
 
     /// Override this connection's SQLite busy timeout for deterministic contention tests.
@@ -1595,9 +1622,35 @@ fn snapshot_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Read a numeric metadata field without allocating an unbounded corrupt SQLite value.
+fn read_bounded_numeric_metadata(connection: &Connection, key: &str) -> Result<u64, SourceDbError> {
+    // A numeric revision is at most 20 decimal bytes. Do not materialize oversized
+    // corrupt values; a second row rejects ambiguous legacy tables rather than picking one.
+    let mut statement = connection
+        .prepare(
+            "SELECT CASE WHEN typeof(value) = 'text'
+                AND length(CAST(value AS BLOB)) BETWEEN 1 AND 20 THEN value END
+             FROM metadata WHERE key = ?1 LIMIT 2",
+        )
+        .map_err(SourceDbError::from)?;
+    let values = statement
+        .query_map([key], |row| row.get::<_, Option<String>>(0))
+        .map_err(SourceDbError::from)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(SourceDbError::from)?;
+    match values.as_slice() {
+        [] => Ok(0),
+        [Some(raw)] => raw.parse::<u64>().map_err(|_| SourceDbError::Unexpected),
+        _ => Err(SourceDbError::Unexpected),
+    }
+}
+
 /// Unit tests for source-database open, migration, and metadata invariants.
 #[cfg(test)]
 mod source_db_mod_tests;
 
 #[cfg(test)]
 mod source_db_migration_tests;
+
+#[cfg(test)]
+mod bounded_metadata_tests;
