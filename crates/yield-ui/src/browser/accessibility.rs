@@ -720,7 +720,7 @@ impl BrowserAccessibility {
                                     cx.notify();
                                 }
                                 JOB_RETRY => {
-                                    view.retry_job_audit(cx);
+                                    view.retry_current_job(cx);
                                     window.focus(&view.job_details_focus_handle);
                                 }
                                 JOB_CANCEL => {
@@ -1350,7 +1350,7 @@ impl Browser {
                     enabled: true,
                 });
                 if jobs.rows.iter().any(|row| row.can_retry) {
-                    controls.push(button(JOB_RETRY, "Retry source audit", None, true));
+                    controls.push(button(JOB_RETRY, "Retry current job", None, true));
                 }
                 if jobs.rows.iter().any(|row| row.can_cancel) {
                     controls.push(button(JOB_CANCEL, "Cancel source audit", None, true));

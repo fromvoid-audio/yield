@@ -61,6 +61,84 @@ impl Request {
     }
 }
 impl Browser {
+    // A current row and its actions use the same full source fence. Keeping the
+    // last request does not make it visible after navigation or catalog refresh.
+    fn current_feature_request(&self) -> Option<&Request> {
+        let request = self.feature_analysis.pending.as_ref()?;
+        let activation = self.catalog_activation.as_ref()?;
+        let context = self.catalog_metadata.context()?;
+        let session = self.source_sessions.get(self.active_source?)?;
+        (self.root.as_ref() == Some(&activation.root)
+            && context.root == activation.root
+            && session.source_id.as_ref() == Some(&request.source)
+            && session.root == activation.root
+            && activation.source_id == request.source
+            && activation.lifecycle_generation == request.lifecycle
+            && activation.registered
+            && activation.registration_admitted
+            && activation.audit_finished
+            && activation.audit_error.is_none()
+            && context.source_id == request.source
+            && context.lifecycle_generation == request.lifecycle
+            && context.revision == request.revision
+            && !request.cancellation.is_cancelled())
+        .then_some(request)
+    }
+
+    pub(super) fn feature_job_row(&self) -> Option<super::job_details::JobRow> {
+        use super::job_details::{JobKind, JobRow, bounded_text};
+        use yield_session::FeatureAnalysisBlocker as Blocker;
+        let request = self.current_feature_request()?;
+        let completed = matches!(request.state, Some(FeatureAnalysisState::Ready { .. }));
+        let blocked = match &request.state {
+            Some(FeatureAnalysisState::Blocked { reason }) => Some(reason.message().to_owned()),
+            _ => None,
+        };
+        let can_retry = matches!(
+            request.state,
+            Some(FeatureAnalysisState::Blocked {
+                reason: Blocker::AdmissionBudget
+                    | Blocker::InputChanged
+                    | Blocker::Computation
+                    | Blocker::NotClaimable
+                    | Blocker::Cancelled
+                    | Blocker::Publication,
+            })
+        );
+        let activity = request
+            .state
+            .as_ref()
+            .map(FeatureAnalysisState::message)
+            .unwrap_or_else(|| "Feature request submitted".into());
+        let file = bounded_text(&request.path.to_string_lossy(), 48);
+        Some(JobRow {
+            kind: JobKind::FeatureAnalysis,
+            source: self.root.clone(),
+            generation: request.id,
+            work: format!("{activity} · {file}"),
+            completed,
+            blocked,
+            action: None,
+            can_retry,
+            can_cancel: false,
+        })
+    }
+
+    pub(super) fn retry_current_job(&mut self, cx: &mut Context<Self>) {
+        if self.feature_job_row().is_some_and(|row| row.can_retry) {
+            let request = self.current_feature_request().expect("same current fence");
+            let (source, lifecycle, revision, path) = (
+                request.source.clone(),
+                request.lifecycle,
+                request.revision,
+                request.path.clone(),
+            );
+            self.request_feature_analysis(source, lifecycle, revision, path, cx);
+        } else {
+            self.retry_job_audit(cx);
+        }
+    }
+
     pub(super) fn request_feature_analysis(
         &mut self,
         source: SourceId,
@@ -74,7 +152,6 @@ impl Browser {
             return;
         };
         self.feature_analysis.next_request = id;
-        self.feature_analysis.pending = None;
         let cancellation = FeatureAnalysisCancellation::new();
         let command = CatalogCommand::RequestFeatureAnalysis {
             source_id: source.clone(),
@@ -95,10 +172,15 @@ impl Browser {
                     cancellation,
                     state: None,
                 });
+                self.job_action_error = None;
                 self.set_playback_status("Feature request submitted");
                 self.start_source_registry_poll(cx);
             }
-            Err(error) => self.set_playback_status(format!("Feature request unavailable: {error}")),
+            Err(error) => {
+                let message = format!("Feature request unavailable: {error}");
+                self.job_action_error = Some(message.clone());
+                self.set_playback_status(message);
+            }
         }
         cx.notify();
     }
@@ -119,6 +201,9 @@ pub(super) fn apply_catalog_event(
     else {
         return false;
     };
+    if browser.current_feature_request().is_none() {
+        return true;
+    }
     let Some(request) = browser.feature_analysis.pending.as_mut() else {
         return true;
     };
@@ -151,81 +236,4 @@ pub(super) fn apply_catalog_event(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn feature_projection_rejects_late_source_revision_path_request_and_cancelled_results() {
-        let source = SourceId::from_string("source");
-        let request = Request {
-            source: source.clone(),
-            lifecycle: 2,
-            revision: 3,
-            id: 4,
-            path: PathBuf::from("tone.wav"),
-            cancellation: FeatureAnalysisCancellation::new(),
-            state: None,
-        };
-        assert!(request.matches(&source, 2, 3, 4, &request.path));
-        assert!(!request.matches(&SourceId::from_string("other"), 2, 3, 4, &request.path));
-        assert!(!request.matches(&source, 5, 3, 4, &request.path));
-        assert!(!request.matches(&source, 2, 5, 4, &request.path));
-        assert!(!request.matches(&source, 2, 3, 5, &request.path));
-        assert!(!request.matches(&source, 2, 3, 4, &PathBuf::from("other.wav")));
-        request.cancellation.cancel();
-        assert!(!request.matches(&source, 2, 3, 4, &request.path));
-    }
-    #[test]
-    fn feature_projection_rejects_regression_and_resets_only_for_a_new_fenced_request() {
-        let source = SourceId::from_string("source");
-        let mut request = Request {
-            source: source.clone(),
-            lifecycle: 2,
-            revision: 3,
-            id: 4,
-            path: PathBuf::from("tone.wav"),
-            cancellation: FeatureAnalysisCancellation::new(),
-            state: None,
-        };
-        let path = request.path.clone();
-        // Queued/running are real incoming phases; no terminal key fixture is needed here.
-        assert!(request.apply_state(&source, 2, 3, 4, &path, &FeatureAnalysisState::Queued));
-        assert!(request.apply_state(&source, 2, 3, 4, &path, &FeatureAnalysisState::Running));
-        assert!(!request.apply_state(&source, 2, 3, 4, &path, &FeatureAnalysisState::Queued));
-        let terminal = FeatureAnalysisState::Blocked {
-            reason: yield_session::FeatureAnalysisBlocker::NotClaimable,
-        };
-        assert!(!request.apply_state(&source, 2, 4, 4, &path, &terminal));
-        assert_eq!(request.state, Some(FeatureAnalysisState::Running));
-        assert!(request.apply_state(&source, 2, 3, 4, &path, &terminal));
-        assert!(!request.apply_state(&source, 2, 3, 4, &path, &FeatureAnalysisState::Queued));
-        // Source revision change creates a fresh request, without accepting old terminal events.
-        let mut next = Request {
-            source: source.clone(),
-            lifecycle: 2,
-            revision: 4,
-            id: 5,
-            path: path.clone(),
-            cancellation: FeatureAnalysisCancellation::new(),
-            state: None,
-        };
-        assert!(!next.apply_state(&source, 2, 3, 4, &path, &terminal));
-        assert!(next.apply_state(&source, 2, 4, 5, &path, &FeatureAnalysisState::Queued));
-        next.cancellation.cancel();
-        assert!(!next.apply_state(&source, 2, 4, 5, &path, &FeatureAnalysisState::Running));
-    }
-    #[test]
-    fn replacing_or_dropping_projection_cancels_its_compute_request() {
-        let cancellation = FeatureAnalysisCancellation::new();
-        let request = Request {
-            source: SourceId::from_string("source"),
-            lifecycle: 1,
-            revision: 1,
-            id: 1,
-            path: "tone.wav".into(),
-            cancellation: cancellation.clone(),
-            state: None,
-        };
-        drop(request);
-        assert!(cancellation.is_cancelled());
-    }
-}
+include!("analysis_tests.rs");
