@@ -545,3 +545,6 @@ fn feature_artifact_unsupported_algorithm_cannot_claim() {
     ));
     assert_eq!(count(&writer), 0);
 }
+
+#[path = "feature_metrics_tests.rs"]
+mod metrics;

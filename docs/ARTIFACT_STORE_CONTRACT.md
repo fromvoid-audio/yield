@@ -139,3 +139,25 @@ they do not contain the new feature payload. Similarity tests exercise current
 compatibility publication, not a new store. Exact counts and tested/merged SHAs
 belong on the PR/Linear completion record. No model fixture is needed to restate
 this decision; new backend tests must target actual commands and persisted bytes.
+
+## Source-local publication diagnostics (OPT-2087)
+
+The retained `SourceWriter::publish_feature_artifact` command records a fixed-size
+`SourceFeaturePublicationMetrics` snapshot. Attempts partition into Recorded,
+Duplicate, stale target/claim/owner/revision, typed cancellation, and other failed
+outcomes. Duration uses a monotonic clock around validation and publication;
+microsecond totals/maxima exclude queue wait and DSP work. Counters saturate.
+`recorded_payload_bytes` counts bytes acknowledged by Recorded, including
+re-association of existing immutable bytes. It is neither allocated nor reclaimed
+storage. Duplicate, stale, cancellation and rolled-back attempts add no bytes.
+
+The read-only snapshot has no source/path labels, event history, observer channel
+or database reads/writes. It resets with each writer acquisition and can be
+serialized for diagnostics; serialized data cannot acquire ownership. This is
+production instrumentation of the existing SQL feature command, not benchmark,
+durability or physical qualification evidence. OPT-1659 remains open for prune,
+reclaimed-byte, retirement-cleanup and other cache-family instrumentation.
+
+Focused verification uses actual profile-bound SQLite owners:
+`cargo test --locked -p yield-library --lib feature_metrics` and existing
+`feature_artifact` tests, including rollback, stale claims and restart.
