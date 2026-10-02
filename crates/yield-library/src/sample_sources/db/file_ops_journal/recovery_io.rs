@@ -792,6 +792,35 @@ impl BoundDatabaseRoot {
         }
     }
 
+    /// Open a connection-owned forwarding VFS without changing journal/store open semantics.
+    pub(crate) fn open_owned_sqlite(
+        &self,
+        name: &Path,
+        flags: rusqlite::OpenFlags,
+    ) -> rusqlite::Result<crate::sqlite_budget::OwnedConnection> {
+        let components = relative_components(name)
+            .map_err(|_| rusqlite::Error::InvalidPath(name.to_path_buf()))?;
+        if components.len() != 1 {
+            return Err(rusqlite::Error::InvalidPath(name.to_path_buf()));
+        }
+        let descriptor = self
+            .try_clone_descriptor()
+            .map_err(|_| rusqlite::Error::InvalidPath(name.to_path_buf()))?;
+        #[cfg(target_os = "linux")]
+        let path = {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd())).join(name)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let path = self.path.join(name);
+        let connection = crate::sqlite_budget::open_owned(
+            path,
+            flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            Some(descriptor),
+        )?;
+        Ok(connection)
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
