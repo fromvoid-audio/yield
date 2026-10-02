@@ -157,6 +157,10 @@ no-op groups, boundaries, payload credits and unrelated fields. A narrowly
 scoped test-only worker fault boundary may deterministically fail before a batch;
 successful prefix receipts must still come from actual transactions. Simulated
 failure is not crash/power-loss or physical capacity qualification.
+The UI's catalog dependency does not expose catalog-local `cfg(test)` helpers.
+[OPT-2190](https://linear.app/boostnlvp/issue/OPT-2190) supplies the missing bounded,
+explicitly gated test-support worker seam, absent from default production builds.
+It precedes the consumer fault matrix and cannot itself complete the consumer.
 
 The GPUI fixture must click actual controls, consume actual owner outcomes, show
 partial/unresolved state and verify selection, focus and viewport restoration
