@@ -9,6 +9,12 @@ use super::tag_vocabulary::ProfileTagVocabularyInputError;
 /// Errors returned when operating on the library database.
 #[derive(Debug, Error)]
 pub enum LibraryError {
+    /// Captured ordinary mutation belongs to a different acquisition; no transaction ran.
+    #[error("stale global mutation acquisition")]
+    GlobalMutationStaleAcquisition,
+    /// Completion differs from the originally captured proposal.
+    #[error("global mutation completion context mismatch")]
+    GlobalMutationCompletionMismatch,
     /// Operation-link request violates a bounded endpoint/identity contract.
     #[error("invalid operation-link input")]
     OperationLinkInput,

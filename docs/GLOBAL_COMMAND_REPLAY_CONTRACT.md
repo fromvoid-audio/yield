@@ -157,3 +157,32 @@ Under OPT-1836, implement these finite leaves before marking that parent complet
 Coordinate these shared owner/session edits; rebase and rerun affected owner/session/app checks.
 OPT-1836/1569 and operation-family consumers remain open until their implementation acceptance
 passes. This decision and its portable owner fixtures require no native physical qualification.
+
+## Implemented common boundary (OPT-2045)
+
+`mutation_context.rs` now supplies the renderer-neutral `ProfileAcquisitionId`, immutable
+`GlobalMutationRequest` constructors for the four ordinary routes, and correlated
+`GlobalMutationCompletion`. Capture `writer.acquisition_id()` / vocabulary client's
+`acquisition_id()` when forming a proposal, retain `request.context().clone()`, submit that
+unchanged request via `submit_captured_mutation`, and consume `into_result_for(&context)`.
+Context includes acquisition, typed route, caller-local correlation and a domain-separated
+BLAKE3 identity of the exact bounded payload (including vocabulary expected revision).
+A wrong context yields `GlobalMutationCompletionMismatch` without exposing an acknowledgement
+or deleted-row Undo result. Correlation remains local; neither it nor the digest is authority.
+
+The new owner command compares captured acquisition with the retained guard identity before
+calling an existing metadata transaction. Stale context yields `GlobalMutationStaleAcquisition`
+with the original context. Existing pre/post-command root/lock/SQLite binding checks remain
+mandatory: post-commit guard failure replaces success with the existing unconfirmable error;
+queued rejected requests also echo their original context. A disconnected reply supplies no
+completion. The vocabulary client admits only vocabulary routes; it retains its old acquisition
+and closing queue even if a fresh client is later installed.
+
+The bounded queue, source/preference/label limits and current CAS transactions are unchanged.
+The new API is implemented, while legacy unframed methods and existing session producers still
+remain until OPT-2046/2047 adoption. Snapshot ordering/replay slots are OPT-2046 work; this common
+frame alone neither rejects lower snapshot revisions nor promises acquisition-local exact replay.
+No receipt table, source admission, file-operation authority or native physical qualification
+is added. Actual-owner fixtures cover all routes through a fresh owner with old context, current
+commit/CAS, mismatch checks, bounded admission, and pre-effect queued rejection / post-commit
+unconfirmable replies under a replaced profile root.
