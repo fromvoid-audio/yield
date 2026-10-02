@@ -73,10 +73,11 @@ pub use operation_link_participant::{
 };
 pub use ordinary_retry::{GlobalAcquisitionMetricsSnapshot, global_acquisition_metrics_snapshot};
 pub use owner::{
-    GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY, GlobalAdmissionMetricsSnapshot, GlobalLibraryWriter,
-    GlobalLibraryWriterDrainOutcome, GlobalLibraryWriterDrainReport, GlobalLibraryWriterQueueError,
-    GlobalLibraryWriterStartError, GlobalLibraryWriterStatus, GlobalLibraryWriterUnavailable,
-    ProfileTagVocabularyClient, SourceRegistrySnapshot,
+    GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY, GlobalAdmissionMetricsSnapshot,
+    GlobalDispatchMetricsSnapshot, GlobalLibraryWriter, GlobalLibraryWriterDrainOutcome,
+    GlobalLibraryWriterDrainReport, GlobalLibraryWriterQueueError, GlobalLibraryWriterStartError,
+    GlobalLibraryWriterStatus, GlobalLibraryWriterUnavailable, ProfileTagVocabularyClient,
+    SourceRegistrySnapshot,
 };
 pub use read_only::load_source_registry_snapshot_read_only;
 pub use reference_participant::{

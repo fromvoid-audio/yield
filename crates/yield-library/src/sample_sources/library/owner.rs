@@ -41,6 +41,10 @@ use super::tag_vocabulary::{
 use crate::app_dirs::{ProfileChildLease, ProfileOwnershipError, WritableProfileGuard};
 use crate::sample_sources::{SampleSource, UI_PREFERENCES_MAX_BYTES};
 
+mod dispatch_metrics;
+pub use dispatch_metrics::GlobalDispatchMetricsSnapshot;
+use dispatch_metrics::QueuedCommand;
+
 mod admission_metrics;
 pub use admission_metrics::GlobalAdmissionMetricsSnapshot;
 
@@ -643,7 +647,7 @@ struct OwnerHooks {
 /// remains on one owner thread for the handle's lifetime and is never exposed to callers.
 pub struct GlobalLibraryWriter {
     acquisition: ProfileAcquisitionId,
-    commands: Arc<Mutex<Option<SyncSender<WriterCommand>>>>,
+    commands: Arc<Mutex<Option<SyncSender<QueuedCommand>>>>,
     admission_gate: Arc<Mutex<()>>,
     admission_metrics: Arc<admission_metrics::AdmissionMetrics>,
     lifecycle: Arc<std::sync::atomic::AtomicU8>,
@@ -651,7 +655,7 @@ pub struct GlobalLibraryWriter {
     worker: Option<JoinHandle<()>>,
     drain_report: Option<GlobalLibraryWriterDrainReport>,
     #[cfg(test)]
-    blocked_receiver: Option<Receiver<WriterCommand>>,
+    blocked_receiver: Option<Receiver<QueuedCommand>>,
 }
 
 /// Cloneable access to the profile-owned tag vocabulary commands.
@@ -661,7 +665,7 @@ pub struct GlobalLibraryWriter {
 #[derive(Clone)]
 pub struct ProfileTagVocabularyClient {
     acquisition: ProfileAcquisitionId,
-    commands: Arc<Mutex<Option<SyncSender<WriterCommand>>>>,
+    commands: Arc<Mutex<Option<SyncSender<QueuedCommand>>>>,
     admission_gate: Arc<Mutex<()>>,
     admission_metrics: Arc<admission_metrics::AdmissionMetrics>,
     lifecycle: Arc<std::sync::atomic::AtomicU8>,
@@ -838,6 +842,12 @@ impl GlobalLibraryWriter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Observe this acquisition's actual worker dequeue counts and fixed wait buckets.
+    /// Never queue depth, SQL execution, durable completion or capacity authority.
+    pub fn dispatch_metrics(&self) -> GlobalDispatchMetricsSnapshot {
+        self.admission_metrics.dispatch.snapshot()
     }
 
     /// Return a cloneable client for the profile-owned tag vocabulary commands.
@@ -1324,11 +1334,11 @@ fn ensure_available_state(
 }
 
 fn send_command(
-    commands: &Arc<Mutex<Option<SyncSender<WriterCommand>>>>,
+    commands: &Arc<Mutex<Option<SyncSender<QueuedCommand>>>>,
     admission_gate: &Arc<Mutex<()>>,
     lifecycle: &Arc<std::sync::atomic::AtomicU8>,
     unavailable: &Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
-    metrics: &admission_metrics::AdmissionMetrics,
+    metrics: &Arc<admission_metrics::AdmissionMetrics>,
     command: WriterCommand,
 ) -> Result<(), GlobalLibraryWriterQueueError> {
     let started = std::time::Instant::now();
@@ -1344,7 +1354,8 @@ fn send_command(
             .as_ref()
             .cloned()
             .ok_or(GlobalLibraryWriterQueueError::Closed)?;
-        sender.try_send(command).map_err(|error| match error {
+        let queued = QueuedCommand::new(command, Arc::clone(&metrics.dispatch));
+        sender.try_send(queued).map_err(|error| match error {
             TrySendError::Full(_) => GlobalLibraryWriterQueueError::Full,
             TrySendError::Disconnected(_) => GlobalLibraryWriterQueueError::Closed,
         })
@@ -1387,7 +1398,7 @@ impl WriterLifecycle {
 fn run_owner(
     profile_guard: WritableProfileGuard,
     _global_writer_lease: ProfileChildLease,
-    command_rx: Receiver<WriterCommand>,
+    command_rx: Receiver<QueuedCommand>,
     lifecycle: Arc<std::sync::atomic::AtomicU8>,
     unavailable: Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
     hooks: OwnerHooks,
@@ -1465,8 +1476,8 @@ fn run_owner(
             );
             break;
         }
-        let command = match command_rx.recv_timeout(OWNER_POLL_INTERVAL) {
-            Ok(command) => command,
+        let (command, dispatch) = match command_rx.recv_timeout(OWNER_POLL_INTERVAL) {
+            Ok(queued) => queued.received(),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
@@ -1481,6 +1492,8 @@ fn run_owner(
             );
             break;
         }
+
+        dispatch.record();
 
         // Invalidate weak read results before a write attempt, including a failed/replayed
         // attempt. Only this actual retained worker owns a strong publication generation.
@@ -1647,7 +1660,7 @@ fn execute_command(
 }
 
 fn close_after_profile_change(
-    command_rx: &Receiver<WriterCommand>,
+    command_rx: &Receiver<QueuedCommand>,
     lifecycle: &Arc<std::sync::atomic::AtomicU8>,
     unavailable: &Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
     admission_gate: &Arc<Mutex<()>>,
@@ -1672,11 +1685,11 @@ fn reject_after_profile_change(command: WriterCommand, error: &ProfileOwnershipE
 }
 
 fn reject_remaining_profile_change(
-    command_rx: &Receiver<WriterCommand>,
+    command_rx: &Receiver<QueuedCommand>,
     error: &ProfileOwnershipError,
 ) {
     while let Ok(command) = command_rx.try_recv() {
-        reject_after_profile_change(command, error);
+        reject_after_profile_change(command.discard(), error);
     }
 }
 
