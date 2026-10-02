@@ -84,6 +84,13 @@ fn legacy_read_only_database_projects_an_empty_index_without_migrating() {
 
     assert_eq!(snapshot.revision, 0);
     assert!(snapshot.entries.is_empty());
+    let page = db
+        .source_index_page(None, 1)
+        .expect("legacy unavailable projection");
+    assert!(!page.schema_available);
+    assert!(page.entries.is_empty());
+    assert!(page.next.is_none());
+    assert_eq!(page.revision, 0);
     assert!(column_names(&db.connection, "source_index_entries").is_empty());
 }
 
