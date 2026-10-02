@@ -5,7 +5,10 @@ The actual `feature_request::request` catalog worker records fixed acquisition-l
 only numeric/boolean scalars, no source/path/request/key/error labels, payloads,
 timestamps, per-request history, extra queue or SQL telemetry.
 
-`entered` counts actual worker invocations, excluding submission rejection.
+`entered` counts actual feature-worker invocations, excluding submission rejection
+and accepted commands discarded by shutdown before this function is invoked. It
+is not an accepted-command completion ledger; command queue observations remain
+in `CatalogCommandMetrics`.
 Closed/retired/missing sources increment `dropped_before_work`. Otherwise exactly
 one terminal Ready or Blocked observation is counted. StaleSource and Cancelled
 are explicit subsets of Blocked; intermediate preparation, queueing and running

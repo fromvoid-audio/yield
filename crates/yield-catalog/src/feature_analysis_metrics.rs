@@ -7,7 +7,8 @@ use std::time::Duration;
 /// entered totals can exceed terminal/drop totals. Saturated values are lower bounds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FeatureAnalysisMetrics {
-    /// Actual worker request entries, excluding requests rejected by submission.
+    /// Actual feature-worker entries; submission rejection and commands discarded before this
+    /// function is invoked (including worker shutdown draining) are excluded.
     pub entered: u64,
     /// Closed/retired/missing source prevented source work before any terminal observation.
     pub dropped_before_work: u64,
