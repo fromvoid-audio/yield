@@ -48,6 +48,14 @@ use dispatch_metrics::QueuedCommand;
 mod admission_metrics;
 pub use admission_metrics::GlobalAdmissionMetricsSnapshot;
 
+mod preparation;
+pub use preparation::{
+    GLOBAL_PREPARATION_MAX_BYTES, GLOBAL_PREPARATION_MAX_DATABASES,
+    GLOBAL_PREPARATION_MAX_DURATION, GlobalPreparationError, GlobalPreparationObservation,
+    GlobalPreparationOwner, GlobalPreparationPending, GlobalPreparationRequest,
+    GlobalPreparationReservation,
+};
+
 mod shutdown;
 pub use shutdown::{GlobalLibraryWriterDrainOutcome, GlobalLibraryWriterDrainReport};
 
@@ -294,6 +302,7 @@ pub enum GlobalLibraryWriterStartError {
 }
 
 enum WriterCommand {
+    Prepare(preparation::Command),
     HarvestFacts {
         request: HarvestFactsRequest,
         result: SyncSender<Result<HarvestFactsBatch, LibraryError>>,
@@ -637,6 +646,7 @@ impl WriterReply {
 type DatabaseHook = Arc<dyn Fn(&rusqlite::Connection) + Send + Sync>;
 
 struct OwnerHooks {
+    preparation_registration: uuid::Uuid,
     initialization_gate: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
     binding_open_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
@@ -651,6 +661,7 @@ struct OwnerHooks {
 /// The handle contains only typed command and lifecycle state. The writable SQLite connection
 /// remains on one owner thread for the handle's lifetime and is never exposed to callers.
 pub struct GlobalLibraryWriter {
+    preparation_owner: GlobalPreparationOwner,
     acquisition: ProfileAcquisitionId,
     commands: Arc<Mutex<Option<SyncSender<QueuedCommand>>>>,
     admission_gate: Arc<Mutex<()>>,
@@ -720,6 +731,9 @@ impl GlobalLibraryWriter {
         post_command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
         #[cfg(test)] database_hook: Option<DatabaseHook>,
     ) -> Result<Self, GlobalLibraryWriterStartError> {
+        let preparation_owner =
+            GlobalPreparationOwner::new(ProfileAcquisitionId::from_guard(profile_guard));
+        let preparation_registration = preparation_owner.registration();
         let global_writer_lease = profile_guard.acquire_named_lease("library.db")?;
         let worker_profile_guard = profile_guard.try_clone()?;
         let (commands, command_rx) = mpsc::sync_channel(GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY);
@@ -748,6 +762,7 @@ impl GlobalLibraryWriter {
                     worker_lifecycle,
                     worker_unavailable,
                     OwnerHooks {
+                        preparation_registration,
                         initialization_gate,
                         #[cfg(test)]
                         binding_open_gate,
@@ -762,6 +777,7 @@ impl GlobalLibraryWriter {
             .map_err(GlobalLibraryWriterStartError::ThreadSpawn)?;
 
         Ok(Self {
+            preparation_owner,
             acquisition: ProfileAcquisitionId::from_guard(profile_guard),
             commands: Arc::clone(&commands),
             admission_gate,
@@ -833,6 +849,7 @@ impl GlobalLibraryWriter {
         let (commands, blocked_receiver) =
             mpsc::sync_channel(GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY);
         Self {
+            preparation_owner: GlobalPreparationOwner::new(ProfileAcquisitionId::test_only()),
             acquisition: ProfileAcquisitionId::test_only(),
             commands: Arc::new(Mutex::new(Some(commands))),
             admission_gate: Arc::new(Mutex::new(())),
@@ -1524,6 +1541,38 @@ fn run_owner(
         }
 
         dispatch.record();
+        let command = match command {
+            WriterCommand::Prepare(command) => {
+                if !preparation::run(
+                    command,
+                    &database,
+                    &profile_guard,
+                    &lifecycle,
+                    hooks.preparation_registration,
+                ) {
+                    let _admission = admission_gate.lock().unwrap_or_else(|p| p.into_inner());
+                    *unavailable.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some(GlobalLibraryWriterUnavailable::DatabaseUnavailable {
+                            reason:
+                                "empty preparation rollback/connection policy requires retirement"
+                                    .into(),
+                        });
+                    lifecycle.store(
+                        WriterLifecycle::Closed as u8,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    while let Ok(command) = command_rx.try_recv() {
+                        send_command_error(
+                            command.discard(),
+                            LibraryError::Sql(rusqlite::Error::InvalidQuery),
+                        );
+                    }
+                    break;
+                }
+                continue;
+            }
+            command => command,
+        };
 
         // Invalidate weak read results before a write attempt, including a failed/replayed
         // attempt. Only this actual retained worker owns a strong publication generation.
@@ -1582,6 +1631,10 @@ fn execute_command(
     harvest_generation: &Arc<harvest_facts::Generation>,
 ) -> WriterReply {
     match command {
+        WriterCommand::Prepare(command) => {
+            command.reject();
+            unreachable!("preparation is handled exclusively before ordinary dispatch");
+        }
         WriterCommand::HarvestFacts { request, result } => WriterReply::HarvestFacts {
             value: database.harvest_facts(owner_identity, &request, harvest_generation),
             request,
@@ -1729,6 +1782,7 @@ fn reject_remaining_profile_change(
 
 fn send_command_error(command: WriterCommand, error: LibraryError) {
     match command {
+        WriterCommand::Prepare(command) => command.reject(),
         WriterCommand::HarvestFacts { result, .. } => {
             let _ = result.send(Err(error));
         }
