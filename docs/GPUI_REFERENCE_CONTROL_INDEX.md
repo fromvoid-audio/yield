@@ -10,25 +10,32 @@ python3 scripts/internal/check/index_gpui_reference_controls.py > /tmp/yield-ref
 
 The index records exact checkout identity, SHA-256 hashes of every input, and
 one-based source witnesses for each business-message reference in archived
-native chrome. It separately lists production GPUI function declarations.
-At baseline `c04e28c37a7ce3396d259764ce21b58f6f3fe117`, the reference index
-contains 175 distinct messages: 37 FolderBrowser, 105 Gui, 15 Metadata, and
-18 Settings. These are **source references**, including forwarding and match
-arms, rather than a count of reachable user controls. Internal widget messages
-and the broad controller `UiAction` enum are outside this finite index.
+native chrome, native keyboard routes and waveform interactions. It separately
+lists production GPUI function declarations. The corrected source review at
+baseline `006e92fd58437fbe0d3e6951d0c47becfa6fa707` contains 242 distinct
+references. The earlier 175-message chrome-only index included standalone test
+files and omitted keyboard/waveform routes; it must not be used as a coverage
+denominator. These are **source references**, including forwarding and match
+arms, rather than a count of reachable user controls. The broad controller
+`UiAction` enum remains outside this finite native-app scope.
 
-Comments, literals, and structural `cfg(test)` modules are excluded using the
-same lexical scanner as the GPUI owner guard. Platform conditions, aliases,
-macro-generated routes, keyboard bindings outside native chrome, and runtime
-visibility still require source review. File hashes make local edits visible;
+Comments, literals, and structural inline `cfg(test)` modules are excluded using
+the same lexical scanner as the GPUI owner guard. The index also excludes
+external `#[cfg(test)] mod name;` files and their module subtrees, recording
+excluded paths explicitly. Platform conditions, custom module path attributes,
+aliases, macro-generated routes and runtime visibility still require review.
+File hashes make local edits visible;
 the checkout SHA alone does not establish the identity of uncommitted inputs.
 
-For each reviewed control, OPT-1867 still requires its actual GPUI handler,
-meaningful automated test, native/manual evidence, backend owner, and concrete
-open blocker. Similar function names do not satisfy that requirement. Keep
-forwarding messages and dormant proposals distinct from active controls, and
-check keyboard/controller routes as well as chrome before declaring coverage
-complete. The index does not close OPT-1867 or release acceptance OPT-1863.
+The source review is recorded per reference in
+[GPUI_REFERENCE_ACTION_REGISTER.md](GPUI_REFERENCE_ACTION_REGISTER.md), with
+GPUI control/model anchors, scoped automated fixtures, explicitly missing
+evidence and open owners/blockers. Its machine-readable register is validated
+against this index; duplicate, missing or retired references and broken
+function/test anchors fail validation. Similar function names alone are not
+semantic proof. Native reachability, aliases/macros and behavior remain open
+in OPT-2009 under the Mac queue OPT-1953. Neither source artifact certifies
+native parity or release acceptance OPT-1863.
 
 The destructive-edit decision remains in
 [GPUI_REFERENCE_EDIT_ACTIONS.md](GPUI_REFERENCE_EDIT_ACTIONS.md) under

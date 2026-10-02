@@ -9,6 +9,12 @@ This fork targets full current Yield feature parity with GPUI replacing
 Radiant. A working GPUI window or browser is an intermediate milestone, not
 completion of the reimplementation.
 
+The current finite native-app source inventory is reviewed in
+[GPUI_REFERENCE_ACTION_REGISTER.md](GPUI_REFERENCE_ACTION_REGISTER.md)
+(OPT-1867). It separates partial source counterparts, missing implementations
+and internal protocols. Native reachability/behavior remain unverified under
+OPT-2009; historical evidence below does not replace fresh native acceptance.
+
 ## Baseline
 
 - Archived reference repository: https://github.com/PORTALSURFER/yield-legacy
