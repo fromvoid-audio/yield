@@ -100,6 +100,20 @@ impl Default for CatalogService {
 }
 
 impl CatalogService {
+    /// Construct a controlled loopback HTTP fixture with a bounded deadline.
+    /// This API is absent unless the explicit `test-support` feature is enabled.
+    #[cfg(feature = "test-support")]
+    pub fn for_loopback_tests(address: std::net::SocketAddr, deadline: Duration) -> Option<Self> {
+        if !address.ip().is_loopback() || deadline.is_zero() || deadline > DEADLINE {
+            return None;
+        }
+        Some(Self {
+            busy: Arc::new(AtomicBool::new(false)),
+            endpoint: format!("http://{address}/releases"),
+            deadline,
+        })
+    }
+
     /// Fetch the latest exact lane/target metadata without blocking the UI executor.
     /// Call this from the UI's background worker. Cancellation returns promptly;
     /// the bounded transport worker retains admission until its I/O ends.

@@ -8,6 +8,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Controlled loopback fixture construction; absent from normal application builds.
+test-support = []
+
 [dependencies]
 raw-window-handle.workspace = true
 ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }

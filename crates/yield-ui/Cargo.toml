@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 rand = "=0.9.5"
+semver = "1.0.27"
 gpui.workspace = true
 raw-window-handle.workspace = true
 reson.workspace = true
@@ -23,6 +24,7 @@ yield-session.workspace = true
 yield-platform.workspace = true
 
 [dev-dependencies]
+yield-platform = { workspace = true, features = ["test-support"] }
 yield-library = { workspace = true, features = ["test-support"] }
 naga = { version = "=25.0.1", features = ["wgsl-in"] }
 gpui = { workspace = true, features = ["test-support"] }

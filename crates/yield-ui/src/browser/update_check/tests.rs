@@ -2,6 +2,82 @@ use super::*;
 use crate::update_check::{UpdateBuild, UpdateChannel, UpdateChecker, UpdatePlatform};
 use gpui::TestAppContext;
 
+#[gpui::test]
+fn production_catalog_runs_in_actual_settings_worker_and_retry_replaces_offline(
+    cx: &mut TestAppContext,
+) {
+    use crate::update_catalog_service::tests::{body, fixture_service, server};
+    use std::net::TcpListener;
+    use std::time::Duration;
+    use yield_platform::update_catalog::CatalogService;
+    cx.set_global(crate::theme::ActiveTheme::default());
+    let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let offline = CatalogService::for_loopback_tests(address, Duration::from_secs(1)).unwrap();
+    cx.update(|_, app| {
+        app.set_global(fixture_service("19.1.0", UpdateChannel::Stable, offline));
+        browser.update(app, |view, cx| {
+            view.theme_settings_open = true;
+            view.check_for_updates(cx);
+            assert_eq!(view.general_settings.updates.state, State::Checking);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, app| {
+        assert_eq!(
+            browser.read(app).general_settings.updates.state,
+            State::Offline
+        )
+    });
+    for (status, bytes, expected) in [
+        (
+            "200 OK",
+            body(
+                "19.1.0",
+                44,
+                &"01".repeat(20),
+                "yield-19.1.0-macos-aarch64.zip",
+            ),
+            State::Current,
+        ),
+        (
+            "200 OK",
+            body(
+                "19.1.0",
+                45,
+                &"02".repeat(20),
+                "yield-19.1.0-macos-aarch64.zip",
+            ),
+            State::Newer(UpdateVersion(19, 1, 0), 45),
+        ),
+        ("500 Error", Vec::new(), State::Failed),
+        ("200 OK", br#"{"releases":[]}"#.to_vec(), State::Unavailable),
+    ] {
+        let (catalog, thread) = server(status, bytes);
+        cx.update(|_, app| {
+            app.set_global(fixture_service("19.1.0", UpdateChannel::Stable, catalog));
+            browser.update(app, |view, cx| {
+                view.check_for_updates(cx);
+                let generation = view.general_settings.updates.generation;
+                view.check_for_updates(cx);
+                assert_eq!(view.general_settings.updates.generation, generation);
+                assert_eq!(view.general_settings.updates.state, State::Checking);
+                assert!(view.general_settings.updates.task.is_some());
+            });
+        });
+        cx.run_until_parked();
+        thread.join().unwrap();
+        cx.update(|_, app| {
+            assert_eq!(browser.read(app).general_settings.updates.state, expected);
+            assert!(browser.read(app).general_settings.updates.task.is_none());
+        });
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("update-check-panel").is_some());
+    }
+}
+
 fn request() -> UpdateCheckRequest {
     UpdateCheckRequest {
         installed: UpdateVersion(0, 19, 1),

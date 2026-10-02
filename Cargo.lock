@@ -8831,6 +8831,7 @@ dependencies = [
  "rand 0.9.5",
  "raw-window-handle",
  "reson",
+ "semver",
  "tempfile",
  "unicode-segmentation",
  "windows 0.62.2",
