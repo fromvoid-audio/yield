@@ -4408,3 +4408,5 @@ mod snapshot_cursor;
 mod tag_admission_observation;
 
 mod collection_history_selection;
+#[path = "curation/metadata_tag_commands.rs"]
+mod metadata_tag_commands;
