@@ -129,14 +129,14 @@ pub use write::{
     FeaturePruneCursor, FeaturePrunePage, FeatureRebuildMetrics, ManifestCommitResult,
     ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
     ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
-    SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite, SourceCommandId, SourceContentHashWrite,
-    SourceCurationCommitReceipt, SourceCurationUpdate, SourceDirectoryTruthCommitResult,
-    SourceFeaturePublicationMetrics, SourceFileWrite, SourceIndexCommitResult, SourceRevision,
-    SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage, SourceSnapshotQueueMetrics,
-    SourceTagAdmissionObservation, SourceTagAssignmentMutation, SourceTagAssignmentSelection,
-    SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceTagWrite, SourceWriteCommand,
-    SourceWriter, SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt,
-    SourceWriterRequest,
+    SOURCE_CURATION_BATCH_LIMIT, SourceCollectionHistoryChange, SourceCollectionHistorySelection,
+    SourceCollectionWrite, SourceCommandId, SourceContentHashWrite, SourceCurationCommitReceipt,
+    SourceCurationUpdate, SourceDirectoryTruthCommitResult, SourceFeaturePublicationMetrics,
+    SourceFileWrite, SourceIndexCommitResult, SourceRevision, SourceScanFence, SourceSnapshotOwner,
+    SourceSnapshotPage, SourceSnapshotQueueMetrics, SourceTagAdmissionObservation,
+    SourceTagAssignmentMutation, SourceTagAssignmentSelection, SourceTagMetadataBudget,
+    SourceTagMetadataPolicy, SourceTagWrite, SourceWriteCommand, SourceWriter,
+    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 
 /// Hidden filename used for per-source databases.

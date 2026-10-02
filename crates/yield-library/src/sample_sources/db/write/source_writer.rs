@@ -6,6 +6,10 @@
 //! owner; their persisted DTOs never construct or reacquire an authority.
 
 use super::super::{SourceReferenceFence, SourceReferenceFenceError};
+mod collection_history_selection;
+pub use collection_history_selection::{
+    SourceCollectionHistoryChange, SourceCollectionHistorySelection,
+};
 mod snapshot_metrics;
 pub use snapshot_metrics::SourceSnapshotQueueMetrics;
 use snapshot_metrics::{SnapshotCounters, SnapshotSender};
