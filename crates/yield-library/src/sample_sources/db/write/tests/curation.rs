@@ -267,9 +267,35 @@ fn replay_manifest_and_checkpoint_commit_once_before_raw_ticket_retirement() {
         stored_checkpoint["continuity_proof"]["acknowledged_end_event_id"],
         12
     );
+    assert_eq!(owner.supervisor().watcher_metrics().admitted_continuity, 1);
+    assert_eq!(owner.supervisor().watcher_metrics().duplicates, 1);
+    assert_eq!(
+        owner
+            .supervisor()
+            .watcher_metrics()
+            .acknowledged_checkpoints,
+        0
+    );
+    assert_eq!(owner.supervisor().watcher_metrics().rejected_checkpoints, 2);
     owner
         .mark_replay_checkpointed(ticket, &committed)
         .expect("retire after committed proof");
+    assert_eq!(
+        owner
+            .supervisor()
+            .watcher_metrics()
+            .acknowledged_checkpoints,
+        1
+    );
+    assert_eq!(
+        owner
+            .supervisor()
+            .watcher_metrics()
+            .acknowledgement_lag_buckets
+            .iter()
+            .sum::<u64>(),
+        1
+    );
     assert_eq!(owner.supervisor().in_flight(), 0);
     assert!(owner.mark_replay_checkpointed(ticket, &committed).is_err());
     assert_eq!(owner.supervisor().in_flight(), 0);
