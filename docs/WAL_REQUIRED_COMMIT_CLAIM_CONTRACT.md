@@ -5,7 +5,13 @@ This decision completes the missing claim-binding design under OPT-2137. It exte
 not implement that handshake, issue a permit, qualify allocation, or finish
 OPT-2137/1685/1688/1348. The production leaves below remain necessary.
 
-## What the current code proves
+## Design baseline and implemented persistence
+
+The following inspection describes the OPT-2147 design baseline. OPT-2166 adds
+the actual schema-11 bounded codec/atomic store boundary described in
+[DATABASE_CLAIM_PERSISTENCE_VERIFICATION.md](DATABASE_CLAIM_PERSISTENCE_VERIFICATION.md).
+Its rows are observations; genuine preparation, attempts and participant
+consumption remain separate production work.
 
 `full_capacity.rs` and `full_capacity_planner.rs` aggregate allocations by volume
 and class. `admission_claims.rs` validates exact aggregate coverage, including
@@ -14,7 +20,7 @@ persists operation, claim, volume, class and bytes. Two sources on the same volu
 can therefore share an aggregate without any row identifying which database may
 spend it. Neither `SourceWalShm` nor a caller's source ID resolves this ambiguity.
 
-The journal currently has SQLite schema version 10 and operation codecs through
+The design baseline had SQLite schema version 10 and operation codecs through
 V17; those are separate version namespaces. `store.rs` atomically settles initial
 intent/claims and retains pinned capacity on uncertainty. Its post-intent chunk
 ledger already demonstrates private issuance, exact readback and durable release.
