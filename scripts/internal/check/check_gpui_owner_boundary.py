@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import tempfile
+import tomllib
 from pathlib import Path
 
 
@@ -24,7 +26,22 @@ MUTATIONS = {
 MUTATION_PATH = re.compile(
     r"\b(?:std\s*::\s*)?(?:os\s*::\s*\w+\s*::\s*)?fs\s*::\s*(\w+)\s*\("
 )
-OWNER_NAMES = ("GlobalLibraryWriter", "OperationJournalOwner", "OperationJournalStore")
+OWNER_NAMES = (
+    "GlobalLibraryWriter", "LibraryDatabase", "SourceDatabase", "SourceWriter",
+    "FileOperationOwner", "OperationJournalOwner", "OperationJournalStore",
+    "OperationJournalClient",
+)
+# UI consumes typed session observations/commands, not background worker crates.
+UI_WORKER_CRATES = {"rusqlite", "yield_catalog", "yield_scan", "yield_analysis", "yield_source_watcher"}
+UPPER_LAYERS = {
+    "yield-library": {"yield-catalog", "yield-session", "yield-ui"},
+    "yield-scan": {"yield-catalog", "yield-session", "yield-ui"},
+    "yield-analysis": {"yield-catalog", "yield-session", "yield-ui"},
+    "yield-source-watcher": {"yield-catalog", "yield-session", "yield-ui"},
+    "yield-catalog": {"yield-session", "yield-ui"},
+    "yield-session": {"yield-ui"},
+    "yield-ui": {name.replace("_", "-") for name in UI_WORKER_CRATES},
+}
 
 
 def blank_non_code(text: str) -> str:
@@ -136,6 +153,22 @@ def check_source(relative: str, text: str) -> list[str]:
     for name in OWNER_NAMES:
         for match in re.finditer(rf"\b{name}\b", code):
             errors.append(f"{relative}:{line(match.start())}: direct durable-owner access ({name}) in yield-ui")
+    for name in sorted(UI_WORKER_CRATES):
+        for match in re.finditer(rf"\b{name}\b", code):
+            errors.append(f"{relative}:{line(match.start())}: direct worker import ({name}) in yield-ui")
+    # Explicit data imports are allowed. A wildcard can import/reexport raw factories
+    # without spelling the guarded owner, and must be reviewed as named imports.
+    for match in re.finditer(r"\b(?:pub\s+)?use\s+yield_library\b[^;]*\*[^;]*;", code):
+        errors.append(f"{relative}:{line(match.start())}: wildcard library import in yield-ui")
+    raw_modules = [(match.start(), match.end(), match[1]) for match in re.finditer(r"\bsample_sources\s*::\s*(library|db)\b", code)]
+    for group in re.finditer(r"\bsample_sources\s*::\s*\{([^;}]+)\}", code):
+        raw_modules.extend((group.start(1) + match.start(), group.start(1) + match.end(), match[1]) for match in re.finditer(r"\b(library|db)\b", group[1]))
+    for start, end, module in raw_modules:
+        # Existing display-label projection uses this pure string/path normalizer.
+        # It does not open a connection, capture a root or perform filesystem I/O.
+        if module == "db" and re.match(r"\s*::\s*normalize_relative_path\b", code[end:]):
+            continue
+        errors.append(f"{relative}:{line(start)}: raw database module import in yield-ui")
 
     imported_mutations: set[str] = set()
     # Recognize imported filesystem function aliases and `use std::fs as alias`.
@@ -145,7 +178,9 @@ def check_source(relative: str, text: str) -> list[str]:
     for match in re.finditer(r"\buse\s+std\s*::\s*fs\s*::\s*\{([^}]+)\}", code):
         for item in match.group(1).split(","):
             parts = re.match(r"\s*(\w+)(?:\s+as\s+(\w+))?\s*$", item)
-            if parts and parts.group(1) in MUTATIONS:
+            if parts and parts.group(1) == "self":
+                fs_aliases.add(parts.group(2) or "fs")
+            elif parts and parts.group(1) in MUTATIONS:
                 imported_mutations.add(parts.group(2) or parts.group(1))
     for match in re.finditer(r"\buse\s+std\s*::\s*fs\s*::\s*(\w+)(?:\s+as\s+(\w+))?\s*;", code):
         if match.group(1) in MUTATIONS:
@@ -182,12 +217,41 @@ def check_source(relative: str, text: str) -> list[str]:
             else:
                 options_aliases.add(found.group(1))
     for alias in sorted(file_aliases):
-        for match in re.finditer(rf"\b{re.escape(alias)}\s*::\s*create\s*\(", code):
+        for match in re.finditer(rf"\b{re.escape(alias)}\s*::\s*create(?:_new)?\s*\(", code):
             errors.append(f"{relative}:{line(match.start())}: File::create mutation in yield-ui")
     for alias in sorted(options_aliases):
-        for match in re.finditer(rf"\b{re.escape(alias)}\s*::\s*new\s*\(\)([^;]{{0,320}})", code):
-            if re.search(r"\.\s*(?:write|append|create|create_new|truncate)\s*\(\s*true\s*\)", match.group(1)):
+        builders = set()
+        for match in re.finditer(rf"\b{re.escape(alias)}\s*::\s*(?:new|default)\s*\(\)([^;]*)", code):
+            prefix = code[max(0, code.rfind(";", 0, match.start()) + 1):match.start()]
+            binding = re.search(r"\blet\s+(?:mut\s+)?(\w+)(?:\s*:[^=]+)?\s*=\s*$", prefix)
+            if binding:
+                builders.add(binding[1])
+            if re.search(r"\.\s*(?:write|append|create|create_new|truncate)\s*\(", match.group(1)):
                 errors.append(f"{relative}:{line(match.start())}: writable OpenOptions in yield-ui")
+        for builder in builders:
+            for match in re.finditer(rf"\b{re.escape(builder)}\s*(\.[^;]+)", code):
+                if re.search(r"\.\s*(?:write|append|create|create_new|truncate)\s*\(", match.group(1)):
+                    errors.append(f"{relative}:{line(match.start())}: configured writable OpenOptions in yield-ui")
+    return errors
+
+
+def check_manifest(relative: str, text: str, workspace_dependencies: dict) -> list[str]:
+    """Check ordinary and target-specific runtime edges, including renamed packages."""
+    manifest = tomllib.loads(text)
+    package = manifest.get("package", {}).get("name")
+    forbidden = UPPER_LAYERS.get(package, set())
+    errors = []
+    groups = [manifest.get("dependencies", {})]
+    groups.extend(target.get("dependencies", {}) for target in manifest.get("target", {}).values())
+    # dev-dependencies are fixture-only; Cargo keeps them outside production builds.
+    for group in groups:
+        for alias, spec in group.items():
+            resolved = spec
+            if isinstance(spec, dict) and spec.get("workspace"):
+                resolved = workspace_dependencies.get(alias, spec)
+            dependency = resolved.get("package", alias) if isinstance(resolved, dict) else alias
+            if dependency in forbidden:
+                errors.append(f"{relative}: forbidden runtime edge {package} -> {dependency} (alias {alias})")
     return errors
 
 
@@ -196,6 +260,10 @@ def scan(root: Path) -> list[str]:
     if not source_root.is_dir():
         return [f"{source_root}: missing yield-ui source tree"]
     errors = []
+    workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]
+    for member in workspace["members"]:
+        manifest = root / member / "Cargo.toml"
+        errors.extend(check_manifest(manifest.relative_to(root).as_posix(), manifest.read_text(encoding="utf-8"), workspace.get("dependencies", {})))
     for path in sorted(source_root.rglob("*.rs")):
         rel = path.relative_to(root).as_posix()
         errors.extend(check_source(rel, path.read_text(encoding="utf-8")))
@@ -222,21 +290,72 @@ fn after_fixture() { let _ = std::fs::metadata(\"x\"); }
         "use rusqlite::Connection;",
         "Connection::open(\"x\");",
         "use yield_library::GlobalLibraryWriter;",
+        "use yield_library::{SourceDatabase as Raw}; Raw::open_for_scan(x);",
+        "use yield_library::file_operation_owner::FileOperationOwner as Effects;",
+        "pub use yield_library::*;",
+        "use yield_library::sample_sources::{library as raw}; raw::load();",
+        "yield_library::sample_sources::library::load();",
+        "use yield_scan as scanner; scanner::scan_in_background(x);",
+        "use yield_analysis::{analysis as work};",
+        "use yield_source_watcher::*;",
+        "OperationJournalClient::new();",
         "OperationJournalStore::open();",
         "std::fs::remove_file(\"x\");",
         "use std::fs as disk; disk::rename(a, b);",
+        "use std::fs::{self as disk}; disk::rename(a, b);",
         "use std::fs::{write as persist}; persist(a, b);",
         "use std::fs::write; write(a, b);",
         "use std::fs::{write, rename}; write(a, b); rename(a, b);",
         "std::fs::File::create(\"x\");",
+        "std::fs::File::create_new(\"x\");",
         "std::fs::OpenOptions::new().write(true).create(true);",
         "std::fs::OpenOptions::new()\n    .write(true)\n    .create_new(true)\n    .open(\"x\");",
+        "use std::fs::OpenOptions as Builder; let mut b = Builder::default(); b.write(flag);",
+        "let mut b = OpenOptions::new(); b.read(true).write(flag).open(path);",
         "#[cfg(test)]\nmod tests { fn fixture() {} }\nfn production() { std::fs::remove_file(\"x\"); }",
     )
     for fixture in bad_cases:
         assert check_source("bad.rs", fixture), fixture
     assert not check_source("fixture.rs", "#[cfg(test)]\nmod tests { fn f() { fs::remove_file(\"x\"); } }\nfn later() {}")
     assert check_source("malformed.rs", "#[cfg(test)]\nmod tests { fn f() {} ")
+    assert not check_source("data.rs", "use yield_library::sample_sources::{SourceId, Rating};")
+    assert not check_source("normalize.rs", "use yield_library::sample_sources::{SourceId, db::normalize_relative_path};")
+    assert check_source("raw.rs", "use yield_library::sample_sources::{db as raw};")
+    assert check_source("raw.rs", "use yield_library::sample_sources::{library as raw, db::normalize_relative_path};")
+    assert check_source("raw.rs", "use yield_library::sample_sources::db::{normalize_relative_path, SourceDatabase};")
+    assert not check_source("reader.rs", "let mut opts = OpenOptions::new(); opts.read(true);")
+    assert not check_source("fixture.rs", "#[cfg(test)]\nmod tests { use yield_catalog::*; SourceDatabase::open_for_test_fixture_source_write(x); }")
+    # A fixture filename or explanatory comment is never an exemption.
+    assert check_source("tests.rs", "// cfg(test) fixture\nSourceWriter::new_for_scan(db);")
+
+    ui = '[package]\nname = "yield-ui"\n'
+    assert not check_manifest("ui.toml", ui + '[dev-dependencies]\nyield-catalog = "1"\n', {})
+    assert not check_manifest("ui.toml", ui + '[dependencies]\nyield-session = "1"\nyield-library = "1"\n', {})
+    assert check_manifest("ui.toml", ui + '[dependencies]\nworker = { package = "yield-scan", version = "1" }\n', {})
+    assert check_manifest("ui.toml", ui + '[target.\'cfg(windows)\'.dependencies]\nworker = { package = "yield-analysis", version = "1" }\n', {})
+    assert check_manifest("ui.toml", ui + '[dependencies]\nhidden = { workspace = true }\n', {"hidden": {"package": "yield-source-watcher"}})
+    assert check_manifest("lib.toml", '[package]\nname = "yield-library"\n[dependencies]\nhidden = { package = "yield-session", version = "1", optional = true }\n', {})
+
+    # Exercise the real repository scan so source masking and Cargo edge checks
+    # cannot accidentally exist only in check_source/check_manifest unit fixtures.
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source = root / "crates/yield-ui/src"
+        source.mkdir(parents=True)
+        (root / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/yield-ui"]\n')
+        manifest = source.parent / "Cargo.toml"
+        manifest.write_text(ui + '[dependencies]\nyield-session = "1"\n')
+        fixture = source / "tests.rs"
+        fixture.write_text("#[cfg(test)]\nmod tests { SourceDatabase::open_for_test_fixture_source_write(x); }")
+        assert not scan(root)
+        fixture.write_text("// fixture\nFileOperationOwner::start(x);")
+        assert scan(root)
+        fixture.write_text("fn production() {}")
+        manifest.write_text(ui + '[dependencies]\nhidden = { package = "yield-catalog", version = "1" }\n')
+        assert scan(root)
+        fixture.unlink()
+        source.rmdir()
+        assert scan(root)
 
 
 def main() -> int:
