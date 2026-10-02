@@ -1,76 +1,31 @@
 #!/usr/bin/env python3
-"""Verify a PortalSurfer release-upload catalog round trip."""
-
+"""Verify an exact packaged-identity PortalSurfer catalog round trip."""
 from __future__ import annotations
 
 import argparse
-import datetime as dt
-import json
 from pathlib import Path
-from typing import Any
+
+from publisher_identity import read_json, verify_response
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Verify that a PortalSurfer catalog lists an uploaded release.",
-    )
-    parser.add_argument("--catalog-file", required=True, type=Path)
-    parser.add_argument("--build-id", required=True)
-    parser.add_argument("--build-number", required=True, type=int)
-    parser.add_argument("--release-version", required=True)
-    parser.add_argument("--released-at", required=True)
-    parser.add_argument("--expected-file", action="append", default=[])
-    return parser.parse_args()
-
-
-def parse_released_at(value: Any, label: str) -> dt.datetime:
-    if not isinstance(value, str) or not value:
-        raise SystemExit(f"{label} is missing or not a string")
-    normalized = value
-    if normalized.endswith("Z"):
-        normalized = f"{normalized[:-1]}+00:00"
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--catalog-file", type=Path, required=True)
+    parser.add_argument("--identity-file", type=Path, required=True)
+    args = parser.parse_args()
+    args.phase = "catalog"
+    args.response_file = args.catalog_file
     try:
-        parsed = dt.datetime.fromisoformat(normalized)
-    except ValueError as exc:
-        raise SystemExit(f"{label} is not a valid ISO-8601 timestamp: {value}") from exc
-    if parsed.tzinfo is None:
-        raise SystemExit(f"{label} must include a timezone: {value}")
-    return parsed.astimezone(dt.timezone.utc)
-
-
-def main() -> int:
-    args = parse_args()
-    catalog = json.loads(args.catalog_file.read_text(encoding="utf-8"))
-    releases = catalog.get("releases") or []
-    release = next((item for item in releases if item.get("build_id") == args.build_id), None)
-    if release is None:
-        raise SystemExit(f"Release catalog does not list {args.build_id}")
-    if release.get("build_number") != args.build_number:
-        raise SystemExit(
-            f"Release catalog build number mismatch: "
-            f"{release.get('build_number')} != {args.build_number}"
-        )
-    if release.get("version") != args.release_version:
-        raise SystemExit(
-            f"Release catalog version mismatch: "
-            f"{release.get('version')} != {args.release_version}"
-        )
-    actual_released_at = parse_released_at(release.get("released_at"), "Release catalog timestamp")
-    expected_released_at = parse_released_at(args.released_at, "Expected release timestamp")
-    if actual_released_at != expected_released_at:
-        raise SystemExit(
-            f"Release catalog timestamp mismatch: "
-            f"{release.get('released_at')} != {args.released_at}"
-        )
-    expected_files = set(args.expected_file)
-    catalog_files = {item.get("name") for item in release.get("files") or []}
-    missing = sorted(expected_files - catalog_files)
-    if missing:
-        raise SystemExit(f"Release catalog is missing files: {', '.join(missing)}")
-    changelog = release.get("changelog") or {}
-    if changelog.get("format") != "markdown" or not changelog.get("url"):
-        raise SystemExit("Release catalog is missing the markdown changelog link")
-    print(f"Uploaded {len(expected_files)} Yield release file(s) to {args.build_id}")
+        verify_response(args)
+        expected = read_json(args.identity_file)
+        catalog = read_json(args.catalog_file)
+        release = next(item for item in catalog["releases"] if item["build_id"] == expected["build_id"])
+        changelog = release.get("changelog")
+        if not isinstance(changelog, dict) or changelog.get("format") != "markdown" or not changelog.get("url"):
+            raise ValueError("catalog missing markdown changelog link")
+    except (ValueError, OSError, KeyError, TypeError, RecursionError) as error:
+        parser.exit(1, f"Publisher catalog rejected: {error}\n")
+    print(f"Verified {len(expected['files'])} release files and full packaged identity for {expected['build_id']}")
     return 0
 
 

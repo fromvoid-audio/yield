@@ -17,6 +17,7 @@ from typing import Any
 
 
 USER_AGENT = "yield-release-changelog-assembler"
+MAX_RESPONSE_BYTES = 512 * 1024
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,10 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--current-version", required=True)
     parser.add_argument("--current-released-at", required=True)
     parser.add_argument("--current-log", required=True, help="Markdown log for the current release.")
-    parser.add_argument(
+    existing = parser.add_mutually_exclusive_group()
+    existing.add_argument(
         "--existing-changelog-url",
         help="Existing site-wide changelog endpoint used to preserve prior release logs.",
     )
+    existing.add_argument("--existing-changelog-file", help="Already downloaded bounded changelog JSON.")
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--generated-at",
@@ -59,7 +62,10 @@ def read_url(url: str, *, request_delay_seconds: float = 0.0) -> str:
             time.sleep(request_delay_seconds)
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                return response.read().decode("utf-8")
+                raw = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    raise SystemExit("PortalSurfer changelog metadata exceeds 512 KiB.")
+                return raw.decode("utf-8")
         except HTTPError as error:
             if error.code != 429 or attempt == 4:
                 raise
@@ -75,7 +81,11 @@ def read_url(url: str, *, request_delay_seconds: float = 0.0) -> str:
 def load_json(source: str, *, request_delay_seconds: float = 0.0) -> dict[str, Any]:
     if source.startswith(("http://", "https://")):
         return json.loads(read_url(source, request_delay_seconds=request_delay_seconds))
-    return json.loads(Path(source).read_text(encoding="utf-8"))
+    with Path(source).open("rb") as handle:
+        raw = handle.read(MAX_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise SystemExit("PortalSurfer changelog metadata exceeds 512 KiB.")
+    return json.loads(raw.decode("utf-8"))
 
 
 def changelog_url(catalog_url: str | None, release: dict[str, Any]) -> str | None:
@@ -279,9 +289,9 @@ def main() -> int:
     ]
 
     current_versions = release_header_versions(current_release)
-    if args.existing_changelog_url:
+    if args.existing_changelog_url or args.existing_changelog_file:
         existing_body = existing_changelog_body(
-            args.existing_changelog_url,
+            args.existing_changelog_url or args.existing_changelog_file,
             request_delay_seconds=args.request_delay_seconds,
         )
         previous_body = remove_release_sections(existing_body, current_versions)
