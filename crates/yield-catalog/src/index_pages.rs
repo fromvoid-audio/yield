@@ -76,6 +76,8 @@ pub struct CatalogIndexPage {
     pub entries: Vec<SourceIndexEntry>,
     /// Continue this source/lifecycle/query at this database connection and revision.
     pub next: Option<CatalogIndexPageCursor>,
+    /// Owner-issued exact-row handles. Display facts cannot construct these.
+    pub inspection_handles: Vec<CatalogIndexEntryHandle>,
 }
 
 pub(super) fn validate_request(
@@ -184,6 +186,17 @@ pub(super) fn request(
         Ok(CatalogIndexPage {
             schema_available: page.schema_available,
             index_revision: page.revision,
+            inspection_handles: page
+                .inspection_handles
+                .into_iter()
+                .map(|entry| CatalogIndexEntryHandle {
+                    source_id: source_id.clone(),
+                    lifecycle_generation,
+                    query_id,
+                    query_token: query_token.clone(),
+                    entry,
+                })
+                .collect(),
             entries: page.entries,
             next: page.next.map(|cursor| CatalogIndexPageCursor {
                 source_id: source_id.clone(),

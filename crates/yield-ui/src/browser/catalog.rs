@@ -761,6 +761,7 @@ impl Browser {
             | CatalogEvent::CurationOperationCompleted { .. }
             | CatalogEvent::IndexPageReady { .. }
             | CatalogEvent::IndexPageFailed { .. }
+            | CatalogEvent::IndexInspectionCompleted { .. }
             | CatalogEvent::TagPageReady { .. }
             | CatalogEvent::TagPageFailed { .. }
             | CatalogEvent::TagAssignmentsReady { .. }
@@ -1130,6 +1131,11 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             ..
         }
         | CatalogEvent::IndexPageReady {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::IndexInspectionCompleted {
             source_id,
             lifecycle_generation,
             ..

@@ -8,13 +8,14 @@ use yield_catalog::{CatalogAuditCancelError, CatalogSubmitError as CatalogWorker
 pub use yield_catalog::{
     CatalogCommand, CatalogCurationRequestError, CatalogCurationTagFactsRequestError,
     CatalogDelivery, CatalogDisplayLabelsRequestError, CatalogError, CatalogEvent,
-    CatalogIndexPage, CatalogIndexPageCursor, CatalogIndexPageError, CatalogOperation,
-    CatalogPublicationStatus, CatalogRatingDecayRequestError, CatalogTagAssignmentPreview,
-    CatalogTagAssignmentPreviewSource, CatalogTagFilterRequestError, CatalogTagPageQuery,
-    CatalogTagPageRequestError, CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
+    CatalogIndexEntryHandle, CatalogIndexInspection, CatalogIndexPage, CatalogIndexPageCursor,
+    CatalogIndexPageError, CatalogOperation, CatalogPublicationStatus,
+    CatalogRatingDecayRequestError, CatalogTagAssignmentPreview, CatalogTagAssignmentPreviewSource,
+    CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
+    CatalogWavMetadataRequestError, IndexInspectionCancellation, MAX_CURATION_OPERATION_BATCHES,
     MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
     MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES,
-    MAX_INDEX_PAGE_PAYLOAD_BYTES, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
+    MAX_HELD_INDEX_INSPECTIONS, MAX_INDEX_PAGE_PAYLOAD_BYTES, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
     MAX_TAG_ASSIGNMENT_PREVIEW_PATHS, MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES,
     MAX_TAG_FILTER_MASK_BYTES, MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES,
     MAX_WAV_METADATA_REQUEST_PATHS, RetainedIndexCompleteness, SOURCE_CURATION_TAG_FACTS_MAX_PATHS,
@@ -23,9 +24,9 @@ pub use yield_catalog::{
     SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
     SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceCurationCommitReceipt, SourceCurationOperationFailure,
     SourceCurationOperationFence, SourceCurationOperationOutcome, SourceCurationTagFacts,
-    SourceCurationUpdate, SourceDisplayLabelEntry, SourceTagAssignmentCursor,
-    SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
-    VerifiedSourceRoot, resolve_source_root,
+    SourceCurationUpdate, SourceDisplayLabelEntry, SourceIndexInspectionError,
+    SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor,
+    SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
 };
 
 /// Lifecycle state of the independently-owned source catalog worker.
@@ -303,5 +304,18 @@ fn map_submit_error(error: CatalogWorkerSubmitError) -> CatalogSubmitError {
         CatalogWorkerSubmitError::InvalidCurationRequest(error) => {
             CatalogSubmitError::InvalidCurationRequest(error)
         }
+    }
+}
+
+/// Cancel a retained index query using only the catalog admission lock.
+pub(crate) fn cancel_index_query(
+    slot: &Arc<Mutex<CatalogSlot>>,
+    source_id: &yield_library::sample_sources::SourceId,
+    generation: u64,
+    query_id: u64,
+) {
+    let slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(service) = &slot.service {
+        service.cancel_index_query(source_id, generation, query_id);
     }
 }

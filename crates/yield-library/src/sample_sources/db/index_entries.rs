@@ -55,6 +55,8 @@ pub struct SourceIndexPage {
     pub entries: Vec<SourceIndexEntry>,
     /// Continue at this revision, or none if the retained table is exhausted/unavailable.
     pub next: Option<SourceIndexPageCursor>,
+    /// Private connection/page-bound inspection proposals for the corresponding rows.
+    pub inspection_handles: Vec<super::SourceIndexEntryHandle>,
 }
 
 /// Explicit rejected continuation, limit, or database projection outcome.
@@ -126,6 +128,7 @@ impl SourceDatabase {
                 revision: 0,
                 entries: Vec::new(),
                 next: None,
+                inspection_handles: Vec::new(),
             });
         }
         let revision = read_index_revision(&transaction)?;
@@ -192,7 +195,20 @@ impl SourceDatabase {
             None
         };
         transaction.rollback().map_err(map_sql_error)?;
+        let delivery = std::sync::Arc::new(());
+        let inspection_handles = entries
+            .iter()
+            .map(|entry| {
+                super::SourceIndexEntryHandle::new(
+                    self.index_page_binding.clone(),
+                    delivery.clone(),
+                    revision,
+                    entry.clone(),
+                )
+            })
+            .collect();
         Ok(SourceIndexPage {
+            inspection_handles,
             schema_available: true,
             revision,
             entries,
@@ -405,6 +421,66 @@ impl SourceDatabase {
         entries.dedup_by(|left, right| left.relative_path == right.relative_path);
         transaction.rollback().map_err(map_sql_error)?;
         Ok(SourceIndexSnapshot { revision, entries })
+    }
+
+    pub(super) fn reread_inspection_entry(
+        &self,
+        handle: &super::SourceIndexEntryHandle,
+    ) -> Result<SourceIndexEntry, super::SourceIndexInspectionError> {
+        use super::SourceIndexInspectionError as E;
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| E::Database)?;
+        if !source_index_schema_available(&transaction).map_err(|_| E::Database)? {
+            return Err(E::Unavailable);
+        }
+        if read_index_revision(&transaction).map_err(|_| E::Database)? != handle.revision() {
+            return Err(E::StaleRevision);
+        }
+        let (key, encoding) = normalize_source_index_path(&handle.entry().relative_path)
+            .map_err(|_| E::InvalidPath)?;
+        let has_encoding =
+            source_index_path_encoding_available(&transaction).map_err(|_| E::Database)?;
+        if !has_encoding && encoding != INDEX_PATH_ENCODING_PLAIN {
+            return Err(E::Unavailable);
+        }
+        let encoding_column = if has_encoding {
+            "path_encoding"
+        } else {
+            "0 AS path_encoding"
+        };
+        let predicate = if has_encoding {
+            " AND path_encoding = ?2"
+        } else {
+            " AND ?2 = 0"
+        };
+        let sql = format!(
+            "SELECT path, {encoding_column}, classification, file_size, modified_ns, file_identity, diagnostic, format_policy_version FROM source_index_entries WHERE path = ?1 COLLATE BINARY{predicate} LIMIT 1"
+        );
+        let mut statement = transaction.prepare(&sql).map_err(|_| E::Database)?;
+        let mut rows = statement
+            .query(params![key, encoding])
+            .map_err(|_| E::Database)?;
+        let row = rows
+            .next()
+            .map_err(|_| E::Database)?
+            .ok_or(E::ChangedEntry)?;
+        let mut bytes = 0usize;
+        for column in [0, 2, 5, 6] {
+            bytes = bytes.saturating_add(match row.get_ref(column).map_err(|_| E::Database)? {
+                rusqlite::types::ValueRef::Text(v) | rusqlite::types::ValueRef::Blob(v) => v.len(),
+                _ => 0,
+            });
+        }
+        if bytes > SOURCE_INDEX_PAGE_MAX_BYTES {
+            return Err(E::ByteLimit);
+        }
+        let entry = strict_page_entry(row).map_err(|_| E::Database)?;
+        if &entry != handle.entry() {
+            return Err(E::ChangedEntry);
+        }
+        Ok(entry)
     }
 
     /// Read a bounded set of index-only entries at one exact typed path set.
@@ -695,6 +771,59 @@ mod tests {
         }
         batch.commit_auxiliary_state().expect("commit index");
         (directory, database)
+    }
+
+    #[test]
+    fn index_inspection_reread_rejects_changed_revision_rows_and_oversized_fields() {
+        use super::super::SourceIndexInspectionError as E;
+        let (_root, database) = page_fixture(&[page_entry(PathBuf::from("a.txt"))]);
+        let page = database.source_index_page(None, 1).unwrap();
+        let handle = &page.inspection_handles[0];
+        assert_eq!(
+            database.reread_inspection_entry(handle).unwrap(),
+            page.entries[0]
+        );
+        database
+            .connection
+            .execute("UPDATE source_index_entries SET file_size = 20", [])
+            .unwrap();
+        assert_eq!(
+            database.reread_inspection_entry(handle).unwrap_err(),
+            E::ChangedEntry
+        );
+        database
+            .connection
+            .execute(
+                "UPDATE source_index_entries SET file_identity = ?1",
+                params!["x".repeat(SOURCE_INDEX_PAGE_MAX_BYTES + 1)],
+            )
+            .unwrap();
+        assert_eq!(
+            database.reread_inspection_entry(handle).unwrap_err(),
+            E::ByteLimit
+        );
+        database
+            .connection
+            .execute(
+                "UPDATE metadata SET value = ?1 WHERE key = ?2",
+                params![(page.revision + 1).to_string(), META_SOURCE_INDEX_REVISION],
+            )
+            .unwrap();
+        assert_eq!(
+            database.reread_inspection_entry(handle).unwrap_err(),
+            E::StaleRevision
+        );
+        let (_other_root, other) = page_fixture(&[page_entry(PathBuf::from("a.txt"))]);
+        assert_eq!(
+            other.inspect_index_entry(handle).unwrap_err(),
+            E::ForeignHandle
+        );
+        drop(database);
+        let reopened = SourceDatabase::open_for_source_write(_root.path()).unwrap();
+        assert_eq!(
+            reopened.inspect_index_entry(handle).unwrap_err(),
+            E::ForeignHandle
+        );
     }
 
     #[test]

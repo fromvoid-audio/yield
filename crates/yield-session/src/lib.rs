@@ -37,13 +37,14 @@ mod vocabulary;
 pub use catalog::{
     CatalogCancelError, CatalogCommand, CatalogCurationRequestError,
     CatalogCurationTagFactsRequestError, CatalogDelivery, CatalogDisplayLabelsRequestError,
-    CatalogError, CatalogEvent, CatalogIndexPage, CatalogIndexPageCursor, CatalogIndexPageError,
-    CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError, CatalogStatus,
-    CatalogSubmitError, CatalogTagAssignmentPreview, CatalogTagAssignmentPreviewSource,
-    CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
-    CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
-    MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
-    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES,
+    CatalogError, CatalogEvent, CatalogIndexEntryHandle, CatalogIndexInspection, CatalogIndexPage,
+    CatalogIndexPageCursor, CatalogIndexPageError, CatalogOperation, CatalogPublicationStatus,
+    CatalogRatingDecayRequestError, CatalogStatus, CatalogSubmitError, CatalogTagAssignmentPreview,
+    CatalogTagAssignmentPreviewSource, CatalogTagFilterRequestError, CatalogTagPageQuery,
+    CatalogTagPageRequestError, CatalogWavMetadataRequestError, IndexInspectionCancellation,
+    MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
+    MAX_CURATION_OPERATION_RECEIPT_BYTES, MAX_CURATION_OPERATION_UPDATES,
+    MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES, MAX_HELD_INDEX_INSPECTIONS,
     MAX_INDEX_PAGE_PAYLOAD_BYTES, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
     MAX_TAG_ASSIGNMENT_PREVIEW_PATHS, MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES,
     MAX_TAG_FILTER_MASK_BYTES, MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES,
@@ -53,9 +54,9 @@ pub use catalog::{
     SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
     SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceCurationCommitReceipt, SourceCurationOperationFailure,
     SourceCurationOperationFence, SourceCurationOperationOutcome, SourceCurationTagFacts,
-    SourceCurationUpdate, SourceDisplayLabelEntry, SourceTagAssignmentCursor,
-    SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
-    VerifiedSourceRoot, resolve_source_root,
+    SourceCurationUpdate, SourceDisplayLabelEntry, SourceIndexInspectionError,
+    SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor,
+    SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
 };
 use catalog::{CatalogService, CatalogSlot};
 use maintenance::{
@@ -513,6 +514,11 @@ impl SourceRegistryService {
     /// Submit one typed catalog command without waiting for catalog startup or worker I/O.
     pub fn submit_catalog(&self, command: CatalogCommand) -> Result<(), CatalogSubmitError> {
         catalog::submit(&self.catalog, command)
+    }
+
+    /// Cancel an exact retained-index query, invalidating its handles and queued inspections.
+    pub fn cancel_catalog_index_query(&self, source_id: &SourceId, generation: u64, query_id: u64) {
+        catalog::cancel_index_query(&self.catalog, source_id, generation, query_id);
     }
 
     /// Request cancellation of the exact current source audit without blocking on the worker.
