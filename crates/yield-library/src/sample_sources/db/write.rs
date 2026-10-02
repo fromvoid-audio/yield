@@ -7,6 +7,7 @@ mod event;
 mod manifest_audit;
 mod mutation;
 mod paths;
+mod reservation_retry;
 mod scan_queries;
 mod source_writer;
 mod tag_assignment_selection;

@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rusqlite::{Transaction, TransactionBehavior};
-
 use super::super::util::map_sql_error;
 use super::super::{
     META_WAV_PATHS_REVISION, Rating, SampleSoundType, SourceDatabase, SourceDbError,
@@ -167,12 +165,8 @@ impl SourceDatabase {
 
     /// Start a write batch that wraps related mutations in a single transaction.
     pub fn write_batch(&self) -> Result<SourceWriteBatch<'_>, SourceDbError> {
-        // Validate before SQLite reserves the writer and before any caller mutation can run.
-        self.validate_profile_owned_mutation()?;
-        // Acquire the writer lock up front so mixed scan/metadata workloads wait
-        // on SQLite's busy timeout instead of failing partway through the batch.
-        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
-            .map_err(map_sql_error)?;
+        // Retry only writer acquisition, before any caller mutation can run.
+        let tx = super::reservation_retry::begin(self)?;
         Ok(SourceWriteBatch {
             tx,
             owner: self,
