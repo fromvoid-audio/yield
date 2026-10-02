@@ -267,7 +267,7 @@ pub(crate) struct SourceLeaseReservation {
 /// source connection. It exists so final release never needs to reopen a pathname after the
 /// ordinary connection has been moved or dropped.
 pub(crate) struct SourceLease {
-    control_connection: Mutex<Connection>,
+    control_connection: Mutex<crate::sqlite_budget::OwnedConnection>,
     database_root: Arc<BoundDatabaseRoot>,
     media_root: Arc<BoundDatabaseRoot>,
     database_file_binding: Arc<DatabaseFileBinding>,
@@ -566,7 +566,7 @@ impl SourceLeaseReservation {
         let db_path = database_file_binding.path().to_path_buf();
         let mut control = database_file_binding
             .root()
-            .open_sqlite(
+            .open_owned_sqlite(
                 database_file_binding.name(),
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             )
@@ -1305,7 +1305,7 @@ impl Drop for SourceLease {
 }
 
 fn bootstrap_lease_row(
-    control: &mut Connection,
+    control: &mut crate::sqlite_budget::OwnedConnection,
     reservation: &SourceLeaseReservation,
     media_root: &BoundDatabaseRoot,
     profile_guard: &WritableProfileGuard,
