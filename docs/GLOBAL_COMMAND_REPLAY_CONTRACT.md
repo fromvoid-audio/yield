@@ -179,9 +179,10 @@ completion. The vocabulary client admits only vocabulary routes; it retains its 
 and closing queue even if a fresh client is later installed.
 
 The bounded queue, source/preference/label limits and current CAS transactions are unchanged.
-The new API is implemented, while legacy unframed methods and existing session producers still
-remain until the relevant producer adoption. OPT-2046 below adds snapshot ordering/replay;
-the common frame by itself supplies only acquisition/context fencing. Vocabulary adoption is OPT-2047 work.
+The common API and session/UI producer adoption are implemented below. Legacy unframed
+library compatibility methods remain without retained caller/restart identity. OPT-2046 adds
+snapshot ordering/replay; the common frame by itself supplies only acquisition/context
+fencing. OPT-2047 adopts vocabulary producers and retains their persistent CAS semantics.
 No receipt table, source admission, file-operation authority or native physical qualification
 is added. Actual-owner fixtures cover all routes through a fresh owner with old context, current
 commit/CAS, mismatch checks, bounded admission, and pre-effect queued rejection / post-commit
@@ -217,3 +218,28 @@ acquisition reload reconciles committed state. Four named preference integration
 the explicit test-only no-capacity startup while preserving real owner/SQLite/restart. Production
 protected-reserve bootstrap is unchanged. Native retained capability checks remain separately
 scoped; these metadata tests supply no physical capacity/publication qualification.
+
+## Implemented vocabulary producer adoption (OPT-2047)
+
+Actual session set/delete submissions use the captured mutation envelope and check
+its exact completion context before projecting a typed receipt. Reads carry their
+observed acquisition. The explicit `*_for_acquisition` methods preserve an originating
+acquisition through a newly obtained client; the worker rejects a redirected old
+proposal before its transaction. Request IDs remain local correlation, never
+restart-stable OperationId values.
+
+GPUI retains that observation in pending add-tag/category intent, profile page and
+lookup state, category drag payload and transient dictionary Undo. A wrong-acquisition
+reply cannot update category state, admit dependent source assignment or manufacture
+Undo. Reopening requires fresh authoritative reads. Disconnected/context-mismatched/
+unconfirmable SQLite or owner replies invalidate affected projections, refresh and
+report an unconfirmed result; they do not blindly replay the old mutation. Only an
+actually received removed-row result creates the bounded same-acquisition Undo.
+A current missing-label no-op is not recovery of a lost deletion tombstone.
+
+Owner/session tests exercise redirected old acquisitions, exact completion mismatch,
+dropped changed/delete results with shutdown/reopen and fresh no-ops. UI projection
+tests use real owner-issued acquisition observations but do not qualify native
+interaction; the action register's OPT-2009 gate remains open. The library's existing
+CAS and worker capability checks remain in force; no vocabulary receipt ledger or
+new SQLite owner was added.

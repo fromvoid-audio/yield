@@ -60,6 +60,7 @@ pub(super) struct TagLibraryState {
     profile_lookup_state: ProfileLookupState,
     profile_categories: BTreeMap<String, ProfileTagCategory>,
     profile_revision: Option<u64>,
+    profile_acquisition: Option<yield_session::ProfileAcquisitionId>,
     metadata_retry_ticks: u8,
     category_pending: Option<PendingCategoryWrite>,
     dragged: Option<DragTarget>,
@@ -93,6 +94,7 @@ impl Default for TagLibraryState {
             profile_lookup_state: ProfileLookupState::NotRequested,
             profile_categories: BTreeMap::new(),
             profile_revision: None,
+            profile_acquisition: None,
             metadata_retry_ticks: 0,
             category_pending: None,
             dragged: None,
@@ -210,6 +212,7 @@ pub(super) struct DragCandidate {
     page_epoch: u64,
     index: usize,
     profile_revision: Option<u64>,
+    profile_acquisition: Option<yield_session::ProfileAcquisitionId>,
 }
 
 #[derive(Clone)]
@@ -222,6 +225,7 @@ struct DragTarget {
     index: usize,
     context: tags::TagSubmissionContext,
     profile_revision: Option<u64>,
+    profile_acquisition: Option<yield_session::ProfileAcquisitionId>,
 }
 
 struct TagLibraryDragGhost;
@@ -299,6 +303,7 @@ pub(super) fn cancel_for_source_change(browser: &mut Browser) {
     browser.tag_library.counts_target = None;
     browser.tag_library.profile_categories.clear();
     browser.tag_library.profile_revision = None;
+    browser.tag_library.profile_acquisition = None;
     browser.tag_library.metadata_retry_ticks = 0;
     browser.tag_library.profile_lookup_target = None;
     browser.tag_library.dragged = None;
@@ -327,8 +332,20 @@ pub(super) fn has_pending(browser: &Browser) -> bool {
 /// Poll one bounded panel lifecycle without creating a second timer.
 pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
     let mut changed = false;
-    changed |= poll_profile_page(browser);
-    changed |= poll_profile_lookup(browser);
+    if browser
+        .tag_library
+        .profile_acquisition
+        .as_ref()
+        .is_some_and(|acquisition| {
+            !super::source_registry::vocabulary_acquisition_is_current(acquisition, cx)
+        })
+    {
+        browser.tag_library.mark_dirty();
+        browser.tag_library.message = Some(String::from("Profile changed; refreshing tags"));
+        changed = true;
+    }
+    changed |= poll_profile_page(browser, cx);
+    changed |= poll_profile_lookup(browser, cx);
     changed |= poll_category_write(browser, cx);
     changed |= super::tag_dictionary::poll(browser, cx);
     if !browser.tag_library.open {
@@ -414,6 +431,7 @@ fn capture_target(browser: &mut Browser) -> bool {
     browser.tag_library.profile_categories.clear();
     browser.tag_library.profile_lookup_state = ProfileLookupState::NotRequested;
     browser.tag_library.profile_revision = None;
+    browser.tag_library.profile_acquisition = None;
     browser.tag_library.dragged = None;
     true
 }
@@ -436,6 +454,7 @@ impl TagLibraryState {
         self.profile_lookup_target = None;
         self.profile_lookup_state = ProfileLookupState::NotRequested;
         self.profile_revision = None;
+        self.profile_acquisition = None;
         self.metadata_retry_ticks = 0;
         self.dragged = None;
         self.message = None;
@@ -465,6 +484,7 @@ impl TagLibraryState {
         self.profile_categories.clear();
         self.profile_lookup_state = ProfileLookupState::NotRequested;
         self.profile_revision = None;
+        self.profile_acquisition = None;
         self.metadata_retry_ticks = 0;
         self.dragged = None;
         self.message = None;
@@ -560,6 +580,7 @@ fn drag_payload_matches_target(
         && candidate.page_epoch == target.page_epoch
         && candidate.index == target.index
         && candidate.profile_revision == target.profile_revision
+        && candidate.profile_acquisition == target.profile_acquisition
 }
 
 fn drag_target_paths_match(target: &DragTarget, current_paths: &[std::path::PathBuf]) -> bool {
@@ -686,10 +707,20 @@ fn submit_profile_page(
     }
 }
 
-fn poll_profile_page(browser: &mut Browser) -> bool {
+fn poll_profile_page(browser: &mut Browser, cx: &Context<Browser>) -> bool {
     let Some(mut pending) = browser.tag_library.profile_pending.take() else {
         return false;
     };
+    if !super::source_registry::vocabulary_acquisition_is_current(
+        pending.request.acquisition_id(),
+        cx,
+    ) {
+        browser.tag_library.mark_dirty();
+        browser.tag_library.message = Some(String::from(
+            "Profile changed; response unconfirmed. Refreshing tags",
+        ));
+        return true;
+    }
     let result = match pending.request.try_recv() {
         Ok(result) => result,
         Err(TryRecvError::Empty) => {
@@ -725,6 +756,8 @@ fn poll_profile_page(browser: &mut Browser) -> bool {
                 return true;
             }
             browser.tag_library.profile_revision = Some(page.revision);
+            browser.tag_library.profile_acquisition =
+                Some(pending.request.acquisition_id().clone());
             for entry in &page.entries {
                 browser
                     .tag_library
@@ -1061,10 +1094,20 @@ fn poll_counts(browser: &mut Browser) -> bool {
     false
 }
 
-fn poll_profile_lookup(browser: &mut Browser) -> bool {
+fn poll_profile_lookup(browser: &mut Browser, cx: &Context<Browser>) -> bool {
     let Some(mut pending) = browser.tag_library.profile_lookup_pending.take() else {
         return false;
     };
+    if !super::source_registry::vocabulary_acquisition_is_current(
+        pending.request.acquisition_id(),
+        cx,
+    ) {
+        browser.tag_library.mark_dirty();
+        browser.tag_library.message = Some(String::from(
+            "Profile changed; response unconfirmed. Refreshing tags",
+        ));
+        return true;
+    }
     let result = match pending.request.try_recv() {
         Ok(result) => result,
         Err(TryRecvError::Empty) => {
@@ -1117,6 +1160,8 @@ fn poll_profile_lookup(browser: &mut Browser) -> bool {
                 return true;
             }
             browser.tag_library.profile_revision = Some(lookup.revision);
+            browser.tag_library.profile_acquisition =
+                Some(pending.request.acquisition_id().clone());
             browser.tag_library.profile_lookup_target = None;
             browser.tag_library.profile_lookup_state = ProfileLookupState::Ready;
             for entry in lookup.entries {
@@ -1141,6 +1186,16 @@ fn poll_category_write(browser: &mut Browser, cx: &mut Context<Browser>) -> bool
     let Some(mut pending) = browser.tag_library.category_pending.take() else {
         return false;
     };
+    if !super::source_registry::vocabulary_acquisition_is_current(
+        pending.request.acquisition_id(),
+        cx,
+    ) {
+        browser.tag_library.mark_dirty();
+        browser.tag_library.message = Some(String::from(
+            "Profile changed; response unconfirmed. Refreshing tags",
+        ));
+        return true;
+    }
     let result = match pending.request.try_recv() {
         Ok(result) => result,
         Err(TryRecvError::Empty) => {
@@ -1155,7 +1210,11 @@ fn poll_category_write(browser: &mut Browser, cx: &mut Context<Browser>) -> bool
                     .tag_library
                     .context_is_current(browser, &pending.context);
             if current {
-                browser.tag_library.message = Some(String::from("Tag category write disconnected"));
+                dictionary_mutation_failed(
+                    browser,
+                    String::from("Tag category outcome unconfirmed; refreshing authoritative tags"),
+                    cx,
+                );
             }
             return true;
         }
@@ -1193,7 +1252,16 @@ fn poll_category_write(browser: &mut Browser, cx: &mut Context<Browser>) -> bool
         }
         Err(error) => {
             if current {
-                browser.tag_library.message = Some(format!("Could not save tag category: {error}"));
+                if super::source_registry::vocabulary_mutation_is_unconfirmed(&error) {
+                    dictionary_mutation_failed(
+                        browser,
+                        format!("Tag category outcome unconfirmed; refreshing tags: {error}"),
+                        cx,
+                    );
+                } else {
+                    browser.tag_library.message =
+                        Some(format!("Could not save tag category: {error}"));
+                }
             }
             true
         }
@@ -1723,6 +1791,7 @@ fn render_candidate(
             page_epoch: epoch,
             index,
             profile_revision: browser.tag_library.profile_revision,
+            profile_acquisition: browser.tag_library.profile_acquisition.clone(),
         });
     let hover = color(theme.colors.selection_hover_fill);
     let pressed = color(theme.interaction.pressed_fill);
@@ -2106,6 +2175,7 @@ impl Browser {
             index: candidate.index,
             context,
             profile_revision: candidate.profile_revision,
+            profile_acquisition: candidate.profile_acquisition,
         });
         cx.notify();
     }
@@ -2211,7 +2281,17 @@ impl Browser {
         };
         let profile_category = ProfileTagCategory::from_id(category.id())
             .expect("core and profile categories share identifiers");
-        match global.set_profile_tag_category(revision, target.label.clone(), profile_category) {
+        let Some(acquisition) = target.profile_acquisition else {
+            self.tag_library.message = Some(String::from("Profile tags are still loading"));
+            cx.notify();
+            return;
+        };
+        match global.set_profile_tag_category(
+            acquisition,
+            revision,
+            target.label.clone(),
+            profile_category,
+        ) {
             Ok(request) => {
                 self.tag_library.category_pending = Some(PendingCategoryWrite {
                     generation: self.tag_library.generation,
@@ -2400,9 +2480,14 @@ impl Browser {
             cx.notify();
             return;
         };
+        let Some(acquisition) = self.tag_library.profile_acquisition.clone() else {
+            self.tag_library.message = Some(String::from("Profile tags are still loading"));
+            cx.notify();
+            return;
+        };
         match self
             .tag_dictionary
-            .submit_remove(global, revision, current.label)
+            .submit_remove(global, acquisition, revision, current.label)
         {
             Ok(()) => {
                 self.tag_library.message = Some(String::from("Removing tag definition…"));
@@ -2434,9 +2519,12 @@ impl Browser {
             cx.notify();
             return;
         };
+        let Some(acquisition) = self.tag_dictionary.undo_acquisition().cloned() else {
+            return;
+        };
         match self
             .tag_dictionary
-            .submit_restore(global, revision, label, category)
+            .submit_restore(global, acquisition, revision, label, category)
         {
             Ok(()) => {
                 self.tag_library.message = Some(String::from("Restoring tag definition…"));
@@ -2792,6 +2880,7 @@ mod tests {
             index: 2,
             context: target_context.clone(),
             profile_revision: Some(7),
+            profile_acquisition: None,
         };
         assert!(drag_target_is_current(
             &target,
