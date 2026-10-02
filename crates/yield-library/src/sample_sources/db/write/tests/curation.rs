@@ -4361,3 +4361,6 @@ mod readiness_targets;
 
 #[path = "curation/wal_admission.rs"]
 mod wal_admission;
+
+#[path = "curation/tag_metadata_budget.rs"]
+mod tag_metadata_budget;

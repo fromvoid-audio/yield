@@ -7,6 +7,8 @@
 
 use super::super::{SourceReferenceFence, SourceReferenceFenceError};
 mod manifest_enrollment;
+mod tag_metadata_budget;
+pub use tag_metadata_budget::SourceTagMetadataBudget;
 #[path = "readiness_targets.rs"]
 mod readiness_targets;
 pub use manifest_enrollment::{
@@ -598,6 +600,9 @@ impl SourceWriterReceipt {
 /// Fail-closed errors from the source-owned revision/receipt boundary.
 #[derive(Debug, Error)]
 pub enum SourceWriterError {
+    /// Unknown/unavailable source metadata allocation policy; no edits or capacity authority.
+    #[error("source metadata allocation bound is not defined for this live owner")]
+    MetadataBoundNotDefined,
     /// Held feature source input could not be admitted or validated.
     #[error(transparent)]
     FeatureInput(#[from] crate::sample_sources::readiness::SourceFeatureInputError),

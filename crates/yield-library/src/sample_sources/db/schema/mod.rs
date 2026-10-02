@@ -9,6 +9,8 @@ use super::SourceDbError;
 use super::util::map_sql_error;
 
 mod ddl;
+mod metadata_budget;
+pub(super) use metadata_budget::require_known_metadata_schema;
 mod migrations;
 
 pub(crate) use migrations::table_columns;

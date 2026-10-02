@@ -11,8 +11,8 @@
 //!   grown beyond the normal steady-state target
 
 mod admission;
-pub(crate) use admission::enforce_wal_admission;
 pub use admission::{WAL_HARD_WATERMARK_BYTES, WAL_SOFT_WATERMARK_BYTES, WalAdmissionError};
+pub(crate) use admission::{enforce_wal_admission, retained_database_bytes, retained_wal_bytes};
 
 use std::collections::HashMap;
 use std::ffi::OsString;
