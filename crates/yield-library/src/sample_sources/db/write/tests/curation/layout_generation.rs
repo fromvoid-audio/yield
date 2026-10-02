@@ -348,7 +348,7 @@ fn layout_generation_strict_binary_decode_rejects_truncation_unknown_and_corrupt
         Err(SourceLayoutGenerationError::Limit("complete row count"))
     ));
     let mut bad = bytes.to_vec();
-    let end = bad.len();
+    let end = bad.len() - 32;
     bad[end - 9..end - 5].copy_from_slice(&f32::NAN.to_bits().to_le_bytes());
     assert!(matches!(
         SourceLayoutGeneration::decode(&bad),
@@ -512,4 +512,22 @@ fn layout_generation_actual_long_quoted_unicode_paths_roundtrip_without_escape_a
         SourceLayoutGeneration::decode(&bad),
         Err(SourceLayoutGenerationError::Limit("field bytes"))
     ));
+}
+#[test]
+fn layout_generation_historical_origin_corruption_cannot_hide_outside_content_digests() {
+    let (_fixture, mut writer) = setup();
+    publish(&mut writer, &["one.wav", "two.wav"]);
+    let input = capture(&writer).unwrap();
+    let prepared = prepare(&writer, &input).unwrap();
+    let mut corrupt = prepared.bytes().to_vec();
+    let mut cursor = 8usize;
+    for _ in 0..4 {
+        let length = u32::from_le_bytes(corrupt[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4 + length;
+    }
+    corrupt[cursor] ^= 1; // Another valid integer, with unchanged manifest and point digests.
+    assert!(
+        SourceLayoutGeneration::decode(&corrupt).is_err(),
+        "historical origin corruption must fail closed"
+    );
 }

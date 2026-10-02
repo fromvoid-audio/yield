@@ -50,11 +50,17 @@ signed zero. There is one fixed field order and no extensible field map:
 | Source ID | UTF8 length field, at most 256 bytes, nonblank |
 | Physical root | Raw length field, at most 4096 bytes, nonempty |
 | Root binding and database identity | Each UTF8 length field, at most 512 bytes, nonblank |
-| Historical origin revision | u64; no serialized incarnation, lifecycle or lease |
+| Historical origin revision | u64 <=i64::MAX, matching the source SQL integer domain; no serialized incarnation, lifecycle or lease |
 | Algorithm and feature version | Length fields, exact `SOURCE_LAYOUT_ALGORITHM_V1` and `features-v1` |
 | Input, CPU and point digest | Three exact 32-byte values |
 | Row count | u32, 1–256, checked before row-vector allocation |
 | Each ordered row | Path <=1024; file identity <=512; full lowercase content hash 64; opaque feature reference <=160; u64 size; i64 mtime; two finite f32 values; cluster tag 0 or 1, followed by i32 for tag 1 |
+
+A final 32-byte BLAKE3 checksum covers every preceding encoded byte, including
+the historical origin revision. It is required even though that revision is
+excluded from the reusable input/point digests. Byte corruption cannot silently
+change historical provenance. This checksum is consistency checking, not signing
+or authentication.
 
 Complete ordered manifest identity bytes (path + file identity + content hash)
 remain <=128KiB. Paths must have canonical source-relative spelling and a WAV
@@ -63,7 +69,7 @@ must have the exact v1 shape and target hash matching source/file/content/versio
 This is archived consistency checking, never reconstruction of a private key.
 
 The conservative encoded bound includes the maximum five-byte cluster field per
-row and all framing before allocating encoded storage. The maximum encoded
+row, the final checksum and all framing before allocating encoded storage. The maximum encoded
 capacity is 512KiB. The decoder checks the input cap before inspecting fields,
 checks every length before borrowing its slice, and checks the row count and a
 minimum remaining-row length before allocation. Strings and root borrow input;
@@ -99,7 +105,8 @@ publication. Tests cover query-only/no DB or WAL changes, complete 256-row input
 wrong CPU/version/order/coverage, finite/cluster rejection, actual metadata commit
 and restart, foreign/expired/replaced issuers, cancellation/transaction quiescence,
 long quoted/Unicode path roundtrip, every truncation prefix, oversize lengths,
-unknown version, corruption and trailing fields. Codec tests separately exercise
+unknown version, historical-origin corruption outside reusable digests and trailing
+fields. Codec tests separately exercise
 checked overflow, UTF8/escape preservation and fixed cluster policy.
 
 Run `cargo test --locked -p yield-library layout_generation -- --test-threads=1`,

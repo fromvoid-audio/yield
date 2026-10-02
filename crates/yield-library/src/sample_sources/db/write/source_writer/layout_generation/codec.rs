@@ -94,6 +94,9 @@ impl<'a> SourceLayoutGeneration<'a> {
             return Err(Error::Invalid("physical source identity"));
         }
         let origin_revision = reader.u64()?;
+        if origin_revision > i64::MAX as u64 {
+            return Err(Error::Invalid("historical origin revision"));
+        }
         if reader.text(128)? != SOURCE_LAYOUT_ALGORITHM_V1 || reader.text(32)? != "features-v1" {
             return Err(Error::Invalid("model/version/parameters"));
         }
@@ -105,7 +108,7 @@ impl<'a> SourceLayoutGeneration<'a> {
             return Err(Error::Limit("complete row count"));
         }
         // Reject truncated row blocks before allocating even the bounded row vector.
-        if reader.bytes.len() - reader.at < count * 41 {
+        if reader.bytes.len() - reader.at < count * 41 + 32 {
             return Err(Error::Invalid("truncated rows"));
         }
         let mut rows: Vec<SourceLayoutGenerationRow<'a>> = Vec::with_capacity(count);
@@ -156,8 +159,13 @@ impl<'a> SourceLayoutGeneration<'a> {
                 cluster_id,
             });
         }
+        let checksum_offset = reader.at;
+        let checksum = reader.digest()?;
         if reader.at != bytes.len() {
             return Err(Error::Invalid("trailing or unknown fields"));
+        }
+        if blake3::hash(&bytes[..checksum_offset]).as_bytes() != &checksum {
+            return Err(Error::Invalid("encoding checksum"));
         }
         let value = Self {
             source_id,
@@ -353,7 +361,7 @@ pub(super) fn encode(
             return Err(Error::Limit("scope field bytes"));
         }
     }
-    let mut bound = MAGIC.len() + 8 + 96 + 4;
+    let mut bound = MAGIC.len() + 8 + 96 + 4 + 32;
     for field in fields {
         bound = add(bound, 4 + field.len())?;
     }
@@ -416,6 +424,8 @@ pub(super) fn encode(
             }
         }
     }
+    let checksum = *blake3::hash(&bytes).as_bytes();
+    bytes.extend_from_slice(&checksum);
     debug_assert!(bytes.len() <= bound);
     Ok(bytes)
 }
