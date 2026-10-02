@@ -4298,6 +4298,21 @@ impl OperationJournalClient {
         })
     }
 
+    /// Queue one bounded compact status page over both journal families.
+    pub fn scan_recovery_status_page(
+        &self,
+        cursor: Option<RecoveryCursor>,
+    ) -> Result<OperationJournalRequest<super::RecoveryStatusPage>, OperationJournalOwnerQueueError>
+    {
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::RecoveryStatus {
+                cursor,
+                input,
+                result,
+            }
+        })
+    }
+
     /// Queue one crate-internal bounded full-progress point lookup.
     #[allow(dead_code)]
     pub(crate) fn get_full(
@@ -4908,6 +4923,11 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<Option<StoredFullProgressRecord>, OperationJournalOwnerError>>,
     },
+    RecoveryStatus {
+        cursor: Option<RecoveryCursor>,
+        input: InputPermit,
+        result: SyncSender<Result<super::RecoveryStatusPage, OperationJournalOwnerError>>,
+    },
     CoordinatorRecovery {
         cursor: Option<RecoveryCursor>,
         input: InputPermit,
@@ -5469,6 +5489,14 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                     .map(|row| row.map(|row| row.into_record()))
             })
         }
+        JournalCommand::RecoveryStatus {
+            cursor,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || runtime.store().scan_recovery_status_page(cursor))
+        }
         JournalCommand::CoordinatorRecovery {
             cursor,
             input,
@@ -5620,6 +5648,10 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             let _ = result.send(Err(error));
         }
         JournalCommand::GetFull { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::RecoveryStatus { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
         }
@@ -7451,6 +7483,27 @@ mod tests {
                 super::super::store::recovery::CoordinatorRecoveryRecord::FullProgress(observed)
             ) if observed == &full
         ));
+        let mut status_request = client
+            .scan_recovery_status_page(None)
+            .expect("status admission");
+        let status = status_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("status result")
+            .expect("status worker");
+        assert_eq!(status.entries().len(), 2);
+        assert_eq!(
+            status.entries()[0].operation_id(),
+            Some(legacy.operation_id)
+        );
+        assert_eq!(status.entries()[1].operation_id(), Some(full_id));
+        assert_eq!(
+            status.entries()[1].outcome(),
+            super::super::RecoveryStatusOutcome::FullProgress {
+                phase: full.snapshot().phase(),
+                disposition: full.snapshot().disposition(),
+            }
+        );
+        assert!(status.is_done());
         assert!(owner.shutdown());
         drop(fixture);
     }

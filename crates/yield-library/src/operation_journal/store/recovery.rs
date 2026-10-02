@@ -1348,6 +1348,8 @@ mod tests {
     };
     use crate::test_runtime::TestRuntimeGuard;
 
+    include!("recovery_status_tests.rs");
+
     struct Fixture {
         owner: WritableProfileGuard,
         _profile: PersistenceProfileGuard,

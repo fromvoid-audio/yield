@@ -41,6 +41,7 @@ pub mod owner;
 pub mod participants;
 pub mod readiness_scheduling;
 pub mod recording_commands;
+pub mod recovery_status;
 pub mod removal_commands;
 pub mod render_commands;
 pub mod retained_resolution_commands;
@@ -299,3 +300,8 @@ pub use work_progress::{
 
 #[cfg(test)]
 mod mixed_batch_contract_tests;
+
+pub use recovery_status::{
+    JournalRetentionKind, JournalStatusFamily, RecoveryStatusEntry, RecoveryStatusOutcome,
+    RecoveryStatusPage,
+};
