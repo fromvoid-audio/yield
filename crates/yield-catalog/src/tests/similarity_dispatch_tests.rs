@@ -173,8 +173,17 @@ mod fixtures {
         // Real retained result, not a preexecution error or fabricated row fixture.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let ready =
-                admission_state(&service.admission, |state| state.tag_page_input_bytes == 0);
+            let ready = service
+                .events
+                .queue
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .events
+                .iter()
+                .any(|queued| {
+                    matches!(&queued.event,
+                    CatalogEvent::SimilarityCompleted { request, .. } if request.generation() == 40)
+                });
             if ready {
                 break;
             }
