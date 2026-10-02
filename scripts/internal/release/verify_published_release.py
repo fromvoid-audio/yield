@@ -608,7 +608,12 @@ def validate_checksum_file(
 ) -> list[str]:
     errors: list[str] = []
     entries: dict[str, str] = {}
-    for line_number, line in enumerate(checksum_path.read_text(encoding="utf-8").splitlines(), start=1):
+    expected_names = {asset.name for asset in expected_zips}
+    try:
+        lines = checksum_path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError:
+        return [f"{checksum_path.name} is not valid UTF-8"]
+    for line_number, line in enumerate(lines, start=1):
         stripped = line.strip()
         if not stripped:
             continue
@@ -616,7 +621,14 @@ def validate_checksum_file(
         if len(parts) != 2 or not re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
             errors.append(f"{checksum_path.name}:{line_number} is not a SHA-256 checksum entry")
             continue
-        entries[parts[1]] = parts[0].lower()
+        name = parts[1]
+        if name not in expected_names:
+            errors.append(f"{checksum_path.name}:{line_number} contains unexpected asset {name}")
+            continue
+        if name in entries:
+            errors.append(f"{checksum_path.name}:{line_number} duplicates checksum entry for {name}")
+            continue
+        entries[name] = parts[0].lower()
 
     for zip_asset in expected_zips:
         expected_hash = entries.get(zip_asset.name)
@@ -650,7 +662,7 @@ def verify_checksum_signature(checksum_path: Path, signature_path: Path, checksu
         pub_der.write_bytes(ED25519_SPKI_PREFIX + public_key)
         try:
             sig_bin.write_bytes(base64.b64decode(signature_path.read_text(encoding="utf-8"), validate=True))
-        except ValueError as error:
+        except (ValueError, UnicodeDecodeError) as error:
             return [f"checksum signature is not valid base64: {error}"]
         completed = subprocess.run(
             [
