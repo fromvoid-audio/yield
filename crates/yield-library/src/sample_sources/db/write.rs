@@ -21,6 +21,8 @@ pub use curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
 };
 pub use source_writer::{
+    ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
+    ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
     SourceCommandId, SourceRevision, SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage,
     SourceWriter, SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt,
     SourceWriterRequest,

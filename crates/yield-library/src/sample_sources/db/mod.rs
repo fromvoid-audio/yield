@@ -119,12 +119,14 @@ pub use types::{
 };
 pub use util::normalize_relative_path;
 pub use write::{
-    ManifestCommitResult, SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite, SourceCommandId,
-    SourceContentHashWrite, SourceCurationCommitReceipt, SourceCurationUpdate,
-    SourceDirectoryTruthCommitResult, SourceFileWrite, SourceIndexCommitResult, SourceRevision,
-    SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage, SourceTagAssignmentMutation,
-    SourceTagAssignmentSelection, SourceTagWrite, SourceWriteCommand, SourceWriter,
-    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
+    ManifestCommitResult, ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
+    ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
+    SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite, SourceCommandId, SourceContentHashWrite,
+    SourceCurationCommitReceipt, SourceCurationUpdate, SourceDirectoryTruthCommitResult,
+    SourceFileWrite, SourceIndexCommitResult, SourceRevision, SourceScanFence, SourceSnapshotOwner,
+    SourceSnapshotPage, SourceTagAssignmentMutation, SourceTagAssignmentSelection, SourceTagWrite,
+    SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
+    SourceWriterReceipt, SourceWriterRequest,
 };
 
 /// Hidden filename used for per-source databases.

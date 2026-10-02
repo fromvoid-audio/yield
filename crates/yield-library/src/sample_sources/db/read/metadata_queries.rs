@@ -884,6 +884,11 @@ impl SourceDatabase {
         self.get_numeric_metadata("revision")
     }
 
+    /// Read the index-only revision with SQL type/length/ambiguity bounds before allocation.
+    pub fn get_source_index_revision(&self) -> Result<u64, SourceDbError> {
+        self.get_numeric_metadata(super::super::META_SOURCE_INDEX_REVISION)
+    }
+
     /// Return the numeric revision for ordered wav-path changes (0 if missing).
     pub fn get_wav_paths_revision(&self) -> Result<u64, SourceDbError> {
         self.get_numeric_metadata(META_WAV_PATHS_REVISION)

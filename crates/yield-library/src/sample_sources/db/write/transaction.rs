@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension;
 use rusqlite::types::ValueRef;
+use serde::{Deserialize, Serialize};
 
 use super::super::util::{
     map_sql_error, normalize_relative_path, parse_canonical_directory_path_from_db,
@@ -17,6 +18,7 @@ use super::super::{
 use crate::sample_sources::reconciliation::{RootIdentity, SourceAuditCommit, SourceAuditRequest};
 
 /// Manifest state published by a committed source-database write batch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestCommitResult {
     /// Revision assigned to the committed manifest state.
     pub revision: u64,
@@ -29,6 +31,7 @@ pub struct ManifestCommitResult {
 }
 
 /// Typed index-only facts proven by one committed source-database write.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceIndexCommitResult {
     /// Generic source revision assigned by the committing transaction.
     pub source_revision: u64,
@@ -757,6 +760,18 @@ impl SourceWriteBatch<'_> {
         self,
         expected_previous_revision: u64,
     ) -> Result<ManifestCommitResult, SourceDbError> {
+        let result = self.prepare_bounded_manifest_changes(expected_previous_revision)?;
+        let owner = self.owner;
+        self.validate_profile_owned_mutation()?;
+        self.tx.commit().map_err(map_sql_error)?;
+        owner.maybe_checkpoint_owned_wal();
+        Ok(result)
+    }
+
+    pub(super) fn prepare_bounded_manifest_changes(
+        &self,
+        expected_previous_revision: u64,
+    ) -> Result<ManifestCommitResult, SourceDbError> {
         if manifest_revision(&self.tx)? != expected_previous_revision {
             return Err(SourceDbError::Unexpected);
         }
@@ -772,16 +787,20 @@ impl SourceWriteBatch<'_> {
                 Ok((normalized, entry))
             })
             .collect::<Result<Vec<_>, SourceDbError>>()?;
-        let owner = self.owner;
-        self.validate_profile_owned_mutation()?;
-        self.tx.commit().map_err(map_sql_error)?;
-        owner.maybe_checkpoint_owned_wal();
         Ok(ManifestCommitResult {
             revision,
             touched_path_changes: changes,
             authoritative_snapshot: None,
             source_index_commit,
         })
+    }
+
+    /// Read the bounded index-only revision inside this retained source transaction.
+    pub fn get_source_index_revision(&self) -> Result<u64, SourceDbError> {
+        super::super::read_bounded_numeric_metadata(
+            &self.tx,
+            super::super::META_SOURCE_INDEX_REVISION,
+        )
     }
 
     fn source_index_commit(
@@ -791,18 +810,7 @@ impl SourceWriteBatch<'_> {
         if self.source_index_changes.is_empty() {
             return Ok(None);
         }
-        let index_revision = self
-            .tx
-            .query_row(
-                "SELECT value FROM metadata WHERE key = 'source_index_revision_v1'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(map_sql_error)?
-            .map(|raw| raw.parse::<u64>().map_err(|_| SourceDbError::Unexpected))
-            .transpose()?
-            .unwrap_or_default();
+        let index_revision = self.get_source_index_revision()?;
         let mut upserted_entries = Vec::new();
         let mut removed_paths = Vec::new();
         for (path, entry) in &self.source_index_changes {

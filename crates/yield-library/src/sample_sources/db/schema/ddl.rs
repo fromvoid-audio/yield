@@ -450,6 +450,18 @@ pub(super) fn apply_base_schema(connection: &Connection) -> Result<(), SourceDbE
     connection
         .execute_batch(BASE_SCHEMA_SQL)
         .map_err(map_sql_error)?;
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS source_manifest_enrollment_receipts (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        command_key TEXT NOT NULL UNIQUE CHECK(length(CAST(command_key AS BLOB)) BETWEEN 1 AND 512),
+        payload BLOB NOT NULL CHECK(length(payload) BETWEEN 1 AND 65536),
+        payload_hash BLOB NOT NULL CHECK(length(payload_hash)=32),
+        result BLOB NOT NULL CHECK(length(result) BETWEEN 1 AND 65536),
+        result_hash BLOB NOT NULL CHECK(length(result_hash)=32)
+    )",
+        )
+        .map_err(map_sql_error)?;
     Ok(())
 }
 

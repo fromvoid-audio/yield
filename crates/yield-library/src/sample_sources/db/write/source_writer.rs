@@ -6,8 +6,13 @@
 //! owner; their persisted DTOs never construct or reacquire an authority.
 
 use super::super::{SourceReferenceFence, SourceReferenceFenceError};
+mod manifest_enrollment;
 #[path = "readiness_targets.rs"]
 mod readiness_targets;
+pub use manifest_enrollment::{
+    ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
+    ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
+};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
