@@ -65,6 +65,7 @@ mod display_labels;
 mod feature_job;
 mod feature_progress;
 mod feature_request;
+mod similarity_query;
 pub use feature_job::{
     ComputedFeatureJob, FeatureJobFailure, FeatureJobOutcome, PreparedFeatureJob,
     prepare_feature_job,
@@ -73,6 +74,11 @@ pub use feature_progress::{FeatureAnalysisPhase, FeaturePhaseMeasurement};
 pub use feature_request::{
     FeatureAnalysisBlocker, FeatureAnalysisCancellation, FeatureAnalysisState,
 };
+pub use similarity_query::{
+    SimilarityCandidateOutcome, SimilarityQueryError, SourceSimilarityQuery,
+    SourceSimilarityResult, SourceSimilarityRow, query_source_similarity,
+};
+pub use yield_analysis::aspects::SimilarityAspect;
 mod index_pages;
 mod index_reveal;
 mod index_reveal_contract;
@@ -15717,4 +15723,5 @@ mod tests {
     mod feature_progress_tests;
     #[cfg(target_os = "linux")]
     mod feature_request_tests;
+    mod similarity_query_tests;
 }
