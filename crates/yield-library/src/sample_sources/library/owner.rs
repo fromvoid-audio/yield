@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use super::connection::LibraryDatabase;
 use super::error::LibraryError;
+use super::operation_link_participant::{OperationLinkRequest, OperationLinkResult};
 use super::registry_limits::{
     RegistryBoundError, SOURCE_REGISTRY_MAX_BYTES, SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
     SOURCE_REGISTRY_MAX_DESCRIPTORS, SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES, path_bytes,
@@ -263,6 +264,10 @@ pub enum GlobalLibraryWriterStartError {
 }
 
 enum WriterCommand {
+    ApplyOperationLink {
+        request: OperationLinkRequest,
+        result: SyncSender<Result<OperationLinkResult, LibraryError>>,
+    },
     ApplySourceRegistryParticipant {
         request: SourceRegistryParticipantRequest,
         result: SyncSender<Result<SourceRegistryParticipantReceipt, LibraryError>>,
@@ -310,6 +315,10 @@ enum WriterCommand {
 }
 
 enum WriterReply {
+    OperationLink {
+        result: SyncSender<Result<OperationLinkResult, LibraryError>>,
+        value: Result<OperationLinkResult, LibraryError>,
+    },
     SourceRegistryParticipant {
         result: SyncSender<Result<SourceRegistryParticipantReceipt, LibraryError>>,
         value: Result<SourceRegistryParticipantReceipt, LibraryError>,
@@ -355,6 +364,9 @@ enum WriterReply {
 impl WriterReply {
     fn send(self) {
         match self {
+            Self::OperationLink { result, value } => {
+                let _ = result.send(value);
+            }
             Self::SourceRegistryParticipant { result, value } => {
                 let _ = result.send(value);
             }
@@ -390,6 +402,9 @@ impl WriterReply {
 
     fn send_error(self, error: LibraryError) {
         match self {
+            Self::OperationLink { result, .. } => {
+                let _ = result.send(Err(error));
+            }
             Self::SourceRegistryParticipant { result, .. } => {
                 let _ = result.send(Err(error));
             }
@@ -638,6 +653,19 @@ impl GlobalLibraryWriter {
             result: result_tx,
         })?;
         Ok(result_rx)
+    }
+
+    /// Queue one bounded durable source/global correlation through this existing owner.
+    /// The receipt is an observation, never journal or filesystem completion authority.
+    pub fn apply_operation_link(
+        &self,
+        request: OperationLinkRequest,
+    ) -> Result<Receiver<Result<OperationLinkResult, LibraryError>>, GlobalLibraryWriterQueueError>
+    {
+        self.ensure_available()?;
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::ApplyOperationLink { request, result })?;
+        Ok(receiver)
     }
 
     /// Queue one durable operation-scoped registry result through this existing owner.
@@ -1125,6 +1153,10 @@ fn execute_command(
     owner_identity: &str,
 ) -> WriterReply {
     match command {
+        WriterCommand::ApplyOperationLink { request, result } => WriterReply::OperationLink {
+            value: database.apply_operation_link(owner_identity, &request),
+            result,
+        },
         WriterCommand::ApplySourceRegistryParticipant { request, result } => {
             WriterReply::SourceRegistryParticipant {
                 value: database.apply_source_registry_participant(owner_identity, &request),
@@ -1230,6 +1262,9 @@ fn reject_remaining_profile_change(
 
 fn send_command_error(command: WriterCommand, error: LibraryError) {
     match command {
+        WriterCommand::ApplyOperationLink { result, .. } => {
+            let _ = result.send(Err(error));
+        }
         WriterCommand::ApplySourceRegistryParticipant { result, .. } => {
             let _ = result.send(Err(error));
         }
@@ -1323,6 +1358,10 @@ fn unavailable_from_library_error(error: &LibraryError) -> GlobalLibraryWriterUn
 
 #[cfg(test)]
 mod tests {
+    mod operation_link_tests {
+        use super::*;
+        include!("operation_link_owner_tests.rs");
+    }
     mod registry_participant_tests {
         use super::*;
         include!("registry_participant_owner_tests.rs");

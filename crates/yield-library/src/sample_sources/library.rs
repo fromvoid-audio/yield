@@ -11,6 +11,7 @@ mod connection;
 mod error;
 mod harvest;
 mod migrations;
+mod operation_link_participant;
 mod owner;
 mod read_only;
 mod registry_limits;
@@ -37,6 +38,10 @@ pub use harvest::{
     HarvestDerivationOperation, HarvestDerivationRecord, HarvestFileIdentity, HarvestFileKey,
     HarvestFileRecord, HarvestMetadataSnapshot, HarvestSourceRange, HarvestState,
     NewHarvestDerivation,
+};
+pub use operation_link_participant::{
+    OPERATION_LINK_MAX_BYTES, OPERATION_LINK_MAX_RECEIPTS, OperationLinkReceipt,
+    OperationLinkRequest, OperationLinkResult,
 };
 pub use owner::{
     GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY, GlobalLibraryWriter, GlobalLibraryWriterQueueError,

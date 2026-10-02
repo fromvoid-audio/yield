@@ -21,6 +21,8 @@ impl LibraryDatabase {
 
     pub(super) fn apply_schema(&self) -> Result<(), LibraryError> {
         self.connection
+            .execute_batch(super::operation_link_participant::CREATE_TABLE)?;
+        self.connection
             .execute_batch(super::registry_participant::CREATE_TABLE)?;
         self.connection
             .execute_batch(

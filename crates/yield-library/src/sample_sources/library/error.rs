@@ -9,6 +9,21 @@ use super::tag_vocabulary::ProfileTagVocabularyInputError;
 /// Errors returned when operating on the library database.
 #[derive(Debug, Error)]
 pub enum LibraryError {
+    /// Operation-link request violates a bounded endpoint/identity contract.
+    #[error("invalid operation-link input")]
+    OperationLinkInput,
+    /// Request acquisition does not match the retained profile owner.
+    #[error("stale operation-link profile owner")]
+    OperationLinkStaleOwner,
+    /// Retained evidence differs under the same immutable link key.
+    #[error("operation-link replay conflict")]
+    OperationLinkReplayConflict,
+    /// Retained receipt is malformed or ambiguous.
+    #[error("malformed operation-link receipt")]
+    OperationLinkMalformedReceipt,
+    /// Bounded receipt budget exhausted; no replay evidence is evicted.
+    #[error("operation-link receipt capacity reached")]
+    OperationLinkReceiptCapacity,
     /// An operation-scoped registry command failed its bounded identity contract.
     #[error("invalid source-registry participant input: {field}")]
     SourceRegistryParticipantInput {

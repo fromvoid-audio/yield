@@ -12,11 +12,11 @@ source registry. The endpoints already exist:
 | Source curation command | `SourceWriter::commit_curation`, source DB `source_participant_curation_receipts`; `SourceWriterReceipt::identity()` and `source_revision()` | Retain the operation, participant and `SourceCommandId` chosen before dispatch. Recover a lost response with `read_receipt_observation` through the reacquired source owner. |
 | Global operation obligation | `operation_journal::work_plan::WorkUnitKey`, role `GlobalLibrary`; frozen universal work plan | Family adapter selects the actual required global key and source key from the admitted plan, rather than constructing a sparse replacement plan. |
 | Correlation persistence | Existing profile-owned `GlobalLibraryWriter`, `library.db` | OPT-1644 adds one bounded command and immutable SQLite receipt in this owner. No separate database, writer, coordinator or completion issuer. |
-| Journal / Harvest / projection consumers | Existing full work progress and private owner-verified completion boundary (OPT-1641) | OPT-1833 wires the family caller; dependent Harvest/projection work consumes the link as an observation and separately establishes its own completion evidence. |
+| Journal / Harvest / projection consumers | Existing full work progress and private owner-verified completion boundary (OPT-1641) | The OPT-1341 saga/family consumers validate journal context; dependent Harvest/projection work consumes the link as an observation and separately establishes its own completion evidence. |
 
 The current global registry receipt already links its own operation/work key, but it
 has no source command endpoint. Neither that receipt nor ordinary registry replacement
-satisfies this link. No production operation-link entrypoint exists yet: this decision
+satisfies this link. At the decision snapshot no production operation-link entrypoint existed: this decision
 and its synthetic fixtures do **not** close OPT-1644 or OPT-1833.
 
 ## Immutable command and scope
@@ -93,7 +93,7 @@ boundary. This decision supplies no new physical completion issuer.
 
 ## Exact remaining implementation and validation
 
-OPT-1644 owns new `sample_sources/library/operation_link_participant.rs` and an isolated
+OPT-1644 implements new `sample_sources/library/operation_link_participant.rs` and an isolated
 owner test include, plus coordinated edits to `library.rs`, `library/owner.rs`,
 `library/error.rs` and schema initialization/checks. Follow the actual
 `registry_participant.rs` transaction/worker pattern, preserving existing routes. Expose
@@ -106,9 +106,11 @@ under one operation; duplicate and lost acknowledgement; reopen/reacquisition re
 receipt; changed source lifecycle/revision/payload conflict; invalid key/identity/bounds;
 stale profile before duplicate; SQL abort rollback; malformed and duplicate retained
 rows; row/byte capacity with exact replay; and source committed/global failed then retry.
-Run relevant source receipt replay tests too. OPT-1833 then connects a concrete admitted
-family producer and verifies its global checkpoint remains pending on every rejection
-or uncertainty. Harvest/projection and other family acceptance remains open.
+Run relevant source receipt replay tests too. OPT-1833 validates this typed writer route
+against duplicate/reordered commands and restart replay; its stated scope excludes saga
+ordering and source participants. OPT-1341 saga consumers must connect an admitted family
+and keep its global checkpoint pending on rejection or uncertainty. Harvest/projection
+and other family acceptance remains open.
 
 `crates/yield-library/tests/operation_link_contract.rs` exercises a typed **synthetic
 contract matrix** for identity, replay and fences. It is not the production table,
@@ -116,3 +118,28 @@ owner command, journal bridge or physical qualification. Linux can implement and
 all of the storage slice. Native receipt-owner tests on macOS/Windows belong with that
 implementation's scoped platform verification; neither platform run alone qualifies
 physical publication, retirement or power-loss durability.
+
+## Implemented storage boundary (OPT-1644)
+
+`OperationLinkRequest::new` accepts an actual `SourceWriterReceipt` and both frozen
+work keys. It bounds observations before cloning, then owns a validated canonical
+payload. `GlobalLibraryWriter::apply_operation_link` queues it through the retained
+profile worker; the worker checks acquisition before either mutation or replay.
+`operation_link_receipts` stores the composite key, exact payload, versioned hash,
+historical acquisition and sequence. `OperationLinkResult::{Committed, Replayed}`
+returns an immutable correlation receipt. The production API supplies no public
+payload/receipt constructor and no journal completion authority.
+
+The focused actual-owner tests include a real source curation commit, failed global
+transaction, retained source readback and successful global retry; lost global reply,
+duplicate/multiple commands/restart/fresh acquisition; changed payload; SQL rollback;
+malformed/ambiguous retained evidence; and both row and byte budgets with exact replay.
+Budget fillers and isolated payload-bound fixtures are synthetic storage stress input.
+They do not stand in for production source receipts or physical qualification.
+
+OPT-1833 validates the bounded typed writer route. Admitted-family integration and full
+journal context checks remain in the OPT-1341 saga consumers, outside this storage slice.
+Harvest/projection and filesystem/source-retirement evidence remain independent.
+The SQLite connection retains the existing `synchronous=NORMAL` policy; these tests
+prove transactional replay and process reopen, not power-loss durability. Native
+macOS/Windows owner and descriptor-bound SQLite regression remains separately scoped.
