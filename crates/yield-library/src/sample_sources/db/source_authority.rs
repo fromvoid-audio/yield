@@ -784,6 +784,49 @@ pub struct SourceAuthorityRegistration {
 }
 
 impl SourceAuthorityRegistration {
+    // Metadata only: source state is not complete journal/capacity installation evidence.
+    pub(crate) fn registry_reference_observation(
+        &self,
+        database: &SourceDatabase,
+    ) -> Result<
+        super::source_registry_reference::SourceRegistryRegistrationObservation,
+        super::source_registry_reference::SourceRegistryReferenceError,
+    > {
+        use super::source_registry_reference::{
+            SourceRegistryReferenceError as E, SourceRegistryRegistrationObservation,
+            SourceRegistryRegistrationPhase as P,
+        };
+        let lease = database
+            .source_lease
+            .as_ref()
+            .ok_or(E::RegistrationMismatch)?;
+        let retained = self.guard.lease.as_ref().ok_or(E::RegistrationMismatch)?;
+        let binding = database
+            .database_file_binding
+            .as_ref()
+            .ok_or(E::RegistrationMismatch)?;
+        if !Arc::ptr_eq(lease, retained)
+            || self.request.lease_identity != SourceLeaseIdentity::from_lease(lease)
+            || self.request.database_file_identity != binding.identity()
+            || self.request.database_root.identity() != lease.database_root_binding().identity()
+            || self.request.media_root.identity() != lease.media_root_binding().identity()
+        {
+            return Err(E::RegistrationMismatch);
+        }
+        let phase = match self.guard.state.phase() {
+            PREPARED => P::Prepared,
+            REGISTERED => P::RegisteredPhaseObserved,
+            DRAINING => P::Draining,
+            RETIRED => P::Retired,
+            ABANDONED => P::Abandoned,
+            _ => return Err(E::Invalid("registration phase")),
+        };
+        Ok(SourceRegistryRegistrationObservation {
+            registration_id: self.request.registration_id.0,
+            phase,
+        })
+    }
+
     /// Return the source-owner request envelope for one bounded journal registration attempt.
     pub fn journal_request(
         &self,

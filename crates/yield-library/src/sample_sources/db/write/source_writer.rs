@@ -1558,6 +1558,30 @@ impl SourceWriter {
         Ok(fence)
     }
 
+    /// Capture bounded scalar registry metadata. No live registration or effect authority.
+    pub fn capture_registry_reference_observation(
+        &self,
+        registration: Option<&super::super::SourceAuthorityRegistration>,
+    ) -> Result<
+        super::super::SourceRegistryReferenceObservation,
+        super::super::SourceRegistryReferenceError,
+    > {
+        let before = self.current_scan_fence()?;
+        let observation = super::super::source_registry_reference::capture(
+            &self.database,
+            &before,
+            registration,
+        )?;
+        self.validate_scan_fence(&before)?;
+        if let Some(registration) = registration {
+            let after = registration.registry_reference_observation(&self.database)?;
+            if observation.subject().registration() != Some(&after) {
+                return Err(super::super::SourceRegistryReferenceError::ObservationChanged);
+            }
+        }
+        Ok(observation)
+    }
+
     /// Observe a live scan position without asserting completed manifest coverage.
     pub fn current_scan_fence(&self) -> Result<SourceScanFence, SourceWriterError> {
         let profile_guard = self
