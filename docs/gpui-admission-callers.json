@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "issue": "OPT-2003",
+  "checkout_head": "a3e326e829dd8879d5dd42469bc8b90604d9a332",
+  "scope": "crates/**/*.rs production lexical witnesses, including declarations and worker forwarding",
+  "limitations": "No alias/macro/cfg evaluation; no runtime caller or effect proof. Archived reference is excluded.",
+  "production_input_count": 444,
+  "production_input_digest": "4c0f5b2dd867a07c0aa65dc0811843e1e5b49da660c08672b6f48c8c80e0ff69",
+  "excluded_test_inputs": [
+    "crates/reson/src/async_decode/tests.rs",
+    "crates/reson/src/output/tests.rs",
+    "crates/reson/src/player/playback/retarget_progress_tests.rs",
+    "crates/reson/src/player/playback/test_support.rs",
+    "crates/reson/src/source/tests.rs",
+    "crates/reson/src/tests/decode.rs",
+    "crates/reson/src/tests/fade.rs",
+    "crates/reson/src/tests/mod.rs",
+    "crates/reson/src/tests/player.rs",
+    "crates/reson/src/tests/playhead_edges.rs",
+    "crates/reson/src/tests/routing.rs",
+    "crates/reson/src/tests/support.rs",
+    "crates/reson/src/wav_sanitize/riff/tests.rs",
+    "crates/yield-analysis/src/analysis/audio/exact_duplicates/tests.rs",
+    "crates/yield-analysis/src/analysis/audio/normalize/tests.rs",
+    "crates/yield-analysis/src/app_dirs/overrides.rs",
+    "crates/yield-analysis/src/app_dirs/tests.rs",
+    "crates/yield-library/src/app_dirs/tests.rs",
+    "crates/yield-library/src/operation_journal/store/process_tests.rs",
+    "crates/yield-library/src/sample_sources/db/file_ops_journal/tests/copy_recovery.rs",
+    "crates/yield-library/src/sample_sources/db/file_ops_journal/tests/malformed_rows.rs",
+    "crates/yield-library/src/sample_sources/db/file_ops_journal/tests/move_recovery.rs",
+    "crates/yield-library/src/sample_sources/db/file_ops_journal/tests/offline_source_retry.rs",
+    "crates/yield-library/src/sample_sources/db/file_ops_journal/tests/production_finalization.rs",
+    "crates/yield-library/src/sample_sources/db/file_ops_journal/tests.rs",
+    "crates/yield-library/src/sample_sources/db/read/tests.rs",
+    "crates/yield-library/src/sample_sources/db/role_contract_tests.rs",
+    "crates/yield-library/src/sample_sources/db/schema/migrations/tests.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_migration_tests/analysis_jobs.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_migration_tests/contract.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_migration_tests/fixtures.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_migration_tests/index_entries.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_migration_tests/pending_rename.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_migration_tests/samples.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_migration_tests/wav_files.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_migration_tests.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/metadata.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/mod.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/opening/cleanup.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/opening/filenames.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/opening/identity.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/opening/lease_preservation.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/opening/open_roles.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/opening/schema.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/opening/user_library.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/opening.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/readiness.rs",
+    "crates/yield-library/src/sample_sources/db/source_db_mod_tests/snapshot.rs",
+    "crates/yield-library/src/sample_sources/db/tags/tests.rs",
+    "crates/yield-library/src/sample_sources/db/write/tests/command.rs",
+    "crates/yield-library/src/sample_sources/db/write/tests/curation.rs",
+    "crates/yield-library/src/sample_sources/db/write/tests/helpers.rs",
+    "crates/yield-library/src/sample_sources/db/write/tests/mod.rs",
+    "crates/yield-library/src/sample_sources/db/write/tests/remap.rs",
+    "crates/yield-library/src/sample_sources/db/write/tests/replay_bootstrap.rs",
+    "crates/yield-library/src/sample_sources/db/write/tests/revision.rs",
+    "crates/yield-library/src/sample_sources/db/write/tests/rollback.rs",
+    "crates/yield-library/src/sample_sources/db/write/tests/upsert.rs",
+    "crates/yield-library/src/sample_sources/library/telemetry_tests.rs",
+    "crates/yield-library/src/sample_sources/library/tests.rs",
+    "crates/yield-library/src/sample_sources/readiness/tests/classification.rs",
+    "crates/yield-library/src/sample_sources/readiness/tests/mod.rs",
+    "crates/yield-library/src/sample_sources/readiness/tests/persistence.rs",
+    "crates/yield-library/src/sample_sources/readiness/tests/work.rs",
+    "crates/yield-library/src/sample_sources/reconciliation/tests.rs",
+    "crates/yield-scan/src/sample_sources/scanner/scan/tests/basics.rs",
+    "crates/yield-scan/src/sample_sources/scanner/scan/tests/filesystem_edges.rs",
+    "crates/yield-scan/src/sample_sources/scanner/scan/tests/hard_rescan.rs",
+    "crates/yield-scan/src/sample_sources/scanner/scan/tests/index_entries.rs",
+    "crates/yield-scan/src/sample_sources/scanner/scan/tests/rename_reconciliation.rs",
+    "crates/yield-scan/src/sample_sources/scanner/scan/tests/rename_retention.rs",
+    "crates/yield-scan/src/sample_sources/scanner/scan/tests/targeted_sync.rs",
+    "crates/yield-scan/src/sample_sources/scanner/scan/tests/timestamps.rs",
+    "crates/yield-scan/src/sample_sources/scanner/scan/tests.rs"
+  ],
+  "witnesses": [
+    {
+      "path": "crates/yield-library/src/operation_journal/owner.rs",
+      "line": 496,
+      "text": "PreparedAdmissionInput",
+      "sha256": "d7d86385a4f4ce6aa0fe8d210213256dda09d7a72fa2c8c39c9687a56193b584"
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner.rs",
+      "line": 508,
+      "text": "PreparedAdmissionInput",
+      "sha256": "d7d86385a4f4ce6aa0fe8d210213256dda09d7a72fa2c8c39c9687a56193b584"
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner.rs",
+      "line": 1464,
+      "text": "admit_prepared(",
+      "sha256": "d7d86385a4f4ce6aa0fe8d210213256dda09d7a72fa2c8c39c9687a56193b584"
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner.rs",
+      "line": 1466,
+      "text": "PreparedAdmissionInput",
+      "sha256": "d7d86385a4f4ce6aa0fe8d210213256dda09d7a72fa2c8c39c9687a56193b584"
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner.rs",
+      "line": 3316,
+      "text": "PreparedAdmissionInput",
+      "sha256": "d7d86385a4f4ce6aa0fe8d210213256dda09d7a72fa2c8c39c9687a56193b584"
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner.rs",
+      "line": 3807,
+      "text": "admit_full(",
+      "sha256": "d7d86385a4f4ce6aa0fe8d210213256dda09d7a72fa2c8c39c9687a56193b584"
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner.rs",
+      "line": 3836,
+      "text": "admit_prepared(",
+      "sha256": "d7d86385a4f4ce6aa0fe8d210213256dda09d7a72fa2c8c39c9687a56193b584"
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner.rs",
+      "line": 3838,
+      "text": "PreparedAdmissionInput",
+      "sha256": "d7d86385a4f4ce6aa0fe8d210213256dda09d7a72fa2c8c39c9687a56193b584"
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner.rs",
+      "line": 4311,
+      "text": "PreparedAdmissionInput",
+      "sha256": "d7d86385a4f4ce6aa0fe8d210213256dda09d7a72fa2c8c39c9687a56193b584"
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner.rs",
+      "line": 4588,
+      "text": "PreparedAdmissionInput",
+      "sha256": "d7d86385a4f4ce6aa0fe8d210213256dda09d7a72fa2c8c39c9687a56193b584"
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner.rs",
+      "line": 5017,
+      "text": "admit_prepared(",
+      "sha256": "d7d86385a4f4ce6aa0fe8d210213256dda09d7a72fa2c8c39c9687a56193b584"
+    }
+  ]
+}
