@@ -1284,6 +1284,31 @@ mod fixtures {
                     ReadinessClassification::Current
                 );
             }
+            // Actual rename/missing owner fixture also runs the maintenance route. Missing
+            // membership is retained evidence, while renamed identity/content remains current.
+            if missing {
+                writer
+                    .prepare_feature_readiness_target(
+                        &revision,
+                        Path::new("two.wav"),
+                        42,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                writer
+                    .prune_superseded_feature_artifacts(
+                        &revision,
+                        None,
+                        64,
+                        &AtomicBool::new(false)
+                    )
+                    .unwrap()
+                    .removed,
+                0
+            );
+            assert_eq!(feature_owner_counts(&writer), (1, 1));
         }
     }
 
@@ -1639,5 +1664,676 @@ mod fixtures {
             );
             assert_eq!(writer.catalog_database().connection.query_row("SELECT count(*) FROM analysis_jobs WHERE readiness_stage='analysis_features' AND status='done'",[],|r|r.get::<_,i64>(0)).unwrap(),2);
         }
+    }
+    fn feature_owner_counts(writer: &SourceWriter) -> (i64, i64) {
+        writer.catalog_database().connection.query_row(
+            "SELECT (SELECT count(*) FROM source_feature_artifacts),(SELECT count(*) FROM source_feature_reverse_owners)",
+            [], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).unwrap()
+    }
+    fn supersede_feature(
+        f: &CurationFixture,
+        writer: &mut SourceWriter,
+        target: &ReadinessTarget,
+    ) -> ReadinessTarget {
+        let bytes = b"actual superseding feature input";
+        std::fs::write(f._source.path().join("one.wav"), bytes).unwrap();
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let mut batch = writer.catalog_database().write_batch().unwrap();
+        batch
+            .upsert_file_with_hash(Path::new("one.wav"), bytes.len() as u64, 3, &hash)
+            .unwrap();
+        batch
+            .set_file_identity(Path::new("one.wav"), Some(&target.scope_id))
+            .unwrap();
+        batch.commit().unwrap();
+        audit_current_manifest(f, writer);
+        publish(writer)
+    }
+    #[test]
+    fn feature_inverse_actual_publication_and_selective_prune_preserve_readiness_and_restart() {
+        let (f, mut writer) = setup();
+        let old = publish(&mut writer);
+        let old_key = complete_feature(&mut writer, &old, 31);
+        let revision = writer.current_revision().unwrap();
+        let other = writer
+            .prepare_feature_readiness_target(
+                &revision,
+                Path::new("two.wav"),
+                33,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let other_key = complete_feature(&mut writer, &other, 34);
+        assert_eq!(feature_owner_counts(&writer), (2, 2));
+        let unchanged = writer
+            .prune_superseded_feature_artifacts(&revision, None, 64, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!((unchanged.observed, unchanged.removed), (2, 0));
+        let fresh = supersede_feature(&f, &mut writer, &old);
+        let fresh_key = complete_feature(&mut writer, &fresh, 41);
+        let revision = writer.current_revision().unwrap();
+        let readiness_before = counts(&writer);
+        let page = writer
+            .prune_superseded_feature_artifacts(&revision, None, 64, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(
+            (
+                page.observed,
+                page.removed,
+                page.logical_payload_bytes_removed
+            ),
+            (3, 1, 732)
+        );
+        assert!(page.next.is_none());
+        assert_eq!(counts(&writer), readiness_before);
+        assert_eq!(feature_owner_counts(&writer), (2, 2));
+        assert!(
+            writer
+                .lookup_feature_artifact(&revision, &fresh_key)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            writer
+                .lookup_feature_artifact(&revision, &other_key)
+                .unwrap()
+                .is_some()
+        );
+        let absent: bool = writer
+            .catalog_database()
+            .connection
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM source_feature_artifacts WHERE artifact_ref=?1)",
+                [old_key.reference()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(absent);
+        drop(writer);
+        let db = SourceDatabase::open_for_source_write_with_profile_guard(
+            f._source.path(),
+            &f.profile_guard,
+            &f.profile_guard
+                .profile_root()
+                .join("curation-profile-bound"),
+        )
+        .unwrap();
+        let mut writer =
+            SourceWriter::new(db, SourceId::from_string("manifest-features"), 8).unwrap();
+        assert_eq!(feature_owner_counts(&writer), (2, 2));
+        let current = writer.current_revision().unwrap();
+        assert!(
+            writer
+                .lookup_feature_artifact(&current, &fresh_key)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            writer
+                .prune_superseded_feature_artifacts(&revision, None, 64, &AtomicBool::new(false))
+                .is_err()
+        );
+    }
+    #[test]
+    fn feature_inverse_legacy_adoption_is_exact_and_conflicting_descriptor_rolls_back() {
+        for conflict in [false, true] {
+            let (_f, mut writer) = setup();
+            let target = publish(&mut writer);
+            let key = complete_feature(&mut writer, &target, 31);
+            let revision = writer.current_revision().unwrap();
+            let c = &writer.catalog_database().connection;
+            if conflict {
+                c.execute(
+                    "UPDATE source_feature_reverse_owners SET file_identity='foreign-identity'",
+                    [],
+                )
+                .unwrap();
+            } else {
+                c.execute("DELETE FROM source_feature_reverse_owners", [])
+                    .unwrap();
+            }
+            assert_eq!(
+                writer
+                    .prune_superseded_feature_artifacts(
+                        &revision,
+                        None,
+                        64,
+                        &AtomicBool::new(false)
+                    )
+                    .unwrap()
+                    .removed,
+                0
+            );
+            writer
+                .inject_feature_artifact_fixture_fault(
+                    &revision,
+                    &target,
+                    crate::sample_sources::readiness::FeatureArtifactFixtureFault::MissingMarker,
+                )
+                .unwrap();
+            writer
+                .admit_feature_artifact_rebuild(&revision, &target, 33, &AtomicBool::new(false))
+                .unwrap();
+            let claim = writer
+                .claim_feature_artifact(&revision, &target, 34, 100)
+                .unwrap()
+                .unwrap();
+            let result = writer.publish_feature_artifact(
+                &revision,
+                &claim,
+                &FeatureArtifactPayload::from_v1_vector(&[0.5; 183]).unwrap(),
+                35,
+                &AtomicBool::new(false),
+            );
+            if conflict {
+                assert!(result.is_err());
+                assert!(
+                    writer
+                        .lookup_feature_artifact_for_target(&revision, &target)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    FeatureArtifactPublication::Recorded(_)
+                ));
+                assert_eq!(feature_owner_counts(&writer), (1, 1));
+                assert!(
+                    writer
+                        .lookup_feature_artifact(&revision, &key)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
+    }
+    #[test]
+    fn feature_inverse_cancellation_cursor_foreign_owner_and_stale_revision_preserve_payloads() {
+        let (f, mut writer) = setup();
+        let target = publish(&mut writer);
+        complete_feature(&mut writer, &target, 31);
+        let revision = writer.current_revision().unwrap();
+        let other = writer
+            .prepare_feature_readiness_target(
+                &revision,
+                Path::new("two.wav"),
+                33,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        complete_feature(&mut writer, &other, 34);
+        for limit in [0, 65, u32::MAX] {
+            assert!(
+                writer
+                    .prune_superseded_feature_artifacts(
+                        &revision,
+                        None,
+                        limit,
+                        &AtomicBool::new(false)
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            writer
+                .prune_superseded_feature_artifacts(&revision, None, 64, &AtomicBool::new(true))
+                .is_err()
+        );
+        let first = writer
+            .prune_superseded_feature_artifacts(&revision, None, 1, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!((first.observed, first.removed), (1, 0));
+        let cursor = first.next.unwrap();
+        let second = writer
+            .prune_superseded_feature_artifacts(
+                &revision,
+                Some(&cursor),
+                1,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!((second.observed, second.removed), (1, 0));
+        assert!(second.next.is_none());
+        let (_other_f, mut foreign) = setup();
+        let foreign_revision = foreign.current_revision().unwrap();
+        assert!(
+            foreign
+                .prune_superseded_feature_artifacts(
+                    &foreign_revision,
+                    Some(&cursor),
+                    1,
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+        );
+        supersede_feature(&f, &mut writer, &target);
+        let current = writer.current_revision().unwrap();
+        assert!(
+            writer
+                .prune_superseded_feature_artifacts(&revision, None, 64, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert!(
+            writer
+                .prune_superseded_feature_artifacts(
+                    &current,
+                    Some(&cursor),
+                    1,
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+        );
+        assert_eq!(feature_owner_counts(&writer), (2, 2));
+    }
+    #[test]
+    fn feature_inverse_prune_retains_ambiguous_and_active_evidence_and_trigger_failure_rolls_back()
+    {
+        for fault in [
+            "legacy",
+            "wrong_descriptor",
+            "bad_digest",
+            "unknown_hash",
+            "missing",
+            "current_alias",
+            "unknown_control",
+            "foreign_control",
+            "running",
+            "offline",
+            "trigger",
+        ] {
+            let (f, mut writer) = setup();
+            let target = publish(&mut writer);
+            complete_feature(&mut writer, &target, 31);
+            supersede_feature(&f, &mut writer, &target);
+            let revision = writer.current_revision().unwrap();
+            let connection = &writer.catalog_database().connection;
+            match fault {
+                "legacy" => {
+                    connection
+                        .execute("DELETE FROM source_feature_reverse_owners", [])
+                        .unwrap();
+                }
+                "wrong_descriptor" => {
+                    connection
+                        .execute(
+                            "UPDATE source_feature_reverse_owners SET content_generation=?1",
+                            ["a".repeat(64)],
+                        )
+                        .unwrap();
+                }
+                "bad_digest" => {
+                    connection
+                        .execute(
+                            "UPDATE source_feature_artifacts SET digest=zeroblob(32)",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "unknown_hash" => {
+                    connection
+                        .execute(
+                            "UPDATE wav_files SET content_hash=NULL WHERE path='one.wav'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "missing" => {
+                    connection
+                        .execute("UPDATE wav_files SET missing=1 WHERE path='one.wav'", [])
+                        .unwrap();
+                }
+                "current_alias" => {
+                    // Retained SQL observations may contain an old alias while a different
+                    // path has newer content. Neither name supplies an absence proof.
+                    connection.execute("UPDATE wav_files SET file_identity=?1,content_hash=?2 WHERE path='two.wav'",rusqlite::params![target.scope_id,target.content_generation]).unwrap();
+                }
+                "running" | "unknown_control" | "foreign_control" => {
+                    connection.execute("INSERT INTO analysis_jobs(sample_id,source_id,job_type,status,created_at,readiness_managed,readiness_scope_kind,readiness_scope_id,readiness_stage,artifact_version,source_generation,content_generation,lease_expires_at,readiness_claim_generation) VALUES (?1,?2,'readiness_analysis_features_v1','running',30,1,'file',?1,'analysis_features',?3,?4,?5,9999,1)",rusqlite::params![target.scope_id,target.source_id,target.required_version,target.source_generation,target.content_generation]).unwrap();
+                    if fault == "unknown_control" {
+                        connection
+                            .execute(
+                                "UPDATE analysis_jobs SET artifact_version=NULL,status='done'",
+                                [],
+                            )
+                            .unwrap();
+                    }
+                    if fault == "foreign_control" {
+                        connection
+                            .execute(
+                                "UPDATE analysis_jobs SET source_id='foreign-source',status='done'",
+                                [],
+                            )
+                            .unwrap();
+                    }
+                }
+                "offline" => {
+                    connection
+                        .execute(
+                            "UPDATE source_readiness_sources SET availability='offline'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "trigger" => {
+                    connection.execute_batch("CREATE TRIGGER refuse_feature_prune BEFORE DELETE ON source_feature_reverse_owners BEGIN SELECT RAISE(ABORT,'retained inverse'); END;").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = feature_owner_counts(&writer);
+            let result = writer.prune_superseded_feature_artifacts(
+                &revision,
+                None,
+                64,
+                &AtomicBool::new(false),
+            );
+            if matches!(fault, "offline" | "trigger") {
+                assert!(result.is_err(), "{fault}");
+            } else {
+                assert_eq!(result.unwrap().removed, 0, "{fault}");
+            }
+            assert_eq!(feature_owner_counts(&writer), before, "{fault}");
+        }
+    }
+    #[test]
+    fn feature_inverse_publication_capacity_and_trigger_rejection_roll_back_completion() {
+        for full in [false, true] {
+            let (_f, mut writer) = setup();
+            let target = publish(&mut writer);
+            let revision = writer.current_revision().unwrap();
+            writer
+                .admit_feature_artifact_rebuild(&revision, &target, 31, &AtomicBool::new(false))
+                .unwrap();
+            let claim = writer
+                .claim_feature_artifact(&revision, &target, 32, 100)
+                .unwrap()
+                .unwrap();
+            if full {
+                writer.catalog_database().connection.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<4096) INSERT INTO source_feature_reverse_owners SELECT printf('%064d',i),'legacy-source',printf('legacy-file-%d',i),printf('%064d',i),'features-v1' FROM n;").unwrap();
+            } else {
+                writer.catalog_database().connection.execute_batch("CREATE TRIGGER refuse_feature_inverse BEFORE INSERT ON source_feature_reverse_owners BEGIN SELECT RAISE(ABORT,'retain publication'); END;").unwrap();
+            }
+            let before = counts(&writer);
+            let result = writer.publish_feature_artifact(
+                &revision,
+                &claim,
+                &FeatureArtifactPayload::from_v1_vector(&[0.5; 183]).unwrap(),
+                33,
+                &AtomicBool::new(false),
+            );
+            assert!(result.is_err());
+            assert_eq!(counts(&writer), before);
+            assert_eq!(
+                feature_owner_counts(&writer),
+                (0, if full { 4096 } else { 0 })
+            );
+            assert!(
+                writer
+                    .lookup_feature_artifact_for_target(&revision, &target)
+                    .unwrap()
+                    .is_none()
+            );
+            if full {
+                writer
+                    .catalog_database()
+                    .connection
+                    .execute("DELETE FROM source_feature_reverse_owners", [])
+                    .unwrap();
+            } else {
+                writer
+                    .catalog_database()
+                    .connection
+                    .execute_batch("DROP TRIGGER refuse_feature_inverse")
+                    .unwrap();
+            }
+            assert!(matches!(
+                writer
+                    .publish_feature_artifact(
+                        &revision,
+                        &claim,
+                        &FeatureArtifactPayload::from_v1_vector(&[0.5; 183]).unwrap(),
+                        34,
+                        &AtomicBool::new(false)
+                    )
+                    .unwrap(),
+                FeatureArtifactPublication::Recorded(_)
+            ));
+            assert_eq!(feature_owner_counts(&writer), (1, 1));
+        }
+    }
+    #[test]
+    fn feature_inverse_candidate_pages_and_alias_evidence_are_bounded() {
+        let (f, mut writer) = setup();
+        let target = publish(&mut writer);
+        complete_feature(&mut writer, &target, 31);
+        let revision = writer.current_revision().unwrap();
+        // Ambiguous legacy payloads are real retained rows, not pruning authorization.
+        writer.catalog_database().connection.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<64) INSERT INTO source_feature_artifacts SELECT printf('%064x',i),printf('legacy:%d',i),zeroblob(732),zeroblob(32),1 FROM n;").unwrap();
+        let first = writer
+            .prune_superseded_feature_artifacts(&revision, None, 64, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!((first.observed, first.removed), (64, 0));
+        let second = writer
+            .prune_superseded_feature_artifacts(
+                &revision,
+                first.next.as_ref(),
+                64,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!((second.observed, second.removed), (1, 0));
+        assert!(second.next.is_none());
+        let fresh = supersede_feature(&f, &mut writer, &target);
+        let current = writer.current_revision().unwrap();
+        writer.catalog_database().connection.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<65) INSERT INTO wav_files(path,file_size,modified_ns,file_identity,content_hash) SELECT printf('retained-alias-%d.wav',i),1,1,?1,?2 FROM n",rusqlite::params![target.scope_id,fresh.content_generation]).unwrap();
+        let first = writer
+            .prune_superseded_feature_artifacts(&current, None, 64, &AtomicBool::new(false))
+            .unwrap();
+        let second = writer
+            .prune_superseded_feature_artifacts(
+                &current,
+                first.next.as_ref(),
+                64,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(first.removed + second.removed, 0);
+        assert_eq!(feature_owner_counts(&writer), (65, 1));
+    }
+    #[test]
+    fn feature_inverse_cancellation_and_elapsed_sql_work_roll_back_after_delete_and_retry() {
+        for elapsed in [false, true] {
+            let (f, mut writer) = setup();
+            let target = publish(&mut writer);
+            complete_feature(&mut writer, &target, 31);
+            supersede_feature(&f, &mut writer, &target);
+            let current = writer.current_revision().unwrap();
+            let cancel = std::sync::Arc::new(AtomicBool::new(false));
+            let flag = cancel.clone();
+            // Test-only fault in the actual retained SQL command, not a clock/grant input.
+            writer.catalog_database().connection.authorizer(Some(
+                move |context: rusqlite::hooks::AuthContext<'_>| {
+                    if matches!(
+                        context.action,
+                        rusqlite::hooks::AuthAction::Delete {
+                            table_name: "source_feature_artifacts"
+                        }
+                    ) {
+                        if elapsed {
+                            std::thread::sleep(std::time::Duration::from_millis(2100));
+                        } else {
+                            flag.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    rusqlite::hooks::Authorization::Allow
+                },
+            ));
+            let result = writer.prune_superseded_feature_artifacts(&current, None, 64, &cancel);
+            assert!(matches!(
+                result,
+                Err(SourceWriterError::Readiness(
+                    crate::sample_sources::readiness::ReadinessError::Cancelled
+                        | crate::sample_sources::readiness::ReadinessError::AdmissionBudget(_)
+                ))
+            ));
+            assert_eq!(feature_owner_counts(&writer), (1, 1));
+            writer.catalog_database().connection.authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            );
+            cancel.store(false, std::sync::atomic::Ordering::Release);
+            assert_eq!(
+                writer
+                    .prune_superseded_feature_artifacts(&current, None, 64, &cancel)
+                    .unwrap()
+                    .removed,
+                1
+            );
+        }
+    }
+    #[test]
+    fn feature_inverse_cancellation_during_final_audit_rolls_back_before_commit() {
+        let (f, mut writer) = setup();
+        let target = publish(&mut writer);
+        complete_feature(&mut writer, &target, 31);
+        supersede_feature(&f, &mut writer, &target);
+        let current = writer.current_revision().unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let deleting = std::sync::Arc::new(AtomicBool::new(false));
+        let phase = deleting.clone();
+        writer.catalog_database().connection.authorizer(Some(
+            move |context: rusqlite::hooks::AuthContext<'_>| {
+                match context.action {
+                    rusqlite::hooks::AuthAction::Delete {
+                        table_name: "source_feature_artifacts",
+                    } => phase.store(true, std::sync::atomic::Ordering::Release),
+                    rusqlite::hooks::AuthAction::Read {
+                        table_name: "metadata",
+                        ..
+                    } if phase.load(std::sync::atomic::Ordering::Acquire) => {
+                        flag.store(true, std::sync::atomic::Ordering::Release)
+                    }
+                    _ => {}
+                }
+                rusqlite::hooks::Authorization::Allow
+            },
+        ));
+        let result = writer.prune_superseded_feature_artifacts(&current, None, 64, &cancel);
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(matches!(
+            result,
+            Err(SourceWriterError::Readiness(
+                crate::sample_sources::readiness::ReadinessError::Cancelled
+            ))
+        ));
+        assert_eq!(feature_owner_counts(&writer), (1, 1));
+        writer.catalog_database().connection.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
+        cancel.store(false, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            writer
+                .prune_superseded_feature_artifacts(&current, None, 64, &cancel)
+                .unwrap()
+                .removed,
+            1
+        );
+    }
+    #[test]
+    fn feature_inverse_retained_hard_wal_blocks_delete_but_allows_readonly_retention_then_retry() {
+        let (f, mut writer) = setup();
+        let target = publish(&mut writer);
+        complete_feature(&mut writer, &target, 31);
+        let current = writer.current_revision().unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            &writer.catalog_database().db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM source_feature_artifacts")
+            .unwrap();
+        writer
+            .catalog_database()
+            .connection
+            .execute(
+                "INSERT INTO metadata(key,value) VALUES ('feature-prune-pressure',zeroblob(?1))",
+                [crate::WAL_HARD_WATERMARK_BYTES as i64],
+            )
+            .unwrap();
+        assert_eq!(
+            writer
+                .prune_superseded_feature_artifacts(&current, None, 64, &AtomicBool::new(false))
+                .unwrap()
+                .removed,
+            0
+        );
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        writer
+            .catalog_database()
+            .connection
+            .execute(
+                "DELETE FROM metadata WHERE key='feature-prune-pressure'",
+                [],
+            )
+            .unwrap();
+        writer
+            .catalog_database()
+            .connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        supersede_feature(&f, &mut writer, &target);
+        let current = writer.current_revision().unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            &writer.catalog_database().db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM source_feature_artifacts")
+            .unwrap();
+        writer
+            .catalog_database()
+            .connection
+            .execute(
+                "INSERT INTO metadata(key,value) VALUES ('feature-prune-pressure',zeroblob(?1))",
+                [crate::WAL_HARD_WATERMARK_BYTES as i64],
+            )
+            .unwrap();
+        let before = counts(&writer);
+        assert!(matches!(
+            writer.prune_superseded_feature_artifacts(&current, None, 64, &AtomicBool::new(false)),
+            Err(SourceWriterError::Readiness(
+                crate::sample_sources::readiness::ReadinessError::WalAdmission(
+                    crate::WalAdmissionError::HardWatermark { .. }
+                )
+            ))
+        ));
+        assert_eq!(feature_owner_counts(&writer), (1, 1));
+        assert_eq!(counts(&writer), before);
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        writer
+            .catalog_database()
+            .connection
+            .execute(
+                "DELETE FROM metadata WHERE key='feature-prune-pressure'",
+                [],
+            )
+            .unwrap();
+        writer
+            .catalog_database()
+            .connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        assert_eq!(
+            writer
+                .prune_superseded_feature_artifacts(&current, None, 64, &AtomicBool::new(false))
+                .unwrap()
+                .removed,
+            1
+        );
     }
 }

@@ -9,6 +9,8 @@ use super::super::{SourceReferenceFence, SourceReferenceFenceError};
 mod snapshot_metrics;
 pub use snapshot_metrics::SourceSnapshotQueueMetrics;
 use snapshot_metrics::{SnapshotCounters, SnapshotSender};
+mod feature_maintenance;
+pub use feature_maintenance::{FeaturePruneCursor, FeaturePrunePage};
 mod feature_metrics;
 pub use feature_metrics::SourceFeaturePublicationMetrics;
 mod feature_rebuild_metrics;
