@@ -50,7 +50,7 @@ cargo check --locked -p yield
 python scripts/internal/check/check_gpui_owner_boundary.py
 python scripts/internal/check/check_source_db_competing_writers.py
 python scripts/internal/check/check_filesystem_producers.py
-python scripts/internal/check/check_gpui_action_register.py
+python scripts/internal/check/check_gpui_action_register.py --check
 ```
 
 The supervisor fixture tests typed classification using explicitly synthetic
