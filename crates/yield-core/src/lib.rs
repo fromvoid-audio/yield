@@ -21,6 +21,7 @@ mod random_audition;
 mod random_navigation;
 mod rating;
 mod rating_filter;
+mod release_identity;
 mod sample_name;
 mod selection;
 mod tag_category;
@@ -59,6 +60,7 @@ pub use random_audition::{RandomAuditionUnits, random_audition_span_for_units};
 pub use random_navigation::RandomNavigationState;
 pub use rating::{MAX_RATING, MIN_RATING, RatingState, RatingTransition, next_rating_state};
 pub use rating_filter::{RATING_FILTER_LEVELS, RatingFilter};
+pub use release_identity::{ReleaseBuildIdentity, ReleaseChannel, ReleaseIdentityError};
 pub use sample_name::{SampleNameViewMode, sample_display_name};
 pub use selection::BrowserSelection;
 pub use tag_category::{
