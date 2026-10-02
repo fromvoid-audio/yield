@@ -25,6 +25,8 @@ impl FeatureAnalysisCancellation {
 /// Bounded reason why one feature request cannot report ready.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeatureAnalysisBlocker {
+    /// Atomic preparation exceeded its bounded work admission; previous evidence is retained.
+    AdmissionBudget,
     /// Required source owner, lifecycle, root or revision no longer matches.
     StaleSource,
     /// Source target admission lacks current full hash/identity/audit or exceeds its bounds.
@@ -46,6 +48,7 @@ impl FeatureAnalysisBlocker {
     /// User-facing explanation of this request's blocked state.
     pub fn message(self) -> &'static str {
         match self {
+            Self::AdmissionBudget => "Feature preparation reached its work limit; try again",
             Self::StaleSource => "The source changed; refresh and try again",
             Self::TargetUnavailable => "The audited source is not available for this request",
             Self::UnsupportedPlatform => "Analysis input is unavailable on this platform",
@@ -184,6 +187,16 @@ pub(super) fn request(
         &token,
     ) {
         Ok(target) => target,
+        Err(SourceWriterError::Readiness(
+            yield_library::sample_sources::readiness::ReadinessError::AdmissionBudget(_),
+        )) => {
+            emit(
+                reservation,
+                source,
+                blocked(FeatureAnalysisBlocker::AdmissionBudget),
+            );
+            return;
+        }
         Err(_) => {
             emit(
                 reservation,

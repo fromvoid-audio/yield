@@ -406,6 +406,37 @@ impl<'connection> ReadinessStore<'connection> {
         )
     }
 
+    /// Internal whole-manifest publication under the original retained writer/audit fence.
+    /// Only bounded pages are resident; failure rolls back the single visible generation.
+    pub(crate) fn publish_streamed_feature_manifest(
+        &mut self,
+        fence: &crate::sample_sources::db::SourceReferenceFence,
+        relative_path: &std::path::Path,
+        updated_at: i64,
+        cancel: &AtomicBool,
+        checkpoint: &mut dyn FnMut(usize),
+    ) -> Result<ReadinessTarget, ReadinessError> {
+        let origin = self.capture_publication_origin()?;
+        persistence::publish(
+            self.connection,
+            &self.ownership,
+            &origin,
+            fence,
+            relative_path,
+            updated_at,
+            cancel,
+            checkpoint,
+        )
+        .map_err(|error| match error {
+            ReadinessError::Sql(rusqlite::Error::SqliteFailure(ref failure, _))
+                if failure.code == rusqlite::ErrorCode::OperationInterrupted =>
+            {
+                ReadinessError::AdmissionBudget("elapsed SQLite work")
+            }
+            other => other,
+        })
+    }
+
     /// Apply a bounded readiness target delta or request a complete fallback publication.
     pub fn publish_target_delta_with_cancel(
         &mut self,

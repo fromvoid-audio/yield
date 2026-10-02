@@ -344,4 +344,39 @@ mod fixtures {
         assert_eq!(counts(&f, &source), (0, 0));
         service.shutdown();
     }
+    #[test]
+    fn feature_request_large_real_scanner_manifest_streams_complete_matrix_and_computes_real_payload()
+     {
+        let f = Fixture::new("large-production-feature-request");
+        for i in 0..300 {
+            write_test_wav(
+                &f.root.path().join(format!("tone-{i:04}.wav")),
+                16_000,
+                16_000,
+            );
+        }
+        write_test_wav(&f.root.path().join("tone.wav"), 16_000, 16_000);
+        let source = SourceId::from_string("large-production-feature-request");
+        let service = CatalogService::start(&f.guard).unwrap();
+        let snapshot = register_and_audit(&service, f.root.path(), &source);
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision,
+                1,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        preparation(&service, 1, true);
+        assert_eq!(state(&service, 1), FeatureAnalysisState::Queued);
+        assert_eq!(state(&service, 1), FeatureAnalysisState::Running);
+        assert!(matches!(
+            state(&service, 1),
+            FeatureAnalysisState::Ready { .. }
+        ));
+        assert_eq!(counts(&f, &source), (1, 1));
+        let (targets,indexes):(i64,i64)=observer(&f,&source).query_row("SELECT (SELECT count(*) FROM source_readiness_targets),(SELECT count(*) FROM source_readiness_artifacts WHERE stage='indexed_identity')",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((targets, indexes), (904, 301));
+        service.shutdown();
+    }
 }

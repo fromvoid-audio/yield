@@ -1,7 +1,9 @@
+mod streamed_manifest;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::atomic::{AtomicBool, Ordering},
 };
+pub(super) use streamed_manifest::publish;
 
 use blake3::Hasher;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};

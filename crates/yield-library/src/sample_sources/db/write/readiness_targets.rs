@@ -28,6 +28,91 @@ impl SourceWriter {
     /// Maximum combined manifest path/identity/content bytes before target construction.
     pub const FEATURE_READINESS_MAX_INPUT_BYTES: usize = 128 * 1024;
 
+    /// Publish current audited targets, using bounded streaming when small-source admission
+    /// exceeds its row/text budget. Both paths preserve the complete-matrix atomic contract.
+    pub fn prepare_feature_readiness_target(
+        &mut self,
+        expected: &SourceRevision,
+        relative_path: &Path,
+        now: i64,
+        cancel: &AtomicBool,
+    ) -> Result<ReadinessTarget, SourceWriterError> {
+        match self.prepare_bounded_feature_readiness_target(expected, relative_path, now, cancel) {
+            Err(SourceWriterError::InvalidRequest(
+                "feature manifest row limit" | "feature manifest byte limit",
+            )) => {
+                self.prepare_streamed_feature_readiness_target(expected, relative_path, now, cancel)
+            }
+            result => result,
+        }
+    }
+
+    /// Stream a complete source generation from 64-row/128-KiB owner-held pages.
+    /// At most 16,384 files and two seconds of SQLite work are admitted per atomic attempt;
+    /// over-budget/cancelled/stale attempts retain the prior visible generation for retry.
+    pub fn prepare_streamed_feature_readiness_target(
+        &mut self,
+        expected: &SourceRevision,
+        relative_path: &Path,
+        now: i64,
+        cancel: &AtomicBool,
+    ) -> Result<ReadinessTarget, SourceWriterError> {
+        self.stream_feature_readiness_with_checkpoint(
+            expected,
+            relative_path,
+            now,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stream_feature_readiness_with_checkpoint_for_test(
+        &mut self,
+        expected: &SourceRevision,
+        relative_path: &Path,
+        now: i64,
+        cancel: &AtomicBool,
+        checkpoint_fn: &mut dyn FnMut(usize),
+    ) -> Result<ReadinessTarget, SourceWriterError> {
+        self.stream_feature_readiness_with_checkpoint(
+            expected,
+            relative_path,
+            now,
+            cancel,
+            checkpoint_fn,
+        )
+    }
+
+    fn stream_feature_readiness_with_checkpoint(
+        &mut self,
+        expected: &SourceRevision,
+        relative_path: &Path,
+        now: i64,
+        cancel: &AtomicBool,
+        checkpoint_fn: &mut dyn FnMut(usize),
+    ) -> Result<ReadinessTarget, SourceWriterError> {
+        checkpoint(cancel)?;
+        self.validate_readiness_revision(expected)?;
+        let fence = self
+            .reference_read_fence()
+            .map_err(|_| SourceWriterError::StaleFence)?;
+        if fence.source_revision() != expected {
+            return Err(SourceWriterError::StaleFence);
+        }
+        RootRelativePath::try_from_path(relative_path.to_path_buf())
+            .map_err(|_| SourceWriterError::InvalidRequest("invalid feature target path"))?;
+        if relative_path.to_str().is_none_or(|p| p.len() > 1024) {
+            return Err(SourceWriterError::InvalidRequest(
+                "feature target path limit",
+            ));
+        }
+        Ok(self
+            .database
+            .readiness_store()?
+            .publish_streamed_feature_manifest(&fence, relative_path, now, cancel, checkpoint_fn)?)
+    }
+
     /// Publish the complete bounded manifest matrix and return one owner-derived WAV target.
     ///
     /// Requires a current complete audit, stable manifest identities and full BLAKE3 hashes.
@@ -37,7 +122,7 @@ impl SourceWriter {
     /// The caller queues the returned feature target through `enqueue_readiness_jobs`; a crash
     /// between publication and that command can retry this publication without losing evidence.
     /// An incompatible existing readiness contract is rejected, never silently replaced.
-    pub fn prepare_feature_readiness_target(
+    pub(crate) fn prepare_bounded_feature_readiness_target(
         &mut self,
         expected: &SourceRevision,
         relative_path: &Path,

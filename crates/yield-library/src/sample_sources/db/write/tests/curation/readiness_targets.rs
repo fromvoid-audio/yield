@@ -274,7 +274,7 @@ mod fixtures {
                     rusqlite::params![name, format!("extra-{i}"), "a".repeat(64)]).unwrap();
             }
             let error = writer
-                .prepare_feature_readiness_target(
+                .prepare_bounded_feature_readiness_target(
                     &revision,
                     Path::new("one.wav"),
                     30,
@@ -409,5 +409,316 @@ mod fixtures {
             ))
         ));
         assert_eq!(counts(&writer), (7, 2, 1));
+    }
+    // These extra rows exercise owned SQLite admission, not physical file/engine qualification.
+    // The selected one.wav retains its real fixture identity and bytes; a catalog test separately
+    // exercises a large manifest produced by the actual scanner and real WAV feature engine.
+    fn grow_manifest(
+        f: &CurationFixture,
+        writer: SourceWriter,
+        count: usize,
+        long_paths: bool,
+    ) -> SourceWriter {
+        let db = writer.into_catalog_database();
+        let mut batch = db.write_batch().unwrap();
+        for i in 0..count {
+            let path = if long_paths {
+                format!(
+                    "{}/{}/{}/extra-{i:05}.wav",
+                    "p".repeat(200),
+                    "q".repeat(200),
+                    "r".repeat(200)
+                )
+            } else {
+                format!("extra-{i:05}.wav")
+            };
+            batch
+                .upsert_file_with_hash(
+                    Path::new(&path),
+                    1,
+                    1,
+                    &blake3::hash(path.as_bytes()).to_hex().to_string(),
+                )
+                .unwrap();
+            batch
+                .set_file_identity(Path::new(&path), Some(&format!("extra-identity-{i:05}")))
+                .unwrap();
+        }
+        batch.commit().unwrap();
+        db.begin_source_directory_truth_generation(3, 0).unwrap();
+        db.write_batch()
+            .unwrap()
+            .commit_manifest_audit_with_staged_directory_truth(
+                3,
+                db.get_revision().unwrap(),
+                40,
+                f.root_identity.clone(),
+                None,
+            )
+            .unwrap();
+        SourceWriter::new(db, SourceId::from_string("manifest-features"), 7).unwrap()
+    }
+    fn stream(
+        writer: &mut SourceWriter,
+        cancel: &AtomicBool,
+        callback: &mut dyn FnMut(usize),
+    ) -> Result<ReadinessTarget, SourceWriterError> {
+        let revision = writer.current_revision().unwrap();
+        writer.stream_feature_readiness_with_checkpoint_for_test(
+            &revision,
+            Path::new("one.wav"),
+            50,
+            cancel,
+            callback,
+        )
+    }
+    #[test]
+    fn streamed_manifest_readiness_exceeds_small_bounds_and_preserves_unchanged_real_payload() {
+        let (f, mut writer) = setup();
+        let target = publish(&mut writer);
+        let revision = writer.current_revision().unwrap();
+        writer
+            .enqueue_readiness_jobs(
+                &revision,
+                &[ReadinessDeficit {
+                    target: target.clone(),
+                    reason: ReadinessClassification::Pending,
+                    enqueued_at: None,
+                }],
+                30,
+            )
+            .unwrap();
+        let claim = writer
+            .claim_feature_artifact(&revision, &target, 31, 100)
+            .unwrap()
+            .unwrap();
+        let payload = FeatureArtifactPayload::from_v1_vector(&vec![0.5; 183]).unwrap();
+        writer
+            .publish_feature_artifact(&revision, &claim, &payload, 32, &AtomicBool::new(false))
+            .unwrap();
+        let mut writer = grow_manifest(&f, writer, 1024, true);
+        let began = std::time::Instant::now();
+        let mut pages = Vec::new();
+        let mut peak_input_bytes = 0i64;
+        let current = stream(&mut writer, &AtomicBool::new(false), &mut |files| {
+            let previous=pages.last().copied().unwrap_or(0);
+            let bytes:i64=f.database.connection.query_row(
+                "SELECT sum(input_bytes) FROM (SELECT length(CAST(path AS BLOB))+length(CAST(file_identity AS BLOB))+length(CAST(content_hash AS BLOB)) AS input_bytes FROM wav_files WHERE missing=0 ORDER BY path LIMIT ?1 OFFSET ?2)",
+                rusqlite::params![(files-previous) as i64,previous as i64],|r|r.get(0)).unwrap();
+            peak_input_bytes=peak_input_bytes.max(bytes);
+            pages.push(files);
+            let visible: (i64,i64)=f.database.connection.query_row(
+                "SELECT (SELECT count(*) FROM source_readiness_targets),(SELECT count(*) FROM source_readiness_artifacts)",
+                [],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(visible,(7,3)); // actual separate read connection never sees partial pages
+        })
+        .unwrap();
+        eprintln!(
+            "streamed owned SQL:1026 files,17 pages, elapsed {:?}; peak manifest input {peak_input_bytes} bytes; page<=64 rows/128KiB",
+            began.elapsed()
+        );
+        assert!(peak_input_bytes > 0 && peak_input_bytes <= 128 * 1024);
+        assert_eq!(pages.len(), 17);
+        assert!(pages.windows(2).all(|pair| pair[1] - pair[0] <= 64));
+        assert_eq!(pages.last(), Some(&1026));
+        assert_eq!(counts(&writer), (3079, 1027, 1));
+        let revision = writer.current_revision().unwrap();
+        assert_eq!(
+            writer
+                .lookup_feature_artifact_for_target(&revision, &current)
+                .unwrap()
+                .unwrap()
+                .1,
+            payload
+        );
+        assert_eq!(current.content_generation, target.content_generation);
+        assert!(current.source_generation > target.source_generation);
+        let again = publish(&mut writer); // actual public small-admission fallback to streaming
+        assert_eq!(again, current);
+        assert_eq!(counts(&writer), (3079, 1027, 1));
+        let db = writer.into_catalog_database();
+        drop(db);
+        let db = SourceDatabase::open_for_catalog_with_profile_guard(
+            f._source.path(),
+            &f.profile_guard,
+            Path::new("curation-profile-bound"),
+        )
+        .unwrap();
+        let mut reopened =
+            SourceWriter::new(db, SourceId::from_string("manifest-features"), 7).unwrap();
+        let target = publish(&mut reopened);
+        let revision = reopened.current_revision().unwrap();
+        assert_eq!(
+            reopened
+                .lookup_feature_artifact_for_target(&revision, &target)
+                .unwrap()
+                .unwrap()
+                .1,
+            payload
+        );
+    }
+    #[test]
+    fn streamed_manifest_readiness_cancellation_after_pages_rolls_back_and_retries_after_restart() {
+        let (f, mut writer) = setup();
+        publish(&mut writer);
+        let mut writer = grow_manifest(&f, writer, 300, false);
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            stream(&mut writer, &cancel, &mut |files| {
+                if files >= 128 {
+                    cancel.store(true, Ordering::Release);
+                }
+            }),
+            Err(SourceWriterError::Readiness(
+                crate::sample_sources::readiness::ReadinessError::Cancelled
+            ))
+        ));
+        assert_eq!(counts(&writer), (7, 2, 1));
+        let db = writer.into_catalog_database();
+        drop(db);
+        let db = SourceDatabase::open_for_catalog_with_profile_guard(
+            f._source.path(),
+            &f.profile_guard,
+            Path::new("curation-profile-bound"),
+        )
+        .unwrap();
+        let mut writer =
+            SourceWriter::new(db, SourceId::from_string("manifest-features"), 7).unwrap();
+        let target = publish(&mut writer);
+        assert_eq!(target.relative_path.as_deref(), Some("one.wav"));
+        assert_eq!(counts(&writer), (907, 302, 1));
+    }
+    #[test]
+    fn streamed_manifest_readiness_root_replacement_between_pages_retains_prior_generation() {
+        let (f, mut writer) = setup();
+        publish(&mut writer);
+        let mut writer = grow_manifest(&f, writer, 300, false);
+        let park = tempfile::tempdir().unwrap();
+        let mut replaced = false;
+        assert!(
+            stream(&mut writer, &AtomicBool::new(false), &mut |files| {
+                if files >= 128 && !replaced {
+                    std::fs::rename(f._source.path(), park.path().join("original")).unwrap();
+                    std::fs::create_dir(f._source.path()).unwrap();
+                    replaced = true;
+                }
+            })
+            .is_err()
+        );
+        assert!(replaced);
+        assert_eq!(counts(&writer), (7, 2, 1));
+    }
+    #[test]
+    fn streamed_manifest_readiness_late_bad_rows_duplicate_identity_and_trigger_failures_are_atomic()
+     {
+        for sql in [
+            "UPDATE wav_files SET content_hash=NULL WHERE path='extra-00250.wav'",
+            "UPDATE wav_files SET content_hash='pending-deep-hash' WHERE path='extra-00250.wav'",
+            "UPDATE wav_files SET file_identity=(SELECT file_identity FROM wav_files WHERE path='extra-00000.wav') WHERE path='extra-00250.wav'",
+            "CREATE TRIGGER break_stream AFTER INSERT ON source_readiness_targets WHEN NEW.relative_path='extra-00250.wav' BEGIN SELECT RAISE(ABORT,'stream rollback fixture'); END",
+            "CREATE TRIGGER break_stream AFTER INSERT ON source_readiness_targets WHEN NEW.relative_path='extra-00250.wav' BEGIN UPDATE metadata SET value='99999' WHERE key='revision'; END",
+            "CREATE TRIGGER break_stream AFTER INSERT ON source_readiness_targets WHEN NEW.relative_path='extra-00250.wav' BEGIN UPDATE source_readiness_targets SET content_generation='other-hash' WHERE relative_path='extra-00000.wav'; END",
+            "CREATE TRIGGER break_stream AFTER INSERT ON source_readiness_targets WHEN NEW.relative_path='extra-00250.wav' BEGIN DELETE FROM metadata WHERE key='last_authoritative_audit_revision_v1'; END",
+        ] {
+            let (f, mut writer) = setup();
+            publish(&mut writer);
+            let mut writer = grow_manifest(&f, writer, 300, false);
+            writer
+                .catalog_database()
+                .connection
+                .execute_batch(sql)
+                .unwrap();
+            assert!(
+                stream(&mut writer, &AtomicBool::new(false), &mut |_| {}).is_err(),
+                "{sql}"
+            );
+            assert_eq!(counts(&writer), (7, 2, 1), "{sql}");
+            assert!(writer.current_revision().is_ok()); // failed SQL-side changes also rolled back
+        }
+    }
+    #[test]
+    fn streamed_manifest_readiness_missing_selected_target_and_incompatible_contract_are_atomic() {
+        let (f, mut writer) = setup();
+        publish(&mut writer);
+        let mut writer = grow_manifest(&f, writer, 300, false);
+        let revision = writer.current_revision().unwrap();
+        assert!(
+            writer
+                .prepare_streamed_feature_readiness_target(
+                    &revision,
+                    Path::new("absent.wav"),
+                    50,
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+        );
+        assert_eq!(counts(&writer), (7, 2, 1));
+        writer
+            .catalog_database()
+            .connection
+            .execute(
+                "UPDATE source_readiness_sources SET contract_version='another-contract'",
+                [],
+            )
+            .unwrap();
+        assert!(stream(&mut writer, &AtomicBool::new(false), &mut |_| {}).is_err());
+        assert_eq!(counts(&writer), (7, 2, 1));
+    }
+    #[test]
+    fn streamed_manifest_readiness_elapsed_budget_rolls_back_active_generation() {
+        let (f, mut writer) = setup();
+        publish(&mut writer);
+        let mut writer = grow_manifest(&f, writer, 300, false);
+        let error = stream(&mut writer, &AtomicBool::new(false), &mut |files| {
+            if files == 64 {
+                std::thread::sleep(std::time::Duration::from_millis(2100));
+            }
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SourceWriterError::Readiness(
+                    crate::sample_sources::readiness::ReadinessError::AdmissionBudget(_)
+                )
+            ),
+            "{error:?}"
+        );
+        assert_eq!(counts(&writer), (7, 2, 1));
+        assert!(publish(&mut writer).relative_path.is_some());
+    }
+    #[test]
+    fn streamed_manifest_readiness_foreign_physical_owner_fence_cannot_publish_into_receiver() {
+        let (_f, writer) = setup();
+        let fence = writer.reference_read_fence().unwrap();
+        let (_other_f, other) = setup();
+        let mut receiver = other.into_catalog_database();
+        let error = receiver
+            .readiness_store()
+            .unwrap()
+            .publish_streamed_feature_manifest(
+                &fence,
+                Path::new("one.wav"),
+                50,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::sample_sources::readiness::ReadinessError::SourcePublicationFence(
+                    crate::sample_sources::db::SourcePublicationFenceError::LeaseMismatch
+                )
+            ),
+            "{error:?}"
+        );
+        let rows: i64 = receiver
+            .connection
+            .query_row("SELECT count(*) FROM source_readiness_targets", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 }

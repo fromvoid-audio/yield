@@ -63,6 +63,11 @@ impl SourceReferenceFence {
     pub fn source_revision(&self) -> &SourceRevision {
         &self.revision
     }
+    /// Borrow immutable physical owner identity for a receiving retained-owner comparison.
+    /// This value neither renews a lease nor authorizes a mutation.
+    pub(crate) fn publication_fence(&self) -> &SourcePublicationFence {
+        &self.publication
+    }
     /// Recheck issuer lifetime, retained source ownership and exact audited revision.
     /// The owner may change immediately after this call; validate at every consuming boundary.
     pub fn validate(&self) -> Result<(), SourceReferenceFenceError> {

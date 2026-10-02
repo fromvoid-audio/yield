@@ -5,16 +5,17 @@ matrix from the retained, fully audited supported-audio manifest and returns
 one current file's `features-v1` target. Production callers can now prepare a
 real job without constructing a readiness matrix in a fixture or GUI process.
 This callable command is a prerequisite of the catalog/session/GPUI adapter
-OPT-1708; that adapter is still required.
+OPT-1708; that production adapter is now implemented.
 
 The initial contract `yield-audited-feature-matrix-v1` admits at most 256 files,
 128 KiB combined path/identity/hash input, 1024 bytes per path, 512 per identity
 and a lowercase full-file BLAKE3 hex digest. SQL checks byte lengths and types
 before materializing strings, and reads at most 257 rows. Missing/pending hashes,
 duplicate identities, invalid paths, incomplete or stale audit metadata, changed
-owner/root/revision and cancellation fail before target mutation. Larger sources
-need a portable scalable publication implementation; increasing these bounds
-without bounded storage traversal is not its acceptance.
+owner/root/revision and cancellation fail before target mutation. This bounded
+small-source route remains supported. Its row/aggregate-text budget rejection now
+falls back to [bounded streamed publication](SOURCE_STREAMED_READINESS_PUBLICATION.md)
+(OPT-2072), rather than rejecting every larger valid manifest.
 
 The source generation is the current authoritative manifest revision. Readiness
 publication revisions increment under the sole writer. Existing incompatible
