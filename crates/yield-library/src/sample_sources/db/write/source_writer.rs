@@ -325,6 +325,10 @@ impl SourceSnapshotOwner {
         requested_limit: usize,
         deadline: Instant,
     ) -> Result<SourceSnapshotPage, SourceWriterError> {
+        // Expired requests must not occupy the sole pending slot or clone their payload.
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
         if after_cursor.is_some_and(|cursor| cursor.as_str().len() > 16 * 1024 * 1024) {
             return Err(SourceWriterError::SnapshotBudgetExceeded);
         }
@@ -1812,6 +1816,9 @@ impl SourceWriter {
         deadline: std::time::Instant,
     ) -> Result<SourceSnapshotPage, SourceWriterError> {
         const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
         if after_cursor.is_some_and(|cursor| cursor.as_str().len() > MAX_INPUT_BYTES) {
             return Err(SourceWriterError::SnapshotBudgetExceeded);
         }
