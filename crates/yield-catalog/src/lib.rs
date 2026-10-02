@@ -63,6 +63,7 @@ mod curation;
 mod curation_tag_facts;
 mod display_labels;
 mod index_pages;
+mod index_reveal_contract;
 mod rating_decay;
 mod root;
 mod tags;
@@ -74,6 +75,11 @@ pub use index_pages::{
     RetainedIndexCompleteness,
 };
 pub use yield_library::sample_sources::db::SOURCE_INDEX_PAGE_MAX_ENTRIES;
+
+pub use index_reveal_contract::{
+    INDEX_REVEAL_MAX_BINDING_BYTES, INDEX_REVEAL_MAX_OBJECT_BYTES, INDEX_REVEAL_MAX_PATH_BYTES,
+    IndexRevealPageIdentity, IndexRevealProposal, IndexRevealRejection, propose_index_reveal,
+};
 
 pub use root::{VerifiedSourceRoot, resolve_source_root};
 
