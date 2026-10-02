@@ -1455,6 +1455,7 @@ impl Render for Browser {
         }
         context_menu::invalidate_if_stale(self);
         similar_sections::invalidate_if_stale(self);
+        super::similarity_list::invalidate_if_stale(self);
         let mut theme = active(cx).clone();
         let enlarged_text =
             self.general_settings.text_scale_percent == yield_session::ENLARGED_TEXT_SCALE_PERCENT;
@@ -1743,6 +1744,8 @@ impl Render for Browser {
                                         for column in &row_columns {
                                             let cell: AnyElement = match column.id {
                                                 BrowserColumn::Name => div()
+                                                    .flex()
+                                                    .items_center()
                                                     .debug_selector(move || format!("browser-row-name-{visible_index}"))
                                                     .flex_none()
                                                     .w(px(column.width))
@@ -1757,7 +1760,8 @@ impl Render for Browser {
                                                     } else {
                                                         color(list_theme.colors.text_primary)
                                                     })
-                                                    .child(sample_name.clone())
+                                                    .child(super::similarity_list::anchor_button(view, &entry.relative_path, index, cx))
+                                                    .child(div().debug_selector(move || format!("browser-row-label-{visible_index}")).overflow_hidden().text_ellipsis().child(sample_name.clone()))
                                                     .into_any_element(),
                                                 BrowserColumn::Rating => curation::rating_cell(
                                                     &entry, &list_theme, column.width,
@@ -2883,6 +2887,7 @@ impl Render for Browser {
                         .child(self.render_audio_output_settings(theme.clone(), cx)),
                 )
             })
+            .child(super::similarity_list::render(self, &theme, cx))
             .when(self.context_menu.is_some(), |element| {
                 element.child(context_menu::render_overlay(self, &theme, cx))
             })
@@ -4205,10 +4210,16 @@ mod tests {
             heading.size.width >= px(384.0),
             "name column did not scale: {heading:?}"
         );
-        let row_center = point(
-            row.origin.x + px(12.0),
-            row.origin.y + row.size.height / 2.0,
-        );
+        let anchor = cx
+            .debug_bounds("sample-similarity-anchor-0")
+            .expect("leading anchor control");
+        cx.simulate_mouse_down(anchor.center(), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(anchor.center(), MouseButton::Left, Modifiers::none());
+        browser.update(&mut cx, |view, _| assert_eq!(view.selected, None));
+        let row_center = cx
+            .debug_bounds("browser-row-label-0")
+            .expect("sample label")
+            .center();
         cx.simulate_mouse_down(row_center, MouseButton::Left, Modifiers::none());
         cx.simulate_mouse_up(row_center, MouseButton::Left, Modifiers::none());
         browser.update(&mut cx, |view, _| assert_eq!(view.selected, Some(0)));

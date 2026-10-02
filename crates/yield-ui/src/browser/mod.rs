@@ -113,6 +113,7 @@ mod rating_decay;
 mod shortcut_help;
 mod sidebar;
 mod similar_sections;
+mod similarity_list;
 mod source_recovery;
 mod source_registry;
 mod status_log;
@@ -377,6 +378,7 @@ pub(crate) struct Browser {
     waveform_detail: waveform_detail::WaveformDetailState,
     zero_crossing: zero_crossing::ZeroCrossingState,
     similar_sections: similar_sections::SimilarSectionsState,
+    similarity_list: similarity_list::SimilarityListState,
     transient_markers: transient_markers::TransientMarkersState,
     bpm_snap_enabled: bool,
     beat_guides_enabled: bool,
@@ -731,6 +733,7 @@ impl Browser {
             waveform_detail: waveform_detail::WaveformDetailState::default(),
             zero_crossing: zero_crossing::ZeroCrossingState::default(),
             similar_sections: similar_sections::SimilarSectionsState::default(),
+            similarity_list: similarity_list::SimilarityListState::default(),
             transient_markers: transient_markers::TransientMarkersState::default(),
             bpm_snap_enabled: false,
             beat_guides_enabled: false,

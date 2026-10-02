@@ -565,11 +565,23 @@
     },
     {
       "message": "FolderBrowserMessage::ToggleSimilarityAnchor",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/similarity_list.rs",
+        "symbol": "toggle_similarity_anchor"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/similarity_list_tests.rs",
+          "symbol": "actual_similarity_controls_admit_owner_scores_render_and_reject_late_aspects"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/similarity_list_tests.rs",
+          "symbol": "similarity_requires_success_fence_and_hides_retired_owner_rows"
+        }
+      ],
       "owner": "OPT-1719",
-      "note": "Similarity-browser anchor/aspect queries differ from the implemented Similar Sections overlay.",
+      "note": "Leading row pointer toggle and sample menu dispatch actual bounded owner-backed anchor/aspect queries, with five existing descriptor selections and <=64 explicit visible candidates. Real GPUI clicks/worker payload scores, queued aspect cancellation, context/fence rejection and owner-retirement rendering are tested. Whole-library/ANN/embedding and aspect enable/weight/master parity remain open in OPT-2159/2164; normal native bootstrap/physical qualification remains OPT-2165 under OPT-1953/2009.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {

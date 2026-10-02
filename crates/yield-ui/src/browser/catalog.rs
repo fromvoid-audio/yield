@@ -168,6 +168,7 @@ impl Browser {
         fallback_to_scan: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.similarity_list.cancel();
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::cancel_for_source_change(self);
         super::unsupported_entries::cancel_for_source_change(self, cx);
@@ -351,6 +352,7 @@ impl Browser {
         }
         self.job_action = None;
         self.job_action_error = None;
+        self.similarity_list.cancel();
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::cancel_for_source_change(self);
         super::unsupported_entries::cancel_for_source_change(self, cx);
@@ -437,6 +439,7 @@ impl Browser {
                 self.catalog_activation = None;
                 self.catalog_pending_command = None;
                 self.catalog_pending_removes.clear();
+                self.similarity_list.cancel();
                 super::source_recovery::cancel_for_source_change(self);
                 super::rating_decay::cancel_for_source_change(self);
                 super::unsupported_entries::cancel_for_source_change(self, cx);
@@ -538,6 +541,7 @@ impl Browser {
         let Some(activation) = self.catalog_activation.clone() else {
             self.catalog_pending_command = None;
             self.catalog_pending_removes.clear();
+            self.similarity_list.cancel();
             super::source_recovery::cancel_for_source_change(self);
             super::rating_decay::cancel_for_source_change(self);
             super::unsupported_entries::cancel_for_source_change(self, cx);
@@ -550,6 +554,7 @@ impl Browser {
         };
         self.catalog_pending_command = None;
         self.catalog_pending_removes.clear();
+        self.similarity_list.cancel();
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::cancel_for_source_change(self);
         super::unsupported_entries::cancel_for_source_change(self, cx);
@@ -600,6 +605,14 @@ impl Browser {
         publication_fence: Option<SourcePublicationFence>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if super::similarity_list::apply_catalog_event(
+            self,
+            &mut event,
+            publication_fence.clone(),
+            cx,
+        ) {
+            return true;
+        }
         if super::analysis::apply_catalog_event(self, &event, cx) {
             return true;
         }
@@ -686,6 +699,7 @@ impl Browser {
             if matches!(event, CatalogEvent::Closed) {
                 self.job_action = None;
                 self.job_action_error = None;
+                self.similarity_list.cancel();
                 super::source_recovery::cancel_for_source_change(self);
                 super::rating_decay::cancel_for_source_change(self);
                 super::unsupported_entries::cancel_for_source_change(self, cx);
@@ -1081,6 +1095,7 @@ impl Browser {
         }) {
             return;
         }
+        self.similarity_list.cancel();
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::invalidate_for_source_publication(self, status);
         super::unsupported_entries::cancel_for_source_change(self, cx);
