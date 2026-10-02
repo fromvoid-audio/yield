@@ -36,7 +36,8 @@ operation, output, work key, role, and deterministic domain-separated control ID
 Its JSON is bounded to 4096 bytes and rejects duplicate/unknown fields, unknown
 versions, and conflicting bindings. Target reservations must contain exactly the
 four expected rows with valid keys, consecutive positive role sequences preceding
-any captured chunk, and exact decoded bytes.
+any captured chunk, and exact decoded bytes. The capture ordering query scans a
+capped per-operation inventory and rejects overflow on recovery.
 Partial, corrupt, extra, and future terminal states stay retained and reject
 capture and recovery observation; none is treated as vacant capacity.
 

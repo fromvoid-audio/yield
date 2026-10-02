@@ -469,3 +469,65 @@ fn recording_controls_reserved_only_rows_block_chunk_charge_release() {
     );
     assert_eq!(store.recording_retained_totals().unwrap(), (4, 16384));
 }
+
+#[test]
+fn recording_controls_oversized_capture_inventory_rejects_point_observation_without_repair() {
+    use crate::operation_journal::recording_commands::recording_proposal_for_test;
+    let f = fixture();
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    let proposal = recording_proposal_for_test(2, 100);
+    store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    let header = initial_recording_header(&proposal);
+    store.retain_recording_chunk(&header).unwrap();
+    // Adversarial persisted corruption, not valid captured bytes or reserve qualification.
+    store.connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    {
+        let mut insert = store.connection.prepare("INSERT INTO operation_journal_recording_chunks(chunk_id,operation_id,slot,sequence,record) VALUES(?1,?2,?3,?4,?5)").unwrap();
+        for ordinal in 0..8188 {
+            insert
+                .execute(params![
+                    Uuid::new_v4().to_string(),
+                    proposal.operation_id().to_string(),
+                    ordinal,
+                    ordinal + 100,
+                    b"?".as_slice()
+                ])
+                .unwrap();
+        }
+    }
+    store.connection.execute_batch("COMMIT").unwrap();
+    assert!(
+        store
+            .get_recording_chunk(proposal.operation_id(), header.chunk_id())
+            .is_err()
+    );
+    assert!(
+        store
+            .recording_chunk_page(proposal.operation_id(), None)
+            .is_err()
+    );
+    assert!(store.retain_recording_chunk(&header).is_err());
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM operation_journal_recording_chunks",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        8193
+    );
+    let retained: Vec<u8> = store
+        .connection
+        .query_row(
+            "SELECT record FROM operation_journal_recording_chunks WHERE chunk_id=?1",
+            params![header.chunk_id().to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, header.encode(&proposal).unwrap());
+    assert!(store.prove_clean_handoff_durable().is_err());
+}

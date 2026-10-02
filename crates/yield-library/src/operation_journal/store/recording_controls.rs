@@ -101,15 +101,20 @@ impl OperationJournalStore {
                 return Err(error("conflicting reserved recording control"));
             }
         }
-        let first_capture: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT sequence FROM operation_journal_recording_chunks WHERE operation_id=?1
-             AND slot NOT BETWEEN 20000 AND 20003 ORDER BY sequence LIMIT 1",
-                params![proposal.operation_id().to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
+        // Use the operation/slot index and a capped inventory, not an ordered global sequence
+        // scan whose work could grow without bound on a corrupt reopened database.
+        let (capture_rows, first_capture): (i64, Option<i64>) = self.connection.query_row(
+            "SELECT COUNT(*), MIN(sequence) FROM (
+             SELECT sequence FROM operation_journal_recording_chunks WHERE operation_id=?1
+             AND slot NOT BETWEEN 20000 AND 20003 LIMIT 8193)",
+            params![proposal.operation_id().to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if capture_rows > 8192 - CONTROL_ROWS {
+            return Err(error(
+                "retained recording capture exceeds its reserved inventory bound",
+            ));
+        }
         if first_capture.is_some_and(|sequence| sequence <= previous_sequence.unwrap()) {
             return Err(error("recording capture precedes its terminal reservation"));
         }
