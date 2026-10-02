@@ -14,8 +14,10 @@ pub use feature_metrics::SourceFeaturePublicationMetrics;
 mod feature_rebuild_metrics;
 mod manifest_enrollment;
 pub use feature_rebuild_metrics::FeatureRebuildMetrics;
+mod tag_admission_observation;
 mod tag_metadata_budget;
 mod tag_metadata_policy;
+pub use tag_admission_observation::SourceTagAdmissionObservation;
 pub use tag_metadata_budget::SourceTagMetadataBudget;
 pub use tag_metadata_policy::SourceTagMetadataPolicy;
 #[path = "readiness_targets.rs"]
