@@ -739,6 +739,37 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn folder_create_cannot_substitute_zero_or_known_staging_for_metadata_bounds() {
+        let parent = NamespaceDirectoryEndpoint::new(
+            ParticipantId::from_uuid(Uuid::from_u128(5)),
+            SourceId::from_string("create-source"),
+            NamespaceDirectoryLocator::root(),
+            NamespaceDirectoryExpectation::new(7, "retained-parent", None).unwrap(),
+        )
+        .unwrap();
+        let args = UniversalCommandArgs::Namespace(NamespaceCommandArgs::CreateFolder(
+            super::super::CreateFolderIntentArgs::new(
+                parent,
+                super::super::NamespaceLeafName::new("new-child").unwrap(),
+            )
+            .unwrap(),
+        ));
+        let matrix = estimate_capacity(&args).unwrap();
+        assert_eq!(matrix.command_kind(), UniversalCommandKind::CreateFolder);
+        for class in FULL_CAPACITY_ALLOCATION_CLASSES {
+            assert!(matches!(
+                matrix.require_known_bytes(class),
+                Err(CapacityRequirementError::Unresolved {
+                    disposition: CapacityEstimateDisposition::Unknown(
+                        CapacityEstimateReason::MetadataBoundNotDefined
+                    ),
+                    ..
+                })
+            ));
+        }
+    }
+
     fn history_args() -> UniversalCommandArgs {
         let participant = ParticipantId::from_uuid(Uuid::from_u128(6));
         let source_id = SourceId::from_string("history-source");
