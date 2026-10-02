@@ -14,6 +14,7 @@ mod migrations;
 mod owner;
 mod read_only;
 mod registry_limits;
+mod registry_participant;
 mod schema_checks;
 mod schema_defs;
 mod sources;
@@ -46,6 +47,10 @@ pub use read_only::load_source_registry_snapshot_read_only;
 pub use registry_limits::{
     SOURCE_REGISTRY_MAX_BYTES, SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
     SOURCE_REGISTRY_MAX_DESCRIPTORS, SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES,
+};
+pub use registry_participant::{
+    SOURCE_REGISTRY_PARTICIPANT_MAX_RECEIPTS, SourceRegistryParticipantDisposition,
+    SourceRegistryParticipantReceipt, SourceRegistryParticipantRequest,
 };
 pub use tag_vocabulary::{
     PROFILE_TAG_VOCABULARY_MAX_LABEL_BYTES, PROFILE_TAG_VOCABULARY_MAX_LOOKUP_LABELS,

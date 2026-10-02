@@ -90,12 +90,19 @@ impl LibraryDatabase {
         validate_sources_encoded(snapshot.as_slice()).map_err(map_registry_bound_error)?;
         let started_at = Instant::now();
         let tx = self.connection.transaction().map_err(map_sql_error)?;
-        let mut mappings = Self::load_known_sources_from(&tx)?;
-        Self::replace_sources(&tx, snapshot.as_slice())?;
-        Self::remember_known_sources_in_tx(&tx, &mut mappings, snapshot.as_slice())?;
+        Self::replace_source_registry_in_tx(&tx, snapshot)?;
         tx.commit().map_err(map_sql_error)?;
         record_library_db_event(event, started_at, Ok(()));
         Ok(())
+    }
+
+    pub(super) fn replace_source_registry_in_tx(
+        tx: &Transaction<'_>,
+        snapshot: &SourceRegistrySnapshot,
+    ) -> Result<(), LibraryError> {
+        let mut mappings = Self::load_known_sources_from(tx)?;
+        Self::replace_sources(tx, snapshot.as_slice())?;
+        Self::remember_known_sources_in_tx(tx, &mut mappings, snapshot.as_slice())
     }
 
     pub(super) fn load_sources(&self) -> Result<Vec<SampleSource>, LibraryError> {
@@ -357,7 +364,7 @@ fn load_bounded_metadata(
         .map_err(|_| LibraryError::MetadataInvalidUtf8 { key })
 }
 
-fn map_registry_bound_error(error: RegistryBoundError) -> LibraryError {
+pub(super) fn map_registry_bound_error(error: RegistryBoundError) -> LibraryError {
     match error {
         RegistryBoundError::TooManyDescriptors { actual } => {
             LibraryError::SourceRegistryTooManyDescriptors {
@@ -601,7 +608,7 @@ fn validate_known_source_mappings(mappings: &[KnownSourceMapping]) -> Result<(),
     Ok(())
 }
 
-fn normalized_source(mut source: SampleSource) -> SampleSource {
+pub(super) fn normalized_source(mut source: SampleSource) -> SampleSource {
     if source.role == SourceRole::Protected {
         source.metadata_storage = SourceMetadataStorage::AppData;
     }

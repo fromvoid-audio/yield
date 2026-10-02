@@ -9,6 +9,21 @@ use super::tag_vocabulary::ProfileTagVocabularyInputError;
 /// Errors returned when operating on the library database.
 #[derive(Debug, Error)]
 pub enum LibraryError {
+    /// An operation-scoped registry command failed its bounded identity contract.
+    #[error("invalid source-registry participant input: {field}")]
+    SourceRegistryParticipantInput {
+        /// Invalid bounded field.
+        field: &'static str,
+    },
+    /// The supplied profile acquisition is stale; no participant effect was attempted.
+    #[error("source-registry participant profile owner is stale")]
+    SourceRegistryParticipantStaleOwner,
+    /// A retained operation receipt has another immutable command identity.
+    #[error("source-registry participant replay conflicts with retained receipt")]
+    SourceRegistryParticipantReplayConflict,
+    /// The bounded receipt ledger cannot retain another operation safely.
+    #[error("source-registry participant receipt capacity reached")]
+    SourceRegistryParticipantReceiptCapacity,
     /// Writable library database access requires an already-acquired profile ownership capability.
     #[error("profile ownership is required for writable library database access")]
     ProfileOwnershipRequired,

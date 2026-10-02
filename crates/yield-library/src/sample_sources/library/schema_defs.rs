@@ -21,6 +21,8 @@ impl LibraryDatabase {
 
     pub(super) fn apply_schema(&self) -> Result<(), LibraryError> {
         self.connection
+            .execute_batch(super::registry_participant::CREATE_TABLE)?;
+        self.connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,

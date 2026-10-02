@@ -14,6 +14,9 @@ use super::registry_limits::{
     SOURCE_REGISTRY_MAX_DESCRIPTORS, SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES, path_bytes,
     validate_sources_encoded,
 };
+use super::registry_participant::{
+    SourceRegistryParticipantReceipt, SourceRegistryParticipantRequest,
+};
 use super::tag_vocabulary::{
     ProfileTagCategory, ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyInputError,
     ProfileTagVocabularyLookup, ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor,
@@ -260,6 +263,10 @@ pub enum GlobalLibraryWriterStartError {
 }
 
 enum WriterCommand {
+    ApplySourceRegistryParticipant {
+        request: SourceRegistryParticipantRequest,
+        result: SyncSender<Result<SourceRegistryParticipantReceipt, LibraryError>>,
+    },
     LoadSourceRegistry {
         result: SyncSender<Result<SourceRegistrySnapshot, LibraryError>>,
     },
@@ -303,6 +310,10 @@ enum WriterCommand {
 }
 
 enum WriterReply {
+    SourceRegistryParticipant {
+        result: SyncSender<Result<SourceRegistryParticipantReceipt, LibraryError>>,
+        value: Result<SourceRegistryParticipantReceipt, LibraryError>,
+    },
     Load {
         result: SyncSender<Result<SourceRegistrySnapshot, LibraryError>>,
         value: Result<SourceRegistrySnapshot, LibraryError>,
@@ -344,6 +355,9 @@ enum WriterReply {
 impl WriterReply {
     fn send(self) {
         match self {
+            Self::SourceRegistryParticipant { result, value } => {
+                let _ = result.send(value);
+            }
             Self::Load { result, value } => {
                 let _ = result.send(value);
             }
@@ -376,6 +390,9 @@ impl WriterReply {
 
     fn send_error(self, error: LibraryError) {
         match self {
+            Self::SourceRegistryParticipant { result, .. } => {
+                let _ = result.send(Err(error));
+            }
             Self::Load { result, .. } => {
                 let _ = result.send(Err(error));
             }
@@ -618,6 +635,25 @@ impl GlobalLibraryWriter {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.send(WriterCommand::LookupRetainedSource {
             root,
+            result: result_tx,
+        })?;
+        Ok(result_rx)
+    }
+
+    /// Queue one durable operation-scoped registry result through this existing owner.
+    /// The request's acquisition identity is checked against the live guard before any effect;
+    /// queue admission and the returned receipt remain observations, not journal authority.
+    pub fn apply_source_registry_participant(
+        &self,
+        request: SourceRegistryParticipantRequest,
+    ) -> Result<
+        Receiver<Result<SourceRegistryParticipantReceipt, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        self.ensure_available()?;
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.send(WriterCommand::ApplySourceRegistryParticipant {
+            request,
             result: result_tx,
         })?;
         Ok(result_rx)
@@ -1054,7 +1090,7 @@ fn run_owner(
             break;
         }
 
-        let reply = execute_command(command, &mut database);
+        let reply = execute_command(command, &mut database, profile_guard.owner_identity());
 
         #[cfg(test)]
         if let Some((ready, release)) = hooks.post_command_gate.as_ref() {
@@ -1083,8 +1119,18 @@ fn run_owner(
     );
 }
 
-fn execute_command(command: WriterCommand, database: &mut LibraryDatabase) -> WriterReply {
+fn execute_command(
+    command: WriterCommand,
+    database: &mut LibraryDatabase,
+    owner_identity: &str,
+) -> WriterReply {
     match command {
+        WriterCommand::ApplySourceRegistryParticipant { request, result } => {
+            WriterReply::SourceRegistryParticipant {
+                value: database.apply_source_registry_participant(owner_identity, &request),
+                result,
+            }
+        }
         WriterCommand::LoadSourceRegistry { result } => WriterReply::Load {
             value: database.load_source_registry(),
             result,
@@ -1184,6 +1230,10 @@ fn reject_remaining_profile_change(
 
 fn send_command_error(command: WriterCommand, error: LibraryError) {
     match command {
+        WriterCommand::ApplySourceRegistryParticipant { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+
         WriterCommand::LoadSourceRegistry { result } => {
             let _ = result.send(Err(error));
         }
@@ -1273,6 +1323,11 @@ fn unavailable_from_library_error(error: &LibraryError) -> GlobalLibraryWriterUn
 
 #[cfg(test)]
 mod tests {
+    mod registry_participant_tests {
+        use super::*;
+        include!("registry_participant_owner_tests.rs");
+    }
+
     use super::*;
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
     use crate::sample_sources::{SourceId, SourceRole};
