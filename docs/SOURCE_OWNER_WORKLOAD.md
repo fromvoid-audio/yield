@@ -1,6 +1,6 @@
-# Bounded source-owner metadata workload (OPT-2092)
+# Bounded source-owner metadata workload (OPT-2092/2109/2142)
 
-Run two independent, isolated measurements:
+Run two independent, isolated measurements from a clean checkout:
 
 ```sh
 python3 scripts/internal/bench/run_source_owner_workload.py \
@@ -32,6 +32,27 @@ profile database at lifecycle 2 must preserve database identity, audited
 revision and the entire row fingerprint, while rejecting the lifecycle-1
 observation as stale. No raw SQLite connection or competing writer is opened.
 
+After that original reopen/page verification, the same retained writer applies one
+64-entry `SetRating(KEEP_3)` curation command. Revision 65 advances exactly once to
+66, and the persisted receipt contains exactly the selected paths/ratings. Exact
+same-acquisition replay returns the same receipt without advancing the revision.
+Conflicting payload reuse and a new stale-revision command are rejected, with no
+locked metadata leaked. A second close/reopen at lifecycle 3 preserves revision 66
+and returns the exact historical receipt through `read_receipt_observation`.
+Replaying the old request must return `SupersededLifecycle`; that historical receipt
+is never fresh write authority. A 64-row page plus one 1-row continuation verifies
+the persisted selected ratings and the unchanged first unselected row. This adds
+no full-table measurement pass or second corpus/runner.
+
+Curation timing fields separately cover the whole-owner commit, exact replay,
+conflict/stale rejection, clean close, reopen, historical receipt read and
+superseded request rejection. `persisted_selection_ns` sums the two page calls;
+assertion/verification loops are outside that duration. Commit and replay include
+existing ownership validation, SQLite reservation/transaction/receipt processing
+and checkpoint policy; these are whole-call boundaries, not independent SQL or
+sync measurements. Storage is observed both after initial audit and after curation
+commit through the existing bounded producer, outside timed command boundaries.
+
 The evidence includes raw nanosecond samples and nearest-rank p95, lower-median
 p50 and maximum for transaction/page calls, plus open, audit, close and reopen
 durations. Transaction time starts before owned batch creation and includes
@@ -46,15 +67,34 @@ Reopen time includes database acquisition, revision validation and worker start.
 Storage observations reuse `capture_tag_metadata_budget` on the current owner:
 main/WAL lengths come from retained SQLite VFS descriptors, SHM length from the
 retained database root, and logical pages from SQLite. If that bounded schema
-and metadata observation is unavailable, the report retains the error and
-marks storage unavailable. Its allocation estimate is not a capacity claim;
+and metadata observation is unavailable, the report records a fixed unavailable category and emits diagnostics to process
+stderr; unavailable storage is not silently replaced with fabricated bytes. Its allocation estimate is not a capacity claim;
 the harness issues no journal capacity admission or tag mutation authority.
 
-The Python runner records the exact command, Git head/dirty paths, Rust version,
-OS/kernel/architecture, logical CPUs and affinity. It checks stable fixture,
-revision and restart fields across 2–5 runs and rejects a source-state change
-during measurement. Timing variation is retained; no pass/fail latency target
-is invented. CPU quotas and storage device qualification remain unmeasured.
+The schema-2 runner requires a clean checkout and records the exact command, Git
+head, Rust/Cargo versions, OS/kernel/architecture, logical CPUs and affinity.
+SHA256 digests cover workspace/library manifests, Cargo.lock, toolchain files and
+repository/Cargo-home configuration (absence is recorded explicitly). Build
+semantic environment overrides such as RUSTFLAGS, Cargo profile/target/runner
+settings and compiler wrappers are rejected by name without printing their values;
+CARGO_TARGET_DIR remains allowed for neutral artifact caching. The runner checks
+source/configuration state immediately before and after each of 2–5 independent
+runs. These digests describe
+the observed build configuration; they are not a hermetic build or platform grant.
+
+Each workload process has a 300-second budget and an 8MiB combined stdout/stderr
+budget on POSIX hosts. Failed, missing, duplicate or malformed marker records,
+unknown fields, incomplete timing distributions, invalid quantiles, unfinished
+queue counters, inconsistent receipt assertions and unsupported schema/corpus
+identities fail closed. Output is replaced atomically only after the complete
+bundle validates. Timing variation is retained; no pass/fail latency target is
+invented. CPU quotas and storage device qualification remain unmeasured.
+
+Run intake/process-budget negative tests separately:
+
+```sh
+python3 scripts/internal/bench/test_source_owner_workload.py
+```
 
 Queue counters are acquisition-local observations sampled independently. Accepted
 means channel admission, not a successful read. Dequeued includes expired requests.

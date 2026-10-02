@@ -4,11 +4,14 @@
 use std::{fs, path::Path, time::Instant};
 
 use serde_json::{Value, json};
+use yield_library::operation_journal::{OperationId, ParticipantId};
+use yield_library::sample_sources::reconciliation::RootRelativePath;
 use yield_library::{
     app_dirs::{AppRootGuard, WritableProfileGuard},
     sample_sources::{
-        SourceDatabase, SourceId, SourceRevision, SourceSnapshotOwner, SourceSnapshotPage,
-        SourceWriter,
+        Rating, SourceCommandId, SourceCurationUpdate, SourceDatabase, SourceId, SourceRevision,
+        SourceSnapshotOwner, SourceSnapshotPage, SourceWriter, SourceWriterError,
+        SourceWriterRequest,
     },
 };
 
@@ -83,6 +86,176 @@ fn pages(owner: &SourceSnapshotOwner, revision: &SourceRevision) -> (String, Vec
         cursor = page.next_cursor;
     }
     panic!("page traversal exceeded fixed fixture bound");
+}
+
+fn storage_observation(writer: &SourceWriter, revision: &SourceRevision) -> Value {
+    match writer.capture_tag_metadata_budget(revision) {
+        Ok(budget) => {
+            json!({"status": "measured", "main_retained_vfs_bytes": budget.resident_database_bytes(),
+            "wal_retained_vfs_bytes": budget.resident_wal_bytes(), "shm_root_observed_bytes": budget.resident_shm_bytes(),
+            "logical_page_count": budget.page_count(), "page_size": budget.page_size(), "capacity_claim": false})
+        }
+        Err(error) => {
+            eprintln!("retained storage observation unavailable: {error}");
+            json!({"status": "unavailable", "reason": "retained-storage-observation-unavailable", "capacity_claim": false})
+        }
+    }
+}
+
+// Whole owner-call boundaries, not independently attributed SQL or sync durations.
+fn curation_receipts(
+    mut writer: SourceWriter,
+    media: &Path,
+    profile: &WritableProfileGuard,
+) -> Value {
+    let initial = writer.current_revision().expect("curation owner fence");
+    let updates = (0..BATCH)
+        .map(|index| SourceCurationUpdate::SetRating {
+            path: RootRelativePath::try_from_path(row(index).0.into()).unwrap(),
+            rating: Rating::KEEP_3,
+        })
+        .collect::<Vec<_>>();
+    let request = SourceWriterRequest::new(
+        OperationId::from_uuid(uuid::Uuid::from_u128(100)),
+        ParticipantId::from_uuid(uuid::Uuid::from_u128(101)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(102)),
+        initial.clone(),
+        updates,
+    )
+    .expect("bounded production curation request");
+    let started = Instant::now();
+    let receipt = writer
+        .commit_curation(request.clone())
+        .expect("actual persisted receipt");
+    let commit_ns = elapsed(started);
+    let committed = writer.current_revision().unwrap();
+    assert_eq!(committed.revision(), initial.revision() + 1);
+    assert_eq!(receipt.source_revision(), &committed);
+    assert_eq!(receipt.curation().files().len(), BATCH);
+    for (index, file) in receipt.curation().files().iter().enumerate() {
+        assert_eq!(file.relative_path, Path::new(&row(index).0));
+        assert_eq!(file.rating, Rating::KEEP_3);
+    }
+    let started = Instant::now();
+    assert_eq!(writer.commit_curation(request.clone()).unwrap(), receipt);
+    let replay_ns = elapsed(started);
+    assert_eq!(writer.current_revision().unwrap(), committed);
+    let conflicting = SourceWriterRequest::new(
+        request.identity().operation_id(),
+        request.identity().participant_id(),
+        request.identity().command_id(),
+        initial.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: RootRelativePath::try_from_path(row(0).0.into()).unwrap(),
+            locked: true,
+        }],
+    )
+    .unwrap();
+    let started = Instant::now();
+    assert!(matches!(
+        writer.commit_curation(conflicting),
+        Err(SourceWriterError::ConflictingCommand { .. })
+    ));
+    let conflict_ns = elapsed(started);
+    let stale = SourceWriterRequest::new(
+        OperationId::from_uuid(uuid::Uuid::from_u128(103)),
+        ParticipantId::from_uuid(uuid::Uuid::from_u128(104)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(105)),
+        initial.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: RootRelativePath::try_from_path(row(0).0.into()).unwrap(),
+            locked: true,
+        }],
+    )
+    .unwrap();
+    let started = Instant::now();
+    assert!(matches!(
+        writer.commit_curation(stale),
+        Err(SourceWriterError::StaleRevision { .. })
+    ));
+    let stale_ns = elapsed(started);
+    assert_eq!(writer.current_revision().unwrap(), committed);
+    let storage_after_commit = storage_observation(&writer, &committed);
+    let started = Instant::now();
+    writer.close().expect("curation owner closes");
+    let close_ns = elapsed(started);
+    let started = Instant::now();
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        media,
+        profile,
+        Path::new("source-workload"),
+    )
+    .unwrap();
+    let mut writer = SourceWriter::new(database, SourceId::from_string(SOURCE), 3).unwrap();
+    let current = writer.current_revision().unwrap();
+    let reopen_ns = elapsed(started);
+    assert_eq!(current.database_identity(), committed.database_identity());
+    assert_eq!(current.revision(), committed.revision());
+    assert_ne!(current.lease_epoch(), committed.lease_epoch());
+    let started = Instant::now();
+    assert_eq!(
+        writer
+            .read_receipt_observation(request.identity())
+            .unwrap()
+            .unwrap(),
+        receipt
+    );
+    let historical_observation_ns = elapsed(started);
+    let started = Instant::now();
+    assert!(matches!(
+        writer.commit_curation(request),
+        Err(SourceWriterError::SupersededLifecycle { .. })
+    ));
+    let superseded_rejection_ns = elapsed(started);
+    assert_eq!(writer.current_revision().unwrap(), current);
+    let owner = SourceSnapshotOwner::start(writer).unwrap();
+    let started = Instant::now();
+    let page = owner
+        .read_browser_metadata_page(&current, None, BATCH)
+        .unwrap();
+    let first_selection_ns = elapsed(started);
+    let SourceSnapshotPage::FreshAsOf { revision, page } = page else {
+        panic!("current bounded selection");
+    };
+    assert_eq!(revision, current);
+    assert_eq!(page.files.len(), BATCH);
+    for (index, file) in page.files.iter().enumerate() {
+        assert_eq!(file.relative_path, Path::new(&row(index).0));
+        assert_eq!(file.rating, Rating::KEEP_3);
+        assert!(
+            !file.locked,
+            "rejected requests cannot leak metadata effects"
+        );
+    }
+    let started = Instant::now();
+    let next = owner
+        .read_browser_metadata_page(&current, page.next_cursor.as_ref(), 1)
+        .unwrap();
+    let persisted_selection_ns = first_selection_ns.checked_add(elapsed(started)).unwrap();
+    let SourceSnapshotPage::FreshAsOf {
+        revision,
+        page: next,
+    } = next
+    else {
+        panic!("current continuation");
+    };
+    assert_eq!(revision, current);
+    assert_eq!(next.files.len(), 1);
+    assert_eq!(next.files[0].relative_path, Path::new(&row(BATCH).0));
+    assert_eq!(next.files[0].rating, Rating::NEUTRAL);
+    assert!(!next.files[0].locked);
+    owner.begin_retirement().join().unwrap().close().unwrap();
+    json!({"selected_rows": BATCH, "expected_revision": initial.revision(),
+        "committed_revision": committed.revision(), "reopened_revision": current.revision(),
+        "exact_replay": true, "conflict_rejected": true, "stale_rejected": true,
+        "historical_receipt_equal": true, "superseded_request_rejected": true,
+        "selected_metadata_persisted": true, "first_unselected_unchanged": true, "storage_after_commit": storage_after_commit,
+        "timings": {"commit_ns": commit_ns, "exact_replay_ns": replay_ns,
+            "conflict_rejection_ns": conflict_ns, "stale_rejection_ns": stale_ns,
+            "close_ns": close_ns, "reopen_ns": reopen_ns,
+            "historical_observation_ns": historical_observation_ns,
+            "superseded_rejection_ns": superseded_rejection_ns,
+            "persisted_selection_ns": persisted_selection_ns}})
 }
 
 #[test]
@@ -161,16 +334,7 @@ fn retained_source_owner_workload() {
     assert_eq!(manifest.len(), ROWS);
     drop(manifest);
     let revision = writer.current_revision().expect("audited revision");
-    let storage = match writer.capture_tag_metadata_budget(&revision) {
-        Ok(budget) => {
-            json!({"status": "measured", "main_retained_vfs_bytes": budget.resident_database_bytes(),
-            "wal_retained_vfs_bytes": budget.resident_wal_bytes(), "shm_root_observed_bytes": budget.resident_shm_bytes(),
-            "logical_page_count": budget.page_count(), "page_size": budget.page_size(), "capacity_claim": false})
-        }
-        Err(error) => {
-            json!({"status": "unavailable", "reason": error.to_string(), "capacity_claim": false})
-        }
-    };
+    let storage = storage_observation(&writer, &revision);
     let owner = SourceSnapshotOwner::start(writer).expect("existing bounded worker transport");
     let (first_hash, first_pages) = pages(&owner, &revision);
     let page_queue = owner.queue_metrics();
@@ -211,12 +375,11 @@ fn retained_source_owner_workload() {
     assert_eq!(reopened_page_queue.accepted, second_pages.len() as u64 + 1);
     assert_eq!(reopened_page_queue.dequeued, second_pages.len() as u64 + 1);
     assert_eq!(reopened_page_queue.pending_dispatch, 0);
-    owner
+    let writer = owner
         .begin_retirement()
         .join()
-        .expect("reopened worker joins")
-        .close()
-        .expect("reopened owner closes");
+        .expect("reopened worker joins");
+    let curation = curation_receipts(writer, &media, &profile);
     let expected_hash = fixture_hash.finalize().to_hex().to_string();
     assert_eq!(first_hash, expected_hash);
     assert_eq!(second_hash, expected_hash);
@@ -225,11 +388,11 @@ fn retained_source_owner_workload() {
         "profile-owned fixture cannot write the media root"
     );
     assert!(!temp.path().join("library.db").exists());
-    let evidence = json!({"schema_version": 1, "fixture": "source-owner-metadata-v1", "rows": ROWS,
+    let evidence = json!({"schema_version": 2, "fixture": "source-owner-metadata-v1", "rows": ROWS,
         "batch_size": BATCH, "page_size": BATCH, "fixture_blake3": expected_hash,
         "initial_revision": initial_revision, "final_revision": revision.revision(),
         "reopened_revision": reopened_revision.revision(), "restart_rows_match": true, "old_lifecycle_stale": true,
-        "storage": storage, "page_queue": page_queue, "reopened_page_queue": reopened_page_queue,
+        "curation": curation, "storage": storage, "page_queue": page_queue, "reopened_page_queue": reopened_page_queue,
         "timings": {"open_ns": open_ns, "manifest_batches": distribution(&mutations),
             "audit_ns": audit_ns, "pages": distribution(&first_pages), "close_ns": close_ns,
             "reopen_ns": reopen_ns, "reopened_pages": distribution(&second_pages)},
