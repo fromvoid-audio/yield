@@ -146,3 +146,28 @@ OPT-2060 fixtures exercise only the decision matrix below; they are synthetic
 contract evidence. They do not implement these leaves, prove a production commit or
 qualify physical behavior. OPT-1645/1341 and other tracking parents remain open until
 their complete implemented/qualified scope is fulfilled.
+
+## Actual parent observation implementation (OPT-2063)
+
+`SourceWriter::observe_file_identity` now issues a private `SourceFileObservation`
+for one exact UTF-8 supported/index-only row. Row count/type/length predicates bound
+audio/index reads before allocation. The read uses the retained source lease control
+connection, with live `SourceReferenceFence` validation before/after query. Consuming
+`validate()` rereads the exact row as well as owner/lifecycle/audited revision, catching
+auxiliary identity changes even when the generic revision is unchanged. It neither
+renews source ownership nor reopens a pathname or retains an ended writer's lifetime.
+
+`into_content_identity` returns the private `SourceContentIdentityObservation` only
+when a full canonical current-scanner hash is recorded. Unhashed audio/index-only
+metadata explicitly returns ContentAuditRequired; size/mtime/object hints cannot mint
+content-ready identity. Returned hashes are source database observations, not freshly
+qualified physical content reads or journal publication/absence/retirement receipts.
+
+Eight actual retained-owner tests cover Unicode audio/index facts, the full-content
+gate, auxiliary row changes, actual source curation revision changes, writer handoff/
+close, missing/unavailable/malformed/oversized/ambiguous records, invalid path/encoding,
+no database reopen or lease renewal, expired ownership and Unix root/database replacement.
+Seeded hashes are storage inputs; no physical hash/publication qualification is claimed.
+Native retained-owner regression stays in OPT-2042 (macOS) / OPT-2043 (Windows).
+Operation manifest receipts, actual Harvest mutations and private journal/family bridges
+remain OPT-2064/2065/1645/1787 work.

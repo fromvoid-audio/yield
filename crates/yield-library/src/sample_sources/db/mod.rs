@@ -36,6 +36,7 @@ pub use replay_authority::{DurableReplayUncertainty, DurableReplayUncertaintySta
 /// SQLite schema management for sample source databases.
 pub mod schema;
 mod source_authority;
+mod source_file_observation;
 mod source_lease;
 mod source_reference_fence;
 pub(crate) mod sqlite_identity;
@@ -50,6 +51,10 @@ pub use source_authority::{
     SourceAuthorityError, SourceAuthorityRegistration, SourceAuthorityRegistrationReceipt,
     SourceAuthorityRegistrationRequest, SourceAuthorityRetargetContext,
     SourceAuthorityRetirementAck,
+};
+pub use source_file_observation::{
+    SourceContentIdentityObservation, SourceFileObservation, SourceFileObservationError,
+    SourceFileObservationKind,
 };
 pub use source_lease::{SourceLeaseError, SourcePublicationFence, SourcePublicationFenceError};
 pub use source_reference_fence::{SourceReferenceFence, SourceReferenceFenceError};

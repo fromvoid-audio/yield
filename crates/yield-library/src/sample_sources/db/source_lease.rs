@@ -415,6 +415,33 @@ impl SourcePublicationFence {
         ))
     }
 
+    /// Read one bounded file record through retained control custody; no callback/write grant.
+    pub(super) fn read_file_observation(
+        &self,
+        path: &crate::operation_journal::StoredRelativePath,
+    ) -> Result<super::source_file_observation::FileFacts, super::SourceFileObservationError> {
+        self.validate()?;
+        let lease = self
+            .source_lease
+            .upgrade()
+            .ok_or(SourcePublicationFenceError::LeaseDropped)?;
+        let facts = {
+            let control = lease.control_connection.lock().map_err(|_| {
+                SourcePublicationFenceError::Lease(SourceLeaseError::ControlUnavailable)
+            })?;
+            lease
+                .validate_control_connection(&control)
+                .map_err(SourcePublicationFenceError::Lease)?;
+            let facts = super::source_file_observation::read_facts(&control, path)?;
+            lease
+                .validate_control_connection(&control)
+                .map_err(SourcePublicationFenceError::Lease)?;
+            facts
+        };
+        self.validate()?;
+        Ok(facts)
+    }
+
     /// Return the durable lease epoch captured by this fence.
     pub(crate) const fn lease_epoch(&self) -> i64 {
         self.lease_epoch
