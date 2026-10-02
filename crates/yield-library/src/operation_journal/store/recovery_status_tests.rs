@@ -156,8 +156,7 @@ fn recovery_status_preserves_guarded_terminal_dispositions_without_publication_a
     assert!(page.entries().iter().any(|entry| matches!(
         entry.outcome(),
         RecoveryStatusOutcome::FullProgress {
-            disposition:
-                crate::operation_journal::FullProgressDisposition::CancelledAfterObservedEffect,
+            disposition: crate::operation_journal::FullProgressDisposition::FailedDataLossRisk,
             ..
         }
     )));
