@@ -24,6 +24,7 @@ use super::file_drag;
 use super::metronome;
 use super::motion;
 use super::normalized_audition;
+use super::panel_resize::{ResizeDrag, bounded_size};
 use super::random_audition;
 use super::shortcut_help;
 use super::similar_sections;
@@ -122,9 +123,9 @@ enum PaneAxis {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PaneResizeDrag {
     axis: PaneAxis,
-    start_position: Point<Pixels>,
-    start_size: f32,
-    previous_preference: Option<f32>,
+    gesture: ResizeDrag,
+    viewport: gpui::Size<Pixels>,
+    row_height: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,9 +146,11 @@ fn sidebar_width(preferred: Option<f32>, window_width: f32, theme: &Theme) -> f3
     let maximum = (window_width - MIN_MAIN_PANE_WIDTH - PANE_RESIZE_RAIL)
         .max(96.0)
         .min(MAX_SIDEBAR_WIDTH);
-    preferred
-        .unwrap_or(theme.spacing.sidebar_width)
-        .clamp(MIN_SIDEBAR_WIDTH.min(maximum), maximum)
+    bounded_size(
+        preferred.unwrap_or(theme.spacing.sidebar_width),
+        MIN_SIDEBAR_WIDTH.min(maximum),
+        maximum,
+    )
 }
 
 fn browser_toolbar_gap(window_width: f32, theme: &Theme) -> f32 {
@@ -192,9 +195,11 @@ fn waveform_height(
         - PANE_RESIZE_RAIL)
         .max(minimum)
         .min(MAX_WAVEFORM_HEIGHT.max(minimum));
-    preferred
-        .unwrap_or(theme.spacing.waveform_height)
-        .clamp(minimum, maximum)
+    bounded_size(
+        preferred.unwrap_or(theme.spacing.waveform_height),
+        minimum,
+        maximum,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -514,6 +519,7 @@ impl Browser {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_pane_resize(cx);
         let theme = active(cx);
         let (start_size, previous_preference) = match axis {
             PaneAxis::Sidebar => (
@@ -546,9 +552,16 @@ impl Browser {
         };
         self.pane_resize_drag = Some(PaneResizeDrag {
             axis,
-            start_position: position,
-            start_size,
-            previous_preference,
+            gesture: ResizeDrag::begin(
+                match axis {
+                    PaneAxis::Sidebar => f32::from(position.x),
+                    PaneAxis::Waveform => f32::from(position.y),
+                },
+                start_size,
+                previous_preference,
+            ),
+            viewport: window.bounds().size,
+            row_height: theme.spacing.row_height,
         });
     }
 
@@ -561,20 +574,24 @@ impl Browser {
         let Some(drag) = self.pane_resize_drag else {
             return;
         };
+        if !self.pane_resize_context_matches(window, cx) {
+            self.cancel_pane_resize(cx);
+            return;
+        }
         let theme = active(cx);
         match drag.axis {
             PaneAxis::Sidebar => {
-                let delta = f32::from(position.x - drag.start_position.x);
+                let requested = drag.gesture.requested_size(f32::from(position.x));
                 self.preferred_sidebar_width = Some(sidebar_width(
-                    Some(drag.start_size + delta),
+                    Some(requested),
                     f32::from(window.bounds().size.width),
                     theme,
                 ));
             }
             PaneAxis::Waveform => {
-                let delta = f32::from(position.y - drag.start_position.y);
+                let requested = drag.gesture.requested_size(f32::from(position.y));
                 self.preferred_waveform_height = Some(waveform_height(
-                    Some(drag.start_size + delta),
+                    Some(requested),
                     f32::from(window.bounds().size.height),
                     theme,
                     browser_toolbar_height(
@@ -609,10 +626,33 @@ impl Browser {
             return;
         };
         match drag.axis {
-            PaneAxis::Sidebar => self.preferred_sidebar_width = drag.previous_preference,
-            PaneAxis::Waveform => self.preferred_waveform_height = drag.previous_preference,
+            PaneAxis::Sidebar => self.preferred_sidebar_width = drag.gesture.previous_preference(),
+            PaneAxis::Waveform => {
+                self.preferred_waveform_height = drag.gesture.previous_preference()
+            }
         }
         cx.notify();
+    }
+
+    fn pane_resize_context_matches(&self, window: &Window, cx: &Context<Self>) -> bool {
+        self.pane_resize_drag.is_none_or(|drag| {
+            drag.viewport == window.bounds().size
+                && drag.row_height == active(cx).spacing.row_height
+        })
+    }
+
+    fn reconcile_pane_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pane_resize_activation.is_none() {
+            self.pane_resize_activation =
+                Some(cx.observe_window_activation(window, |view, window, cx| {
+                    if !window.is_window_active() {
+                        view.cancel_pane_resize(cx);
+                    }
+                }));
+        }
+        if !self.pane_resize_context_matches(window, cx) {
+            self.cancel_pane_resize(cx);
+        }
     }
 
     fn render_sidebar_resize_rail(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1273,6 +1313,7 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reconcile_pane_resize(window, cx);
         self.reconcile_shipped_visual_effect(window, cx);
         self.refresh_user_shader_review_token();
         #[cfg(target_os = "macos")]
@@ -4748,6 +4789,94 @@ mod tests {
                 browser_status_bar_height(&enlarged, true),
             ) >= minimum
         );
+    }
+
+    #[gpui::test]
+    fn sidebar_resize_preserves_text_focus_and_escape_restores_preference(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.refresh().expect("initial layout");
+        cx.update(|window, app| {
+            window.focus(&browser.read(app).search_input.read(app).focus_handle());
+        });
+        let rail = cx
+            .debug_bounds("workspace-sidebar-resize")
+            .expect("sidebar rail");
+        let start = rail.center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            point(start.x + px(4.0), start.y),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(start.x + px(70.0), start.y),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.update(|window, app| {
+            let view = browser.read(app);
+            assert!(
+                view.search_input
+                    .read(app)
+                    .focus_handle()
+                    .is_focused(window)
+            );
+            assert!(view.preferred_sidebar_width.is_some());
+        });
+        cx.simulate_keystrokes("escape");
+        cx.update(|_, app| {
+            let view = browser.read(app);
+            assert!(view.pane_resize_drag.is_none());
+            assert!(view.preferred_sidebar_width.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_resize_retires_on_viewport_or_text_scale_change(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.refresh().expect("initial layout");
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                view.preferred_sidebar_width = Some(300.0);
+                view.begin_pane_resize(PaneAxis::Sidebar, point(px(300.0), px(100.0)), window, cx);
+                view.update_pane_resize(point(px(400.0), px(100.0)), window, cx);
+                assert_eq!(view.preferred_sidebar_width, Some(400.0));
+            });
+        });
+        cx.simulate_resize(gpui::size(px(800.0), px(560.0)));
+        cx.refresh().expect("resized window");
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                assert!(view.pane_resize_drag.is_none());
+                assert_eq!(view.preferred_sidebar_width, Some(300.0));
+                view.begin_pane_resize(PaneAxis::Sidebar, point(px(300.0), px(100.0)), window, cx);
+            });
+            let enlarged = crate::theme::with_text_scale(active(app), 200);
+            app.set_global(crate::theme::ActiveTheme(std::sync::Arc::new(enlarged)));
+        });
+        cx.refresh().expect("enlarged layout");
+        cx.update(|_, app| {
+            assert!(browser.read(app).pane_resize_drag.is_none());
+            assert_eq!(browser.read(app).preferred_sidebar_width, Some(300.0));
+        });
+    }
+
+    #[test]
+    fn sidebar_clamp_preserves_main_viewport_at_both_text_scales() {
+        for percent in [100, 200] {
+            let theme = crate::theme::with_text_scale(&Theme::default(), percent);
+            for width in [400.0, 800.0, 1440.0] {
+                for request in [-500.0, 10000.0, f32::NAN] {
+                    let sidebar = sidebar_width(Some(request), width, &theme);
+                    assert!(sidebar.is_finite());
+                    assert!(sidebar >= 96.0);
+                    assert!(sidebar <= MAX_SIDEBAR_WIDTH);
+                    assert!(width - sidebar - PANE_RESIZE_RAIL >= MIN_MAIN_PANE_WIDTH);
+                }
+            }
+        }
     }
 
     #[gpui::test]

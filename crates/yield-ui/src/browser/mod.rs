@@ -100,6 +100,7 @@ mod metronome;
 mod motion;
 mod normalized_audition;
 mod panel_focus;
+mod panel_resize;
 mod playback_age;
 mod played_ranges;
 mod playmark_timing;
@@ -386,6 +387,7 @@ pub(crate) struct Browser {
     preferred_sidebar_width: Option<f32>,
     preferred_waveform_height: Option<f32>,
     pane_resize_drag: Option<view::PaneResizeDrag>,
+    pane_resize_activation: Option<gpui::Subscription>,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
     waveform_edit_region: Option<WaveformEditRegion>,
@@ -731,6 +733,7 @@ impl Browser {
             preferred_sidebar_width: None,
             preferred_waveform_height: None,
             pane_resize_drag: None,
+            pane_resize_activation: None,
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
             waveform_edit_region: None,
