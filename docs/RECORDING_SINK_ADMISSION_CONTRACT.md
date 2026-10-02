@@ -87,6 +87,32 @@ fall back to direct file I/O. Existing FileOperationOwner queue/result/input/rec
 remain in force. Header finalization, seeking and shorter-than-budget allocation settlement
 must be explicitly covered by the prepared chunk graph; a generic hound sink supplies no grant.
 
+## OPT-2069 finite journal value codec
+
+`operation_journal::recording_commands` introduces a separate V1 observation codec for a
+finite float32 proposal and actual immutable encoded chunks. Its version does not extend
+operation-journal V1-V16 and does not make a new initial intent dispatchable. A proposal
+freezes operation/output identity, initial participant inventory, a filesystem Stage work key,
+owner-local destination/staging registration observations, a source-parent/leaf destination,
+a distinct bounded staging locator, absent/no-replace policy and checked format/allocation.
+Existing namespace validators check participant/source/parent relations. Recovered root
+observations cannot reconstruct live registrations.
+
+The initial durable-value budget is narrower than reson's RIFF maximum: at most 8176 PCM
+slots of at most 16384 bytes, rounded down to complete interleaved frames, plus 16 header
+patch slots (8192 total, within the existing chunk-claim row ceiling) of at most 128 bytes each. The initial header slot must cover the entire header at offset zero. Header extent is explicit and bounded; a later actual
+encoder/owner bridge must verify its bytes and format. Slot offsets are deterministic and all
+bytes fit the finite allocation. The bounded strict JSON codec rejects duplicate/unknown
+fields, unknown versions/roles, mismatched proposal bindings and incomplete frames. Exact
+replay requires identical actual bytes and frozen context, not only a digest. An individual
+valid chunk does not establish contiguous capture coverage, completed header ordering or a
+positive physical result.
+
+OPT-2070 must integrate supported versioned initial intents, work/capacity plans, actual
+SQLite retention before dispatch, ordered/contiguous prefix recovery, live grants and safe
+retirement/reclamation. Until then OPT-2057 remains open; these values alone are no journal
+reopen evidence, filesystem admission or physical qualification.
+
 ## Journal and physical adapter gaps to implement
 
 `file_operation_owner.rs` already names `CreateStaging`, `WriteStagingChunk`, `FlushStaging`,
