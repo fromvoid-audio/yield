@@ -607,6 +607,19 @@ impl HeldIndexFile {
         &self,
         entry: &super::super::SourceIndexEntry,
     ) -> Result<(), super::super::SourceIndexInspectionError> {
+        self.validate_facts(
+            entry.file_identity.as_deref(),
+            entry.file_size,
+            entry.modified_ns,
+        )
+    }
+
+    pub(crate) fn validate_facts(
+        &self,
+        expected_identity: Option<&str>,
+        expected_size: Option<u64>,
+        expected_modified: Option<i64>,
+    ) -> Result<(), super::super::SourceIndexInspectionError> {
         use super::super::SourceIndexInspectionError as E;
         #[cfg(target_os = "linux")]
         {
@@ -628,9 +641,9 @@ impl HeldIndexFile {
             let identity = stable_filesystem_identity_from_open_file(file).ok_or(E::Unavailable)?;
             let modified =
                 system_time_to_unix_nanos(metadata.modified().map_err(|_| E::Unavailable)?);
-            if entry.file_identity.as_deref() != Some(&identity)
-                || entry.file_size != Some(metadata.len())
-                || entry.modified_ns != Some(modified)
+            if expected_identity != Some(&identity)
+                || expected_size != Some(metadata.len())
+                || expected_modified != Some(modified)
             {
                 return Err(E::ChangedEntry);
             }
@@ -638,7 +651,48 @@ impl HeldIndexFile {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = entry;
+            let _ = (expected_identity, expected_size, expected_modified);
+            Err(E::Unsupported)
+        }
+    }
+    pub(crate) fn open_for_feature_read(
+        &self,
+    ) -> Result<fs::File, super::super::SourceIndexInspectionError> {
+        use super::super::SourceIndexInspectionError as E;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+            let parent = self
+                .chain
+                .get(self.chain.len().checked_sub(2).ok_or(E::Unavailable)?)
+                .ok_or(E::Unavailable)?;
+            let name = std::ffi::CString::new(self.names.last().ok_or(E::Unavailable)?.as_bytes())
+                .map_err(|_| E::InvalidPath)?;
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                )
+            };
+            if fd < 0 {
+                return Err(E::Unavailable);
+            }
+            // openat returned a new, uniquely owned descriptor. Validate it against the held
+            // O_PATH regular file before data access; never follow a pathname/proc alias.
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            let held = self.chain.last().ok_or(E::Unavailable)?;
+            if !file.metadata().map_err(|_| E::Unavailable)?.is_file()
+                || stable_filesystem_identity_from_open_file(&file).ok_or(E::Unavailable)?
+                    != stable_filesystem_identity_from_open_file(held).ok_or(E::Unavailable)?
+            {
+                return Err(E::ChangedEntry);
+            }
+            Ok(file)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
             Err(E::Unsupported)
         }
     }

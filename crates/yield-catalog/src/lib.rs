@@ -62,6 +62,11 @@ use yield_source_watcher::{SourceWatchSpec, SourceWatcher, WatcherSignal};
 mod curation;
 mod curation_tag_facts;
 mod display_labels;
+mod feature_job;
+pub use feature_job::{
+    ComputedFeatureJob, FeatureJobFailure, FeatureJobOutcome, PreparedFeatureJob,
+    prepare_feature_job,
+};
 mod index_pages;
 mod index_reveal;
 mod index_reveal_contract;
@@ -15561,4 +15566,6 @@ mod tests {
             (true, false)
         );
     }
+    #[cfg(target_os = "linux")]
+    mod feature_job_tests;
 }

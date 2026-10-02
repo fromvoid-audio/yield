@@ -1,6 +1,7 @@
 mod analysis_prep;
 mod decode;
 mod decode_io;
+pub(crate) use decode_io::decode_feature_wav_bytes;
 mod exact_duplicates;
 mod normalize;
 mod resample;

@@ -8,6 +8,7 @@ warnings = "deny"
 missing_docs = "deny"
 
 [dependencies]
+yield-analysis = { path = "../yield-analysis" }
 blake3 = "1.6.1"
 thiserror = "2.0.17"
 yield-library = { path = "../yield-library" }

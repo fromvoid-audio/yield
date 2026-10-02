@@ -12,9 +12,9 @@ pub use analysis::{
     ExactSimilarityArtifactRequest, ExactSimilarityManifestEntry, ExactSimilarityPublication,
     FEATURE_VECTOR_LEN_V1, FEATURE_VERSION_V1, compute_feature_vector_v1_for_decoded_audio,
     compute_feature_vector_v1_for_mono_samples, compute_feature_vector_v1_for_path,
-    compute_similarity_embedding_for_mono_samples, compute_similarity_embedding_for_path,
-    decode_f32_le_blob, light_dsp_from_features_v1, preprocess_mono_for_embedding,
-    rebuild_exact_similarity_artifacts,
+    compute_feature_vector_v1_for_wav_bytes, compute_similarity_embedding_for_mono_samples,
+    compute_similarity_embedding_for_path, decode_f32_le_blob, light_dsp_from_features_v1,
+    preprocess_mono_for_embedding, rebuild_exact_similarity_artifacts,
 };
 pub use analysis::{ann_index, aspects, hdbscan, similarity, vector};
 
