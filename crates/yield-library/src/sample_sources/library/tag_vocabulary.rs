@@ -422,7 +422,10 @@ impl LibraryDatabase {
         category: ProfileTagCategory,
     ) -> Result<ProfileTagVocabularySetReceipt, LibraryError> {
         validate_set_input(label, category).map_err(LibraryError::from)?;
-        let transaction = self.connection.transaction().map_err(map_sql_error)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(map_sql_error)?;
         let revision = profile_tag_vocabulary_revision(&transaction)?;
         if revision != expected_revision {
             return Err(LibraryError::ProfileTagVocabularyStaleRevision {
@@ -460,6 +463,7 @@ impl LibraryDatabase {
                     changed: false,
                 });
             }
+            crate::sqlite_wal::enforce_wal_admission(&transaction)?;
             transaction
                 .execute(
                     "UPDATE profile_tag_vocabulary SET category = ?1 WHERE label = ?2",
@@ -467,6 +471,7 @@ impl LibraryDatabase {
                 )
                 .map_err(map_sql_error)?;
         } else {
+            crate::sqlite_wal::enforce_wal_admission(&transaction)?;
             transaction
                 .execute(
                     "INSERT INTO profile_tag_vocabulary (label, category) VALUES (?1, ?2)",
@@ -492,7 +497,10 @@ impl LibraryDatabase {
         label: &str,
     ) -> Result<ProfileTagVocabularyDeleteReceipt, LibraryError> {
         validate_delete_input(label).map_err(LibraryError::from)?;
-        let transaction = self.connection.transaction().map_err(map_sql_error)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(map_sql_error)?;
         let revision = profile_tag_vocabulary_revision(&transaction)?;
         if revision != expected_revision {
             return Err(LibraryError::ProfileTagVocabularyStaleRevision {
@@ -534,6 +542,7 @@ impl LibraryDatabase {
             category: existing,
         };
 
+        crate::sqlite_wal::enforce_wal_admission(&transaction)?;
         transaction
             .execute(
                 "DELETE FROM profile_tag_vocabulary WHERE label = ?1",

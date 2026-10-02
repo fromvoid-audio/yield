@@ -68,7 +68,12 @@ impl LibraryDatabase {
             });
         }
         let started_at = Instant::now();
-        let tx = self.connection.transaction().map_err(map_sql_error)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(map_sql_error)?;
+        // Observe the retained WAL while this owner holds the SQLite writer reservation.
+        crate::sqlite_wal::enforce_wal_admission(&tx)?;
         Self::set_metadata_in_tx(&tx, UI_PREFERENCES_KEY, payload)?;
         tx.commit().map_err(map_sql_error)?;
         record_library_db_event("library.replace_ui_preferences_payload", started_at, Ok(()));
@@ -89,7 +94,12 @@ impl LibraryDatabase {
     ) -> Result<(), LibraryError> {
         validate_sources_encoded(snapshot.as_slice()).map_err(map_registry_bound_error)?;
         let started_at = Instant::now();
-        let tx = self.connection.transaction().map_err(map_sql_error)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(map_sql_error)?;
+        // Observe the retained WAL while this owner holds the SQLite writer reservation.
+        crate::sqlite_wal::enforce_wal_admission(&tx)?;
         Self::replace_source_registry_in_tx(&tx, snapshot)?;
         tx.commit().map_err(map_sql_error)?;
         record_library_db_event(event, started_at, Ok(()));

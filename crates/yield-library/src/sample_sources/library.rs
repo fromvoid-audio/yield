@@ -27,6 +27,9 @@ mod tag_vocabulary;
 mod telemetry;
 
 #[cfg(test)]
+mod global_wal_tests;
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

@@ -34,6 +34,9 @@ pub enum LibraryError {
     #[error("Harvest copy commit acknowledgement uncertain; replay original proposal")]
     HarvestCopyCommitUncertain,
 
+    /// The retained SQLite owner cannot admit an ordinary WAL-growing mutation.
+    #[error(transparent)]
+    WalAdmission(#[from] crate::WalAdmissionError),
     /// An ordinary snapshot proposal is older than this acquisition's last committed one.
     #[error("global snapshot revision {proposed} is older than committed {committed}")]
     GlobalSnapshotStaleRevision {
