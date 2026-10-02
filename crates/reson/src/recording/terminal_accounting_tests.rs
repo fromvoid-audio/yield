@@ -218,3 +218,63 @@ fn terminal_accounting_worker_panic_cannot_confirm_a_prefix_or_accept_late_sampl
     assert_eq!(health.snapshot().writer_accepted_samples, 0);
     assert_eq!(health.snapshot().writer_dropped_samples, 1);
 }
+
+struct PartialWriteFailureSink {
+    inner: SharedSink,
+    remaining: Arc<Mutex<Option<usize>>>,
+}
+impl Write for PartialWriteFailureSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut remaining = self.remaining.lock().unwrap();
+        match remaining.as_mut() {
+            Some(0) => Err(io::Error::other("injected error after partial PCM write")),
+            Some(left) => {
+                let count = bytes.len().min(*left);
+                let written = self.inner.write(&bytes[..count])?;
+                *left -= written;
+                Ok(written)
+            }
+            None => self.inner.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+impl Seek for PartialWriteFailureSink {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+#[test]
+fn terminal_accounting_partial_transport_error_keeps_failed_batch_unconfirmed() {
+    let health = Arc::new(RecordingHealthState::default());
+    let output = SharedSink::default();
+    let remaining = Arc::new(Mutex::new(None));
+    let settings = limits(1, 10_000);
+    let writer = WavSampleWriter::new(
+        Box::new(PartialWriteFailureSink {
+            inner: output.clone(),
+            remaining: remaining.clone(),
+        }),
+        settings,
+    )
+    .unwrap();
+    let header_bytes = output.bytes.lock().unwrap().get_ref().len();
+    let (mut capture, consumer) = RecorderWriter::prepare_capture(settings, health.clone());
+    capture.submit(&vec![0.25; 2 * WRITER_DRAIN_SAMPLES + 2]);
+    *remaining.lock().unwrap() = Some(8);
+    assert!(writer_loop(writer, consumer, &capture.mode, &health).is_err());
+    // The first whole codec batch filled the buffer. The next batch triggered its partially
+    // successful transport flush: codec success still cannot be read as durable PCM success.
+    partition(&health, 8194, 4096, 2, 4096);
+    assert!(health.snapshot().writer_failed);
+    assert_eq!(
+        output.bytes.lock().unwrap().get_ref().len(),
+        header_bytes + 8
+    );
+    capture.submit(&[0.5]);
+    assert_eq!(health.snapshot().writer_accepted_samples, 8194);
+    assert_eq!(health.snapshot().writer_dropped_samples, 1);
+}
