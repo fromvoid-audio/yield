@@ -4410,3 +4410,6 @@ mod tag_admission_observation;
 mod collection_history_selection;
 #[path = "curation/metadata_tag_commands.rs"]
 mod metadata_tag_commands;
+
+#[path = "curation/layout_metadata.rs"]
+mod layout_metadata;
