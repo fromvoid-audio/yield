@@ -1096,4 +1096,255 @@ mod fixtures {
             );
         }
     }
+    fn audit_current_manifest(f: &CurationFixture, writer: &SourceWriter) {
+        let db = writer.catalog_database();
+        let revision = db.get_revision().unwrap();
+        db.begin_source_directory_truth_generation(3, 0).unwrap();
+        db.write_batch()
+            .unwrap()
+            .commit_manifest_audit_with_staged_directory_truth(
+                3,
+                revision,
+                40,
+                f.root_identity.clone(),
+                None,
+            )
+            .unwrap();
+    }
+    #[test]
+    fn feature_current_manifest_change_invalidates_old_ready_before_target_republication() {
+        let (f, mut writer) = setup();
+        let target = publish(&mut writer);
+        let old_key = complete_feature(&mut writer, &target, 31);
+        let revision = writer.current_revision().unwrap();
+        let other = writer
+            .prepare_feature_readiness_target(
+                &revision,
+                Path::new("two.wav"),
+                33,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let other_key = complete_feature(&mut writer, &other, 34);
+        let other_payload = writer
+            .lookup_feature_artifact(&revision, &other_key)
+            .unwrap()
+            .unwrap();
+        let file = f._source.path().join("one.wav");
+        std::fs::write(&file, b"new audited content").unwrap();
+        let hash = blake3::hash(b"new audited content").to_hex().to_string();
+        let mut batch = writer.catalog_database().write_batch().unwrap();
+        batch
+            .upsert_file_with_hash(Path::new("one.wav"), 19, 2, &hash)
+            .unwrap();
+        batch.commit().unwrap();
+        audit_current_manifest(&f, &writer);
+        let next_revision = writer.current_revision().unwrap();
+        assert!(next_revision.revision() > revision.revision());
+        assert_eq!(
+            feature_classification(&writer, &target, 40),
+            ReadinessClassification::StaleByGeneration
+        );
+        assert!(
+            writer
+                .lookup_feature_artifact(&next_revision, &old_key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            writer
+                .lookup_feature_artifact_for_target(&next_revision, &target)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            feature_classification(&writer, &other, 40),
+            ReadinessClassification::Current
+        );
+        assert_eq!(
+            writer
+                .lookup_feature_artifact(&next_revision, &other_key)
+                .unwrap()
+                .unwrap(),
+            other_payload
+        );
+        assert_eq!(
+            writer
+                .catalog_database()
+                .connection
+                .query_row("SELECT count(*) FROM source_feature_artifacts", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            2
+        );
+        let next = writer
+            .prepare_feature_readiness_target(
+                &next_revision,
+                Path::new("one.wav"),
+                41,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(next.scope_id, target.scope_id);
+        assert_ne!(next.content_generation, target.content_generation);
+        assert!(next.source_generation > target.source_generation);
+        let key = complete_feature(&mut writer, &next, 42);
+        assert_ne!(key, old_key);
+        assert_eq!(
+            feature_classification(&writer, &next, 43),
+            ReadinessClassification::Current
+        );
+    }
+    #[test]
+    fn feature_current_manifest_rename_and_missing_retain_immutable_bytes_without_false_current() {
+        for missing in [false, true] {
+            let (f, mut writer) = setup();
+            let target = publish(&mut writer);
+            let key = complete_feature(&mut writer, &target, 31);
+            let revision = writer.current_revision().unwrap();
+            let payload = writer
+                .lookup_feature_artifact(&revision, &key)
+                .unwrap()
+                .unwrap();
+            let mut batch = writer.catalog_database().write_batch().unwrap();
+            if missing {
+                batch.set_missing(Path::new("one.wav"), true).unwrap();
+            } else {
+                std::fs::rename(
+                    f._source.path().join("one.wav"),
+                    f._source.path().join("renamed.wav"),
+                )
+                .unwrap();
+                batch
+                    .remap_wav_file_path(Path::new("one.wav"), Path::new("renamed.wav"))
+                    .unwrap();
+                // Remapping correctly clears old observations. Republish actual post-rename
+                // identity/hash as the scanner does before declaring a complete audit.
+                let file = f._source.path().join("renamed.wav");
+                let metadata = file.metadata().unwrap();
+                let identity =
+                    crate::filesystem_identity::stable_filesystem_identity(&file, &metadata)
+                        .unwrap();
+                let hash = blake3::hash(&std::fs::read(&file).unwrap())
+                    .to_hex()
+                    .to_string();
+                batch
+                    .upsert_file_with_hash(Path::new("renamed.wav"), metadata.len(), 1, &hash)
+                    .unwrap();
+                batch
+                    .set_file_identity(Path::new("renamed.wav"), Some(&identity))
+                    .unwrap();
+            }
+            batch.commit().unwrap();
+            audit_current_manifest(&f, &writer);
+            let revision = writer.current_revision().unwrap();
+            assert_eq!(
+                feature_classification(&writer, &target, 40),
+                ReadinessClassification::StaleByGeneration
+            );
+            assert!(
+                writer
+                    .lookup_feature_artifact(&revision, &key)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                writer
+                    .catalog_database()
+                    .connection
+                    .query_row("SELECT count(*) FROM source_feature_artifacts", [], |r| r
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                1
+            );
+            if !missing {
+                let next = writer
+                    .prepare_feature_readiness_target(
+                        &revision,
+                        Path::new("renamed.wav"),
+                        41,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                assert_eq!(next.scope_id, target.scope_id);
+                assert_eq!(next.content_generation, target.content_generation);
+                assert_eq!(
+                    writer
+                        .lookup_feature_artifact(&revision, &key)
+                        .unwrap()
+                        .unwrap(),
+                    payload
+                );
+                assert_eq!(
+                    feature_classification(&writer, &next, 41),
+                    ReadinessClassification::Current
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn feature_current_manifest_change_during_publication_rolls_back_all_completion() {
+        let (_f, mut writer) = setup();
+        let target = publish(&mut writer);
+        let revision = writer.current_revision().unwrap();
+        writer
+            .admit_feature_artifact_rebuild(&revision, &target, 31, &AtomicBool::new(false))
+            .unwrap();
+        let claim = writer
+            .claim_feature_artifact(&revision, &target, 32, 100)
+            .unwrap()
+            .unwrap();
+        writer.catalog_database().connection.execute_batch("CREATE TRIGGER completion_changes_manifest AFTER INSERT ON source_feature_artifacts BEGIN UPDATE wav_files SET content_hash='changed-inside-transaction' WHERE path='one.wav'; END").unwrap();
+        let result = writer
+            .publish_feature_artifact(
+                &revision,
+                &claim,
+                &FeatureArtifactPayload::from_v1_vector(&[0.5; 183]).unwrap(),
+                33,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(result, FeatureArtifactPublication::RejectedStale);
+        assert_eq!(counts(&writer), (7, 2, 1));
+        assert_eq!(
+            writer
+                .catalog_database()
+                .connection
+                .query_row("SELECT count(*) FROM source_feature_artifacts", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            writer
+                .catalog_database()
+                .connection
+                .query_row(
+                    "SELECT content_hash FROM wav_files WHERE path='one.wav'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            target.content_generation
+        );
+        assert_eq!(
+            writer
+                .catalog_database()
+                .connection
+                .query_row(
+                    "SELECT status FROM analysis_jobs WHERE readiness_stage='analysis_features'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "running"
+        );
+    }
 }

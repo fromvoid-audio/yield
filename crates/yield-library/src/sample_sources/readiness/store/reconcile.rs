@@ -408,24 +408,29 @@ fn build_snapshot(
             && target.eligibility == ReadinessEligibility::Eligible
             && source_state.availability == SourceAvailability::Active
         {
-            use super::feature_artifact::{Health, health, marker_matches};
-            match health(connection, &target)? {
-                Health::Healthy(ref artifact_key, _)
-                    if marker_matches(connection, artifact_key)? => {}
-                Health::Ambiguous => {
-                    classification = ReadinessClassification::PermanentFailure {
-                        code: "feature_artifact_ownership".into(),
-                        reason: "Feature payload provenance is ambiguous; evidence retained".into(),
+            use super::feature_artifact::{Health, health, manifest_matches, marker_matches};
+            if !manifest_matches(connection, &target)? {
+                classification = ReadinessClassification::StaleByGeneration;
+            } else {
+                match health(connection, &target)? {
+                    Health::Healthy(ref artifact_key, _)
+                        if marker_matches(connection, artifact_key)? => {}
+                    Health::Ambiguous => {
+                        classification = ReadinessClassification::PermanentFailure {
+                            code: "feature_artifact_ownership".into(),
+                            reason: "Feature payload provenance is ambiguous; evidence retained"
+                                .into(),
+                        }
                     }
-                }
-                _ => {
-                    classification = classify_target(
-                        &target,
-                        source_state.availability,
-                        None,
-                        work.get(&key),
-                        now,
-                    )
+                    _ => {
+                        classification = classify_target(
+                            &target,
+                            source_state.availability,
+                            None,
+                            work.get(&key),
+                            now,
+                        )
+                    }
                 }
             }
         }

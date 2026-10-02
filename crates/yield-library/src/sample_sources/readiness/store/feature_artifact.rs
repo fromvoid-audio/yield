@@ -29,7 +29,10 @@ fn current_target(
         WHERE t.source_id = ?1 AND t.scope_kind = 'file' AND t.scope_id = ?2
         AND t.stage = 'analysis_features' AND t.required_version = ?3
         AND t.content_generation = ?4 AND t.eligibility = 'eligible'
-        AND s.availability = 'active')",
+        AND s.availability = 'active'
+        AND (s.contract_version <> 'yield-audited-feature-matrix-v1' OR EXISTS(
+            SELECT 1 FROM wav_files w WHERE w.path=t.relative_path AND w.missing=0
+            AND w.file_identity=t.scope_id AND w.content_hash=t.content_generation)))",
         params![
             key.target.source_id,
             key.target.scope_id,
@@ -38,6 +41,16 @@ fn current_target(
         ],
         |row| row.get(0),
     )?)
+}
+
+// Current file content is the dependency of a file-scoped feature artifact. A source revision
+// bump alone (for example curation of a different file) must not throw away unchanged features.
+pub(super) fn manifest_matches(
+    connection: &Connection,
+    target: &super::super::ReadinessTarget,
+) -> Result<bool, ReadinessError> {
+    Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM wav_files WHERE path=?1 AND missing=0 AND file_identity=?2 AND content_hash=?3)",
+        params![target.relative_path,target.scope_id,target.content_generation],|row|row.get(0))?)
 }
 
 pub(super) fn publish(
@@ -118,12 +131,18 @@ pub(super) fn publish(
             if cancel.load(Ordering::Acquire) {
                 return Err(ReadinessError::Cancelled);
             }
+            if !current_target(&tx, &key)? {
+                return Ok(FeatureArtifactPublication::RejectedStale);
+            }
             tx.commit()?;
             return Ok(FeatureArtifactPublication::Recorded(key));
         }
         super::work::validate_claim_ownership(&tx, ownership, claim)?;
         if cancel.load(Ordering::Acquire) {
             return Err(ReadinessError::Cancelled);
+        }
+        if !current_target(&tx, &key)? {
+            return Ok(FeatureArtifactPublication::RejectedStale);
         }
         tx.commit()?;
         return Ok(FeatureArtifactPublication::Duplicate(key));
@@ -157,6 +176,9 @@ pub(super) fn publish(
     super::work::validate_claim_ownership(&tx, ownership, claim)?;
     if cancel.load(Ordering::Acquire) {
         return Err(ReadinessError::Cancelled);
+    }
+    if !current_target(&tx, &key)? {
+        return Ok(FeatureArtifactPublication::RejectedStale);
     }
     tx.commit()?;
     Ok(FeatureArtifactPublication::Recorded(key))
