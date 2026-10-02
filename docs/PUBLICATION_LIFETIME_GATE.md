@@ -289,6 +289,8 @@ cargo test --locked -p yield-library --lib staging_checkpoint -- --test-threads=
 cargo test --locked -p yield-library --lib v16_copy_retry_and_cancel_preserve_full_plan_through_store_cas_and_restart -- --test-threads=1
 cargo test --locked -p yield-library --lib file_operation_owner::tests -- --test-threads=1
 cargo test --locked -p yield-library --lib source_authority::tests -- --test-threads=1
+cargo test --locked -p yield-library --lib source_effect_pin -- --test-threads=1
+cargo test --locked -p yield-library --lib source_release_waits_for_effect_permit_before_releasing_durable_row -- --test-threads=1
 bash scripts/agent.sh preflight
 git diff --check
 ```
