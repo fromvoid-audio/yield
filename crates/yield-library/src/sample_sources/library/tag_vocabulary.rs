@@ -422,10 +422,7 @@ impl LibraryDatabase {
         category: ProfileTagCategory,
     ) -> Result<ProfileTagVocabularySetReceipt, LibraryError> {
         validate_set_input(label, category).map_err(LibraryError::from)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(map_sql_error)?;
+        let transaction = super::ordinary_retry::begin(&self.connection)?;
         let revision = profile_tag_vocabulary_revision(&transaction)?;
         if revision != expected_revision {
             return Err(LibraryError::ProfileTagVocabularyStaleRevision {
@@ -497,10 +494,7 @@ impl LibraryDatabase {
         label: &str,
     ) -> Result<ProfileTagVocabularyDeleteReceipt, LibraryError> {
         validate_delete_input(label).map_err(LibraryError::from)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(map_sql_error)?;
+        let transaction = super::ordinary_retry::begin(&self.connection)?;
         let revision = profile_tag_vocabulary_revision(&transaction)?;
         if revision != expected_revision {
             return Err(LibraryError::ProfileTagVocabularyStaleRevision {

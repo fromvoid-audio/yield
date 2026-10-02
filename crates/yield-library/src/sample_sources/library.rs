@@ -15,6 +15,7 @@ mod harvest_copy;
 mod migrations;
 mod mutation_context;
 mod operation_link_participant;
+mod ordinary_retry;
 mod owner;
 mod read_only;
 mod reference_participant;

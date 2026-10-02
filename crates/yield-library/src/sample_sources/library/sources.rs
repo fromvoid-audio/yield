@@ -68,10 +68,7 @@ impl LibraryDatabase {
             });
         }
         let started_at = Instant::now();
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(map_sql_error)?;
+        let tx = super::ordinary_retry::begin(&self.connection)?;
         // Observe the retained WAL while this owner holds the SQLite writer reservation.
         crate::sqlite_wal::enforce_wal_admission(&tx)?;
         Self::set_metadata_in_tx(&tx, UI_PREFERENCES_KEY, payload)?;
@@ -94,10 +91,7 @@ impl LibraryDatabase {
     ) -> Result<(), LibraryError> {
         validate_sources_encoded(snapshot.as_slice()).map_err(map_registry_bound_error)?;
         let started_at = Instant::now();
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(map_sql_error)?;
+        let tx = super::ordinary_retry::begin(&self.connection)?;
         // Observe the retained WAL while this owner holds the SQLite writer reservation.
         crate::sqlite_wal::enforce_wal_admission(&tx)?;
         Self::replace_source_registry_in_tx(&tx, snapshot)?;
