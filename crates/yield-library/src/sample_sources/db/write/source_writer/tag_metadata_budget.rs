@@ -93,12 +93,11 @@ impl SourceWriter {
         Ok(budget)
     }
 
-    pub(super) fn read_tag_metadata_facts(
+    fn read_tag_metadata_facts(
         &self,
         revision: SourceRevision,
         deadline: Instant,
     ) -> Result<SourceTagMetadataBudget, SourceWriterError> {
-        let _progress = SnapshotProgressGuard::install(&self.database.connection, deadline);
         let _extensions =
             crate::sqlite_ext::try_extension_free_metadata_scope().ok_or_else(unknown)?;
         crate::sample_sources::db::schema::require_known_metadata_schema(&self.database.connection)
@@ -193,6 +192,7 @@ impl SourceWriter {
         if !Arc::ptr_eq(&owner, &self.reference_liveness) {
             return Err(SourceWriterError::StaleFence);
         }
+        let _progress = SnapshotProgressGuard::install(&self.database.connection, deadline);
         let current = self.read_tag_metadata_facts(budget.revision.clone(), deadline)?;
         if (
             current.page_size,
