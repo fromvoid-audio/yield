@@ -85,6 +85,25 @@ pub(super) fn consume(
     {
         return retained(submission, CatalogReplayError::PendingDifferent);
     }
+    if source
+        .replay
+        .as_ref()
+        .unwrap()
+        .audit_batch
+        .as_ref()
+        .is_some_and(|b| b != &submission.batch)
+    {
+        return retained(submission, CatalogReplayError::PendingDifferent);
+    }
+    if source.replay.as_ref().unwrap().needs_audit {
+        return audit(
+            source,
+            submission,
+            profile,
+            admission,
+            CatalogReplayError::GapOrOverflow,
+        );
+    }
     if submission.batch.continuous()
         && let Some(receipt) = receipt.as_ref()
         && provenance
@@ -117,25 +136,6 @@ pub(super) fn consume(
         return CatalogReplayOutcome::PreviouslyCommitted {
             receipt: receipt.clone(),
         };
-    }
-    if source
-        .replay
-        .as_ref()
-        .unwrap()
-        .audit_batch
-        .as_ref()
-        .is_some_and(|b| b != &submission.batch)
-    {
-        return retained(submission, CatalogReplayError::PendingDifferent);
-    }
-    if source.replay.as_ref().unwrap().needs_audit {
-        return audit(
-            source,
-            submission,
-            profile,
-            admission,
-            CatalogReplayError::GapOrOverflow,
-        );
     }
     let Some(receipt) = receipt else {
         return audit(

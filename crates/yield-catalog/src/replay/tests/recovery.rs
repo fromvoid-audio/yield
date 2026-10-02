@@ -1,6 +1,49 @@
 use super::*;
 use yield_library::sample_sources::db::DurableReplayUncertaintyState;
 
+#[test]
+fn older_duplicate_cannot_release_raw_after_uncertainty_write_failure() {
+    let mut f = Fixture::new(true);
+    f.fail_uncertainty_commit = true;
+    let service = f.start();
+    let before = f.read().get_revision().unwrap();
+    let committed = f.batch(10, &[(Some(11), "one.wav")]);
+    let request = service.submit_replay(committed.clone(), 7, before).unwrap();
+    let CatalogReplayOutcome::Committed { delta, .. } = Fixture::receive(&request) else {
+        panic!("baseline actual checkpoint");
+    };
+    drop(request);
+    let uncertain = service
+        .submit_replay(f.batch(11, &[(None, "one.wav")]), 7, delta.revision)
+        .unwrap();
+    assert!(matches!(
+        Fixture::receive(&uncertain),
+        CatalogReplayOutcome::Retained {
+            reason: CatalogReplayError::CommitUncertain,
+            ..
+        }
+    ));
+    drop(uncertain);
+    let old = service.submit_replay(committed, 7, before).unwrap();
+    assert!(matches!(
+        Fixture::receive(&old),
+        CatalogReplayOutcome::Retained {
+            reason: CatalogReplayError::PendingDifferent,
+            ..
+        }
+    ));
+    drop(old);
+    let permits = (0..MAX_CATALOG_REPLAY_REQUESTS - 1)
+        .map(|_| Permit::acquire().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(Permit::acquire(), Err(CatalogReplaySubmitError::Busy)),
+        "old receipt cannot retire the newer unacknowledged raw batch"
+    );
+    drop(permits);
+    service.shutdown();
+}
+
 fn event(service: &CatalogService, predicate: impl Fn(&CatalogEvent) -> bool) -> CatalogEvent {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

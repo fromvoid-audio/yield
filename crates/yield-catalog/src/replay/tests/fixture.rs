@@ -4,6 +4,7 @@ pub(super) struct Fixture {
     pub(super) base: crate::tests::Fixture,
     bootstrap: bool,
     pub(super) fail_replay_update: bool,
+    pub(super) fail_uncertainty_commit: bool,
 }
 impl Fixture {
     pub(super) fn new(bootstrap: bool) -> Self {
@@ -11,6 +12,7 @@ impl Fixture {
             base: crate::tests::Fixture::new("catalog-production-replay"),
             bootstrap,
             fail_replay_update: false,
+            fail_uncertainty_commit: false,
         };
         f.put("one.wav", b"original audio");
         f.put("notes.txt", b"original notes");
@@ -94,6 +96,7 @@ impl Fixture {
         let root = self.base.root.path().to_path_buf();
         let bootstrap = self.bootstrap;
         let fail_replay_update = self.fail_replay_update;
+        let fail_uncertainty_commit = self.fail_uncertainty_commit;
         let (ready, startup) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             let db = SourceDatabase::open_for_catalog_with_profile_guard(
@@ -182,6 +185,16 @@ impl Fixture {
                 )
                 .unwrap();
                 fault.execute_batch("CREATE TRIGGER replay_fault BEFORE UPDATE ON metadata WHEN NEW.key = 'source_watcher_checkpoint_v1' BEGIN SELECT RAISE(ABORT, 'replay fixture rollback'); END").unwrap();
+            }
+            if fail_uncertainty_commit {
+                let fault = rusqlite::Connection::open(
+                    worker_guard
+                        .profile_root()
+                        .join(catalog_profile_child(&id))
+                        .join(yield_library::sample_sources::db::DB_FILE_NAME),
+                )
+                .unwrap();
+                fault.execute_batch("CREATE TRIGGER marker_fault BEFORE INSERT ON metadata WHEN NEW.key = 'source_watcher_uncertainty_v1' BEGIN SELECT RAISE(ABORT, 'marker fixture rollback'); END").unwrap();
             }
             let snapshot =
                 read_snapshot_from_database(&db, &worker_guard, &id, 7, &identity, || false).ok();
