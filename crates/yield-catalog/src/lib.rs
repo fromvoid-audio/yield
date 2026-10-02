@@ -63,9 +63,13 @@ mod curation;
 mod curation_tag_facts;
 mod display_labels;
 mod feature_job;
+mod feature_request;
 pub use feature_job::{
     ComputedFeatureJob, FeatureJobFailure, FeatureJobOutcome, PreparedFeatureJob,
     prepare_feature_job,
+};
+pub use feature_request::{
+    FeatureAnalysisBlocker, FeatureAnalysisCancellation, FeatureAnalysisState,
 };
 mod index_pages;
 mod index_reveal;
@@ -455,6 +459,21 @@ pub use curation::{
 /// A typed operation accepted by the catalog worker.
 #[derive(Debug)]
 pub enum CatalogCommand {
+    /// Compute one bounded WAV feature job at an exact retained source revision.
+    RequestFeatureAnalysis {
+        /// Stable registered source.
+        source_id: SourceId,
+        /// Required registered lifecycle.
+        lifecycle_generation: u64,
+        /// Current authoritative manifest revision captured by the caller.
+        expected_revision: u64,
+        /// Caller query identity for late result rejection.
+        request_id: u64,
+        /// One bounded source-relative WAV path, resolved by the retained owner.
+        relative_path: PathBuf,
+        /// Per-request cancellation; the owner also binds it to source retirement.
+        cancellation: FeatureAnalysisCancellation,
+    },
     /// Register or replace one source lifecycle generation.
     Register {
         /// Stable source identifier.
@@ -958,6 +977,9 @@ pub enum CatalogRatingDecayRequestError {
 /// A bounded admission failure from the catalog command queue.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CatalogSubmitError {
+    /// A feature request exceeds the source/path bounds or has an invalid relative path.
+    #[error("invalid bounded feature request")]
+    InvalidFeatureRequest,
     /// The worker command queue is full.
     #[error("catalog command queue is full")]
     Full,
@@ -1276,6 +1298,21 @@ pub enum CatalogPublicationStatus {
 /// Worker output carrying source identity, lifecycle generation, and revision fences.
 #[derive(Debug)]
 pub enum CatalogEvent {
+    /// One request's truthful state; ready requires validated durable feature bytes.
+    FeatureAnalysisState {
+        /// Stable source.
+        source_id: SourceId,
+        /// Registered source lifecycle.
+        lifecycle_generation: u64,
+        /// Exact authoritative manifest revision required by this request.
+        expected_revision: u64,
+        /// Caller identity for late result rejection.
+        request_id: u64,
+        /// Requested source-relative file.
+        relative_path: PathBuf,
+        /// Actual owner/job state, without an optimistic feature completion.
+        state: FeatureAnalysisState,
+    },
     /// Registration completed; a persisted snapshot may follow immediately.
     Registered {
         /// Stable source identifier.
@@ -2157,6 +2194,18 @@ impl EventReservation<'_> {
 
 fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> {
     match command {
+        CatalogCommand::RequestFeatureAnalysis {
+            source_id,
+            relative_path,
+            ..
+        } => {
+            if source_id.as_str().len() > 256
+                || relative_path.to_str().is_none_or(|p| p.len() > 1024)
+                || RootRelativePath::try_from_path(relative_path.clone()).is_err()
+            {
+                return Err(CatalogSubmitError::InvalidFeatureRequest);
+            }
+        }
         CatalogCommand::RequestIndexInspection { handle, .. } => {
             if handle.input_bytes() > SOURCE_INDEX_PAGE_MAX_ENTRIES * 1024 {
                 return Err(CatalogIndexPageError::InputTooLarge.into());
@@ -2545,6 +2594,7 @@ fn encoded_path_len(path: &Path) -> usize {
 
 fn command_event_budget(command: &CatalogCommand) -> usize {
     match command {
+        CatalogCommand::RequestFeatureAnalysis { .. } => 3,
         CatalogCommand::Register { .. } | CatalogCommand::RegisterVerified { .. } => 2,
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestWavMetadata { .. }
@@ -2757,7 +2807,8 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
             handle: handle.clone(),
             cancellation: cancellation.clone(),
         },
-        CatalogCommand::RequestWavMetadata { .. } => AdmissionAction::RequestWavMetadata,
+        CatalogCommand::RequestWavMetadata { .. }
+        | CatalogCommand::RequestFeatureAnalysis { .. } => AdmissionAction::RequestWavMetadata,
         CatalogCommand::RequestIndexPage {
             source_id,
             lifecycle_generation,
@@ -3716,6 +3767,27 @@ fn handle_command(
                 AuditTrigger::Explicit,
                 test_gate,
                 watcher_mode,
+            );
+            false
+        }
+        CatalogCommand::RequestFeatureAnalysis {
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            relative_path,
+            cancellation,
+        } => {
+            feature_request::request(
+                source_id,
+                lifecycle_generation,
+                expected_revision,
+                request_id,
+                relative_path,
+                cancellation,
+                reservation,
+                admission,
+                sources,
             );
             false
         }
@@ -15568,4 +15640,6 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     mod feature_job_tests;
+    #[cfg(target_os = "linux")]
+    mod feature_request_tests;
 }

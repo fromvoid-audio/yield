@@ -426,7 +426,8 @@ fn submit_source_page(
             true
         }
         Err(
-            CatalogSubmitError::InvalidWavMetadataRequest(_)
+            CatalogSubmitError::InvalidFeatureRequest
+            | CatalogSubmitError::InvalidWavMetadataRequest(_)
             | CatalogSubmitError::InvalidCurationRequest(_)
             | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
             | CatalogSubmitError::InvalidCurationTagFactsRequest(_)

@@ -76,6 +76,7 @@ mod accessibility {
         format!("browser-curation-queue-choice-{index}")
     }
 }
+mod analysis;
 mod audio_output;
 mod catalog;
 mod catalog_metadata;
@@ -367,6 +368,7 @@ pub(crate) struct Browser {
     browser_focus_detached: bool,
     focus_chord_started: Option<(Instant, u64, Option<PathBuf>)>,
     context_menu: Option<context_menu::ContextMenuState>,
+    feature_analysis: analysis::FeatureAnalysisProjection,
     waveform: Option<WaveformPreview>,
     waveform_error: Option<String>,
     waveform_render_cache: waveform::WaveformRenderCache,
@@ -720,6 +722,7 @@ impl Browser {
             browser_focus_detached: false,
             focus_chord_started: None,
             context_menu: None,
+            feature_analysis: analysis::FeatureAnalysisProjection::default(),
             waveform: None,
             waveform_error: None,
             waveform_render_cache: waveform::WaveformRenderCache::default(),

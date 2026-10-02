@@ -27,6 +27,7 @@ const STALE_CONTEXT_MESSAGE: &str =
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContextMenuAction {
+    AnalyzeFeatures,
     Reveal,
     CopyPath,
     Unlock,
@@ -457,6 +458,15 @@ impl Browser {
         let target = menu.target.clone();
         self.close_context_menu(cx);
         match (action, target) {
+            (ContextMenuAction::AnalyzeFeatures, ContextMenuTarget::Sample(target)) => {
+                self.request_feature_analysis(
+                    target.source_id,
+                    target.lifecycle_generation,
+                    target.revision,
+                    target.relative_path,
+                    cx,
+                );
+            }
             (ContextMenuAction::Reveal, ContextMenuTarget::Sample(target)) => {
                 self.reveal_context_file(target.absolute_path, cx)
             }
@@ -572,7 +582,11 @@ fn context_menu_actions(
     curation: Option<AudioFileCuration>,
     collection_filter: Option<usize>,
 ) -> Vec<ContextMenuAction> {
-    let mut actions = vec![ContextMenuAction::Reveal, ContextMenuAction::CopyPath];
+    let mut actions = vec![
+        ContextMenuAction::Reveal,
+        ContextMenuAction::CopyPath,
+        ContextMenuAction::AnalyzeFeatures,
+    ];
     if curation.is_some_and(|curation| {
         curation.rating().value() == MAX_RATING && curation.rating().locked()
     }) {
@@ -751,6 +765,7 @@ fn source_primary_menu_action(
 
 fn context_menu_action_label(action: ContextMenuAction) -> &'static str {
     match action {
+        ContextMenuAction::AnalyzeFeatures => "Analyze features",
         ContextMenuAction::Reveal => file_manager_reveal_label(),
         ContextMenuAction::CopyPath => "Copy Path",
         ContextMenuAction::Unlock => "Unlock",
@@ -874,6 +889,7 @@ mod tests {
             vec![
                 ContextMenuAction::Reveal,
                 ContextMenuAction::CopyPath,
+                ContextMenuAction::AnalyzeFeatures,
                 ContextMenuAction::Unlock,
                 ContextMenuAction::RemoveFromCollection { slot: 3 },
             ]

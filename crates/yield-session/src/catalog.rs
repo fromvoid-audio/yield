@@ -12,7 +12,8 @@ pub use yield_catalog::{
     CatalogIndexPageError, CatalogOperation, CatalogPublicationStatus,
     CatalogRatingDecayRequestError, CatalogTagAssignmentPreview, CatalogTagAssignmentPreviewSource,
     CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
-    CatalogWavMetadataRequestError, IndexInspectionCancellation, MAX_CURATION_OPERATION_BATCHES,
+    CatalogWavMetadataRequestError, FeatureAnalysisBlocker, FeatureAnalysisCancellation,
+    FeatureAnalysisState, IndexInspectionCancellation, MAX_CURATION_OPERATION_BATCHES,
     MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
     MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES,
     MAX_HELD_INDEX_INSPECTIONS, MAX_INDEX_PAGE_PAYLOAD_BYTES, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
@@ -48,6 +49,9 @@ pub enum CatalogStatus {
 /// Errors returned while admitting a catalog command.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CatalogSubmitError {
+    /// The feature request exceeds bounded source/path input admission.
+    #[error("invalid bounded feature request")]
+    InvalidFeatureRequest,
     /// Catalog startup has not completed.
     #[error("source catalog is still loading")]
     NotReady,
@@ -278,6 +282,9 @@ fn mark_closed(slot: &Arc<Mutex<CatalogSlot>>, service: &Arc<CatalogService>) {
 
 fn map_submit_error(error: CatalogWorkerSubmitError) -> CatalogSubmitError {
     match error {
+        CatalogWorkerSubmitError::InvalidFeatureRequest => {
+            CatalogSubmitError::InvalidFeatureRequest
+        }
         CatalogWorkerSubmitError::InvalidIndexPageRequest(error) => {
             CatalogSubmitError::InvalidIndexPageRequest(error)
         }

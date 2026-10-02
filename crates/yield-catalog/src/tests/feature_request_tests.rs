@@ -1,0 +1,263 @@
+#[cfg(test)]
+mod fixtures {
+    use super::super::*;
+    use crate::{FeatureAnalysisBlocker, FeatureAnalysisCancellation, FeatureAnalysisState};
+    use yield_library::sample_sources::SourceDatabaseConnectionRole;
+
+    fn command(
+        source: &SourceId,
+        revision: u64,
+        id: u64,
+        cancellation: FeatureAnalysisCancellation,
+    ) -> CatalogCommand {
+        CatalogCommand::RequestFeatureAnalysis {
+            source_id: source.clone(),
+            lifecycle_generation: 1,
+            expected_revision: revision,
+            request_id: id,
+            relative_path: "tone.wav".into(),
+            cancellation,
+        }
+    }
+    fn state(service: &CatalogService, id: u64) -> FeatureAnalysisState {
+        match receive_until(
+            service,
+            |event| matches!(event, CatalogEvent::FeatureAnalysisState { request_id, .. } if *request_id == id),
+        ) {
+            CatalogEvent::FeatureAnalysisState { state, .. } => state,
+            _ => unreachable!(),
+        }
+    }
+    fn observer(f: &Fixture, source: &SourceId) -> rusqlite::Connection {
+        SourceDatabase::open_connection_with_role_and_database_root(
+            f.root.path(),
+            f.guard.profile_root().join(catalog_profile_child(source)),
+            SourceDatabaseConnectionRole::UiRead,
+        )
+        .unwrap()
+    }
+    fn counts(f: &Fixture, source: &SourceId) -> (i64, i64) {
+        observer(f, source)
+            .query_row(
+                "SELECT (SELECT count(*) FROM source_feature_artifacts),
+            (SELECT count(*) FROM source_readiness_artifacts WHERE stage='analysis_features')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+    #[test]
+    fn feature_request_production_catalog_audit_queue_compute_and_validated_ready() {
+        let f = Fixture::new("production-feature-request");
+        write_test_wav(&f.root.path().join("tone.wav"), 16_000, 16_000);
+        let source = SourceId::from_string("production-feature-request");
+        let service = CatalogService::start(&f.guard).unwrap();
+        let snapshot = register_and_audit(&service, f.root.path(), &source);
+        assert_eq!(counts(&f, &source), (0, 0));
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision,
+                1,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        assert_eq!(state(&service, 1), FeatureAnalysisState::Queued);
+        assert_eq!(state(&service, 1), FeatureAnalysisState::Running);
+        let ready = state(&service, 1);
+        assert!(matches!(ready, FeatureAnalysisState::Ready { .. }));
+        assert_eq!(counts(&f, &source), (1, 1));
+        let bytes: i64 = observer(&f, &source)
+            .query_row(
+                "SELECT length(payload) FROM source_feature_artifacts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, 732);
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision,
+                2,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        assert_eq!(state(&service, 2), ready);
+        assert_eq!(counts(&f, &source), (1, 1));
+        service.shutdown();
+    }
+    #[test]
+    fn feature_request_invalid_engine_bytes_block_with_durable_retry_and_no_ready() {
+        let f = Fixture::new("feature-request-invalid-wav");
+        fs::write(f.root.path().join("tone.wav"), b"invalid real WAV bytes").unwrap();
+        let source = SourceId::from_string("feature-request-invalid-wav");
+        let service = CatalogService::start(&f.guard).unwrap();
+        let snapshot = register_and_audit(&service, f.root.path(), &source);
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision,
+                1,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        assert_eq!(state(&service, 1), FeatureAnalysisState::Queued);
+        assert_eq!(state(&service, 1), FeatureAnalysisState::Running);
+        assert_eq!(
+            state(&service, 1),
+            FeatureAnalysisState::Blocked {
+                reason: FeatureAnalysisBlocker::Computation
+            }
+        );
+        assert_eq!(counts(&f, &source), (0, 0));
+        let retained: (String,String) = observer(&f,&source).query_row("SELECT status,failure_kind FROM analysis_jobs WHERE readiness_stage='analysis_features'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(retained, ("failed".into(), "retryable".into()));
+        service.shutdown();
+    }
+    #[test]
+    fn feature_request_cancelled_or_stale_revision_never_queue_or_complete() {
+        let f = Fixture::new("feature-request-cancel-stale");
+        write_test_wav(&f.root.path().join("tone.wav"), 16_000, 16_000);
+        let source = SourceId::from_string("feature-request-cancel-stale");
+        let service = CatalogService::start(&f.guard).unwrap();
+        let snapshot = register_and_audit(&service, f.root.path(), &source);
+        let cancellation = FeatureAnalysisCancellation::new();
+        cancellation.cancel();
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision,
+                1,
+                cancellation,
+            ))
+            .unwrap();
+        assert_eq!(
+            state(&service, 1),
+            FeatureAnalysisState::Blocked {
+                reason: FeatureAnalysisBlocker::Cancelled
+            }
+        );
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision + 1,
+                2,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        assert_eq!(
+            state(&service, 2),
+            FeatureAnalysisState::Blocked {
+                reason: FeatureAnalysisBlocker::StaleSource
+            }
+        );
+        assert_eq!(counts(&f, &source), (0, 0));
+        let target_count: i64 = observer(&f, &source)
+            .query_row("SELECT count(*) FROM source_readiness_targets", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(target_count, 0);
+        service.shutdown();
+    }
+    #[test]
+    fn feature_request_bounds_reject_invalid_relative_path_before_queue_admission() {
+        let f = Fixture::new("feature-request-input-bounds");
+        let service = CatalogService::start(&f.guard).unwrap();
+        for path in [
+            "../escape.wav".to_owned(),
+            format!("{}.wav", "a".repeat(1025)),
+        ] {
+            let mut cmd = command(
+                &SourceId::from_string("not-registered"),
+                1,
+                1,
+                FeatureAnalysisCancellation::new(),
+            );
+            if let CatalogCommand::RequestFeatureAnalysis { relative_path, .. } = &mut cmd {
+                *relative_path = path.into();
+            }
+            assert_eq!(
+                service.submit(cmd),
+                Err(CatalogSubmitError::InvalidFeatureRequest)
+            );
+        }
+        service.shutdown();
+    }
+    #[test]
+    fn feature_request_restart_retains_unexpired_claim_without_optimistic_ready() {
+        use yield_library::sample_sources::readiness::{ReadinessClassification, ReadinessDeficit};
+        let f = Fixture::new("feature-request-retained-claim");
+        write_test_wav(&f.root.path().join("tone.wav"), 16_000, 16_000);
+        let source = SourceId::from_string("feature-request-retained-claim");
+        let service = CatalogService::start(&f.guard).unwrap();
+        let snapshot = register_and_audit(&service, f.root.path(), &source);
+        service.shutdown();
+        let db = SourceDatabase::open_for_catalog_with_profile_guard(
+            f.root.path(),
+            &f.guard,
+            &catalog_profile_child(&source),
+        )
+        .unwrap();
+        let mut writer = SourceWriter::new(db, source.clone(), 1).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let target = writer
+            .prepare_feature_readiness_target(
+                &revision,
+                Path::new("tone.wav"),
+                now,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        writer
+            .enqueue_readiness_jobs(
+                &revision,
+                &[ReadinessDeficit {
+                    target: target.clone(),
+                    reason: ReadinessClassification::Pending,
+                    enqueued_at: None,
+                }],
+                now,
+            )
+            .unwrap();
+        let old_claim = writer
+            .claim_feature_artifact(&revision, &target, now, 120)
+            .unwrap()
+            .unwrap();
+        drop(writer);
+        drop(old_claim);
+        let service = CatalogService::start(&f.guard).unwrap();
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source.clone(),
+                canonical_root: f.root.path().into(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        receive_until(&service, |e| matches!(e, CatalogEvent::Registered { .. }));
+        receive_until(&service, |e| {
+            matches!(e, CatalogEvent::SnapshotReady { .. })
+        });
+        service
+            .submit(command(
+                &source,
+                snapshot.committed_revision,
+                2,
+                FeatureAnalysisCancellation::new(),
+            ))
+            .unwrap();
+        assert_eq!(
+            state(&service, 2),
+            FeatureAnalysisState::Blocked {
+                reason: FeatureAnalysisBlocker::NotClaimable
+            }
+        );
+        assert_eq!(counts(&f, &source), (0, 0));
+        service.shutdown();
+    }
+}

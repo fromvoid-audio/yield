@@ -103,6 +103,7 @@ def render(root: Path, data: dict, source: dict) -> str:
         "| Feedback issue composer | `browser/feedback_issue.rs`; bounded issue URL generation and user-triggered external open | OPT-1882 |",
         "| Volume pointer capture | `browser/view.rs`, `browser/transport.rs`; source counterpart listed above; window/OS capture unverified | OPT-1936 |", "",
         "| InspectUnsupportedFile | " + anchor(root, {"path": "crates/yield-ui/src/browser/unsupported_entries.rs", "symbol": "inspect_unsupported_action"}) + "; real read-only owner inspection, bounded modal and cancellation; no native reveal grant | OPT-2039 / OPT-1953 |",
+        "| Analyze features sample menu | " + anchor(root, {"path": "crates/yield-ui/src/browser/analysis.rs", "symbol": "request_feature_analysis"}) + "; one real source-owned WAV job; exact request/source/revision/path/cancel fence; overall embedding/layout and rich progress remain open | OPT-2075 / OPT-2061 |",
         "See [source index scope](GPUI_REFERENCE_CONTROL_INDEX.md), "
         "[destructive action decision](GPUI_REFERENCE_EDIT_ACTIONS.md), and "
         "[migration evidence](GPUI_MIGRATION.md).", ""])
