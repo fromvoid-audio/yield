@@ -222,7 +222,8 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
             true
         }
         Err(
-            CatalogSubmitError::InvalidWavMetadataRequest(_)
+            CatalogSubmitError::InvalidFeatureRequest
+            | CatalogSubmitError::InvalidWavMetadataRequest(_)
             | CatalogSubmitError::InvalidCurationRequest(_)
             | CatalogSubmitError::InvalidTagFilterRequest(_)
             | CatalogSubmitError::InvalidDisplayLabelsRequest(_)

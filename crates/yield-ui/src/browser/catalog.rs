@@ -465,6 +465,7 @@ impl Browser {
                 }
                 Err(
                     CatalogSubmitError::Closed
+                    | CatalogSubmitError::InvalidFeatureRequest
                     | CatalogSubmitError::InvalidWavMetadataRequest(_)
                     | CatalogSubmitError::InvalidCurationRequest(_)
                     | CatalogSubmitError::InvalidTagPageRequest(_)
@@ -515,6 +516,7 @@ impl Browser {
                 }
                 Err(
                     CatalogSubmitError::Closed
+                    | CatalogSubmitError::InvalidFeatureRequest
                     | CatalogSubmitError::InvalidWavMetadataRequest(_)
                     | CatalogSubmitError::InvalidCurationRequest(_)
                     | CatalogSubmitError::InvalidTagPageRequest(_)
@@ -598,6 +600,9 @@ impl Browser {
         publication_fence: Option<SourcePublicationFence>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if super::analysis::apply_catalog_event(self, &event, cx) {
+            return true;
+        }
         if super::unsupported_entries::apply_catalog_event(self, &mut event, cx) {
             return true;
         }
@@ -768,7 +773,8 @@ impl Browser {
                 );
                 true
             }
-            CatalogEvent::CurationCommitted { .. }
+            CatalogEvent::FeatureAnalysisState { .. }
+            | CatalogEvent::CurationCommitted { .. }
             | CatalogEvent::CurationFailed { .. }
             | CatalogEvent::CurationOperationCompleted { .. }
             | CatalogEvent::IndexPageReady { .. }
@@ -1134,7 +1140,12 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
         CatalogEvent::SnapshotReady { snapshot } | CatalogEvent::AuditCommitted { snapshot } => {
             Some((snapshot.source_id.clone(), snapshot.lifecycle_generation))
         }
-        CatalogEvent::WavMetadataReady {
+        CatalogEvent::FeatureAnalysisState {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::WavMetadataReady {
             source_id,
             lifecycle_generation,
             ..
