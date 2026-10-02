@@ -75,3 +75,7 @@ Pre-admission schema/runtime images use bounded reads without SQL ORDER BY;
 canonical sorting happens only after the owned vector passes its byte/row cap.
 This avoids introducing SQLite temporary-sort disk writes while merely
 observing a prospective allocation plan.
+An optional extension loader request fails fast while a metadata scope holds
+the process gate, including on the same owner thread. That refusal executes no
+initialization and does not taint the bound; an initialization actually started
+after release still makes subsequent allocation observations unknown.

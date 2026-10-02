@@ -288,3 +288,40 @@ pub(super) fn restore_failure() {
     ));
     assert!(writer.capture_tag_metadata_budget(&revision).is_err());
 }
+
+#[test]
+fn tag_metadata_policy_loader_fails_fast_while_owner_scope_is_entered() {
+    run_case("policy-extension-gate");
+}
+
+pub(super) fn extension_gate() {
+    let fixture = CurationFixture::new_profile_bound();
+    let writer = SourceWriter::new(fixture.database, SourceId::from_string("policy"), 1).unwrap();
+    let revision = writer.current_revision().unwrap();
+    let budget = writer.capture_tag_metadata_budget(&revision).unwrap();
+    let policy = writer.begin_tag_metadata_policy(&budget).unwrap();
+    let invalid = fixture._source.path().join("invalid-policy-extension");
+    std::fs::write(&invalid, b"not an extension").unwrap();
+    assert!(
+        crate::sqlite_ext::load_extension_for_test(
+            &writer.database_for_tests().connection,
+            &invalid
+        )
+        .is_err()
+    );
+    assert!(
+        !crate::sqlite_ext::extension_load_attempted(),
+        "scope refusal must execute no initialization callback"
+    );
+    policy.validate_entered().unwrap();
+    policy.finish().unwrap();
+    assert!(
+        crate::sqlite_ext::load_extension_for_test(
+            &writer.database_for_tests().connection,
+            &invalid
+        )
+        .is_err()
+    );
+    assert!(crate::sqlite_ext::extension_load_attempted());
+    assert!(writer.begin_tag_metadata_policy(&budget).is_err());
+}

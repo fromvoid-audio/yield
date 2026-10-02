@@ -95,6 +95,7 @@ fn tag_metadata_budget_child() {
         "policy-full" => super::tag_metadata_policy::full(),
         "policy-poison" => super::tag_metadata_policy::poison(),
         "policy-restore-failure" => super::tag_metadata_policy::restore_failure(),
+        "policy-extension-gate" => super::tag_metadata_policy::extension_gate(),
         _ => panic!("unknown fixture case"),
     }
 }
