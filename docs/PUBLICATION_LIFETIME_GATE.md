@@ -93,6 +93,13 @@ construct it. Its owner stays alive through the runtime resource guard. This
 capsule/interface and mirror are required production work in OPT-2215/2218;
 there is no qualified Linux positive provider asserted here. Namespace metadata
 allocation must also have its actual bound/charge; unknown bounds reject entry.
+Acquire a unique pre-entry resource-use permit under admission then slot before
+reading that capsule. It increments the aggregate native-use count and is
+limited to the primary envelope; queued grants alone perform no reads. Closing
+admission prevents new reads as well as new effects. Upgrade this permit to
+the entered effect without a zero-count gap, or drop it on before-effect
+rejection. Resource retirement waits for these reads too. A capsule cannot
+borrow actor-owned resources while uncounted, even before namespace entry.
 
 ## State, entry and cancellation
 
@@ -104,7 +111,8 @@ authority and retains charges. Mutex guards never cross SQL, native effects,
 source validation, callbacks, condition waits or queue operations.
 
 An additional shared publication-admission mutex holds the issuer incarnation,
-open/closed flag and checked aggregate physical-in-flight count. It contains
+open/closed flag and checked aggregate physical-in-flight count, including
+pre-entry native-resource reads. It contains
 no provider or native resource. Worker lock order is admission, then slot;
 both are released before effects. Owner unavailable/shutdown closes admission
 under this mutex before publishing its lifecycle transition, so iterating
@@ -121,7 +129,7 @@ admission-then-slot order and notifies a physical-quiescence condition variable.
    this call. No journal request/reply is needed at this point.
 3. Under admission then slot mutexes, compare the exact immutable issuer/binding
    and require open admission and `Issued`. Transition to `Entered`, set slot
-   physical-in-flight to one, increment the checked aggregate counter, and take
+   physical-in-flight to one, upgrade the existing counted resource-use permit, and take
    the unique entered permit. Release both mutexes immediately.
    If closed, drop the source permit and return typed no-effect rejection.
 4. Both opaque permits survive through the bounded native attempt and capture
