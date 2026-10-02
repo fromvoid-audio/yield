@@ -11,6 +11,7 @@ an exact anchor target, aspect and nonzero consumer generation. It admits at mos
 64 distinct candidate paths/object identities, 4096 bytes per canonical portable
 path and 64 KiB of combined anchor/candidate path text. Source, file-stage,
 version, content-hash and eligibility inputs are checked before payload reads.
+Accepted anchor strings are copied after validation, like the candidates, so caller spare capacity cannot enlarge retained input storage.
 The source owner revalidates every path/object/hash through genuine
 `SourceFileObservation` values. A copied artifact key cannot substitute for that
 binding. Missing, corrupt or invalid selected descriptors are unavailable; no

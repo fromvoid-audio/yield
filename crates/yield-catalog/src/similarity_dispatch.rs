@@ -70,12 +70,13 @@ impl SourceSimilarityRequest {
         if bytes > 64 * 1024 {
             return Err(SimilarityDispatchFailure::InvalidInput);
         }
+        // Caller-owned strings can have unbounded spare capacity despite short valid text.
         Ok(Self {
-            source_id,
+            source_id: SourceId::from_string(source_id.as_str()),
             lifecycle,
             revision,
             generation,
-            anchor,
+            anchor: anchor.into_boxed_str().into_string(),
             candidates: candidates.to_vec(),
             aspect,
         })
@@ -110,10 +111,39 @@ impl SourceSimilarityRequest {
     }
     pub(super) fn input_bytes(&self) -> usize {
         self.source_id.as_str().len()
-            + self.anchor.len()
-            + self.candidates.iter().map(String::len).sum::<usize>()
-            + self.candidates.len() * std::mem::size_of::<String>()
+            + self.anchor.capacity()
+            + self.candidates.iter().map(String::capacity).sum::<usize>()
+            + self.candidates.capacity() * std::mem::size_of::<String>()
             + std::mem::size_of::<Self>()
+    }
+}
+
+#[cfg(test)]
+mod input_storage_tests {
+    use super::*;
+
+    #[test]
+    fn similarity_dispatch_constructor_does_not_retain_oversized_path_allocations() {
+        let mut anchor = String::with_capacity(MAX_RESULT_BYTES * 2);
+        anchor.push_str("anchor.wav");
+        let mut candidate = String::with_capacity(MAX_RESULT_BYTES * 2);
+        candidate.push_str("candidate.wav");
+        let request = SourceSimilarityRequest::new(
+            SourceId::from_string("bounded"),
+            1,
+            1,
+            1,
+            anchor,
+            &[candidate],
+            SimilarityAspect::Spectrum,
+        )
+        .unwrap();
+        assert_eq!(request.anchor.capacity(), request.anchor.len());
+        assert_eq!(
+            request.candidates[0].capacity(),
+            request.candidates[0].len()
+        );
+        assert!(request.input_bytes() < 64 * 1024);
     }
 }
 /// Cancellation retained through computation and queued delivery.

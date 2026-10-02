@@ -449,6 +449,44 @@ mod fixtures {
     }
 
     #[test]
+    fn similarity_query_constructor_does_not_retain_oversized_anchor_allocations() {
+        let (_fixture, mut writer, targets) = setup();
+        let mut anchor = targets[0].clone();
+        for text in [
+            &mut anchor.source_id,
+            &mut anchor.scope_id,
+            &mut anchor.content_generation,
+            &mut anchor.required_version,
+            anchor.relative_path.as_mut().unwrap(),
+        ] {
+            text.reserve(2 * 1024 * 1024);
+        }
+        let request = SourceSimilarityQuery::new(
+            writer.current_revision().unwrap(),
+            anchor,
+            SimilarityAspect::Spectrum,
+            1,
+            &targets[1..],
+        )
+        .unwrap();
+        assert_eq!(request.anchor(), &targets[0]);
+        let retained = request.anchor();
+        for text in [
+            &retained.source_id,
+            &retained.scope_id,
+            &retained.content_generation,
+            &retained.required_version,
+            retained.relative_path.as_ref().unwrap(),
+        ] {
+            assert_eq!(text.capacity(), text.len());
+        }
+        let result =
+            query_source_similarity(&mut writer, &request, &AtomicBool::new(false)).unwrap();
+        assert!(result.matches_query(&request));
+        writer.close().unwrap();
+    }
+
+    #[test]
     fn similarity_query_rejects_combined_path_budget_and_noncanonical_paths() {
         let (_fixture, writer, targets) = setup();
         let revision = writer.current_revision().unwrap();

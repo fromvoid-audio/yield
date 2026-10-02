@@ -50,7 +50,8 @@ impl SourceSimilarityQuery {
         }
         Ok(Self {
             revision,
-            anchor,
+            // Match the already-copied candidates: retain text, not caller spare capacity.
+            anchor: anchor.clone(),
             aspect,
             generation,
             candidates: candidates.to_vec(),
