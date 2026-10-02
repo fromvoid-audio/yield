@@ -195,6 +195,8 @@ impl SourceDatabase {
             &normalized_paths,
         )?;
 
+        crate::sqlite_wal::enforce_wal_admission(batch.curation_transaction())?;
+
         apply_curation_updates(&mut batch, updates)?;
 
         SourceDatabase::bump_revision(batch.curation_transaction())?;

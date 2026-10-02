@@ -27,6 +27,7 @@ pub mod sqlite_ext;
 #[cfg(target_os = "linux")]
 mod sqlite_linux;
 mod sqlite_wal;
+pub use sqlite_wal::{WAL_HARD_WATERMARK_BYTES, WAL_SOFT_WATERMARK_BYTES, WalAdmissionError};
 /// Process-global test runtime isolation helpers.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_runtime;
