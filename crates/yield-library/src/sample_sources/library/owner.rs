@@ -40,6 +40,9 @@ use super::tag_vocabulary::{
 use crate::app_dirs::{ProfileChildLease, ProfileOwnershipError, WritableProfileGuard};
 use crate::sample_sources::{SampleSource, UI_PREFERENCES_MAX_BYTES};
 
+mod admission_metrics;
+pub use admission_metrics::GlobalAdmissionMetricsSnapshot;
+
 mod shutdown;
 pub use shutdown::{GlobalLibraryWriterDrainOutcome, GlobalLibraryWriterDrainReport};
 
@@ -617,6 +620,7 @@ pub struct GlobalLibraryWriter {
     acquisition: ProfileAcquisitionId,
     commands: Arc<Mutex<Option<SyncSender<WriterCommand>>>>,
     admission_gate: Arc<Mutex<()>>,
+    admission_metrics: Arc<admission_metrics::AdmissionMetrics>,
     lifecycle: Arc<std::sync::atomic::AtomicU8>,
     unavailable: Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
     worker: Option<JoinHandle<()>>,
@@ -634,6 +638,7 @@ pub struct ProfileTagVocabularyClient {
     acquisition: ProfileAcquisitionId,
     commands: Arc<Mutex<Option<SyncSender<WriterCommand>>>>,
     admission_gate: Arc<Mutex<()>>,
+    admission_metrics: Arc<admission_metrics::AdmissionMetrics>,
     lifecycle: Arc<std::sync::atomic::AtomicU8>,
     unavailable: Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
 }
@@ -716,6 +721,7 @@ impl GlobalLibraryWriter {
             acquisition: ProfileAcquisitionId::from_guard(profile_guard),
             commands: Arc::clone(&commands),
             admission_gate,
+            admission_metrics: Arc::default(),
             lifecycle,
             unavailable,
             worker: Some(worker),
@@ -775,6 +781,7 @@ impl GlobalLibraryWriter {
             acquisition: ProfileAcquisitionId::test_only(),
             commands: Arc::new(Mutex::new(Some(commands))),
             admission_gate: Arc::new(Mutex::new(())),
+            admission_metrics: Arc::default(),
             lifecycle: Arc::new(std::sync::atomic::AtomicU8::new(
                 WriterLifecycle::Available as u8,
             )),
@@ -814,6 +821,7 @@ impl GlobalLibraryWriter {
             acquisition: self.acquisition.clone(),
             commands: Arc::clone(&self.commands),
             admission_gate: Arc::clone(&self.admission_gate),
+            admission_metrics: Arc::clone(&self.admission_metrics),
             lifecycle: Arc::clone(&self.lifecycle),
             unavailable: Arc::clone(&self.unavailable),
         }
@@ -1058,8 +1066,18 @@ impl GlobalLibraryWriter {
         initiated
     }
 
+    /// Read finite per-owner admission counters shared with vocabulary clients.
+    /// Accepted counts mean queued, not committed; concurrent fields are approximate.
+    pub fn admission_metrics(&self) -> GlobalAdmissionMetricsSnapshot {
+        self.admission_metrics.snapshot()
+    }
+
     fn ensure_available(&self) -> Result<(), GlobalLibraryWriterQueueError> {
-        ensure_available_state(&self.lifecycle, &self.unavailable)
+        let result = ensure_available_state(&self.lifecycle, &self.unavailable);
+        if result.is_err() {
+            self.admission_metrics.record_outcome(&result);
+        }
+        result
     }
 
     fn send(&self, command: WriterCommand) -> Result<(), GlobalLibraryWriterQueueError> {
@@ -1068,6 +1086,7 @@ impl GlobalLibraryWriter {
             &self.admission_gate,
             &self.lifecycle,
             &self.unavailable,
+            &self.admission_metrics,
             command,
         )
     }
@@ -1186,8 +1205,18 @@ impl ProfileTagVocabularyClient {
         Ok(result_rx)
     }
 
+    /// Read finite per-owner admission counters shared with vocabulary clients.
+    /// Accepted counts mean queued, not committed; concurrent fields are approximate.
+    pub fn admission_metrics(&self) -> GlobalAdmissionMetricsSnapshot {
+        self.admission_metrics.snapshot()
+    }
+
     fn ensure_available(&self) -> Result<(), GlobalLibraryWriterQueueError> {
-        ensure_available_state(&self.lifecycle, &self.unavailable)
+        let result = ensure_available_state(&self.lifecycle, &self.unavailable);
+        if result.is_err() {
+            self.admission_metrics.record_outcome(&result);
+        }
+        result
     }
 
     fn send(&self, command: WriterCommand) -> Result<(), GlobalLibraryWriterQueueError> {
@@ -1196,6 +1225,7 @@ impl ProfileTagVocabularyClient {
             &self.admission_gate,
             &self.lifecycle,
             &self.unavailable,
+            &self.admission_metrics,
             command,
         )
     }
@@ -1249,22 +1279,32 @@ fn send_command(
     admission_gate: &Arc<Mutex<()>>,
     lifecycle: &Arc<std::sync::atomic::AtomicU8>,
     unavailable: &Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
+    metrics: &admission_metrics::AdmissionMetrics,
     command: WriterCommand,
 ) -> Result<(), GlobalLibraryWriterQueueError> {
-    let _admission = admission_gate
+    let started = std::time::Instant::now();
+    let admission = admission_gate
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    ensure_available_state(lifecycle, unavailable)?;
-    let sender = commands
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .cloned()
-        .ok_or(GlobalLibraryWriterQueueError::Closed)?;
-    sender.try_send(command).map_err(|error| match error {
-        TrySendError::Full(_) => GlobalLibraryWriterQueueError::Full,
-        TrySendError::Disconnected(_) => GlobalLibraryWriterQueueError::Closed,
-    })
+    let wait = started.elapsed();
+    let result = (|| {
+        ensure_available_state(lifecycle, unavailable)?;
+        let sender = commands
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or(GlobalLibraryWriterQueueError::Closed)?;
+        sender.try_send(command).map_err(|error| match error {
+            TrySendError::Full(_) => GlobalLibraryWriterQueueError::Full,
+            TrySendError::Disconnected(_) => GlobalLibraryWriterQueueError::Closed,
+        })
+    })();
+    // Telemetry subscribers never execute while the admission/shutdown gate is held.
+    drop(admission);
+    metrics.record_wait(wait);
+    metrics.record_outcome(&result);
+    result
 }
 
 impl Drop for GlobalLibraryWriter {

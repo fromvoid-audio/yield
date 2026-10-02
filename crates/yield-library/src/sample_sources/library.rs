@@ -65,10 +65,10 @@ pub use operation_link_participant::{
     OperationLinkRequest, OperationLinkResult,
 };
 pub use owner::{
-    GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY, GlobalLibraryWriter, GlobalLibraryWriterDrainOutcome,
-    GlobalLibraryWriterDrainReport, GlobalLibraryWriterQueueError, GlobalLibraryWriterStartError,
-    GlobalLibraryWriterStatus, GlobalLibraryWriterUnavailable, ProfileTagVocabularyClient,
-    SourceRegistrySnapshot,
+    GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY, GlobalAdmissionMetricsSnapshot, GlobalLibraryWriter,
+    GlobalLibraryWriterDrainOutcome, GlobalLibraryWriterDrainReport, GlobalLibraryWriterQueueError,
+    GlobalLibraryWriterStartError, GlobalLibraryWriterStatus, GlobalLibraryWriterUnavailable,
+    ProfileTagVocabularyClient, SourceRegistrySnapshot,
 };
 pub use read_only::load_source_registry_snapshot_read_only;
 pub use reference_participant::{
