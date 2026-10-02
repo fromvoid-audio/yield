@@ -6,6 +6,7 @@ mod failures;
 mod fixture;
 mod namespace;
 mod recovery;
+mod subtree;
 use fixture::Fixture;
 
 #[test]

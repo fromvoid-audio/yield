@@ -10,9 +10,9 @@ use yield_library::{
     test_runtime::TestRuntimeGuard,
 };
 
-struct Fixture {
-    owner: SourceWriter,
-    source: TempDir,
+pub(in crate::sample_sources::scanner) struct Fixture {
+    pub(in crate::sample_sources::scanner) owner: SourceWriter,
+    pub(in crate::sample_sources::scanner) source: TempDir,
     _guard: WritableProfileGuard,
     _profile: PersistenceProfileGuard,
     _config: ConfigBaseGuard,
@@ -20,7 +20,7 @@ struct Fixture {
     _runtime: TestRuntimeGuard,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(in crate::sample_sources::scanner) fn new() -> Self {
         let runtime = TestRuntimeGuard::acquire();
         let base =
             tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
@@ -46,10 +46,10 @@ impl Fixture {
             _runtime: runtime,
         }
     }
-    fn put(&self, path: &str, bytes: &[u8]) {
+    pub(in crate::sample_sources::scanner) fn put(&self, path: &str, bytes: &[u8]) {
         std::fs::write(self.source.path().join(path), bytes).unwrap();
     }
-    fn paths(paths: &[&str]) -> Vec<RootRelativePath> {
+    pub(in crate::sample_sources::scanner) fn paths(paths: &[&str]) -> Vec<RootRelativePath> {
         paths
             .iter()
             .map(|p| RootRelativePath::try_from_path(PathBuf::from(p)).unwrap())
@@ -57,15 +57,15 @@ impl Fixture {
     }
 }
 
-struct CountingWriter<'a> {
-    owner: &'a SourceWriter,
-    locks: Cell<usize>,
-    commits: Cell<usize>,
-    reject: bool,
-    cancel_at_lock: Option<&'a AtomicBool>,
+pub(in crate::sample_sources::scanner) struct CountingWriter<'a> {
+    pub(in crate::sample_sources::scanner) owner: &'a SourceWriter,
+    pub(in crate::sample_sources::scanner) locks: Cell<usize>,
+    pub(in crate::sample_sources::scanner) commits: Cell<usize>,
+    pub(in crate::sample_sources::scanner) reject: bool,
+    pub(in crate::sample_sources::scanner) cancel_at_lock: Option<&'a AtomicBool>,
 }
 impl<'a> CountingWriter<'a> {
-    fn new(owner: &'a SourceWriter) -> Self {
+    pub(in crate::sample_sources::scanner) fn new(owner: &'a SourceWriter) -> Self {
         Self {
             owner,
             locks: Cell::new(0),

@@ -21,6 +21,8 @@ mod error;
 pub mod file_ops_journal;
 pub(crate) use file_ops_journal::BoundDatabaseRoot;
 mod exact_scan;
+mod subtree_scan;
+pub use subtree_scan::{SUBTREE_SCAN_MAX_RETAINED, SubtreeScanDatabaseFacts};
 mod index_entries;
 mod index_inspection;
 mod open;
@@ -570,6 +572,8 @@ pub struct SourceWriteBatch<'conn> {
     manifest_touched_paths: BTreeSet<PathBuf>,
     source_index_changes: BTreeMap<PathBuf, Option<SourceIndexEntry>>,
     manifest_audit_completed: bool,
+    /// Exact next revision reserved by a complete targeted directory observation.
+    subtree_directory_revision: Option<u64>,
 }
 
 impl SourceDatabase {

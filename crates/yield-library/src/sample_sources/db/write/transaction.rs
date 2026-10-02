@@ -100,7 +100,8 @@ impl SourceWriteBatch<'_> {
 
     /// Commit the source-writer transaction while preserving rollback certainty.
     pub(super) fn commit_curation_prepared_with_outcome(self) -> CurationCommitOutcome {
-        if self.paths_revision_dirty
+        if self.subtree_directory_revision.is_some()
+            || self.paths_revision_dirty
             || self.identities_revision_dirty
             || self.index_revision_dirty
             || !self.manifest_touched_paths.is_empty()
@@ -344,7 +345,8 @@ impl SourceWriteBatch<'_> {
         expected_source_revision: u64,
         completed_at: i64,
     ) -> Result<SourceDirectoryTruthCommitResult, SourceDbError> {
-        if self.paths_revision_dirty
+        if self.subtree_directory_revision.is_some()
+            || self.paths_revision_dirty
             || self.identities_revision_dirty
             || self.index_revision_dirty
             || !self.manifest_touched_paths.is_empty()
@@ -380,6 +382,9 @@ impl SourceWriteBatch<'_> {
         expected_source_revision: u64,
         activation_mode: DirectoryTruthActivationMode,
     ) -> Result<SourceDirectoryTruthPublication, SourceDbError> {
+        if self.subtree_directory_revision.is_some() {
+            return Err(SourceDbError::Unexpected);
+        }
         let generation_sql = directory_generation_sql_value(generation)?;
         let Some((status, expected_entry_count, staged_entry_count, complete, published_revision)) =
             self.tx
@@ -601,7 +606,8 @@ impl SourceWriteBatch<'_> {
     /// Callers use it for transactionally coherent auxiliary lifecycle state whose publication
     /// must not impersonate a new source-manifest generation.
     pub fn commit_auxiliary_state(self) -> Result<(), SourceDbError> {
-        if self.paths_revision_dirty
+        if self.subtree_directory_revision.is_some()
+            || self.paths_revision_dirty
             || self.identities_revision_dirty
             || !self.manifest_touched_paths.is_empty()
         {
@@ -648,6 +654,9 @@ impl SourceWriteBatch<'_> {
         if !self.manifest_audit_completed {
             return Err(SourceDbError::Unexpected);
         }
+        if self.subtree_directory_revision.is_some() {
+            return Err(SourceDbError::Unexpected);
+        }
         self.prepare_commit()?;
         let (revision, snapshot) = manifest_snapshot(&self.tx)?;
         let owner = self.owner;
@@ -674,7 +683,8 @@ impl SourceWriteBatch<'_> {
         committed_root_identity: RootIdentity,
         audit_request: Option<&SourceAuditRequest>,
     ) -> Result<(SourceAuditCommit, Vec<SourceManifestEntry>), SourceDbError> {
-        if self.paths_revision_dirty
+        if self.subtree_directory_revision.is_some()
+            || self.paths_revision_dirty
             || self.identities_revision_dirty
             || self.index_revision_dirty
             || !self.manifest_touched_paths.is_empty()
@@ -828,6 +838,14 @@ impl SourceWriteBatch<'_> {
     }
 
     fn prepare_commit(&self) -> Result<(), SourceDbError> {
+        if self.subtree_directory_revision.is_some_and(|next| {
+            manifest_revision(&self.tx)
+                .ok()
+                .and_then(|r| r.checked_add(1))
+                != Some(next)
+        }) {
+            return Err(SourceDbError::Unexpected);
+        }
         SourceDatabase::bump_revision(&self.tx)?;
         if self.paths_revision_dirty {
             SourceDatabase::bump_wav_paths_revision(&self.tx)?;

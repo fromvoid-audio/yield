@@ -22,7 +22,7 @@ impl SourceDatabase {
         paths: &[RootRelativePath],
         expected_revision: u64,
     ) -> Result<ExactScanDatabaseFacts, SourceDbError> {
-        if paths.is_empty() || paths.len() > 64 {
+        if paths.len() > 64 {
             return Err(SourceDbError::Unexpected);
         }
         let transaction = self.connection.unchecked_transaction()?;
@@ -31,21 +31,7 @@ impl SourceDatabase {
         }
         let index_revision =
             read_bounded_numeric_metadata(&transaction, META_SOURCE_INDEX_REVISION)?;
-        use super::replay_authority::{MetadataValue, read_metadata};
-        let policy = match read_metadata(&transaction, META_SOURCE_TRAVERSAL_POLICY)? {
-            MetadataValue::Absent => SourceTraversalPolicy::default(),
-            MetadataValue::Invalid => return Err(SourceDbError::Unexpected),
-            MetadataValue::Value(value)
-                if [
-                    SourceTraversalPolicy::include_hidden_directories().as_str(),
-                    SourceTraversalPolicy::exclude_hidden_directories().as_str(),
-                ]
-                .contains(&value.as_str()) =>
-            {
-                SourceTraversalPolicy::from_stored(&value)
-            }
-            MetadataValue::Value(_) => return Err(SourceDbError::Unexpected),
-        };
+        let policy = read_policy(&transaction)?;
         let mut tracked_paths = Vec::with_capacity(paths.len());
         let mut statement = transaction
             .prepare("SELECT 1 FROM wav_files WHERE path = ?1 COLLATE BINARY LIMIT 2")?;
@@ -78,4 +64,25 @@ impl SourceDatabase {
             tracked_paths,
         })
     }
+}
+
+pub(super) fn read_policy(
+    transaction: &rusqlite::Connection,
+) -> Result<SourceTraversalPolicy, SourceDbError> {
+    use super::replay_authority::{MetadataValue, read_metadata};
+    let policy = match read_metadata(transaction, META_SOURCE_TRAVERSAL_POLICY)? {
+        MetadataValue::Absent => SourceTraversalPolicy::default(),
+        MetadataValue::Invalid => return Err(SourceDbError::Unexpected),
+        MetadataValue::Value(value)
+            if [
+                SourceTraversalPolicy::include_hidden_directories().as_str(),
+                SourceTraversalPolicy::exclude_hidden_directories().as_str(),
+            ]
+            .contains(&value.as_str()) =>
+        {
+            SourceTraversalPolicy::from_stored(&value)
+        }
+        MetadataValue::Value(_) => return Err(SourceDbError::Unexpected),
+    };
+    Ok(policy)
 }

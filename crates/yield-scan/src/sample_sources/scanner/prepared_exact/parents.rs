@@ -2,12 +2,12 @@
 use super::*;
 use yield_library::filesystem_identity::stable_filesystem_identity_from_open_file;
 
-pub(super) struct ParentDirectory {
+pub(in crate::sample_sources::scanner) struct ParentDirectory {
     path: std::path::PathBuf,
     identity: String,
     file: File,
 }
-pub(super) fn hold_parents(
+pub(in crate::sample_sources::scanner) fn hold_parents(
     owner: &SourceWriter,
     paths: &[RootRelativePath],
     root: &SourceRootCapability,
@@ -35,7 +35,7 @@ pub(super) fn hold_parents(
     }
     Ok(parents)
 }
-pub(super) fn revalidate(
+pub(in crate::sample_sources::scanner) fn revalidate(
     parents: &[ParentDirectory],
     root: &SourceRootCapability,
     cancel: Option<&AtomicBool>,
