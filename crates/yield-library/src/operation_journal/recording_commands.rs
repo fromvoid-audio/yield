@@ -12,6 +12,9 @@ use crate::file_operation_owner::{OutputIdentity, RootRegistrationRef};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Bounded reconstruction and seal observations; no live closure or filesystem authority.
+pub mod prefix;
+
 /// Version of this separate bounded observation codec, not an operation wire-schema version.
 pub const RECORDING_VALUE_VERSION: u16 = 1;
 /// Maximum immutable PCM bytes in one retained chunk.
