@@ -18,6 +18,7 @@ pub(crate) mod external_clipboard;
 mod multiline_text_input;
 mod search_input;
 mod theme;
+mod update_catalog_service;
 /// Read-only asynchronous update metadata port and typed outcomes.
 pub mod update_check;
 
@@ -37,6 +38,7 @@ const WINDOW_HEIGHT: f32 = 720.0;
 /// Start the browser window.
 pub fn run(initial_root: Option<PathBuf>) {
     Application::new().run(move |cx: &mut App| {
+        update_catalog_service::register(cx);
         #[cfg(debug_assertions)]
         let debug_post_effect_enabled =
             std::env::var("YIELD_DEV_POST_EFFECT").ok().as_deref() == Some("1");
