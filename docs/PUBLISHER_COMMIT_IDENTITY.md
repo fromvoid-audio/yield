@@ -37,7 +37,10 @@ markdown changelog response/link/content checks also remain required.
 Missing, shortened, substituted, duplicate, malformed or overflowing fields reject
 publication success. Metadata responses are limited to 512 KiB; parser depth is
 at most 16, strings at most 16 KiB, catalog releases at most 512, and file inventories
-at most 16. Existing finite curl connect/total deadlines and retry policy are retained.
+at most 16. Every publisher metadata GET/PUT, including pre-commit catalog and historical
+changelog downloads, uses the existing finite curl connect/total deadlines and retry
+policy. The assembler receives bounded local files in this path; it performs no
+additional network requests. Its standalone URL/local metadata reader also caps bytes.
 A failing response after PUT may mean staged or committed server data exists; the
 publisher reports failure and does not assert rollback or remove remote evidence.
 An old server that omits these fields cannot produce successful publication.

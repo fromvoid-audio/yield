@@ -212,14 +212,18 @@ for file in "${files[@]}"; do
 done
 
 summary_phase="assembling full changelog"
+assembly_catalog_file="$response_dir/assembly-catalog.json"
+assembly_changelog_file="$response_dir/assembly-changelog.json"
+curl "${curl_args[@]}" "$catalog_url" > "$assembly_catalog_file"
+curl "${curl_args[@]}" "$full_changelog_url" > "$assembly_changelog_file"
 scripts/internal/release/assemble_portal_changelog.py \
-  --catalog-url "$catalog_url" \
+  --catalog-file "$assembly_catalog_file" \
   --current-build-id "$BUILD_ID" \
   --current-build-number "$BUILD_NUMBER" \
   --current-version "$RELEASE_VERSION" \
   --current-released-at "$RELEASED_AT" \
   --current-log "$RELEASE_LOG" \
-  --existing-changelog-url "$full_changelog_url" \
+  --existing-changelog-file "$assembly_changelog_file" \
   --generated-at "$RELEASED_AT" \
   --output "$FULL_CHANGELOG_OUT"
 

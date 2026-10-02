@@ -76,12 +76,12 @@ class Server:
             def do_GET(self):
                 if self.path.endswith("/releases"):
                     self.reply({"releases": [owner.release] if owner.release else []},
-                               "catalog" if owner.release else None)
+                               "catalog" if owner.release else "pre_catalog")
                 elif self.path.endswith("/changelog"):
                     field = "changelog" if "/releases/" in self.path else "full_changelog"
                     body = owner.body[field]["body"] if owner.body else ""
                     self.reply({"build_id": owner.release["build_id"] if owner.release else None,
-                                "changelog": {"body": body}})
+                                "changelog": {"body": body}}, "pre_changelog" if owner.release is None else None)
                 else:
                     self.send_error(404)
         self.http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -252,6 +252,14 @@ class PublisherIdentity(unittest.TestCase):
         for mutate in (lambda r: {"releases": r["releases"] * 2}, lambda r: b"[", lambda r: b" " * (identity.MAX_JSON + 1)):
             case, server = self.artifacts(), self.server("catalog", mutate)
             self.assertNotEqual(self.run_publisher(case, server).returncode, 0)
+
+    def test_precommit_catalog_response_is_bounded_before_assembly(self):
+        for phase in ("pre_catalog", "pre_changelog"):
+            case = self.artifacts()
+            server = self.server(phase, lambda r: json.dumps(r).encode() + b" " * identity.MAX_JSON)
+            result = self.run_publisher(case, server)
+            self.assertNotEqual(result.returncode, 0, "oversized pre-commit metadata was accepted")
+            self.assertIsNone(server.body, "must reject before remote commit")
 
     def test_nightly_abbreviated_build_id_uses_full_manifest_identity(self):
         case, server = self.artifacts("nightly"), self.server()
