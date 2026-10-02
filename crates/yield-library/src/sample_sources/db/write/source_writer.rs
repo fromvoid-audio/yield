@@ -14,7 +14,9 @@ mod snapshot_metrics;
 pub use snapshot_metrics::SourceSnapshotQueueMetrics;
 use snapshot_metrics::{SnapshotCounters, SnapshotSender};
 mod feature_maintenance;
+mod feature_maintenance_metrics;
 pub use feature_maintenance::{FeaturePruneCursor, FeaturePrunePage};
+pub use feature_maintenance_metrics::FeatureMaintenanceMetrics;
 mod feature_metrics;
 pub use feature_metrics::SourceFeaturePublicationMetrics;
 mod feature_rebuild_metrics;
@@ -723,6 +725,7 @@ pub struct SourceWriter {
     feature_publication_metrics: SourceFeaturePublicationMetrics,
     reference_liveness: Arc<()>,
     feature_rebuild_metrics: FeatureRebuildMetrics,
+    feature_maintenance_metrics: FeatureMaintenanceMetrics,
     database: SourceDatabase,
     source_id: SourceId,
     lifecycle_generation: u64,
@@ -1501,6 +1504,7 @@ impl SourceWriter {
             feature_publication_metrics: SourceFeaturePublicationMetrics::default(),
             reference_liveness: Arc::new(()),
             feature_rebuild_metrics: FeatureRebuildMetrics::default(),
+            feature_maintenance_metrics: FeatureMaintenanceMetrics::default(),
             database,
             source_id,
             lifecycle_generation,

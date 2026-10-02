@@ -22,15 +22,15 @@ pub use curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
 };
 pub use source_writer::{
-    FeaturePruneCursor, FeaturePrunePage, FeatureRebuildMetrics, ManifestEnrollmentEntry,
-    ManifestEnrollmentError, ManifestEnrollmentKind, ManifestEnrollmentReceipt,
-    ManifestEnrollmentRequest, ManifestEnrollmentResult, SourceCollectionHistoryChange,
-    SourceCollectionHistorySelection, SourceCommandId, SourceFeaturePublicationMetrics,
-    SourceRevision, SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage,
-    SourceSnapshotQueueMetrics, SourceTagAdmissionObservation, SourceTagMetadataBudget,
-    SourceTagMetadataPolicy, SourceWalPreparation, SourceWalPreparationError,
-    SourceWalPreparationFailure, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
-    SourceWriterReceipt, SourceWriterRequest,
+    FeatureMaintenanceMetrics, FeaturePruneCursor, FeaturePrunePage, FeatureRebuildMetrics,
+    ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
+    ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
+    SourceCollectionHistoryChange, SourceCollectionHistorySelection, SourceCommandId,
+    SourceFeaturePublicationMetrics, SourceRevision, SourceScanFence, SourceSnapshotOwner,
+    SourceSnapshotPage, SourceSnapshotQueueMetrics, SourceTagAdmissionObservation,
+    SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceWalPreparation,
+    SourceWalPreparationError, SourceWalPreparationFailure, SourceWriter,
+    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};
 pub use transaction::{

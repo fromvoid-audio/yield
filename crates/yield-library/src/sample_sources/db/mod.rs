@@ -126,8 +126,8 @@ pub use types::{
 };
 pub use util::normalize_relative_path;
 pub use write::{
-    FeaturePruneCursor, FeaturePrunePage, FeatureRebuildMetrics, ManifestCommitResult,
-    ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
+    FeatureMaintenanceMetrics, FeaturePruneCursor, FeaturePrunePage, FeatureRebuildMetrics,
+    ManifestCommitResult, ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
     ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
     SOURCE_CURATION_BATCH_LIMIT, SourceCollectionHistoryChange, SourceCollectionHistorySelection,
     SourceCollectionWrite, SourceCommandId, SourceContentHashWrite, SourceCurationCommitReceipt,
