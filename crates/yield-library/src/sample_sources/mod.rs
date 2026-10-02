@@ -22,7 +22,7 @@ pub use audio_support::{
 pub use db::normalize_relative_path;
 pub use db::{
     BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, BrowserMetadataSnapshot,
-    DB_FILE_NAME, ExistingFileMetadataUpdate, ManifestCommitResult, Rating,
+    DB_FILE_NAME, ExistingFileMetadataUpdate, FeatureRebuildMetrics, ManifestCommitResult, Rating,
     SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES,
     SOURCE_CURATION_TAG_FACTS_MAX_PATHS, SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES,
     SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATHS,

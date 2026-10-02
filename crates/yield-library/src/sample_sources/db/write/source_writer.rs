@@ -8,7 +8,9 @@
 use super::super::{SourceReferenceFence, SourceReferenceFenceError};
 mod feature_metrics;
 pub use feature_metrics::SourceFeaturePublicationMetrics;
+mod feature_rebuild_metrics;
 mod manifest_enrollment;
+pub use feature_rebuild_metrics::FeatureRebuildMetrics;
 mod tag_metadata_budget;
 mod tag_metadata_policy;
 pub use tag_metadata_budget::SourceTagMetadataBudget;
@@ -696,6 +698,7 @@ pub enum SourceWriterError {
 pub struct SourceWriter {
     feature_publication_metrics: SourceFeaturePublicationMetrics,
     reference_liveness: Arc<()>,
+    feature_rebuild_metrics: FeatureRebuildMetrics,
     database: SourceDatabase,
     source_id: SourceId,
     lifecycle_generation: u64,
@@ -1340,19 +1343,35 @@ impl SourceWriter {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<crate::sample_sources::readiness::FeatureArtifactRebuildAdmission, SourceWriterError>
     {
-        self.validate_readiness_command(expected, target)?;
-        if target.source_generation
-            != i64::try_from(expected.revision()).map_err(|_| SourceWriterError::StaleFence)?
-        {
-            return Err(SourceWriterError::StaleFence);
-        }
-        let fence = self
-            .reference_read_fence()
-            .map_err(|_| SourceWriterError::StaleFence)?;
-        Ok(self
-            .database
-            .readiness_store()?
-            .admit_feature_rebuild(&fence, target, now, cancel)?)
+        let started = Instant::now();
+        let result = (|| {
+            self.validate_readiness_command(expected, target)?;
+            if target.source_generation
+                != i64::try_from(expected.revision()).map_err(|_| SourceWriterError::StaleFence)?
+            {
+                return Err(SourceWriterError::StaleFence);
+            }
+            let fence = self
+                .reference_read_fence()
+                .map_err(|_| SourceWriterError::StaleFence)?;
+            Ok(self
+                .database
+                .readiness_store()?
+                .admit_feature_rebuild(&fence, target, now, cancel)?)
+        })();
+        self.feature_rebuild_metrics
+            .record(&result, started.elapsed());
+        result
+    }
+
+    /// Observe fixed-size process-local rebuild diagnostics under this current audited owner.
+    /// No payload/path history, DB recount, write grant or physical reclamation is represented.
+    pub fn feature_rebuild_metrics(
+        &self,
+        expected: &SourceRevision,
+    ) -> Result<FeatureRebuildMetrics, SourceWriterError> {
+        self.validate_readiness_revision(expected)?;
+        Ok(self.feature_rebuild_metrics)
     }
 
     /// Record a classified failure for the exact claimed readiness target.
@@ -1456,6 +1475,7 @@ impl SourceWriter {
         let writer = Self {
             feature_publication_metrics: SourceFeaturePublicationMetrics::default(),
             reference_liveness: Arc::new(()),
+            feature_rebuild_metrics: FeatureRebuildMetrics::default(),
             database,
             source_id,
             lifecycle_generation,

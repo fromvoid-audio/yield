@@ -112,13 +112,13 @@ pub(in crate::sample_sources::readiness::store) fn admit(
     if !exact_target(&tx, target)? {
         return Ok(FeatureArtifactRebuildAdmission::RejectedStale);
     }
-    let health = health(&tx, target)?;
-    if let Health::Healthy(ref key, _) = health {
+    let current_health = health(&tx, target)?;
+    if let Health::Healthy(ref key, _) = current_health {
         if marker_matches(&tx, key)? {
             return Ok(FeatureArtifactRebuildAdmission::Ready);
         }
     }
-    if matches!(health, Health::Ambiguous) {
+    if matches!(current_health, Health::Ambiguous) {
         return Ok(FeatureArtifactRebuildAdmission::Ambiguous);
     }
     // Preserve an active exact job and unknown/malformed ownership-control state.
@@ -147,7 +147,7 @@ pub(in crate::sample_sources::readiness::store) fn admit(
             AND readiness_scope_id=?1 AND readiness_stage='analysis_features' AND artifact_version=?3 AND content_generation=?4)",
             params![target.scope_id,target.source_id,target.required_version,target.content_generation],|r|r.get(0))?;
         if !matches {
-            return Ok(if matches!(health, Health::Missing) {
+            return Ok(if matches!(current_health, Health::Missing) {
                 FeatureArtifactRebuildAdmission::Unchanged
             } else {
                 FeatureArtifactRebuildAdmission::Ambiguous
@@ -165,18 +165,25 @@ pub(in crate::sample_sources::readiness::store) fn admit(
             return Ok(FeatureArtifactRebuildAdmission::Ambiguous);
         }
         // Failed/retry work retains its policy. It has no finished payload to rebuild yet.
-        if status == "failed" || (matches!(health, Health::Missing) && status == "pending") {
+        if status == "failed" || (matches!(current_health, Health::Missing) && status == "pending")
+        {
             return Ok(FeatureArtifactRebuildAdmission::Unchanged);
         }
     }
     drop(rows);
     drop(statement);
-    let removed = matches!(health, Health::CorruptOwned);
+    let removed = matches!(current_health, Health::CorruptOwned);
     if removed {
-        tx.execute(
+        let before = tx.total_changes();
+        let removed_rows = tx.execute(
             "DELETE FROM source_feature_artifacts WHERE target_key=?1",
             [&probe.target_key],
         )?;
+        if removed_rows != 1 || tx.total_changes().checked_sub(before) != Some(1) {
+            return Err(ReadinessError::InvalidFeatureArtifact(
+                "corrupt removal has unconfirmed SQL effects",
+            ));
+        }
     }
     tx.execute("DELETE FROM source_readiness_artifacts WHERE source_id=?1 AND scope_kind='file'
         AND scope_id=?2 AND stage='analysis_features' AND artifact_version=?3 AND content_generation=?4",
@@ -193,6 +200,11 @@ pub(in crate::sample_sources::readiness::store) fn admit(
     super::super::persistence::validate_audit(&tx, fence)?;
     if !exact_target(&tx, target)? {
         return Ok(FeatureArtifactRebuildAdmission::RejectedStale);
+    }
+    if removed && !matches!(health(&tx, target)?, Health::Missing) {
+        return Err(ReadinessError::InvalidFeatureArtifact(
+            "corrupt removal was not retained",
+        ));
     }
     tx.commit()?;
     Ok(FeatureArtifactRebuildAdmission::Admitted {
