@@ -1564,7 +1564,7 @@ mod tests {
             SimilarityAspect::Timbre,
         )
         .unwrap();
-        let event = CatalogEvent::SimilarityCompleted {
+        let event = yield_session::CatalogEvent::SimilarityCompleted {
             request,
             cancellation: SimilarityCancellation::new(),
             result: Err(SimilarityDispatchFailure::AnchorUnavailable),

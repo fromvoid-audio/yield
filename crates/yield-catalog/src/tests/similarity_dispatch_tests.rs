@@ -135,6 +135,99 @@ mod fixtures {
         service.shutdown();
     }
     #[test]
+    fn similarity_dispatch_read_does_not_renew_near_expiry_or_expired_owner() {
+        let (fixture, service, source, snapshot) = setup();
+        let directory = fixture
+            .guard
+            .profile_root()
+            .join(catalog_profile_child(&source));
+        // Deliberate fixture-only perturbation of the actual retained lease row.
+        let sql = rusqlite::Connection::open_with_flags(
+            directory.join(".yield.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .unwrap();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        sql.execute(
+            "UPDATE source_lease SET expires_at=?1 WHERE singleton=1",
+            [now + 30],
+        )
+        .unwrap();
+        let before: Vec<_> = [".yield.db", ".yield.db-wal"]
+            .into_iter()
+            .filter_map(|name| {
+                fs::read(directory.join(name))
+                    .ok()
+                    .map(|bytes| (name, bytes))
+            })
+            .collect();
+        submit(
+            &service,
+            request(&source, snapshot.committed_revision, 16),
+            SimilarityCancellation::new(),
+        );
+        assert!(matches!(
+            delivery(&service, 16).into_event_if_live().unwrap(),
+            CatalogEvent::SimilarityCompleted { result: Ok(_), .. }
+        ));
+        let expiry: i64 = sql
+            .query_row(
+                "SELECT expires_at FROM source_lease WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            expiry,
+            now + 30,
+            "similarity renewed lease through control writer"
+        );
+        for (name, bytes) in before {
+            assert!(
+                fs::read(directory.join(name)).unwrap() == bytes,
+                "similarity changed {name}"
+            );
+        }
+        sql.execute(
+            "UPDATE source_lease SET expires_at=acquired_at WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        let expiry: i64 = sql
+            .query_row(
+                "SELECT expires_at FROM source_lease WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        submit(
+            &service,
+            request(&source, snapshot.committed_revision, 17),
+            SimilarityCancellation::new(),
+        );
+        wait_for_tag_page_input_release(&service);
+        wait_for_tag_read_payload(&service, 0);
+        assert!(service.try_recv_delivery().is_err()); // expired custody cannot project a success
+        assert_eq!(
+            sql.query_row(
+                "SELECT expires_at FROM source_lease WHERE singleton=1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            expiry
+        );
+        drop(sql);
+        service.shutdown();
+    }
+
+    #[test]
     fn similarity_dispatch_queued_cancellation_drops_projection_without_sql() {
         let (_fixture, service, source, snapshot) = setup();
         let token = SimilarityCancellation::new();

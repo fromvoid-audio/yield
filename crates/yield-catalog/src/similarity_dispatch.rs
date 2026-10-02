@@ -142,7 +142,7 @@ fn execute(
     cancellation: &SimilarityCancellation,
 ) -> Result<SourceSimilarityResult, SimilarityDispatchFailure> {
     let revision = writer
-        .current_revision_for_command()
+        .current_revision()
         .map_err(|_| SimilarityDispatchFailure::StaleSource)?;
     if revision.source_id() != &request.source_id
         || revision.lifecycle_generation() != request.lifecycle
