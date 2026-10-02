@@ -146,11 +146,23 @@
     },
     {
       "message": "FolderBrowserMessage::DragSource",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
-      "owner": "OPT-2006",
-      "note": "Reference per-panel sizing/source-order gesture has no equivalent verified GPUI handler; fixed/dynamic layout is not the same control.",
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/sidebar.rs",
+        "symbol": "drop_source_reorder"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-session/src/lib.rs",
+          "symbol": "source_reorder_persists_identity_and_rejects_stale_revision"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/source_registry.rs",
+          "symbol": "restored_session_matches_by_durable_id_before_root_fallback"
+        }
+      ],
+      "owner": "OPT-1914",
+      "note": "Stable-ID, revision-fenced source reorder and persisted restart order were implemented in PR #97. OPT-1914 records native drag, AX order, restart and keyboard evidence; insertion-marker/Escape physical observation was explicitly limited. OPT-2006 is a duplicate. This row does not certify the broader native pointer inventory.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
