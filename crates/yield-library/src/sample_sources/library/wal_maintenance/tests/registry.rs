@@ -357,6 +357,7 @@ fn registry_wal_replacement_during_checkpoint_is_not_confirmed() {
         "replacement during maintenance cannot be acknowledged as current: {result:?}"
     );
     assert_eq!(counter.load(Ordering::SeqCst), 1);
+    closed_after_profile_change(&writer);
     assert!(!writer.shutdown());
     assert!(!root.join(LIBRARY_DB_FILE_NAME).exists());
 }
@@ -399,6 +400,7 @@ fn registry_wal_replacement_before_maintenance_skips_checkpoint() {
         0,
         "postvalidation fails before maintenance can execute"
     );
+    closed_after_profile_change(&writer);
     assert!(!writer.shutdown());
     assert!(!root.join(LIBRARY_DB_FILE_NAME).exists());
 }

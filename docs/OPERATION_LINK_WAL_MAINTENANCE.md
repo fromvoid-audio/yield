@@ -41,6 +41,13 @@ Six focused tests exercise actual SQLite and the existing retained worker:
   closes the worker, cannot confirm current success, and leaves the committed
   receipt readable under the displaced original root.
 
+The command's ownership-error reply precedes the worker's terminal closure.
+Ownership fixtures therefore await actual `Closed` within five seconds, verify
+the retained ownership-failure reason and closed queue, then check the legacy
+shutdown initiation boolean. They do not mistake that boolean for a drain result.
+This also repairs the observed ordinary-maintenance fixture race without
+changing production lifecycle behavior or relaxing its closure assertions.
+
 ```sh
 cargo test --locked -p yield-library --lib operation_link_wal_ -- --test-threads=1
 cargo test --locked -p yield-library --lib sample_sources::library -- --test-threads=1

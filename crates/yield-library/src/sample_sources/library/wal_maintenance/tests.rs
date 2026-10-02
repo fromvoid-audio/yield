@@ -74,6 +74,24 @@ fn available(writer: &GlobalLibraryWriter) {
     }
 }
 
+fn closed_after_profile_change(writer: &GlobalLibraryWriter) {
+    // The command's error reply precedes terminal closure; shutdown's boolean only
+    // identifies who initiated closure, so observe the actual terminal state first.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while writer.status() != GlobalLibraryWriterStatus::Closed {
+        assert!(Instant::now() < deadline, "{:?}", writer.status());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(
+        writer.unavailable_reason(),
+        Some(GlobalLibraryWriterUnavailable::ProfileOwnershipChanged { .. })
+    ));
+    assert!(matches!(
+        writer.load_source_registry_snapshot(),
+        Err(GlobalLibraryWriterQueueError::Closed)
+    ));
+}
+
 fn complete(
     writer: &GlobalLibraryWriter,
     request: GlobalMutationRequest,

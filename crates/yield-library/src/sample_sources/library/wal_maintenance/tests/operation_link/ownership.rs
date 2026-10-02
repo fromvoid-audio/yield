@@ -65,6 +65,7 @@ fn operation_link_wal_actual_worker_ownership_loss_before_or_during_checkpoint_i
             "replacement must not be confirmed current: {result:?}"
         );
         assert_eq!(counter.load(Ordering::SeqCst), usize::from(during));
+        closed_after_profile_change(&writer);
         assert!(!writer.shutdown());
         assert!(!root.join(LIBRARY_DB_FILE_NAME).exists());
         let readback = Connection::open_with_flags(
