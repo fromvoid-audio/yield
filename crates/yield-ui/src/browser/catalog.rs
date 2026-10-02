@@ -1548,6 +1548,36 @@ mod tests {
     }
 
     #[test]
+    fn similarity_dispatch_event_uses_exact_captured_source_lifecycle() {
+        use yield_session::{
+            SimilarityAspect, SimilarityCancellation, SimilarityDispatchFailure,
+            SourceSimilarityRequest,
+        };
+        let source = SourceId::from_string("similarity-event");
+        let request = SourceSimilarityRequest::new(
+            source.clone(),
+            8,
+            20,
+            30,
+            "anchor.wav".into(),
+            &["candidate.wav".into()],
+            SimilarityAspect::Timbre,
+        )
+        .unwrap();
+        let event = CatalogEvent::SimilarityCompleted {
+            request,
+            cancellation: SimilarityCancellation::new(),
+            result: Err(SimilarityDispatchFailure::AnchorUnavailable),
+        };
+        assert_eq!(catalog_event_identity(&event), Some((source.clone(), 8)));
+        assert_ne!(catalog_event_identity(&event), Some((source, 7)));
+        assert!(
+            project_catalog_event(event, PathBuf::from("/unused"), &AtomicBool::new(false))
+                .is_err()
+        ); // transport alone invents no rendered result
+    }
+
+    #[test]
     fn non_snapshot_events_fail_projection_without_membership() {
         let event = yield_session::CatalogEvent::Registered {
             source_id: SourceId::from_string("source"),

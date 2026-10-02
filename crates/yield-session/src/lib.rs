@@ -58,11 +58,13 @@ pub use catalog::{
     SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
     SOURCE_DISPLAY_LABEL_MAX_PATHS, SOURCE_INDEX_PAGE_MAX_ENTRIES, SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
     SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
-    SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceCurationCommitReceipt, SourceCurationOperationFailure,
-    SourceCurationOperationFence, SourceCurationOperationOutcome, SourceCurationTagFacts,
-    SourceCurationUpdate, SourceDisplayLabelEntry, SourceIndexInspectionError,
-    SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor,
-    SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
+    SOURCE_TAG_PAGE_MAX_TAG_IDS, SimilarityAspect, SimilarityCancellation,
+    SimilarityCandidateOutcome, SimilarityDispatchFailure, SourceCurationCommitReceipt,
+    SourceCurationOperationFailure, SourceCurationOperationFence, SourceCurationOperationOutcome,
+    SourceCurationTagFacts, SourceCurationUpdate, SourceDisplayLabelEntry,
+    SourceIndexInspectionError, SourceSimilarityRequest, SourceSimilarityResult,
+    SourceSimilarityRow, SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage,
+    SourceTagPageCursor, SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
 };
 use catalog::{CatalogService, CatalogSlot};
 use maintenance::{
