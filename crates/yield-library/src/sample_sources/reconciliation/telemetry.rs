@@ -135,6 +135,16 @@ mod tests {
     #[derive(Clone, Default)]
     struct Collector(Arc<Mutex<Vec<Fields>>>);
     impl Subscriber for Collector {
+        fn register_callsite(
+            &self,
+            metadata: &'static Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            if metadata.target() == "yield::watcher_metrics" {
+                tracing::subscriber::Interest::always()
+            } else {
+                tracing::subscriber::Interest::never()
+            }
+        }
         fn enabled(&self, metadata: &Metadata<'_>) -> bool {
             metadata.target() == "yield::watcher_metrics"
         }
@@ -164,6 +174,21 @@ mod tests {
 
     #[test]
     fn emitted_fields_are_bounded_and_lag_only_describes_acknowledgement() {
+        // Other library fixtures install process-global tracing filters. Isolate the event
+        // subscriber so their concurrent callsite-cache updates cannot disable this collector.
+        const CHILD: &str = "YIELD_WATCHER_TELEMETRY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "sample_sources::reconciliation::telemetry::tests::emitted_fields_are_bounded_and_lag_only_describes_acknowledgement", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "isolated emitter test: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let collector = Collector::default();
         let mut metrics = WatcherMetrics::default();
         tracing::subscriber::with_default(collector.clone(), || {
