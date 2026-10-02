@@ -185,8 +185,9 @@ charges retained and denies further authority.
 | Resource | Selected bound and accounting |
 | --- | --- |
 | Journal slots | 32 total, including issued, entered and unresolved quiescent slots; no eviction of uncertainty |
+| Shared admission backing | At most 16 KiB, including the bounded volume mirror and synchronization state; included in the 2 MiB publication ceiling |
 | Slot backing | At most 64 KiB each, including normalized binding, retained validation, completion and fixed slot overhead; checked retained capacities, not just encoded length |
-| Journal retained publication backing | At most 2 MiB, debited from existing 4 MiB queued-input credit and held through settlement; leaves 2 MiB outside publication backing |
+| Journal retained publication backing | At most 2 MiB including shared admission and all slots, debited from existing 4 MiB queued-input credit and held through settlement; leaves 2 MiB outside publication backing |
 | Journal control input | Reserve 64 KiB of the remaining input pool for bounded closure/control; ordinary admission cannot spend it |
 | Publication file envelope | At most 64 KiB including canonical command, original grant backing and fixed overhead; debit existing 4 MiB file input credit |
 | File admission/results/receipts | Existing 32 commands, 64 result credits, 64 receipts/tombstones; unresolved publication occupies these credits rather than creating another history |
