@@ -61,9 +61,9 @@ impl Request {
     }
 }
 impl Browser {
-    // A current row and its actions use the same full source fence. Keeping the
-    // last request does not make it visible after navigation or catalog refresh.
-    fn current_feature_request(&self) -> Option<&Request> {
+    // Observe a revision change only within the same current audited owner.
+    // Navigation, retirement and incomplete audits still hide the old request.
+    fn feature_request_context(&self) -> Option<(&Request, u64)> {
         let request = self.feature_analysis.pending.as_ref()?;
         let activation = self.catalog_activation.as_ref()?;
         let context = self.catalog_metadata.context()?;
@@ -80,39 +80,68 @@ impl Browser {
             && activation.audit_error.is_none()
             && context.source_id == request.source
             && context.lifecycle_generation == request.lifecycle
-            && context.revision == request.revision
-            && !request.cancellation.is_cancelled())
-        .then_some(request)
+            && context.revision >= request.revision
+            // A later audited revision can explain why the old attempt was
+            // cancelled. Only its revalidation row is visible, never its state.
+            && (context.revision > request.revision || !request.cancellation.is_cancelled()))
+        .then_some((request, context.revision))
+    }
+
+    fn current_feature_request(&self) -> Option<&Request> {
+        let (request, revision) = self.feature_request_context()?;
+        (request.revision == revision).then_some(request)
     }
 
     pub(super) fn feature_job_row(&self) -> Option<super::job_details::JobRow> {
-        use super::job_details::{JobKind, JobRow, bounded_text};
+        use super::job_details::{FeatureJobState, JobKind, JobRow, bounded_text};
         use yield_session::FeatureAnalysisBlocker as Blocker;
-        let request = self.current_feature_request()?;
-        let completed = matches!(request.state, Some(FeatureAnalysisState::Ready { .. }));
-        let blocked = match &request.state {
-            Some(FeatureAnalysisState::Blocked { reason }) => Some(reason.message().to_owned()),
-            _ => None,
+        let (request, revision) = self.feature_request_context()?;
+        let outdated = revision != request.revision;
+        let feature_state = if outdated {
+            FeatureJobState::NeedsRevalidation
+        } else {
+            match request.state {
+                None | Some(FeatureAnalysisState::Preparing { .. }) => FeatureJobState::Preparing,
+                Some(FeatureAnalysisState::Queued) => FeatureJobState::Queued,
+                Some(FeatureAnalysisState::Running) => FeatureJobState::Running,
+                Some(FeatureAnalysisState::Ready { .. }) => FeatureJobState::Ready,
+                Some(FeatureAnalysisState::Blocked { .. }) => FeatureJobState::Blocked,
+            }
         };
-        let can_retry = matches!(
-            request.state,
-            Some(FeatureAnalysisState::Blocked {
-                reason: Blocker::AdmissionBudget
-                    | Blocker::InputChanged
-                    | Blocker::Computation
-                    | Blocker::NotClaimable
-                    | Blocker::Cancelled
-                    | Blocker::Publication,
-            })
-        );
-        let activity = request
-            .state
-            .as_ref()
-            .map(FeatureAnalysisState::message)
-            .unwrap_or_else(|| "Feature request submitted".into());
+        let completed = feature_state == FeatureJobState::Ready;
+        let blocked = if outdated {
+            Some("This source was updated; retry to check this file again".into())
+        } else {
+            match &request.state {
+                Some(FeatureAnalysisState::Blocked { reason }) => Some(reason.message().to_owned()),
+                _ => None,
+            }
+        };
+        let can_retry = outdated
+            || matches!(
+                request.state,
+                Some(FeatureAnalysisState::Blocked {
+                    reason: Blocker::AdmissionBudget
+                        | Blocker::InputChanged
+                        | Blocker::Computation
+                        | Blocker::NotClaimable
+                        | Blocker::Cancelled
+                        | Blocker::Publication,
+                })
+            );
+        let activity = if outdated {
+            "Needs revalidation".into()
+        } else {
+            request
+                .state
+                .as_ref()
+                .map(FeatureAnalysisState::message)
+                .unwrap_or_else(|| "Feature request submitted".into())
+        };
         let file = bounded_text(&request.path.to_string_lossy(), 48);
         Some(JobRow {
             kind: JobKind::FeatureAnalysis,
+            feature_state: Some(feature_state),
             source: self.root.clone(),
             generation: request.id,
             work: format!("{activity} · {file}"),
@@ -124,15 +153,21 @@ impl Browser {
         })
     }
 
+    fn feature_retry_target(&self) -> Option<(SourceId, u64, u64, PathBuf)> {
+        if !self.feature_job_row()?.can_retry {
+            return None;
+        }
+        let (request, revision) = self.feature_request_context()?;
+        Some((
+            request.source.clone(),
+            request.lifecycle,
+            revision,
+            request.path.clone(),
+        ))
+    }
+
     pub(super) fn retry_current_job(&mut self, cx: &mut Context<Self>) {
-        if self.feature_job_row().is_some_and(|row| row.can_retry) {
-            let request = self.current_feature_request().expect("same current fence");
-            let (source, lifecycle, revision, path) = (
-                request.source.clone(),
-                request.lifecycle,
-                request.revision,
-                request.path.clone(),
-            );
+        if let Some((source, lifecycle, revision, path)) = self.feature_retry_target() {
             self.request_feature_analysis(source, lifecycle, revision, path, cx);
         } else {
             self.retry_job_audit(cx);
@@ -243,3 +278,6 @@ include!("analysis_tests.rs");
 
 #[cfg(test)]
 include!("analysis_lifecycle_tests.rs");
+
+#[cfg(test)]
+include!("analysis_presentation_tests.rs");

@@ -43,11 +43,36 @@ impl JobKind {
     }
 }
 
+/// Feature presentation is distinct from the worker's retained result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FeatureJobState {
+    Preparing,
+    Queued,
+    Running,
+    Blocked,
+    NeedsRevalidation,
+    Ready,
+}
+
+impl FeatureJobState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Preparing => "Preparing · time remaining unknown",
+            Self::Queued => "Queued · awaiting feature work",
+            Self::Running => "Running · time remaining unknown",
+            Self::Blocked => "Blocked · needs attention",
+            Self::NeedsRevalidation => "Needs revalidation · source updated",
+            Self::Ready => "Selected file ready",
+        }
+    }
+}
+
 /// A bounded current presentation row. Feature work carries phase target counts;
 /// other workers and compute phases remain explicitly indeterminate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct JobRow {
     pub(super) kind: JobKind,
+    pub(super) feature_state: Option<FeatureJobState>,
     pub(super) source: Option<PathBuf>,
     pub(super) generation: u64,
     pub(super) work: String,
@@ -64,6 +89,8 @@ impl JobRow {
             "Retry queued · awaiting audit"
         } else if matches!(self.action, Some(JobActionKind::CancelRequested)) {
             "Cancellation requested · awaiting worker"
+        } else if let Some(state) = self.feature_state {
+            state.label()
         } else if self.completed {
             "Selected file ready"
         } else if self.blocked.is_some() {
@@ -121,7 +148,7 @@ impl JobSnapshot {
         {
             format!("{} · {}", row.source_label(), row.work)
         } else if count > 0 {
-            format!("{count} job{} running", if count == 1 { "" } else { "s" })
+            format!("{count} job{} active", if count == 1 { "" } else { "s" })
         } else if self.rows.iter().any(|row| row.blocked.is_some()) {
             "Job needs attention".into()
         } else {
@@ -141,6 +168,7 @@ pub(super) fn snapshot(browser: &Browser, cx: &Context<Browser>) -> JobSnapshot 
     {
         rows.push(JobRow {
             kind: JobKind::SourceScan,
+            feature_state: None,
             source: Some(root.clone()),
             generation: browser.scan_generation,
             work: "Finding audio files".into(),
@@ -169,6 +197,7 @@ pub(super) fn snapshot(browser: &Browser, cx: &Context<Browser>) -> JobSnapshot 
         if !activation.audit_finished || browser.catalog_projection_task.is_some() {
             rows.push(JobRow {
                 kind: JobKind::Catalog,
+                feature_state: None,
                 source: Some(activation.root.clone()),
                 generation: activation.lifecycle_generation,
                 work: "Checking source catalog".into(),
@@ -184,6 +213,7 @@ pub(super) fn snapshot(browser: &Browser, cx: &Context<Browser>) -> JobSnapshot 
         } else if let Some(error) = activation.audit_error.as_ref() {
             rows.push(JobRow {
                 kind: JobKind::Catalog,
+                feature_state: None,
                 source: Some(activation.root.clone()),
                 generation: activation.lifecycle_generation,
                 work: "Retry this source audit".into(),
@@ -198,6 +228,7 @@ pub(super) fn snapshot(browser: &Browser, cx: &Context<Browser>) -> JobSnapshot 
     if browser.waveform_pending || browser.waveform_detail.is_pending() {
         rows.push(JobRow {
             kind: JobKind::Waveform,
+            feature_state: None,
             source: active_root.cloned(),
             generation: browser.waveform_generation,
             work: "Loading selected waveform".into(),
@@ -211,6 +242,7 @@ pub(super) fn snapshot(browser: &Browser, cx: &Context<Browser>) -> JobSnapshot 
     if browser.audio_output_open_task.is_some() && browser.playback_init_intent.is_some() {
         rows.push(JobRow {
             kind: JobKind::AudioOutput,
+            feature_state: None,
             source: active_root.cloned(),
             generation: browser.playback_init_generation,
             work: "Starting audio output".into(),

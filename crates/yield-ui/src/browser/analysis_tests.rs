@@ -163,9 +163,11 @@ pub(super) mod tests {
             let mut context = view.catalog_metadata.context().unwrap().clone();
             context.revision += 1;
             view.catalog_metadata.install_projection(context);
-            assert!(view.feature_job_row().is_none());
+            let outdated = view.feature_job_row().unwrap();
+            assert!(!outdated.completed);
+            assert!(outdated.can_retry);
             view.retry_current_job(cx);
-            assert!(view.feature_job_row().is_none());
+            assert_eq!(view.feature_job_row(), Some(outdated));
             install(
                 view,
                 FeatureAnalysisState::Blocked {
