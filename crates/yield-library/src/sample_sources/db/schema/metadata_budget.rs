@@ -30,21 +30,9 @@ pub(in crate::sample_sources::db) fn require_known_metadata_schema(
     if attached || temp_objects != 0 {
         return Err(SourceDbError::Unexpected);
     }
-    static EXPECTED: OnceLock<Option<SchemaImage>> = OnceLock::new();
-    let expected = EXPECTED
-        .get_or_init(|| {
-            let reference = Connection::open_in_memory().ok()?;
-            super::assure_schema(&reference).ok()?;
-            reference
-                .execute_batch(super::super::source_lease::LEASE_TABLE_SQL)
-                .ok()?;
-            image(&reference).ok()
-        })
-        .as_ref()
-        .ok_or(SourceDbError::Unexpected)?;
-    static EXPECTED_RUNTIME: OnceLock<Option<Vec<String>>> = OnceLock::new();
-    let runtime = EXPECTED_RUNTIME
-        .get_or_init(|| runtime_image(&Connection::open_in_memory().ok()?).ok())
+    static EXPECTED: OnceLock<Option<(SchemaImage, Vec<String>)>> = OnceLock::new();
+    let (expected, runtime) = EXPECTED
+        .get_or_init(|| reference_image().ok())
         .as_ref()
         .ok_or(SourceDbError::Unexpected)?;
     let actual_runtime = runtime_image(connection)?;
@@ -56,6 +44,16 @@ pub(in crate::sample_sources::db) fn require_known_metadata_schema(
         return Err(SourceDbError::Unexpected);
     }
     Ok(())
+}
+
+/// Fresh bundled SQLite reference only: no pathname, external source owner or write authority.
+fn reference_image() -> Result<(SchemaImage, Vec<String>), SourceDbError> {
+    let reference = Connection::open_in_memory().map_err(map_sql_error)?;
+    super::assure_schema(&reference)?;
+    reference
+        .execute_batch(super::super::source_lease::LEASE_TABLE_SQL)
+        .map_err(map_sql_error)?;
+    Ok((image(&reference)?, runtime_image(&reference)?))
 }
 
 fn image(connection: &Connection) -> Result<SchemaImage, SourceDbError> {

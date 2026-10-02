@@ -16,7 +16,7 @@ OPT-2012, OPT-1721/1722 and OPT-1486 remain open.
 | Journal participant/checkpoint owner | Owns stable operation/work-unit identity, required participant set and dispositions under OPT-1641. | Persist/read back exact source outcome before advancing that participant; preserve prefix failure and the profile definition. |
 
 Use `source_writer.rs`, `write/curation.rs`, `tags/{identity,mutations}.rs` and
-the existing `source_writer_receipts` transaction/retention boundary. Extend its
+the existing `source_participant_curation_receipts` transaction/retention boundary. Extend its
 versioned request/result codec with an explicit assignment variant; V1 curation
 receipts remain readable and cannot satisfy a V2 assignment receipt. A receipt
 table is not a second owner. Profile vocabulary and source numeric tag IDs never
@@ -182,3 +182,10 @@ Tag/manifest eligibility, row/byte overflow and stale owner fences reject the en
 read. SQL byte guards run before path strings are materialized. Atomic admitted
 delta, receipt codec and durable replay remain OPT-2049; full journal definition
 coordination remains OPT-2012. Selection tests cannot complete those scopes.
+
+
+The owner-bound physical/schema observation prerequisite is implemented by
+`SourceWriter::capture_tag_metadata_budget` (OPT2083). It is read-only and is
+not an installed page policy, capacity claim or participant receipt. See
+`SOURCE_TAG_METADATA_BUDGET.md` for the measured facts and remaining entered
+transaction requirements. OPT2049 remains responsible for those requirements.
