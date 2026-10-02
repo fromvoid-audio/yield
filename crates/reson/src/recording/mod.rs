@@ -232,6 +232,12 @@ mod tests {
         let outcome = recorder.stop().unwrap();
         assert!(!recorder.is_active());
         assert_eq!(outcome.frames, 0);
-        assert_eq!(outcome.health, RecordingHealth::default());
+        assert_eq!(
+            outcome.health,
+            RecordingHealth {
+                writer_accounting_complete: true,
+                ..RecordingHealth::default()
+            }
+        );
     }
 }

@@ -90,27 +90,45 @@ pub(super) struct RecorderCapture {
     health: Arc<RecordingHealthState>,
     pub(super) mode: Arc<AtomicU8>,
     channels: usize,
+    #[cfg(test)]
+    submission_hook: Option<Box<dyn FnOnce() + Send>>,
 }
+
+struct CaptureSubmission<'a>(&'a RecordingHealthState);
+impl Drop for CaptureSubmission<'_> {
+    fn drop(&mut self) {
+        self.0.capture_in_flight.store(false, Ordering::SeqCst);
+    }
+}
+
 impl RecorderCapture {
     pub(super) fn submit(&mut self, samples: &[f32]) {
+        // These SC operations and the terminal worker's SC mode RMW prevent both sides from
+        // missing one another: an accepted submission finishes before terminal accounting.
+        self.health.capture_in_flight.store(true, Ordering::SeqCst);
+        let _submission = CaptureSubmission(&self.health);
         if samples.len() % self.channels != 0 {
             self.health.writer_failed.store(true, Ordering::Release);
             self.mode.store(CANCELLED, Ordering::Release);
         }
-        if self.mode.load(Ordering::Acquire) != RUNNING
+        if self.mode.load(Ordering::SeqCst) != RUNNING
             || self.health.writer_failed.load(Ordering::Acquire)
             || self.producer.vacant_len() < samples.len()
         {
             self.health
-                .writer_dropped_samples
-                .fetch_add(samples.len() as u64, Ordering::Relaxed);
+                .add_writer_count(&self.health.writer_dropped_samples, samples.len() as u64);
             self.health
-                .writer_overrun_events
-                .fetch_add(1, Ordering::Relaxed);
+                .add_writer_count(&self.health.writer_overrun_events, 1);
             return;
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.submission_hook.take() {
+            hook();
         }
         let pushed = self.producer.push_slice(samples);
         debug_assert_eq!(pushed, samples.len());
+        self.health
+            .add_writer_count(&self.health.writer_accepted_samples, pushed as u64);
     }
 }
 
@@ -131,6 +149,8 @@ impl RecorderWriter {
                 health,
                 mode: Arc::new(AtomicU8::new(RUNNING)),
                 channels: usize::from(limits.channels),
+                #[cfg(test)]
+                submission_hook: None,
             },
             consumer,
         )
@@ -149,7 +169,20 @@ impl RecorderWriter {
         let join = thread::Builder::new()
             .name("reson-recording-writer".into())
             .spawn(move || {
-                let result = writer_loop(writer, consumer, &worker_mode);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    writer_loop(writer, consumer, &worker_mode, &health)
+                }));
+                let result = match result {
+                    Ok(result) => result,
+                    Err(panic) => {
+                        health.writer_failed.store(true, Ordering::Release);
+                        health
+                            .writer_accounting_complete
+                            .store(false, Ordering::Release);
+                        worker_mode.store(CANCELLED, Ordering::SeqCst);
+                        std::panic::resume_unwind(panic);
+                    }
+                };
                 if result.is_err() {
                     health.writer_failed.store(true, Ordering::Release);
                 }
@@ -204,20 +237,41 @@ fn writer_loop(
     mut writer: WavSampleWriter,
     mut consumer: ringbuf::HeapCons<f32>,
     mode: &AtomicU8,
+    health: &RecordingHealthState,
 ) -> Result<RecordingStats, AudioInputError> {
     // A read batch must remain an exact number of interleaved frames for every accepted format.
     let channels = usize::from(writer.limits.channels);
     let mut samples = vec![0.0; WRITER_DRAIN_SAMPLES - WRITER_DRAIN_SAMPLES % channels];
     loop {
         if mode.load(Ordering::Acquire) == CANCELLED {
+            settle_capture(mode, health);
             break;
         }
         let popped = consumer.pop_slice(&mut samples);
         if popped > 0 {
-            writer.write_samples(&samples[..popped])?;
+            if let Err(error) = writer.write_samples(&samples[..popped]) {
+                mode.store(CANCELLED, Ordering::SeqCst);
+                settle_capture(mode, health);
+                health.add_writer_count(&health.writer_unconfirmed_samples, popped as u64);
+                health.add_writer_count(
+                    &health.writer_abandoned_samples,
+                    consumer.occupied_len() as u64,
+                );
+                health.writer_failed.store(true, Ordering::Release);
+                health
+                    .writer_accounting_complete
+                    .store(true, Ordering::Release);
+                return Err(error);
+            }
+            health.add_writer_count(&health.writer_encoded_samples, popped as u64);
             continue;
         }
         if mode.load(Ordering::Acquire) != RUNNING {
+            settle_capture(mode, health);
+            // A callback may have passed Running before Stop. Drain its accepted frames too.
+            if mode.load(Ordering::Acquire) == STOPPED && consumer.occupied_len() != 0 {
+                continue;
+            }
             break;
         }
         thread::sleep(IDLE_POLL_INTERVAL);
@@ -227,7 +281,27 @@ fn writer_loop(
     } else {
         RecordingPrefixState::StoppedUnpublished
     };
-    writer.finalize(state)
+    health.add_writer_count(
+        &health.writer_abandoned_samples,
+        consumer.occupied_len() as u64,
+    );
+    let result = writer.finalize(state);
+    if result.is_err() {
+        health.writer_failed.store(true, Ordering::Release);
+    }
+    health
+        .writer_accounting_complete
+        .store(true, Ordering::Release);
+    result
+}
+
+fn settle_capture(mode: &AtomicU8, health: &RecordingHealthState) {
+    // Preserve Stop vs Cancel, while putting terminal mode in the SC handshake order.
+    let terminal_mode = mode.fetch_or(0, Ordering::SeqCst);
+    debug_assert_ne!(terminal_mode, RUNNING);
+    while health.capture_in_flight.load(Ordering::SeqCst) {
+        thread::sleep(IDLE_POLL_INTERVAL);
+    }
 }
 
 struct BoundedSink {
