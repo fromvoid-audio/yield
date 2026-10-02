@@ -5,8 +5,10 @@
 //! database transaction.  The live revision/fence values below are observations of the retained
 //! owner; their persisted DTOs never construct or reacquire an authority.
 
+use super::super::{SourceReferenceFence, SourceReferenceFenceError};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -589,6 +591,7 @@ pub enum SourceWriterError {
 
 /// Owner of one already-profile-bound source database.
 pub struct SourceWriter {
+    reference_liveness: Arc<()>,
     database: SourceDatabase,
     source_id: SourceId,
     lifecycle_generation: u64,
@@ -1143,6 +1146,7 @@ impl SourceWriter {
     ) -> Result<Self, SourceWriterError> {
         validate_source_id(&source_id)?;
         let writer = Self {
+            reference_liveness: Arc::new(()),
             database,
             source_id,
             lifecycle_generation,
@@ -1150,6 +1154,46 @@ impl SourceWriter {
             fault: None,
         };
         Ok(writer)
+    }
+
+    /// Issue a bounded audited reference read fence from this retained writer instance.
+    /// The observation expires on writer handoff/close or revision/ownership changes; it is
+    /// not a mutation grant and performs no pathname reopen or lease renewal.
+    pub fn reference_read_fence(&self) -> Result<SourceReferenceFence, SourceReferenceFenceError> {
+        let publication = self.database.source_publication_fence()?;
+        let (root_identity, revision) = publication.read_reference_audit()?;
+        let binding = self
+            .database
+            .database_file_binding
+            .as_deref()
+            .ok_or(SourceReferenceFenceError::InvalidIdentity)?;
+        let lease_epoch = u64::try_from(publication.lease_epoch())
+            .map_err(|_| SourceReferenceFenceError::InvalidIdentity)?;
+        let root_binding_identity = binding.root().identity();
+        let database_identity = binding.identity();
+        if self.source_id.as_str().is_empty()
+            || self.source_id.as_str().len() > 256
+            || root_binding_identity.is_empty()
+            || root_binding_identity.len() > 256
+            || database_identity.is_empty()
+            || database_identity.len() > 256
+            || lease_epoch == 0
+            || self.lifecycle_generation > i64::MAX as u64
+        {
+            return Err(SourceReferenceFenceError::InvalidIdentity);
+        }
+        let observation = SourceRevision {
+            source_id: self.source_id.clone(),
+            root_identity,
+            root_binding_identity: root_binding_identity.to_owned(),
+            database_identity: database_identity.to_owned(),
+            lifecycle_generation: self.lifecycle_generation,
+            lease_epoch,
+            revision,
+        };
+        let fence = SourceReferenceFence::issue(observation, publication, &self.reference_liveness);
+        fence.validate()?;
+        Ok(fence)
     }
 
     /// Observe a live scan position without asserting completed manifest coverage.
