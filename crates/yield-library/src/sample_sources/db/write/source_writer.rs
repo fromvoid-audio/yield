@@ -48,6 +48,9 @@ use super::curation::{
     apply_curation_updates, normalize_update_paths, validate_curation_preconditions,
     validate_update_values,
 };
+use super::tag_assignment_selection::{
+    self, SourceTagAssignmentMutation, SourceTagAssignmentSelection,
+};
 use super::transaction::CurationCommitOutcome;
 
 /// Maximum durable source-participant receipts retained by one source database.
@@ -149,7 +152,16 @@ struct SnapshotRequest {
     reply: mpsc::Sender<Result<SourceSnapshotPage, SourceWriterError>>,
 }
 
+struct TagSelectionRequest {
+    expected: SourceRevision,
+    old_label: String,
+    mutation: SourceTagAssignmentMutation,
+    deadline: Instant,
+    reply: mpsc::Sender<Result<SourceTagAssignmentSelection, SourceWriterError>>,
+}
+
 enum SnapshotCommand {
+    TagSelection(TagSelectionRequest),
     Page(SnapshotRequest),
     #[cfg(test)]
     BlockForTest {
@@ -170,6 +182,65 @@ pub struct SourceSnapshotOwner {
 }
 
 impl SourceSnapshotOwner {
+    /// Capture all bounded tag assignments on the sole worker within a two-second caller budget.
+    ///
+    /// Timeout retains source custody on the worker; it never grants mutation or finalization.
+    pub fn capture_tag_assignment_selection(
+        &self,
+        expected: &SourceRevision,
+        old_label: &str,
+        mutation: SourceTagAssignmentMutation,
+    ) -> Result<SourceTagAssignmentSelection, SourceWriterError> {
+        self.capture_tag_assignment_selection_with_deadline(
+            expected,
+            old_label,
+            mutation,
+            Instant::now() + Duration::from_secs(2),
+        )
+    }
+
+    pub(super) fn capture_tag_assignment_selection_with_deadline(
+        &self,
+        expected: &SourceRevision,
+        old_label: &str,
+        mutation: SourceTagAssignmentMutation,
+        deadline: Instant,
+    ) -> Result<SourceTagAssignmentSelection, SourceWriterError> {
+        super::super::tags::validate_curation_tag_label(old_label)?;
+        if let SourceTagAssignmentMutation::Rename(label) = &mutation {
+            super::super::tags::validate_curation_tag_label(label)?;
+        }
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        let (reply, response) = mpsc::channel();
+        let request = TagSelectionRequest {
+            expected: expected.clone(),
+            old_label: old_label.to_owned(),
+            mutation,
+            deadline,
+            reply,
+        };
+        self.requests
+            .as_ref()
+            .ok_or(SourceWriterError::SnapshotOwnerUnavailable)?
+            .try_send(SnapshotCommand::TagSelection(request))
+            .map_err(|e| match e {
+                mpsc::TrySendError::Full(_) => SourceWriterError::SnapshotBudgetExceeded,
+                mpsc::TrySendError::Disconnected(_) => SourceWriterError::SnapshotOwnerUnavailable,
+            })?;
+        let result = response
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|e| match e {
+                mpsc::RecvTimeoutError::Timeout => SourceWriterError::SnapshotBudgetExceeded,
+                mpsc::RecvTimeoutError::Disconnected => SourceWriterError::SnapshotOwnerUnavailable,
+            })?;
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        result
+    }
+
     /// Transfer the existing source writer to a single snapshot worker.
     pub fn start(writer: SourceWriter) -> io::Result<Self> {
         let (requests, receiver) = mpsc::sync_channel::<SnapshotCommand>(1);
@@ -178,6 +249,15 @@ impl SourceSnapshotOwner {
             .spawn(move || {
                 while let Ok(command) = receiver.recv() {
                     match command {
+                        SnapshotCommand::TagSelection(request) => {
+                            let result = writer.capture_tag_assignment_selection_with_deadline(
+                                &request.expected,
+                                &request.old_label,
+                                request.mutation,
+                                request.deadline,
+                            );
+                            let _ = request.reply.send(result);
+                        }
                         SnapshotCommand::Page(request) => {
                             if Instant::now() >= request.deadline {
                                 let _ = request
@@ -1452,6 +1532,64 @@ impl SourceWriter {
             &expected.root_identity,
             updates,
         )?)
+    }
+
+    /// Capture a bounded whole-source tag scope on the retained owner thread.
+    ///
+    /// SQL has a two-second deadline; use SourceSnapshotOwner to also bound the caller while
+    /// an OS identity check stalls. The returned observation is not mutation admission.
+    pub fn capture_tag_assignment_selection(
+        &self,
+        expected: &SourceRevision,
+        old_label: &str,
+        mutation: SourceTagAssignmentMutation,
+    ) -> Result<SourceTagAssignmentSelection, SourceWriterError> {
+        self.capture_tag_assignment_selection_with_deadline(
+            expected,
+            old_label,
+            mutation,
+            Instant::now() + Duration::from_secs(2),
+        )
+    }
+
+    pub(super) fn capture_tag_assignment_selection_with_deadline(
+        &self,
+        expected: &SourceRevision,
+        old_label: &str,
+        mutation: SourceTagAssignmentMutation,
+        deadline: Instant,
+    ) -> Result<SourceTagAssignmentSelection, SourceWriterError> {
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        let _progress = SnapshotProgressGuard::install(&self.database.connection, deadline);
+        let result = (|| {
+            // The authoritative-audit helper owns its own SQLite transaction. Keep full
+            // owner checks outside this read transaction, then pin its logical revision.
+            let before = self.current_revision()?;
+            if expected != &before {
+                return Err(SourceWriterError::StaleFence);
+            }
+            let transaction = self
+                .database
+                .connection
+                .unchecked_transaction()
+                .map_err(map_sql_error)?;
+            if self.database.get_revision()? != expected.revision() {
+                return Err(SourceWriterError::StaleFence);
+            }
+            let selection =
+                tag_assignment_selection::capture(&transaction, before, old_label, mutation)?;
+            transaction.commit().map_err(map_sql_error)?;
+            if expected != &self.current_revision()? {
+                return Err(SourceWriterError::StaleFence);
+            }
+            Ok(selection)
+        })();
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        result
     }
 
     /// Synchronous worker primitive; the owned worker bounds the caller's response time.

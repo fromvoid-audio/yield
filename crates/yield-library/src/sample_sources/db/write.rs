@@ -9,6 +9,7 @@ mod mutation;
 mod paths;
 mod scan_queries;
 mod source_writer;
+mod tag_assignment_selection;
 mod transaction;
 mod upsert;
 
@@ -24,6 +25,7 @@ pub use source_writer::{
     SourceWriter, SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt,
     SourceWriterRequest,
 };
+pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};
 pub use transaction::{
     ManifestCommitResult, SourceDirectoryTruthCommitResult, SourceIndexCommitResult,
 };
