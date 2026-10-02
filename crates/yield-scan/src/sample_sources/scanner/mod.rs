@@ -1,5 +1,9 @@
 mod manifest;
 mod prepared_exact;
+mod prepared_subtree;
+pub use prepared_subtree::{
+    PreparedSubtreeScan, SUBTREE_SCAN_MAX_ELAPSED, SUBTREE_SCAN_MAX_ENTRIES, prepare_subtree_scan,
+};
 mod scan;
 mod scan_capability;
 mod scan_db_sync;

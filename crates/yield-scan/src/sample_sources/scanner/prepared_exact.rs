@@ -8,10 +8,10 @@ use super::{
 };
 
 mod enrollment;
-mod parents;
+pub(super) mod parents;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 use std::{
     collections::BTreeSet,
     fs::File,
@@ -71,10 +71,19 @@ pub fn prepare_exact_scan<'a>(
     paths: &[RootRelativePath],
     cancel: Option<&AtomicBool>,
 ) -> Result<PreparedExactScan<'a>, ScanError> {
+    prepare_exact_entries(owner, paths, cancel, true)
+}
+
+pub(super) fn prepare_exact_entries<'a>(
+    owner: &'a SourceWriter,
+    paths: &[RootRelativePath],
+    cancel: Option<&AtomicBool>,
+    require_known_parents: bool,
+) -> Result<PreparedExactScan<'a>, ScanError> {
     canceled(cancel)?;
     let db = owner.catalog_database();
     let fail = || invalid(db.root(), "exact scan input exceeds bounds or is ambiguous");
-    if paths.is_empty() || paths.len() > EXACT_SCAN_MAX_ENTRIES {
+    if (require_known_parents && paths.is_empty()) || paths.len() > EXACT_SCAN_MAX_ENTRIES {
         return Err(fail());
     }
     let mut bytes = 0usize;
@@ -100,7 +109,11 @@ pub fn prepare_exact_scan<'a>(
     }
     // Only scalar/existence facts are needed: preserve curation in SQL, never hydrate tags.
     let observed = db.exact_scan_database_facts_at_revision(paths, fence.revision())?;
-    let parents = parents::hold_parents(owner, paths, &root, fence.revision())?;
+    let parents = if require_known_parents {
+        parents::hold_parents(owner, paths, &root, fence.revision())?
+    } else {
+        Vec::new()
+    };
     let policy = observed.policy;
 
     let mut prepared = PreparedExactScan {
@@ -186,7 +199,7 @@ impl PreparedExactScan<'_> {
         self.audio.len() + self.index.len()
     }
 
-    fn revalidate(&self, cancel: Option<&AtomicBool>) -> Result<(), ScanError> {
+    pub(super) fn revalidate(&self, cancel: Option<&AtomicBool>) -> Result<(), ScanError> {
         canceled(cancel)?;
         self.owner
             .validate_scan_fence(&self.fence)
@@ -244,6 +257,15 @@ impl PreparedExactScan<'_> {
         if batch.get_source_index_revision()? != self.index_revision {
             return Err(invalid(db.root(), "prepared index revision changed"));
         }
+        self.apply(&mut batch, cancel)?;
+        canceled(cancel)?;
+        writer.commit_bounded_manifest_batch(batch, self.fence.revision())
+    }
+    pub(super) fn apply(
+        &self,
+        batch: &mut yield_library::sample_sources::db::SourceWriteBatch<'_>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(), ScanError> {
         for audio in &self.audio {
             canceled(cancel)?;
             let path = &audio.facts.relative;
@@ -262,25 +284,24 @@ impl PreparedExactScan<'_> {
             }
             batch.upsert_source_index_entry(&index.entry)?;
         }
-        canceled(cancel)?;
-        writer.commit_bounded_manifest_batch(batch, self.fence.revision())
+        Ok(())
     }
 }
 
-fn canceled(cancel: Option<&AtomicBool>) -> Result<(), ScanError> {
+pub(super) fn canceled(cancel: Option<&AtomicBool>) -> Result<(), ScanError> {
     if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
         Err(ScanError::Canceled)
     } else {
         Ok(())
     }
 }
-fn invalid(path: &Path, message: &'static str) -> ScanError {
+pub(super) fn invalid(path: &Path, message: &'static str) -> ScanError {
     ScanError::Io {
         path: path.to_path_buf(),
         source: io::Error::new(io::ErrorKind::InvalidInput, message),
     }
 }
-fn owner_error(error: SourceWriterError) -> ScanError {
+pub(super) fn owner_error(error: SourceWriterError) -> ScanError {
     match error {
         SourceWriterError::StaleRevision { expected, actual } => {
             ScanError::StaleRevision { expected, actual }

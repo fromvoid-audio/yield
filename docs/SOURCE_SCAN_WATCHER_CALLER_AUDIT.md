@@ -171,3 +171,45 @@ Representative source tests include
 The 14-opening tripwire and its negative self-tests provide finite lexical
 evidence only. Physical publication/cleanup, macOS captures and full parent
 acceptance remain open.
+
+## Atomic bounded subtree replay (OPT-2074)
+
+The retained catalog replay consumer also accepts separately admitted subtree
+scopes through `prepare_subtree_scan`. Complete enumeration and file hashing
+finish before mutation admission. One request holds at most 128 visited entries,
+64 regular files, 64 directories, 128 retained database locators across audio,
+index and directory tables, 32 levels/components, 1024 bytes per locator,
+32 KiB per locator collection and 64 MiB audio hashing. A five-second cooperative
+preparation/admission deadline rejects unfinished work; it is not a hard deadline
+for an individual filesystem call. All database retained-path queries use exact
+BINARY subtree ranges, bounded lookahead and stored-field preflight; no complete
+manifest or curation/tag list is hydrated for a replay event.
+
+The private prepared observation retains no-follow directories/files, directory
+membership and metadata stamps. Known directory identities must match retained
+truth; new directories are observed under held known ancestors. Membership,
+namespace, content snapshots, physical root, profile and source/index revisions
+are revalidated before applying the entire audio/index/absence delta. Admission
+checks held metadata/bindings again without traversal or hashing. Missing targets,
+links, repeated identities, replaced directories, budget overflow or incomplete
+traversal widen to a correlated owner audit and retain the original raw batch.
+
+An opaque database-owned subtree read observation fences the directory mutation
+to the receiving connection, exact selected scopes, active complete generation,
+source/index revisions and its next generic source revision. The transaction
+replaces only directory entries inside those scopes and adjusts active counts and
+publication revision, preserving other directory truth. Existing cursor validation
+rejects the older publication revision. A savepoint rolls back a rejected partial
+directory edit. Auxiliary, curation and full-audit commit routes reject the prepared
+targeted publication; it cannot issue complete-source audit authority. The final
+retained replay writer commits this directory state together with audio/index
+facts and its separately admitted watcher checkpoint in one transaction/revision.
+
+Actual owned-source/scanner and catalog worker tests cover additions, absence,
+empty/new/mixed scopes, file-to-directory changes, lossless raw paths, unchanged
+outside truth, duplicate/restart acknowledgements, namespace/content/root changes,
+index revision changes, cancellation, budget/deadline/incomplete traversal and
+SQL checkpoint failure rollback. Database-only synthetic directory-label fixtures
+check ownership/commit rejection; they are not physical qualification. Native
+FSEvents capture-to-consumer/GPUI integration remains OPT-2080 and Finder/native
+qualification remains OPT-1981/1953. OPT-2053/1355 tracking acceptance remains open.

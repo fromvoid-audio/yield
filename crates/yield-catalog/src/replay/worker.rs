@@ -7,7 +7,9 @@ use std::cell::{Cell, RefCell};
 use yield_library::sample_sources::reconciliation::{
     AdapterDisposition, AdmissionOutcome, ReconciliationScopeKind, WatcherGeneration,
 };
-use yield_scan::sample_sources::scanner::{EXACT_SCAN_MAX_ENTRIES, prepare_exact_scan};
+use yield_scan::sample_sources::scanner::{
+    EXACT_SCAN_MAX_ENTRIES, prepare_exact_scan, prepare_subtree_scan,
+};
 
 pub(super) fn consume(
     submission: &CatalogReplaySubmission,
@@ -213,7 +215,7 @@ pub(super) fn consume(
         .normalized()
         .scopes()
         .iter()
-        .any(|s| s.kind() != ReconciliationScopeKind::ExactEntry)
+        .any(|s| s.kind() == ReconciliationScopeKind::SourceAudit)
     {
         return audit(
             source,
@@ -241,6 +243,22 @@ pub(super) fn consume(
             CatalogReplayError::InvalidTarget,
         );
     }
+    let subtrees = pending
+        .dispatched
+        .normalized()
+        .scopes()
+        .iter()
+        .filter(|s| s.kind() == ReconciliationScopeKind::Subtree)
+        .filter_map(|s| s.path().cloned())
+        .collect::<Vec<_>>();
+    let exact = pending
+        .dispatched
+        .normalized()
+        .scopes()
+        .iter()
+        .filter(|s| s.kind() == ReconciliationScopeKind::ExactEntry)
+        .filter_map(|s| s.path().cloned())
+        .collect::<Vec<_>>();
     let Some(proof) = pending
         .dispatched
         .normalized()
@@ -280,12 +298,22 @@ pub(super) fn consume(
         checkpoint: RefCell::new(None),
         commit_uncertain: Cell::new(false),
     };
-    let result = prepare_exact_scan(
-        &source.database.writer,
-        &paths,
-        Some(&submission.cancellation),
-    )
-    .and_then(|prepared| prepared.commit(&writer, Some(&submission.cancellation)));
+    let result = if subtrees.is_empty() {
+        prepare_exact_scan(
+            &source.database.writer,
+            &paths,
+            Some(&submission.cancellation),
+        )
+        .and_then(|prepared| prepared.commit(&writer, Some(&submission.cancellation)))
+    } else {
+        prepare_subtree_scan(
+            &source.database.writer,
+            &subtrees,
+            &exact,
+            Some(&submission.cancellation),
+        )
+        .and_then(|prepared| prepared.commit(&writer, Some(&submission.cancellation)))
+    };
     let delta = match result {
         Ok(delta) => delta,
         Err(_) if writer.commit_uncertain.get() => {
