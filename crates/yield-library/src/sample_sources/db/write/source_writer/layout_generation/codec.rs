@@ -1,6 +1,6 @@
 //! Fixed-order, length-delimited v1 format. No optional extension/unknown field lane.
 use super::{
-    SOURCE_LAYOUT_GENERATION_MAX_BYTES, SourceLayoutComputedView,
+    SOURCE_LAYOUT_CANONICAL_MAX_BYTES, SourceLayoutComputedView,
     SourceLayoutGenerationError as Error,
 };
 use crate::sample_sources::db::write::{SOURCE_LAYOUT_ALGORITHM_V1, SourceLayoutCapture};
@@ -75,7 +75,7 @@ impl<'a> SourceLayoutGeneration<'a> {
     /// Decode exact v1 canonical bytes with bounded borrowed fields and digest checks.
     /// Successful decode does not validate a lease, current membership or owner.
     pub fn decode(bytes: &'a [u8]) -> Result<Self, Error> {
-        if bytes.len() > SOURCE_LAYOUT_GENERATION_MAX_BYTES {
+        if bytes.len() > SOURCE_LAYOUT_CANONICAL_MAX_BYTES {
             return Err(Error::Limit("encoded bytes"));
         }
         let mut reader = Reader { bytes, at: 0 };
@@ -422,7 +422,7 @@ pub(super) fn encode(
 fn add(total: usize, extra: usize) -> Result<usize, Error> {
     total
         .checked_add(extra)
-        .filter(|v| *v <= SOURCE_LAYOUT_GENERATION_MAX_BYTES)
+        .filter(|v| *v <= SOURCE_LAYOUT_CANONICAL_MAX_BYTES)
         .ok_or(Error::Limit("encoded bytes"))
 }
 fn put_field(bytes: &mut Vec<u8>, field: &[u8]) {
@@ -473,7 +473,7 @@ mod tests {
     use super::*;
     #[test]
     fn layout_generation_codec_bounds_before_allocation_and_preserves_exact_escaped_utf8() {
-        assert!(add(SOURCE_LAYOUT_GENERATION_MAX_BYTES, 1).is_err());
+        assert!(add(SOURCE_LAYOUT_CANONICAL_MAX_BYTES, 1).is_err());
         assert!(add(usize::MAX, 1).is_err());
         let value = "quoted-\"-\\-\n-\t-é";
         let mut bytes = Vec::new();

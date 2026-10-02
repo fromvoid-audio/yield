@@ -23,7 +23,7 @@ mod feature_rebuild_metrics;
 mod layout_capture;
 mod layout_generation;
 pub use layout_generation::{
-    SOURCE_LAYOUT_GENERATION_KEY, SOURCE_LAYOUT_GENERATION_MAX_BYTES, SourceLayoutComputedPoint,
+    SOURCE_LAYOUT_CANONICAL_MAX_BYTES, SOURCE_LAYOUT_GENERATION_KEY, SourceLayoutComputedPoint,
     SourceLayoutComputedView, SourceLayoutGeneration, SourceLayoutGenerationError,
     SourceLayoutGenerationRow, SourcePreparedLayoutGeneration,
 };

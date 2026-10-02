@@ -1,7 +1,7 @@
 // Reuse actual retained-owner setup and production feature publication, not a fake grant.
 use super::*;
 use crate::sample_sources::db::write::{
-    SOURCE_LAYOUT_ALGORITHM_V1, SOURCE_LAYOUT_GENERATION_MAX_BYTES, SourceLayoutComputedPoint,
+    SOURCE_LAYOUT_ALGORITHM_V1, SOURCE_LAYOUT_CANONICAL_MAX_BYTES, SourceLayoutComputedPoint,
     SourceLayoutComputedView, SourceLayoutGeneration, SourceLayoutGenerationError,
     SourcePreparedLayoutGeneration,
 };
@@ -61,7 +61,7 @@ fn layout_generation_real_owner_prepares_complete_canonical_readonly_observation
         .pragma_update(None, "query_only", true)
         .unwrap();
     let prepared = prepare(&writer, &input).unwrap();
-    assert!(prepared.bytes().len() <= SOURCE_LAYOUT_GENERATION_MAX_BYTES);
+    assert!(prepared.bytes().len() <= SOURCE_LAYOUT_CANONICAL_MAX_BYTES);
     assert_eq!(
         prepared.bytes_digest(),
         blake3::hash(prepared.bytes()).as_bytes()
@@ -366,7 +366,7 @@ fn layout_generation_strict_binary_decode_rejects_truncation_unknown_and_corrupt
         SourceLayoutGeneration::decode(&bad),
         Err(SourceLayoutGenerationError::Invalid("UTF8 field"))
     ));
-    let huge = vec![0; SOURCE_LAYOUT_GENERATION_MAX_BYTES + 1];
+    let huge = vec![0; SOURCE_LAYOUT_CANONICAL_MAX_BYTES + 1];
     assert!(matches!(
         SourceLayoutGeneration::decode(&huge),
         Err(SourceLayoutGenerationError::Limit("encoded bytes"))
@@ -383,7 +383,7 @@ fn layout_generation_max256_actual_features_encode_and_validate_bounded_clusters
     assert_eq!(decoded.rows().len(), 256);
     assert_eq!(decoded.rows()[255].cluster_id(), Some(255));
     assert_eq!(decoded.input_digest(), input.input_digest());
-    assert!(prepared.bytes().len() <= SOURCE_LAYOUT_GENERATION_MAX_BYTES);
+    assert!(prepared.bytes().len() <= SOURCE_LAYOUT_CANONICAL_MAX_BYTES);
     assert_eq!(persisted(&writer), before);
     eprintln!(
         "actual 256-row canonical preparation: {:?}, encoded {} bytes",

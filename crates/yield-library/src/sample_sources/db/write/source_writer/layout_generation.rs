@@ -15,7 +15,7 @@ pub use codec::{SourceLayoutGeneration, SourceLayoutGenerationRow};
 /// Exact metadata key reserved for the future admitted publication owner.
 pub const SOURCE_LAYOUT_GENERATION_KEY: &str = "source_starmap_generation_v1";
 /// Encoded canonical generation maximum; not a physical allocation grant.
-pub const SOURCE_LAYOUT_GENERATION_MAX_BYTES: usize = 512 * 1024;
+pub const SOURCE_LAYOUT_CANONICAL_MAX_BYTES: usize = 512 * 1024;
 
 /// Borrowed, untrusted CPU observation; construction confers no owner authority.
 #[derive(Debug, Clone, Copy)]

@@ -25,7 +25,7 @@ pub use source_writer::{
     FeatureMaintenanceMetrics, FeaturePruneCursor, FeaturePrunePage, FeatureRebuildMetrics,
     ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,
     ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
-    SOURCE_LAYOUT_ALGORITHM_V1, SOURCE_LAYOUT_GENERATION_KEY, SOURCE_LAYOUT_GENERATION_MAX_BYTES,
+    SOURCE_LAYOUT_ALGORITHM_V1, SOURCE_LAYOUT_CANONICAL_MAX_BYTES, SOURCE_LAYOUT_GENERATION_KEY,
     SourceCollectionHistoryChange, SourceCollectionHistorySelection, SourceCommandId,
     SourceFeaturePublicationMetrics, SourceLayoutCapture, SourceLayoutCaptureError,
     SourceLayoutComputedPoint, SourceLayoutComputedView, SourceLayoutFeature,
