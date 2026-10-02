@@ -38,6 +38,16 @@ pub struct SourceReferenceFence {
     writer: Weak<()>,
 }
 impl SourceReferenceFence {
+    pub(super) fn file_facts(
+        &self,
+        path: &crate::operation_journal::StoredRelativePath,
+    ) -> Result<super::source_file_observation::FileFacts, super::SourceFileObservationError> {
+        self.validate()?;
+        let facts = self.publication.read_file_observation(path)?;
+        self.validate()?;
+        Ok(facts)
+    }
+
     pub(super) fn issue(
         revision: SourceRevision,
         publication: SourcePublicationFence,
