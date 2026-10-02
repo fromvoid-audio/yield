@@ -64,6 +64,13 @@ pub use command_metrics::{CatalogCommandMetrics, CatalogDurationMetrics};
 
 mod curation;
 mod curation_tag_facts;
+mod harvest_facts;
+pub use harvest_facts::{
+    CatalogHarvestFacts, HARVEST_FACTS_MAX_BYTES, HARVEST_FACTS_MAX_PATH_BYTES,
+    HARVEST_FACTS_MAX_PATHS, HarvestFactsCancellation, HarvestFactsEntry, HarvestFactsFailure,
+    HarvestState, SourceHarvestFactsRequest,
+};
+use yield_library::sample_sources::library::HarvestFactsClient;
 mod display_labels;
 mod feature_job;
 mod feature_progress;
@@ -488,6 +495,13 @@ pub use curation::{
 /// A typed operation accepted by the catalog worker.
 #[derive(Debug)]
 pub enum CatalogCommand {
+    /// Read bounded exact Harvest state/count facts through the retained global owner.
+    RequestHarvestFacts {
+        /// Validated immutable profile/source/browser/path context.
+        request: SourceHarvestFactsRequest,
+        /// One-way cancellation retained through queued delivery and cached facts.
+        cancellation: HarvestFactsCancellation,
+    },
     /// Read one bounded explicit anchor/aspect set on the retained owner.
     RequestSimilarity {
         /// Immutable validated source/path/query binding.
@@ -1073,6 +1087,9 @@ pub enum CatalogAuditCancelError {
 /// Startup failures for the profile-owned catalog worker.
 #[derive(Debug, Error)]
 pub enum CatalogStartError {
+    /// The global read client belongs to a different profile acquisition.
+    #[error("Harvest read client belongs to a different profile owner")]
+    HarvestOwnerMismatch,
     /// The supplied profile capability could not be cloned for the worker.
     #[error("could not clone profile ownership for catalog worker: {0}")]
     ProfileOwnership(#[from] ProfileOwnershipError),
@@ -1339,6 +1356,15 @@ pub enum CatalogPublicationStatus {
 /// Worker output carrying source identity, lifecycle generation, and revision fences.
 #[derive(Debug)]
 pub enum CatalogEvent {
+    /// Completion of one bounded exact Harvest query; no mutation or filtering.
+    HarvestFactsCompleted {
+        /// Exact request and caller projection context.
+        request: SourceHarvestFactsRequest,
+        /// Explicit cancellation retained through delivery.
+        cancellation: HarvestFactsCancellation,
+        /// Privately produced facts or a bounded fail-closed diagnostic.
+        result: Result<CatalogHarvestFacts, HarvestFactsFailure>,
+    },
     /// Exact bounded similarity result or truthful failure; no readiness mutation.
     SimilarityCompleted {
         /// Exact captured request, required to match before rendering.
@@ -1779,6 +1805,16 @@ impl CatalogDelivery {
         } = self;
         if index_query_token.is_some_and(|token| token.load(Ordering::Acquire)) {
             return None;
+        }
+        if let CatalogEvent::HarvestFactsCompleted {
+            cancellation,
+            result,
+            ..
+        } = &event
+        {
+            if cancellation.is_canceled() || result.as_ref().is_ok_and(|facts| !facts.is_live()) {
+                return None;
+            }
         }
         if let CatalogEvent::IndexInspectionCompleted {
             cancellation,
@@ -2667,6 +2703,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestTagFilter { .. }
         | CatalogCommand::RequestDisplayLabels { .. }
         | CatalogCommand::RequestCurationTagFacts { .. }
+        | CatalogCommand::RequestHarvestFacts { .. }
         | CatalogCommand::ApplyCuration { .. }
         | CatalogCommand::ApplyCurationOperation { .. }
         | CatalogCommand::ApplyRatingDecay { .. }
@@ -2707,6 +2744,7 @@ fn command_curation_update_count(command: &CatalogCommand) -> usize {
 
 fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
     match command {
+        CatalogCommand::RequestHarvestFacts { request, .. } => request.input_bytes(),
         CatalogCommand::RequestSimilarity { request, .. } => request.input_bytes(),
         CatalogCommand::ConsumeReplay { submission } => submission.input_bytes(),
         CatalogCommand::RequestIndexInspection { handle, .. } => handle.input_bytes(),
@@ -2781,6 +2819,7 @@ fn selected_paths_input_bytes(relative_paths: &[PathBuf]) -> usize {
 
 fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, CatalogSubmitError> {
     match command {
+        CatalogCommand::RequestHarvestFacts { .. } => Ok(harvest_facts::MAX_RESULT_BYTES),
         CatalogCommand::RequestSimilarity { .. } => Ok(similarity_dispatch::MAX_RESULT_BYTES),
         CatalogCommand::RequestIndexPage { .. } | CatalogCommand::RequestIndexInspection { .. } => {
             Ok(MAX_INDEX_PAGE_PAYLOAD_BYTES)
@@ -2890,7 +2929,8 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         CatalogCommand::RequestTagAssignmentPreview { .. } => AdmissionAction::RequestTagPage,
         CatalogCommand::RequestTagFilter { .. } => AdmissionAction::RequestTagFilter,
         CatalogCommand::RequestDisplayLabels { .. } => AdmissionAction::RequestDisplayLabels,
-        CatalogCommand::RequestCurationTagFacts { .. } => AdmissionAction::RequestCurationTagFacts,
+        CatalogCommand::RequestCurationTagFacts { .. }
+        | CatalogCommand::RequestHarvestFacts { .. } => AdmissionAction::RequestCurationTagFacts,
         CatalogCommand::ApplyCuration { .. } => AdmissionAction::ApplyCuration,
         CatalogCommand::ApplyCurationOperation {
             source_id,
@@ -3312,6 +3352,33 @@ impl CatalogService {
         journal: Option<OperationJournalClient>,
         watcher_mode: WatcherMode,
     ) -> Result<Self, CatalogStartError> {
+        Self::start_inner_with_harvest(profile_guard, test_gate, journal, watcher_mode, None)
+    }
+
+    /// Start the catalog with the actual profile global read client and optional journal owner.
+    /// The cloneable client owns no SQLite connection, writer or profile lock.
+    pub fn start_with_profile_owners(
+        profile_guard: &WritableProfileGuard,
+        journal: Option<OperationJournalClient>,
+        harvest: HarvestFactsClient,
+    ) -> Result<Self, CatalogStartError> {
+        if harvest.acquisition_id().as_str() != profile_guard.owner_identity() {
+            return Err(CatalogStartError::HarvestOwnerMismatch);
+        }
+        #[cfg(test)]
+        let mode = WatcherMode::Detached;
+        #[cfg(not(test))]
+        let mode = WatcherMode::Native;
+        Self::start_inner_with_harvest(profile_guard, None, journal, mode, Some(harvest))
+    }
+
+    fn start_inner_with_harvest(
+        profile_guard: &WritableProfileGuard,
+        test_gate: Option<Arc<CatalogTestGate>>,
+        journal: Option<OperationJournalClient>,
+        watcher_mode: WatcherMode,
+        harvest: Option<HarvestFactsClient>,
+    ) -> Result<Self, CatalogStartError> {
         let worker_profile_guard = profile_guard.try_clone()?;
         let (commands, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
         let events = Arc::new(EventHub::new());
@@ -3331,6 +3398,7 @@ impl CatalogService {
                     worker_test_gate,
                     worker_journal,
                     watcher_mode,
+                    harvest,
                 )
             })
             .map_err(CatalogStartError::ThreadSpawn)?;
@@ -3635,6 +3703,7 @@ fn run_worker(
     test_gate: Option<Arc<CatalogTestGate>>,
     journal: Option<OperationJournalClient>,
     watcher_mode: WatcherMode,
+    harvest: Option<HarvestFactsClient>,
 ) {
     run_worker_with_sources(
         profile_guard,
@@ -3644,6 +3713,7 @@ fn run_worker(
         test_gate,
         journal,
         watcher_mode,
+        harvest,
         HashMap::new(),
     );
 }
@@ -3656,6 +3726,7 @@ fn run_worker_with_sources(
     test_gate: Option<Arc<CatalogTestGate>>,
     journal: Option<OperationJournalClient>,
     watcher_mode: WatcherMode,
+    harvest: Option<HarvestFactsClient>,
     mut sources: HashMap<SourceId, RegisteredSource>,
 ) {
     let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
@@ -3728,6 +3799,7 @@ fn run_worker_with_sources(
             test_gate.as_ref(),
             journal.as_ref(),
             watcher_mode,
+            harvest.as_ref(),
         ) {
             reservation.finish();
             break;
@@ -3801,8 +3873,24 @@ fn handle_command(
     test_gate: Option<&Arc<CatalogTestGate>>,
     journal: Option<&OperationJournalClient>,
     watcher_mode: WatcherMode,
+    harvest: Option<&HarvestFactsClient>,
 ) -> bool {
     match command {
+        CatalogCommand::RequestHarvestFacts {
+            request,
+            cancellation,
+        } => {
+            harvest_facts::dispatch(
+                request,
+                cancellation,
+                profile_guard,
+                harvest,
+                reservation,
+                admission,
+                sources,
+            );
+            false
+        }
         CatalogCommand::ConsumeReplay { submission } => {
             replay::consume(submission, profile_guard, admission, sources);
             false
@@ -15844,6 +15932,7 @@ mod tests {
     mod feature_progress_tests;
     #[cfg(target_os = "linux")]
     mod feature_request_tests;
+    mod harvest_facts_tests;
     mod similarity_dispatch_tests;
     mod similarity_query_tests;
 }

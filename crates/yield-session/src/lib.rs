@@ -42,16 +42,19 @@ mod vocabulary;
 pub use catalog::{
     CatalogCancelError, CatalogCommand, CatalogCurationRequestError,
     CatalogCurationTagFactsRequestError, CatalogDelivery, CatalogDisplayLabelsRequestError,
-    CatalogError, CatalogEvent, CatalogIndexEntryHandle, CatalogIndexInspection, CatalogIndexPage,
-    CatalogIndexPageCursor, CatalogIndexPageError, CatalogOperation, CatalogPublicationStatus,
-    CatalogRatingDecayRequestError, CatalogStatus, CatalogSubmitError, CatalogTagAssignmentPreview,
-    CatalogTagAssignmentPreviewSource, CatalogTagFilterRequestError, CatalogTagPageQuery,
-    CatalogTagPageRequestError, CatalogWavMetadataRequestError, FeatureAnalysisBlocker,
-    FeatureAnalysisCancellation, FeatureAnalysisPhase, FeatureAnalysisState,
-    FeaturePhaseMeasurement, IndexInspectionCancellation, MAX_CURATION_OPERATION_BATCHES,
-    MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
-    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES,
-    MAX_HELD_INDEX_INSPECTIONS, MAX_INDEX_PAGE_PAYLOAD_BYTES, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
+    CatalogError, CatalogEvent, CatalogHarvestFacts, CatalogIndexEntryHandle,
+    CatalogIndexInspection, CatalogIndexPage, CatalogIndexPageCursor, CatalogIndexPageError,
+    CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError, CatalogStatus,
+    CatalogSubmitError, CatalogTagAssignmentPreview, CatalogTagAssignmentPreviewSource,
+    CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
+    CatalogWavMetadataRequestError, FeatureAnalysisBlocker, FeatureAnalysisCancellation,
+    FeatureAnalysisPhase, FeatureAnalysisState, FeaturePhaseMeasurement, HARVEST_FACTS_MAX_BYTES,
+    HARVEST_FACTS_MAX_PATH_BYTES, HARVEST_FACTS_MAX_PATHS, HarvestFactsCancellation,
+    HarvestFactsEntry, HarvestFactsFailure, HarvestState, IndexInspectionCancellation,
+    MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
+    MAX_CURATION_OPERATION_RECEIPT_BYTES, MAX_CURATION_OPERATION_UPDATES,
+    MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES, MAX_HELD_INDEX_INSPECTIONS,
+    MAX_INDEX_PAGE_PAYLOAD_BYTES, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
     MAX_TAG_ASSIGNMENT_PREVIEW_PATHS, MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES,
     MAX_TAG_FILTER_MASK_BYTES, MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES,
     MAX_WAV_METADATA_REQUEST_PATHS, RetainedIndexCompleteness, SOURCE_CURATION_TAG_FACTS_MAX_PATHS,
@@ -62,9 +65,10 @@ pub use catalog::{
     SimilarityCandidateOutcome, SimilarityDispatchFailure, SourceCurationCommitReceipt,
     SourceCurationOperationFailure, SourceCurationOperationFence, SourceCurationOperationOutcome,
     SourceCurationTagFacts, SourceCurationUpdate, SourceDisplayLabelEntry,
-    SourceIndexInspectionError, SourceSimilarityRequest, SourceSimilarityResult,
-    SourceSimilarityRow, SourceTagAssignmentCursor, SourceTagAssignmentPage, SourceTagPage,
-    SourceTagPageCursor, SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
+    SourceHarvestFactsRequest, SourceIndexInspectionError, SourceSimilarityRequest,
+    SourceSimilarityResult, SourceSimilarityRow, SourceTagAssignmentCursor,
+    SourceTagAssignmentPage, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
+    VerifiedSourceRoot, resolve_source_root,
 };
 use catalog::{CatalogService, CatalogSlot};
 use maintenance::{
@@ -1326,9 +1330,17 @@ impl Persistence {
             catalog::mark_unavailable(catalog_slot, reason);
             return;
         };
-        let service_result = match self.journal.as_ref().map(OperationJournalOwner::client) {
-            Some(journal) => CatalogService::start_with_journal(writable, journal),
-            None => CatalogService::start(writable),
+        let journal = self.journal.as_ref().map(OperationJournalOwner::client);
+        let service_result = match self.writer.as_ref() {
+            Some(writer) => CatalogService::start_with_profile_owners(
+                writable,
+                journal,
+                writer.harvest_facts_client(),
+            ),
+            None => match journal {
+                Some(journal) => CatalogService::start_with_journal(writable, journal),
+                None => CatalogService::start(writable),
+            },
         };
         let service = match service_result {
             Ok(service) => Arc::new(service),
@@ -2968,6 +2980,10 @@ fn drain_shutdown(
 
 #[cfg(test)]
 mod tests {
+    mod harvest_catalog_tests {
+        use super::*;
+        include!("harvest_catalog_tests.rs");
+    }
     mod snapshot_persistence {
         use super::*;
         include!("snapshot_persistence_tests.rs");
