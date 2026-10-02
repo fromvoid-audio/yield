@@ -826,7 +826,7 @@ impl Browser {
                 super::tag_filter::cancel_for_source_change(self);
                 false
             }
-            CatalogEvent::Closed => false,
+            CatalogEvent::SimilarityCompleted { .. } | CatalogEvent::Closed => false,
         }
     }
 
@@ -1125,6 +1125,9 @@ pub(super) fn submit_catalog_command(
 
 fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
     match event {
+        CatalogEvent::SimilarityCompleted { request, .. } => {
+            Some((request.source_id().clone(), request.lifecycle_generation()))
+        }
         CatalogEvent::Registered {
             source_id,
             lifecycle_generation,
