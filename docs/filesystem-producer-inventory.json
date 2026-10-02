@@ -6,22 +6,12 @@
     {
       "path": "crates/reson/src/recording/writer.rs",
       "function": "new",
-      "operation": "File::create",
-      "count": 1,
-      "classification": "compatibility",
-      "issue": "OPT-1663",
-      "reason": "Existing recording WAV writer accepts a pathname and creates/truncates a file; this is not a qualified journal-backed user file operation.",
-      "retirement": "Audit its live recording caller and replace with bounded owner admission before claiming physical file-operation parity."
-    },
-    {
-      "path": "crates/reson/src/recording/writer.rs",
-      "function": "new",
       "operation": "WavWriter::new",
       "count": 1,
       "classification": "compatibility",
-      "issue": "OPT-1663",
-      "reason": "Existing recording WAV writer accepts a pathname and creates/truncates a file; this is not a qualified journal-backed user file operation.",
-      "retirement": "Audit its live recording caller and replace with bounded owner admission before claiming physical file-operation parity."
+      "issue": "OPT-2058",
+      "reason": "Bounded WAV byte serialization into already retained Write+Seek transport; reson no longer opens/creates/truncates pathnames. Generic codec transport alone is not namespace or publication authority.",
+      "retirement": "Bind the transport to actual admitted FileOperationOwner/journal staging/chunk/closure before activating a recording producer; no current GPUI caller."
     },
     {
       "path": "crates/yield-analysis/src/analysis/ann_index/container/mod.rs",

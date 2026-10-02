@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// Observable health counters for one recording session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecordingHealth {
-    /// Samples dropped because the bounded WAV-writer ring was full.
+    /// Samples dropped because the bounded writer ring was full, stopped or failed.
     pub writer_dropped_samples: u64,
     /// Capture callbacks that encountered a full WAV-writer ring.
     pub writer_overrun_events: u64,

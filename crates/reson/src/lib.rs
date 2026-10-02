@@ -44,7 +44,10 @@ pub use player::{
     PlaybackSourceIdentity, PlaybackSourceKind, PlaybackSpanPlan, PlaybackSpanPlanError,
     PlaybackSpanRequest,
 };
-pub use recording::{AudioRecorder, InputMonitor, RecordingHealth, RecordingOutcome};
+pub use recording::{
+    AudioRecorder, InputMonitor, RecordingHealth, RecordingLimits, RecordingOutcome,
+    RecordingPrefixState, RecordingSink,
+};
 pub use time_stretch::Wsola;
 
 pub(crate) use async_decode::AsyncSource;
