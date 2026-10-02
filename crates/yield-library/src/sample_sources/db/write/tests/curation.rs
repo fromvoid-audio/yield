@@ -3516,7 +3516,7 @@ fn source_owner_page_is_bounded_read_only_and_rejects_stale_continuation() {
             std::time::Instant::now() + std::time::Duration::from_secs(2),
         )
         .expect("new revision page");
-    assert!(matches!(second, SourceSnapshotPage::FreshAsOf { .. }));
+    assert!(matches!(second, SourceSnapshotPage::Stale { .. }));
 }
 
 #[test]
@@ -4395,3 +4395,5 @@ mod tag_metadata_budget;
 mod tag_metadata_policy;
 
 mod snapshot_read_only;
+
+mod snapshot_cursor;

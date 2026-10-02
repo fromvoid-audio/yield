@@ -308,18 +308,34 @@ pub struct BrowserMetadataSnapshot {
     pub files: Vec<BrowserFileMetadata>,
 }
 
-/// Opaque keyset cursor retaining the exact raw SQLite path key.
+/// Opaque keyset cursor retaining the raw SQLite path and optional live owner scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BrowserMetadataCursor(String);
+pub struct BrowserMetadataCursor {
+    raw: String,
+    owner_revision: Option<Box<super::SourceRevision>>,
+}
 
 impl BrowserMetadataCursor {
     pub(crate) fn from_raw(raw: String) -> Self {
-        Self(raw)
+        Self {
+            raw,
+            owner_revision: None,
+        }
+    }
+
+    /// Bind a low-level page continuation to the exact retained owner's observation.
+    pub(crate) fn bind_owner_revision(&mut self, revision: super::SourceRevision) {
+        self.owner_revision = Some(Box::new(revision));
+    }
+
+    /// An unbound low-level cursor cannot name a retained-owner continuation.
+    pub(crate) fn matches_owner_revision(&self, revision: &super::SourceRevision) -> bool {
+        self.owner_revision.as_deref() == Some(revision)
     }
 
     /// Borrow the raw SQLite path key for the next page query.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.raw
     }
 }
 
