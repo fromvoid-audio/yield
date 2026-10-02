@@ -129,8 +129,17 @@ SourceDatabaseCommit=1/SourceWalShm=2/GlobalDatabaseCommit=3/GlobalWalShm=4.
 Revision domains are SourceAuthoritative=1/GlobalMutationGeneration=2/
 GlobalRegistry=3/GlobalPreferences=4/GlobalVocabulary=5. A source binding accepts
 only domain 1; a global binding accepts only its actual applicable global domain.
-The binding's current revision is the source authoritative revision or the global
-mutation generation; it does not substitute for a participant's narrower revision.
+The binding's current revision is the source authoritative revision or a new
+private acquisition-local global mutation counter; it does not substitute for a
+participant's narrower revision. Current global code has no such common u64
+counter: its Harvest publication generation is a UUID and registry/preferences
+proposal revisions are acquisition-local correlations. OPT-2136/2170 must add
+the checked counter on the real worker, invalidate it before every potentially
+mutating dispatch (including failed/replayed attempts), expose it under the held
+reservation and reject exhaustion. A fresh registration may reset it; binding
+that registration prevents historical counter replay. Do not cast the Harvest
+UUID or a caller correlation into this field. Narrow revision domains retain
+their actual persistent or acquisition-local family semantics.
 These are local inventory tags, not enum discriminants of existing Rust models.
 Command digests bind the actual validated family encoding and requirement, not
 just a command-kind tag. Derive future revisions from that family; unchecked
