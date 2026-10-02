@@ -11,10 +11,12 @@ import argparse
 import base64
 import json
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 
@@ -72,11 +74,27 @@ class ReleaseIntegrityTests(unittest.TestCase):
                     archive.writestr(f"{self.layout.root_dir}/{name}", payload)
         self.checksum = self.assets / self.expected.checksum
         self.signature = self.assets / self.expected.signature
+        self.refresh_checksums()
+
+    def refresh_checksums(self) -> None:
         self.checksum.write_text("".join(
             f"{verifier.sha256(self.assets / asset.name)}  {asset.name}\n"
             for asset in self.expected.zips
         ), encoding="utf-8")
         self.sign()
+
+    def rewrite_payload(self, members: list[tuple[zipfile.ZipInfo | str, bytes]]) -> None:
+        path = self.assets / self.expected.zips[0].name
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(path, "w") as archive:
+                for info, data in members:
+                    archive.writestr(info, data)
+        self.refresh_checksums()
+
+    def payload_members(self) -> list[tuple[zipfile.ZipInfo, bytes]]:
+        with zipfile.ZipFile(self.assets / self.expected.zips[0].name) as archive:
+            return [(info, archive.read(info)) for info in archive.infolist()]
 
     def sign(self) -> None:
         signature = self.run_openssl(
@@ -111,6 +129,51 @@ class ReleaseIntegrityTests(unittest.TestCase):
         path = self.assets / self.expected.zips[0].name
         path.write_bytes(path.read_bytes() + b"tampered")
         self.assert_rejected("Checksum mismatch")
+
+    def test_signed_duplicate_payload_is_rejected(self) -> None:
+        members = self.payload_members()
+        name = members[0][0].filename
+        self.rewrite_payload(members + [(name, b"conflicting second payload")])
+        self.assert_rejected("duplicate archive member")
+
+    def test_signed_noncanonical_member_names(self) -> None:
+        members = self.payload_members()
+        for name in (
+            "/yield/absolute", "yield/../escape", "yield/./alias", "yield//alias",
+            "yield/back\\slash", "C:/yield/drive", "yield/payload:stream",
+        ):
+            with self.subTest(name=name):
+                self.rewrite_payload(members + [(name, b"ambiguous payload")])
+                self.assert_rejected("non-canonical archive member")
+
+    def test_signed_special_members(self) -> None:
+        members = self.payload_members()
+        for kind in (stat.S_IFLNK, stat.S_IFIFO, stat.S_IFSOCK, stat.S_IFCHR, stat.S_IFDIR):
+            with self.subTest(kind=kind):
+                info = zipfile.ZipInfo("yield/special")
+                info.create_system = 3
+                info.external_attr = (kind | 0o644) << 16
+                self.rewrite_payload(members + [(info, b"unexpected member type")])
+                self.assert_rejected("special or inconsistent archive member")
+
+    def test_signed_file_directory_collisions(self) -> None:
+        members = self.payload_members()
+        for extra in (
+            [("yield/collision", b"file"), ("yield/collision/child", b"child")],
+            [("yield/collision/child", b"child"), ("yield/collision", b"file")],
+            [("yield/collision", b"file"), ("yield/collision/", b"")],
+        ):
+            with self.subTest(extra=extra):
+                self.rewrite_payload(members + extra)
+                errors = self.verify()
+                self.assertTrue(any(
+                    "parent directory" in error or "duplicate archive member" in error
+                    for error in errors
+                ), errors)
+
+    def test_explicit_directory_records_are_supported(self) -> None:
+        self.rewrite_payload(self.payload_members() + [("yield/", b"")])
+        self.assertEqual([], self.verify())
 
     def test_tampered_checksums_without_resigning(self) -> None:
         self.checksum.write_bytes(self.checksum.read_bytes() + b"\n")
