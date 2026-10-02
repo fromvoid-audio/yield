@@ -94,8 +94,9 @@ Before allocating a durable history ID/intent, validate all bounds, acquire a
 fresh retained-owner observation, reject hard/unknown WAL health for new work,
 and obtain the actual registered capacity admission covering both intent and
 completion. OPT-2126 owns the shared affected-participant reservation and
-protected required-completion handshake; history must implement that owner
-contract rather than create a separate recovery exemption. No scalar fixture,
+protected required-completion handshake; history requires actual OPT-2136
+all-owner pre-ID admission and OPT-2137 claim-backed required/recovery permits,
+not the decision alone. It must not create a separate recovery exemption. No scalar fixture,
 boolean recovery flag or merely retained guard
 substitutes for a registered requirement/reservation. The implementation must
 either provide that admission or return a typed unavailable/rejected outcome.
