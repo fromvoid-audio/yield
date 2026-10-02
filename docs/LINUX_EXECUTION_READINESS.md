@@ -1,5 +1,18 @@
 # Linux execution readiness (OPT-2024)
 
+## Current five-agent dispatch (OPT-2035)
+
+The earlier review below is historical. Use the live
+[Linear execution plan](https://linear.app/boostnlvp/issue/OPT-2035),
+[five-agent policy](LINUX_FIVE_AGENT_EXECUTION_PLAN.md) and
+[complete dependency refresh](LINUX_EXECUTION_DEPENDENCY_REFRESH.md).
+Four independent tasks OPT-1661/1663/1636/1655 are now ready; portable contract
+leaves OPT-2031..2034 and OPT-2036 resolve the implicit consumer gates.
+OPT-1641/2025/2005/2023/1642 and the earlier contract slices have merged.
+Read live claims before choosing work. A Linux: Blocked label means resolve the
+first portable prerequisite, not stop; only a concrete unavailable resource
+can halt that step. Tracking parents and physical acceptance remain open.
+
 Readiness review, 2 October 2026, against `origin/main`
 `0e115f62e` (`PORTALSURFER/yield`, Linear project P-OPT-63).
 The review read all 177 Linux-blocked issues and their 68 distinct direct
