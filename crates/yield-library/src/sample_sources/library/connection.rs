@@ -21,6 +21,7 @@ const LIBRARY_DB_SHM_FILE_NAME: &str = "library.db-shm";
 
 pub(super) struct LibraryDatabase {
     pub(super) connection: Connection,
+    pub(super) ordinary_wal_maintenance: super::wal_maintenance::OrdinaryWalMaintenance,
     _database_root_binding: Option<BoundDatabaseRoot>,
 }
 
@@ -75,6 +76,7 @@ impl LibraryDatabase {
     ) -> Result<Self, LibraryError> {
         let mut db = Self {
             connection,
+            ordinary_wal_maintenance: Default::default(),
             _database_root_binding: database_root_binding,
         };
         db.apply_pragmas()?;

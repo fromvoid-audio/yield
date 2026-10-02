@@ -28,6 +28,7 @@ mod schema_defs;
 mod sources;
 mod tag_vocabulary;
 mod telemetry;
+mod wal_maintenance;
 
 #[cfg(test)]
 mod global_wal_tests;
