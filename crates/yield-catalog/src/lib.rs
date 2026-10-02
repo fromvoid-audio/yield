@@ -59,6 +59,9 @@ use yield_source_watcher::WatchHintEvidence;
 use yield_source_watcher::replay::macos::BootstrapCapture;
 use yield_source_watcher::{SourceWatchSpec, SourceWatcher, WatcherSignal};
 
+mod command_metrics;
+pub use command_metrics::{CatalogCommandMetrics, CatalogDurationMetrics};
+
 mod curation;
 mod curation_tag_facts;
 mod display_labels;
@@ -1893,6 +1896,7 @@ struct CurationLineage {
 }
 
 struct AdmissionState {
+    command_metrics: command_metrics::CommandMetrics,
     shutdown: bool,
     closed: bool,
     event_budget: usize,
@@ -1909,6 +1913,7 @@ struct AdmissionState {
 impl AdmissionState {
     fn new() -> Self {
         Self {
+            command_metrics: command_metrics::CommandMetrics::new(),
             shutdown: false,
             closed: false,
             event_budget: 1,
@@ -3311,10 +3316,36 @@ impl CatalogService {
 
     /// Submit one typed operation without waiting for the worker.
     pub fn submit(&self, command: CatalogCommand) -> Result<(), CatalogSubmitError> {
+        let started = Instant::now();
         let mut admission = self
             .admission
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let gate_wait = started.elapsed();
+        let result = self.submit_locked(command, &mut admission);
+        admission.command_metrics.submission(&result, gate_wait);
+        result
+    }
+
+    /// Observe fixed-size command metrics without waiting for an admission lock.
+    ///
+    /// Returns `None` while admission is busy. The snapshot grants no source/effect authority and
+    /// reports boundary crossings, not successful work or exact channel occupancy.
+    pub fn try_command_metrics(&self) -> Option<CatalogCommandMetrics> {
+        match self.admission.try_lock() {
+            Ok(state) => Some(state.command_metrics.snapshot()),
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                Some(error.into_inner().command_metrics.snapshot())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    fn submit_locked(
+        &self,
+        command: CatalogCommand,
+        admission: &mut AdmissionState,
+    ) -> Result<(), CatalogSubmitError> {
         if admission.closed || admission.shutdown {
             return Err(CatalogSubmitError::Closed);
         }
@@ -3365,12 +3396,14 @@ impl CatalogService {
         admission.tag_read_payload_bytes = admission
             .tag_read_payload_bytes
             .saturating_add(tag_read_payload_bytes);
+        let sent_at = Instant::now();
         match self.commands.try_send(command) {
             Ok(()) => {
+                admission.command_metrics.accepted(sent_at);
                 admission.event_budget += event_budget;
                 admission.curation_payload_bytes += curation_payload_bytes;
                 admission.curation_update_count += curation_update_count;
-                apply_admission_action(&mut admission, action);
+                apply_admission_action(admission, action);
                 Ok(())
             }
             Err(TrySendError::Full(_)) => {
@@ -3635,7 +3668,13 @@ fn run_worker_with_sources(
             admission: &admission,
             bytes: command_tag_page_input_bytes(&command),
         };
-        let closing = admission_state(&admission, |state| state.shutdown || state.closed);
+        let closing = {
+            let mut state = admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.command_metrics.received(Instant::now());
+            state.shutdown || state.closed
+        };
         let reserved_events = command_event_budget(&command);
         let mut reservation = EventReservation {
             hub: &events,
