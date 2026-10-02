@@ -213,6 +213,7 @@ pub(super) fn render(
     browser: &Browser,
     theme: Theme,
     motion_frame: MotionFrame,
+    window_height: f32,
     cx: &mut Context<Browser>,
 ) -> impl gpui::IntoElement {
     if tag_library::is_open(browser) {
@@ -842,11 +843,38 @@ pub(super) fn render(
         .debug_selector(|| String::from("sidebar-auxiliary"))
         .id("sidebar-auxiliary")
         .overflow_y_scroll()
-        .child(curation::render_collection_filters(
-            browser,
-            theme.clone(),
-            cx,
-        ))
+        .child(
+            div()
+                .id("sidebar-collections-panel")
+                .debug_selector(|| String::from("sidebar-collections-panel"))
+                .flex()
+                .flex_col()
+                .flex_none()
+                .w_full()
+                .h(px(super::view::collections_height(
+                    browser.preferred_collections_height,
+                    window_height,
+                    &theme,
+                )))
+                .child(browser.render_collections_resize_rail(theme.clone(), cx))
+                .child(
+                    div()
+                        .id("sidebar-collections-scroll")
+                        .debug_selector(|| String::from("sidebar-collections-scroll"))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        // Keep a collections scroll from also moving the outer sidebar.
+                        .on_scroll_wheel(cx.listener(|_, _: &gpui::ScrollWheelEvent, _, cx| {
+                            cx.stop_propagation();
+                        }))
+                        .child(curation::render_collection_filters(
+                            browser,
+                            theme.clone(),
+                            cx,
+                        )),
+                ),
+        )
         .child(curation::render_playback_type_filters(
             browser,
             theme.clone(),
@@ -1178,6 +1206,119 @@ mod tests {
     }
 
     #[gpui::test]
+    fn collections_panel_resize_commits_and_escape_preserves_focus(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.refresh().expect("initial panel");
+        cx.update(|window, app| {
+            window.focus(&browser.read(app).search_input.read(app).focus_handle())
+        });
+        let rail = cx
+            .debug_bounds("sidebar-collections-resize")
+            .expect("collection rail");
+        let start = rail.center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            point(start.x, start.y + px(4.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(start.x, start.y + px(30.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            point(start.x, start.y + px(30.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        let saved = cx.update(|window, app| {
+            let view = browser.read(app);
+            assert!(view.pane_resize_drag.is_none());
+            assert!(
+                view.search_input
+                    .read(app)
+                    .focus_handle()
+                    .is_focused(window)
+            );
+            view.preferred_collections_height.expect("committed height")
+        });
+        cx.refresh().expect("committed panel");
+        let panel = cx.debug_bounds("sidebar-collections-panel").expect("panel");
+        assert!((f32::from(panel.size.height) - saved).abs() < 1.0);
+        let rail = cx.debug_bounds("sidebar-collections-resize").expect("rail");
+        let start = rail.center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            point(start.x, start.y + px(4.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(start.x, start.y + px(20.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_keystrokes("escape");
+        cx.update(|_, app| {
+            assert!(browser.read(app).pane_resize_drag.is_none());
+            assert_eq!(browser.read(app).preferred_collections_height, Some(saved));
+        });
+    }
+
+    #[gpui::test]
+    fn collections_panel_scroll_reaches_last_row_at_both_text_scales(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.simulate_resize(size(px(960.0), px(560.0)));
+        for percent in [100, 200] {
+            cx.update(|_, app| {
+                let theme = crate::theme::with_text_scale(&yield_design::Theme::default(), percent);
+                app.set_global(crate::theme::ActiveTheme(std::sync::Arc::new(theme)));
+                browser.update(app, |view, _| view.preferred_collections_height = Some(1.0));
+            });
+            draw_sidebar(&browser, cx);
+            let viewport = cx
+                .debug_bounds("sidebar-collections-scroll")
+                .expect("viewport");
+            let panel = cx.debug_bounds("sidebar-collections-panel").expect("panel");
+            let rail = cx.debug_bounds("sidebar-collections-resize").expect("rail");
+            assert!(rail.top() >= panel.top());
+            let before = cx
+                .debug_bounds("collection-filter-last")
+                .expect("last collection");
+            cx.simulate_event(ScrollWheelEvent {
+                position: viewport.center(),
+                delta: ScrollDelta::Pixels(point(px(0.0), px(-10000.0))),
+                modifiers: Modifiers::none(),
+                touch_phase: TouchPhase::Moved,
+            });
+            draw_sidebar(&browser, cx);
+            let after = cx
+                .debug_bounds("collection-filter-last")
+                .expect("scrolled last collection");
+            let auxiliary = cx
+                .debug_bounds("sidebar-auxiliary")
+                .expect("outer viewport");
+            let viewport_after = cx
+                .debug_bounds("sidebar-collections-scroll")
+                .expect("stable collection viewport");
+            assert_eq!(
+                viewport_after, viewport,
+                "collection scrolling must not move its parent"
+            );
+            assert!(after.top() < before.top());
+            assert!(after.bottom() <= auxiliary.bottom() + px(1.0));
+            assert!(after.bottom() <= viewport.bottom() + px(1.0));
+            assert!(
+                after.top() >= viewport.top(),
+                "percent={percent}, viewport={viewport:?}, panel={panel:?}, before={before:?}, after={after:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
     fn compact_sidebar_keeps_folder_space_and_scrolls_auxiliary_controls(cx: &mut TestAppContext) {
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
@@ -1221,7 +1362,7 @@ mod tests {
         assert!(refresh_before.top() >= auxiliary.top());
 
         cx.simulate_event(ScrollWheelEvent {
-            position: point(auxiliary.origin.x + px(8.0), auxiliary.origin.y + px(8.0)),
+            position: point(auxiliary.origin.x + px(8.0), auxiliary.origin.y + px(2.0)),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-400.0))),
             modifiers: Modifiers::none(),
             touch_phase: TouchPhase::Moved,

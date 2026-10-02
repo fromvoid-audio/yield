@@ -1465,6 +1465,13 @@ pub(super) fn render_collection_filters(
             };
             div()
                 .id(("collection-filter", slot))
+                .debug_selector(move || {
+                    if slot + 1 == COLLECTION_COUNT {
+                        String::from("collection-filter-last")
+                    } else {
+                        format!("collection-filter-{slot}")
+                    }
+                })
                 .when_some(
                     browser.ax_focus(&super::accessibility::collection_filter_id(slot)),
                     |element, focus| element.track_focus(&focus),
