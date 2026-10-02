@@ -11,6 +11,7 @@ use super::connection::LibraryDatabase;
 use super::error::LibraryError;
 use super::mutation_context::{
     GlobalMutationCompletion, GlobalMutationKind, GlobalMutationRequest, ProfileAcquisitionId,
+    SnapshotFences,
 };
 use super::operation_link_participant::{OperationLinkRequest, OperationLinkResult};
 use super::registry_limits::{
@@ -1155,6 +1156,7 @@ fn run_owner(
         std::sync::atomic::Ordering::Release,
     );
 
+    let mut snapshot_fences = SnapshotFences::default();
     loop {
         if let Err(error) = database.validate_profile_guard(&profile_guard) {
             close_after_profile_change(
@@ -1183,7 +1185,12 @@ fn run_owner(
             break;
         }
 
-        let reply = execute_command(command, &mut database, profile_guard.owner_identity());
+        let reply = execute_command(
+            command,
+            &mut database,
+            profile_guard.owner_identity(),
+            &mut snapshot_fences,
+        );
 
         #[cfg(test)]
         if let Some((ready, release)) = hooks.post_command_gate.as_ref() {
@@ -1216,10 +1223,11 @@ fn execute_command(
     command: WriterCommand,
     database: &mut LibraryDatabase,
     owner_identity: &str,
+    snapshot_fences: &mut SnapshotFences,
 ) -> WriterReply {
     match command {
         WriterCommand::CapturedMutation { request, result } => WriterReply::CapturedMutation {
-            value: request.execute(database, owner_identity),
+            value: request.execute(database, owner_identity, snapshot_fences),
             result,
         },
         WriterCommand::ApplyOperationLink { request, result } => WriterReply::OperationLink {
@@ -1430,6 +1438,10 @@ fn unavailable_from_library_error(error: &LibraryError) -> GlobalLibraryWriterUn
 
 #[cfg(test)]
 mod tests {
+    mod snapshot_fence_tests {
+        use super::*;
+        include!("snapshot_fence_owner_tests.rs");
+    }
     mod mutation_context_tests {
         use super::*;
         include!("mutation_context_owner_tests.rs");

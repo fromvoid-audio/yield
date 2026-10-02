@@ -59,7 +59,8 @@ impl GlobalMutationContext {
     pub fn acquisition(&self) -> &ProfileAcquisitionId {
         &self.acquisition
     }
-    /// Caller-local result correlation; not a durable operation identity.
+    /// Caller-local result correlation. Snapshot routes use their strictly ordered proposal
+    /// revision; vocabulary routes use a local request ID. Neither is a durable operation ID.
     pub fn correlation(&self) -> u64 {
         self.correlation
     }
@@ -127,7 +128,8 @@ impl GlobalMutationRequest {
         }
     }
 
-    /// Freeze a validated source snapshot within the producer's captured acquisition.
+    /// Freeze a validated source snapshot at its acquisition-local proposal revision.
+    /// `correlation` is the ordered registry revision, not an arbitrary request ID.
     pub fn registry(
         acquisition: ProfileAcquisitionId,
         correlation: u64,
@@ -148,7 +150,8 @@ impl GlobalMutationRequest {
         ))
     }
 
-    /// Freeze a bounded preference payload; its versioned codec remains the session's contract.
+    /// Freeze bounded preferences at an acquisition-local proposal revision (`correlation`).
+    /// The versioned payload codec remains the session's contract.
     pub fn preferences(
         acquisition: ProfileAcquisitionId,
         correlation: u64,
@@ -234,9 +237,18 @@ impl GlobalMutationRequest {
         self,
         database: &mut LibraryDatabase,
         owner_identity: &str,
+        fences: &mut SnapshotFences,
     ) -> GlobalMutationCompletion {
         let result = if self.context.acquisition.as_str() != owner_identity {
             Err(LibraryError::GlobalMutationStaleAcquisition)
+        } else if let Err(error) = fences.check(&self.context) {
+            Err(error)
+        } else if fences.is_replay(&self.context) {
+            Ok(match self.context.kind {
+                GlobalMutationKind::ConfiguredRegistry => GlobalMutationValue::RegistryCommitted,
+                GlobalMutationKind::UiPreferences => GlobalMutationValue::PreferencesCommitted,
+                _ => unreachable!("only snapshot routes have fence slots"),
+            })
         } else {
             match self.mutation {
                 Mutation::Registry(snapshot) => database
@@ -260,6 +272,9 @@ impl GlobalMutationRequest {
                     .map(GlobalMutationValue::VocabularyDelete),
             }
         };
+        if result.is_ok() {
+            fences.record(&self.context);
+        }
         GlobalMutationCompletion {
             context: self.context,
             result,
@@ -308,5 +323,52 @@ impl GlobalMutationCompletion {
     pub(super) fn replace_result_with_error(mut self, error: LibraryError) -> Self {
         self.result = Err(error);
         self
+    }
+}
+
+// Two fixed acknowledgement slots; no old payloads, durable history or caller-key map.
+#[derive(Default)]
+pub(super) struct SnapshotFences {
+    slots: [Option<(u64, [u8; 32])>; 2],
+}
+
+impl SnapshotFences {
+    fn index(context: &GlobalMutationContext) -> Option<usize> {
+        match context.kind {
+            GlobalMutationKind::ConfiguredRegistry => Some(0),
+            GlobalMutationKind::UiPreferences => Some(1),
+            _ => None,
+        }
+    }
+
+    fn check(&self, context: &GlobalMutationContext) -> Result<(), LibraryError> {
+        let Some(index) = Self::index(context) else {
+            return Ok(());
+        };
+        let Some((revision, identity)) = self.slots[index] else {
+            return Ok(());
+        };
+        if context.correlation < revision {
+            return Err(LibraryError::GlobalSnapshotStaleRevision {
+                proposed: context.correlation,
+                committed: revision,
+            });
+        }
+        if context.correlation == revision && context.payload_identity != identity {
+            return Err(LibraryError::GlobalSnapshotPayloadConflict { revision });
+        }
+        Ok(())
+    }
+
+    fn is_replay(&self, context: &GlobalMutationContext) -> bool {
+        Self::index(context).is_some_and(|index| {
+            self.slots[index] == Some((context.correlation, context.payload_identity))
+        })
+    }
+
+    fn record(&mut self, context: &GlobalMutationContext) {
+        if let Some(index) = Self::index(context) {
+            self.slots[index] = Some((context.correlation, context.payload_identity));
+        }
     }
 }

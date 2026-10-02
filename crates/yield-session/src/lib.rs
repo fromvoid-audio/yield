@@ -29,6 +29,11 @@ use yield_library::sample_sources::{
     SourceRole,
 };
 
+use yield_library::sample_sources::library::{
+    GlobalMutationCompletion, GlobalMutationContext, GlobalMutationKind, GlobalMutationRequest,
+    GlobalMutationValue,
+};
+
 mod catalog;
 mod maintenance;
 mod preferences;
@@ -770,12 +775,14 @@ enum Edit {
 
 struct SaveInFlight {
     revision: RegistryRevision,
-    receiver: Receiver<Result<(), LibraryError>>,
+    context: GlobalMutationContext,
+    receiver: Receiver<GlobalMutationCompletion>,
 }
 
 struct PreferenceSaveInFlight {
     revision: PreferenceRevision,
-    receiver: Receiver<Result<(), LibraryError>>,
+    context: GlobalMutationContext,
+    receiver: Receiver<GlobalMutationCompletion>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2166,10 +2173,23 @@ fn queue_preference_save(
             return;
         }
     };
-    match writer.replace_ui_preferences_payload(payload) {
+    let proposal = match GlobalMutationRequest::preferences(
+        writer.acquisition_id(),
+        coordinator.revision().get(),
+        payload,
+    ) {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            persistence.preference_unavailable = Some(SessionError::Preference(error.to_string()));
+            return;
+        }
+    };
+    let context = proposal.context().clone();
+    match writer.submit_captured_mutation(proposal) {
         Ok(receiver) => {
             persistence.preference_save = Some(PreferenceSaveInFlight {
                 revision: coordinator.revision(),
+                context,
                 receiver,
             });
             persistence.preference_save_deadline.clear();
@@ -2179,6 +2199,18 @@ fn queue_preference_save(
             persistence.preference_unavailable = Some(SessionError::Preference(error.to_string()));
         }
         Err(error) => persistence.unavailable = Some(session_from_queue_error(error)),
+    }
+}
+
+fn snapshot_completion_result(
+    completion: GlobalMutationCompletion,
+    context: &GlobalMutationContext,
+    kind: GlobalMutationKind,
+) -> Result<(), LibraryError> {
+    match (kind, completion.into_result_for(context)?) {
+        (GlobalMutationKind::ConfiguredRegistry, GlobalMutationValue::RegistryCommitted)
+        | (GlobalMutationKind::UiPreferences, GlobalMutationValue::PreferencesCommitted) => Ok(()),
+        _ => Err(LibraryError::GlobalMutationCompletionMismatch),
     }
 }
 
@@ -2192,7 +2224,10 @@ fn poll_preference_save(
     let Some(save) = persistence.preference_save.as_ref() else {
         return;
     };
-    match save.receiver.try_recv() {
+    let result = save.receiver.try_recv().map(|completion| {
+        snapshot_completion_result(completion, &save.context, GlobalMutationKind::UiPreferences)
+    });
+    match result {
         Ok(Ok(())) => {
             let revision = save.revision;
             persistence.preference_save = None;
@@ -2246,7 +2281,10 @@ fn shared_preference_failure(
     persistence.status_error().or_else(|| {
         matches!(
             error,
-            LibraryError::ProfileOwnership(_) | LibraryError::ProfileOwnershipChanged { .. }
+            LibraryError::ProfileOwnership(_)
+                | LibraryError::ProfileOwnershipChanged { .. }
+                | LibraryError::GlobalMutationStaleAcquisition
+                | LibraryError::GlobalMutationCompletionMismatch
         )
         .then(|| SessionError::Persistence(error.to_string()))
     })
@@ -2567,10 +2605,23 @@ fn queue_save(persistence: &mut Persistence, coordinator: &Coordinator) {
     let Some(writer) = persistence.writer.as_ref() else {
         return;
     };
-    match writer.replace_source_registry(coordinator.snapshot()) {
+    let proposal = match GlobalMutationRequest::registry(
+        writer.acquisition_id(),
+        coordinator.revision().get(),
+        coordinator.snapshot(),
+    ) {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            persistence.unavailable = Some(session_from_queue_error(error));
+            return;
+        }
+    };
+    let context = proposal.context().clone();
+    match writer.submit_captured_mutation(proposal) {
         Ok(receiver) => {
             persistence.save = Some(SaveInFlight {
                 revision: coordinator.revision(),
+                context,
                 receiver,
             });
             persistence.force_save = false;
@@ -2590,7 +2641,14 @@ fn poll_save(
     let Some(save) = persistence.save.as_ref() else {
         return;
     };
-    match save.receiver.try_recv() {
+    let result = save.receiver.try_recv().map(|completion| {
+        snapshot_completion_result(
+            completion,
+            &save.context,
+            GlobalMutationKind::ConfiguredRegistry,
+        )
+    });
+    match result {
         Ok(Ok(())) => {
             let revision = save.revision;
             persistence.save = None;
@@ -2831,6 +2889,10 @@ fn drain_shutdown(
 
 #[cfg(test)]
 mod tests {
+    mod snapshot_persistence {
+        use super::*;
+        include!("snapshot_persistence_tests.rs");
+    }
     use super::*;
     use rusqlite::Connection;
     use std::{
@@ -4883,7 +4945,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_preference_snapshot(&service, |preferences| {
             preferences == &UiPreferences::default()
         });
@@ -4942,8 +5005,8 @@ mod tests {
         );
         service.shutdown().expect("preference shutdown");
 
-        let mut reopened =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("reopen service");
         let restored = wait_for_preference_snapshot(&reopened, |preferences| {
             preferences.theme.name == "Persisted theme"
                 && preferences.theme.motion.enabled
@@ -5091,7 +5154,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_preference_snapshot(&service, |preferences| {
             preferences == &UiPreferences::default()
         });
@@ -5104,8 +5168,8 @@ mod tests {
             .expect("latest volume patch");
         service.shutdown().expect("immediate shutdown");
 
-        let mut reopened =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("reopen service");
         let restored = wait_for_preference_snapshot(&reopened, |preferences| {
             (preferences.output_volume - 0.73).abs() < f32::EPSILON
         });
@@ -5119,7 +5183,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_preference_snapshot(&service, |preferences| {
             preferences == &UiPreferences::default()
         });
@@ -5147,8 +5212,8 @@ mod tests {
         );
         service.shutdown().expect("reversion shutdown");
 
-        let mut reopened =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("reopen service");
         wait_for_preference_snapshot(&reopened, |preferences| {
             preferences == &UiPreferences::default()
         });
@@ -5232,7 +5297,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut initial =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_event(&initial, |event| {
             matches!(event, RegistryEvent::Snapshot { .. })
         });
@@ -5265,8 +5331,8 @@ mod tests {
         drop(connection);
         drop(app_root_guard);
 
-        let mut service =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let mut service = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("reopen service");
         wait_for_event(&service, |event| {
             matches!(event, RegistryEvent::Snapshot { .. })
         });
