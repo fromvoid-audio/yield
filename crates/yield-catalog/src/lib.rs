@@ -69,7 +69,8 @@ pub use feature_job::{
     prepare_feature_job,
 };
 pub use feature_request::{
-    FeatureAnalysisBlocker, FeatureAnalysisCancellation, FeatureAnalysisState,
+    FeatureAnalysisBlocker, FeatureAnalysisCancellation, FeatureAnalysisPhase,
+    FeatureAnalysisState, FeaturePhaseMeasurement,
 };
 mod index_pages;
 mod index_reveal;
@@ -2594,7 +2595,7 @@ fn encoded_path_len(path: &Path) -> usize {
 
 fn command_event_budget(command: &CatalogCommand) -> usize {
     match command {
-        CatalogCommand::RequestFeatureAnalysis { .. } => 3,
+        CatalogCommand::RequestFeatureAnalysis { .. } => 6,
         CatalogCommand::Register { .. } | CatalogCommand::RegisterVerified { .. } => 2,
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestWavMetadata { .. }
