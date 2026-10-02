@@ -1,6 +1,9 @@
 //! Ordinary global metadata acquisition only. Never retry a body or a commit.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod metrics;
+pub use metrics::{GlobalAcquisitionMetricsSnapshot, global_acquisition_metrics_snapshot};
 
 use rusqlite::{Connection, Transaction, TransactionBehavior, ffi};
 
@@ -16,8 +19,28 @@ pub(super) fn begin(connection: &Connection) -> Result<Transaction<'_>, LibraryE
 
 fn begin_with_backoff(
     connection: &Connection,
-    mut backoff: impl FnMut(u8),
+    backoff: impl FnMut(u8),
 ) -> Result<Transaction<'_>, LibraryError> {
+    begin_observed(connection, backoff, &metrics::PROCESS_METRICS)
+}
+
+fn begin_observed<'a>(
+    connection: &'a Connection,
+    backoff: impl FnMut(u8),
+    metrics: &metrics::AcquisitionMetrics,
+) -> Result<Transaction<'a>, LibraryError> {
+    let started = Instant::now();
+    let nested = !connection.is_autocommit();
+    let result = begin_inner(connection, backoff, metrics);
+    metrics.finish(&result, nested, started.elapsed());
+    result
+}
+
+fn begin_inner<'a>(
+    connection: &'a Connection,
+    mut backoff: impl FnMut(u8),
+    metrics: &metrics::AcquisitionMetrics,
+) -> Result<Transaction<'a>, LibraryError> {
     // Do not disturb a caller's active transaction or retry an ambiguous acquisition.
     if !connection.is_autocommit() {
         return Err(map_sql_error(rusqlite::Error::InvalidQuery));
@@ -30,6 +53,7 @@ fn begin_with_backoff(
         .map_err(map_sql_error)?;
     let result = (|| {
         for attempt in 1..=MAX_ATTEMPTS {
+            metrics.attempt();
             match Transaction::new_unchecked(connection, TransactionBehavior::Immediate) {
                 Ok(transaction) => return Ok(transaction),
                 Err(error) => {
@@ -55,6 +79,7 @@ fn begin_with_backoff(
                             sqlite_code: code,
                         });
                     }
+                    metrics.retry();
                     backoff(attempt);
                 }
             }

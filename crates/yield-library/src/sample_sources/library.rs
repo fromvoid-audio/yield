@@ -65,6 +65,7 @@ pub use operation_link_participant::{
     OPERATION_LINK_MAX_BYTES, OPERATION_LINK_MAX_RECEIPTS, OperationLinkReceipt,
     OperationLinkRequest, OperationLinkResult,
 };
+pub use ordinary_retry::{GlobalAcquisitionMetricsSnapshot, global_acquisition_metrics_snapshot};
 pub use owner::{
     GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY, GlobalAdmissionMetricsSnapshot, GlobalLibraryWriter,
     GlobalLibraryWriterDrainOutcome, GlobalLibraryWriterDrainReport, GlobalLibraryWriterQueueError,
