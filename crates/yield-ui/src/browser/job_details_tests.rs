@@ -38,7 +38,7 @@ mod tests {
             view.catalog_activation = Some(catalog("/sources/first", 11, None));
         });
         let jobs = browser.update(cx, |view, cx| snapshot(view, cx));
-        assert_eq!(jobs.status_label(), "2 jobs running");
+        assert_eq!(jobs.status_label(), "2 jobs active");
         assert_eq!(jobs.rows[0].generation, 7);
         assert_eq!(jobs.rows[1].generation, 11);
         assert!(jobs.rows.iter().all(|row| row.source_label() == "first"));
@@ -49,7 +49,7 @@ mod tests {
             view.catalog_activation = Some(catalog("/sources/first", 11, None));
         });
         let jobs = browser.update(cx, |view, cx| snapshot(view, cx));
-        assert_eq!(jobs.status_label(), "1 job running");
+        assert_eq!(jobs.status_label(), "1 job active");
         assert_eq!(jobs.rows[0].generation, 8);
         assert_eq!(jobs.rows[0].source_label(), "second");
         assert!(jobs.rows.iter().all(|row| row.kind != JobKind::Catalog));
@@ -135,6 +135,7 @@ mod tests {
         assert_eq!(snapshot.status_label(), "Jobs idle");
         snapshot.rows.push(JobRow {
             kind: JobKind::Catalog,
+                feature_state: None,
             source: Some(PathBuf::from("/source")),
             generation: 4,
             work: "Retry this source audit".into(),
@@ -147,6 +148,7 @@ mod tests {
         assert_eq!(snapshot.status_label(), "Job needs attention");
         snapshot.rows.push(JobRow {
             kind: JobKind::Waveform,
+                feature_state: None,
             source: Some(PathBuf::from("/source")),
             generation: 8,
             work: "Loading selected waveform".into(),
@@ -156,7 +158,7 @@ mod tests {
             can_retry: false,
             can_cancel: false,
         });
-        assert_eq!(snapshot.status_label(), "1 job running");
+        assert_eq!(snapshot.status_label(), "1 job active");
         assert_eq!(
             snapshot.rows[1].state_label(),
             "In progress · time remaining unknown"
@@ -169,6 +171,7 @@ mod tests {
         let mut snapshot = JobSnapshot {
             rows: vec![JobRow {
                 kind: JobKind::FeatureAnalysis,
+                feature_state: None,
                 source: Some("/source".into()),
                 generation: 2,
                 work: "Features ready: 1 / 1 readiness targets".into(),
@@ -189,8 +192,8 @@ mod tests {
         scan.source = Some("/other-source".into());
         scan.work = "Finding audio files".into();
         snapshot.rows.push(scan);
-        assert_eq!(snapshot.status_label(), "2 jobs running");
+        assert_eq!(snapshot.status_label(), "2 jobs active");
         snapshot.rows[0].blocked = Some("Analysis failed".into());
-        assert_eq!(snapshot.status_label(), "1 job running");
+        assert_eq!(snapshot.status_label(), "1 job active");
     }
 }
