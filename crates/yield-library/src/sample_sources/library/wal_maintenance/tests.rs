@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 mod ownership;
+mod registry;
 
 #[derive(Clone, Copy)]
 enum Fault {

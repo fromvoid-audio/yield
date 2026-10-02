@@ -213,6 +213,7 @@ impl LibraryDatabase {
         // and receipt. A lost post-commit response is recovered by this same immutable key.
         let receipt = read_receipt(&tx, request)?.ok_or_else(|| invalid("receipt readback"))?;
         tx.commit()?;
+        self.note_registry_participant_commit();
         Ok(receipt)
     }
 }
