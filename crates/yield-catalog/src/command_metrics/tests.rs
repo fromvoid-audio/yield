@@ -166,3 +166,19 @@ fn disconnected_channel_rejects_without_timestamp_or_credit_leak() {
     assert_eq!(snapshot.dispatch_wait.count, 0);
     assert_eq!(service.admission.lock().unwrap().event_budget, 1);
 }
+
+#[test]
+fn unrelated_dispatch_removes_its_own_timestamp_without_stealing_deferred_latency() {
+    let mut metrics = CommandMetrics::new();
+    let first = Instant::now();
+    let second = first + Duration::from_millis(10);
+    metrics.accepted(first);
+    metrics.accepted(second);
+    metrics.received_at(second + Duration::from_millis(1), second);
+    assert_eq!(metrics.snapshot().dispatch_wait.total_micros, 1_000);
+    assert_eq!(metrics.snapshot().pending_dispatch, 1);
+    metrics.received_at(first + Duration::from_millis(100), first);
+    assert_eq!(metrics.snapshot().dispatch_wait.total_micros, 101_000);
+    assert_eq!(metrics.snapshot().pending_dispatch, 0);
+    assert_eq!(metrics.snapshot().untracked_dispatches, 0);
+}

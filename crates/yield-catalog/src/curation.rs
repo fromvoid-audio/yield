@@ -1240,3 +1240,81 @@ pub(crate) fn checked_source_root_identity(
         error => error,
     })
 }
+
+// Closing may dispatch an already accepted durable command while its original writer remains
+// private after failed rollback. Emit its genuine terminal shape without pretending the source
+// was unregistered, executing SQL, constructing a receipt, or discarding existing event credits.
+pub(super) fn reject_unavailable_command(
+    command: &CatalogCommand,
+    reservation: &mut EventReservation<'_>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) -> bool {
+    let error = || {
+        CatalogError::SourceWriterConflict(String::from(
+            "original source writer remains private after unconfirmed preparation cleanup",
+        ))
+    };
+    match command {
+        CatalogCommand::ApplyCuration {
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            ..
+        } => {
+            reservation.publish(CatalogEvent::CurationFailed {
+                source_id: source_id.clone(),
+                lifecycle_generation: *lifecycle_generation,
+                expected_revision: *expected_revision,
+                request_id: *request_id,
+                error: error(),
+            });
+        }
+        CatalogCommand::ApplyCurationOperation {
+            source_id,
+            lifecycle_generation,
+            fence,
+            request_id,
+            ..
+        } => {
+            let initial_revision = match fence {
+                SourceCurationOperationFence::ExactRevision(revision) => Some(*revision),
+                SourceCurationOperationFence::AfterOperation { .. } => None,
+            };
+            publish_operation_outcome(
+                source_id.clone(),
+                *lifecycle_generation,
+                *request_id,
+                SourceCurationOperationOutcome {
+                    initial_revision,
+                    final_revision: initial_revision,
+                    committed_batches: Vec::new(),
+                    prepared_group: None,
+                    failure: Some(SourceCurationOperationFailure {
+                        batch_index: 0,
+                        error: error(),
+                    }),
+                },
+                reservation,
+                sources,
+            );
+        }
+        CatalogCommand::ApplyRatingDecay {
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            ..
+        } => {
+            reservation.publish(CatalogEvent::RatingDecayFailed {
+                source_id: source_id.clone(),
+                lifecycle_generation: *lifecycle_generation,
+                expected_revision: *expected_revision,
+                request_id: *request_id,
+                error: error(),
+            });
+        }
+        _ => return false,
+    }
+    true
+}

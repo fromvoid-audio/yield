@@ -26,9 +26,9 @@ use yield_library::operation_journal::{
 };
 use yield_library::sample_sources::db::{
     ManifestCommitResult, SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT, SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT,
-    SourceAuthorityRegistration, SourceAuthorityRegistrationReceipt, SourceAuthorityRetirementAck,
-    SourceDirectoryEntry, SourceDirectoryTruthPage, SourceDirectoryTruthState, SourceLeaseError,
-    SourceManifestEntry, SourceWriteBatch,
+    SourceAuthorityError, SourceAuthorityRegistration, SourceAuthorityRegistrationReceipt,
+    SourceAuthorityRetirementAck, SourceDirectoryEntry, SourceDirectoryTruthPage,
+    SourceDirectoryTruthState, SourceLeaseError, SourceManifestEntry, SourceWriteBatch,
 };
 #[cfg(target_os = "macos")]
 use yield_library::sample_sources::reconciliation::WatcherGeneration;
@@ -59,6 +59,12 @@ use yield_source_watcher::WatchHintEvidence;
 use yield_source_watcher::replay::macos::BootstrapCapture;
 use yield_source_watcher::{SourceWatchSpec, SourceWatcher, WatcherSignal};
 
+mod source_wal_preparation;
+pub use source_wal_preparation::{
+    CATALOG_WAL_MAX_CONTEXT_BYTES, CATALOG_WAL_MAX_SLOTS, CatalogSourceWalCorrelation,
+    CatalogSourceWalObservation, CatalogSourceWalPreparation, CatalogSourceWalRejection,
+    CatalogSourceWalRequest, CatalogSourceWalStatus,
+};
 mod command_metrics;
 pub use command_metrics::{CatalogCommandMetrics, CatalogDurationMetrics};
 
@@ -2044,12 +2050,12 @@ impl CatalogDelivery {
     }
 }
 
-struct RegisteredSource {
+struct RegisteredSource<D = CatalogSourceDatabase> {
     collection_history_token: Option<std::sync::Weak<AtomicBool>>,
     replay: Option<replay::ReplayState>,
     root: PathBuf,
     lifecycle_generation: u64,
-    database: CatalogSourceDatabase,
+    database: D,
     publication_fence: SourcePublicationFence,
     known_root_identity: Option<RootIdentity>,
     snapshot: Option<CatalogSnapshot>,
@@ -2060,6 +2066,69 @@ struct RegisteredSource {
     source_authority: Option<SourceAuthorityRegistration>,
     source_authority_receipt: Option<SourceAuthorityRegistrationReceipt>,
     source_authority_pending: Option<PendingSourceAuthority>,
+}
+
+impl<D> RegisteredSource<D> {
+    // Move every existing watcher, snapshot, registration and lineage field with the SQL owner.
+    // A parked entry has a distinct database type and cannot dereference or call ordinary SQL.
+    fn try_map_database<T, E>(
+        self,
+        convert: impl FnOnce(D) -> Result<T, E>,
+    ) -> Result<RegisteredSource<T>, RegisteredSource<E>> {
+        let RegisteredSource {
+            database,
+            collection_history_token,
+            replay,
+            root,
+            lifecycle_generation,
+            publication_fence,
+            known_root_identity,
+            snapshot,
+            attempt_token,
+            curation_lineage,
+            watcher,
+            watcher_schedule,
+            source_authority,
+            source_authority_receipt,
+            source_authority_pending,
+        } = self;
+        match convert(database) {
+            Ok(database) => Ok(RegisteredSource {
+                database,
+                collection_history_token,
+                replay,
+                root,
+                lifecycle_generation,
+                publication_fence,
+                known_root_identity,
+                snapshot,
+                attempt_token,
+                curation_lineage,
+                watcher,
+                watcher_schedule,
+                source_authority,
+                source_authority_receipt,
+                source_authority_pending,
+            }),
+            Err(database) => Err(RegisteredSource {
+                database,
+                collection_history_token,
+                replay,
+                root,
+                lifecycle_generation,
+                publication_fence,
+                known_root_identity,
+                snapshot,
+                attempt_token,
+                curation_lineage,
+                watcher,
+                watcher_schedule,
+                source_authority,
+                source_authority_receipt,
+                source_authority_pending,
+            }),
+        }
+    }
 }
 
 /// Transitional catalog adapter that retains the one writable source owner.
@@ -2111,10 +2180,10 @@ struct PendingSourceFinalization {
     reason: String,
 }
 
-enum RetireSourceOutcome {
+enum RetireSourceOutcome<D = CatalogSourceDatabase> {
     Removed,
     Retained {
-        source: RegisteredSource,
+        source: RegisteredSource<D>,
         reason: String,
     },
     FinalizationPending {
@@ -2139,6 +2208,8 @@ struct CurationLineage {
 }
 
 struct AdmissionState {
+    source_wal: source_wal_preparation::Control,
+    queued_commands: usize,
     #[cfg(feature = "test-support")]
     compound_batch_fault: Option<test_support::CompoundBatchFault>,
     feature_analysis_metrics: FeatureAnalysisMetrics,
@@ -2161,6 +2232,8 @@ impl AdmissionState {
         Self {
             #[cfg(feature = "test-support")]
             compound_batch_fault: None,
+            source_wal: source_wal_preparation::Control::new(),
+            queued_commands: 0,
             command_metrics: command_metrics::CommandMetrics::new(),
             feature_analysis_metrics: FeatureAnalysisMetrics::default(),
             shutdown: false,
@@ -3529,9 +3602,14 @@ fn publish_removal_if_current(
     true
 }
 
+struct QueuedCatalogCommand {
+    command: CatalogCommand,
+    sent_at: Instant,
+}
+
 /// Profile-owned catalog worker handle.
 pub struct CatalogService {
-    commands: SyncSender<CatalogCommand>,
+    commands: SyncSender<QueuedCatalogCommand>,
     events: Arc<EventHub>,
     admission: Arc<Mutex<AdmissionState>>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -3694,6 +3772,9 @@ impl CatalogService {
             return Err(CatalogSubmitError::Closed);
         }
         validate_command(&command)?;
+        if admission.queued_commands >= COMMAND_CAPACITY {
+            return Err(CatalogSubmitError::Full);
+        }
         // Validate variable inputs before cloning identifiers into admission actions.
         let action = admission_action(&command);
         curation::validate_submission(&command, &admission)
@@ -3741,8 +3822,12 @@ impl CatalogService {
             .tag_read_payload_bytes
             .saturating_add(tag_read_payload_bytes);
         let sent_at = Instant::now();
-        match self.commands.try_send(command) {
+        match self
+            .commands
+            .try_send(QueuedCatalogCommand { command, sent_at })
+        {
             Ok(()) => {
+                admission.queued_commands += 1;
                 admission.command_metrics.accepted(sent_at);
                 admission.event_budget += event_budget;
                 admission.curation_payload_bytes += curation_payload_bytes;
@@ -3944,7 +4029,7 @@ impl Drop for CatalogService {
 
 fn run_worker(
     profile_guard: WritableProfileGuard,
-    command_rx: Receiver<CatalogCommand>,
+    command_rx: Receiver<QueuedCatalogCommand>,
     events: Arc<EventHub>,
     admission: Arc<Mutex<AdmissionState>>,
     test_gate: Option<Arc<CatalogTestGate>>,
@@ -3967,7 +4052,7 @@ fn run_worker(
 
 fn run_worker_with_sources(
     profile_guard: WritableProfileGuard,
-    command_rx: Receiver<CatalogCommand>,
+    command_rx: Receiver<QueuedCatalogCommand>,
     events: Arc<EventHub>,
     admission: Arc<Mutex<AdmissionState>>,
     test_gate: Option<Arc<CatalogTestGate>>,
@@ -3976,63 +4061,135 @@ fn run_worker_with_sources(
     harvest: Option<HarvestFactsClient>,
     mut sources: HashMap<SourceId, RegisteredSource>,
 ) {
+    let control = admission
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .source_wal
+        .clone();
+    let mut preparations = source_wal_preparation::WorkerReservations::new(control);
+    let mut deferred = VecDeque::<QueuedCatalogCommand>::new();
     let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
     loop {
-        if let Some(test_gate) = test_gate.as_ref() {
-            test_gate.before_receive();
-        }
+        preparations.poll(&admission, &mut sources);
         let closing = admission_state(&admission, |state| state.shutdown || state.closed);
-        let command = if closing {
-            match command_rx.try_recv() {
-                Ok(command) => Some(command),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-            }
+        if closing {
+            preparations.close(&mut sources);
+        }
+        let ready = deferred.iter().position(|packet| {
+            closing || !source_wal_preparation::deferred(&packet.command, &preparations)
+        });
+        let packet = if let Some(index) = ready {
+            deferred.remove(index)
         } else {
-            match command_rx.recv_timeout(WORKER_IDLE_POLL) {
-                Ok(command) => Some(command),
-                Err(RecvTimeoutError::Timeout) => match command_rx.try_recv() {
+            if let Some(test_gate) = test_gate.as_ref() {
+                test_gate.before_receive();
+            }
+            if closing {
+                match command_rx.try_recv() {
                     Ok(command) => Some(command),
-                    Err(TryRecvError::Empty) => {
-                        run_watcher_idle_work(
-                            &profile_guard,
-                            &events,
-                            &admission,
-                            &mut sources,
-                            test_gate.as_ref(),
-                            watcher_mode,
-                        );
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+                }
+            } else {
+                match command_rx.recv_timeout(WORKER_IDLE_POLL) {
+                    Ok(command) => Some(command),
+                    Err(RecvTimeoutError::Timeout) => {
+                        // No callback may rediscover a parked SQL owner. Defer native watcher
+                        // idle scanning while any preparation is held; other-source commands
+                        // continue through the finite normal queue.
+                        if !preparations.has_slots() {
+                            run_watcher_idle_work(
+                                &profile_guard,
+                                &events,
+                                &admission,
+                                &mut sources,
+                                test_gate.as_ref(),
+                                watcher_mode,
+                            );
+                        }
                         continue;
                     }
-                    Err(TryRecvError::Disconnected) => break,
-                },
-                Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let mut state = admission.lock().unwrap_or_else(|p| p.into_inner());
+                        state.shutdown = true;
+                        state.invalidate_all();
+                        continue;
+                    }
+                }
             }
         };
-        let Some(command) = command else {
+        let Some(packet) = packet else {
             break;
         };
+        if source_wal_preparation::lifecycle(&packet.command) {
+            // Existing drain/finalization may await the journal. No successful pre-intent
+            // reservation may remain held across that wait.
+            preparations.abort_all(&mut sources);
+            preparations.retire_failed(journal.as_ref(), &mut pending_finalizations);
+            if ready.is_none() && !deferred.is_empty() {
+                // Earlier accepted source work regains its place before a later lifecycle
+                // command after successful abort. Lifecycle cannot jump its own source FIFO.
+                deferred.push_back(packet);
+                continue;
+            }
+        }
+        if !closing && source_wal_preparation::deferred(&packet.command, &preparations) {
+            assert!(
+                deferred.len() < COMMAND_CAPACITY,
+                "normal channel plus deferrals stays bounded"
+            );
+            deferred.push_back(packet);
+            continue;
+        }
+        if source_wal_preparation::interrupts_preparation(&packet.command) {
+            // The command targets an unparked source, or closing is draining accepted
+            // work. Never carry successful pre-intent locks through broad SQL/DSP/IO or
+            // another owner's response wait. This is an honest abort, never settlement.
+            preparations.abort_all(&mut sources);
+        }
+        let QueuedCatalogCommand { command, sent_at } = packet;
         let _tag_page_input_reservation = CommandInputReservation {
             admission: &admission,
             bytes: command_tag_page_input_bytes(&command),
         };
         let closing = {
-            let mut state = admission
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.command_metrics.received(Instant::now());
+            let mut state = admission.lock().unwrap_or_else(|p| p.into_inner());
+            state.queued_commands = state
+                .queued_commands
+                .checked_sub(1)
+                .expect("normal command credit");
+            state.command_metrics.received_at(Instant::now(), sent_at);
             state.shutdown || state.closed
         };
-        let reserved_events = command_event_budget(&command);
         let mut reservation = EventReservation {
             hub: &events,
             admission: &admission,
-            remaining: reserved_events,
+            remaining: command_event_budget(&command),
             curation_payload_bytes: command_curation_payload_bytes(&command),
             curation_update_count: command_curation_update_count(&command),
             tag_read_payload_bytes: command_tag_read_payload_bytes(&command)
                 .expect("validated tag-read command has bounded output"),
         };
         if closing && !curation::is_durable(&command) {
+            reservation.finish();
+            continue;
+        }
+        if let Some((source_id, lifecycle_generation, operation)) =
+            preparations.blocked_lifecycle(&command)
+        {
+            reservation.publish(CatalogEvent::Failed {
+                source_id: Some(source_id),
+                lifecycle_generation: Some(lifecycle_generation),
+                operation,
+                error: CatalogError::SourceWriterConflict(String::from(
+                    "original source owner remains unavailable; retirement is unconfirmed",
+                )),
+            });
+            reservation.finish();
+            continue;
+        }
+        if source_wal_preparation::deferred(&command, &preparations)
+            && curation::reject_unavailable_command(&command, &mut reservation, &mut sources)
+        {
             reservation.finish();
             continue;
         }
@@ -4053,6 +4210,8 @@ fn run_worker_with_sources(
         }
         reservation.finish();
     }
+    preparations.close(&mut sources);
+    preparations.retire_failed(journal.as_ref(), &mut pending_finalizations);
     if let Some(journal) = journal.as_ref() {
         for (source_id, source) in sources.drain() {
             match retire_source(
@@ -6261,7 +6420,7 @@ fn handle_source_authority_error(
     }
 }
 
-fn poll_pending_source_authority(source: &mut RegisteredSource) -> Result<(), String> {
+fn poll_pending_source_authority<D>(source: &mut RegisteredSource<D>) -> Result<(), String> {
     let Some(mut pending) = source.source_authority_pending.take() else {
         return Ok(());
     };
@@ -6365,16 +6524,49 @@ fn poll_pending_source_finalization(
     }
 }
 
+// Private consume-only close contract shared by ordinary and unavailable retained owners.
+trait SourceRetirementDatabase {
+    fn close_ready(&self) -> bool;
+    fn close_with_authority(
+        self,
+        authority: &mut SourceAuthorityRegistration,
+    ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError>;
+}
+impl SourceRetirementDatabase for CatalogSourceDatabase {
+    fn close_ready(&self) -> bool {
+        self.source_authority_close_ready()
+    }
+    fn close_with_authority(
+        self,
+        authority: &mut SourceAuthorityRegistration,
+    ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
+        authority.close_database(self.into_database())
+    }
+}
+impl SourceRetirementDatabase
+    for yield_library::sample_sources::db::write::SourceWalPreparationFailure
+{
+    fn close_ready(&self) -> bool {
+        self.source_authority_close_ready()
+    }
+    fn close_with_authority(
+        self,
+        authority: &mut SourceAuthorityRegistration,
+    ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
+        self.close_for_retirement(authority)
+    }
+}
+
 /// Retire one source. Failures before the source lease is consumed return the complete source so
 /// the worker can keep its opaque authority and retry evidence. Once the source-owner close has
 /// consumed the database, the sealed acknowledgement is moved into the worker-owned
 /// `pending_finalizations` map before any finalize command is submitted.
-fn retire_source(
+fn retire_source<D: SourceRetirementDatabase>(
     source_id: SourceId,
-    mut source: RegisteredSource,
+    mut source: RegisteredSource<D>,
     journal: &OperationJournalClient,
     pending_finalizations: &mut HashMap<SourceId, PendingSourceFinalization>,
-) -> RetireSourceOutcome {
+) -> RetireSourceOutcome<D> {
     // A source ID can reach this helper again while an earlier generation's sealed
     // acknowledgement is still pending. Resolve that carrier before consuming the new source;
     // otherwise inserting the new generation's carrier could discard the older exact proof.
@@ -6440,14 +6632,14 @@ fn retire_source(
             return RetireSourceOutcome::Retained { source, reason };
         }
     }
-    if !source.database.source_authority_close_ready() {
+    if !source.database.close_ready() {
         let reason = String::from("source retirement is blocked by retained snapshots");
         source.source_authority = Some(authority);
         report_source_authority_issue(&reason, "retaining journal evidence");
         return RetireSourceOutcome::Retained { source, reason };
     }
     let RegisteredSource { database, .. } = source;
-    let acknowledgement = match authority.close_database(database.into_database()) {
+    let acknowledgement = match database.close_with_authority(&mut authority) {
         Ok(acknowledgement) => acknowledgement,
         Err(error) => {
             report_source_authority_issue(

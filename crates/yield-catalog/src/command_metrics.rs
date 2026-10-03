@@ -52,9 +52,9 @@ pub struct CatalogCommandMetrics {
     pub invalid: u64,
     /// Commands admitted but not yet observed at the worker receipt boundary.
     ///
-    /// Valid only while `dispatch_timing_available` is true. Includes one command received while
-    /// waiting for the admission mutex; this is not exact
-    /// channel occupancy. The bound is channel capacity plus one, currently 33.
+    /// Valid only while `dispatch_timing_available` is true. Includes commands parked
+    /// for a source preparation until their actual dispatch. Normal channel plus deferrals
+    /// share 32 admission credits; the internal timestamp ring retains one spare slot.
     pub pending_dispatch: u32,
     /// Largest observed pending-dispatch count in this owner lifetime.
     pub pending_high_water: u32,
@@ -132,16 +132,31 @@ impl CommandMetrics {
         self.snapshot.pending_high_water = self.snapshot.pending_high_water.max(self.len as u32);
     }
 
+    #[cfg(test)]
     pub(super) fn received(&mut self, now: Instant) {
-        if self.len == 0 {
+        let Some(sent_at) = self.pending[self.head] else {
             self.snapshot.untracked_dispatches =
                 self.snapshot.untracked_dispatches.saturating_add(1);
             return;
+        };
+        self.received_at(now, sent_at);
+    }
+
+    pub(super) fn received_at(&mut self, now: Instant, sent_at: Instant) {
+        let index = (0..self.len)
+            .find(|offset| self.pending[(self.head + offset) % PENDING_CAPACITY] == Some(sent_at));
+        let Some(index) = index else {
+            self.snapshot.untracked_dispatches =
+                self.snapshot.untracked_dispatches.saturating_add(1);
+            return;
+        };
+        // Per-source deferral permits unrelated commands to overtake. Remove the exact
+        // packet timestamp rather than attributing the oldest pending command's latency.
+        for offset in index..self.len - 1 {
+            self.pending[(self.head + offset) % PENDING_CAPACITY] =
+                self.pending[(self.head + offset + 1) % PENDING_CAPACITY];
         }
-        let sent_at = self.pending[self.head]
-            .take()
-            .expect("occupied timestamp slot");
-        self.head = (self.head + 1) % PENDING_CAPACITY;
+        self.pending[(self.head + self.len - 1) % PENDING_CAPACITY] = None;
         self.len -= 1;
         self.snapshot.pending_dispatch = self.len as u32;
         self.snapshot.dispatched = self.snapshot.dispatched.saturating_add(1);

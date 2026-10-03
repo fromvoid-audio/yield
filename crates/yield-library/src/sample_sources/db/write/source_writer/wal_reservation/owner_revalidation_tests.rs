@@ -293,3 +293,72 @@ fn held_owner_revalidation_rejects_actual_main_file_substitution_without_unlocki
     preparation.revalidate_owner().unwrap();
     preparation.abort().unwrap().close().unwrap();
 }
+
+#[test]
+fn failed_empty_reservation_cannot_retire_without_original_durable_drain() {
+    let (_fixture, writer) = fixture();
+    let revision = writer.current_revision().unwrap();
+    let mut authority = writer.database.prepare_source_authority().unwrap();
+    let other = external(&writer);
+    let preparation = writer
+        .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    preparation
+        .held
+        .writer()
+        .database
+        .connection
+        .authorizer(Some(|_: AuthContext<'_>| Authorization::Deny));
+    let failure = match preparation.abort() {
+        Err(failure) => failure,
+        Ok(_) => panic!("real rollback denial must keep owner private"),
+    };
+    busy(&other);
+    assert_eq!(
+        failure.retained_database_identity(),
+        Some(revision.database_identity())
+    );
+    assert!(failure.source_authority_close_ready());
+    assert!(matches!(
+        failure.close_for_retirement(&mut authority),
+        Err(SourceAuthorityError::InvalidLifecycle)
+    ));
+    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    // Closing a consumed resource does not manufacture a registration or retirement ack.
+    drop(authority);
+}
+
+#[test]
+fn failed_empty_reservation_cannot_use_another_sources_actual_guard() {
+    let (fixture, writer) = fixture();
+    let revision = writer.current_revision().unwrap();
+    let other = external(&writer);
+    let different = SourceDatabase::open_for_catalog_with_profile_guard(
+        &fixture.media,
+        &fixture._profile,
+        Path::new("different-retirement-owner"),
+    )
+    .unwrap();
+    let mut wrong_authority = different.prepare_source_authority().unwrap();
+    let preparation = writer
+        .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    preparation
+        .held
+        .writer()
+        .database
+        .connection
+        .authorizer(Some(|_: AuthContext<'_>| Authorization::Deny));
+    let failure = match preparation.abort() {
+        Err(failure) => failure,
+        Ok(_) => panic!("real rollback denial must keep owner private"),
+    };
+    busy(&other);
+    assert!(matches!(
+        failure.close_for_retirement(&mut wrong_authority),
+        Err(SourceAuthorityError::GuardMismatch)
+    ));
+    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    drop(wrong_authority);
+    drop(different);
+}
