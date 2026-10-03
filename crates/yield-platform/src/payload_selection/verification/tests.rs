@@ -15,16 +15,16 @@ use std::{
 };
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-struct Fixture {
+pub(super) struct Fixture {
     service: PayloadSelectionService,
-    selected: SelectedPayload,
-    archive: Vec<u8>,
-    checksum: Vec<u8>,
-    signature: Vec<u8>,
-    key: SigningKey,
+    pub(super) selected: SelectedPayload,
+    pub(super) archive: Vec<u8>,
+    pub(super) checksum: Vec<u8>,
+    pub(super) signature: Vec<u8>,
+    pub(super) key: SigningKey,
 }
 impl Fixture {
-    fn new(bytes: Vec<u8>, version: &str, lane: Channel, platform: Platform) -> Self {
+    pub(super) fn new(bytes: Vec<u8>, version: &str, lane: Channel, platform: Platform) -> Self {
         let key = SigningKey::from_bytes(&[0x25; 32]);
         let version_parsed = semver::Version::parse(version).unwrap();
         let names = catalog::inventory(&version_parsed, lane).unwrap();
@@ -123,7 +123,7 @@ fn reject<T>(result: Result<T, SelectionError>) -> SelectionError {
         Err(e) => e,
     }
 }
-fn packed(version: &str, lane: Channel, platform: Platform) -> Vec<u8> {
+pub(super) fn packed(version: &str, lane: Channel, platform: Platform) -> Vec<u8> {
     let temp = tempfile::tempdir().unwrap();
     let (_, _, target) = platform.labels();
     let binary = temp.path().join(format!(
@@ -216,7 +216,7 @@ with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED) as z:
   with z.open(info,'w',force_zip64=config.get('zip64',False)) as f:f.write(data)
 sys.stdout.buffer.write(out.getvalue())
 "#;
-fn python_zip(config: Value) -> Vec<u8> {
+pub(super) fn python_zip(config: Value) -> Vec<u8> {
     use std::io::Write;
     let mut child = Command::new("python3")
         .args(["-c", ZIP_SCRIPT])

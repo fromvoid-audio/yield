@@ -79,3 +79,4 @@ windows-core = { version = "=0.62.2" }
 [dev-dependencies]
 gpui.workspace = true
 tempfile.workspace = true
+log = "=0.4.34"

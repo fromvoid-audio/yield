@@ -6,6 +6,8 @@ use crate::update_catalog::{Channel, Platform, asset_name, bounded_json, channel
 use serde::Deserialize;
 use std::{io::Read, time::Instant};
 mod guarded;
+pub(super) mod staging;
+mod wire;
 
 pub(super) const CATALOG: &str = "https://portalsurfer.org/yield/api/v1/releases";
 const ORIGIN: &str = "https://portalsurfer.org";
@@ -228,10 +230,14 @@ struct Gate {
 /// No Debug/Display/Clone or public token/URL accessor. The staging owner consumes this custody.
 pub(super) struct TokenRequest {
     url: url::Url,
+    name: String,
 }
 impl TokenRequest {
     pub(super) fn len(&self) -> usize {
         self.url.as_str().len()
+    }
+    pub(super) fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -286,7 +292,7 @@ pub(super) fn gate_requests(
         if url.as_str().len() > 20 * 1024 {
             return Err(invalid);
         }
-        requests.push(TokenRequest { url });
+        requests.push(TokenRequest { url, name });
     }
     Ok(requests)
 }
