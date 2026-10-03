@@ -166,7 +166,9 @@ pub(super) fn dispatch(
     else {
         return;
     };
-    if let Some(previous) = live.attempt_token.replace(Arc::clone(&cancellation.0)) {
+    if let Some(previous) = live.attempt_token.replace(Arc::clone(&cancellation.0))
+        && !Arc::ptr_eq(&previous, &cancellation.0)
+    {
         previous.store(true, Ordering::Release);
     }
     drop(state);
@@ -272,6 +274,15 @@ pub(super) fn invalidate_before_write(
         } => (source_id, *lifecycle_generation),
         _ => return,
     };
+    invalidate_for_source(id, lifecycle, admission, sources);
+}
+
+fn invalidate_for_source(
+    id: &SourceId,
+    lifecycle: u64,
+    admission: &Arc<Mutex<AdmissionState>>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) {
     let Some(source) = sources
         .get_mut(id)
         .filter(|s| s.lifecycle_generation == lifecycle)
@@ -326,3 +337,10 @@ mod input_storage_tests {
         assert!(request.input_bytes() < 32 * 1024);
     }
 }
+
+#[path = "collection_history_group.rs"]
+mod group;
+pub use group::{
+    CatalogCollectionHistoryGroup, CollectionHistoryGroupRequest, PreparedCollectionOperation,
+};
+pub(super) use group::{dispatch_group, dispatch_prepared};

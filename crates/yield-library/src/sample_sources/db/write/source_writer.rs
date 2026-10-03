@@ -8,7 +8,9 @@
 use super::super::{SourceReferenceFence, SourceReferenceFenceError};
 mod collection_history_selection;
 pub use collection_history_selection::{
-    SourceCollectionHistoryChange, SourceCollectionHistorySelection,
+    SOURCE_COLLECTION_HISTORY_GROUP_MAX_BYTES, SOURCE_COLLECTION_HISTORY_GROUP_MAX_PATHS,
+    SourceCollectionHistoryChange, SourceCollectionHistoryExecution, SourceCollectionHistoryGroup,
+    SourceCollectionHistorySelection,
 };
 mod snapshot_metrics;
 pub use snapshot_metrics::SourceSnapshotQueueMetrics;

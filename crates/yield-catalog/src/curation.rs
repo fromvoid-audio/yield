@@ -93,9 +93,18 @@ pub struct SourceCurationOperationOutcome {
     final_revision: Option<u64>,
     committed_batches: Vec<SourceCurationCommitReceipt>,
     failure: Option<SourceCurationOperationFailure>,
+    prepared_group: Option<std::sync::Arc<super::CatalogCollectionHistoryGroup>>,
 }
 
 impl SourceCurationOperationOutcome {
+    /// Exact privately issued preparation bound by the worker to this terminal outcome.
+    /// This is historical outcome custody, never current mutation authority.
+    pub fn prepared_collection_group(
+        &self,
+    ) -> Option<&std::sync::Arc<super::CatalogCollectionHistoryGroup>> {
+        self.prepared_group.as_ref()
+    }
+
     /// Return the exact starting revision when the operation could resolve its fence.
     pub const fn initial_revision(&self) -> Option<u64> {
         self.initial_revision
@@ -248,6 +257,7 @@ pub(crate) fn validate_submission(
     command: &CatalogCommand,
     state: &AdmissionState,
 ) -> Result<(), CatalogCurationRequestError> {
+    let prepared_lifecycle;
     let (source_id, lifecycle_generation) = match command {
         CatalogCommand::ApplyCuration {
             source_id,
@@ -269,6 +279,23 @@ pub(crate) fn validate_submission(
         } => {
             validate_operation(*request_id, fence, root_identity, batches, state, source_id)?;
             (source_id, lifecycle_generation)
+        }
+        CatalogCommand::ApplyPreparedCollectionOperation { operation } => {
+            let revision = operation.group().source_observation().revision();
+            let request = operation.request_id();
+            let last = state
+                .sources
+                .get(revision.source_id())
+                .and_then(|s| s.last_curation_request_id)
+                .unwrap_or(0);
+            if request == 0 || request <= last {
+                return Err(CatalogCurationRequestError::NonMonotonicRequestId {
+                    last,
+                    received: request,
+                });
+            }
+            prepared_lifecycle = revision.lifecycle_generation();
+            (revision.source_id(), &prepared_lifecycle)
         }
         CatalogCommand::ApplyRatingDecay {
             source_id,
@@ -678,6 +705,65 @@ pub(crate) fn execute_operation(
     reservation: &mut EventReservation<'_>,
     sources: &mut HashMap<SourceId, RegisteredSource>,
 ) {
+    execute_operation_inner(
+        source_id,
+        lifecycle_generation,
+        fence,
+        root_identity,
+        request_id,
+        batches,
+        profile_guard,
+        reservation,
+        sources,
+        None,
+    );
+}
+
+pub(crate) fn execute_prepared_operation(
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    revision: u64,
+    root_identity: RootIdentity,
+    request_id: u64,
+    batches: Vec<Vec<SourceCurationUpdate>>,
+    group: std::sync::Arc<super::CatalogCollectionHistoryGroup>,
+    execution: Result<
+        yield_library::sample_sources::db::SourceCollectionHistoryExecution,
+        CatalogError,
+    >,
+    profile_guard: &WritableProfileGuard,
+    reservation: &mut EventReservation<'_>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) {
+    execute_operation_inner(
+        source_id,
+        lifecycle_generation,
+        SourceCurationOperationFence::ExactRevision(revision),
+        root_identity,
+        request_id,
+        batches,
+        profile_guard,
+        reservation,
+        sources,
+        Some((group, execution)),
+    );
+}
+
+fn execute_operation_inner(
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    fence: SourceCurationOperationFence,
+    root_identity: RootIdentity,
+    request_id: u64,
+    batches: Vec<Vec<SourceCurationUpdate>>,
+    profile_guard: &WritableProfileGuard,
+    reservation: &mut EventReservation<'_>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+    mut prepared: Option<(
+        std::sync::Arc<super::CatalogCollectionHistoryGroup>,
+        Result<yield_library::sample_sources::db::SourceCollectionHistoryExecution, CatalogError>,
+    )>,
+) {
     let initial_revision = match fence {
         SourceCurationOperationFence::ExactRevision(revision) => Some(revision),
         SourceCurationOperationFence::AfterOperation { .. } => None,
@@ -697,6 +783,9 @@ pub(crate) fn execute_operation(
                     initial_revision,
                     final_revision: initial_revision,
                     committed_batches: Vec::new(),
+                    prepared_group: prepared
+                        .as_ref()
+                        .map(|(group, _)| std::sync::Arc::clone(group)),
                     failure: Some(SourceCurationOperationFailure {
                         batch_index: 0,
                         error,
@@ -716,7 +805,9 @@ pub(crate) fn execute_operation(
     let mut committed_batches = Vec::new();
     let mut failure = None;
     for (batch_index, updates) in batches.iter().enumerate() {
-        let result = if expected_revision == u64::MAX {
+        let result = if let Some((_, Err(error))) = prepared.as_ref() {
+            Err(error.clone())
+        } else if expected_revision == u64::MAX {
             Err(CatalogError::CurationRevisionOverflow(expected_revision))
         } else {
             execute_inner_scoped(
@@ -727,6 +818,9 @@ pub(crate) fn execute_operation(
                 updates,
                 profile_guard,
                 sources,
+                prepared
+                    .as_mut()
+                    .and_then(|(_, result)| result.as_mut().ok()),
                 #[cfg(feature = "test-support")]
                 Some((reservation.admission, request_id, batch_index)),
             )
@@ -762,6 +856,9 @@ pub(crate) fn execute_operation(
         final_revision,
         committed_batches,
         failure,
+        prepared_group: prepared
+            .as_ref()
+            .map(|(group, _)| std::sync::Arc::clone(group)),
     };
     publish_operation_outcome(
         source_id,
@@ -865,6 +962,7 @@ pub(crate) fn execute_inner(
         updates,
         profile_guard,
         sources,
+        None,
         #[cfg(feature = "test-support")]
         None,
     )
@@ -878,6 +976,7 @@ fn execute_inner_scoped(
     updates: &[SourceCurationUpdate],
     profile_guard: &WritableProfileGuard,
     sources: &mut HashMap<SourceId, RegisteredSource>,
+    execution: Option<&mut yield_library::sample_sources::db::SourceCollectionHistoryExecution>,
     #[cfg(feature = "test-support")] fault: Option<(
         &std::sync::Arc<std::sync::Mutex<AdmissionState>>,
         u64,
@@ -997,11 +1096,24 @@ fn execute_inner_scoped(
             batch_index,
         )?;
     }
-    let receipt = source
-        .database
-        .writer
-        .commit_catalog_curation_command(&owner_revision, profile_guard, updates)
-        .map_err(|error| curation_writer_error(source_id, error))?;
+    let receipt = if let Some(execution) = execution {
+        if execution.revision() != expected_revision {
+            return Err(CatalogError::SourceIdentityUncertain(
+                "prepared prefix revision changed".into(),
+            ));
+        }
+        source
+            .database
+            .writer
+            .commit_collection_history_next(execution, profile_guard)
+    } else {
+        source.database.writer.commit_catalog_curation_command(
+            &owner_revision,
+            profile_guard,
+            updates,
+        )
+    }
+    .map_err(|error| curation_writer_error(source_id, error))?;
 
     // The library receipt is durable authority. Any post-commit check failure only invalidates
     // the retained cache; it must never turn a successful database commit into CurationFailed.

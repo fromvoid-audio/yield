@@ -849,6 +849,7 @@ impl Browser {
                 false
             }
             CatalogEvent::CollectionHistoryCompleted { .. }
+            | CatalogEvent::CollectionHistoryGroupCompleted { .. }
             | CatalogEvent::SimilarityCompleted { .. }
             | CatalogEvent::Closed => false,
         }
@@ -1161,6 +1162,9 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
         CatalogEvent::CollectionHistoryCompleted { request, .. } => {
+            Some((request.source_id().clone(), request.lifecycle_generation()))
+        }
+        CatalogEvent::CollectionHistoryGroupCompleted { request, .. } => {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
         CatalogEvent::SimilarityCompleted { request, .. } => {

@@ -82,7 +82,8 @@ mod feature_request;
 mod history_selection;
 pub use feature_analysis_metrics::FeatureAnalysisMetrics;
 pub use history_selection::{
-    CollectionHistoryCancellation, CollectionHistoryFailure, CollectionHistoryRequest,
+    CatalogCollectionHistoryGroup, CollectionHistoryCancellation, CollectionHistoryFailure,
+    CollectionHistoryGroupRequest, CollectionHistoryRequest, PreparedCollectionOperation,
     SourceCollectionHistorySelection,
 };
 mod similarity_dispatch;
@@ -595,6 +596,18 @@ pub enum CatalogCommand {
         request: CollectionHistoryRequest,
         /// Cancellation retained through queued delivery.
         cancellation: CollectionHistoryCancellation,
+    },
+    /// Capture one bounded compound collection group at an exact original owner revision.
+    RequestCollectionHistoryGroup {
+        /// Immutable bounded complete selection and original queue deadline.
+        request: CollectionHistoryGroupRequest,
+        /// Preparation cancellation retained through delivery and owner handoff.
+        cancellation: CollectionHistoryCancellation,
+    },
+    /// Execute the genuine prepared collection group with exact original-owner progression.
+    ApplyPreparedCollectionOperation {
+        /// Genuine privately produced observation and exact command correlation.
+        operation: PreparedCollectionOperation,
     },
     /// Read one bounded explicit anchor/aspect set on the retained owner.
     RequestSimilarity {
@@ -1477,6 +1490,15 @@ pub enum CatalogEvent {
         /// Sole-owner observation moved without reconstruction.
         result: Result<SourceCollectionHistorySelection, CollectionHistoryFailure>,
     },
+    /// Actual complete-owner compound observation; no mutation/admission permission.
+    CollectionHistoryGroupCompleted {
+        /// Exact original frozen caller context.
+        request: CollectionHistoryGroupRequest,
+        /// Retained preparation cancellation.
+        cancellation: CollectionHistoryCancellation,
+        /// Privately constructed owner/delivery observation or truthful refusal.
+        result: Result<Arc<CatalogCollectionHistoryGroup>, CollectionHistoryFailure>,
+    },
     /// Exact bounded similarity result or truthful failure; no readiness mutation.
     SimilarityCompleted {
         /// Exact captured request, required to match before rendering.
@@ -1975,6 +1997,25 @@ impl CatalogDelivery {
                 publication_fence = None;
             }
         }
+        if let CatalogEvent::CollectionHistoryGroupCompleted {
+            cancellation,
+            result,
+            ..
+        } = &mut event
+        {
+            if cancellation.is_cancelled()
+                || publication_fence.as_ref().is_some_and(|f| !f.is_live())
+            {
+                return None;
+            }
+            if result
+                .as_ref()
+                .is_ok_and(|group| !group.within_observation_window())
+            {
+                *result = Err(CollectionHistoryFailure::ObservationExpired);
+                publication_fence = None;
+            }
+        }
         if publication_fence
             .as_ref()
             .is_none_or(SourcePublicationFence::is_live)
@@ -2440,7 +2481,8 @@ impl EventReservation<'_> {
 fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> {
     match command {
         CatalogCommand::RequestSimilarity { .. }
-        | CatalogCommand::RequestCollectionHistory { .. } => {}
+        | CatalogCommand::RequestCollectionHistory { .. }
+        | CatalogCommand::RequestCollectionHistoryGroup { .. } => {}
         CatalogCommand::RequestFeatureAnalysis {
             source_id,
             relative_path,
@@ -2847,6 +2889,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         CatalogCommand::Register { .. } | CatalogCommand::RegisterVerified { .. } => 2,
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
+        | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::RequestSimilarity { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestIndexPage { .. }
@@ -2861,6 +2904,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestHarvestFacts { .. }
         | CatalogCommand::ApplyCuration { .. }
         | CatalogCommand::ApplyCurationOperation { .. }
+        | CatalogCommand::ApplyPreparedCollectionOperation { .. }
         | CatalogCommand::ApplyRatingDecay { .. }
         | CatalogCommand::ReadSnapshot { .. }
         | CatalogCommand::Remove { .. }
@@ -2880,6 +2924,11 @@ fn command_curation_payload_bytes(command: &CatalogCommand) -> usize {
             batches,
             ..
         } => curation::operation_payload_bytes(root_identity, batches),
+        CatalogCommand::ApplyPreparedCollectionOperation { operation } => operation
+            .group()
+            .source_observation()
+            .charged_bytes()
+            .saturating_mul(2),
         CatalogCommand::ApplyRatingDecay { root_identity, .. } => {
             rating_decay::command_payload_bytes(root_identity)
         }
@@ -2892,6 +2941,9 @@ fn command_curation_update_count(command: &CatalogCommand) -> usize {
         CatalogCommand::ApplyCurationOperation { batches, .. } => {
             batches.iter().map(Vec::len).sum()
         }
+        CatalogCommand::ApplyPreparedCollectionOperation { operation } => {
+            operation.group().source_observation().changes().len()
+        }
         CatalogCommand::ApplyRatingDecay { .. } => rating_decay::PAGE_SIZE,
         _ => 0,
     }
@@ -2902,6 +2954,7 @@ fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
         CatalogCommand::RequestHarvestFilter { request, .. } => request.input_bytes(),
         CatalogCommand::RequestHarvestFacts { request, .. } => request.input_bytes(),
         CatalogCommand::RequestCollectionHistory { request, .. } => request.input_bytes(),
+        CatalogCommand::RequestCollectionHistoryGroup { request, .. } => request.input_bytes(),
         CatalogCommand::RequestSimilarity { request, .. } => request.input_bytes(),
         CatalogCommand::ConsumeReplay { submission } => submission.input_bytes(),
         CatalogCommand::RequestIndexInspection { handle, .. } => handle.input_bytes(),
@@ -2981,6 +3034,9 @@ fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, Cat
         }
         CatalogCommand::RequestHarvestFacts { .. } => Ok(harvest_facts::MAX_RESULT_BYTES),
         CatalogCommand::RequestCollectionHistory { .. } => Ok(history_selection::MAX_RESULT_BYTES),
+        CatalogCommand::RequestCollectionHistoryGroup { request, .. } => {
+            Ok(request.charged_bytes())
+        }
         CatalogCommand::RequestSimilarity { .. } => Ok(similarity_dispatch::MAX_RESULT_BYTES),
         CatalogCommand::RequestIndexPage { .. } | CatalogCommand::RequestIndexInspection { .. } => {
             Ok(MAX_INDEX_PAGE_PAYLOAD_BYTES)
@@ -3075,6 +3131,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestFeatureAnalysis { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
+        | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::RequestSimilarity { .. } => AdmissionAction::RequestWavMetadata,
         CatalogCommand::RequestIndexPage {
             source_id,
@@ -3094,6 +3151,17 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         CatalogCommand::RequestCurationTagFacts { .. }
         | CatalogCommand::RequestHarvestFilter { .. }
         | CatalogCommand::RequestHarvestFacts { .. } => AdmissionAction::RequestCurationTagFacts,
+        CatalogCommand::ApplyPreparedCollectionOperation { operation } => {
+            AdmissionAction::ApplyCurationOperation {
+                source_id: operation
+                    .group()
+                    .source_observation()
+                    .revision()
+                    .source_id()
+                    .clone(),
+                request_id: operation.request_id(),
+            }
+        }
         CatalogCommand::ApplyCuration { .. } => AdmissionAction::ApplyCuration,
         CatalogCommand::ApplyCurationOperation {
             source_id,
@@ -4175,6 +4243,29 @@ fn handle_command(
                 AuditTrigger::Explicit,
                 test_gate,
                 watcher_mode,
+            );
+            false
+        }
+        CatalogCommand::RequestCollectionHistoryGroup {
+            request,
+            cancellation,
+        } => {
+            history_selection::dispatch_group(
+                request,
+                cancellation,
+                reservation,
+                admission,
+                sources,
+            );
+            false
+        }
+        CatalogCommand::ApplyPreparedCollectionOperation { operation } => {
+            history_selection::dispatch_prepared(
+                operation,
+                profile_guard,
+                reservation,
+                admission,
+                sources,
             );
             false
         }
@@ -16136,6 +16227,9 @@ mod tests {
             (true, false)
         );
     }
+    #[cfg(test)]
+    #[cfg(feature = "test-support")]
+    mod collection_history_group_tests;
     #[cfg(feature = "test-support")]
     mod compound_batch_fault;
     #[cfg(target_os = "linux")]

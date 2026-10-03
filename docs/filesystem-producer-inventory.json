@@ -124,6 +124,66 @@
       "retirement": "Replace with the capability-bound artifact store and remove the legacy call; a contract fixture alone is insufficient."
     },
     {
+      "path": "crates/yield-catalog/src/tests/collection_history_group_tests.rs",
+      "function": "queued_refusal",
+      "operation": "fs::copy",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2232",
+      "reason": "Feature-gated automated test nested under cfg(test); mutates only an isolated tempfile root or explicitly owned fixture profile to prove queued source/root/main/database-child replacement refuses collection SQL. Copy replaces a fixture main inode; sentinel bytes are verified untouched; cleanup restores/removes only fixture paths.",
+      "retirement": "Retain only while the exact automated ownership-substitution fixture exists; remove entries with removed fixture calls. Grants no runtime filesystem, publication or physical reserve authority."
+    },
+    {
+      "path": "crates/yield-catalog/src/tests/collection_history_group_tests.rs",
+      "function": "queued_refusal",
+      "operation": "fs::create_dir",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2232",
+      "reason": "Feature-gated automated test nested under cfg(test); mutates only an isolated tempfile root or explicitly owned fixture profile to prove queued source/root/main/database-child replacement refuses collection SQL. Copy replaces a fixture main inode; sentinel bytes are verified untouched; cleanup restores/removes only fixture paths.",
+      "retirement": "Retain only while the exact automated ownership-substitution fixture exists; remove entries with removed fixture calls. Grants no runtime filesystem, publication or physical reserve authority."
+    },
+    {
+      "path": "crates/yield-catalog/src/tests/collection_history_group_tests.rs",
+      "function": "queued_refusal",
+      "operation": "fs::remove_dir_all",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2232",
+      "reason": "Feature-gated automated test nested under cfg(test); mutates only an isolated tempfile root or explicitly owned fixture profile to prove queued source/root/main/database-child replacement refuses collection SQL. Copy replaces a fixture main inode; sentinel bytes are verified untouched; cleanup restores/removes only fixture paths.",
+      "retirement": "Retain only while the exact automated ownership-substitution fixture exists; remove entries with removed fixture calls. Grants no runtime filesystem, publication or physical reserve authority."
+    },
+    {
+      "path": "crates/yield-catalog/src/tests/collection_history_group_tests.rs",
+      "function": "queued_refusal",
+      "operation": "fs::remove_file",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2232",
+      "reason": "Feature-gated automated test nested under cfg(test); mutates only an isolated tempfile root or explicitly owned fixture profile to prove queued source/root/main/database-child replacement refuses collection SQL. Copy replaces a fixture main inode; sentinel bytes are verified untouched; cleanup restores/removes only fixture paths.",
+      "retirement": "Retain only while the exact automated ownership-substitution fixture exists; remove entries with removed fixture calls. Grants no runtime filesystem, publication or physical reserve authority."
+    },
+    {
+      "path": "crates/yield-catalog/src/tests/collection_history_group_tests.rs",
+      "function": "queued_refusal",
+      "operation": "fs::rename",
+      "count": 5,
+      "classification": "fixture",
+      "issue": "OPT-2232",
+      "reason": "Feature-gated automated test nested under cfg(test); mutates only an isolated tempfile root or explicitly owned fixture profile to prove queued source/root/main/database-child replacement refuses collection SQL. Copy replaces a fixture main inode; sentinel bytes are verified untouched; cleanup restores/removes only fixture paths.",
+      "retirement": "Retain only while the exact automated ownership-substitution fixture exists; remove entries with removed fixture calls. Grants no runtime filesystem, publication or physical reserve authority."
+    },
+    {
+      "path": "crates/yield-catalog/src/tests/collection_history_group_tests.rs",
+      "function": "queued_refusal",
+      "operation": "fs::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2232",
+      "reason": "Feature-gated automated test nested under cfg(test); mutates only an isolated tempfile root or explicitly owned fixture profile to prove queued source/root/main/database-child replacement refuses collection SQL. Copy replaces a fixture main inode; sentinel bytes are verified untouched; cleanup restores/removes only fixture paths.",
+      "retirement": "Retain only while the exact automated ownership-substitution fixture exists; remove entries with removed fixture calls. Grants no runtime filesystem, publication or physical reserve authority."
+    },
+    {
       "path": "crates/yield-library/src/app_dirs/overrides.rs",
       "function": "set",
       "operation": "fs::create_dir_all",
