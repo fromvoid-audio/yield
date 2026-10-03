@@ -14,7 +14,9 @@ use crate::update_catalog::{Channel, Platform};
 
 mod catalog;
 mod protocol;
+mod verification;
 use catalog::{Installed, Release};
+pub use verification::VerifiedPayload;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -241,6 +243,16 @@ pub struct PayloadAssetIdentity<'a> {
     pub sha256: [u8; 32],
 }
 impl SelectedPayload {
+    /// Verify downloaded bytes off the UI thread against this exact live selection and compiled
+    /// trust pin. This grants immutable byte custody only, never staging paths or installation.
+    pub fn verify_retained(
+        self,
+        archive: Vec<u8>,
+        checksums: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> Result<VerifiedPayload, SelectionError> {
+        verification::verify(self, archive, checksums, signature)
+    }
     /// Observe complete identity only while the original factory/request/cancellation remains live.
     pub fn identity(&self) -> Result<PayloadIdentity<'_>, SelectionError> {
         self.ensure_live()?;

@@ -491,7 +491,11 @@ pub(super) fn asset_name(
 }
 
 pub(super) fn bounded_json(bytes: &[u8]) -> bool {
-    if bytes.len() as u64 > MAX_BYTES {
+    bounded_json_limit(bytes, MAX_BYTES)
+}
+
+pub(super) fn bounded_json_limit(bytes: &[u8], limit: u64) -> bool {
+    if bytes.len() as u64 > limit {
         return false;
     }
     let (mut depth, mut string, mut escape, mut text) = (0u32, false, false, 0usize);
