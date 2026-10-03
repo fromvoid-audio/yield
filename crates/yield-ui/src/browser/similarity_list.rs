@@ -7,7 +7,7 @@ use yield_design::Theme;
 use yield_library::sample_sources::SourcePublicationFence;
 use yield_session::{
     CatalogCommand, CatalogEvent, SimilarityAspect, SimilarityCancellation,
-    SimilarityCandidateOutcome, SourceSimilarityRequest, SourceSimilarityResult,
+    SourceSimilarityRequest, SourceSimilarityResult, SourceSimilarityRow,
 };
 
 pub(super) const ASPECTS: [(SimilarityAspect, &str); 5] = [
@@ -22,7 +22,61 @@ pub(super) const ASPECTS: [(SimilarityAspect, &str); 5] = [
 pub(super) struct SimilarityListState {
     next_generation: u64,
     active: Option<Projection>,
+    settings: AspectSettings,
 }
+#[derive(Clone, Copy)]
+struct AspectControl {
+    enabled: bool,
+    weight: f32,
+}
+struct AspectSettings {
+    weighting_enabled: bool,
+    controls: [AspectControl; 5],
+}
+impl Default for AspectSettings {
+    fn default() -> Self {
+        Self {
+            weighting_enabled: false,
+            controls: [AspectControl {
+                enabled: true,
+                weight: 1.0,
+            }; 5],
+        }
+    }
+}
+impl AspectSettings {
+    fn effective_score(&self, scores: &[Option<f32>; 5]) -> Option<f32> {
+        let finite =
+            |score: Option<f32>| score.filter(|s| s.is_finite()).map(|s| s.clamp(-1.0, 1.0));
+        let raw = finite(scores[SimilarityAspect::Overall.index()])?;
+        if !self.weighting_enabled {
+            return Some(raw);
+        }
+        let mut sum = 0.0;
+        let mut weight = 0.0;
+        for (index, control) in self.controls.iter().enumerate() {
+            if control.enabled && control.weight > f32::EPSILON {
+                if let Some(score) = finite(scores[index]) {
+                    sum += score * control.weight;
+                    weight += control.weight;
+                }
+            }
+        }
+        Some(if weight <= f32::EPSILON {
+            raw
+        } else {
+            (sum / weight).clamp(-1.0, 1.0)
+        })
+    }
+}
+fn normalized_weight(weight: f32) -> f32 {
+    if weight.is_finite() {
+        weight.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
 #[derive(Clone)]
 struct ViewBinding {
     context: CatalogMetadataContext,
@@ -175,6 +229,42 @@ impl Projection {
     }
 }
 impl Browser {
+    fn set_similarity_aspect_enabled(
+        &mut self,
+        aspect: SimilarityAspect,
+        enabled: bool,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if control_is_current(self, generation) {
+            self.similarity_list.settings.controls[aspect.index()].enabled = enabled;
+            cx.notify();
+        }
+    }
+    fn set_similarity_aspect_weight(
+        &mut self,
+        aspect: SimilarityAspect,
+        weight: f32,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if control_is_current(self, generation) {
+            self.similarity_list.settings.controls[aspect.index()].weight =
+                normalized_weight(weight);
+            cx.notify();
+        }
+    }
+    fn set_similarity_aspect_weighting_enabled(
+        &mut self,
+        enabled: bool,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if control_is_current(self, generation) {
+            self.similarity_list.settings.weighting_enabled = enabled;
+            cx.notify();
+        }
+    }
     /// Toggle one audited row's anchor; every aspect change gets a fresh request.
     pub(super) fn toggle_similarity_anchor(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.similarity_list.active.as_ref().is_some_and(|p| {
@@ -460,13 +550,74 @@ pub(super) fn render(browser: &Browser, theme: &Theme, cx: &mut Context<Browser>
                 })),
         );
     }
-    panel = panel.child(controls).child(projection.status.clone());
+    let enabled = browser.similarity_list.settings.weighting_enabled;
+    panel = panel.child(controls).child(
+        div()
+            .id("sample-similarity-weighting")
+            .debug_selector(|| "sample-similarity-weighting".into())
+            .cursor_pointer()
+            .child(if enabled {
+                "Aspect weighting: on"
+            } else {
+                "Aspect weighting: off"
+            })
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.set_similarity_aspect_weighting_enabled(!enabled, generation, cx)
+            })),
+    );
+    for (index, (aspect, name)) in ASPECTS.into_iter().enumerate() {
+        let control = browser.similarity_list.settings.controls[index];
+        let mut row = div()
+            .flex()
+            .gap(px(8.))
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "sample-similarity-enable-{index}"
+                    )))
+                    .debug_selector(move || format!("sample-similarity-enable-{index}"))
+                    .cursor_pointer()
+                    .child(format!(
+                        "{} {name}",
+                        if control.enabled { "☑" } else { "☐" }
+                    ))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.set_similarity_aspect_enabled(aspect, !control.enabled, generation, cx)
+                    })),
+            )
+            .child(format!("{:.2}", control.weight));
+        for (label, delta) in [("minus", -0.25), ("plus", 0.25)] {
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "sample-similarity-weight-{label}-{index}"
+                    )))
+                    .debug_selector(move || format!("sample-similarity-weight-{label}-{index}"))
+                    .cursor_pointer()
+                    .child(if delta < 0.0 { "−" } else { "+" })
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.set_similarity_aspect_weight(
+                            aspect,
+                            control.weight + delta,
+                            generation,
+                            cx,
+                        )
+                    })),
+            );
+        }
+        panel = panel.child(row);
+    }
+    panel = panel
+        .child(if enabled {
+            "Rank by weighted aspects"
+        } else {
+            "Rank by Overall"
+        })
+        .child(projection.status.clone());
     if let Some(result) = &projection.result {
-        for (index, row) in result.rows().iter().enumerate() {
-            let score = match row.outcome() {
-                SimilarityCandidateOutcome::Scored(score) => format!("{score:.3}"),
-                SimilarityCandidateOutcome::Unavailable => "Unavailable".into(),
-            };
+        let rows = ranked_rows(&browser.similarity_list.settings, result);
+        for (index, (row, value)) in rows.iter().enumerate() {
+            let score = value.map_or_else(|| "Unavailable".into(), |score| format!("{score:.3}"));
             panel = panel.child(
                 div()
                     .id(SharedString::from(format!("sample-similarity-row-{index}")))
@@ -479,6 +630,26 @@ pub(super) fn render(browser: &Browser, theme: &Theme, cx: &mut Context<Browser>
         }
     }
     panel.into_any_element()
+}
+fn ranked_rows<'a>(
+    settings: &AspectSettings,
+    result: &'a SourceSimilarityResult,
+) -> Vec<(&'a SourceSimilarityRow, Option<f32>)> {
+    // At most64 borrowed rows; preserve immutable owner result and its publication custody.
+    let mut rows = result
+        .rows()
+        .iter()
+        .map(|row| (row, settings.effective_score(row.aspect_scores())))
+        .collect::<Vec<_>>();
+    rows.sort_by(|(a, sa), (b, sb)| match (sa, sb) {
+        (Some(a_score), Some(b_score)) => b_score
+            .total_cmp(a_score)
+            .then_with(|| a.target().relative_path.cmp(&b.target().relative_path)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.target().relative_path.cmp(&b.target().relative_path),
+    });
+    rows
 }
 fn control_is_current(browser: &Browser, generation: u64) -> bool {
     browser
@@ -509,3 +680,5 @@ fn label(path: &str) -> String {
 #[cfg(test)]
 #[path = "similarity_list_tests.rs"]
 mod tests;
+#[cfg(test)]
+use yield_session::SimilarityCandidateOutcome;
