@@ -508,6 +508,24 @@ impl SourceLeaseReservation {
         &self.lock_identity
     }
 
+    /// Observe the original retained reservation lock; no source lease or capacity authority.
+    pub(crate) fn observation_lock_facts(
+        &self,
+        profile: &WritableProfileGuard,
+        binding: &DatabaseFileBinding,
+    ) -> Result<(u64, crate::durable_capacity::VolumeFacts), SourceLeaseError> {
+        self.validate_before_open(profile, binding)?;
+        let bytes = self
+            .lock_file
+            .metadata()
+            .map_err(|e| map_lock_io(&self.lock_path, e))?
+            .len();
+        let facts = crate::durable_capacity::descriptor_capacity_facts(&self.lock_file)
+            .map_err(|e| map_lock_io(&self.lock_path, io::Error::other(e.to_string())))?;
+        self.validate_before_open(profile, binding)?;
+        Ok((bytes, facts))
+    }
+
     /// Acquire the source sidecar lock after profile/root proof and before SQLite opens.
     pub(crate) fn acquire(
         database_root: Arc<BoundDatabaseRoot>,

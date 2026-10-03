@@ -27,7 +27,9 @@ mod index_entries;
 mod index_inspection;
 mod legacy_observation;
 pub use legacy_observation::{
-    LegacyObservationError, LegacySourceImage, LegacySourcePagerObservation, LegacySourceReadOwner,
+    LegacyAllocationObject, LegacyAllocationRole, LegacyAllocationVolume,
+    LegacyCommonAllocationObservation, LegacyObservationError, LegacySourceImage,
+    LegacySourcePagerObservation, LegacySourceReadOwner,
 };
 mod open;
 mod open_profiles;
