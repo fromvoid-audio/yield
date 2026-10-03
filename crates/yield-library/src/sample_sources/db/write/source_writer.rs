@@ -748,6 +748,7 @@ pub struct SourceWriter {
     wal_timeout_restore_fault: Option<Arc<std::sync::atomic::AtomicBool>>,
     feature_publication_metrics: SourceFeaturePublicationMetrics,
     reference_liveness: Arc<()>,
+    registry_handoff_custody: super::super::source_registry_handoff::WriterCustody,
     feature_rebuild_metrics: FeatureRebuildMetrics,
     feature_maintenance_metrics: FeatureMaintenanceMetrics,
     database: SourceDatabase,
@@ -1529,6 +1530,7 @@ impl SourceWriter {
             wal_timeout_restore_fault: None,
             feature_publication_metrics: SourceFeaturePublicationMetrics::default(),
             reference_liveness: Arc::new(()),
+            registry_handoff_custody: super::super::source_registry_handoff::WriterCustody::new(),
             feature_rebuild_metrics: FeatureRebuildMetrics::default(),
             feature_maintenance_metrics: FeatureMaintenanceMetrics::default(),
             database,
@@ -1602,6 +1604,37 @@ impl SourceWriter {
             }
         }
         Ok(observation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registry_handoff_gate_for_tests(
+        &self,
+    ) -> Arc<super::super::source_authority::SourceEffectGate> {
+        self.registry_handoff_custody.gate()
+    }
+
+    /// Capture an opaque metadata handoff from this exact live writer and registration.
+    /// No physical capacity, file effect or admitted SQL permission is issued.
+    pub fn prepare_registry_metadata_handoff(
+        &self,
+        registration: &super::super::SourceAuthorityRegistration,
+        receipt: super::super::SourceAuthorityRegistrationReceipt,
+        deadline: std::time::Instant,
+    ) -> Result<
+        super::super::SourceRegistryMetadataCandidate,
+        super::super::SourceRegistryMetadataHandoffError,
+    > {
+        let credit = super::super::source_registry_handoff::capture_credit(deadline)?;
+        let observation = self.capture_registry_reference_observation(Some(registration))?;
+        super::super::source_registry_handoff::SourceRegistryMetadataCandidate::capture(
+            observation,
+            registration,
+            receipt,
+            Arc::downgrade(&self.reference_liveness),
+            self.registry_handoff_custody.gate(),
+            deadline,
+            credit,
+        )
     }
 
     /// Observe a live scan position without asserting completed manifest coverage.

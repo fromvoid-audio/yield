@@ -49,6 +49,9 @@ held reservation or reinterpret pre-intent abort/deadline as post-intent release
 OPT-2136 and required-commit permissions must implement this before2195 effects.
 
 Add library-owned opaque candidate/validation APIs beside `source_authority.rs`.
+OPT-2193 now implements that narrow authenticated handoff API and original-writer/
+journal-registration custody; see [its implementation boundary](SOURCE_REGISTRY_METADATA_HANDOFF.md).
+The admitted global SQL consumer and catalog lifecycle routing remain OPT-2195/2197.
 Catalog requests a candidate from its retained writer and registration; library
 code must match the exact registered receipt, registration state and retained
 source subject. Journal validates that registration is complete, rather than
