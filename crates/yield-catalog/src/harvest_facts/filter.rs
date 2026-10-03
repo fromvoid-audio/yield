@@ -152,3 +152,5 @@ impl CatalogHarvestFilter {
 }
 mod producer;
 pub(crate) use producer::dispatch;
+
+pub(crate) mod lifetime;

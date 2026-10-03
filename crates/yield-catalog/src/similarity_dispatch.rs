@@ -287,11 +287,22 @@ pub(super) fn dispatch(
         });
         return;
     }
+    let preserve_harvest = state
+        .sources
+        .get(&request.source_id)
+        .and_then(|s| s.attempt_token.as_ref())
+        .is_some_and(|token| {
+            state
+                .retained_harvest
+                .owns(&request.source_id, request.lifecycle, token)
+        });
     let live = state
         .sources
         .get_mut(&request.source_id)
         .expect("checked source");
-    if let Some(previous) = live.attempt_token.replace(Arc::clone(&cancellation.0)) {
+    if let Some(previous) = live.attempt_token.replace(Arc::clone(&cancellation.0))
+        && !preserve_harvest
+    {
         previous.store(true, Ordering::Release);
     }
     drop(state);

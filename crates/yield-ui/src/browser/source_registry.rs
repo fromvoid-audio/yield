@@ -944,6 +944,7 @@ impl Browser {
             .set_curation_queue(&self.entries, yield_core::CurationQueueMode::default());
         tag_filter::reinstall_after_projection(self, cx);
         curation_queue::reinstall_after_projection(self, cx);
+        super::harvest_filter::reinstall_after_projection(self, cx);
         self.reset_collection_filter();
         self.selected = None;
         self.folder_tree = None;

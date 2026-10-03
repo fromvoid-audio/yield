@@ -253,6 +253,15 @@ pub(crate) fn dispatch_group(
     if state.shutdown || state.closed {
         return;
     }
+    let preserve_harvest = state
+        .sources
+        .get(&request.source_id)
+        .and_then(|s| s.attempt_token.as_ref())
+        .is_some_and(|token| {
+            state
+                .retained_harvest
+                .owns(&request.source_id, request.lifecycle, token)
+        });
     let Some(live) = state
         .sources
         .get_mut(&request.source_id)
@@ -262,6 +271,7 @@ pub(crate) fn dispatch_group(
     };
     if let Some(previous) = live.attempt_token.replace(Arc::clone(&cancellation.0))
         && !Arc::ptr_eq(&previous, &cancellation.0)
+        && !preserve_harvest
     {
         previous.store(true, Ordering::Release);
     }
