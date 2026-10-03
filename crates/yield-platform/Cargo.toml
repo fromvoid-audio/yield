@@ -16,6 +16,13 @@ test-support = []
 yield-core.workspace = true
 url = "=2.5.8"
 webpki-roots = "=0.26.11"
+base64 = "=0.22.1"
+crc32fast = "=1.5.1"
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
+flate2 = "=1.1.10"
+sha2 = "=0.10.9"
+unicode-normalization = "=0.1.25"
+unicode-casefold = "=0.2.0"
 raw-window-handle.workspace = true
 ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -71,3 +78,4 @@ windows-core = { version = "=0.62.2" }
 
 [dev-dependencies]
 gpui.workspace = true
+tempfile.workspace = true
