@@ -2,6 +2,7 @@
 // invents a production reservation, sealed all-owner latch or physical allocation guarantee.
 mod exact_database_claim_persistence {
     include!("database_attempt_metadata_tests.rs");
+    include!("database_attempts_tests.rs");
     use super::*;
     use crate::operation_journal::database_claims::{
         ClaimDirection, DatabaseBinding, DatabaseClaimInventory, DatabaseClaimSlice,
@@ -995,7 +996,7 @@ mod exact_database_claim_persistence {
                 .receipt()
                 .is_some()
         );
-        store.connection.execute_batch("DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; PRAGMA user_version=10").unwrap();
+        store.connection.execute_batch("DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; PRAGMA user_version=10").unwrap();
         drop(store);
         let store = OperationJournalStore::open(&f.owner).unwrap();
         assert_eq!(
@@ -1003,7 +1004,7 @@ mod exact_database_claim_persistence {
                 .connection
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            11
+            JOURNAL_SCHEMA_VERSION as i64
         );
         assert_eq!(
             store.get(record.operation_id).unwrap(),

@@ -2435,7 +2435,7 @@ mod tests {
             .join(super::super::JOURNAL_DATABASE_FILE_NAME);
         drop(store);
 
-        let key = "k".repeat(MAX_RECOVERY_BYTES_PER_PAGE);
+        let key = "k".repeat(super::super::SQLITE_VALUE_LIMIT as usize + 1);
         let connection = rusqlite::Connection::open(&path).expect("open fixture database");
         connection
             .execute(

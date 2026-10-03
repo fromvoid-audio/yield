@@ -264,6 +264,13 @@ impl OperationJournalStore {
         record: &crate::operation_journal::StoredOperationRecord,
     ) -> Result<(), OperationJournalStoreError> {
         self.configure_recording_metadata_policy()?;
+        self.validate_database_claim_metadata_volume(record)
+    }
+    /// Read-only restart/readback check. Historical observations never change pager policy.
+    pub(super) fn validate_database_claim_metadata_volume(
+        &self,
+        record: &crate::operation_journal::StoredOperationRecord,
+    ) -> Result<(), OperationJournalStoreError> {
         let opened = crate::sample_sources::db::sqlite_identity::open_existing_database_file(
             &self.database_root,
             std::path::Path::new(super::JOURNAL_DATABASE_FILE_NAME),
@@ -283,7 +290,7 @@ impl OperationJournalStore {
                 "complete journal/rollback peak not covered on actual descriptor volume",
             ));
         }
-        self.validate_namespace()?;
+        self.validate_namespace_for_precommit()?;
         Ok(())
     }
     pub(crate) fn read_database_claim_inventory(
@@ -304,7 +311,7 @@ impl OperationJournalStore {
         Ok(value)
     }
     /// Compare the immutable intent and original aggregate ledger during restart or lost-reply readback.
-    fn validate_database_claim_operation(
+    pub(super) fn validate_database_claim_operation(
         &self,
         operation: OperationId,
         inventory: &DatabaseClaimInventory,

@@ -23,7 +23,9 @@ pub(crate) enum DatabaseRole {
     Source = 1,
     Global = 2,
 }
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub(crate) enum ClaimDirection {
     Routine = 0,
@@ -31,7 +33,7 @@ pub(crate) enum ClaimDirection {
     RequiredCompensation = 2,
     LeaseMaintenance = 3,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub(crate) enum RevisionDomain {
     SourceAuthoritative = 1,
@@ -712,6 +714,14 @@ pub(crate) fn command_digest(
     requirement: u8,
 ) -> Result<[u8; 32]> {
     require(matches!(requirement, 1 | 2), "requirement tag")?;
+    let family = command_bytes(record)?;
+    let mut hasher = blake3::Hasher::new_derive_key("yield.database-command-family.v1");
+    hasher.update(&record.schema_version.to_le_bytes());
+    hasher.update(&[requirement]);
+    hasher.update(&family);
+    Ok(*hasher.finalize().as_bytes())
+}
+pub(crate) fn command_bytes(record: &super::codec::StoredOperationRecord) -> Result<Vec<u8>> {
     let encoded = super::codec::encode(record)
         .map_err(|_| DatabaseClaimError("unsupported operation codec"))?;
     let value: serde_json::Value =
@@ -722,12 +732,7 @@ pub(crate) fn command_digest(
         .ok_or(DatabaseClaimError(
             "untyped legacy command cannot bind database claims",
         ))?;
-    let family = serde_json::to_vec(args).map_err(|_| DatabaseClaimError("command encoding"))?;
-    let mut hasher = blake3::Hasher::new_derive_key("yield.database-command-family.v1");
-    hasher.update(&record.schema_version.to_le_bytes());
-    hasher.update(&[requirement]);
-    hasher.update(&family);
-    Ok(*hasher.finalize().as_bytes())
+    serde_json::to_vec(args).map_err(|_| DatabaseClaimError("command encoding"))
 }
 fn put_string(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u16).to_le_bytes());
