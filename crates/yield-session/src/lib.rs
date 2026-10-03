@@ -671,7 +671,7 @@ impl SourceRegistryService {
         )
     }
 
-    /// Start a portable registry fixture with real profile/SQLite ownership but no reserve.
+    /// Start a portable metadata/catalog fixture with real profile/SQLite ownership but no reserve.
     /// This seam is compiled only in this crate's tests; normal startup remains qualified.
     #[cfg(test)]
     fn start_portable_registry_for_test(app_root: PathBuf) -> Result<Self, StartError> {
@@ -685,18 +685,6 @@ impl SourceRegistryService {
         initialization_gate: Arc<std::sync::Barrier>,
     ) -> Result<Self, StartError> {
         Self::start_inner_with_initialization_gate(Some(app_root), Some(initialization_gate), true)
-    }
-
-    #[cfg(test)]
-    fn start_inner_with_initialization_gate_for_test(
-        app_root_override: Option<PathBuf>,
-        initialization_gate: Arc<std::sync::Barrier>,
-    ) -> Result<Self, StartError> {
-        Self::start_inner_with_initialization_gate(
-            app_root_override,
-            Some(initialization_gate),
-            false,
-        )
     }
 
     fn start_inner_with_initialization_gate(
@@ -3927,7 +3915,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_session_owner_slots(&service);
 
         let journal_path = journal_database_path(&profile_root);
@@ -4230,8 +4219,8 @@ mod tests {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let gate = Arc::new(std::sync::Barrier::new(2));
-        let mut service = SourceRegistryService::start_inner_with_initialization_gate_for_test(
-            Some(profile_root(&temp)),
+        let mut service = SourceRegistryService::start_portable_vocabulary_with_gate_for_test(
+            profile_root(&temp),
             Arc::clone(&gate),
         )
         .expect("service start");
@@ -4263,6 +4252,7 @@ mod tests {
         service.shutdown().expect("shutdown");
     }
 
+    // OPT-2235: requires real native reserve/bootstrap qualification; retain normal startup.
     #[test]
     fn loaded_cache_clear_rejects_source_and_trash_namespace_conflicts() {
         let temp = TempDir::new().expect("config base");
@@ -4339,6 +4329,7 @@ mod tests {
         service.shutdown().expect("shutdown");
     }
 
+    // OPT-2235: requires real native reserve/bootstrap qualification; retain normal startup.
     #[test]
     fn loaded_cache_clear_succeeds_and_releases_admission_for_storage_query() {
         let temp = TempDir::new().expect("config base");
@@ -4369,6 +4360,7 @@ mod tests {
         service.shutdown().expect("shutdown");
     }
 
+    // OPT-2235: requires real native reserve/bootstrap qualification; retain normal startup.
     #[test]
     fn dropping_admitted_cache_clear_is_joined_during_shutdown() {
         let temp = TempDir::new().expect("config base");
@@ -4834,7 +4826,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_catalog_ready(&service);
 
         let app_root_guard = AppRootGuard::set(profile_root.clone()).expect("app root");
@@ -4865,8 +4858,8 @@ mod tests {
         }
         let source_root = fs::canonicalize(source_root).expect("canonical source root");
         let source_id = SourceId::from_string("session-catalog");
-        let mut service =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("service start");
+        let mut service = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("service start");
         wait_for_catalog_ready(&service);
         wait_for_preference_snapshot(&service, |preferences| {
             preferences == &UiPreferences::default()
@@ -4922,8 +4915,8 @@ mod tests {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
-        let mut service =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("service start");
+        let mut service = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("service start");
         service.shutdown().expect("immediate shutdown");
 
         assert_eq!(service.catalog_status(), CatalogStatus::Closed);
@@ -4955,7 +4948,8 @@ mod tests {
         let source_root = fs::canonicalize(source_root_path).expect("canonical source root");
         let source_id = SourceId::from_string("session-curation-shutdown");
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_catalog_ready(&service);
         service
             .submit_catalog(CatalogCommand::Register {
@@ -5033,8 +5027,8 @@ mod tests {
         ));
         drop(service);
 
-        let mut reopened =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("reopen service");
         wait_for_catalog_ready(&reopened);
         reopened
             .submit_catalog(CatalogCommand::Register {
@@ -5081,8 +5075,8 @@ mod tests {
         write_test_wav(&source_root_path.join("one.wav"));
         let source_root = fs::canonicalize(source_root_path).expect("canonical source root");
         let source_id = SourceId::from_string("session-compound-catalog-shutdown");
-        let mut service =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("service start");
+        let mut service = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("service start");
         wait_for_catalog_ready(&service);
         service
             .submit_catalog(CatalogCommand::Register {
@@ -5355,7 +5349,8 @@ mod tests {
         fs::create_dir_all(&second_profile).expect("other profile root");
         let second_profile = fs::canonicalize(second_profile).expect("canonical other profile");
         let mut service =
-            SourceRegistryService::start_inner(Some(first_profile.clone())).expect("first start");
+            SourceRegistryService::start_portable_registry_for_test(first_profile.clone())
+                .expect("first start");
         wait_for_preference_snapshot(&service, |preferences| {
             preferences == &UiPreferences::default()
         });
@@ -5375,8 +5370,8 @@ mod tests {
         );
         service.shutdown().expect("first shutdown");
 
-        let mut reopened =
-            SourceRegistryService::start_inner(Some(first_profile)).expect("reopen first");
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(first_profile)
+            .expect("reopen first");
         let restored = wait_for_preference_snapshot(&reopened, |preferences| {
             preferences.collection_names[4].as_deref() == Some("Textures")
         });
@@ -5389,8 +5384,8 @@ mod tests {
         );
         reopened.shutdown().expect("reopen shutdown");
 
-        let mut other =
-            SourceRegistryService::start_inner(Some(second_profile)).expect("other profile start");
+        let mut other = SourceRegistryService::start_portable_registry_for_test(second_profile)
+            .expect("other profile start");
         let isolated = wait_for_preference_snapshot(&other, |preferences| {
             preferences == &UiPreferences::default()
         });
@@ -5476,7 +5471,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_preference_snapshot(&service, |preferences| {
             preferences == &UiPreferences::default()
         });
@@ -5495,8 +5491,9 @@ mod tests {
         drop(connection);
         drop(app_root_guard);
 
-        let mut malformed = SourceRegistryService::start_inner(Some(profile_root.clone()))
-            .expect("reopen malformed service");
+        let mut malformed =
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("reopen malformed service");
         wait_for_preference_event(&malformed, |event| {
             matches!(event, PreferenceEvent::LoadFailed { .. })
         });
@@ -5629,8 +5626,8 @@ mod tests {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
-        let mut service =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("service start");
+        let mut service = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("service start");
         wait_for_event(&service, |event| {
             matches!(event, RegistryEvent::Snapshot { .. })
         });
@@ -5681,7 +5678,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_event(&service, |event| {
             matches!(event, RegistryEvent::Snapshot { .. })
         });
@@ -5711,8 +5709,8 @@ mod tests {
         );
         service.shutdown().expect("shutdown");
 
-        let mut reopened =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let mut reopened = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("reopen service");
         let restored = wait_for_snapshot(&reopened, |snapshot| snapshot.as_slice().is_empty());
         assert!(restored.as_slice().is_empty());
         reopened.shutdown().expect("reopen shutdown");
@@ -5724,7 +5722,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         let source_root = root(&temp, "undrained");
         service.add_root(source_root).expect("add");
         service
@@ -5740,12 +5739,13 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut owner =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("owner service");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("owner service");
         wait_for_event(&owner, |event| {
             matches!(event, RegistryEvent::Snapshot { .. })
         });
-        let mut contender =
-            SourceRegistryService::start_inner(Some(profile_root)).expect("contender service");
+        let mut contender = SourceRegistryService::start_portable_registry_for_test(profile_root)
+            .expect("contender service");
         wait_for_event(&contender, |event| {
             matches!(event, RegistryEvent::PersistenceUnavailable { .. })
         });
@@ -5756,6 +5756,7 @@ mod tests {
         owner.shutdown().expect("owner shutdown");
     }
 
+    // OPT-2235: requires real native reserve/bootstrap qualification; retain normal startup.
     #[test]
     fn competing_profile_restarts_only_after_orderly_volume_handoff() {
         let temp = TempDir::new().expect("config base");
@@ -5859,8 +5860,9 @@ mod tests {
             ));
         }
 
-        let mut contender = SourceRegistryService::start_inner(Some(profile_root.clone()))
-            .expect("contender service");
+        let mut contender =
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("contender service");
         wait_for_event(&contender, |event| {
             matches!(
                 event,
@@ -5918,11 +5920,12 @@ mod tests {
     #[test]
     #[ignore = "spawned by the cross-process session ownership test"]
     fn session_owner_process_helper() {
+        // Real cross-process profile/journal ownership only, not physical reserve qualification.
         let profile_root = PathBuf::from(
             std::env::var_os(SESSION_OWNER_PROFILE_ROOT_ENV)
                 .expect("session owner helper profile root"),
         );
-        let mut service = SourceRegistryService::start_inner(Some(profile_root))
+        let mut service = SourceRegistryService::start_portable_registry_for_test(profile_root)
             .expect("session owner helper service");
         wait_for_session_owner_slots(&service);
         println!("{SESSION_OWNER_READY_LINE}");
@@ -5978,7 +5981,8 @@ mod tests {
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root.clone())
+                .expect("service start");
         wait_for_event(&service, |event| {
             matches!(event, RegistryEvent::Snapshot { .. })
         });
@@ -6195,7 +6199,8 @@ mod tests {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let mut service =
-            SourceRegistryService::start_inner(Some(profile_root(&temp))).expect("service start");
+            SourceRegistryService::start_portable_registry_for_test(profile_root(&temp))
+                .expect("service start");
         wait_for_event(&service, |event| {
             matches!(event, RegistryEvent::Snapshot { .. })
         });
