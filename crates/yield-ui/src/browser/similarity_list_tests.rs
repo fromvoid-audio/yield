@@ -182,6 +182,15 @@ mod fixtures {
         yield_catalog::CatalogService,
         yield_catalog::CatalogSnapshot,
     ) {
+        owner_inputs(false)
+    }
+    fn owner_inputs(
+        weighted: bool,
+    ) -> (
+        OwnerFixture,
+        yield_catalog::CatalogService,
+        yield_catalog::CatalogSnapshot,
+    ) {
         let config = tempfile::tempdir().unwrap();
         let base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
         let profile = PersistenceProfileGuard::named("similarity-gpui-owner");
@@ -205,8 +214,21 @@ mod fixtures {
         for i in 0..frames {
             wav.extend_from_slice(&(((i as f64 / 16.).sin() * 12000.) as i16).to_le_bytes());
         }
-        for name in ["anchor.wav", "same.wav", "missing.wav"] {
-            std::fs::write(root.path().join(name), &wav).unwrap();
+        let names = if weighted {
+            vec!["anchor.wav", "same.wav", "missing.wav", "variant.wav"]
+        } else {
+            vec!["anchor.wav", "same.wav", "missing.wav"]
+        };
+        for name in names {
+            let mut payload = wav.clone();
+            if weighted && matches!(name, "same.wav" | "variant.wav") {
+                for (index, chunk) in payload[44..].chunks_exact_mut(2).enumerate() {
+                    let phase = index as f64 / if name == "same.wav" { 16.0 } else { 11.0 };
+                    let sample = phase.sin() * if name == "same.wav" { 2000.0 } else { 12000.0 };
+                    chunk.copy_from_slice(&(sample as i16).to_le_bytes());
+                }
+            }
+            std::fs::write(root.path().join(name), &payload).unwrap();
         }
         let service = yield_catalog::CatalogService::start(&guard).unwrap();
         let id = yield_library::sample_sources::SourceId::from_string("similarity-gpui-owner");
@@ -229,7 +251,12 @@ mod fixtures {
         }) else {
             panic!()
         };
-        for (index, name) in ["anchor.wav", "same.wav"].into_iter().enumerate() {
+        let analyzed = if weighted {
+            vec!["anchor.wav", "same.wav", "variant.wav"]
+        } else {
+            vec!["anchor.wav", "same.wav"]
+        };
+        for (index, name) in analyzed.into_iter().enumerate() {
             service
                 .submit(CatalogCommand::RequestFeatureAnalysis {
                     source_id: id.clone(),
@@ -571,5 +598,186 @@ mod fixtures {
             assert_eq!(view.similarity_list.next_generation, 0);
             assert_eq!(view.selected, None);
         });
+    }
+    #[test]
+    fn weighting_reference_fallback_available_weights_and_nonfinite_inputs() {
+        let mut settings = AspectSettings::default();
+        let scores = [Some(0.9), Some(0.2), None, Some(-0.4), Some(f32::NAN)];
+        assert_eq!(settings.effective_score(&scores), Some(0.9));
+        settings.weighting_enabled = true;
+        settings.controls[0].enabled = false;
+        settings.controls[1].weight = 0.5;
+        settings.controls[3].weight = 0.25;
+        assert!((settings.effective_score(&scores).unwrap() - 0.0).abs() < 1e-6);
+        for c in &mut settings.controls {
+            c.enabled = false;
+        }
+        assert_eq!(settings.effective_score(&scores), Some(0.9));
+        for c in &mut settings.controls {
+            c.enabled = true;
+            c.weight = 0.0;
+        }
+        assert_eq!(settings.effective_score(&scores), Some(0.9));
+        assert_eq!(settings.effective_score(&[None; 5]), None);
+        assert_eq!(settings.effective_score(&[Some(f32::INFINITY); 5]), None);
+        for c in &mut settings.controls {
+            c.weight = f32::EPSILON;
+        }
+        assert_eq!(settings.effective_score(&scores), Some(0.9));
+        settings.weighting_enabled = false;
+        assert_eq!(settings.effective_score(&[Some(2.0); 5]), Some(1.0));
+        settings.weighting_enabled = true;
+        settings.controls[1].weight = 1.0;
+        let clipped = [Some(2.0), Some(-2.0), None, None, None];
+        assert_eq!(settings.effective_score(&clipped), Some(-1.0));
+        assert_eq!(normalized_weight(f32::NAN), 1.0);
+        assert_eq!(normalized_weight(f32::NEG_INFINITY), 1.0);
+        assert_eq!(normalized_weight(-2.0), 0.0);
+        assert_eq!(normalized_weight(3.0), 1.0);
+    }
+    fn weighting_controls_actual(cx: &mut TestAppContext, stale: bool) {
+        let _runtime = yield_library::test_runtime::TestRuntimeGuard::acquire();
+        let (fixture, service, snapshot) = owner_inputs(true);
+        cx.set_global(crate::theme::ActiveTheme::default());
+        cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
+        let (controls, cx) = cx.add_window_view(|_, cx| Controls(cx.new(|cx| Browser::new(cx))));
+        let browser = cx.update(|_, app| controls.read(app).0.clone());
+        browser.update(cx, |v, cx| {
+            install_owned(v, &fixture, &snapshot);
+            v.preferences_task.take();
+            v.source_registry_task.take();
+            v.request_similarity("anchor.wav".into(), SimilarityAspect::Overall, cx);
+            v.source_registry_task.take();
+        });
+        let generation = browser.read_with(cx, |v, _| {
+            v.similarity_list
+                .active
+                .as_ref()
+                .unwrap()
+                .request
+                .generation()
+        });
+        let delivery = next_delivery(cx, generation);
+        browser.update(cx, |v, cx| assert!(v.apply_catalog_delivery(delivery, cx)));
+        let original = browser.read_with(cx, |v, _| {
+            let p = v.similarity_list.active.as_ref().unwrap();
+            let result = p.result.as_ref().unwrap();
+            assert_eq!(result.rows().len(), 3);
+            assert_eq!(
+                result
+                    .rows()
+                    .iter()
+                    .filter(|r| r.aspect_score(SimilarityAspect::Overall).is_some())
+                    .count(),
+                2
+            );
+            result.rows().as_ptr() as usize
+        });
+        let click = |id: &'static str, cx: &mut gpui::VisualTestContext| {
+            draw_controls(&controls, cx);
+            let bounds = cx.debug_bounds(id).unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        };
+        if stale {
+            draw_controls(&controls, cx);
+            let bounds = cx.debug_bounds("sample-similarity-weighting").unwrap();
+            browser.update(cx, |v, _| {
+                v.catalog_activation.as_mut().unwrap().lifecycle_generation += 1;
+            });
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            browser.update(cx, |v, cx| {
+                v.set_similarity_aspect_weighting_enabled(true, generation, cx);
+                v.set_similarity_aspect_enabled(SimilarityAspect::Spectrum, false, generation, cx);
+                v.set_similarity_aspect_weight(SimilarityAspect::Spectrum, 0.0, generation, cx);
+                assert!(!v.similarity_list.settings.weighting_enabled);
+                assert!(v.similarity_list.settings.controls[1].enabled);
+                assert_eq!(v.similarity_list.settings.controls[1].weight, 1.0);
+                invalidate_if_stale(v);
+                assert!(v.similarity_list.active.is_none());
+            });
+        } else {
+            click("sample-similarity-weighting", cx);
+            browser.read_with(cx, |v, _| {
+                assert!(v.similarity_list.settings.weighting_enabled)
+            });
+            for id in [
+                "sample-similarity-enable-0",
+                "sample-similarity-enable-2",
+                "sample-similarity-enable-3",
+                "sample-similarity-enable-4",
+            ] {
+                click(id, cx);
+            }
+            click("sample-similarity-weight-minus-1", cx);
+            browser.read_with(cx, |v, _| {
+                let settings = &v.similarity_list.settings;
+                assert_eq!(settings.controls[1].weight, 0.75);
+                let p = v.similarity_list.active.as_ref().unwrap();
+                let result = p.result.as_ref().unwrap();
+                let rows = ranked_rows(settings, result);
+                for (row, score) in &rows {
+                    assert_eq!(*score, row.aspect_score(SimilarityAspect::Spectrum));
+                }
+                for pair in rows.windows(2) {
+                    if let (Some(a), Some(b)) = (pair[0].1, pair[1].1) {
+                        assert!(a >= b);
+                    }
+                }
+                assert_eq!(
+                    rows.last().unwrap().0.target().relative_path.as_deref(),
+                    Some("missing.wav")
+                );
+                assert!(
+                    rows.iter()
+                        .any(|(row, score)| *score != row.aspect_score(SimilarityAspect::Overall)),
+                    "real descriptor weights must change displayed scores"
+                );
+                assert_eq!(result.rows().as_ptr() as usize, original);
+                assert_eq!(p.request.generation(), generation);
+                assert!(!p.cancellation.is_cancelled());
+            });
+            for _ in 0..3 {
+                click("sample-similarity-weight-minus-1", cx);
+            }
+            browser.read_with(cx, |v, _| {
+                let settings = &v.similarity_list.settings;
+                assert_eq!(settings.controls[1].weight, 0.0);
+                let result = v
+                    .similarity_list
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .result
+                    .as_ref()
+                    .unwrap();
+                for (row, score) in ranked_rows(settings, result) {
+                    assert_eq!(score, row.aspect_score(SimilarityAspect::Overall));
+                }
+            });
+            click("sample-similarity-enable-1", cx); // all disabled, fallback
+            click("sample-similarity-weighting", cx); // master disabled, raw Overall
+            click("sample-similarity-weight-plus-1", cx);
+            browser.update(cx, |v, cx| {
+                assert!(!v.similarity_list.settings.weighting_enabled);
+                v.set_similarity_aspect_weight(
+                    SimilarityAspect::Spectrum,
+                    f32::NAN,
+                    generation,
+                    cx,
+                );
+                assert_eq!(v.similarity_list.settings.controls[1].weight, 1.0);
+            });
+            draw_controls(&controls, cx);
+            assert!(cx.debug_bounds("sample-similarity-row-2").is_some());
+        }
+        cx.update(|_, app| app.update_global::<SourceRegistryGlobal, _>(|g, _| g.shutdown()));
+    }
+    #[gpui::test]
+    fn actual_weighting_enable_weight_master_controls_reuse_owner_result(cx: &mut TestAppContext) {
+        weighting_controls_actual(cx, false);
+    }
+    #[gpui::test]
+    fn actual_weighting_cached_controls_refuse_replaced_context(cx: &mut TestAppContext) {
+        weighting_controls_actual(cx, true);
     }
 }

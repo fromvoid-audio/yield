@@ -1802,29 +1802,65 @@
     },
     {
       "message": "GuiMessage::SetSimilarityAspectEnabled",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/similarity_list.rs",
+        "symbol": "set_similarity_aspect_enabled"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/similarity_list_tests.rs",
+          "symbol": "actual_weighting_enable_weight_master_controls_reuse_owner_result"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/similarity_list_tests.rs",
+          "symbol": "actual_weighting_cached_controls_refuse_replaced_context"
+        }
+      ],
       "owner": "OPT-1719",
-      "note": "Similarity-browser anchor/aspect queries differ from the implemented Similar Sections overlay.",
+      "note": "Actual enable/normalized weight/master controls rerank at most64 retained owner rows in memory. Reference raw Overall fallback and finite available positive-weight blending; exact cached request/view/publication fences. Existing catalog query/result budgets unchanged. Native normal bootstrap/physical controls remain OPT-2165; whole-library/ANN/embedding and tracking OPT-1719/1484 remain open.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
       "message": "GuiMessage::SetSimilarityAspectWeight",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/similarity_list.rs",
+        "symbol": "set_similarity_aspect_weight"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/similarity_list_tests.rs",
+          "symbol": "actual_weighting_enable_weight_master_controls_reuse_owner_result"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/similarity_list_tests.rs",
+          "symbol": "actual_weighting_cached_controls_refuse_replaced_context"
+        }
+      ],
       "owner": "OPT-1719",
-      "note": "Similarity-browser anchor/aspect queries differ from the implemented Similar Sections overlay.",
+      "note": "Actual enable/normalized weight/master controls rerank at most64 retained owner rows in memory. Reference raw Overall fallback and finite available positive-weight blending; exact cached request/view/publication fences. Existing catalog query/result budgets unchanged. Native normal bootstrap/physical controls remain OPT-2165; whole-library/ANN/embedding and tracking OPT-1719/1484 remain open.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
       "message": "GuiMessage::SetSimilarityAspectWeightingEnabled",
-      "state": "gap",
-      "handler": null,
-      "automated_evidence": [],
+      "state": "partial",
+      "handler": {
+        "path": "crates/yield-ui/src/browser/similarity_list.rs",
+        "symbol": "set_similarity_aspect_weighting_enabled"
+      },
+      "automated_evidence": [
+        {
+          "path": "crates/yield-ui/src/browser/similarity_list_tests.rs",
+          "symbol": "actual_weighting_enable_weight_master_controls_reuse_owner_result"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/similarity_list_tests.rs",
+          "symbol": "actual_weighting_cached_controls_refuse_replaced_context"
+        }
+      ],
       "owner": "OPT-1719",
-      "note": "Similarity-browser anchor/aspect queries differ from the implemented Similar Sections overlay.",
+      "note": "Actual enable/normalized weight/master controls rerank at most64 retained owner rows in memory. Reference raw Overall fallback and finite available positive-weight blending; exact cached request/view/publication fences. Existing catalog query/result budgets unchanged. Native normal bootstrap/physical controls remain OPT-2165; whole-library/ANN/embedding and tracking OPT-1719/1484 remain open.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
