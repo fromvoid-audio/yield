@@ -2208,6 +2208,7 @@ struct CurationLineage {
 }
 
 struct AdmissionState {
+    retained_harvest: harvest_facts::filter::lifetime::RetainedMasks,
     source_wal: source_wal_preparation::Control,
     queued_commands: usize,
     #[cfg(feature = "test-support")]
@@ -2232,6 +2233,7 @@ impl AdmissionState {
         Self {
             #[cfg(feature = "test-support")]
             compound_batch_fault: None,
+            retained_harvest: Default::default(),
             source_wal: source_wal_preparation::Control::new(),
             queued_commands: 0,
             command_metrics: command_metrics::CommandMetrics::new(),
@@ -2251,6 +2253,7 @@ impl AdmissionState {
     }
 
     fn invalidate_all(&mut self) {
+        self.retained_harvest.cancel_all();
         #[cfg(feature = "test-support")]
         {
             self.compound_batch_fault = None;
@@ -3326,6 +3329,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .get(&source_id)
                 .is_none_or(|source| lifecycle_generation > source.lifecycle_generation);
             if replace {
+                state.retained_harvest.cancel_source(&source_id);
                 #[cfg(feature = "test-support")]
                 test_support::clear_source(state, &source_id);
                 state.active_audits.remove(&source_id);
@@ -3360,6 +3364,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .get(&source_id)
                 .is_none_or(|source| lifecycle_generation >= source.lifecycle_generation);
             if replace {
+                state.retained_harvest.cancel_source(&source_id);
                 #[cfg(feature = "test-support")]
                 test_support::clear_source(state, &source_id);
                 state.active_audits.remove(&source_id);
@@ -3390,6 +3395,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
             state.invalidate_all();
         }
         AdmissionAction::RequestAudit { source_id } => {
+            state.retained_harvest.cancel_source(&source_id);
             if let Some(cancellation) = state.index_inspections.remove(&source_id) {
                 cancellation.cancel();
             }
@@ -3431,17 +3437,46 @@ fn begin_source_attempt(
     source_id: &SourceId,
     lifecycle_generation: u64,
 ) -> Option<Arc<AtomicBool>> {
-    let mut state = admission
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    begin_attempt(admission, source_id, lifecycle_generation, false)
+}
+
+// Ordinary read attempts still supersede one another. Only the explicitly retained Harvest
+// mask survives a different read: it remains fenced to its real source and global generation.
+fn begin_source_read_attempt(
+    admission: &Arc<Mutex<AdmissionState>>,
+    source_id: &SourceId,
+    lifecycle_generation: u64,
+) -> Option<Arc<AtomicBool>> {
+    begin_attempt(admission, source_id, lifecycle_generation, true)
+}
+
+fn begin_attempt(
+    admission: &Arc<Mutex<AdmissionState>>,
+    source_id: &SourceId,
+    lifecycle_generation: u64,
+    read_only: bool,
+) -> Option<Arc<AtomicBool>> {
+    let mut state = admission.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutdown || state.closed {
         return None;
     }
-    let source = state.sources.get_mut(source_id)?;
+    let source = state.sources.get(source_id)?;
     if !source.active || source.lifecycle_generation != lifecycle_generation {
         return None;
     }
-    if let Some(previous) = source.attempt_token.take() {
+    let preserve_previous = read_only
+        && source.attempt_token.as_ref().is_some_and(|token| {
+            state
+                .retained_harvest
+                .owns(source_id, lifecycle_generation, token)
+        });
+    if !read_only {
+        state.retained_harvest.cancel_source(source_id);
+    }
+    let source = state.sources.get_mut(source_id)?;
+    if let Some(previous) = source.attempt_token.take()
+        && !preserve_previous
+    {
         previous.store(true, Ordering::Release);
     }
     let token = Arc::new(AtomicBool::new(false));
@@ -4281,6 +4316,7 @@ fn handle_command(
     watcher_mode: WatcherMode,
     harvest: Option<&HarvestFactsClient>,
 ) -> bool {
+    harvest_facts::filter::lifetime::invalidate_before_write(&command, admission);
     history_selection::invalidate_before_write(&command, admission, sources);
     match command {
         CatalogCommand::RequestHarvestFilter {
@@ -4783,7 +4819,7 @@ fn request_tag_page(
         );
         return;
     }
-    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
+    let Some(token) = begin_source_read_attempt(admission, &source_id, lifecycle_generation) else {
         return;
     };
     let Some(source) = sources.get_mut(&source_id) else {
@@ -4876,7 +4912,7 @@ fn request_tag_assignments(
         );
         return;
     }
-    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
+    let Some(token) = begin_source_read_attempt(admission, &source_id, lifecycle_generation) else {
         return;
     };
     let Some(source) = sources.get_mut(&source_id) else {
@@ -4968,7 +5004,7 @@ fn request_tag_filter(
         );
         return;
     }
-    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
+    let Some(token) = begin_source_read_attempt(admission, &source_id, lifecycle_generation) else {
         return;
     };
     let Some(source) = sources.get_mut(&source_id) else {
@@ -5060,7 +5096,7 @@ fn request_display_labels(
         );
         return;
     }
-    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
+    let Some(token) = begin_source_read_attempt(admission, &source_id, lifecycle_generation) else {
         return;
     };
     let Some(source) = sources.get_mut(&source_id) else {
@@ -5151,7 +5187,7 @@ fn request_curation_tag_facts(
         );
         return;
     }
-    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
+    let Some(token) = begin_source_read_attempt(admission, &source_id, lifecycle_generation) else {
         return;
     };
     let Some(source) = sources.get_mut(&source_id) else {
@@ -5924,7 +5960,7 @@ fn request_wav_metadata(
         );
         return;
     }
-    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
+    let Some(token) = begin_source_read_attempt(admission, &source_id, lifecycle_generation) else {
         return;
     };
     let Some(source) = sources.get_mut(&source_id) else {

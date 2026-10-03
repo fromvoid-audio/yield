@@ -19,7 +19,7 @@ use super::{
     AdmissionState, CatalogError, CatalogSnapshot, CatalogTagAssignmentPreview,
     CatalogTagAssignmentPreviewSource, CatalogTagPageQuery, MAX_TAG_ASSIGNMENT_PREVIEW_BYTES,
     MAX_TAG_ASSIGNMENT_PREVIEW_PATHS, MAX_TAG_ASSIGNMENT_PREVIEW_SOURCES, RegisteredSource,
-    begin_source_attempt, publication_is_current, source_root_identity,
+    begin_source_read_attempt, publication_is_current, source_root_identity,
 };
 
 /// A completed bounded tag read before it is published to the catalog event queue.
@@ -482,7 +482,7 @@ pub(crate) fn read_assignment_preview(
             .as_ref()
             .ok_or(CatalogError::SnapshotUnavailable)?
             .committed_revision;
-        let token = begin_source_attempt(admission, source_id, lifecycle_generation)
+        let token = begin_source_read_attempt(admission, source_id, lifecycle_generation)
             .ok_or(CatalogError::Canceled)?;
         source.attempt_token = Some(Arc::clone(&token));
         let mut cursor = None;

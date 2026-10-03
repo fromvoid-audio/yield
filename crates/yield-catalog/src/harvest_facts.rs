@@ -9,7 +9,7 @@ use yield_library::sample_sources::library::{
     HarvestFactsBatch, HarvestFactsClient, ProfileAcquisitionId,
 };
 mod dispatch;
-mod filter;
+pub(crate) mod filter;
 mod read;
 pub(super) use dispatch::dispatch;
 pub(super) use filter::dispatch as dispatch_filter;

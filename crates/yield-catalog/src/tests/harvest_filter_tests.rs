@@ -44,13 +44,17 @@ fn filter_mask(
     let (event, fence) = filter_delivery(service, id)
         .into_parts_if_live()
         .expect("actual live mask");
-    assert!(fence.unwrap().is_live());
     let CatalogEvent::HarvestFilterCompleted {
         result: Ok(mask), ..
     } = event
     else {
         panic!("{event:?}")
     };
+    assert!(
+        fence
+            .expect("successful mask has a publication fence")
+            .is_live()
+    );
     mask
 }
 #[test]
@@ -181,4 +185,154 @@ fn harvest_filter_actual_stale_revision_and_missing_owner_fail_closed() {
     ));
     service.shutdown();
     drop(fixture);
+}
+
+#[test]
+fn harvest_filter_retained_mask_survives_real_read_lanes_but_not_writes_or_supersession() {
+    let (_fixture, mut global, service, snapshot) = setup();
+    let original = filter_mask(
+        &service,
+        filter_request(&global, &snapshot, 201, HarvestFilterChoice::New),
+    );
+    let paths = snapshot
+        .manifest
+        .iter()
+        .map(|e| e.relative_path.clone())
+        .collect::<Vec<_>>();
+    service
+        .submit(CatalogCommand::RequestTagFilter {
+            source_id: snapshot.source_id.clone(),
+            lifecycle_generation: snapshot.lifecycle_generation,
+            expected_revision: snapshot.committed_revision,
+            request_id: 202,
+            expected_manifest_len: snapshot.manifest.len(),
+            required_tags: vec!["absent-tag".into()],
+        })
+        .unwrap();
+    service
+        .submit(CatalogCommand::RequestCurationTagFacts {
+            source_id: snapshot.source_id.clone(),
+            lifecycle_generation: snapshot.lifecycle_generation,
+            expected_revision: snapshot.committed_revision,
+            request_id: 203,
+            relative_paths: paths.clone(),
+        })
+        .unwrap();
+    service
+        .submit(CatalogCommand::RequestWavMetadata {
+            source_id: snapshot.source_id.clone(),
+            lifecycle_generation: snapshot.lifecycle_generation,
+            expected_revision: snapshot.committed_revision,
+            request_id: 204,
+            relative_paths: paths,
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut reads = 0;
+    while reads < 3 {
+        if let Ok(delivery) = service.recv_delivery_timeout(Duration::from_millis(10)) {
+            let event = delivery
+                .into_event_if_live()
+                .expect("real current read result");
+            match event {
+                CatalogEvent::TagFilterReady {
+                    request_id: 202,
+                    mask,
+                    ..
+                } => {
+                    assert_eq!(mask, vec![0]);
+                    reads += 1;
+                }
+                CatalogEvent::CurationTagFactsReady {
+                    request_id: 203,
+                    entries,
+                    ..
+                } => {
+                    assert_eq!(entries.len(), snapshot.manifest.len());
+                    reads += 1;
+                }
+                CatalogEvent::WavMetadataReady {
+                    request_id: 204, ..
+                } => reads += 1,
+                event => panic!("unexpected read completion: {event:?}"),
+            }
+            assert!(
+                original.is_live(),
+                "read-only lane invalidated retained Harvest"
+            );
+        }
+        assert!(Instant::now() < deadline);
+    }
+    let replacement = filter_mask(
+        &service,
+        filter_request(&global, &snapshot, 205, HarvestFilterChoice::Touched),
+    );
+    assert!(!original.is_live());
+    assert!(replacement.is_live());
+    service
+        .submit(CatalogCommand::ApplyCuration {
+            source_id: snapshot.source_id.clone(),
+            lifecycle_generation: snapshot.lifecycle_generation,
+            expected_revision: snapshot.committed_revision,
+            root_identity: snapshot.root_identity.clone(),
+            request_id: 206,
+            updates: vec![SourceCurationUpdate::SetRating {
+                path: crate::RootRelativePath::try_from_path(
+                    snapshot.manifest[0].relative_path.clone(),
+                )
+                .unwrap(),
+                rating: yield_library::sample_sources::Rating::KEEP_1,
+            }],
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Ok(event) = service.recv_event_timeout(Duration::from_millis(10)) {
+            if let CatalogEvent::CurationCommitted {
+                request_id: 206, ..
+            } = event
+            {
+                break;
+            }
+            panic!("unexpected mutation completion: {event:?}");
+        }
+        assert!(Instant::now() < deadline);
+    }
+    assert!(
+        !replacement.is_live(),
+        "actual committed source mutation kept old Harvest live"
+    );
+    service.shutdown();
+    global.shutdown();
+}
+
+#[test]
+fn harvest_filter_retained_mask_is_canceled_by_source_removal_and_shutdown() {
+    let (_fixture, mut global, service, snapshot) = setup();
+    let mask = filter_mask(
+        &service,
+        filter_request(&global, &snapshot, 301, HarvestFilterChoice::New),
+    );
+    service
+        .submit(CatalogCommand::Remove {
+            source_id: snapshot.source_id.clone(),
+            lifecycle_generation: snapshot.lifecycle_generation,
+        })
+        .unwrap();
+    assert!(
+        !mask.is_live(),
+        "remove admission must invalidate before dequeue"
+    );
+    service.shutdown();
+    global.shutdown();
+    drop(_fixture);
+
+    let (_fixture, mut global, service, snapshot) = setup();
+    let mask = filter_mask(
+        &service,
+        filter_request(&global, &snapshot, 302, HarvestFilterChoice::New),
+    );
+    service.shutdown();
+    assert!(!mask.is_live());
+    global.shutdown();
 }

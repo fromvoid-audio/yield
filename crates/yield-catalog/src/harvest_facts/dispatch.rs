@@ -12,7 +12,7 @@ pub(crate) fn dispatch(
     if cancellation.is_canceled() {
         return;
     }
-    let token = begin_source_attempt(admission, &request.source_id, request.lifecycle);
+    let token = begin_source_read_attempt(admission, &request.source_id, request.lifecycle);
     let mut fence = None;
     let result = if let Some(token) = &token {
         if let Some(source) = sources.get_mut(&request.source_id) {

@@ -13,13 +13,13 @@ pub(crate) fn dispatch(
         return;
     }
     let context = request.context();
-    let token = begin_source_attempt(
+    let token = lifetime::begin(
         admission,
         context.source_id(),
         context.lifecycle_generation(),
     );
     let result = match (token.as_ref(), sources.get_mut(context.source_id())) {
-        (Some(token), Some(source)) => {
+        (Ok(token), Some(source)) => {
             source.attempt_token = Some(Arc::clone(token));
             produce(
                 source,
@@ -31,13 +31,14 @@ pub(crate) fn dispatch(
                 client,
             )
         }
+        (Err(error), _) => Err(*error),
         _ => Err(HarvestFactsFailure::StaleSource),
     };
-    let state = admission.lock().unwrap_or_else(|p| p.into_inner());
+    let mut state = admission.lock().unwrap_or_else(|p| p.into_inner());
     if state.closed
         || state.shutdown
         || cancellation.is_canceled()
-        || token.as_ref().is_some_and(|t| t.load(Ordering::Acquire))
+        || token.as_ref().is_ok_and(|t| t.load(Ordering::Acquire))
     {
         return;
     }
@@ -48,6 +49,15 @@ pub(crate) fn dispatch(
             Err(HarvestFactsFailure::GlobalChanged)
         }
     });
+    if result.is_err()
+        && let Ok(token) = token.as_ref()
+    {
+        state.retained_harvest.discard_failed(
+            context.source_id(),
+            context.lifecycle_generation(),
+            token,
+        );
+    }
     let fence = result.as_ref().ok().map(|m| m.source.clone());
     reservation.publish_with_fence(
         CatalogEvent::HarvestFilterCompleted {
