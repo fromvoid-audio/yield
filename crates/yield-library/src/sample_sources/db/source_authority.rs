@@ -60,6 +60,12 @@ impl SourceLeaseIdentity {
 /// Opaque identity for one source-volume registration handshake.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SourceRegistrationId(Uuid);
+impl SourceRegistrationId {
+    #[cfg(test)]
+    pub(crate) fn model_key_for_tests(value: u128) -> Self {
+        Self(Uuid::from_u128(value))
+    }
+}
 
 #[derive(Debug)]
 struct AuthorityState {
@@ -120,7 +126,7 @@ impl SourceEffectGate {
         }
     }
 
-    fn begin(
+    pub(crate) fn begin(
         self: &Arc<Self>,
         validate: impl FnOnce() -> Result<(), SourceAuthorityError>,
     ) -> Result<SourceEffectPermit, SourceAuthorityError> {
@@ -167,6 +173,16 @@ impl SourceEffectGate {
                 .map_err(|_| SourceLeaseError::ControlUnavailable)?;
         }
         Ok(())
+    }
+
+    // Writer handoff must retain the database until metadata SQL is quiescent, even
+    // if an earlier validation panic poisoned the gate. Poison never reopens admission.
+    pub(crate) fn close_and_wait_for_custody(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.open = false;
+        while state.in_flight != 0 {
+            state = self.idle.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
     }
 
     #[cfg(test)]
@@ -825,6 +841,20 @@ impl SourceAuthorityRegistration {
             registration_id: self.request.registration_id.0,
             phase,
         })
+    }
+
+    pub(crate) fn metadata_handoff_parts(
+        &self,
+        receipt: &SourceAuthorityRegistrationReceipt,
+    ) -> Result<(Arc<SourceAuthorityRequest>, SourceEffectPin), SourceAuthorityError> {
+        if receipt.registration_id != self.request.registration_id
+            || receipt.lease_identity != self.request.lease_identity
+            || receipt.volume_identities.is_empty()
+            || receipt.volume_identities.len() > 2
+        {
+            return Err(SourceAuthorityError::RegistrationMismatch);
+        }
+        Ok((Arc::clone(&self.request), self.guard.pin_for_effect()?))
     }
 
     /// Return the source-owner request envelope for one bounded journal registration attempt.

@@ -360,6 +360,9 @@ pub enum OperationJournalOwnerError {
     /// A source-owner authority handshake failed closed.
     #[error(transparent)]
     SourceAuthority(#[from] SourceAuthorityError),
+    /// An authenticated metadata handoff failed closed without effect permission.
+    #[error(transparent)]
+    SourceMetadata(#[from] crate::sample_sources::db::SourceRegistryMetadataHandoffError),
     /// A source registration or retirement message conflicts with retained owner state.
     #[error("source authority registration conflict: {reason}")]
     SourceAuthorityConflict {
@@ -1225,7 +1228,16 @@ enum SourceVolumeBindingReadiness {
     Complete,
 }
 
+struct SourceRegistryWriterBinding {
+    source_id: String,
+    lifecycle: u64,
+    writer: std::sync::Weak<()>,
+}
+
 struct SourceAuthorityRecord {
+    metadata_registration:
+        crate::sample_sources::db::source_registry_handoff::MetadataRegistrationCustody,
+    metadata_writer: Option<SourceRegistryWriterBinding>,
     request: Arc<SourceAuthorityRequest>,
     receipt: SourceAuthorityRegistrationReceipt,
     drain_marker: Option<SourceAuthorityDrainMarker>,
@@ -2633,6 +2645,16 @@ impl OwnerRuntime {
             });
         }
 
+        // Retired and partial records retain custody and count toward the same bound.
+        // Exact duplicate readback above remains possible at full retention.
+        if self.source_registrations.len().checked_add(self.retired_source_registrations.len())
+            .is_none_or(|n| n >= crate::sample_sources::db::source_registry_handoff::MAX_SOURCE_REGISTRY_CARRIERS)
+        {
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from("source authority carrier retention limit reached"),
+            });
+        }
+
         let profile_guard = self
             .final_profile_guard
             .as_ref()
@@ -2790,6 +2812,8 @@ impl OwnerRuntime {
         self.source_registrations.insert(
             registration_id,
             SourceAuthorityRecord {
+                metadata_registration: crate::sample_sources::db::source_registry_handoff::MetadataRegistrationCustody::new(),
+                metadata_writer: None,
                 request: Arc::clone(&request),
                 receipt: receipt.clone(),
                 drain_marker: None,
@@ -2909,6 +2933,7 @@ impl OwnerRuntime {
             .into_drain_marker();
         if let Some(record) = self.source_registrations.get_mut(&registration_id) {
             record.drain_marker = Some(drain_marker);
+            record.metadata_registration.activate()?;
             record.readiness = SourceRegistrationReadiness::Registered;
         }
         Ok(receipt)
@@ -2926,6 +2951,7 @@ impl OwnerRuntime {
             .get_mut(&registration_id)
             .expect("source registration placeholder was inserted");
         record.drain_marker = proof.map(|proof| proof.into_drain_marker());
+        record.metadata_registration.revoke();
         record.readiness = SourceRegistrationReadiness::RecoveryRequired {
             stage,
             reason: reason.clone(),
@@ -2936,6 +2962,58 @@ impl OwnerRuntime {
                 receipt: Some(record.receipt.clone()),
             },
         )
+    }
+
+    fn authenticate_source_registry_metadata(
+        &mut self,
+        candidate: crate::sample_sources::db::SourceRegistryMetadataCandidate,
+    ) -> Result<crate::sample_sources::db::SourceRegistryMetadataPermit, OperationJournalOwnerError>
+    {
+        let record = self
+            .source_registrations
+            .get_mut(&candidate.receipt.registration_id)
+            .ok_or_else(|| OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from("metadata handoff has no current registered source"),
+            })?;
+        if !matches!(record.readiness, SourceRegistrationReadiness::Registered)
+            || !Arc::ptr_eq(&record.request, &candidate.request)
+            || record.receipt.registration_id != candidate.receipt.registration_id
+            || record.receipt.lease_identity != candidate.receipt.lease_identity
+            || record.receipt.volume_identities != candidate.receipt.volume_identities
+        {
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from(
+                    "metadata handoff differs from completed original registration",
+                ),
+            });
+        }
+        let subject = candidate.observation().subject();
+        let source_id = subject.source_id().to_owned();
+        let lifecycle = subject.lifecycle_generation();
+        let writer = candidate.writer.clone();
+        if record.metadata_writer.as_ref().is_some_and(|bound| {
+            bound.source_id != source_id
+                || bound.lifecycle != lifecycle
+                || !bound.writer.ptr_eq(&writer)
+        }) {
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from("metadata handoff replaced the original registered writer"),
+            });
+        }
+        let profile = self.final_profile_guard.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from("metadata consumer profile ownership unavailable"),
+            }
+        })?;
+        let permit = candidate.into_permit(profile, record.metadata_registration.token())?;
+        if record.metadata_writer.is_none() {
+            record.metadata_writer = Some(SourceRegistryWriterBinding {
+                source_id,
+                lifecycle,
+                writer,
+            });
+        }
+        Ok(permit)
     }
 
     fn begin_source_drain(
@@ -2982,6 +3060,7 @@ impl OwnerRuntime {
             return Err(OperationJournalOwnerError::from(error));
         }
         record.drain_marker.take();
+        record.metadata_registration.revoke();
         record.readiness = SourceRegistrationReadiness::Draining;
         Ok(())
     }
@@ -3845,6 +3924,24 @@ impl OperationJournalClient {
         self.submit(CONTROL_INPUT_BYTES, move |input, result| {
             JournalCommand::RegisterSource {
                 request,
+                input,
+                result,
+            }
+        })
+    }
+
+    /// Authenticate one source-writer-issued metadata envelope on the actual journal worker.
+    /// The result supplies custody only; admitted global SQL and physical claims remain separate.
+    pub fn authenticate_source_registry_metadata(
+        &self,
+        candidate: crate::sample_sources::db::SourceRegistryMetadataCandidate,
+    ) -> Result<
+        OperationJournalRequest<crate::sample_sources::db::SourceRegistryMetadataPermit>,
+        OperationJournalOwnerQueueError,
+    > {
+        self.submit(candidate.input_bytes(), move |input, result| {
+            JournalCommand::AuthenticateSourceMetadata {
+                candidate,
                 input,
                 result,
             }
@@ -4766,6 +4863,16 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<RecordingChunkPage, OperationJournalOwnerError>>,
     },
+    AuthenticateSourceMetadata {
+        candidate: crate::sample_sources::db::SourceRegistryMetadataCandidate,
+        input: InputPermit,
+        result: SyncSender<
+            Result<
+                crate::sample_sources::db::SourceRegistryMetadataPermit,
+                OperationJournalOwnerError,
+            >,
+        >,
+    },
     RegisterSource {
         request: SourceAuthorityRegistrationRequest,
         input: InputPermit,
@@ -5128,6 +5235,16 @@ fn run_owner(
 
 fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool {
     match command {
+        JournalCommand::AuthenticateSourceMetadata {
+            candidate,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                runtime.authenticate_source_registry_metadata(candidate)
+            })
+        }
         JournalCommand::RegisterSource {
             request,
             input,
@@ -5548,6 +5665,10 @@ where
 
 fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
     match command {
+        JournalCommand::AuthenticateSourceMetadata { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
         JournalCommand::RegisterSource { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
@@ -5671,6 +5792,7 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 
 #[cfg(test)]
 mod tests {
+    mod source_registry_handoff_tests;
     #[test]
     fn recording_dispatch_binding_checks_actual_bytes_range_output_and_root() {
         let (proposal, target) =
