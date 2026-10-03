@@ -1445,10 +1445,14 @@
         {
           "path": "crates/yield-ui/src/browser/curation/collection_history/tests.rs",
           "symbol": "collection_history_real_gpui_owner_commit_undo_redo_and_restart"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/curation/collection_history/sample_history_tests.rs",
+          "symbol": "sample_history_real_gpui_apply_undo_redo"
         }
       ],
       "owner": "OPT-1617",
-      "note": "Dedicated collection-membership controls only: one bounded atomic batch, acknowledged retained catalog/SQLite owner, committed-only history and redo invalidation. Test uses an explicit actual-catalog harness, not normal qualified session bootstrap (OPT-2143). Global shortcuts, waveform/file/folder/dictionary history, compound commits (OPT-2114) and history across restart (OPT-2115) remain open under OPT-1476.",
+      "note": "Dedicated shared sample unlock and collection-membership controls: acknowledged retained catalog/SQLite receipts, combined chronological budget, actual compound prefix refencing and committed-only redo invalidation. Explicit catalog fixture is not normal qualified session/native bootstrap. Global shortcuts, waveform/file/folder/dictionary adapters and durable collection/sample history remain open under OPT-1476. Native scoped verification: OPT-2143 / OPT-2233.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
@@ -2126,10 +2130,14 @@
         {
           "path": "crates/yield-ui/src/browser/curation/collection_history/tests.rs",
           "symbol": "collection_history_real_gpui_owner_commit_undo_redo_and_restart"
+        },
+        {
+          "path": "crates/yield-ui/src/browser/curation/collection_history/sample_history_tests.rs",
+          "symbol": "sample_history_real_gpui_apply_undo_redo"
         }
       ],
       "owner": "OPT-1617",
-      "note": "Dedicated collection-membership controls only: one bounded atomic batch, acknowledged retained catalog/SQLite owner, committed-only history and redo invalidation. Test uses an explicit actual-catalog harness, not normal qualified session bootstrap (OPT-2143). Global shortcuts, waveform/file/folder/dictionary history, compound commits (OPT-2114) and history across restart (OPT-2115) remain open under OPT-1476.",
+      "note": "Dedicated shared sample unlock and collection-membership controls: acknowledged retained catalog/SQLite receipts, combined chronological budget, actual compound prefix refencing and committed-only redo invalidation. Explicit catalog fixture is not normal qualified session/native bootstrap. Global shortcuts, waveform/file/folder/dictionary adapters and durable collection/sample history remain open under OPT-1476. Native scoped verification: OPT-2143 / OPT-2233.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {
@@ -2150,12 +2158,12 @@
       },
       "automated_evidence": [
         {
-          "path": "crates/yield-ui/src/browser/curation.rs",
-          "symbol": "remove_collection_action_targets_only_the_active_slot"
+          "path": "crates/yield-ui/src/browser/curation/collection_history/sample_history_tests.rs",
+          "symbol": "sample_history_real_gpui_apply_undo_redo"
         }
       ],
       "owner": "OPT-1499",
-      "note": "Source-owned collection/rating metadata counterpart; reference collection missing-file cleanup and ordering are not all established by this test.",
+      "note": "UnlockKeepRating writes lock false at confirmed rating3 through the actual retained curation owner. Shared acknowledged atomic undo/redo writes explicit lock values with actual timestamps; no whole-row restoration. Larger ordinary edits have explicit absent history coverage; native bootstrap and durable sample history remain separate. Native scoped verification: OPT-2143 / OPT-2233.",
       "native_evidence": "unverified \u2014 OPT-2009"
     },
     {

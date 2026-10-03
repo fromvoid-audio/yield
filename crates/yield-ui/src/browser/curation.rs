@@ -357,11 +357,11 @@ impl CurationState {
     pub(super) fn status_for(&self, key: &CurationLifecycleKey) -> Option<String> {
         let lineage = self.lineages.get(key)?;
         if let Some(error) = lineage.failed.as_ref() {
-            if let Some(message) = lineage
-                .message
-                .as_ref()
-                .filter(|m| m.starts_with("Collection "))
-            {
+            if let Some(message) = lineage.message.as_ref().filter(|m| {
+                m.starts_with("Collection ")
+                    || m.starts_with("Sample ")
+                    || m.starts_with("Curation undo ")
+            }) {
                 if self.collection_history.permits_failure(key, lineage) {
                     return Some(message.clone());
                 }
@@ -377,7 +377,7 @@ impl CurationState {
             ));
         }
         if lineage.history_unresolved {
-            return Some("Collection history completion unconfirmed after source context changed; refresh the catalog".into());
+            return Some("Curation history completion unconfirmed after source context changed; refresh the catalog".into());
         }
         if !lineage.pending.is_empty() {
             let trash_required = lineage
@@ -1072,6 +1072,7 @@ impl CurationState {
                 update,
                 SourceCurationUpdate::AddCollection { .. }
                     | SourceCurationUpdate::RemoveCollection { .. }
+                    | SourceCurationUpdate::SetLocked { .. }
             )
         });
         lineage.message = None;
@@ -1273,7 +1274,7 @@ impl CurationState {
         if let Some(message) = history_message {
             lineage.message = Some(message);
         } else if success && operation_collection_edit {
-            lineage.message = Some("Collection saved · Undo unavailable for this edit".into());
+            lineage.message = Some("Curation saved · Undo unavailable for this edit".into());
         }
         Some(CurationOutcomeApplication {
             history_restore,
@@ -1725,6 +1726,10 @@ fn render_collection_history(
     .into_iter()
     .map(|(direction, id, _label)| {
         let enabled = browser.collection_history_ready(direction);
+        let captured_top = browser
+            .curation_state
+            .collection_history
+            .control_snapshot(direction);
         div()
             .id(id)
             .debug_selector(move || id.into())
@@ -1740,7 +1745,13 @@ fn render_collection_history(
             .when(!enabled, |element| element.opacity(0.45))
             .when(enabled, |element| element.cursor_pointer())
             .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
-                if event.standard_click() {
+                if event.standard_click()
+                    && captured_top
+                        == view
+                            .curation_state
+                            .collection_history
+                            .control_snapshot(direction)
+                {
                     view.submit_collection_history(direction, cx);
                 }
             }))
@@ -1816,7 +1827,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let Some(key) = self.collection_history_key() else {
-            self.set_scan_status("Collection history requires current catalog metadata");
+            self.set_scan_status("Curation history requires current catalog metadata");
             cx.notify();
             return;
         };
@@ -1832,16 +1843,14 @@ impl Browser {
             )
         });
         let Some(plan) = plan else {
-            self.curation_state.set_message(
-                &key,
-                "Collection history changed; refresh the catalog".into(),
-            );
+            self.curation_state
+                .set_message(&key, "Curation history changed; refresh the catalog".into());
             cx.notify();
             return;
         };
         if let Err(error) = self.submit_planned_curation(&key, plan, false, cx) {
             self.curation_state
-                .set_message(&key, format!("Collection history not saved: {error}"));
+                .set_message(&key, format!("Curation history not saved: {error}"));
         }
         cx.notify();
     }
@@ -1859,6 +1868,7 @@ impl Browser {
                     update,
                     SourceCurationUpdate::AddCollection { .. }
                         | SourceCurationUpdate::RemoveCollection { .. }
+                        | SourceCurationUpdate::SetLocked { locked: false, .. }
                 )
             })
             || !self
@@ -1901,7 +1911,18 @@ impl Browser {
                     .map(|path| 256 + path_byte_len(path))
                     .sum::<usize>(),
             );
-        if bytes > 16 * 1024 * 1024 / 3 {
+        let sample = plan
+            .batches
+            .iter()
+            .flatten()
+            .all(|u| matches!(u, SourceCurationUpdate::SetLocked { locked: false, .. }));
+        if bytes
+            > (if sample {
+                1024 * 1024
+            } else {
+                16 * 1024 * 1024
+            }) / 3
+        {
             return None;
         }
         Some(collection_history::Presentation {

@@ -1,4 +1,4 @@
-//! Bounded collection membership history acknowledged by the existing catalog owner.
+//! Bounded collection and sample lock history acknowledged by the existing catalog owner.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -48,12 +48,63 @@ impl Presentation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Collection(usize),
+    UnlockKeepRating,
+}
+
+impl Field {
+    fn value(self, row: AudioFileCuration) -> Option<bool> {
+        match self {
+            Self::Collection(slot) => Some(row.has_collection(slot)),
+            Self::UnlockKeepRating => (row.rating().value() == 3).then_some(row.rating().locked()),
+        }
+    }
+    fn update(self, path: RootRelativePath, value: bool) -> Option<SourceCurationUpdate> {
+        Some(match self {
+            Self::Collection(slot) => {
+                let collection = SampleCollection::new(slot as u8)?;
+                if value {
+                    SourceCurationUpdate::AddCollection { path, collection }
+                } else {
+                    SourceCurationUpdate::RemoveCollection { path, collection }
+                }
+            }
+            Self::UnlockKeepRating => SourceCurationUpdate::SetLocked {
+                path,
+                locked: value,
+            },
+        })
+    }
+    fn overlay(self, current: AudioFileCuration, value: bool) -> Option<AudioFileCuration> {
+        match self {
+            Self::Collection(slot) => {
+                let CurationTransition::Changed(row) =
+                    plan_curation_action(current, CurationAction::ToggleCollection { slot })
+                else {
+                    return None;
+                };
+                Some(row)
+            }
+            Self::UnlockKeepRating => AudioFileCuration::from_parts(
+                3,
+                value,
+                current.collection_mask(),
+                current.last_played_at(),
+                current.last_curated_at(),
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Record {
     key: CurationLifecycleKey,
     root: RootIdentity,
     generation: u64,
-    slot: usize,
+    field: Field,
+    origin_request: u64,
     bits: BTreeMap<PathBuf, (bool, bool)>,
     presentation: Presentation,
     bytes: usize,
@@ -189,7 +240,6 @@ impl History {
             return None;
         }
         let record = self.top(direction)?;
-        let collection = SampleCollection::new(record.slot as u8)?;
         let mut updates = Vec::new();
         let mut overlays = BTreeMap::new();
         for (path, (before, after)) in &record.bits {
@@ -203,29 +253,13 @@ impl History {
                 Direction::Undo => *before,
                 Direction::Redo => *after,
             };
-            if current.has_collection(record.slot) != expected {
+            if record.field.value(current)? != expected {
                 return None;
             }
             let relative = RootRelativePath::try_from_path(path.clone()).ok()?;
-            updates.push(if target {
-                SourceCurationUpdate::AddCollection {
-                    path: relative,
-                    collection,
-                }
-            } else {
-                SourceCurationUpdate::RemoveCollection {
-                    path: relative,
-                    collection,
-                }
-            });
+            updates.push(record.field.update(relative, target)?);
             if expected != target {
-                let CurationTransition::Changed(changed) = plan_curation_action(
-                    current,
-                    CurationAction::ToggleCollection { slot: record.slot },
-                ) else {
-                    return None;
-                };
-                overlays.insert(path.clone(), changed);
+                overlays.insert(path.clone(), record.field.overlay(current, target)?);
             }
         }
         Some(CurationOperationPlan {
@@ -269,7 +303,8 @@ impl History {
                             b.iter()
                                 .filter_map(|u| match u {
                                     SourceCurationUpdate::AddCollection { path, .. }
-                                    | SourceCurationUpdate::RemoveCollection { path, .. } => {
+                                    | SourceCurationUpdate::RemoveCollection { path, .. }
+                                    | SourceCurationUpdate::SetLocked { path, .. } => {
                                         Some(path.as_path().to_path_buf())
                                     }
                                     _ => None,
@@ -312,30 +347,44 @@ impl History {
                 .as_ref()
                 .map_or(0, |g| g.source_observation().charged_bytes()),
         );
-        if estimate > MAX_BYTES {
+        let sample = plan
+            .batches
+            .iter()
+            .flatten()
+            .all(|u| matches!(u, SourceCurationUpdate::SetLocked { locked: false, .. }));
+        if estimate > MAX_BYTES || (sample && estimate > 1024 * 1024) {
             return;
         }
         let mut bits = BTreeMap::new();
-        let mut slot = None;
+        let mut field = None;
         for update in plan.batches.iter().flatten() {
-            let (path, collection, after) = match update {
-                SourceCurationUpdate::AddCollection { path, collection } => {
-                    (path, collection, true)
-                }
-                SourceCurationUpdate::RemoveCollection { path, collection } => {
-                    (path, collection, false)
-                }
+            let (path, this_field, after) = match update {
+                SourceCurationUpdate::AddCollection { path, collection } => (
+                    path,
+                    Field::Collection(usize::from(collection.index())),
+                    true,
+                ),
+                SourceCurationUpdate::RemoveCollection { path, collection } => (
+                    path,
+                    Field::Collection(usize::from(collection.index())),
+                    false,
+                ),
+                SourceCurationUpdate::SetLocked {
+                    path,
+                    locked: false,
+                } if plan.batches.len() == 1 => (path, Field::UnlockKeepRating, false),
                 _ => return,
             };
-            let this_slot = usize::from(collection.index());
-            if slot.is_some_and(|prior| prior != this_slot) {
+            if field.is_some_and(|prior| prior != this_field) {
                 return;
             }
-            slot = Some(this_slot);
+            field = Some(this_field);
             let Some(current) = lineage.confirmed.get(path.as_path()) else {
                 return;
             };
-            let before = current.has_collection(this_slot);
+            let Some(before) = this_field.value(*current) else {
+                return;
+            };
             if before == after
                 || bits
                     .insert(path.as_path().to_path_buf(), (before, after))
@@ -359,7 +408,7 @@ impl History {
                 .as_ref()
                 .map_or(0, |g| g.source_observation().charged_bytes()),
         );
-        if bytes > MAX_BYTES {
+        if bytes > MAX_BYTES || (field == Some(Field::UnlockKeepRating) && bytes > 1024 * 1024) {
             return;
         }
         while self.bytes().saturating_add(bytes) > MAX_BYTES
@@ -370,8 +419,9 @@ impl History {
             {
                 return;
             }
-            if self.undo.pop_front().is_none() && self.redo.pop_front().is_none() {
-                break;
+            if self.undo.pop_front().is_none() {
+                // An uncommitted original never evicts redo to make room.
+                return;
             }
         }
         self.pending = Some(Pending {
@@ -386,7 +436,8 @@ impl History {
                     b.iter()
                         .filter_map(|u| match u {
                             SourceCurationUpdate::AddCollection { path, .. }
-                            | SourceCurationUpdate::RemoveCollection { path, .. } => {
+                            | SourceCurationUpdate::RemoveCollection { path, .. }
+                            | SourceCurationUpdate::SetLocked { path, .. } => {
                                 Some(path.as_path().to_path_buf())
                             }
                             _ => None,
@@ -398,7 +449,8 @@ impl History {
                 key: key.clone(),
                 root: lineage.root_identity.clone(),
                 generation: lineage.directory_generation,
-                slot: slot.expect("non-empty collection batch"),
+                field: field.expect("non-empty history batch"),
+                origin_request: plan.request_id,
                 applied: bits.keys().cloned().collect(),
                 bits,
                 owner: plan.prepared_group.clone(),
@@ -486,10 +538,37 @@ impl History {
                 Direction::Redo => "Keep confirmed",
             },
             None => match direction {
+                Direction::Undo
+                    if self
+                        .top(direction)
+                        .is_some_and(|r| r.field == Field::UnlockKeepRating) =>
+                {
+                    "Undo unlock"
+                }
+                Direction::Redo
+                    if self
+                        .top(direction)
+                        .is_some_and(|r| r.field == Field::UnlockKeepRating) =>
+                {
+                    "Redo unlock"
+                }
                 Direction::Undo => "Undo collection",
                 Direction::Redo => "Redo collection",
             },
         }
+    }
+
+    pub(super) fn control_snapshot(
+        &self,
+        direction: Direction,
+    ) -> Option<(CurationLifecycleKey, u64, u64, Option<Direction>)> {
+        let record = self.top(direction)?;
+        Some((
+            record.key.clone(),
+            self.revision?,
+            record.origin_request,
+            record.phase,
+        ))
     }
 
     fn pop_direction_record(&mut self, direction: Direction) -> Option<Record> {
@@ -617,7 +696,7 @@ impl History {
                         };
                         r.files
                             .get(p)
-                            .is_some_and(|f| f.has_collection(pending.record.slot) == target)
+                            .is_some_and(|f| pending.record.field.value(*f) == Some(target))
                     })
             })
     }
@@ -643,7 +722,13 @@ impl History {
         let valid = lineage_valid && Self::valid_receipts(&pending, outcome);
         if !valid {
             self.clear();
-            return (None,Some("Collection undo unavailable: result could not be confirmed; refresh the catalog".into()));
+            return (
+                None,
+                Some(
+                    "Curation undo unavailable: result could not be confirmed; refresh the catalog"
+                        .into(),
+                ),
+            );
         }
         if outcome.failure.is_some() {
             self.known_failure = true;
@@ -661,6 +746,12 @@ impl History {
                     pending.batches.iter().map(Vec::len).sum::<usize>(),
                     outcome.failure.as_deref().unwrap_or("batch failed")
                 )),
+            );
+        }
+        if outcome.failure.is_some() && pending.record.field == Field::UnlockKeepRating {
+            return (
+                None,
+                Some("Sample unlock failed; refresh the catalog before retrying".into()),
             );
         }
         if outcome.failure.is_some() {
@@ -709,6 +800,7 @@ impl History {
         }
         self.revision = outcome.final_revision;
         self.known_failure = false;
+        let sample = pending.record.field == Field::UnlockKeepRating;
         let (restore, message) = match pending.direction {
             None => {
                 self.redo.clear();
@@ -720,7 +812,14 @@ impl History {
                     self.undo.clear();
                 }
                 self.undo.push_back(pending.record);
-                (None, "Collection saved · Undo available")
+                (
+                    None,
+                    if sample {
+                        "Sample unlocked · Undo available"
+                    } else {
+                        "Collection saved · Undo available"
+                    },
+                )
             }
             Some(Direction::Undo) => {
                 self.pop_direction_record(Direction::Undo);
@@ -729,7 +828,14 @@ impl History {
                 let restore = pending.record.presentation.clone();
                 pending.record.applied.clear();
                 self.redo.push_back(pending.record);
-                (Some(restore), "Collection undo saved · Redo available")
+                (
+                    Some(restore),
+                    if sample {
+                        "Sample unlock undo saved · Redo available"
+                    } else {
+                        "Collection undo saved · Redo available"
+                    },
+                )
             }
             Some(Direction::Redo) => {
                 self.pop_direction_record(Direction::Redo);
@@ -738,7 +844,14 @@ impl History {
                 let restore = pending.record.presentation.clone();
                 pending.record.applied = pending.record.bits.keys().cloned().collect();
                 self.undo.push_back(pending.record);
-                (Some(restore), "Collection redo saved · Undo available")
+                (
+                    Some(restore),
+                    if sample {
+                        "Sample unlock redo saved · Undo available"
+                    } else {
+                        "Collection redo saved · Undo available"
+                    },
+                )
             }
         };
         (restore, Some(message.into()))
