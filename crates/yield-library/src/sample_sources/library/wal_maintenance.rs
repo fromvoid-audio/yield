@@ -26,6 +26,11 @@ impl LibraryDatabase {
         self.ordinary_wal_maintenance.committed.set(true);
     }
 
+    /// A new authored receipt commits even when its disposition rejects the edit.
+    pub(super) fn note_harvest_authored_commit(&self) {
+        self.ordinary_wal_maintenance.committed.set(true);
+    }
+
     /// Consume the marker on the same worker after its post-command ownership check.
     /// Failure is best effort and cannot turn an already committed write into an SQL failure.
     pub(super) fn maintain_after_ordinary_commit(&self, guard: &WritableProfileGuard) {

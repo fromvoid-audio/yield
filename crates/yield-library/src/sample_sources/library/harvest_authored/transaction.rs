@@ -59,6 +59,7 @@ impl LibraryDatabase {
         )?;
         request.validate_sources(true)?;
         tx.commit()?;
+        self.note_harvest_authored_commit();
         if request.validate_sources(true).is_err() {
             return Err(LibraryError::HarvestAuthoredCommitUncertain);
         }
