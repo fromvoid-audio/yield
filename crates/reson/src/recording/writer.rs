@@ -3,6 +3,9 @@
 //! No pathname opens or publication authority live here. The app's owner adapter remains
 //! responsible for admission, retained staging identity, sync/validation and publication.
 use super::health::RecordingHealthState;
+use super::settlement::{
+    BarrierIssuer, JoinedIssuer, ProducerSettlement, TerminalFacts, TerminalWriteFence,
+};
 use crate::input::AudioInputError;
 use ringbuf::{HeapRb, traits::*};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
@@ -16,8 +19,8 @@ use std::time::Duration;
 const WRITER_DRAIN_SAMPLES: usize = 4096;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const RUNNING: u8 = 0;
-const STOPPED: u8 = 1;
-const CANCELLED: u8 = 2;
+pub(super) const STOPPED: u8 = 1;
+pub(super) const CANCELLED: u8 = 2;
 
 /// Already retained byte transport. This interface grants no filesystem authority.
 /// Yield must supply its admitted owner channel; arbitrary transports are useful for codecs/tests.
@@ -60,6 +63,14 @@ impl RecordingLimits {
             ring_samples,
         })
     }
+    /// Actual validated serializer sample rate.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+    /// Actual validated interleaved serializer channel count.
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
     /// Maximum accepted audio frames; the transport/header allowance is separately checked.
     pub fn max_frames(&self) -> u64 {
         self.max_frames
@@ -83,6 +94,7 @@ pub enum RecordingPrefixState {
 pub(super) struct RecordingStats {
     pub(super) frames: u64,
     pub(super) state: RecordingPrefixState,
+    terminal: Option<TerminalFacts>,
 }
 
 pub(super) struct RecorderCapture {
@@ -135,6 +147,7 @@ impl RecorderCapture {
 pub(super) struct RecorderWriter {
     mode: Arc<AtomicU8>,
     join: Option<JoinHandle<Result<RecordingStats, AudioInputError>>>,
+    joined_issuer: Option<JoinedIssuer>,
 }
 impl RecorderWriter {
     /// Prepare callback state without opening or writing a transport.
@@ -156,7 +169,8 @@ impl RecorderWriter {
         )
     }
 
-    /// Start serialization only after paused stream construction and limits validation.
+    /// Legacy observation fixture route; production startup uses the same optional-settlement core.
+    #[cfg(test)]
     pub(super) fn spawn_prepared(
         sink: Box<dyn RecordingSink>,
         limits: RecordingLimits,
@@ -164,7 +178,25 @@ impl RecorderWriter {
         mode: Arc<AtomicU8>,
         health: Arc<RecordingHealthState>,
     ) -> Result<Self, AudioInputError> {
-        let writer = WavSampleWriter::new(sink, limits)?;
+        Self::spawn_prepared_with_settlement(sink, limits, consumer, mode, health, None)
+    }
+
+    pub(super) fn spawn_prepared_with_settlement(
+        sink: Box<dyn RecordingSink>,
+        limits: RecordingLimits,
+        consumer: ringbuf::HeapCons<f32>,
+        mode: Arc<AtomicU8>,
+        health: Arc<RecordingHealthState>,
+        settlement: Option<ProducerSettlement>,
+    ) -> Result<Self, AudioInputError> {
+        let (barrier, joined_issuer) = match settlement {
+            Some(producer) => {
+                let (barrier, joined) = producer.start(mode.clone(), health.clone());
+                (Some(barrier), Some(joined))
+            }
+            None => (None, None),
+        };
+        let writer = WavSampleWriter::new_with_barrier(sink, limits, barrier)?;
         let worker_mode = Arc::clone(&mode);
         let join = thread::Builder::new()
             .name("reson-recording-writer".into())
@@ -192,6 +224,7 @@ impl RecorderWriter {
         Ok(Self {
             mode,
             join: Some(join),
+            joined_issuer,
         })
     }
 
@@ -217,15 +250,29 @@ impl RecorderWriter {
         self.mode.store(CANCELLED, Ordering::Release);
     }
     pub(super) fn join(&mut self) -> Result<RecordingStats, AudioInputError> {
-        self.join
+        let result = self
+            .join
             .take()
             .ok_or_else(|| failed("recorder writer already joined"))?
             .join()
-            .map_err(|_| failed("recorder writer panicked; prefix is unconfirmed"))?
+            .map_err(|_| failed("recorder writer panicked; prefix is unconfirmed"))?;
+        let issuer = self.joined_issuer.take();
+        let stats = result?;
+        if let Some(issuer) = issuer {
+            issuer.publish(
+                stats
+                    .terminal
+                    .ok_or_else(|| failed("recording terminal proof unavailable"))?,
+            )?;
+        }
+        Ok(stats)
     }
 }
 impl Drop for RecorderWriter {
     fn drop(&mut self) {
+        if let Some(issuer) = self.joined_issuer.take() {
+            issuer.deny();
+        }
         self.cancel();
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -285,6 +332,23 @@ fn writer_loop(
         &health.writer_abandoned_samples,
         consumer.occupied_len() as u64,
     );
+    if writer.barrier.is_some() {
+        health
+            .writer_accounting_complete
+            .store(true, Ordering::Release);
+        let facts = BarrierIssuer::facts(
+            state,
+            writer.written_samples / u64::from(writer.limits.channels),
+            writer.limits,
+            health,
+        )?;
+        writer
+            .barrier
+            .as_ref()
+            .unwrap()
+            .acknowledge(facts, health)?;
+        writer.terminal = Some(facts);
+    }
     let result = writer.finalize(state);
     if result.is_err() {
         health.writer_failed.store(true, Ordering::Release);
@@ -308,27 +372,50 @@ struct BoundedSink {
     inner: Box<dyn RecordingSink>,
     position: u64,
     limit: u64,
+    terminal_fence: Option<Arc<TerminalWriteFence>>,
+}
+impl BoundedSink {
+    fn transport_error(&self, error: io::Error) -> io::Error {
+        if let Some(fence) = &self.terminal_fence {
+            fence.deny();
+        }
+        error
+    }
 }
 impl Write for BoundedSink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Some(fence) = &self.terminal_fence {
+            fence.check()?;
+        }
         let end = self
             .position
             .checked_add(bytes.len() as u64)
             .filter(|v| *v <= self.limit)
             .ok_or_else(|| io::Error::other("recording sink byte budget exceeded"))?;
-        let written = self.inner.write(bytes)?;
+        let written = self
+            .inner
+            .write(bytes)
+            .map_err(|error| self.transport_error(error))?;
         if written > bytes.len() {
-            return Err(io::Error::other("invalid sink write result"));
+            return Err(self.transport_error(io::Error::other("invalid sink write result")));
         }
         self.position = end - (bytes.len() - written) as u64;
         Ok(written)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        if let Some(fence) = &self.terminal_fence {
+            fence.check()?;
+        }
+        self.inner
+            .flush()
+            .map_err(|error| self.transport_error(error))
     }
 }
 impl Seek for BoundedSink {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        if let Some(fence) = &self.terminal_fence {
+            fence.check()?;
+        }
         let offset = match position {
             SeekFrom::Start(v) => i128::from(v),
             SeekFrom::Current(v) => i128::from(self.position) + i128::from(v),
@@ -342,9 +429,14 @@ impl Seek for BoundedSink {
             .ok()
             .filter(|v| *v <= self.limit)
             .ok_or_else(|| io::Error::other("recording seek exceeds retained allocation"))?;
-        let observed = self.inner.seek(SeekFrom::Start(offset))?;
+        let observed = self
+            .inner
+            .seek(SeekFrom::Start(offset))
+            .map_err(|error| self.transport_error(error))?;
         if observed != offset {
-            return Err(io::Error::other("recording sink seek result mismatch"));
+            return Err(
+                self.transport_error(io::Error::other("recording sink seek result mismatch"))
+            );
         }
         self.position = offset;
         Ok(offset)
@@ -352,14 +444,21 @@ impl Seek for BoundedSink {
 }
 
 struct WavSampleWriter {
-    writer: hound::WavWriter<BufWriter<BoundedSink>>,
+    writer: Option<hound::WavWriter<BufWriter<BoundedSink>>>,
+    barrier: Option<BarrierIssuer>,
+    terminal: Option<TerminalFacts>,
     limits: RecordingLimits,
     written_samples: u64,
 }
 impl WavSampleWriter {
-    fn new(
+    #[cfg(test)]
+    fn new(sink: Box<dyn RecordingSink>, limits: RecordingLimits) -> Result<Self, AudioInputError> {
+        Self::new_with_barrier(sink, limits, None)
+    }
+    fn new_with_barrier(
         mut sink: Box<dyn RecordingSink>,
         limits: RecordingLimits,
+        barrier: Option<BarrierIssuer>,
     ) -> Result<Self, AudioInputError> {
         if sink
             .stream_position()
@@ -383,6 +482,7 @@ impl WavSampleWriter {
                     inner: sink,
                     position: 0,
                     limit: limits.max_bytes,
+                    terminal_fence: barrier.as_ref().map(|issuer| issuer.guard.clone()),
                 },
             ),
             spec,
@@ -394,7 +494,9 @@ impl WavSampleWriter {
             ))
         })?;
         Ok(Self {
-            writer,
+            writer: Some(writer),
+            barrier,
+            terminal: None,
             limits,
             written_samples: 0,
         })
@@ -412,20 +514,33 @@ impl WavSampleWriter {
         }
         for &sample in samples {
             self.writer
+                .as_mut()
+                .unwrap()
                 .write_sample(sample)
                 .map_err(|error| failed(&format!("recording sample write failed: {error}")))?;
         }
         self.written_samples = next;
         Ok(())
     }
-    fn finalize(self, state: RecordingPrefixState) -> Result<RecordingStats, AudioInputError> {
+    fn finalize(mut self, state: RecordingPrefixState) -> Result<RecordingStats, AudioInputError> {
         self.writer
+            .take()
+            .unwrap()
             .finalize()
             .map_err(|error| failed(&format!("recording header/flush unconfirmed: {error}")))?;
         Ok(RecordingStats {
             frames: self.written_samples / u64::from(self.limits.channels),
             state,
+            terminal: self.terminal,
         })
+    }
+}
+impl Drop for WavSampleWriter {
+    fn drop(&mut self) {
+        // Arm before hound/BufWriter field destructors, including codec errors and unwinding.
+        if let Some(barrier) = &self.barrier {
+            barrier.guard.deny();
+        }
     }
 }
 fn failed(detail: &str) -> AudioInputError {

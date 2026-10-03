@@ -5,12 +5,12 @@
   "rows": [
     {
       "path": "crates/reson/src/recording/writer.rs",
-      "function": "new",
+      "function": "new_with_barrier",
       "operation": "WavWriter::new",
       "count": 1,
       "classification": "compatibility",
       "issue": "OPT-2058",
-      "reason": "Bounded WAV byte serialization into already retained Write+Seek transport; reson no longer opens/creates/truncates pathnames. Generic codec transport alone is not namespace or publication authority.",
+      "reason": "Bounded WAV byte serialization into already retained Write+Seek transport; optional instance-bound producer acknowledgement fences terminal writes and codec Drop. No pathname opens, physical namespace authority, retained-byte verification or publication grant.",
       "retirement": "Bind the transport to actual admitted FileOperationOwner/journal staging/chunk/closure before activating a recording producer; no current GPUI caller."
     },
     {

@@ -96,6 +96,7 @@ fn retained_writer_bounds_each_transport_write_and_seek_without_fallback() {
         inner: Box::new(output.clone()),
         position: 0,
         limit: 4,
+        terminal_fence: None,
     };
     bounded.write_all(&[1, 2, 3, 4]).unwrap();
     assert!(bounded.write_all(&[5]).is_err());
@@ -218,4 +219,9 @@ fn recorder_worker_budget_failure_is_visible_and_subsequent_callbacks_do_not_wri
 mod terminal_accounting {
     use super::*;
     include!("terminal_accounting_tests.rs");
+}
+
+mod terminal_settlement {
+    use super::*;
+    include!("terminal_settlement_tests.rs");
 }

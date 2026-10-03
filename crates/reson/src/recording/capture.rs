@@ -26,6 +26,7 @@ pub(super) fn start_recording_runtime(
     config: &AudioInputConfig,
     sink: Box<dyn RecordingSink>,
     max_frames: u64,
+    settlement: Option<super::settlement::ProducerSettlement>,
 ) -> Result<RecordingRuntime, AudioInputError> {
     let resolved = resolve_input_stream_config(config)?;
     let selection =
@@ -54,8 +55,14 @@ pub(super) fn start_recording_runtime(
             monitor_capture.submit(samples);
         },
     )?;
-    let writer =
-        RecorderWriter::spawn_prepared(sink, limits, consumer, writer_mode, Arc::clone(&health))?;
+    let writer = RecorderWriter::spawn_prepared_with_settlement(
+        sink,
+        limits,
+        consumer,
+        writer_mode,
+        Arc::clone(&health),
+        settlement,
+    )?;
     Ok(RecordingRuntime {
         stream,
         writer,
