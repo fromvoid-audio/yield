@@ -29,6 +29,9 @@ pub struct LegacyJournalObservation {
     owner_identity: String,
     volume: VolumeIdentity,
     unit: u64,
+    directory_identity: String,
+    sidecar_volume: VolumeIdentity,
+    sidecar_unit: u64,
     main_bytes: u64,
     rollback_bytes: u64,
     rollback_identity: Option<String>,
@@ -66,6 +69,18 @@ impl LegacyJournalObservation {
     /// Actual descriptor volume, without free capacity or registration authority.
     pub fn volume(&self) -> &VolumeIdentity {
         &self.volume
+    }
+    /// Original retained database-directory identity, distinct from its main file.
+    pub fn directory_identity(&self) -> &str {
+        &self.directory_identity
+    }
+    /// Actual retained directory volume for DELETE sidecar creation.
+    pub fn sidecar_volume(&self) -> &VolumeIdentity {
+        &self.sidecar_volume
+    }
+    /// Actual directory filesystem unit for sidecar allowance observations.
+    pub fn sidecar_allocation_unit(&self) -> u64 {
+        self.sidecar_unit
     }
     /// Actual filesystem unit observation, not a qualified physical peak.
     pub fn allocation_unit(&self) -> u64 {
@@ -147,7 +162,7 @@ impl OperationJournalStore {
     ) -> Result<LegacyJournalObservation> {
         self.capture_legacy_journal_until(profile, Instant::now() + Duration::from_secs(2))
     }
-    fn capture_legacy_journal_until(
+    pub(crate) fn capture_legacy_journal_until(
         &self,
         profile: &WritableProfileGuard,
         deadline: Instant,
@@ -255,6 +270,12 @@ impl OperationJournalStore {
                     "unknown unit or unbounded profile control",
                 ));
             }
+            let directory = self.database_root.try_clone_descriptor().map_err(refuse)?;
+            let directory_facts =
+                crate::durable_capacity::descriptor_capacity_facts(&directory).map_err(refuse)?;
+            if !valid_unit(directory_facts.allocation_unit) {
+                return Err(LegacyJournalObservationError("unknown directory unit"));
+            }
             let (rollback_bytes, rollback_identity) = self.rollback_facts()?;
             if rollback_bytes > rollback_bound {
                 return Err(LegacyJournalObservationError(
@@ -272,6 +293,9 @@ impl OperationJournalStore {
                 owner_identity: profile.owner_identity().into(),
                 volume: facts.identity,
                 unit: facts.allocation_unit,
+                directory_identity: self.database_root.identity().into(),
+                sidecar_volume: directory_facts.identity,
+                sidecar_unit: directory_facts.allocation_unit,
                 main_bytes,
                 rollback_bytes,
                 rollback_identity,
@@ -319,6 +343,21 @@ impl OperationJournalStore {
                 let identity =
                     crate::filesystem_identity::stable_filesystem_identity_from_open_file(&file)
                         .ok_or(LegacyJournalObservationError("rollback identity unknown"))?;
+                let directory = self.database_root.try_clone_descriptor().map_err(refuse)?;
+                let directory_facts =
+                    crate::durable_capacity::descriptor_capacity_facts(&directory)
+                        .map_err(refuse)?;
+                let facts =
+                    crate::durable_capacity::descriptor_capacity_facts(&file).map_err(refuse)?;
+                // The initial logical model does not qualify a separately mounted or unknown
+                // retained rollback object. Refuse, rather than charge it on the main volume.
+                if facts.identity != directory_facts.identity
+                    || facts.allocation_unit != directory_facts.allocation_unit
+                {
+                    return Err(LegacyJournalObservationError(
+                        "rollback is on a foreign directory volume",
+                    ));
+                }
                 Ok((metadata.len(), Some(identity)))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, None)),
@@ -412,5 +451,6 @@ fn native_facts(connection: &Connection) -> Option<(u64, u64)> {
         }
     }
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg(test)]
 mod tests;

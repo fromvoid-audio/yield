@@ -92,7 +92,7 @@ impl LegacySourceReadOwner {
     ) -> Result<LegacySourcePagerObservation> {
         self.capture_pager_until(profile, Instant::now() + Duration::from_secs(2))
     }
-    fn capture_pager_until(
+    pub(super) fn capture_pager_until(
         &self,
         profile: &WritableProfileGuard,
         deadline: Instant,
@@ -199,5 +199,6 @@ fn peak(p: u64, m: u64) -> Option<Peak> {
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg(test)]
 mod tests;

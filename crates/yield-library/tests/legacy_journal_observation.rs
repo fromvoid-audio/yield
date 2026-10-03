@@ -1,5 +1,8 @@
 //! Normal-build actual journal/profile capture; no fixture capacity or migration permission.
-#![cfg(not(feature = "test-support"))]
+#![cfg(all(
+    not(feature = "test-support"),
+    any(target_os = "linux", target_os = "macos")
+))]
 use tempfile::{TempDir, tempdir};
 use yield_library::{
     app_dirs::{AppRootGuard, WritableProfileGuard},

@@ -12,6 +12,11 @@ use std::{
 use thiserror::Error;
 
 mod allocation;
+mod common_allocation;
+pub use common_allocation::{
+    LegacyAllocationObject, LegacyAllocationRole, LegacyAllocationVolume,
+    LegacyCommonAllocationObservation,
+};
 mod image;
 mod rows;
 pub use allocation::LegacySourcePagerObservation;

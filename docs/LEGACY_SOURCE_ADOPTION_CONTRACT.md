@@ -1,9 +1,10 @@
 # Pre-lease legacy source adoption (OPT-2112)
 
 This decision resolves the allocation and recovery ownership prerequisite for
-OPT-2098. It installs no migration command, allocation observation, capacity
-grant, or receipt. Normal catalog opens continue to reject version 11 before
-source lease bootstrap. OPT-2098 and OPT-1745 remain open for implementation and
+OPT-2098. Retained source/journal/profile observers now return bounded historical
+images and conditional logical allocation allowances. They install no migration
+command, capacity grant or receipt. Normal catalog opens continue to reject
+version 11 before source lease bootstrap. OPT-2098 and OPT-1745 remain open for implementation and
 their original acceptance.
 
 ## Existing entrypoints and the gap
@@ -312,3 +313,58 @@ including the original source reservation/control descriptor, alias accounting,
 and all original acceptance. OPT-2117, OPT-2098 and OPT-1745 remain open for genuine
 admitted implementation. Contract fixtures and these historical observations do
 not complete migration, settlement or native physical qualification.
+
+## Common original-owner observation (OPT-2116)
+
+`LegacySourceReadOwner::capture_common_allocation_observation(profile,journal)`
+composes the actual retained source reservation/read connection with the existing
+journal/profile owner. One original cooperative two-second deadline is passed to
+both observers; it is not renewed between participants or revalidation. The
+extension exclusion remains held throughout. Original source image, journal
+settings/bindings and control facts are revalidated before returning. Foreign
+profile acquisitions, changed rows/objects/settings, conflicting units, duplicate
+object identities, oversize controls and checked overflow refuse without writes.
+
+The eight distinct logical objects are source main, DELETE rollback, future WAL,
+future SHM, original source reservation lock, whole journal main, journal DELETE
+rollback and original profile-owner lock. Main allowances already include their
+retained original bytes. The initial fresh source lock must remain empty; changed control bytes refuse.
+Each control descriptor is observed and conservatively allowed 4KiB; this enters no control-file write permission. Exact original file
+identities and directory/direct-child identities for absent future sidecars remain
+explicit. No object is relabeled as an unrelated recovery payload.
+
+The retained main descriptor determines the main volume; the retained database
+**directory** descriptor determines absent sidecar placement. These can differ.
+An existing journal rollback descriptor must agree with its directory volume/unit
+for this initial model; separately mounted/unknown rollback objects refuse. Distinct
+objects are each counted once, while identical descriptor volumes aggregate in
+stable device order. Unknown or inconsistent filesystem units never become zero
+allowances. Returned sums are conditional **logical** allowances, without free
+capacity, rounded physical charges, protected-floor claims or provider authority.
+Native physical allocation/directory metadata/durability qualification remains a
+separate precondition for the existing owner's future effect admission. The
+explicit adoption command, capacity-class/claim bridge, entered-policy verification,
+source transaction/receipt and separately accounted lease bootstrap remain OPT-2117.
+
+Normal-build integration executes genuine source/journal/profile custody and checks
+all eight objects, same-volume aliases, replacements, foreign acquisitions, changed
+rows and byte preservation. Linux additionally runs a real bind-mount case in a
+private user/mount namespace: the v11 main resides on `/dev/shm`, while its retained
+database directory and sidecars reside on the workspace filesystem. A second
+actual case independently mounts the genuine bootstrapped journal main on tmpfs
+and reopens it under the original profile guard, with rollback on the workspace.
+Actual open file/directory descriptors confirm distinct devices and correct
+per-volume sums.
+No parent mount is changed. This verifies descriptor placement, not physical
+allocation or power-loss qualification. Positive pager fixtures apply only to the
+known Linux/macOS VFS; unsupported targets continue to refuse observation.
+
+```
+cargo test --locked -p yield-library --test legacy_common_allocation
+cargo test --locked -p yield-library --lib sample_sources::db::legacy_observation::common_allocation::tests -- --test-threads=1
+cargo test --locked -p yield-library --test legacy_source_read_owner --test legacy_journal_observation --test profile_admission --test versioned_profile_migration
+```
+
+Ordinary v11 opens still return `MigrationRequired`. These observations create no
+source lease/audit, operation ID, intent, claim or adoption receipt. OPT-2098 and
+OPT-1745 remain open until genuine admitted implementation and original acceptance.

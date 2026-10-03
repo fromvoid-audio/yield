@@ -131,6 +131,7 @@ fn every_unknown_schema_and_malformed_row_rejects_without_source_mutation() {
         "INSERT INTO metadata VALUES ('large-a',printf('%040000d',1)),('large-b',printf('%040000d',2))",
         "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<129) INSERT INTO metadata SELECT 'row-'||i,'value' FROM n",
         "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1025) INSERT INTO wav_files SELECT 'row-'||i||'.wav',1,1 FROM n",
+        "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1023) INSERT INTO wav_files SELECT printf('%04088d.wav',i),1,1 FROM n",
     ] {
         let f = Fixture::new(sql);
         let bytes = std::fs::read(&f.path).unwrap();
@@ -220,6 +221,7 @@ fn retained_owner_rejects_replaced_main_root_sidecar_and_foreign_profile() {
     assert!(owner.capture(&foreign_guard).is_err());
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn actual_retained_pager_policy_is_source_only_and_preserves_original_bytes() {
     let f = Fixture::new("");
