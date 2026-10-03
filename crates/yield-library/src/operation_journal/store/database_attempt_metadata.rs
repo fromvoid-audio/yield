@@ -37,6 +37,16 @@ impl OperationJournalStore {
         // Includes the entire bounded database, all indexes/rows/control images, and the maximum
         // DELETE rollback copy. Existing database bytes are counted again, never credited back.
         self.validate_database_claim_metadata_capacity(&record)?;
+        self.validate_database_attempt_journal_claims(&record)?;
+        self.validate_namespace()?;
+        Ok(extensions)
+    }
+    pub(super) fn validate_database_attempt_journal_claims(
+        &self,
+        record: &crate::operation_journal::StoredOperationRecord,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.validate_database_claim_metadata_volume(record)?;
+        let operation = record.operation_id;
         let plan = super::full_capacity_plan_for_record(&record)?;
         let expected: Vec<_> = plan
             .allocations()
@@ -85,7 +95,7 @@ impl OperationJournalStore {
                 ));
             }
         }
-        self.validate_namespace()?;
-        Ok(extensions)
+        self.validate_namespace_for_precommit()?;
+        Ok(())
     }
 }

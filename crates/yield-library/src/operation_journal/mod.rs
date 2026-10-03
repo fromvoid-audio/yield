@@ -22,6 +22,7 @@ mod capacity_reserve_namespace;
 mod capacity_volume_owner;
 pub mod codec;
 pub mod coordinator;
+pub(crate) mod database_attempts;
 #[allow(dead_code)]
 pub(crate) mod database_claims;
 pub mod decoded_edit_commands;

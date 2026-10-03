@@ -20,7 +20,7 @@ mod integration {
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
     }
 
-    fn actual_journal_input(
+    pub(super) fn actual_journal_input(
         store: &OperationJournalStore,
         owner: &WritableProfileGuard,
     ) -> (
@@ -28,7 +28,18 @@ mod integration {
         AdmissionClaimInventory,
         DatabaseClaimInventory,
     ) {
-        let (mut record, original, inventory) = input(owner, 1);
+        actual_journal_input_count(store, owner, 1)
+    }
+    pub(super) fn actual_journal_input_count(
+        store: &OperationJournalStore,
+        owner: &WritableProfileGuard,
+        count: usize,
+    ) -> (
+        StoredOperationRecord,
+        AdmissionClaimInventory,
+        DatabaseClaimInventory,
+    ) {
+        let (mut record, original, inventory) = input(owner, count);
         let opened = crate::sample_sources::db::sqlite_identity::open_existing_database_file(
             &store.database_root,
             std::path::Path::new(JOURNAL_DATABASE_FILE_NAME),
@@ -84,7 +95,7 @@ mod integration {
         (record, claims, inventory)
     }
 
-    fn durable_image(store: &OperationJournalStore) -> Vec<String> {
+    pub(super) fn durable_image(store: &OperationJournalStore) -> Vec<String> {
         // Capture every relevant retained row, including release facts. No rejection may discard
         // unsupported evidence or manufacture an attempt/outcome row.
         let mut image = Vec::new();
