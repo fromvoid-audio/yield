@@ -202,3 +202,39 @@ cargo test --locked -p yield-library --test profile_admission
 Those tests establish current rejected source adoption and actual global migration,
 ownership and preservation. They do not execute this proposed migration or qualify
 physical allocation/durability. No new production migration success is claimed.
+
+## Retained read image prerequisite (OPT-2239)
+
+`SourceDatabase::open_legacy_read_owner` is an explicit normal-build read route,
+separate from ordinary opens. It holds the original profile acquisition, media and
+database roots, fresh source-sidecar reservation and main-file binding around a
+read-only descriptor-bound SQLite connection. It never bootstraps `source_lease`.
+Existing sidecar/WAL/SHM/journal evidence is refused without deletion or reset.
+
+The owner accepts the exact compiled v11 two-table/implicit-index DDL image and
+bounded typed metadata/audio rows. Bounded lookahead precedes retention; memory
+sorting does not ask SQLite to create sort files. Capture runs in one read
+transaction with a two-second cooperative progress deadline. Main bytes come from
+SQLite's retained VFS descriptor. The versioned digest includes bounded schema,
+rows and original physical/profile bindings. The initial digest is frozen;
+subsequent capture refuses changed rows even when an external SQLite writer
+ignores Yield's sidecar. All retained physical bindings are revalidated.
+
+`LegacySourceImage` is a privately constructed historical observation. It has no
+current source lease, audit, writable connection, allocation estimate or adoption
+permission. Inspection Drop preserves the created sidecar; such evidence requires
+an explicit later recovery route, so a fresh inspection cannot simply be retried.
+
+Normal-build tests exercise this actual owner and preserve original source bytes,
+rows and normal-open `MigrationRequired`, with unknown-schema, malformed/bounded
+row, prior-sidecar, replacement and foreign-acquisition refusals:
+
+```
+cargo test --locked -p yield-library --test legacy_source_read_owner
+```
+
+OPT-2116 remains open for its complete known-runtime/VFS allocation policy,
+page/sidecar facts, conservative DELETE/future-WAL bounds, profile/journal overhead,
+and deadline/overflow qualification. OPT-2117, OPT-2098 and OPT-1745 remain open for
+admitted migration, atomic receipt, crash recovery and original acceptance. The
+read image neither enters a persistent page cap nor proves physical allocation.

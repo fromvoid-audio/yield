@@ -503,6 +503,11 @@ impl SourcePublicationFence {
 }
 
 impl SourceLeaseReservation {
+    /// Historical locked sidecar identity for the pre-lease observer; no ownership grant.
+    pub(crate) fn observation_lock_identity(&self) -> &str {
+        &self.lock_identity
+    }
+
     /// Acquire the source sidecar lock after profile/root proof and before SQLite opens.
     pub(crate) fn acquire(
         database_root: Arc<BoundDatabaseRoot>,
