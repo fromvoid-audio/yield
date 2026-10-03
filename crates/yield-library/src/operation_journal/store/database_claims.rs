@@ -259,7 +259,7 @@ impl OperationJournalStore {
     /// bounded bundled-pager policy used for captured metadata caps the whole journal at 512MiB,
     /// disables spill/savepoints/temporary disk objects and checks actual descriptor identity.
     /// The logical peak never qualifies a native provider or protected reserve.
-    fn validate_database_claim_metadata_capacity(
+    pub(super) fn validate_database_claim_metadata_capacity(
         &self,
         record: &crate::operation_journal::StoredOperationRecord,
     ) -> Result<(), OperationJournalStoreError> {

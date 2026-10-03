@@ -1,6 +1,7 @@
 // Real profile-owned SQLite tests. Capacity fixtures prove logical settlement only; no test
 // invents a production reservation, sealed all-owner latch or physical allocation guarantee.
 mod exact_database_claim_persistence {
+    include!("database_attempt_metadata_tests.rs");
     use super::*;
     use crate::operation_journal::database_claims::{
         ClaimDirection, DatabaseBinding, DatabaseClaimInventory, DatabaseClaimSlice,
