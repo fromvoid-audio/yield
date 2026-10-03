@@ -62,6 +62,11 @@ def fixture_rows(data):
     if len(data) > 8192:
         raise ValueError("fixture exceeded byte limit")
     rows = []
+    expected_flags = {"create": {"created-file"}, "duplicate": {"created-file"},
+                      "rename": {"renamed-file"}, "reparent": {"renamed-file"},
+                      "delete": {"removed-file"}, "unsupported": {"unknown-event"},
+                      "empty-folder": {"created-directory"},
+                      "unsupported-only": {"created-directory", "created-file"}}
     for line in data.decode("utf-8").splitlines():
         if not line or line.startswith("#"):
             continue
@@ -69,19 +74,14 @@ def fixture_rows(data):
         if len(parts) != 5 or len(rows) >= 32:
             raise ValueError("invalid or unbounded redacted fixture")
         action, sequence, volume_path, flags, relative = parts
-        if action not in {"create", "duplicate", "rename", "reparent", "delete", "unsupported"}:
+        if action not in expected_flags:
             raise ValueError("unknown fixture session")
         if not sequence.isascii() or not sequence.isdecimal():
             raise ValueError("invalid fixture cursor")
         sequence = integer(int(sequence))
         if sequence == 0 or (rows and sequence <= rows[-1]["sequence"]):
             raise ValueError("fixture cursors must advance")
-        if flags not in {"created-file", "renamed-file", "removed-file", "unknown-event"}:
-            raise ValueError("unknown fixture event shape")
-        expected_flags = {"create": "created-file", "duplicate": "created-file",
-                          "rename": "renamed-file", "reparent": "renamed-file",
-                          "delete": "removed-file", "unsupported": "unknown-event"}
-        if flags != expected_flags[action] or (relative == "-") != (action == "unsupported"):
+        if flags not in expected_flags[action] or (relative == "-") != (action == "unsupported"):
             raise ValueError("fixture action and disposition disagree")
         for locator in (volume_path, relative):
             if locator == "-":
@@ -96,9 +96,8 @@ def fixture_rows(data):
             raise ValueError("fixture root mapping changed")
         # Only action/cursor/flag shape enters the output; no fixture paths are persisted.
         rows.append({"session": action, "sequence": sequence, "event_shape": flags})
-    if {row["session"] for row in rows} != set(SESSIONS) - {
-        "empty_folder", "unsupported_only_folder", "overflow", "restart", "scan_overlap"
-    }:
+    expected_shapes = {(action, flag) for action, flags in expected_flags.items() for flag in flags}
+    if {(row["session"], row["event_shape"]) for row in rows} != expected_shapes:
         raise ValueError("fixture action matrix is incomplete")
     return rows
 
@@ -181,9 +180,13 @@ def report(head, fixture, input_data=None):
     records = parse_records(input_data) if input_data is not None else []
     sessions = []
     for name, (issue, expected) in SESSIONS.items():
-        covered = [row["sequence"] for row in rows if row["session"] == name]
+        fixture_name = {"empty_folder": "empty-folder", "unsupported_only_folder": "unsupported-only"}.get(name, name)
+        covered = [row["sequence"] for row in rows if row["session"] == fixture_name]
         model_case = "unsupported_finder_shape" if name == "unsupported" else "valid_finder_replay"
-        evidence = next((record for record in records if record["case"] == model_case), None) if covered else None
+        # The existing valid batch exercises file-only incremental replay. Folder
+        # fixture coverage cannot inherit its revision or become audit evidence.
+        file_model = name in {"create", "duplicate", "rename", "reparent", "delete", "unsupported"}
+        evidence = next((record for record in records if record["case"] == model_case), None) if covered and file_model else None
         sessions.append({"session": name, "issue": issue, "expected_disposition": expected,
                          "expected_affected_region": "old_and_new_parents" if name in ("rename", "reparent") else "current_source" if name in ("unsupported", "overflow", "restart", "scan_overlap") else "entry_or_parent_subtree",
                          "fixture_sequences": covered,
