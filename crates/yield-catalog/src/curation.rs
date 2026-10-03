@@ -686,6 +686,13 @@ pub(crate) fn execute_operation(
         match resolve_operation_fence(&source_id, fence, sources) {
             Ok(resolved) => resolved,
             Err(error) => {
+                #[cfg(feature = "test-support")]
+                super::test_support::finish_request(
+                    reservation.admission,
+                    &source_id,
+                    lifecycle_generation,
+                    request_id,
+                );
                 let outcome = SourceCurationOperationOutcome {
                     initial_revision,
                     final_revision: initial_revision,
@@ -712,7 +719,7 @@ pub(crate) fn execute_operation(
         let result = if expected_revision == u64::MAX {
             Err(CatalogError::CurationRevisionOverflow(expected_revision))
         } else {
-            execute_inner(
+            execute_inner_scoped(
                 &source_id,
                 lifecycle_generation,
                 expected_revision,
@@ -720,6 +727,8 @@ pub(crate) fn execute_operation(
                 updates,
                 profile_guard,
                 sources,
+                #[cfg(feature = "test-support")]
+                Some((reservation.admission, request_id, batch_index)),
             )
         };
         match result {
@@ -733,6 +742,14 @@ pub(crate) fn execute_operation(
             }
         }
     }
+
+    #[cfg(feature = "test-support")]
+    super::test_support::finish_request(
+        reservation.admission,
+        &source_id,
+        lifecycle_generation,
+        request_id,
+    );
 
     // The final revision is the committed prefix's revision, or the fenced revision when the
     // first batch failed.
@@ -840,6 +857,33 @@ pub(crate) fn execute_inner(
     profile_guard: &WritableProfileGuard,
     sources: &mut HashMap<SourceId, RegisteredSource>,
 ) -> Result<SourceCurationCommitReceipt, CatalogError> {
+    execute_inner_scoped(
+        source_id,
+        lifecycle_generation,
+        expected_revision,
+        expected_root_identity,
+        updates,
+        profile_guard,
+        sources,
+        #[cfg(feature = "test-support")]
+        None,
+    )
+}
+
+fn execute_inner_scoped(
+    source_id: &SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    expected_root_identity: &RootIdentity,
+    updates: &[SourceCurationUpdate],
+    profile_guard: &WritableProfileGuard,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+    #[cfg(feature = "test-support")] fault: Option<(
+        &std::sync::Arc<std::sync::Mutex<AdmissionState>>,
+        u64,
+        usize,
+    )>,
+) -> Result<SourceCurationCommitReceipt, CatalogError> {
     let Some(source) = sources.get_mut(source_id) else {
         return Err(CatalogError::NotRegistered(source_id.clone()));
     };
@@ -942,6 +986,16 @@ pub(crate) fn execute_inner(
             source_id: source_id.clone(),
             detail: String::from("source writer root identity differs from the curation request"),
         });
+    }
+    #[cfg(feature = "test-support")]
+    if let Some((admission, request_id, batch_index)) = fault {
+        super::test_support::take_failure(
+            admission,
+            source_id,
+            lifecycle_generation,
+            request_id,
+            batch_index,
+        )?;
     }
     let receipt = source
         .database
