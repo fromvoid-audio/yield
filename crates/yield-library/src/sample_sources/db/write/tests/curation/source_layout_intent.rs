@@ -21,6 +21,14 @@ case!(
     source_layout_intent_owner_readonly_roundtrip,
     "layout-intent-owner"
 );
+case!(
+    source_layout_durable_family_restart_owner,
+    "layout-intent-durable"
+);
+case!(
+    source_layout_durable_maximum_manifest,
+    "layout-intent-durable-max"
+);
 case!(source_layout_intent_wire_rejections, "layout-intent-wire");
 case!(source_layout_intent_maximum_bounds, "layout-intent-max");
 case!(
@@ -63,8 +71,8 @@ fn intent(
     )
 }
 pub(super) fn dispatch(case: &str) {
-    if case == "layout-intent-max" {
-        let (_fixture, writer) = setup_max_manifest();
+    if matches!(case, "layout-intent-max" | "layout-intent-durable-max") {
+        let (fixture, writer) = setup_max_manifest();
         let p = prepare(&writer, &capture(&writer).unwrap()).unwrap();
         let b = writer.capture_layout_metadata_budget(p.revision()).unwrap();
         let args = intent(&writer, &p, &b).unwrap();
@@ -77,8 +85,14 @@ pub(super) fn dispatch(case: &str) {
         );
         assert_eq!(
             decode_source_layout_intent(&args.canonical_bytes().unwrap()).unwrap(),
-            StoredSourceLayoutIntent::Supported(args)
+            StoredSourceLayoutIntent::Supported(args.clone())
         );
+        if case == "layout-intent-durable-max" {
+            crate::operation_journal::test_source_layout_durable(
+                args.clone(),
+                &fixture.profile_guard,
+            );
+        }
         let mut opaque = vec![0; MAX_SOURCE_LAYOUT_INTENT_BYTES];
         opaque[..4].copy_from_slice(b"YSLI");
         opaque[4..12].copy_from_slice(&2u64.to_le_bytes());
@@ -120,6 +134,10 @@ pub(super) fn dispatch(case: &str) {
     let args = intent(&writer, &p, &b).unwrap();
     let bytes = args.canonical_bytes().unwrap();
     match case {
+        "layout-intent-durable" => crate::operation_journal::test_source_layout_durable(
+            args.clone(),
+            &fixture.profile_guard,
+        ),
         "layout-intent-owner" => {
             writer
                 .database_for_tests()

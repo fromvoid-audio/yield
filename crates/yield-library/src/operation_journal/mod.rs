@@ -283,9 +283,10 @@ pub use store::{
 };
 pub use validation::{RecordConsistency, classify_record};
 pub use work_plan::{
-    MAX_WORK_PLAN_EDGES, MAX_WORK_PLAN_UNITS, WORK_PLAN_VERSION, WORK_PLAN_VERSION_V1, WorkPlan,
-    WorkPlanError, WorkPrerequisite, WorkUnit, WorkUnitApplicability, WorkUnitKey, WorkUnitRole,
-    derive_work_plan, derive_work_plan_v1, validate_work_plan,
+    MAX_WORK_PLAN_EDGES, MAX_WORK_PLAN_UNITS, WORK_PLAN_VERSION, WORK_PLAN_VERSION_SOURCE_LAYOUT,
+    WORK_PLAN_VERSION_V1, WorkPlan, WorkPlanError, WorkPrerequisite, WorkUnit,
+    WorkUnitApplicability, WorkUnitKey, WorkUnitRole, derive_work_plan, derive_work_plan_v1,
+    validate_work_plan,
 };
 pub use work_progress::{
     AfterEffectReconciliationObservation, AuditTarget, AuditTargetValidationError,
@@ -316,3 +317,6 @@ pub use metadata_tag_commands::{
     MetadataTagHistoricalScope, MetadataTagMutation, MetadataTagSourceIntentArgs,
     StoredMetadataTagSourceIntent, decode_metadata_tag_source_intent,
 };
+
+#[cfg(test)]
+pub(crate) use store::source_layout_tests::run as test_source_layout_durable;

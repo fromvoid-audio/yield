@@ -33,6 +33,8 @@ use crate::sample_sources::SourceId;
 
 /// Version of the frozen work-plan derivation algorithm.
 pub const WORK_PLAN_VERSION_V1: u16 = 1;
+/// Source-only SQL layout plan; V1 file topology remains frozen.
+pub const WORK_PLAN_VERSION_SOURCE_LAYOUT: u16 = 2;
 /// Alias for the current work-plan version.
 pub const WORK_PLAN_VERSION: u16 = WORK_PLAN_VERSION_V1;
 /// Maximum number of derived participant work units in one plan.
@@ -70,6 +72,8 @@ const STEP_ARTIFACT: u16 = 50;
 /// Semantic obligation represented by one derived work unit.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum WorkUnitRole {
+    /// Publish or reconcile one admitted canonical source SQL layout generation.
+    SourceDerivedLayout,
     /// Read an existing source-database observation.
     SourceRead,
     /// Apply or reconcile an affected source-database entry.
@@ -273,7 +277,28 @@ impl WorkPlan {
 
     /// Validate the bounded, sorted, self-contained shape of a decoded plan.
     pub fn validate(&self) -> Result<(), WorkPlanError> {
-        if self.plan_version != WORK_PLAN_VERSION_V1 {
+        if !matches!(
+            self.plan_version,
+            WORK_PLAN_VERSION_V1 | WORK_PLAN_VERSION_SOURCE_LAYOUT
+        ) {
+            return Err(WorkPlanError::UnsupportedPlanVersion {
+                actual: self.plan_version,
+            });
+        }
+        if (self.plan_version == WORK_PLAN_VERSION_SOURCE_LAYOUT
+            && (self.units.len() != 1
+                || !self.prerequisites.is_empty()
+                || self.units[0].key.role != WorkUnitRole::SourceDerivedLayout
+                || self.units[0].key.action_ordinal != 0
+                || self.units[0].key.step_ordinal != STEP_SOURCE_AFFECT
+                || self.units[0].requirement != ParticipantRequirement::Required
+                || self.units[0].applicability != WorkUnitApplicability::Required))
+            || (self.plan_version == WORK_PLAN_VERSION_V1
+                && self
+                    .units
+                    .iter()
+                    .any(|u| u.key.role == WorkUnitRole::SourceDerivedLayout))
+        {
             return Err(WorkPlanError::UnsupportedPlanVersion {
                 actual: self.plan_version,
             });
@@ -401,6 +426,31 @@ pub fn derive_work_plan(
     args: &UniversalCommandArgs,
     participants: &ParticipantSet,
 ) -> Result<WorkPlan, WorkPlanError> {
+    if let UniversalCommandArgs::SourceDerivedLayout(command) = args {
+        participants.validate_for_new_intent()?;
+        command
+            .validate_against_participants(participants)
+            .map_err(|e| {
+                WorkPlanError::CommandArguments(
+                    UniversalCommandArgsValidationError::SourceDerivedLayout(e),
+                )
+            })?;
+        let key = WorkUnitKey::new(
+            0,
+            STEP_SOURCE_AFFECT,
+            command.participant_id(),
+            WorkUnitRole::SourceDerivedLayout,
+        );
+        let mut builder = PlanBuilder::default();
+        builder.add_unit(
+            key,
+            ParticipantRequirement::Required,
+            WorkUnitApplicability::Required,
+        )?;
+        let plan = builder.finish_with_version(WORK_PLAN_VERSION_SOURCE_LAYOUT)?;
+        plan.validate()?;
+        return Ok(plan);
+    }
     derive_work_plan_v1(args, participants)
 }
 
@@ -431,7 +481,7 @@ pub fn validate_work_plan(
     participants: &ParticipantSet,
 ) -> Result<(), WorkPlanError> {
     plan.validate()?;
-    let expected = derive_work_plan_v1(args, participants)?;
+    let expected = derive_work_plan(args, participants)?;
     if plan != &expected {
         return Err(WorkPlanError::PlanMismatch);
     }
@@ -940,6 +990,11 @@ fn collect_topology(
     collected: &mut CollectedTopology,
 ) -> Result<(), WorkPlanError> {
     match args {
+        UniversalCommandArgs::SourceDerivedLayout(_) => {
+            return Err(WorkPlanError::IncompleteTopology(
+                "source layout requires the source-only V2 planner",
+            ));
+        }
         UniversalCommandArgs::Recording(command) => {
             collected.filesystem(command.work_key().participant_id())?;
             collect_namespace_directory(collected, command.destination().parent(), false, true)?;
@@ -1179,11 +1234,15 @@ impl PlanBuilder {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<WorkPlan, WorkPlanError> {
+    fn finish(self) -> Result<WorkPlan, WorkPlanError> {
+        self.finish_with_version(WORK_PLAN_VERSION_V1)
+    }
+
+    fn finish_with_version(mut self, plan_version: u16) -> Result<WorkPlan, WorkPlanError> {
         self.units.sort_by_key(|unit| unit.key);
         self.prerequisites.sort();
         let plan = WorkPlan {
-            plan_version: WORK_PLAN_VERSION_V1,
+            plan_version,
             units: self.units,
             prerequisites: self.prerequisites,
         };
@@ -1221,6 +1280,11 @@ fn derive_actions(
     action_spans: &mut Vec<ActionSpan>,
 ) -> Result<(), WorkPlanError> {
     match args {
+        UniversalCommandArgs::SourceDerivedLayout(_) => {
+            return Err(WorkPlanError::IncompleteTopology(
+                "source layout requires the source-only V2 planner",
+            ));
+        }
         UniversalCommandArgs::Recording(command) => {
             let mut span = ActionSpan::default();
             add_staged_mutation_without_source_read(

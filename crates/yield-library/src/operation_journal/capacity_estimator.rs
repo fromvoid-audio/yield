@@ -230,6 +230,9 @@ pub fn estimate_capacity(
     args: &UniversalCommandArgs,
 ) -> Result<CapacityRequirementMatrix, CapacityEstimatorError> {
     match args {
+        UniversalCommandArgs::SourceDerivedLayout(_) => Ok(unsupported_matrix(
+            UniversalCommandKind::SourceDerivedLayout,
+        )),
         UniversalCommandArgs::Recording(_) => Ok(unknown_output_matrix(
             UniversalCommandKind::CreateFile,
             CapacityEstimateReason::MetadataBoundNotDefined,
@@ -316,6 +319,7 @@ pub fn estimate_capacity(
 /// Return the conservative matrix for an argumentless command kind.
 pub fn estimate_command_kind(command_kind: UniversalCommandKind) -> CapacityRequirementMatrix {
     match command_kind {
+        UniversalCommandKind::SourceDerivedLayout => unsupported_matrix(command_kind),
         UniversalCommandKind::Extract => unsupported_matrix(command_kind),
         UniversalCommandKind::Copy => unsupported_matrix(command_kind),
         UniversalCommandKind::Import => unsupported_matrix(command_kind),
