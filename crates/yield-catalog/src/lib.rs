@@ -65,6 +65,8 @@ pub use command_metrics::{CatalogCommandMetrics, CatalogDurationMetrics};
 mod curation;
 mod curation_tag_facts;
 mod harvest_facts;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub use harvest_facts::{
     CatalogHarvestFacts, HARVEST_FACTS_MAX_BYTES, HARVEST_FACTS_MAX_PATH_BYTES,
     HARVEST_FACTS_MAX_PATHS, HarvestFactsCancellation, HarvestFactsEntry, HarvestFactsFailure,
@@ -2096,6 +2098,8 @@ struct CurationLineage {
 }
 
 struct AdmissionState {
+    #[cfg(feature = "test-support")]
+    compound_batch_fault: Option<test_support::CompoundBatchFault>,
     feature_analysis_metrics: FeatureAnalysisMetrics,
     command_metrics: command_metrics::CommandMetrics,
     shutdown: bool,
@@ -2114,6 +2118,8 @@ struct AdmissionState {
 impl AdmissionState {
     fn new() -> Self {
         Self {
+            #[cfg(feature = "test-support")]
+            compound_batch_fault: None,
             command_metrics: command_metrics::CommandMetrics::new(),
             feature_analysis_metrics: FeatureAnalysisMetrics::default(),
             shutdown: false,
@@ -2131,6 +2137,10 @@ impl AdmissionState {
     }
 
     fn invalidate_all(&mut self) {
+        #[cfg(feature = "test-support")]
+        {
+            self.compound_batch_fault = None;
+        }
         for (_, cancellation) in self.index_inspections.drain() {
             cancellation.cancel();
         }
@@ -3175,6 +3185,8 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .get(&source_id)
                 .is_none_or(|source| lifecycle_generation > source.lifecycle_generation);
             if replace {
+                #[cfg(feature = "test-support")]
+                test_support::clear_source(state, &source_id);
                 state.active_audits.remove(&source_id);
                 if let Some(cancellation) = state.index_inspections.remove(&source_id) {
                     cancellation.cancel();
@@ -3207,6 +3219,8 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .get(&source_id)
                 .is_none_or(|source| lifecycle_generation >= source.lifecycle_generation);
             if replace {
+                #[cfg(feature = "test-support")]
+                test_support::clear_source(state, &source_id);
                 state.active_audits.remove(&source_id);
                 if let Some(cancellation) = state.index_inspections.remove(&source_id) {
                     cancellation.cancel();
@@ -16122,6 +16136,8 @@ mod tests {
             (true, false)
         );
     }
+    #[cfg(feature = "test-support")]
+    mod compound_batch_fault;
     #[cfg(target_os = "linux")]
     mod feature_job_tests;
     mod feature_progress_tests;

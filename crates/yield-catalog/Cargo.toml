@@ -7,6 +7,10 @@ edition = "2024"
 warnings = "deny"
 missing_docs = "deny"
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 yield-analysis = { path = "../yield-analysis" }
 blake3 = "1.6.1"
