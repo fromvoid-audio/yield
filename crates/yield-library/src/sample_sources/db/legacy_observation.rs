@@ -11,8 +11,10 @@ use std::{
 };
 use thiserror::Error;
 
+mod allocation;
 mod image;
 mod rows;
+pub use allocation::LegacySourcePagerObservation;
 
 /// Refusal to inspect an unsupported, stale or unbounded legacy source.
 #[derive(Debug, Error)]
@@ -167,9 +169,16 @@ impl LegacySourceReadOwner {
     /// Capture one coherent bounded image under the actual retained read connection.
     /// The result has no allocation estimate, current lease, audit or adoption permission.
     pub fn capture(&self, profile: &WritableProfileGuard) -> Result<LegacySourceImage> {
+        self.capture_until(profile, Instant::now() + Duration::from_secs(2))
+    }
+
+    fn capture_until(
+        &self,
+        profile: &WritableProfileGuard,
+        deadline: Instant,
+    ) -> Result<LegacySourceImage> {
         let _extensions = crate::sqlite_ext::try_extension_free_metadata_scope()
             .ok_or(LegacyObservationError("SQLite extension runtime unknown"))?;
-        let deadline = Instant::now() + Duration::from_secs(2);
         let _progress = Progress::install(&self.connection, deadline);
         self.validate(profile)?;
         let main_bytes =

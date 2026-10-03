@@ -26,7 +26,9 @@ pub use subtree_scan::{SUBTREE_SCAN_MAX_RETAINED, SubtreeScanDatabaseFacts};
 mod index_entries;
 mod index_inspection;
 mod legacy_observation;
-pub use legacy_observation::{LegacyObservationError, LegacySourceImage, LegacySourceReadOwner};
+pub use legacy_observation::{
+    LegacyObservationError, LegacySourceImage, LegacySourcePagerObservation, LegacySourceReadOwner,
+};
 mod open;
 mod open_profiles;
 /// Private rename-recovery metadata retained after immediate file pruning.

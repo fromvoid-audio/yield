@@ -238,3 +238,31 @@ page/sidecar facts, conservative DELETE/future-WAL bounds, profile/journal overh
 and deadline/overflow qualification. OPT-2117, OPT-2098 and OPT-1745 remain open for
 admitted migration, atomic receipt, crash recovery and original acceptance. The
 read image neither enters a persistent page cap nor proves physical allocation.
+
+## Source pager policy observation (OPT-2240)
+
+`LegacySourceReadOwner::capture_pager_observation` captures the source-side policy
+through the same frozen image and retained owner. It checks bundled SQLite 3.50.2,
+process extension exclusion, the known connection-owned Unix forwarding VFS and
+its actual sector callback. An unregistered/unknown pager or tainted runtime is
+refused. It reads actual page size/count/current maximum and selects the smaller
+of that maximum and 64MiB/page_size without changing the page cap or journal mode.
+
+The checked J/B formula above produces separate main, DELETE rollback, future-WAL
+and future-SHM estimates. Main-file length remains a retained VFS observation;
+page count and these estimates are logical bounds. The reopened volume-inspection
+handle is no-follow, checked against the original retained file identity and used
+only to capture volume/allocation-unit facts. Free bytes are not carried into the
+result. The result is non-deserializable and privately constructed, with no
+conversion into allocation, migration or capacity authority.
+
+Actual normal-build capture preserves source bytes and creates no WAL/SHM/journal.
+Private real-owner fixtures verify a smaller page cap remains unchanged, altered
+read policy and expired deadline refuse, and an actual failed extension load in a
+separate process taints/refuses capture. Checked-formula tests cover page-size
+boundaries and overflow; a genuine unregistered SQLite connection cannot qualify.
+
+These source-only estimates do not include profile/journal intent/claim/receipt
+requirements, prove native physical allocation, enter a future migration policy,
+or authorize the separately admitted WAL transition. Complete-owner/common-
+capacity composition remains OPT-2116 and migration remains OPT-2117.
