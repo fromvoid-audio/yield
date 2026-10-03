@@ -26,6 +26,11 @@ fn exact_channel_build_identity_is_retained() {
             "0.19.1-nightly.20261002+01234567",
             ReleaseChannel::Nightly,
         ),
+        (
+            "nightly",
+            "0.19.1-nightly.2026-10-02+01234567",
+            ReleaseChannel::Nightly,
+        ),
     ] {
         let mut input = stable();
         input[0] = Some(channel);
@@ -110,6 +115,8 @@ fn mismatched_or_unknown_identity_is_rejected() {
 #[test]
 fn nightly_suffix_is_bound_to_exact_commit_and_build_date() {
     for version in [
+        "0.19.1-nightly.2026-10-03+01234567",
+        "0.19.1-nightly.2026-10-02+deadbeef",
         "0.19.1-nightly.20261003+01234567",
         "0.19.1-nightly.20261002+deadbeef",
         "0.19.1-nightly.20261002+012345",

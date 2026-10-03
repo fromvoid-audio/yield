@@ -8774,8 +8774,11 @@ dependencies = [
  "serde_json",
  "toml 0.8.23",
  "ureq",
+ "url",
+ "webpki-roots 0.26.11",
  "windows 0.62.2",
  "windows-core 0.62.2",
+ "yield-core",
 ]
 
 [[package]]
