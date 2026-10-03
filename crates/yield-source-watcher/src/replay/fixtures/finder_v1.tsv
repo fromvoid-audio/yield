@@ -6,3 +6,6 @@ rename	104	Library/snare.wav	renamed-file	snare.wav
 reparent	105	Library/drums/snare.wav	renamed-file	drums/snare.wav
 delete	106	Library/drums/snare.wav	removed-file	drums/snare.wav
 unsupported	107	Library/unknown.bin	unknown-event	-
+empty-folder	108	Library/empty	created-directory	empty
+unsupported-only	109	Library/unsupported-only	created-directory	unsupported-only
+unsupported-only	110	Library/unsupported-only/notes.txt	created-file	unsupported-only/notes.txt

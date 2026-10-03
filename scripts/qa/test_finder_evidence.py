@@ -46,6 +46,33 @@ def log(records):
 
 
 class FinderEvidenceTests(unittest.TestCase):
+    def test_folder_shapes_have_coverage_without_inheriting_file_batch_evidence(self):
+        fixture = (evidence.ROOT / evidence.FIXTURE).read_bytes()
+        result = evidence.report("a" * 40, fixture, log(model_records()))
+        sessions = {row["session"]: row for row in result["sessions"]}
+        for name, sequences in (("empty_folder", [108]),
+                                ("unsupported_only_folder", [109, 110])):
+            with self.subTest(session=name):
+                row = sessions[name]
+                self.assertEqual(row["fixture_sequences"], sequences)
+                self.assertIsNone(row["model_batch_case"])
+                self.assertIsNone(row["batch_source_revision"])
+                self.assertEqual(row["last_good_projection"], "unverified_per_session")
+                self.assertTrue(row["native"].startswith("blocked"))
+
+    def test_folder_matrix_requires_directory_and_unsupported_child_shapes(self):
+        fixture = (evidence.ROOT / evidence.FIXTURE).read_bytes()
+        for line in fixture.splitlines():
+            if not line.startswith((b"empty-folder\t", b"unsupported-only\t")):
+                continue
+            for invalid in (fixture.replace(line + b"\n", b""),
+                            fixture.replace(line, line.replace(b"created-directory", b"removed-file")
+                                            if b"created-directory" in line else line.replace(b"created-file", b"created-directory"))):
+                with self.subTest(row=line), self.assertRaises(ValueError):
+                    evidence.fixture_rows(invalid)
+        with self.assertRaises(ValueError):
+            evidence.fixture_rows(b"")
+
     def test_complete_matrix_has_explicit_native_and_io_gaps(self):
         fixture = (evidence.ROOT / evidence.FIXTURE).read_bytes()
         result = evidence.report("a" * 40, fixture, log(model_records()))

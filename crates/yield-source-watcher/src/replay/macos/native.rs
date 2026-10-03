@@ -758,7 +758,7 @@ mod tests {
     /// ordinals, and source-relative paths for review instead of rewriting the fixture.
     #[test]
     #[ignore = "manual disposable-source FSEvents capture for Finder fixture review"]
-    fn capture_disposable_file_action_shapes_for_fixture_review() {
+    fn capture_disposable_action_shapes_for_fixture_review() {
         let _capture_guard = capture_test_guard();
         let temp = tempfile::tempdir().expect("disposable capture root");
         let root = fs::canonicalize(temp.path()).expect("canonical capture root");
@@ -836,5 +836,18 @@ mod tests {
         capture_action("delete", Path::new("drums/snare.wav"), &mut || {
             fs::remove_file(root.join("drums/snare.wav")).expect("remove disposable sample");
         });
+        capture_action("empty-folder", Path::new("empty"), &mut || {
+            fs::create_dir(root.join("empty")).expect("create empty disposable folder");
+        });
+        capture_action(
+            "unsupported-only",
+            Path::new("unsupported-only"),
+            &mut || {
+                fs::create_dir(root.join("unsupported-only"))
+                    .expect("create unsupported-only disposable folder");
+                fs::write(root.join("unsupported-only/notes.txt"), b"notes")
+                    .expect("create unsupported disposable file");
+            },
+        );
     }
 }
