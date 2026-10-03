@@ -20,6 +20,7 @@ yield-scan = { path = "../yield-scan" }
 yield-source-watcher = { path = "../yield-source-watcher" }
 
 [dev-dependencies]
+serde_json = "1.0.145"
 hound.workspace = true
 rusqlite = "=0.37.0"
 tempfile = "3.23.0"
