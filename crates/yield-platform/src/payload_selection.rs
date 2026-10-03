@@ -17,6 +17,10 @@ mod protocol;
 mod verification;
 use catalog::{Installed, Release};
 pub use verification::VerifiedPayload;
+pub use verification::owner::{
+    PayloadStageAttempt, PayloadStageIdentity, PayloadStageObservation, PayloadStagePhase,
+    PayloadStagingService,
+};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 

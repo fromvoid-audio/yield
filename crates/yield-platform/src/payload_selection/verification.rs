@@ -5,6 +5,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 mod archive;
+pub(super) mod owner;
 
 const PIN: &str = "8Z7dQJBRMbxCFkFMeBYa1FMSWOUm6nePFgoK5c43jT4=";
 const ARCHIVE_CAP: usize = 1024 * 1024 * 1024;
@@ -86,6 +87,7 @@ impl Ledger {
         Ok(())
     }
 }
+#[derive(Clone)]
 enum Key {
     Compiled,
     #[cfg(test)]
@@ -170,7 +172,7 @@ fn verify_inner(
     }
     // Fixed conservative credit covers manifest raw/decoded text/list, decompressor/hash/signature
     // work and bounded selection/proof overhead. Index and normalized-name capacities add below.
-    let mut ledger = Ledger(8 * 1024 * 1024);
+    let mut ledger = Ledger(super::protocol::staging::OWNER_WORKING_CREDIT);
     ledger.charge(checksums.capacity())?;
     ledger.charge(signature.capacity())?;
     let version = semver::Version::parse(&selection.release.version).map_err(|_| invalid)?;

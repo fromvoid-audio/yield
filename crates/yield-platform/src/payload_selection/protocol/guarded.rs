@@ -7,7 +7,13 @@ use std::{
 };
 use ureq::{ReadWrite, TlsConnector};
 
-pub(super) struct ValidatedTls(Arc<ureq::rustls::ClientConfig>);
+#[derive(Clone)]
+struct StagePolicy {
+    ceiling: usize,
+    traffic: Arc<super::staging::Traffic>,
+    line: Option<Arc<super::wire::RequestLine>>,
+}
+pub(super) struct ValidatedTls(Arc<ureq::rustls::ClientConfig>, Option<StagePolicy>);
 impl ValidatedTls {
     pub(super) fn new() -> Self {
         let config = ureq::rustls::ClientConfig::builder_with_provider(
@@ -19,7 +25,20 @@ impl ValidatedTls {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         })
         .with_no_client_auth();
-        Self(Arc::new(config))
+        Self(Arc::new(config), None)
+    }
+    pub(super) fn staging(
+        ceiling: usize,
+        traffic: Arc<super::staging::Traffic>,
+        line: Option<Arc<super::wire::RequestLine>>,
+    ) -> Self {
+        let mut tls = Self::new();
+        tls.1 = Some(StagePolicy {
+            ceiling,
+            traffic,
+            line,
+        });
+        tls
     }
 }
 impl TlsConnector for ValidatedTls {
@@ -29,7 +48,10 @@ impl TlsConnector for ValidatedTls {
         stream: Box<dyn ReadWrite>,
     ) -> Result<Box<dyn ReadWrite>, ureq::Error> {
         let validated = self.0.connect(name, stream)?;
-        Ok(Box::new(Guarded::new(validated)))
+        Ok(Box::new(match &self.1 {
+            Some(policy) => Guarded::staged(validated, policy.clone()),
+            None => Guarded::new(validated),
+        }))
     }
 }
 #[cfg(test)]
@@ -52,6 +74,41 @@ impl TlsConnector for LoopbackTls {
         );
         // Deliberate private unit-test transport substitution, not a production TLS override.
         Ok(Box::new(Guarded::new(stream)))
+    }
+}
+#[cfg(test)]
+pub(super) struct LoopbackStagingTls(StagePolicy);
+#[cfg(test)]
+impl LoopbackStagingTls {
+    pub(super) fn new(
+        ceiling: usize,
+        traffic: Arc<super::staging::Traffic>,
+        line: Option<Arc<super::wire::RequestLine>>,
+    ) -> Self {
+        Self(StagePolicy {
+            ceiling,
+            traffic,
+            line,
+        })
+    }
+}
+#[cfg(test)]
+impl TlsConnector for LoopbackStagingTls {
+    fn connect(
+        &self,
+        _: &str,
+        stream: Box<dyn ReadWrite>,
+    ) -> Result<Box<dyn ReadWrite>, ureq::Error> {
+        assert!(
+            stream
+                .socket()
+                .unwrap()
+                .peer_addr()
+                .unwrap()
+                .ip()
+                .is_loopback()
+        );
+        Ok(Box::new(Guarded::staged(stream, self.0.clone())))
     }
 }
 
@@ -82,6 +139,9 @@ struct Guarded {
     body: usize,
     framing: usize,
     denied: bool,
+    ceiling: usize,
+    traffic: Option<Arc<super::staging::Traffic>>,
+    writer: Option<super::wire::Writer>,
 }
 impl fmt::Debug for Guarded {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -108,7 +168,17 @@ impl Guarded {
             body: 0,
             framing: 0,
             denied: false,
+            ceiling: super::MAX_BODY,
+            traffic: None,
+            writer: None,
         }
+    }
+    fn staged(inner: Box<dyn ReadWrite>, policy: StagePolicy) -> Self {
+        let mut guarded = Self::new(inner);
+        guarded.ceiling = policy.ceiling;
+        guarded.traffic = Some(policy.traffic);
+        guarded.writer = policy.line.map(super::wire::Writer::new);
+        guarded
     }
     fn consume(&mut self, b: u8) -> io::Result<()> {
         match self.phase {
@@ -144,7 +214,7 @@ impl Guarded {
                         return Err(invalid());
                     }
                     let n = usize::from_str_radix(size, 16).map_err(|_| invalid())?;
-                    if n > super::MAX_BODY - self.body {
+                    if n > self.ceiling - self.body {
                         return Err(invalid());
                     }
                     self.phase = if n == 0 {
@@ -183,7 +253,7 @@ impl Guarded {
     }
     fn body_byte(&mut self) -> io::Result<()> {
         self.body += 1;
-        if self.body > super::MAX_BODY {
+        if self.body > self.ceiling {
             Err(invalid())
         } else {
             Ok(())
@@ -277,7 +347,7 @@ impl Guarded {
                 return Err(invalid());
             }
             let n = value.parse::<usize>().map_err(|_| invalid())?;
-            if n > super::MAX_BODY {
+            if n > self.ceiling {
                 return Err(invalid());
             }
             self.length = Some(n);
@@ -302,31 +372,82 @@ impl Guarded {
 }
 impl Read for Guarded {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.writer.as_ref().is_some_and(|w| !w.complete()) {
+            return Err(invalid());
+        }
+        if let Some(traffic) = &self.traffic {
+            traffic
+                .check()
+                .map_err(|_| io::Error::new(io::ErrorKind::Interrupted, "payload retired"))?;
+        }
         if self.denied {
             return Err(invalid());
         }
         if out.is_empty() {
             return Ok(0);
         }
-        let n = self.inner.read(out)?;
+        #[cfg(test)]
+        if let Some(traffic) = &self.traffic {
+            traffic
+                .reading
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let result = self.inner.read(out);
+        #[cfg(test)]
+        if let Some(traffic) = &self.traffic {
+            traffic
+                .reading
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        let n = result?;
+        if let Some(traffic) = &self.traffic {
+            if traffic.consume_plaintext(n).is_err() {
+                self.denied = true;
+                return Err(invalid());
+            }
+            traffic
+                .check()
+                .map_err(|_| io::Error::new(io::ErrorKind::Interrupted, "payload retired"))?;
+        }
         if n == 0 && !matches!(self.phase, Phase::Done | Phase::Eof) {
             self.denied = true;
             return Err(invalid());
         }
+        let before = self.body;
         for &b in &out[..n] {
             if self.consume(b).is_err() {
                 self.denied = true;
+                break;
+            }
+        }
+        if let Some(traffic) = &self.traffic {
+            if traffic.consume_body(self.body - before).is_err() {
+                self.denied = true;
                 return Err(invalid());
             }
+        }
+        if self.denied {
+            return Err(invalid());
         }
         Ok(n)
     }
 }
 impl Write for Guarded {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.inner.write(bytes)
+        if let Some(traffic) = &self.traffic {
+            traffic
+                .check()
+                .map_err(|_| io::Error::new(io::ErrorKind::Interrupted, "payload retired"))?;
+        }
+        match &mut self.writer {
+            Some(writer) => writer.write(self.inner.as_mut(), bytes),
+            None => self.inner.write(bytes),
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
+        if self.writer.as_ref().is_some_and(|w| !w.complete()) {
+            return Ok(());
+        }
         self.inner.flush()
     }
 }
