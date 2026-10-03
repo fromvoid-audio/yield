@@ -219,3 +219,41 @@ fn retained_owner_rejects_replaced_main_root_sidecar_and_foreign_profile() {
     assert!(owner.validate(&foreign_guard).is_err());
     assert!(owner.capture(&foreign_guard).is_err());
 }
+
+#[test]
+fn actual_retained_pager_policy_is_source_only_and_preserves_original_bytes() {
+    let f = Fixture::new("");
+    let bytes = std::fs::read(&f.path).unwrap();
+    let owner = f.open().unwrap();
+    let image = owner.capture(&f.guard).unwrap();
+    let b = owner.capture_pager_observation(&f.guard).unwrap();
+    assert_eq!(b.image(), &image);
+    let p = b.page_size();
+    let m = b.selected_max_pages();
+    assert!(p.is_power_of_two());
+    assert!(b.sector_size().is_power_of_two());
+    assert!(b.allocation_unit() > 0);
+    assert_eq!(m, b.existing_max_pages().min(64 * 1024 * 1024 / p));
+    assert_eq!(b.database_bytes(), p * m);
+    assert_eq!(b.rollback_bytes(), (m + 1) * 65536 + m * (p + 8));
+    assert_eq!(b.future_wal_bytes(), 32 + m * (p + 24));
+    assert_eq!(b.future_shm_bytes(), 32768 + 16 * m);
+    assert_eq!(
+        b.source_logical_peak_bytes(),
+        b.database_bytes() + b.rollback_bytes() + b.future_wal_bytes() + b.future_shm_bytes()
+    );
+    assert_eq!(b, owner.capture_pager_observation(&f.guard).unwrap());
+    assert_eq!(std::fs::read(&f.path).unwrap(), bytes);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(
+            !f.path
+                .with_file_name(format!("{DB_FILE_NAME}{suffix}"))
+                .exists()
+        );
+    }
+    let external = Connection::open(&f.path).unwrap();
+    external
+        .execute("UPDATE metadata SET value='8' WHERE key='revision'", [])
+        .unwrap();
+    assert!(owner.capture_pager_observation(&f.guard).is_err());
+}

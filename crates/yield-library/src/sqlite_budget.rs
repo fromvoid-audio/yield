@@ -41,6 +41,45 @@ impl Deref for OwnedConnection {
     }
 }
 impl OwnedConnection {
+    /// Inspect the retained known Unix pager used by DELETE allocation observations.
+    /// This reads a native scalar only; it installs no budget or mutation permission.
+    pub(crate) fn known_delete_sector_size(&self) -> Option<u64> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            None
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if rusqlite::version_number() != 3_050_002 {
+                return None;
+            }
+            let registration = self.registration.as_ref()?;
+            let file = registration.context.main.load(Ordering::SeqCst);
+            if file.is_null() {
+                return None;
+            }
+            // SAFETY: the private owned constructor verified this main pointer belongs to this
+            // registration. Both outlive the borrowed connection. No concurrent close is possible.
+            unsafe {
+                #[cfg(target_os = "linux")]
+                let expected = ffi::sqlite3_vfs_find(c"yield-linux-retained-root-v1".as_ptr());
+                #[cfg(target_os = "macos")]
+                let expected = ffi::sqlite3_vfs_find(c"unix".as_ptr());
+                {
+                    if expected.is_null() || registration.context.native != expected {
+                        return None;
+                    }
+                    let methods = (*file).pMethods.as_ref()?;
+                    let sector = (methods.xSectorSize?)(file);
+                    let sector = u64::try_from(sector).ok()?;
+                    // Bundled pager clamps JOURNAL_HDR_SZ to MAX_SECTOR_SIZE=0x10000.
+                    // Refuse unknown callbacks/values rather than presume that clamp is sufficient.
+                    ((512..=65536).contains(&sector) && sector.is_power_of_two()).then_some(sector)
+                }
+            }
+        }
+    }
+
     // Never expose &mut Connection: safe mem::replace could otherwise separate the
     // live original connection from its registration and cause a use-after-free.
     pub(crate) fn transaction(&mut self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
