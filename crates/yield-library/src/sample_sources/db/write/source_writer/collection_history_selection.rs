@@ -288,3 +288,10 @@ impl SourceWriter {
         }
     }
 }
+
+#[path = "collection_history_group.rs"]
+mod group;
+pub use group::{
+    SOURCE_COLLECTION_HISTORY_GROUP_MAX_BYTES, SOURCE_COLLECTION_HISTORY_GROUP_MAX_PATHS,
+    SourceCollectionHistoryExecution, SourceCollectionHistoryGroup,
+};

@@ -102,6 +102,8 @@ fn collection_history_selection_child() {
         return;
     };
     match case.as_str() {
+        "group-handoff" | "group-lease" | "group-expired" | "group-cancel" | "group-progress"
+        | "group-mid-lease" => group_owner(&case),
         "read-only" => read_only(),
         "bounds" => bounds(),
         "malformed" => malformed(),
@@ -696,4 +698,176 @@ fn wrong_source() {
         ),
         Err(SourceWriterError::StaleFence)
     ));
+}
+
+#[test]
+fn collection_history_group_rejects_identical_numeric_owner_handoff_before_sql() {
+    run("group-handoff");
+}
+#[test]
+fn collection_history_group_rejects_actual_reacquired_owner_lease_before_sql() {
+    run("group-lease");
+}
+#[test]
+fn collection_history_group_original_deadline_rejects_before_sql() {
+    run("group-expired");
+}
+#[test]
+fn collection_history_group_cancellation_rejects_before_sql() {
+    run("group-cancel");
+}
+#[test]
+fn collection_history_group_progress_retains_issuer_across_real_receipts() {
+    run("group-progress");
+}
+
+fn group_owner(case: &str) {
+    use std::sync::{Arc, atomic::AtomicBool};
+    let fixture = CurationFixture::new_profile_bound();
+    let mut paths = vec![
+        CurationFixture::path("one.wav"),
+        CurationFixture::path("two.wav"),
+    ];
+    if case == "group-progress" || case == "group-mid-lease" {
+        for i in 0..127 {
+            let path = format!("group-{i:03}.wav");
+            fixture
+                .database
+                .upsert_file(Path::new(&path), 10, 1)
+                .unwrap();
+            paths.push(CurationFixture::path(&path));
+        }
+        fixture
+            .database
+            .begin_source_directory_truth_generation(2, 0)
+            .unwrap();
+        let revision = fixture.database.get_revision().unwrap();
+        fixture
+            .database
+            .write_batch()
+            .unwrap()
+            .commit_manifest_audit_with_staged_directory_truth(
+                2,
+                revision,
+                20,
+                fixture.root_identity.clone(),
+                None,
+            )
+            .unwrap();
+    }
+    let mut owner = writer(fixture.database, 7);
+    let original = owner.current_revision().unwrap();
+    let cancel = AtomicBool::new(case == "group-cancel");
+    let deadline = if case == "group-expired" {
+        Instant::now() - Duration::from_millis(1)
+    } else {
+        Instant::now() + Duration::from_secs(2)
+    };
+    if case == "group-expired" || case == "group-cancel" {
+        owner.database_for_tests().connection.authorizer(Some(
+            |_: AuthContext<'_>| -> Authorization {
+                panic!("expired/cancelled capture must not run SQL")
+            },
+        ));
+        assert!(
+            owner
+                .capture_collection_history_group(
+                    &original,
+                    SampleCollection::new(0).unwrap(),
+                    true,
+                    &[CurationFixture::path("one.wav")],
+                    &cancel,
+                    deadline
+                )
+                .is_err()
+        );
+        return;
+    }
+    let group = Arc::new(
+        owner
+            .capture_collection_history_group(
+                &original,
+                SampleCollection::new(0).unwrap(),
+                true,
+                &paths,
+                &cancel,
+                deadline,
+            )
+            .unwrap(),
+    );
+    if case == "group-progress" || case == "group-mid-lease" {
+        let mut execution = owner
+            .begin_collection_history_execution(Arc::clone(&group))
+            .unwrap();
+        let receipt = owner
+            .commit_collection_history_next(&mut execution, &fixture.profile_guard)
+            .unwrap();
+        assert_eq!(receipt.source_revision(), original.revision() + 1);
+        assert_eq!(execution.revision(), receipt.source_revision());
+        assert_eq!(execution.next_batch(), 1);
+        assert_eq!(receipt.files().len(), 128);
+        if case == "group-mid-lease" {
+            owner
+                .database_for_tests()
+                .connection
+                .execute("UPDATE source_lease SET lease_epoch=lease_epoch+1", [])
+                .unwrap();
+            assert!(
+                owner
+                    .commit_collection_history_next(&mut execution, &fixture.profile_guard)
+                    .is_err()
+            );
+            assert_eq!(execution.next_batch(), 1);
+            assert_eq!(execution.revision(), receipt.source_revision());
+            return;
+        }
+        let second = owner
+            .commit_collection_history_next(&mut execution, &fixture.profile_guard)
+            .unwrap();
+        assert_eq!(second.files().len(), 1);
+        assert_eq!(second.source_revision(), original.revision() + 2);
+        assert_eq!(execution.next_batch(), 2);
+
+        assert!(
+            owner
+                .commit_collection_history_next(&mut execution, &fixture.profile_guard)
+                .is_err()
+        );
+        assert!(owner.begin_collection_history_execution(group).is_err());
+        return;
+    }
+    owner = if case == "group-handoff" {
+        writer(owner.into_catalog_database(), 7)
+    } else {
+        owner.close().unwrap();
+        writer(
+            SourceDatabase::open_for_catalog_with_profile_guard(
+                fixture._source.path(),
+                &fixture.profile_guard,
+                fixture.profile_child.as_ref().unwrap(),
+            )
+            .unwrap(),
+            7,
+        )
+    };
+    let fresh = owner.current_revision().unwrap();
+    assert_eq!(original.revision(), fresh.revision());
+    assert_eq!(original.database_identity(), fresh.database_identity());
+    if case == "group-lease" {
+        assert!(fresh.lease_epoch() > original.lease_epoch());
+    } else {
+        assert_eq!(original.lease_epoch(), fresh.lease_epoch());
+    }
+    owner
+        .database_for_tests()
+        .connection
+        .authorizer(Some(|_: AuthContext<'_>| -> Authorization {
+            panic!("foreign issuer must reject before SQL")
+        }));
+    assert!(owner.begin_collection_history_execution(group).is_err());
+}
+
+#[test]
+fn collection_history_group_checks_actual_lease_before_every_batch() {
+    run("group-mid-lease");
 }
