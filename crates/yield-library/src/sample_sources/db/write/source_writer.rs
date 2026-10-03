@@ -744,6 +744,8 @@ pub enum SourceWriterError {
 
 /// Owner of one already-profile-bound source database.
 pub struct SourceWriter {
+    #[cfg(feature = "test-support")]
+    wal_timeout_restore_fault: Option<Arc<std::sync::atomic::AtomicBool>>,
     feature_publication_metrics: SourceFeaturePublicationMetrics,
     reference_liveness: Arc<()>,
     feature_rebuild_metrics: FeatureRebuildMetrics,
@@ -1523,6 +1525,8 @@ impl SourceWriter {
     ) -> Result<Self, SourceWriterError> {
         validate_source_id(&source_id)?;
         let writer = Self {
+            #[cfg(feature = "test-support")]
+            wal_timeout_restore_fault: None,
             feature_publication_metrics: SourceFeaturePublicationMetrics::default(),
             reference_liveness: Arc::new(()),
             feature_rebuild_metrics: FeatureRebuildMetrics::default(),

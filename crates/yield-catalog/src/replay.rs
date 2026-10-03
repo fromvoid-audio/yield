@@ -152,6 +152,9 @@ pub struct CatalogReplaySubmission {
     permit: Arc<Permit>,
 }
 impl CatalogReplaySubmission {
+    pub(super) fn source_id(&self) -> &SourceId {
+        self.batch.batch().provenance().source_id()
+    }
     pub(super) fn input_bytes(&self) -> usize {
         input_bytes(&self.batch)
     }

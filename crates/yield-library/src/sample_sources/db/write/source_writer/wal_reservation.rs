@@ -1,7 +1,9 @@
 //! Exclusive retained-source preparation; no operation, capacity or effect permission.
 use super::{SourceRevision, SourceWriter, SourceWriterError};
 use crate::WalAdmissionError;
-use crate::sample_sources::db::SourceDbError;
+use crate::sample_sources::db::{
+    SourceAuthorityError, SourceAuthorityRegistration, SourceAuthorityRetirementAck, SourceDbError,
+};
 use crate::sqlite_wal::enforce_wal_admission;
 use std::fmt;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -60,6 +62,41 @@ impl SourceWalPreparationFailure {
     /// Inspect the bounded typed rejection; it grants no retry authority.
     pub fn error(&self) -> &SourceWalPreparationError {
         &self.error
+    }
+
+    /// Borrow the original retained main-file identity solely for alias exclusion.
+    /// This passive observation executes no SQL and cannot prove current owner validity,
+    /// reopen a database, release a reservation or issue publication/capacity authority.
+    pub fn retained_database_identity(&self) -> Option<&str> {
+        self.held
+            .writer()
+            .database
+            .database_file_binding
+            .as_deref()
+            .map(|binding| binding.identity())
+    }
+
+    /// Check snapshot custody without executing SQL on the unavailable writer.
+    pub fn source_authority_close_ready(&self) -> bool {
+        self.held.writer().database.source_authority_close_ready()
+    }
+
+    /// Consume an empty failed reservation through its original draining source authority.
+    ///
+    /// This never returns a callable SQL owner or fabricates retirement from rollback failure.
+    /// The original authority checks retained guard identity and durable draining state; it
+    /// closes the ordinary connection before releasing its source lease and sealing the ack.
+    /// A pre-existing caller transaction cannot use this empty-reservation close boundary.
+    pub fn close_for_retirement(
+        mut self,
+        authority: &mut SourceAuthorityRegistration,
+    ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
+        if !self.held.reservation && !self.held.writer().database.connection.is_autocommit() {
+            return Err(SourceAuthorityError::InvalidLifecycle);
+        }
+        let writer = self.held.writer.take().expect("retained source writer");
+        self.held.reservation = false;
+        authority.close_database(writer.into_catalog_database())
     }
 
     /// Return the exact retained writer only after confirming empty rollback and timeout policy.
@@ -166,6 +203,23 @@ impl HeldWriter {
     fn writer(&self) -> &SourceWriter {
         self.writer.as_ref().expect("retained source writer")
     }
+    fn restore_busy_timeout(&self, timeout: Duration) -> Result<(), rusqlite::Error> {
+        // Deterministic negative test at the original owner's restoration boundary. No
+        // production bypass, global SQLite fault, alternate connection or pretend SQL success.
+        #[cfg(feature = "test-support")]
+        if self
+            .writer()
+            .wal_timeout_restore_fault
+            .as_ref()
+            .is_some_and(|fault| fault.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                None,
+            ));
+        }
+        self.writer().database.connection.busy_timeout(timeout)
+    }
     fn release(&mut self) -> Result<SourceWriter, SourceWalPreparationError> {
         let connection = &self.writer().database.connection;
         if self.reservation {
@@ -175,7 +229,7 @@ impl HeldWriter {
             self.reservation = false;
         }
         if let Some(timeout) = self.restore_timeout {
-            self.writer().database.connection.busy_timeout(timeout)?;
+            self.restore_busy_timeout(timeout)?;
             self.restore_timeout = None;
         }
         Ok(self.writer.take().expect("retained source writer"))
@@ -195,6 +249,50 @@ impl Drop for HeldWriter {
 }
 
 impl SourceWriter {
+    /// Run the real preparation with a per-file retained WAL size IO failure.
+    /// Explicit test-support only: the descriptor methods are restored before custody moves,
+    /// including unwind. No alternative connection, injected size or positive grant is used.
+    #[cfg(feature = "test-support")]
+    pub fn prepare_wal_reservation_unknown_for_tests(
+        self,
+        expected: &SourceRevision,
+        deadline: Instant,
+    ) -> Result<SourceWalPreparation, SourceWalPreparationFailure> {
+        self.prepare_wal_reservation_unknown_for_test(expected, deadline)
+    }
+    /// Inject restoration failure only at this owner's actual WAL timeout restore boundary.
+    /// The explicit test-support fault retains the real writer until cleared and retried.
+    #[cfg(feature = "test-support")]
+    pub fn set_wal_timeout_restore_fault_for_tests(
+        &mut self,
+        fault: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.wal_timeout_restore_fault = Some(fault);
+    }
+    /// Install a real SQLite rollback authorizer fault on this retained connection.
+    /// Only available in explicit test-support builds; exposes no SQL or alternate writer.
+    #[cfg(feature = "test-support")]
+    pub fn set_wal_rollback_denial_for_tests(
+        &self,
+        deny: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+        self.database
+            .connection
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::Transaction {
+                        operation: TransactionOperation::Rollback
+                    }
+                ) && deny.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }));
+    }
     /// Retain the existing writer in a bounded, empty WAL preparation reservation.
     ///
     /// Uses strict read-only lease validation; it never auto-renews or reopens a database. SQLite
@@ -228,7 +326,7 @@ impl SourceWriter {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod test_vfs;
 
 #[cfg(test)]
@@ -265,14 +363,7 @@ fn finish_preparation(
                 .restore_timeout
                 .filter(|_| !rollback_before_timeout || !failure.held.reservation)
             {
-                if failure
-                    .held
-                    .writer()
-                    .database
-                    .connection
-                    .busy_timeout(timeout)
-                    .is_ok()
-                {
+                if failure.held.restore_busy_timeout(timeout).is_ok() {
                     failure.held.restore_timeout = None;
                 }
             }
@@ -399,10 +490,7 @@ fn prepare(
     held.reservation = !held.writer().database.connection.is_autocommit();
     // Restore even when BEGIN fails; never leave the ordinary owner's timeout disabled.
     if restore_while_held {
-        held.writer()
-            .database
-            .connection
-            .busy_timeout(Duration::from_millis(timeout))?;
+        held.restore_busy_timeout(Duration::from_millis(timeout))?;
         held.restore_timeout = None;
     }
     acquired?;
