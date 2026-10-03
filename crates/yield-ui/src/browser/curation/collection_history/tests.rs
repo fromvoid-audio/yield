@@ -10,6 +10,8 @@ mod fixtures {
         source_registry::SourceRegistryGlobal,
     };
 
+    include!("sample_history_tests.rs");
+
     struct ControlsFixture(gpui::Entity<Browser>);
 
     impl gpui::Render for ControlsFixture {
