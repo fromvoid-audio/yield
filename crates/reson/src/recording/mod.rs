@@ -3,6 +3,7 @@
 mod capture;
 mod health;
 mod monitor;
+mod settlement;
 mod writer;
 
 #[cfg(test)]
@@ -21,6 +22,10 @@ use monitor::RecordingMonitor;
 use writer::RecorderWriter;
 
 pub use health::RecordingHealth;
+pub use settlement::{
+    RECORDING_TERMINAL_ACK_TIMEOUT, RecordingJoinedCompletion, RecordingSettlements,
+    RecordingSinkBinding, RecordingTerminalAccounting, RecordingTerminalBarrier,
+};
 pub use writer::{RecordingLimits, RecordingPrefixState, RecordingSink};
 
 /// Summary returned when a recording completes.
@@ -68,7 +73,37 @@ impl AudioRecorder {
         max_frames: u64,
         diagnostic_path: PathBuf,
     ) -> Result<Self, AudioInputError> {
-        let runtime = capture::start_recording_runtime(config, sink, max_frames)?;
+        let runtime = capture::start_recording_runtime(config, sink, max_frames, None)?;
+        runtime
+            .stream
+            .play()
+            .map_err(|source| AudioInputError::StartStream { source })?;
+        Ok(Self {
+            stream: Some(runtime.stream),
+            writer: Some(runtime.writer),
+            resolved: runtime.resolved,
+            path: diagnostic_path,
+            monitor: runtime.monitor,
+            health: runtime.health,
+            active: true,
+        })
+    }
+
+    /// Start the actual paused-input/serializer route with a previously bound settlement channel.
+    /// The admitted adapter must handle its receiver on another thread before calling Stop/join.
+    /// Producer evidence alone does not activate journal, staging or publication authority.
+    pub fn start_into_bound_sink(
+        config: &AudioInputConfig,
+        binding: RecordingSinkBinding,
+        max_frames: u64,
+        diagnostic_path: PathBuf,
+    ) -> Result<Self, AudioInputError> {
+        let runtime = capture::start_recording_runtime(
+            config,
+            binding.sink,
+            max_frames,
+            Some(binding.producer),
+        )?;
         runtime
             .stream
             .play()

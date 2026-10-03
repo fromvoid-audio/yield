@@ -3040,15 +3040,19 @@ mod tests {
         let handle = runtime.handle.clone();
         runtime.handle.try_shutdown().expect("shutdown");
 
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
             match handle.try_play(test_request(0.0)) {
                 Err(PlaybackRuntimeSubmitError::Closed) => return,
                 Err(PlaybackRuntimeSubmitError::QueueFull) | Ok(_) => {
-                    thread::yield_now();
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "retained handle should close after runtime shutdown"
+                    );
+                    thread::sleep(Duration::from_millis(1));
                 }
             }
         }
-        panic!("retained handle should close after runtime shutdown");
     }
 
     #[test]
