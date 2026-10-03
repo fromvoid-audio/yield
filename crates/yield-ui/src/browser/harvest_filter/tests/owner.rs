@@ -115,6 +115,8 @@ mod fixtures {
         fixture: &OwnerFixture,
         snapshot: &yield_catalog::CatalogSnapshot,
     ) {
+        view.source_registry_task.take();
+        view.preferences_task.take();
         let root = fixture.root.path().to_path_buf();
         let mut session = SourceSession::new(root.clone());
         session.source_id = Some(snapshot.source_id.clone());

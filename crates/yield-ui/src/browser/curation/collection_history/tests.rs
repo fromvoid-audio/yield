@@ -100,6 +100,24 @@ mod fixtures {
                 for event in events.drain(..) {
                     if matches!(&event, CatalogEvent::CollectionHistoryGroupCompleted { .. }) {
                         browser.update(cx, |view, cx| {
+                            if let CatalogEvent::CollectionHistoryGroupCompleted {
+                                request, ..
+                            } = &event
+                            {
+                                if let Some(record) =
+                                    view.curation_state.collection_history.undo.back().or_else(
+                                        || view.curation_state.collection_history.redo.back(),
+                                    )
+                                {
+                                    assert_eq!(request.targets().len(), record.bits.len());
+                                    assert!(
+                                        request
+                                            .targets()
+                                            .iter()
+                                            .all(|(p, _)| record.bits.contains_key(p.as_path()))
+                                    );
+                                }
+                            }
                             assert!(view.apply_collection_preparation_event(&event, cx));
                             view.source_registry_task.take();
                         });
@@ -112,12 +130,28 @@ mod fixtures {
             |e| matches!(e, CatalogEvent::CurationOperationCompleted { .. }),
         )
     }
+    #[derive(Clone, Copy)]
+    enum DirectionSpecial {
+        Lost,
+        Cancel,
+        RevisionChanged,
+        DirectoryChanged,
+        ReacquiredOwner,
+    }
+    #[derive(Clone, Copy)]
+    struct DirectionScenario {
+        direction: Direction,
+        fail_at: usize,
+        reverse: bool,
+        special: Option<DirectionSpecial>,
+    }
     fn compound_gpui(
         cx: &mut gpui::TestAppContext,
         fault: Option<usize>,
         lost: bool,
         malformed: bool,
         oversized: bool,
+        scenario: Option<DirectionScenario>,
     ) {
         let _runtime = yield_library::test_runtime::TestRuntimeGuard::acquire();
         let config = tempfile::tempdir().unwrap();
@@ -207,6 +241,20 @@ mod fixtures {
         if let Some(index) = fault {
             service
                 .arm_compound_batch_failure(&source_id, 1, 1, index)
+                .unwrap();
+        }
+        if let Some(case) = scenario.filter(|c| c.special.is_none()) {
+            service
+                .arm_compound_batch_failure(
+                    &source_id,
+                    1,
+                    if case.direction == Direction::Undo {
+                        2
+                    } else {
+                        3
+                    },
+                    case.fail_at,
+                )
                 .unwrap();
         }
         cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
@@ -462,8 +510,14 @@ mod fixtures {
                 assert_eq!(c.rating(), yield_core::RatingState::new(1, true).unwrap());
             }
             if fault.is_some() || oversized {
-                assert!(!view.collection_history_ready(Direction::Undo));
-                assert!(!view.collection_history_ready(Direction::Redo));
+                assert_eq!(
+                    view.collection_history_ready(Direction::Undo),
+                    !oversized && committed > 0
+                );
+                assert_eq!(
+                    view.collection_history_ready(Direction::Redo),
+                    !oversized && committed > 0
+                );
                 let status = view.curation_state.status_for(&key).unwrap();
                 if oversized {
                     assert!(status.contains("Undo unavailable"), "{status}");
@@ -475,8 +529,367 @@ mod fixtures {
                 }
             }
         });
-        // Actual disabled controls must not admit a direction for a failed original group.
-        if fault.is_some() || oversized {
+        if let Some(case) = scenario {
+            let click = |browser: &gpui::Entity<Browser>,
+                         fixture: &gpui::Entity<ControlsFixture>,
+                         cx: &mut gpui::VisualTestContext,
+                         direction: Direction| {
+                draw_controls(fixture, cx);
+                let selector = if direction == Direction::Undo {
+                    "collection-history-undo"
+                } else {
+                    "collection-history-redo"
+                };
+                let bounds = cx.debug_bounds(selector).unwrap();
+                cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+                browser.update(cx, |v, _| {
+                    v.source_registry_task.take();
+                    assert!(v.curation_state.collection_preparation.is_some());
+                    assert!(!v.collection_history_ready(Direction::Undo));
+                    assert!(!v.collection_history_ready(Direction::Redo));
+                });
+            };
+            if case.direction == Direction::Redo {
+                click(&browser, &fixture, cx, Direction::Undo);
+                let e = browser_owner_event(&browser, cx);
+                browser.update(cx, |v, cx| {
+                    assert!(v.apply_curation_event(&e, cx));
+                });
+            }
+            let base_count = if case.direction == Direction::Undo {
+                257
+            } else {
+                0
+            };
+            if let Some(special) = case.special {
+                match special {
+                    DirectionSpecial::RevisionChanged => {
+                        let current =
+                            browser.read_with(cx, |v, _| v.curation_state.lineages[&key].revision);
+                        cx.update(|_, app| {
+                            app.global::<SourceRegistryGlobal>().submit_catalog(
+                                CatalogCommand::ApplyCuration {
+                                    source_id: source_id.clone(),
+                                    lifecycle_generation: 1,
+                                    expected_revision: current,
+                                    root_identity: snapshot.root_identity.clone(),
+                                    request_id: 901,
+                                    updates: vec![SourceCurationUpdate::SetLocked {
+                                        path: RootRelativePath::try_from_path(
+                                            entries[0].relative_path.clone(),
+                                        )
+                                        .unwrap(),
+                                        locked: false,
+                                    }],
+                                },
+                            )
+                        })
+                        .unwrap();
+                        next_event(
+                            |events| {
+                                cx.update(|_, app| {
+                                    app.global::<SourceRegistryGlobal>()
+                                        .drain_catalog_events(events);
+                                });
+                            },
+                            |e| matches!(e, CatalogEvent::CurationCommitted { .. }),
+                        );
+                    }
+                    DirectionSpecial::DirectoryChanged => {
+                        write_wav(&root.join("new.wav"));
+                        cx.update(|_, app| {
+                            app.global::<SourceRegistryGlobal>().submit_catalog(
+                                CatalogCommand::RequestAudit {
+                                    source_id: source_id.clone(),
+                                    lifecycle_generation: 1,
+                                },
+                            )
+                        })
+                        .unwrap();
+                        next_event(
+                            |events| {
+                                cx.update(|_, app| {
+                                    app.global::<SourceRegistryGlobal>()
+                                        .drain_catalog_events(events);
+                                });
+                            },
+                            |e| matches!(e, CatalogEvent::AuditCommitted { .. }),
+                        );
+                    }
+                    DirectionSpecial::ReacquiredOwner => {
+                        cx.update(|_, app| {
+                            app.update_global::<SourceRegistryGlobal, _>(|g, _| g.shutdown())
+                        });
+                        let replacement = yield_catalog::CatalogService::start(&guard).unwrap();
+                        replacement
+                            .submit(CatalogCommand::Register {
+                                source_id: source_id.clone(),
+                                canonical_root: root.clone(),
+                                lifecycle_generation: 1,
+                            })
+                            .unwrap();
+                        owner_event(&replacement, |e| {
+                            matches!(e, CatalogEvent::Registered { .. })
+                        });
+                        cx.update(|_, app| {
+                            app.set_global(SourceRegistryGlobal::for_catalog_fixture(replacement))
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            click(&browser, &fixture, cx, case.direction);
+            if let Some(
+                special @ (DirectionSpecial::Cancel
+                | DirectionSpecial::RevisionChanged
+                | DirectionSpecial::DirectoryChanged
+                | DirectionSpecial::ReacquiredOwner),
+            ) = case.special
+            {
+                if matches!(special, DirectionSpecial::Cancel) {
+                    browser.update(cx, |v, _| {
+                        v.curation_state
+                            .collection_preparation
+                            .take()
+                            .unwrap()
+                            .cancel();
+                    });
+                }
+                let e = if matches!(special, DirectionSpecial::Cancel) {
+                    None
+                } else {
+                    Some(next_event(
+                        |events| {
+                            cx.update(|_, app| {
+                                app.global::<SourceRegistryGlobal>()
+                                    .drain_catalog_events(events);
+                            });
+                        },
+                        |e| matches!(e, CatalogEvent::CollectionHistoryGroupCompleted { .. }),
+                    ))
+                };
+                browser.update(cx, |v, cx| {
+                    if let Some(e) = e.as_ref() {
+                        let _ = v.apply_collection_preparation_event(e, cx);
+                    }
+                    assert!(v.curation_state.collection_preparation.is_none());
+                    assert!(v.curation_state.collection_history.pending.is_none());
+                    assert!(v.curation_state.lineages[&key].pending.is_empty());
+                });
+                cx.update(|_, app| {
+                    app.global::<SourceRegistryGlobal>().submit_catalog(
+                        CatalogCommand::ReadSnapshot {
+                            source_id: source_id.clone(),
+                            expected_revision: None,
+                        },
+                    )
+                })
+                .unwrap();
+                let CatalogEvent::SnapshotReady { snapshot: actual } = next_event(
+                    |events| {
+                        cx.update(|_, app| {
+                            app.global::<SourceRegistryGlobal>()
+                                .drain_catalog_events(events);
+                        });
+                    },
+                    |e| matches!(e, CatalogEvent::SnapshotReady { .. }),
+                ) else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    actual
+                        .curation_metadata
+                        .values()
+                        .filter(|m| m.collections.contains(&SampleCollection::new(0).unwrap()))
+                        .count(),
+                    base_count
+                );
+                cx.update(|_, app| {
+                    app.update_global::<SourceRegistryGlobal, _>(|g, _| g.shutdown())
+                });
+                return;
+            }
+            let e = browser_owner_event(&browser, cx);
+            if matches!(case.special, Some(DirectionSpecial::Lost)) {
+                let CatalogEvent::CurationOperationCompleted { outcome, .. } = &e else {
+                    unreachable!()
+                };
+                assert!(outcome.is_success());
+                cx.update(|_, app| {
+                    app.global::<SourceRegistryGlobal>().submit_catalog(
+                        CatalogCommand::ReadSnapshot {
+                            source_id: source_id.clone(),
+                            expected_revision: outcome.final_revision(),
+                        },
+                    )
+                })
+                .unwrap();
+                let CatalogEvent::SnapshotReady { snapshot: actual } = next_event(
+                    |events| {
+                        cx.update(|_, app| {
+                            app.global::<SourceRegistryGlobal>()
+                                .drain_catalog_events(events);
+                        });
+                    },
+                    |e| matches!(e, CatalogEvent::SnapshotReady { .. }),
+                ) else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    actual
+                        .curation_metadata
+                        .values()
+                        .filter(|m| m.collections.contains(&SampleCollection::new(0).unwrap()))
+                        .count(),
+                    if case.direction == Direction::Undo {
+                        0
+                    } else {
+                        257
+                    }
+                );
+                browser.update(cx, |v, cx| {
+                    let mut observed = entries.clone();
+                    for e in &mut observed {
+                        e.curation = Some(
+                            curation_from_metadata(&actual.curation_metadata[&e.relative_path])
+                                .unwrap(),
+                        );
+                    }
+                    v.curation_state.install_projection(
+                        key.clone(),
+                        actual.root_identity.clone(),
+                        actual.directory_generation,
+                        actual.committed_revision,
+                        &observed,
+                    );
+                    assert!(v.curation_state.lineages[&key].history_unresolved);
+                    assert!(v.curation_state.collection_history.undo.is_empty());
+                    assert!(v.curation_state.collection_history.redo.is_empty());
+                    assert!(!v.collection_history_ready(Direction::Undo));
+                    assert!(!v.collection_history_ready(Direction::Redo));
+                    assert!(v.apply_curation_event(&e, cx));
+                    assert!(v.curation_state.lineages[&key].history_unresolved);
+                    assert!(v.curation_state.collection_history.pending.is_none());
+                });
+                cx.update(|_, app| {
+                    app.update_global::<SourceRegistryGlobal, _>(|g, _| g.shutdown())
+                });
+                return;
+            }
+            let CatalogEvent::CurationOperationCompleted { outcome, .. } = &e else {
+                unreachable!()
+            };
+            assert_eq!(outcome.committed_batches().len(), case.fail_at);
+            assert_eq!(outcome.failure().unwrap().batch_index(), case.fail_at);
+            browser.update(cx, |v, cx| {
+                assert!(v.apply_curation_event(&e, cx));
+                let h = &v.curation_state.collection_history;
+                let r = h.undo.back().unwrap();
+                assert!(r.partial);
+                assert_eq!(r.bits.len(), 257);
+                assert_eq!(
+                    r.applied.len(),
+                    if case.direction == Direction::Undo {
+                        257 - 128 * case.fail_at
+                    } else {
+                        128 * case.fail_at
+                    }
+                );
+                assert!(v.collection_history_ready(Direction::Undo));
+                assert!(v.collection_history_ready(Direction::Redo));
+                let status = v.curation_state.status_for(&key).unwrap();
+                assert!(
+                    status.contains(&format!("{}/3 batches", case.fail_at)),
+                    "{status}"
+                );
+                assert!(status.contains("resume or reverse"), "{status}");
+                let sizes = (h.undo.len(), h.redo.len(), r.applied.len());
+                assert!(h.bytes() <= MAX_BYTES);
+                assert!(h.undo.len() + h.redo.len() <= MAX_RECORDS);
+                assert!(v.apply_curation_event(&e, cx));
+                let h = &v.curation_state.collection_history;
+                assert_eq!(
+                    (
+                        h.undo.len(),
+                        h.redo.len(),
+                        h.undo.back().unwrap().applied.len()
+                    ),
+                    sizes
+                );
+                v.selection.clear();
+                v.browser_focus_detached = true;
+            });
+            let target = if case.reverse {
+                if case.direction == Direction::Undo {
+                    Direction::Redo
+                } else {
+                    Direction::Undo
+                }
+            } else {
+                case.direction
+            };
+            click(&browser, &fixture, cx, target);
+            if case.reverse && case.fail_at == 0 {
+                let e = next_event(
+                    |events| {
+                        cx.update(|_, app| {
+                            app.global::<SourceRegistryGlobal>()
+                                .drain_catalog_events(events);
+                        })
+                    },
+                    |e| matches!(e, CatalogEvent::CollectionHistoryGroupCompleted { .. }),
+                );
+                browser.update(cx, |v, cx| {
+                    assert!(v.apply_collection_preparation_event(&e, cx));
+                    assert!(v.curation_state.collection_history.pending.is_none());
+                    assert!(v.curation_state.lineages[&key].pending.is_empty());
+                });
+            } else {
+                let e = browser_owner_event(&browser, cx);
+                let CatalogEvent::CurationOperationCompleted { outcome, .. } = &e else {
+                    unreachable!()
+                };
+                assert!(outcome.is_success());
+                let eligible = if case.reverse {
+                    case.fail_at * 128
+                } else {
+                    257 - case.fail_at * 128
+                };
+                assert_eq!(
+                    outcome
+                        .committed_batches()
+                        .iter()
+                        .map(|r| r.files().len())
+                        .sum::<usize>(),
+                    eligible
+                );
+                browser.update(cx, |v, cx| {
+                    assert!(v.apply_curation_event(&e, cx));
+                });
+            }
+            browser.update(cx, |v, _| {
+                assert_eq!(
+                    v.entries
+                        .iter()
+                        .filter(|e| e.curation.unwrap().has_collection(0))
+                        .count(),
+                    if target == Direction::Undo { 0 } else { 257 }
+                );
+                assert_eq!(v.selection.len(), 257);
+                assert_eq!(v.selection.anchor(), Some(&ids[0]));
+                assert_eq!(v.browser_focus_id(), Some(ids[0].clone()));
+                assert_eq!(v.list_scroll_handle.0.borrow().base_handle.offset(), offset);
+                assert!(v.curation_state.lineages[&key].failed.is_none());
+            });
+            // Return to the applied endpoint and prove the full origin remains eligible.
+            if target == Direction::Undo {
+                click(&browser, &fixture, cx, Direction::Redo);
+                let e = browser_owner_event(&browser, cx);
+                browser.update(cx, |v, cx| {
+                    assert!(v.apply_curation_event(&e, cx));
+                });
+            }
+        } else if oversized || committed == 0 {
             draw_controls(&fixture, cx);
             let bounds = cx.debug_bounds("collection-history-undo").unwrap();
             cx.simulate_click(bounds.center(), gpui::Modifiers::none());
@@ -486,7 +899,7 @@ mod fixtures {
         } else {
             for (control, expected) in [
                 ("collection-history-undo", 0),
-                ("collection-history-redo", 257),
+                ("collection-history-redo", committed),
             ] {
                 browser.update(cx, |view, _| {
                     view.selection.clear();
@@ -564,38 +977,390 @@ mod fixtures {
         service.shutdown();
     }
     #[gpui::test]
+    fn collection_history_real_gpui_undo_lost(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Undo,
+                fail_at: 0,
+                reverse: false,
+                special: Some(DirectionSpecial::Lost),
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_redo_lost(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Redo,
+                fail_at: 0,
+                reverse: false,
+                special: Some(DirectionSpecial::Lost),
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_undo_cancel(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Undo,
+                fail_at: 0,
+                reverse: false,
+                special: Some(DirectionSpecial::Cancel),
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_redo_cancel(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Redo,
+                fail_at: 0,
+                reverse: false,
+                special: Some(DirectionSpecial::Cancel),
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_undo_revisionchanged(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Undo,
+                fail_at: 0,
+                reverse: false,
+                special: Some(DirectionSpecial::RevisionChanged),
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_redo_revisionchanged(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Redo,
+                fail_at: 0,
+                reverse: false,
+                special: Some(DirectionSpecial::RevisionChanged),
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_undo_directorychanged(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Undo,
+                fail_at: 0,
+                reverse: false,
+                special: Some(DirectionSpecial::DirectoryChanged),
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_redo_directorychanged(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Redo,
+                fail_at: 0,
+                reverse: false,
+                special: Some(DirectionSpecial::DirectoryChanged),
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_undo_reacquiredowner(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Undo,
+                fail_at: 0,
+                reverse: false,
+                special: Some(DirectionSpecial::ReacquiredOwner),
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_redo_reacquiredowner(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Redo,
+                fail_at: 0,
+                reverse: false,
+                special: Some(DirectionSpecial::ReacquiredOwner),
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_undo_first_resume(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Undo,
+                fail_at: 0,
+                reverse: false,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_undo_first_reverse(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Undo,
+                fail_at: 0,
+                reverse: true,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_undo_middle_resume(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Undo,
+                fail_at: 1,
+                reverse: false,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_undo_middle_reverse(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Undo,
+                fail_at: 1,
+                reverse: true,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_undo_last_resume(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Undo,
+                fail_at: 2,
+                reverse: false,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_undo_last_reverse(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Undo,
+                fail_at: 2,
+                reverse: true,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_redo_first_resume(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Redo,
+                fail_at: 0,
+                reverse: false,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_redo_first_reverse(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Redo,
+                fail_at: 0,
+                reverse: true,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_redo_middle_resume(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Redo,
+                fail_at: 1,
+                reverse: false,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_redo_middle_reverse(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Redo,
+                fail_at: 1,
+                reverse: true,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_redo_last_resume(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Redo,
+                fail_at: 2,
+                reverse: false,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_redo_last_reverse(cx: &mut gpui::TestAppContext) {
+        compound_gpui(
+            cx,
+            None,
+            false,
+            false,
+            false,
+            Some(DirectionScenario {
+                direction: Direction::Redo,
+                fail_at: 2,
+                reverse: true,
+                special: None,
+            }),
+        );
+    }
+    #[gpui::test]
     fn collection_history_real_gpui_compound_first_failure(cx: &mut gpui::TestAppContext) {
-        compound_gpui(cx, Some(0), false, false, false);
+        compound_gpui(cx, Some(0), false, false, false, None);
     }
     #[gpui::test]
     fn collection_history_real_gpui_compound_middle_failure(cx: &mut gpui::TestAppContext) {
-        compound_gpui(cx, Some(1), false, false, false);
+        compound_gpui(cx, Some(1), false, false, false, None);
     }
     #[gpui::test]
     fn collection_history_real_gpui_compound_last_failure(cx: &mut gpui::TestAppContext) {
-        compound_gpui(cx, Some(2), false, false, false);
+        compound_gpui(cx, Some(2), false, false, false, None);
     }
     #[gpui::test]
     fn collection_history_real_gpui_compound_complete_undo_redo(cx: &mut gpui::TestAppContext) {
-        compound_gpui(cx, None, false, false, false);
+        compound_gpui(cx, None, false, false, false, None);
     }
     #[gpui::test]
     fn collection_history_real_gpui_lost_compound_delivery_never_reconstructed_by_readback(
         cx: &mut gpui::TestAppContext,
     ) {
-        compound_gpui(cx, None, true, false, false);
+        compound_gpui(cx, None, true, false, false, None);
     }
     #[gpui::test]
     fn collection_history_real_gpui_malformed_real_compound_receipt_preserves_unknown(
         cx: &mut gpui::TestAppContext,
     ) {
-        compound_gpui(cx, None, false, true, false);
+        compound_gpui(cx, None, false, true, false, None);
     }
     #[gpui::test]
     fn collection_history_real_gpui_owned_capacity_bound_keeps_ordinary_edit(
         cx: &mut gpui::TestAppContext,
     ) {
-        compound_gpui(cx, None, false, false, true);
+        compound_gpui(cx, None, false, false, true, None);
     }
     #[gpui::test]
     fn collection_history_real_gpui_owner_commit_undo_redo_and_restart(

@@ -28,6 +28,9 @@ fn settle(browser: &gpui::Entity<Browser>, cx: &mut gpui::VisualTestContext) {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         browser.update(cx, |view, cx| {
+            // This fixture owns the event pump; a second background poll can supersede its
+            // exact mask between settling and painting controls.
+            view.source_registry_task.take();
             poll(view, cx);
             let mut deliveries = Vec::new();
             cx.global::<SourceRegistryGlobal>()
