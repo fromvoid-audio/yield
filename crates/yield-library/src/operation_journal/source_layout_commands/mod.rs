@@ -354,3 +354,139 @@ pub enum StoredSourceLayoutIntent {
         bytes: Vec<u8>,
     },
 }
+
+impl SourceLayoutIntentArgs {
+    /// Validate exactly one required source SQL participant and the complete historical fence.
+    /// Raw media-root bytes remain in the binary command; the participant binds the retained
+    /// domain-separated digest of the raw media-root bytes, so arbitrary opaque roots need
+    /// no lossy text conversion. The complete root and database-root binding remain in the command.
+    pub fn validate_against_participants(
+        &self,
+        participants: &super::ParticipantSet,
+    ) -> Result<(), SourceLayoutIntentError> {
+        self.validate()?;
+        participants
+            .validate_for_new_intent()
+            .map_err(|_| SourceLayoutIntentError::Identity)?;
+        if participants.descriptors().len() != 1 {
+            return Err(SourceLayoutIntentError::Identity);
+        }
+        let d = &participants.descriptors()[0];
+        let f = d.source_fence().ok_or(SourceLayoutIntentError::Identity)?;
+        if d.id() != self.participant
+            || d.kind() != super::ParticipantKind::SourceDatabase
+            || d.requirement() != super::ParticipantRequirement::Required
+            || f.source_id().as_str() != self.scope.source
+            || f.root_identity() != self.participant_root_identity()
+            || f.database_identity() != self.participant_database_identity()
+            || f.lifecycle_generation() != self.scope.lifecycle
+            || f.lease_epoch() != self.scope.lease
+            || f.source_revision() != self.scope.revision
+        {
+            return Err(SourceLayoutIntentError::Identity);
+        }
+        Ok(())
+    }
+}
+
+// One canonical binary request in a JSON string, never a decimal byte array. Decode only
+// historical data; successful serde does not reacquire the producer's writer/capture/budget.
+impl serde::Serialize for SourceLayoutIntentArgs {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine;
+        let bytes = self.canonical_bytes().map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+}
+impl<'de> serde::Deserialize<'de> for SourceLayoutIntentArgs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct HistoricalVisitor;
+        impl serde::de::Visitor<'_> for HistoricalVisitor {
+            type Value = SourceLayoutIntentArgs;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("bounded canonical base64 source layout input")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                use base64::Engine;
+                if value.len() > 4 * MAX_SOURCE_LAYOUT_INTENT_BYTES.div_ceil(3) {
+                    return Err(E::custom("source layout transport exceeds byte bound"));
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .map_err(E::custom)?;
+                if base64::engine::general_purpose::STANDARD.encode(&bytes) != value {
+                    return Err(E::custom("noncanonical source layout transport"));
+                }
+                match decode_source_layout_intent(&bytes).map_err(E::custom)? {
+                    StoredSourceLayoutIntent::Supported(args) => Ok(args),
+                    StoredSourceLayoutIntent::Unsupported { .. } => {
+                        Err(E::custom("unsupported source layout input version"))
+                    }
+                }
+            }
+        }
+        deserializer.deserialize_str(HistoricalVisitor)
+    }
+}
+
+impl SourceLayoutIntentArgs {
+    fn participant_root_identity(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(b"yield.source-layout-participant-root.v1\0");
+        h.update(&self.scope.root);
+        format!("layout-root-v1:{}", h.finalize().to_hex())
+    }
+    /// Derive the sole historical source participant; this never acquires a live source owner.
+    /// The command keeps raw root bytes and the independent database-directory binding exactly.
+    pub fn participant_observation(
+        &self,
+    ) -> Result<super::ParticipantSet, SourceLayoutIntentError> {
+        use super::{
+            ParticipantCheckpoint, ParticipantCheckpointState, ParticipantDescriptor,
+            ParticipantKind, ParticipantRequirement, ParticipantSet, StoredSourceFence,
+        };
+        self.validate()?;
+        let r = &self.scope;
+        let fence = StoredSourceFence::new(
+            crate::sample_sources::SourceId::from_string(&r.source),
+            self.participant_root_identity(),
+            self.participant_database_identity(),
+            r.lifecycle,
+            r.revision,
+            r.lease,
+        )
+        .map_err(|_| SourceLayoutIntentError::Identity)?;
+        let descriptor = ParticipantDescriptor::new(
+            self.participant,
+            ParticipantKind::SourceDatabase,
+            ParticipantRequirement::Required,
+            Some(fence),
+            None,
+        )
+        .map_err(|_| SourceLayoutIntentError::Identity)?;
+        let checkpoint = ParticipantCheckpoint::new(
+            self.participant,
+            ParticipantCheckpointState::Pending,
+            None,
+            None,
+        )
+        .map_err(|_| SourceLayoutIntentError::Identity)?;
+        ParticipantSet::new(vec![descriptor], vec![checkpoint])
+            .map_err(|_| SourceLayoutIntentError::Identity)
+    }
+}
+
+impl SourceLayoutIntentArgs {
+    fn participant_database_identity(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(b"yield.source-layout-participant-database.v1\0");
+        for bytes in [
+            self.scope.root_binding.as_bytes(),
+            self.scope.database.as_bytes(),
+        ] {
+            h.update(&(bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        }
+        format!("layout-db-v1:{}", h.finalize().to_hex())
+    }
+}

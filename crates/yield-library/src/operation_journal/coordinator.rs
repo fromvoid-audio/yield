@@ -1470,6 +1470,8 @@ pub enum WaveformEditValidationError {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub enum UniversalCommandArgs {
+    /// Bounded historical source-only derived layout; not live admission.
+    SourceDerivedLayout(super::source_layout_commands::SourceLayoutIntentArgs),
     /// Frozen finite recording; captured bytes are retained separately before dispatch.
     Recording(super::recording_commands::RecordingProposal),
     /// Copy between two source-database endpoints.
@@ -1508,6 +1510,7 @@ impl UniversalCommandArgs {
     /// Return the universal command kind represented by these arguments.
     pub const fn command_kind(&self) -> super::model::UniversalCommandKind {
         match self {
+            Self::SourceDerivedLayout(_) => super::model::UniversalCommandKind::SourceDerivedLayout,
             Self::Recording(_) => super::model::UniversalCommandKind::CreateFile,
             Self::Copy(_) => super::model::UniversalCommandKind::Copy,
             Self::Import(_) => super::model::UniversalCommandKind::Import,
@@ -1533,6 +1536,9 @@ impl UniversalCommandArgs {
         participants: &ParticipantSet,
     ) -> Result<(), UniversalCommandArgsValidationError> {
         match self {
+            Self::SourceDerivedLayout(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::SourceDerivedLayout),
             Self::Recording(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::Recording),
@@ -1588,6 +1594,9 @@ impl UniversalCommandArgs {
 /// Failure while validating a tagged V6 command argument envelope.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum UniversalCommandArgsValidationError {
+    /// Source-only layout identity, topology or canonical data was inconsistent.
+    #[error("invalid source-derived layout arguments: {0}")]
+    SourceDerivedLayout(#[source] super::source_layout_commands::SourceLayoutIntentError),
     /// Finite recording observations failed validation.
     #[error("invalid recording command arguments: {0}")]
     Recording(#[source] super::recording_commands::RecordingValueError),

@@ -74,6 +74,8 @@ pub(crate) use recording_chunks::{RecordingChunkPage, RecordingChunkReceipt};
 mod frozen_copy;
 #[allow(dead_code)]
 mod full_progress;
+#[cfg(test)]
+pub(crate) mod source_layout_tests;
 pub(crate) use frozen_copy::FrozenCopyData;
 #[allow(dead_code)] // Genuine preparation/latch consumer is OPT-2136; rows confer no authority.
 mod database_claims;

@@ -15,6 +15,7 @@ use super::work_progress::{FullProgressSnapshotObservation, FullProgressSnapshot
 pub(crate) const FULL_PROGRESS_RECORD_KIND: &str = "full_progress";
 /// The first full-progress observation envelope schema.
 pub(crate) const FULL_PROGRESS_SCHEMA_VERSION: u32 = 1;
+const SOURCE_LAYOUT_SCHEMA_VERSION: u32 = 2;
 /// Maximum encoded or decoded full-progress observation size.
 pub(crate) const FULL_PROGRESS_MAX_RECORD_BYTES: usize = 1024 * 1024;
 /// Maximum JSON nesting depth accepted by the full-progress observation codec.
@@ -39,7 +40,14 @@ impl StoredFullProgressRecord {
     ) -> Result<Self, FullProgressCodecError> {
         let record = Self {
             record_kind: FULL_PROGRESS_RECORD_KIND.to_owned(),
-            schema_version: FULL_PROGRESS_SCHEMA_VERSION,
+            schema_version: if matches!(
+                snapshot.intent().args(),
+                super::coordinator::UniversalCommandArgs::SourceDerivedLayout(_)
+            ) {
+                SOURCE_LAYOUT_SCHEMA_VERSION
+            } else {
+                FULL_PROGRESS_SCHEMA_VERSION
+            },
             snapshot,
         };
         record.validate()?;
@@ -68,7 +76,15 @@ impl StoredFullProgressRecord {
                 actual: self.record_kind.clone(),
             });
         }
-        if self.schema_version != FULL_PROGRESS_SCHEMA_VERSION {
+        let expected = if matches!(
+            self.snapshot.intent().args(),
+            super::coordinator::UniversalCommandArgs::SourceDerivedLayout(_)
+        ) {
+            SOURCE_LAYOUT_SCHEMA_VERSION
+        } else {
+            FULL_PROGRESS_SCHEMA_VERSION
+        };
+        if self.schema_version != expected {
             return Err(FullProgressCodecError::UnsupportedVersion {
                 version: u64::from(self.schema_version),
             });
@@ -213,7 +229,7 @@ fn validate_envelope_header(value: &Value) -> Result<(), FullProgressCodecError>
         .ok_or_else(|| FullProgressCodecError::Malformed {
             reason: String::from("schema_version must be an unsigned integer"),
         })?;
-    if version != u64::from(FULL_PROGRESS_SCHEMA_VERSION) {
+    if !matches!(version, 1 | 2) {
         return Err(FullProgressCodecError::UnsupportedVersion { version });
     }
     Ok(())

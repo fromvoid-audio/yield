@@ -117,6 +117,8 @@ pub enum OperationActor {
 /// Typed operation family. Payload details remain bounded and opaque to this foundation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum OperationKind {
+    /// Source-local rebuildable SQL layout, separate from user history and files.
+    SourceDerivedLayout,
     /// An operation originating from transaction history.
     FileHistory,
     /// An application-owned file operation.
@@ -142,6 +144,8 @@ pub struct OperationIntent {
 /// an explicit model and schema decision; unknown command values remain retained data.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum UniversalCommandKind {
+    /// Replace one bounded source-owned canonical layout generation.
+    SourceDerivedLayout,
     /// Extract a rendered result from a source or waveform selection.
     Extract,
     /// Copy an existing file into a destination.
@@ -182,6 +186,7 @@ impl UniversalCommandKind {
     /// Return the stable documentation identifier for this command family.
     pub const fn stable_id(self) -> &'static str {
         match self {
+            Self::SourceDerivedLayout => "family.source_derived_layout",
             Self::Extract => "family.extract",
             Self::Copy => "family.copy",
             Self::Import => "family.import",
@@ -302,6 +307,9 @@ fn command_matches_intent(
     kind: &OperationKind,
 ) -> bool {
     match command_kind {
+        UniversalCommandKind::SourceDerivedLayout => {
+            actor == OperationActor::User && *kind == OperationKind::SourceDerivedLayout
+        }
         UniversalCommandKind::ExternalReconciliation => {
             actor == OperationActor::ExternalFs && *kind == OperationKind::ExternalReconciliation
         }

@@ -555,7 +555,8 @@ impl PreparedAdmissionInput {
         }
         if matches!(
             &self.args,
-            UniversalCommandArgs::DecodedEdit(_)
+            UniversalCommandArgs::SourceDerivedLayout(_)
+                | UniversalCommandArgs::DecodedEdit(_)
                 | UniversalCommandArgs::DecodedExport(_)
                 | UniversalCommandArgs::DecodedExportBatch(_)
         ) {
@@ -3468,7 +3469,8 @@ fn prepared_record(
 ) -> Result<StoredOperationRecord, OperationJournalOwnerError> {
     if matches!(
         prepared.args,
-        UniversalCommandArgs::DecodedEdit(_)
+        UniversalCommandArgs::SourceDerivedLayout(_)
+            | UniversalCommandArgs::DecodedEdit(_)
             | UniversalCommandArgs::DecodedExport(_)
             | UniversalCommandArgs::DecodedExportBatch(_)
     ) {
@@ -5289,6 +5291,11 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
         } => {
             drop(input);
             execute_store_result(result, || {
+                if matches!(&args, UniversalCommandArgs::SourceDerivedLayout(_)) {
+                    return Err(PreparedAdmissionError::Unsupported {
+                        reason: "source layout requires the actual retained all-owner pre-intent admission latch".into(),
+                    }.into());
+                }
                 runtime.store().validate_for_admission()?;
                 derive_work_plan(&args, &participants).map_err(|error| {
                     OperationJournalOwnerError::InvalidInput {

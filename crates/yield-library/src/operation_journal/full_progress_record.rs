@@ -111,6 +111,39 @@ impl FullProgressIntentObservation {
         self.capacity_plan
             .validate()
             .map_err(FullProgressIntentObservationError::Capacity)?;
+        if let UniversalCommandArgs::SourceDerivedLayout(args) = &self.args {
+            use super::full_capacity::FullCapacityAllocationClass as C;
+            let mut source = 0u64;
+            let mut journal = 0u64;
+            let mut sidecars = 0u64;
+            for allocation in self.capacity_plan.allocations() {
+                let total = match allocation.class() {
+                    C::SourceDatabaseCommit => &mut source,
+                    C::JournalRecord => &mut journal,
+                    C::SourceWalShm => &mut sidecars,
+                    _ => return Err(FullProgressIntentObservationError::SourceLayoutAllocation),
+                };
+                *total = total
+                    .checked_add(allocation.logical_bytes())
+                    .ok_or(FullProgressIntentObservationError::SourceLayoutAllocation)?;
+            }
+            let database = args
+                .allocation()
+                .page_size()
+                .checked_mul(args.allocation().maximum_pages())
+                .ok_or(FullProgressIntentObservationError::SourceLayoutAllocation)?;
+            let wal_shm = args
+                .allocation()
+                .required_metadata_bytes()
+                .checked_sub(database)
+                .ok_or(FullProgressIntentObservationError::SourceLayoutAllocation)?;
+            if source < database
+                || sidecars < wal_shm
+                || journal < super::model::MAX_RECORD_BYTES as u64
+            {
+                return Err(FullProgressIntentObservationError::SourceLayoutAllocation);
+            }
+        }
         self.admission_claims
             .validate_against(&self.capacity_plan)
             .map_err(FullProgressIntentObservationError::AdmissionClaims)
@@ -120,6 +153,9 @@ impl FullProgressIntentObservation {
 /// Why a full-progress intent observation failed closed validation.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum FullProgressIntentObservationError {
+    /// Source layout must cover its complete finite source peak and bounded journal transport only.
+    #[error("source layout allocation inventory omits its peak or includes unrelated effects")]
+    SourceLayoutAllocation,
     /// The retained operation identity was nil.
     #[error("full-progress intent observation has a nil operation ID")]
     NilOperationId,

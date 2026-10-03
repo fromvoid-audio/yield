@@ -7104,7 +7104,8 @@ impl WorkProgress {
         let source_complete = self.all_required_role_complete(|role| {
             matches!(
                 role,
-                WorkUnitRole::SourceAffect
+                WorkUnitRole::SourceDerivedLayout
+                    | WorkUnitRole::SourceAffect
                     | WorkUnitRole::DestinationSourceReconcile
                     | WorkUnitRole::OriginSourceReconcile
             )
