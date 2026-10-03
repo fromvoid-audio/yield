@@ -266,3 +266,49 @@ These source-only estimates do not include profile/journal intent/claim/receipt
 requirements, prove native physical allocation, enter a future migration policy,
 or authorize the separately admitted WAL transition. Complete-owner/common-
 capacity composition remains OPT-2116 and migration remains OPT-2117.
+
+## Actual journal/profile observation prerequisite (OPT-2241)
+
+`OperationJournalStore::capture_legacy_journal_observation` uses the existing
+retained journal connection, database-root capability and original profile-owner
+acquisition. It creates no second journal connection, intent, claim or receipt.
+Capture validates exact bounded schema 12 and current DELETE/EXTRA/exclusive
+configuration, excludes process extension loading, and measures the actual known
+retained Unix VFS/main file and sector callback. A read transaction and cooperative
+two-second progress deadline bound inspection. Unknown runtime/VFS, attached/temp
+schema, changed objects, oversized schema/control files, or elapsed budget refuse.
+The original retained profile-lock descriptor supplies its actual length, volume,
+and allocation unit; neither journal nor lock observations expose free capacity.
+Ordinary retained DELETE sidecar bytes/identity are observed without deleting them.
+A narrow no-follow, nonblocking observation open rejects substituted FIFOs and
+non-regular children without waiting; other existing open helpers are unchanged.
+
+For P/page size and proposed M=min(current max_page_count,512MiB/P), the conditional
+whole-journal logical allowance is P*M plus J=(M+1)*65536+M*(P+8). This covers the
+whole journal database, including every index and intent/claim/receipt family,
+rather than discounting to a small observed record. Capture leaves max_page_count,
+cache_spill, temp_store and journal mode unchanged. Their actual values are carried
+as historical facts. Before this estimate can be consumed for an effect, the
+existing owner must separately enter/verify the selected cap, non-spilling DELETE,
+MEMORY temporary storage, no attachments/savepoints and extension exclusion.
+The existing recording configurator is not invoked and must not raise a smaller
+cap for adoption. This conditional estimate is neither entered policy nor physical
+allocation qualification, a provider claim, write permission or adoption result.
+
+Normal-build actual store tests preserve main/profile-lock bytes and empty recovery
+inventory, reject foreign acquisition and main/root/lock substitution, and retain
+unexpected WAL/SHM evidence. Private actual-owner tests preserve smaller caps and
+current settings, reject unsupported mode/schema/attachments/active transactions,
+and test checked overflow/deadlines plus a real extension-load taint in an isolated
+process:
+
+```
+cargo test --locked -p yield-library --test legacy_journal_observation
+cargo test --locked -p yield-library --lib operation_journal::store::legacy_allocation_observation::tests -- --test-threads=1
+```
+
+OPT-2116 remains open for owner-bound common-volume requirement composition,
+including the original source reservation/control descriptor, alias accounting,
+and all original acceptance. OPT-2117, OPT-2098 and OPT-1745 remain open for genuine
+admitted implementation. Contract fixtures and these historical observations do
+not complete migration, settlement or native physical qualification.

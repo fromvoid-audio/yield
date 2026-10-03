@@ -214,6 +214,29 @@ impl WritableProfileGuard {
         &self.lock_identity
     }
 
+    /// Observe the original retained lock descriptor; no pathname reopen or capacity authority.
+    pub(crate) fn retained_lock_allocation_facts(
+        &self,
+    ) -> Result<(u64, crate::durable_capacity::VolumeFacts), ProfileOwnershipError> {
+        self.validate_current()?;
+        let bytes = self
+            ._lock_file
+            .metadata()
+            .map_err(|source| ProfileOwnershipError::Io {
+                path: self.lock_path.clone(),
+                source,
+            })?
+            .len();
+        let facts = crate::durable_capacity::descriptor_capacity_facts(&self._lock_file).map_err(
+            |error| ProfileOwnershipError::Io {
+                path: self.lock_path.clone(),
+                source: io::Error::other(error.to_string()),
+            },
+        )?;
+        self.validate_current()?;
+        Ok((bytes, facts))
+    }
+
     /// Clone this acquired profile capability for another profile-owned participant.
     ///
     /// The clone retains the same lock identity and open lock descriptor. It therefore does not

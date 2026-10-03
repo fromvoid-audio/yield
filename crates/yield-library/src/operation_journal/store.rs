@@ -68,7 +68,9 @@ use super::validation::{RecordConsistency, classify_record};
 
 mod chunk_claims;
 mod chunk_staging;
+mod legacy_allocation_observation;
 mod recording_chunks;
+pub use legacy_allocation_observation::{LegacyJournalObservation, LegacyJournalObservationError};
 mod recording_controls;
 pub(crate) use recording_chunks::{RecordingChunkPage, RecordingChunkReceipt};
 mod frozen_copy;
