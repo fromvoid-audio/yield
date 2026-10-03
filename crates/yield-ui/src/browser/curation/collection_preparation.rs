@@ -260,7 +260,12 @@ impl Browser {
             if self.collection_history_key().as_ref() != Some(&pending.key)
                 || !lineage.pending.is_empty()
                 || lineage.staged_latest.is_some()
-                || lineage.failed.is_some()
+                || (lineage.failed.is_some()
+                    && !pending.plan.history_direction.is_some_and(|d| {
+                        self.curation_state
+                            .collection_history
+                            .ready(&pending.key, lineage, d)
+                    }))
                 || !group.within_observation_window()
                 || group.generation() != pending.plan.request_id
                 || revision.source_id() != &pending.key.source_id
@@ -332,6 +337,26 @@ impl Browser {
             }
         };
         if group.source_observation().changes().is_empty() {
+            if pending.plan.history_direction.is_some() {
+                if let Some(restore) = self
+                    .curation_state
+                    .collection_history
+                    .complete_empty_direction(&pending.plan, &group)
+                {
+                    self.curation_state.next_request_id = pending.plan.request_id;
+                    if let Some(lineage) = self.curation_state.lineages.get_mut(&pending.key) {
+                        lineage.failed = None;
+                    }
+                    self.restore_collection_history_presentation(restore, cx);
+                    self.curation_state.set_message(
+                        &pending.key,
+                        "Collection endpoint confirmed; no edit needed".into(),
+                    );
+                }
+                pending.cancel();
+                cx.notify();
+                return true;
+            }
             self.curation_state
                 .set_message(&pending.key, "Collection unchanged".into());
             pending.cancel();

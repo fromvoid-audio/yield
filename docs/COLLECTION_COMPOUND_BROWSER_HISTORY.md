@@ -34,10 +34,10 @@ origin committed paths; `applied` represents the acknowledged current after-bit
 subset. Immutable owner partitions and provenance remain shared. Neither a
 failed nor an unattempted original suffix becomes redo work. Status reports
 confirmed/committed and remaining batch/path counts with the actual failure.
-Zero-receipt failure creates no history effect. A partial record stays exclusive
-and its directions remain disabled pending OPT-2187's explicit refencing/retry.
+Zero-receipt original failure creates no history effect. A partial record stays
+exclusive; OPT-2187 supplies the explicit all-origin refencing/retry below.
 
-Successful full groups support the existing Undo/Redo controls with fresh
+Full endpoints and partial directions use the existing Undo/Redo controls with fresh
 complete-owner capture and field-only Add/Remove commands. Selection, focus and
 viewport restore from original presentation; ratings, lock, playback history,
 tags and other collection slots are never restored as an entire metadata row.
@@ -68,6 +68,7 @@ cargo test --locked -p yield-session catalog_history -- --nocapture
 
 This implements portable source/UI behavior through explicit catalog fixtures.
 Normal native protected-reserve startup and physical UI acceptance remain
-OPT-2026/2143. It does not complete partial direction OPT-2187, durable restart
-OPT-2115, journal OPT-2127 or tracking parents OPT-2114/1617/1476. Fixture restart
+OPT-2026/2143. Partial direction implementation is documented in
+[owner-refenced retry](COLLECTION_PARTIAL_DIRECTION_RETRY.md). It does not complete
+durable restart OPT-2115, journal OPT-2127 or tracking parents OPT-2114/1617/1476. Fixture restart
 readback verifies persistence, not reconstructed durable undo history.

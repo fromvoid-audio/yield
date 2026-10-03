@@ -362,6 +362,9 @@ impl CurationState {
                 .as_ref()
                 .filter(|m| m.starts_with("Collection "))
             {
+                if self.collection_history.permits_failure(key, lineage) {
+                    return Some(message.clone());
+                }
                 return Some(format!("{message}; refresh the catalog before editing"));
             }
             return Some(format!(
@@ -1042,8 +1045,14 @@ impl CurationState {
         let Some(lineage) = self.lineages.get_mut(key) else {
             return false;
         };
-        if lineage.failed.is_some()
+        let refenced_direction = plan.history_direction.is_some()
+            && plan
+                .prepared_group
+                .as_ref()
+                .is_some_and(|g| self.collection_history.owner_matches_direction(&plan, g));
+        if (lineage.failed.is_some() && !refenced_direction)
             || lineage.invalidated.is_some()
+            || lineage.history_unresolved
             || plan.root_identity != lineage.root_identity
         {
             return false;
@@ -1053,6 +1062,9 @@ impl CurationState {
         }
         self.collection_history
             .accept(key, lineage, &plan, presentation);
+        if refenced_direction {
+            lineage.failed = None;
+        }
         self.next_request_id = plan.request_id;
         let tags_may_change = plan.tags_may_change();
         let collection_edit = plan.batches.iter().flatten().any(|update| {
@@ -1711,7 +1723,7 @@ fn render_collection_history(
         ),
     ]
     .into_iter()
-    .map(|(direction, id, label)| {
+    .map(|(direction, id, _label)| {
         let enabled = browser.collection_history_ready(direction);
         div()
             .id(id)
@@ -1732,7 +1744,12 @@ fn render_collection_history(
                     view.submit_collection_history(direction, cx);
                 }
             }))
-            .child(label)
+            .child(
+                browser
+                    .curation_state
+                    .collection_history
+                    .control_label(direction),
+            )
     })
     .collect::<Vec<_>>();
     div()
@@ -1758,12 +1775,22 @@ impl Browser {
             && context.source_id == key.source_id
             && context.lifecycle_generation == key.lifecycle_generation
             && context.root == activation.root
-            && self.curation_state.authority_matches(
-                &key,
-                &context.root_identity,
-                context.directory_generation,
-                context.revision,
-            ))
+            && self
+                .curation_state
+                .lineages
+                .get(&key)
+                .is_some_and(|lineage| {
+                    lineage.root_identity == context.root_identity
+                        && lineage.directory_generation == context.directory_generation
+                        && lineage.revision == context.revision
+                        && lineage.invalidated.is_none()
+                        && !lineage.history_unresolved
+                        && (lineage.failed.is_none()
+                            || self
+                                .curation_state
+                                .collection_history
+                                .permits_failure(&key, lineage))
+                }))
         .then_some(key)
     }
 
@@ -3237,6 +3264,15 @@ impl Browser {
             return true;
         }
         if active {
+            let confirmed_history_prefix =
+                self.curation_state
+                    .lineages
+                    .get(&key)
+                    .is_some_and(|lineage| {
+                        self.curation_state
+                            .collection_history
+                            .permits_failure(&key, lineage)
+                    });
             super::curation_queue::invalidate_after_curation(self, cx);
             let tag_filter_revision_changed = !application.failed
                 && self.catalog_metadata.context().is_some_and(|context| {
@@ -3297,13 +3333,13 @@ impl Browser {
                     && context.lifecycle_generation == key.lifecycle_generation
                     && context.root_identity == application.root_identity
                     && context.directory_generation == application.directory_generation
-                    && !application.failed
+                    && (!application.failed || confirmed_history_prefix)
                 {
                     self.catalog_metadata
                         .advance_projection_revision(application.revision);
                 }
                 self.catalog_metadata.pause_for_curation();
-            } else if !application.failed
+            } else if (!application.failed || confirmed_history_prefix)
                 && let Some(context) = self.catalog_metadata.context()
                 && context.source_id == key.source_id
                 && context.lifecycle_generation == key.lifecycle_generation

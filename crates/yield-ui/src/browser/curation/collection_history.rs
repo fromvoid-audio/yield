@@ -60,6 +60,7 @@ struct Record {
     owner: Option<Arc<yield_session::CatalogCollectionHistoryGroup>>,
     applied: BTreeSet<PathBuf>,
     partial: bool,
+    phase: Option<Direction>,
 }
 
 struct Pending {
@@ -78,6 +79,7 @@ pub(super) struct History {
     redo: VecDeque<Record>,
     revision: Option<u64>,
     pending: Option<Pending>,
+    known_failure: bool,
 }
 
 impl History {
@@ -146,6 +148,9 @@ impl History {
             && (direction.is_some() || self.undo.len() + self.redo.len() < MAX_RECORDS)
     }
     fn top(&self, direction: Direction) -> Option<&Record> {
+        if self.undo.back().is_some_and(|r| r.partial) {
+            return self.undo.back();
+        }
         match direction {
             Direction::Undo => self.undo.back(),
             Direction::Redo => self.redo.back(),
@@ -161,11 +166,12 @@ impl History {
         self.pending.is_none()
             && lineage.pending.is_empty()
             && lineage.staged_latest.is_none()
-            && lineage.failed.is_none()
+            && (lineage.failed.is_none() || self.permits_failure(key, lineage))
+            && !lineage.history_unresolved
             && lineage.invalidated.is_none()
             && self.revision == Some(lineage.revision)
             && self.top(direction).is_some_and(|record| {
-                !record.partial
+                (!record.partial || record.owner.is_some())
                     && record.key == *key
                     && record.root == lineage.root_identity
                     && record.generation == lineage.directory_generation
@@ -188,11 +194,16 @@ impl History {
         let mut overlays = BTreeMap::new();
         for (path, (before, after)) in &record.bits {
             let current = *lineage.confirmed.get(path)?;
-            let (expected, target) = match direction {
-                Direction::Undo => (*after, *before),
-                Direction::Redo => (*before, *after),
+            let expected = if record.applied.contains(path) {
+                *after
+            } else {
+                *before
             };
-            if current.has_collection(record.slot) != expected || expected == target {
+            let target = match direction {
+                Direction::Undo => *before,
+                Direction::Redo => *after,
+            };
+            if current.has_collection(record.slot) != expected {
                 return None;
             }
             let relative = RootRelativePath::try_from_path(path.clone()).ok()?;
@@ -207,13 +218,15 @@ impl History {
                     collection,
                 }
             });
-            let CurationTransition::Changed(changed) = plan_curation_action(
-                current,
-                CurationAction::ToggleCollection { slot: record.slot },
-            ) else {
-                return None;
-            };
-            overlays.insert(path.clone(), changed);
+            if expected != target {
+                let CurationTransition::Changed(changed) = plan_curation_action(
+                    current,
+                    CurationAction::ToggleCollection { slot: record.slot },
+                ) else {
+                    return None;
+                };
+                overlays.insert(path.clone(), changed);
+            }
         }
         Some(CurationOperationPlan {
             request_id,
@@ -390,6 +403,7 @@ impl History {
                 bits,
                 owner: plan.prepared_group.clone(),
                 partial: false,
+                phase: None,
                 presentation,
                 bytes,
             },
@@ -411,18 +425,112 @@ impl History {
             return false;
         };
         let source = group.source_observation();
-        source.same_owner_as(owner.source_observation())
-            && source.changes().len() == record.bits.len()
-            && source.changes().iter().all(|c| {
-                record
-                    .bits
-                    .get(c.path().as_path())
-                    .is_some_and(|(before, after)| match direction {
-                        Direction::Undo => c.before() == *after && c.after() == *before,
-                        Direction::Redo => c.before() == *before && c.after() == *after,
-                    })
-            })
+        if !source.same_owner_as(owner.source_observation())
+            || source.changes().len() > record.bits.len()
+        {
+            return false;
+        }
+        let changed = source
+            .changes()
+            .iter()
+            .map(|c| (c.path().as_path(), c))
+            .collect::<BTreeMap<_, _>>();
+        if changed.keys().any(|p| !record.bits.contains_key(*p)) {
+            return false;
+        }
+        record.bits.iter().all(|(p, (before, after))| {
+            let expected = if record.applied.contains(p) {
+                *after
+            } else {
+                *before
+            };
+            let target = match direction {
+                Direction::Undo => *before,
+                Direction::Redo => *after,
+            };
+            match changed.get(p.as_path()) {
+                Some(c) => c.before() == expected && c.after() == target && expected != target,
+                None => expected == target,
+            }
+        })
     }
+
+    pub(super) fn permits_failure(
+        &self,
+        key: &CurationLifecycleKey,
+        lineage: &CurationLineage,
+    ) -> bool {
+        self.known_failure
+            && self.revision == Some(lineage.revision)
+            && self.key() == Some(key)
+            && !lineage.history_unresolved
+            && self
+                .undo
+                .iter()
+                .chain(&self.redo)
+                .any(|r| r.owner.is_some())
+    }
+
+    pub(super) fn control_label(&self, direction: Direction) -> &'static str {
+        match self.undo.back().filter(|r| r.partial).map(|r| r.phase) {
+            Some(Some(Direction::Undo)) => match direction {
+                Direction::Undo => "Resume undo",
+                Direction::Redo => "Reverse undo",
+            },
+            Some(Some(Direction::Redo)) => match direction {
+                Direction::Undo => "Reverse redo",
+                Direction::Redo => "Resume redo",
+            },
+            Some(None) => match direction {
+                Direction::Undo => "Undo confirmed",
+                Direction::Redo => "Keep confirmed",
+            },
+            None => match direction {
+                Direction::Undo => "Undo collection",
+                Direction::Redo => "Redo collection",
+            },
+        }
+    }
+
+    fn pop_direction_record(&mut self, direction: Direction) -> Option<Record> {
+        if self.undo.back().is_some_and(|r| r.partial) || direction == Direction::Undo {
+            self.undo.pop_back()
+        } else {
+            self.redo.pop_back()
+        }
+    }
+
+    /// A genuine successful all-path refence can establish an already-reached endpoint locally.
+    /// This moves no metadata and manufactures no receipt.
+    pub(super) fn complete_empty_direction(
+        &mut self,
+        plan: &CurationOperationPlan,
+        group: &yield_session::CatalogCollectionHistoryGroup,
+    ) -> Option<Presentation> {
+        let direction = plan.history_direction?;
+        if !self.owner_matches_direction(plan, group)
+            || !group.source_observation().changes().is_empty()
+        {
+            return None;
+        }
+        let mut record = self.pop_direction_record(direction)?;
+        record.partial = false;
+        record.phase = None;
+        let presentation = record.presentation.clone();
+        match direction {
+            Direction::Undo => {
+                record.applied.clear();
+                self.redo.push_back(record);
+            }
+            Direction::Redo => {
+                record.applied = record.bits.keys().cloned().collect();
+                self.undo.push_back(record);
+            }
+        }
+        self.known_failure = false;
+        Some(presentation)
+    }
+
     pub(super) fn validate_bound_outcome(
         &self,
         key: &CurationLifecycleKey,
@@ -537,7 +645,14 @@ impl History {
             self.clear();
             return (None,Some("Collection undo unavailable: result could not be confirmed; refresh the catalog".into()));
         }
-        if outcome.committed_batches.is_empty() && outcome.failure.is_some() {
+        if outcome.failure.is_some() {
+            self.known_failure = true;
+            self.revision = outcome.final_revision;
+        }
+        if outcome.committed_batches.is_empty()
+            && outcome.failure.is_some()
+            && pending.direction.is_none()
+        {
             return (
                 None,
                 Some(format!(
@@ -568,17 +683,18 @@ impl History {
                     for p in &paths {
                         pending.record.applied.remove(p);
                     }
-                    self.undo.pop_back();
+                    self.pop_direction_record(Direction::Undo);
                 }
                 Some(Direction::Redo) => {
                     pending.record.applied.extend(paths.iter().cloned());
-                    self.redo.pop_back();
+                    self.pop_direction_record(Direction::Redo);
                 }
             }
             pending.record.partial = true;
+            pending.record.phase = pending.direction;
             self.revision = outcome.final_revision;
             let message = format!(
-                "Collection partially saved: {committed}/{total} batches · {} changed paths committed · {} remain; {} · directions unavailable",
+                "Collection partially saved: {committed}/{total} batches · {} changed paths committed · {} remain; {} · resume or reverse confirmed changes",
                 paths.len(),
                 pending
                     .batches
@@ -592,6 +708,7 @@ impl History {
             return (None, Some(message));
         }
         self.revision = outcome.final_revision;
+        self.known_failure = false;
         let (restore, message) = match pending.direction {
             None => {
                 self.redo.clear();
@@ -606,14 +723,18 @@ impl History {
                 (None, "Collection saved · Undo available")
             }
             Some(Direction::Undo) => {
-                self.undo.pop_back();
+                self.pop_direction_record(Direction::Undo);
+                pending.record.partial = false;
+                pending.record.phase = None;
                 let restore = pending.record.presentation.clone();
                 pending.record.applied.clear();
                 self.redo.push_back(pending.record);
                 (Some(restore), "Collection undo saved · Redo available")
             }
             Some(Direction::Redo) => {
-                self.redo.pop_back();
+                self.pop_direction_record(Direction::Redo);
+                pending.record.partial = false;
+                pending.record.phase = None;
                 let restore = pending.record.presentation.clone();
                 pending.record.applied = pending.record.bits.keys().cloned().collect();
                 self.undo.push_back(pending.record);
