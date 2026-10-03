@@ -791,3 +791,7 @@ mod layout_generation;
 pub(super) fn canonical_blob_budget() {
     layout_generation::canonical_blob_budget();
 }
+
+pub(super) fn source_layout_intent_case(case: &str) {
+    layout_generation::source_layout_intent_case(case);
+}

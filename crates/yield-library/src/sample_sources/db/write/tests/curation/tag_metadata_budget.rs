@@ -103,6 +103,9 @@ fn tag_metadata_budget_child() {
         "policy-poison" => super::tag_metadata_policy::poison(),
         "policy-restore-failure" => super::tag_metadata_policy::restore_failure(),
         "policy-extension-gate" => super::tag_metadata_policy::extension_gate(),
+        case if case.starts_with("layout-intent-") => {
+            super::layout_capture::source_layout_intent_case(case)
+        }
         case if case.starts_with("layout-owned-") => super::layout_wal_preparation::dispatch(case),
         case if case.starts_with("tag-owned-") => super::tag_wal_preparation::dispatch(case),
         _ => panic!("unknown fixture case"),

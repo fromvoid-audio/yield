@@ -588,3 +588,9 @@ pub(super) fn canonical_blob_budget() {
     );
     assert_eq!(writer.current_revision().unwrap(), rev);
 }
+
+#[path = "source_layout_intent.rs"]
+mod source_layout_intent;
+pub(super) fn source_layout_intent_case(case: &str) {
+    source_layout_intent::dispatch(case);
+}

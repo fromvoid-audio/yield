@@ -51,6 +51,7 @@ pub mod reserve_telemetry;
 pub mod retained_resolution_commands;
 pub mod selection_normalize_commands;
 pub mod selection_output_commands;
+pub mod source_layout_commands;
 pub mod status;
 pub mod store;
 pub mod validation;
