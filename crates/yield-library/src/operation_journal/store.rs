@@ -77,6 +77,7 @@ mod full_progress;
 #[cfg(test)]
 pub(crate) mod source_layout_tests;
 pub(crate) use frozen_copy::FrozenCopyData;
+mod database_attempt_metadata;
 #[allow(dead_code)] // Genuine preparation/latch consumer is OPT-2136; rows confer no authority.
 mod database_claims;
 #[allow(dead_code)]
