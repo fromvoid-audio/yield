@@ -63,7 +63,7 @@ pub enum Platform {
 }
 
 impl Platform {
-    fn labels(self) -> (&'static str, &'static str, &'static str) {
+    pub(super) fn labels(self) -> (&'static str, &'static str, &'static str) {
         match self {
             Self::MacArm64 => ("macos", "aarch64", "aarch64-apple-darwin"),
             Self::MacX64 => ("macos", "x86_64", "x86_64-apple-darwin"),
@@ -439,7 +439,7 @@ fn select_for_installed(
     }
 }
 
-fn channel_name(channel: Channel) -> &'static str {
+pub(super) fn channel_name(channel: Channel) -> &'static str {
     match channel {
         Channel::Stable => "stable",
         Channel::Rc => "rc",
@@ -447,7 +447,7 @@ fn channel_name(channel: Channel) -> &'static str {
     }
 }
 
-fn full_commit(text: &str) -> Option<[u8; 20]> {
+pub(super) fn full_commit(text: &str) -> Option<[u8; 20]> {
     if text.len() != 40 || !text.bytes().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
@@ -458,7 +458,11 @@ fn full_commit(text: &str) -> Option<[u8; 20]> {
     (commit != [0; 20]).then_some(commit)
 }
 
-fn asset_name(version: &semver::Version, channel: Channel, platform: Platform) -> Option<String> {
+pub(super) fn asset_name(
+    version: &semver::Version,
+    channel: Channel,
+    platform: Platform,
+) -> Option<String> {
     // Consume the repository contract instead of admitting future/inactive targets.
     let contract: toml::Value =
         toml::from_str(include_str!("../../../release_contract.toml")).ok()?;
@@ -486,7 +490,7 @@ fn asset_name(version: &semver::Version, channel: Channel, platform: Platform) -
     )
 }
 
-fn bounded_json(bytes: &[u8]) -> bool {
+pub(super) fn bounded_json(bytes: &[u8]) -> bool {
     if bytes.len() as u64 > MAX_BYTES {
         return false;
     }

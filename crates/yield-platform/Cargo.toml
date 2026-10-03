@@ -13,6 +13,9 @@ workspace = true
 test-support = []
 
 [dependencies]
+yield-core.workspace = true
+url = "=2.5.8"
+webpki-roots = "=0.26.11"
 raw-window-handle.workspace = true
 ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
 serde = { version = "1.0.228", features = ["derive"] }

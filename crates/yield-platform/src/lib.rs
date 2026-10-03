@@ -4,6 +4,7 @@
 //! Callers prepare and verify paths elsewhere, then hand a bounded list of
 //! absolute paths to the synchronous native drag entry point.
 
+pub mod payload_selection;
 pub mod update_catalog;
 
 use std::fmt;

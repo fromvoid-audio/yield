@@ -150,7 +150,7 @@ fn validate(
                 .chars()
                 .filter(|character| *character != '-')
                 .collect();
-            if date != expected_date
+            if (date != expected_date && date != build_date)
                 || !(7..=40).contains(&abbreviated_commit.len())
                 || !abbreviated_commit
                     .bytes()
