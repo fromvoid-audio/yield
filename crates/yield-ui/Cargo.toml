@@ -24,6 +24,11 @@ yield-session.workspace = true
 yield-platform.workspace = true
 
 [dev-dependencies]
+base64 = "=0.22.1"
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
+sha2 = "=0.10.9"
+serde_json = "1.0.145"
+toml = "0.8.19"
 yield-platform = { workspace = true, features = ["test-support"] }
 yield-library = { workspace = true, features = ["test-support"] }
 naga = { version = "=25.0.1", features = ["wgsl-in"] }

@@ -25,7 +25,7 @@ pub(in crate::payload_selection) struct Traffic {
     pub(in crate::payload_selection) body: AtomicU64,
     pub(in crate::payload_selection) plaintext: AtomicU64,
     pub(in crate::payload_selection) requests: AtomicU8,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(in crate::payload_selection) reading: std::sync::atomic::AtomicBool,
 }
 impl Traffic {
@@ -36,7 +36,7 @@ impl Traffic {
             body: AtomicU64::new(0),
             plaintext: AtomicU64::new(0),
             requests: AtomicU8::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             reading: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -155,7 +155,7 @@ fn fetch(
     }
     let endpoint = match transport {
         Transport::Production => original.to_owned(),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         Transport::Loopback(address) => {
             if !address.ip().is_loopback() {
                 return Err(invalid);
@@ -187,7 +187,7 @@ fn fetch(
                 line,
             )))
             .build(),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         Transport::Loopback(_) => builder
             .tls_connector(Arc::new(guarded::LoopbackStagingTls::new(
                 body.ceiling(),

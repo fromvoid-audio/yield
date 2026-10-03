@@ -21,6 +21,7 @@ mod theme;
 mod update_catalog_service;
 /// Read-only asynchronous update metadata port and typed outcomes.
 pub mod update_check;
+mod update_payload_service;
 
 actions!(
     yield_ui,

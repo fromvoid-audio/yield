@@ -17,7 +17,7 @@ const MAX_BODY: usize = 512 * 1024;
 #[derive(Clone)]
 pub(super) enum Transport {
     Production,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Loopback(std::net::SocketAddr),
 }
 impl Transport {
@@ -29,7 +29,7 @@ impl Transport {
         let original_url = url::Url::parse(original).map_err(|_| invalid)?;
         let endpoint = match self {
             Self::Production => original.to_owned(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::Loopback(address) => {
                 if !address.ip().is_loopback() {
                     return Err(invalid);
@@ -54,7 +54,7 @@ impl Transport {
             Self::Production => builder
                 .tls_connector(std::sync::Arc::new(guarded::ValidatedTls::new()))
                 .build(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::Loopback(_) => builder
                 .tls_connector(std::sync::Arc::new(guarded::LoopbackTls))
                 .build(),

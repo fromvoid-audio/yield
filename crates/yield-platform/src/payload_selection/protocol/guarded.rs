@@ -54,9 +54,9 @@ impl TlsConnector for ValidatedTls {
         }))
     }
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) struct LoopbackTls;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl TlsConnector for LoopbackTls {
     fn connect(
         &self,
@@ -76,9 +76,9 @@ impl TlsConnector for LoopbackTls {
         Ok(Box::new(Guarded::new(stream)))
     }
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) struct LoopbackStagingTls(StagePolicy);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl LoopbackStagingTls {
     pub(super) fn new(
         ceiling: usize,
@@ -92,7 +92,7 @@ impl LoopbackStagingTls {
         })
     }
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl TlsConnector for LoopbackStagingTls {
     fn connect(
         &self,
@@ -386,14 +386,14 @@ impl Read for Guarded {
         if out.is_empty() {
             return Ok(0);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(traffic) = &self.traffic {
             traffic
                 .reading
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         let result = self.inner.read(out);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(traffic) = &self.traffic {
             traffic
                 .reading
