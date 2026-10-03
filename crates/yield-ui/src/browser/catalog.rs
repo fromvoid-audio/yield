@@ -427,6 +427,9 @@ impl Browser {
     }
 
     pub(super) fn retry_catalog_commands(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.expire_collection_preparation() {
+            cx.notify();
+        }
         let Some(status) = catalog_status(cx) else {
             return false;
         };
@@ -668,7 +671,20 @@ impl Browser {
         ) {
             return super::curation_queue::apply_catalog_event(self, &event);
         }
+        if matches!(&event, CatalogEvent::CollectionHistoryGroupCompleted { .. }) {
+            if publication_fence.as_ref().is_some_and(|f| !f.is_live())
+                && let CatalogEvent::CollectionHistoryGroupCompleted { result, .. } = &mut event
+            {
+                *result = Err(yield_session::CollectionHistoryFailure::StaleSource);
+            }
+            return self.apply_collection_preparation_event(&event, cx);
+        }
         if matches!(event, CatalogEvent::CurationOperationCompleted { .. }) {
+            if publication_fence.as_ref().is_some_and(|f| !f.is_live())
+                && let CatalogEvent::CurationOperationCompleted { publication, .. } = &mut event
+            {
+                *publication = CatalogPublicationStatus::NonProjectable;
+            }
             // Compound outcomes belong to their source lifecycle even after the browser has
             // switched to another source. Consume them before the active projection fence so a
             // later receipt cannot be mistaken for a new source's metadata.

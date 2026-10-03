@@ -73,6 +73,530 @@ mod fixtures {
         std::fs::write(path, bytes).expect("write WAV");
     }
 
+    fn owner_event(
+        service: &yield_catalog::CatalogService,
+        predicate: impl Fn(&CatalogEvent) -> bool,
+    ) -> CatalogEvent {
+        next_event(
+            |events| {
+                while let Ok(event) = service.try_recv_event() {
+                    events.push(event)
+                }
+            },
+            predicate,
+        )
+    }
+    fn browser_owner_event(
+        browser: &gpui::Entity<Browser>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> CatalogEvent {
+        next_event(
+            |events| {
+                cx.update(|_, app| {
+                    app.global::<SourceRegistryGlobal>()
+                        .drain_catalog_events(events);
+                });
+                let mut terminal = Vec::new();
+                for event in events.drain(..) {
+                    if matches!(&event, CatalogEvent::CollectionHistoryGroupCompleted { .. }) {
+                        browser.update(cx, |view, cx| {
+                            assert!(view.apply_collection_preparation_event(&event, cx));
+                            view.source_registry_task.take();
+                        });
+                    } else {
+                        terminal.push(event);
+                    }
+                }
+                events.extend(terminal);
+            },
+            |e| matches!(e, CatalogEvent::CurationOperationCompleted { .. }),
+        )
+    }
+    fn compound_gpui(
+        cx: &mut gpui::TestAppContext,
+        fault: Option<usize>,
+        lost: bool,
+        malformed: bool,
+        oversized: bool,
+    ) {
+        let _runtime = yield_library::test_runtime::TestRuntimeGuard::acquire();
+        let config = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
+        let _profile = PersistenceProfileGuard::named("gpui-development");
+        let source_root = tempfile::tempdir().unwrap();
+        let root = source_root.path().canonicalize().unwrap();
+        for i in 0..257 {
+            write_wav(&root.join(format!("{i:04}.wav")));
+        }
+        let source_id = SourceId::from_string(format!("compound-gpui-{fault:?}"));
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let guard = WritableProfileGuard::acquire_current().unwrap();
+        let service = yield_catalog::CatalogService::start(&guard).unwrap();
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: root.clone(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        owner_event(&service, |e| matches!(e, CatalogEvent::Registered { .. }));
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        let CatalogEvent::AuditCommitted { snapshot, .. } = owner_event(&service, |e| {
+            matches!(e, CatalogEvent::AuditCommitted { .. })
+        }) else {
+            unreachable!()
+        };
+        let mut revision = snapshot.committed_revision;
+        // Seed unrelated fields through actual ordinary owner commands, without compound request IDs.
+        let seed = snapshot
+            .curation_metadata
+            .keys()
+            .flat_map(|p| {
+                let path = RootRelativePath::try_from_path(p.clone()).unwrap();
+                [
+                    SourceCurationUpdate::SetLocked {
+                        path: path.clone(),
+                        locked: true,
+                    },
+                    SourceCurationUpdate::SetLastPlayedAt {
+                        path: path.clone(),
+                        played_at: Some(456),
+                    },
+                    SourceCurationUpdate::SetRatingAndLastCuratedAt {
+                        path,
+                        rating: yield_library::sample_sources::Rating::KEEP_1,
+                        last_curated_at: 123,
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        for chunk in seed.chunks(MAX_CURATION_UPDATES) {
+            service
+                .submit(CatalogCommand::ApplyCuration {
+                    source_id: source_id.clone(),
+                    lifecycle_generation: 1,
+                    expected_revision: revision,
+                    root_identity: snapshot.root_identity.clone(),
+                    request_id: 900,
+                    updates: chunk.to_vec(),
+                })
+                .unwrap();
+            let CatalogEvent::CurationCommitted { receipt, .. } = owner_event(&service, |e| {
+                matches!(e, CatalogEvent::CurationCommitted { .. })
+            }) else {
+                unreachable!()
+            };
+            revision = receipt.source_revision();
+        }
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id: source_id.clone(),
+                expected_revision: Some(revision),
+            })
+            .unwrap();
+        let CatalogEvent::SnapshotReady { snapshot } = owner_event(&service, |e| {
+            matches!(e, CatalogEvent::SnapshotReady { .. })
+        }) else {
+            unreachable!()
+        };
+        if let Some(index) = fault {
+            service
+                .arm_compound_batch_failure(&source_id, 1, 1, index)
+                .unwrap();
+        }
+        cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
+        let entries = snapshot
+            .curation_metadata
+            .iter()
+            .map(|(path, m)| AudioFile {
+                path: root.join(path),
+                relative_path: path.clone(),
+                byte_len: m.file_size,
+                duration_seconds: Some(1.0 / 8000.0),
+                sample_rate: Some(8000),
+                playback_type: None,
+                curation: Some(curation_from_metadata(m).unwrap()),
+            })
+            .collect::<Vec<_>>();
+        let ids = entries.iter().map(AudioFile::stable_id).collect::<Vec<_>>();
+        let (fixture, cx) =
+            cx.add_window_view(|_, cx| ControlsFixture(cx.new(|cx| Browser::new(cx))));
+        let browser = cx.update(|_, app| fixture.read(app).0.clone());
+        cx.simulate_resize(gpui::size(px(240.0), px(100.0)));
+        let key = CurationLifecycleKey {
+            source_id: source_id.clone(),
+            lifecycle_generation: 1,
+        };
+        let offset = gpui::point(px(0.0), px(-7.0));
+        browser.update(cx, |view, _| {
+            view.source_registry_task.take();
+            view.preferences_task.take();
+            let mut source = SourceSession::new(root.clone());
+            source.source_id = Some(source_id.clone());
+            source.catalog_lifecycle_generation = Some(1);
+            source.entries = entries.clone();
+            view.source_sessions = vec![source];
+            view.active_source = Some(0);
+            view.root = Some(root.clone());
+            view.entries = entries.clone();
+            view.view_model.set_entries(&view.entries);
+            view.selected = Some(0);
+            view.selection.focus_pointer(&ids[0]);
+            view.selection.select_all(&ids);
+            view.list_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(offset);
+            view.catalog_activation = Some(CatalogActivation {
+                source_id: source_id.clone(),
+                root: root.clone(),
+                lifecycle_generation: 1,
+                registered: true,
+                registration_admitted: true,
+                root_identity: Some(snapshot.root_identity.clone()),
+                audit_finished: true,
+                audit_error: None,
+                audit_retryable: false,
+                force_reload: false,
+                fallback_to_scan: false,
+            });
+            view.catalog_metadata
+                .install_projection(CatalogMetadataContext {
+                    source_id: source_id.clone(),
+                    lifecycle_generation: 1,
+                    root: root.clone(),
+                    root_identity: snapshot.root_identity.clone(),
+                    directory_generation: snapshot.directory_generation,
+                    revision: snapshot.committed_revision,
+                    entry_indices: Arc::new(
+                        entries
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| (e.relative_path.clone(), i))
+                            .collect(),
+                    ),
+                });
+            view.curation_state.install_projection(
+                key.clone(),
+                snapshot.root_identity.clone(),
+                snapshot.directory_generation,
+                snapshot.committed_revision,
+                &view.entries,
+            );
+        });
+        if oversized {
+            browser.update(cx, |view, _| {
+                for i in 0..100000 {
+                    let mut dummy = entries[0].clone();
+                    dummy.path = root.join(format!("absent-{i}.wav"));
+                    view.selection.toggle(&dummy.stable_id(), None);
+                }
+                view.selection.clear();
+                view.selection.focus_pointer(&ids[0]);
+                assert!(view.selection.selected().capacity() > 100000);
+            });
+        }
+        browser.update(cx, |view, cx| {
+            view.submit_curation_action(CurationAction::ToggleCollection { slot: 0 }, None, cx);
+            view.source_registry_task.take();
+            if oversized {
+                assert!(view.curation_state.collection_preparation.is_none());
+            } else {
+                assert!(view.curation_state.collection_preparation.is_some());
+            }
+            assert!(view.curation_state.collection_history.pending.is_none());
+        });
+        let event = browser_owner_event(&browser, cx);
+        if lost || malformed {
+            let CatalogEvent::CurationOperationCompleted { outcome, .. } = &event else {
+                unreachable!()
+            };
+            assert!(outcome.is_success());
+            assert_eq!(outcome.committed_batches().len(), 3);
+            if malformed {
+                let mut normalized = CurationOutcome::from_catalog(outcome);
+                let (path, _) = normalized.committed_batches[0].files.pop_first().unwrap();
+                normalized.committed_batches[0].playback_types.remove(&path);
+                let (suffix, curation) = normalized.committed_batches[2]
+                    .files
+                    .first_key_value()
+                    .unwrap();
+                let (suffix, curation) = (suffix.clone(), *curation);
+                normalized.committed_batches[0]
+                    .files
+                    .insert(suffix.clone(), curation);
+                normalized.committed_batches[0]
+                    .playback_types
+                    .insert(suffix, None);
+                // Keep count, revision, root and generic row coherence valid. Only the
+                // exact immutable prepared batch pathset detects this suffix substitution.
+                browser.update(cx, |view, _| {
+                    let before = view.curation_state.lineages[&key].revision;
+                    assert!(
+                        view.curation_state
+                            .apply_outcome(key.clone(), 1, normalized)
+                            .is_some()
+                    );
+                    assert_eq!(view.curation_state.lineages[&key].revision, before);
+                    assert!(view.curation_state.collection_history.undo.is_empty());
+                    assert!(!view.collection_history_ready(Direction::Undo));
+                    assert!(
+                        view.curation_state
+                            .status_for(&key)
+                            .unwrap()
+                            .contains("could not be confirmed")
+                    );
+                });
+            }
+            cx.update(|_, app| {
+                app.update_global::<SourceRegistryGlobal, _>(|global, _| {
+                    global.submit_catalog(CatalogCommand::ReadSnapshot {
+                        source_id: source_id.clone(),
+                        expected_revision: outcome.final_revision(),
+                    })
+                })
+            })
+            .unwrap();
+            let CatalogEvent::SnapshotReady { snapshot: actual } = next_event(
+                |events| {
+                    cx.update(|_, app| {
+                        app.global::<SourceRegistryGlobal>()
+                            .drain_catalog_events(events);
+                    })
+                },
+                |e| matches!(e, CatalogEvent::SnapshotReady { .. }),
+            ) else {
+                unreachable!()
+            };
+            assert_eq!(
+                actual
+                    .curation_metadata
+                    .values()
+                    .filter(|m| m.collections.contains(&SampleCollection::new(0).unwrap()))
+                    .count(),
+                257
+            );
+            browser.update(cx, |view, cx| {
+                let mut actual_entries = entries.clone();
+                for e in &mut actual_entries {
+                    e.curation = Some(
+                        curation_from_metadata(&actual.curation_metadata[&e.relative_path])
+                            .unwrap(),
+                    );
+                }
+                view.curation_state.install_projection(
+                    key.clone(),
+                    actual.root_identity.clone(),
+                    actual.directory_generation,
+                    actual.committed_revision,
+                    &actual_entries,
+                );
+                assert!(view.curation_state.collection_history.undo.is_empty());
+                assert!(view.curation_state.collection_history.redo.is_empty());
+                assert!(!view.collection_history_ready(Direction::Undo));
+                assert!(
+                    view.curation_state
+                        .status_for(&key)
+                        .unwrap()
+                        .contains("unconfirmed")
+                );
+                // The genuine delayed owner result is drained; equality after readback cannot
+                // reconstruct the lost record or clear its unknown history marker.
+                assert!(view.apply_curation_event(&event, cx));
+                assert!(view.curation_state.collection_history.undo.is_empty());
+                assert!(
+                    view.curation_state
+                        .status_for(&key)
+                        .unwrap()
+                        .contains("unconfirmed")
+                );
+            });
+            cx.update(|_, app| {
+                app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
+            });
+            return;
+        }
+        let committed = if oversized {
+            1
+        } else {
+            fault.map_or(257, |i| i * 128)
+        };
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_curation_event(&event, cx));
+            let history = &view.curation_state.collection_history;
+            assert!(history.pending.is_none());
+            assert!(history.redo.is_empty());
+            assert!(history.bytes() <= MAX_BYTES);
+            if committed == 0 || oversized {
+                assert!(history.undo.is_empty());
+            } else {
+                let r = history.undo.back().unwrap();
+                assert_eq!(r.bits.len(), committed);
+                assert_eq!(r.applied.len(), committed);
+                assert_eq!(r.partial, fault.is_some());
+            }
+            assert_eq!(
+                view.entries
+                    .iter()
+                    .filter(|e| e.curation.unwrap().has_collection(0))
+                    .count(),
+                committed
+            );
+            assert_eq!(view.selection.len(), if oversized { 0 } else { 257 });
+            assert_eq!(view.selection.anchor(), Some(&ids[0]));
+            assert_eq!(view.browser_focus_id(), Some(ids[0].clone()));
+            assert_eq!(
+                view.list_scroll_handle.0.borrow().base_handle.offset(),
+                offset
+            );
+            for e in &view.entries {
+                let c = e.curation.unwrap();
+                assert!(c.rating().locked());
+                assert_eq!(c.last_played_at(), Some(456));
+                assert_eq!(c.rating(), yield_core::RatingState::new(1, true).unwrap());
+            }
+            if fault.is_some() || oversized {
+                assert!(!view.collection_history_ready(Direction::Undo));
+                assert!(!view.collection_history_ready(Direction::Redo));
+                let status = view.curation_state.status_for(&key).unwrap();
+                if oversized {
+                    assert!(status.contains("Undo unavailable"), "{status}");
+                } else if committed > 0 {
+                    assert!(
+                        status.contains(&format!("{} changed paths committed", committed)),
+                        "{status}"
+                    );
+                }
+            }
+        });
+        // Actual disabled controls must not admit a direction for a failed original group.
+        if fault.is_some() || oversized {
+            draw_controls(&fixture, cx);
+            let bounds = cx.debug_bounds("collection-history-undo").unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            browser.update(cx, |view, _| {
+                assert!(view.curation_state.collection_preparation.is_none())
+            });
+        } else {
+            for (control, expected) in [
+                ("collection-history-undo", 0),
+                ("collection-history-redo", 257),
+            ] {
+                browser.update(cx, |view, _| {
+                    view.selection.clear();
+                    view.browser_focus_detached = true;
+                });
+                draw_controls(&fixture, cx);
+                let bounds = cx.debug_bounds(control).unwrap();
+                cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+                browser.update(cx, |view, _| {
+                    view.source_registry_task.take();
+                });
+                let event = browser_owner_event(&browser, cx);
+                browser.update(cx, |view, cx| {
+                    assert!(view.apply_curation_event(&event, cx));
+                    assert_eq!(
+                        view.entries
+                            .iter()
+                            .filter(|e| e.curation.unwrap().has_collection(0))
+                            .count(),
+                        expected
+                    );
+                    assert_eq!(view.selection.len(), 257);
+                    assert_eq!(view.selection.anchor(), Some(&ids[0]));
+                    assert_eq!(
+                        view.list_scroll_handle.0.borrow().base_handle.offset(),
+                        offset
+                    );
+                });
+            }
+        }
+        cx.update(|_, app| {
+            app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
+        });
+        // Restart readback checks the real persistent prefix; no manufactured receipt is used.
+        let service = yield_catalog::CatalogService::start(&guard).unwrap();
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: root.clone(),
+                lifecycle_generation: 2,
+            })
+            .unwrap();
+        owner_event(&service, |e| matches!(e, CatalogEvent::Registered { .. }));
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id,
+                lifecycle_generation: 2,
+            })
+            .unwrap();
+        let CatalogEvent::AuditCommitted { snapshot, .. } = owner_event(&service, |e| {
+            matches!(e, CatalogEvent::AuditCommitted { .. })
+        }) else {
+            unreachable!()
+        };
+        assert_eq!(
+            snapshot
+                .curation_metadata
+                .values()
+                .filter(|m| m.collections.contains(&SampleCollection::new(0).unwrap()))
+                .count(),
+            committed
+        );
+        for (index, m) in snapshot.curation_metadata.values().enumerate() {
+            assert!(m.locked);
+            assert_eq!(m.last_played_at, Some(456));
+            // Membership commands retain the existing owner's decision timestamp semantics;
+            // history never replays a historical timestamp or whole metadata row.
+            if index < committed {
+                assert!(m.last_curated_at.is_some_and(|t| t > 123));
+            } else {
+                assert_eq!(m.last_curated_at, Some(123));
+            }
+            assert_eq!(m.rating, yield_library::sample_sources::Rating::KEEP_1);
+        }
+        service.shutdown();
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_compound_first_failure(cx: &mut gpui::TestAppContext) {
+        compound_gpui(cx, Some(0), false, false, false);
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_compound_middle_failure(cx: &mut gpui::TestAppContext) {
+        compound_gpui(cx, Some(1), false, false, false);
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_compound_last_failure(cx: &mut gpui::TestAppContext) {
+        compound_gpui(cx, Some(2), false, false, false);
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_compound_complete_undo_redo(cx: &mut gpui::TestAppContext) {
+        compound_gpui(cx, None, false, false, false);
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_lost_compound_delivery_never_reconstructed_by_readback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        compound_gpui(cx, None, true, false, false);
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_malformed_real_compound_receipt_preserves_unknown(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        compound_gpui(cx, None, false, true, false);
+    }
+    #[gpui::test]
+    fn collection_history_real_gpui_owned_capacity_bound_keeps_ordinary_edit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        compound_gpui(cx, None, false, false, true);
+    }
     #[gpui::test]
     fn collection_history_real_gpui_owner_commit_undo_redo_and_restart(
         cx: &mut gpui::TestAppContext,
@@ -243,7 +767,10 @@ mod fixtures {
             }
             browser.update(cx, |view, _| {
                 view.source_registry_task.take();
-                assert!(view.curation_state.collection_history.pending.is_some());
+                assert!(
+                    view.curation_state.collection_preparation.is_some()
+                        || view.curation_state.collection_history.pending.is_some()
+                );
                 if step == 0 {
                     assert!(view.curation_state.collection_history.undo.is_empty());
                 }
@@ -254,6 +781,18 @@ mod fixtures {
                         app.global::<SourceRegistryGlobal>()
                             .drain_catalog_events(events);
                     });
+                    let mut terminal = Vec::new();
+                    for event in events.drain(..) {
+                        if matches!(&event, CatalogEvent::CollectionHistoryGroupCompleted { .. }) {
+                            browser.update(cx, |view, cx| {
+                                assert!(view.apply_collection_preparation_event(&event, cx));
+                                view.source_registry_task.take();
+                            });
+                        } else {
+                            terminal.push(event);
+                        }
+                    }
+                    events.extend(terminal);
                 },
                 |event| matches!(event, CatalogEvent::CurationOperationCompleted { .. }),
             );
@@ -401,6 +940,10 @@ mod fixtures {
             .collect::<BTreeMap<_, _>>();
         let playback_types = files.keys().map(|path| (path.clone(), None)).collect();
         CurationOutcome {
+            failure_index: None,
+            failure_error: None,
+            prepared_group: None,
+
             initial_revision: Some(initial),
             final_revision: Some(initial + 1),
             failure: None,
@@ -507,6 +1050,10 @@ mod fixtures {
             key.clone(),
             request,
             CurationOutcome {
+                failure_index: None,
+                failure_error: None,
+                prepared_group: None,
+
                 initial_revision: Some(11),
                 final_revision: Some(11),
                 committed_batches: vec![],

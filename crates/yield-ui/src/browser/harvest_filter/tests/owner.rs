@@ -11,6 +11,7 @@ mod fixtures {
         _base: ConfigBaseGuard,
         pub(in crate::browser::harvest_filter::tests) root: tempfile::TempDir,
         _config: tempfile::TempDir,
+        _runtime: yield_library::test_runtime::TestRuntimeGuard,
     }
     pub(in crate::browser::harvest_filter::tests) fn owner() -> (
         OwnerFixture,
@@ -18,6 +19,7 @@ mod fixtures {
         yield_catalog::CatalogSnapshot,
         yield_library::sample_sources::library::GlobalLibraryWriter,
     ) {
+        let runtime = yield_library::test_runtime::TestRuntimeGuard::acquire();
         let config = tempfile::tempdir().unwrap();
         let base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
         let profile = PersistenceProfileGuard::named("harvest-gpui-owner");
@@ -86,6 +88,7 @@ mod fixtures {
                 _base: base,
                 root,
                 _config: config,
+                _runtime: runtime,
             },
             service,
             snapshot,
