@@ -889,6 +889,43 @@ impl BoundDatabaseRoot {
             .map(|file| file.into_std())
     }
 
+    /// Read one observation child without following links or waiting for a substituted FIFO.
+    pub(crate) fn open_observation_file_nofollow(&self, name: &Path) -> io::Result<fs::File> {
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bounded observation open unavailable",
+            ))
+        }
+        #[cfg(unix)]
+        {
+            use cap_primitives::fs::OpenOptionsExt;
+            let components = relative_components(name).map_err(io::Error::other)?;
+            if components.len() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "observation child must be direct",
+                ));
+            }
+            let directory = cap_std::fs::Dir::from_std_file(self._capability.try_clone()?);
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .follow(FollowSymlinks::No)
+                .custom_flags(libc::O_NONBLOCK);
+            let file = directory.open_with(name, &options)?.into_std();
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "observation child is not regular",
+                ));
+            }
+            Ok(file)
+        }
+    }
+
     /// Inspect one direct child without following a final symlink.
     pub(crate) fn symlink_metadata(&self, name: &Path) -> io::Result<cap_std::fs::Metadata> {
         let components = relative_components(name).map_err(io::Error::other)?;
