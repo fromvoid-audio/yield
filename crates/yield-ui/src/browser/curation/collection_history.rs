@@ -1,6 +1,7 @@
 //! Bounded collection membership history acknowledged by the existing catalog owner.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use gpui::{Pixels, Point};
 use yield_core::BrowserSelection;
@@ -35,9 +36,15 @@ impl Presentation {
             .chain(self.selection.anchor())
             .chain(self.focus.iter())
             .chain(self.viewport_anchor.iter())
-            .fold(512usize, |bytes, id| {
-                bytes.saturating_add(128 + path_byte_len(id.path()))
-            })
+            .fold(
+                512usize.saturating_add(
+                    self.selection
+                        .selected()
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<AudioFileId>() + 32),
+                ),
+                |bytes, id| bytes.saturating_add(128 + path_byte_len(id.path())),
+            )
     }
 }
 
@@ -50,6 +57,9 @@ struct Record {
     bits: BTreeMap<PathBuf, (bool, bool)>,
     presentation: Presentation,
     bytes: usize,
+    owner: Option<Arc<yield_session::CatalogCollectionHistoryGroup>>,
+    applied: BTreeSet<PathBuf>,
+    partial: bool,
 }
 
 struct Pending {
@@ -57,6 +67,8 @@ struct Pending {
     initial_revision: u64,
     direction: Option<Direction>,
     record: Record,
+    prepared: Option<Arc<yield_session::CatalogCollectionHistoryGroup>>,
+    batches: Vec<Vec<PathBuf>>,
 }
 
 /// One bounded history lane. Replacing its audited source context retires the lane.
@@ -69,6 +81,14 @@ pub(super) struct History {
 }
 
 impl History {
+    pub(super) fn is_pending(&self, key: &CurationLifecycleKey, request: u64) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|p| p.request == request && p.record.key == *key)
+    }
+    pub(super) fn pending_key(&self) -> Option<CurationLifecycleKey> {
+        self.pending.as_ref().map(|p| p.record.key.clone())
+    }
     pub(super) fn clear(&mut self) {
         *self = Self::default();
     }
@@ -117,6 +137,14 @@ impl History {
             )
     }
 
+    pub(super) fn reserve_preparation(&self, bytes: usize, direction: Option<Direction>) -> bool {
+        // Preparation/admission failure cannot move settled stack positions. Refuse coverage
+        // before allocating when retaining the old lane plus this capture cannot fit.
+        self.pending.is_none()
+            && bytes <= MAX_BYTES
+            && self.bytes().saturating_add(bytes) <= MAX_BYTES
+            && (direction.is_some() || self.undo.len() + self.redo.len() < MAX_RECORDS)
+    }
     fn top(&self, direction: Direction) -> Option<&Record> {
         match direction {
             Direction::Undo => self.undo.back(),
@@ -137,7 +165,8 @@ impl History {
             && lineage.invalidated.is_none()
             && self.revision == Some(lineage.revision)
             && self.top(direction).is_some_and(|record| {
-                record.key == *key
+                !record.partial
+                    && record.key == *key
                     && record.root == lineage.root_identity
                     && record.generation == lineage.directory_generation
             })
@@ -190,10 +219,16 @@ impl History {
             request_id,
             fence: SourceCurationOperationFence::ExactRevision(lineage.revision),
             root_identity: lineage.root_identity.clone(),
-            batches: vec![updates],
+            batches: updates
+                .chunks(MAX_CURATION_UPDATES)
+                .map(|c| c.to_vec())
+                .collect(),
             overlays,
             trash_required: 0,
             history_direction: Some(direction),
+            prepared_group: None,
+            history_unavailable: false,
+            captured_presentation: None,
         })
     }
 
@@ -213,6 +248,22 @@ impl History {
                     initial_revision: lineage.revision,
                     direction: Some(direction),
                     record,
+                    prepared: plan.prepared_group.clone(),
+                    batches: plan
+                        .batches
+                        .iter()
+                        .map(|b| {
+                            b.iter()
+                                .filter_map(|u| match u {
+                                    SourceCurationUpdate::AddCollection { path, .. }
+                                    | SourceCurationUpdate::RemoveCollection { path, .. } => {
+                                        Some(path.as_path().to_path_buf())
+                                    }
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .collect(),
                 });
             }
             return;
@@ -221,9 +272,13 @@ impl History {
             || !lineage.pending.is_empty()
             || lineage.staged_latest.is_some()
             || plan.fence != SourceCurationOperationFence::ExactRevision(lineage.revision)
-            || plan.batches.len() != 1
-            || plan.batches[0].is_empty()
-            || plan.batches[0].len() > MAX_CURATION_UPDATES
+            || plan.history_unavailable
+            || plan.batches.is_empty()
+            || (plan.prepared_group.is_none() && plan.batches.len() != 1)
+            || plan
+                .batches
+                .iter()
+                .any(|b| b.is_empty() || b.len() > MAX_CURATION_UPDATES)
         {
             return;
         }
@@ -239,12 +294,17 @@ impl History {
             .saturating_add(key.source_id.as_str().len())
             .saturating_add(lineage.root_identity.as_bytes().len())
             .saturating_mul(3);
+        let estimate = estimate.saturating_add(
+            plan.prepared_group
+                .as_ref()
+                .map_or(0, |g| g.source_observation().charged_bytes()),
+        );
         if estimate > MAX_BYTES {
             return;
         }
         let mut bits = BTreeMap::new();
         let mut slot = None;
-        for update in &plan.batches[0] {
+        for update in plan.batches.iter().flatten() {
             let (path, collection, after) = match update {
                 SourceCurationUpdate::AddCollection { path, collection } => {
                     (path, collection, true)
@@ -281,12 +341,22 @@ impl History {
             .saturating_add(key.source_id.as_str().len())
             .saturating_add(lineage.root_identity.as_bytes().len())
             .saturating_mul(3);
+        let bytes = bytes.saturating_add(
+            plan.prepared_group
+                .as_ref()
+                .map_or(0, |g| g.source_observation().charged_bytes()),
+        );
         if bytes > MAX_BYTES {
             return;
         }
         while self.bytes().saturating_add(bytes) > MAX_BYTES
             || self.undo.len() + self.redo.len() >= MAX_RECORDS
         {
+            if self.undo.front().is_some_and(|r| r.partial)
+                || self.redo.front().is_some_and(|r| r.partial)
+            {
+                return;
+            }
             if self.undo.pop_front().is_none() && self.redo.pop_front().is_none() {
                 break;
             }
@@ -295,16 +365,153 @@ impl History {
             request: plan.request_id,
             initial_revision: lineage.revision,
             direction: None,
+            prepared: plan.prepared_group.clone(),
+            batches: plan
+                .batches
+                .iter()
+                .map(|b| {
+                    b.iter()
+                        .filter_map(|u| match u {
+                            SourceCurationUpdate::AddCollection { path, .. }
+                            | SourceCurationUpdate::RemoveCollection { path, .. } => {
+                                Some(path.as_path().to_path_buf())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .collect(),
             record: Record {
                 key: key.clone(),
                 root: lineage.root_identity.clone(),
                 generation: lineage.directory_generation,
                 slot: slot.expect("non-empty collection batch"),
+                applied: bits.keys().cloned().collect(),
                 bits,
+                owner: plan.prepared_group.clone(),
+                partial: false,
                 presentation,
                 bytes,
             },
         });
+    }
+
+    pub(super) fn owner_matches_direction(
+        &self,
+        plan: &CurationOperationPlan,
+        group: &yield_session::CatalogCollectionHistoryGroup,
+    ) -> bool {
+        let Some(direction) = plan.history_direction else {
+            return true;
+        };
+        let Some(record) = self.top(direction) else {
+            return false;
+        };
+        let Some(owner) = record.owner.as_ref() else {
+            return false;
+        };
+        let source = group.source_observation();
+        source.same_owner_as(owner.source_observation())
+            && source.changes().len() == record.bits.len()
+            && source.changes().iter().all(|c| {
+                record
+                    .bits
+                    .get(c.path().as_path())
+                    .is_some_and(|(before, after)| match direction {
+                        Direction::Undo => c.before() == *after && c.after() == *before,
+                        Direction::Redo => c.before() == *before && c.after() == *after,
+                    })
+            })
+    }
+    pub(super) fn validate_bound_outcome(
+        &self,
+        key: &CurationLifecycleKey,
+        request: u64,
+        outcome: &CurationOutcome,
+    ) -> bool {
+        let Some(pending) = self
+            .pending
+            .as_ref()
+            .filter(|p| p.request == request && p.record.key == *key)
+        else {
+            return outcome.prepared_group.is_none();
+        };
+        Self::valid_receipts(pending, outcome)
+    }
+    fn valid_receipts(pending: &Pending, outcome: &CurationOutcome) -> bool {
+        if outcome.initial_revision != Some(pending.initial_revision)
+            || outcome.committed_batches.len() > pending.batches.len()
+            || outcome.final_revision
+                != pending
+                    .initial_revision
+                    .checked_add(outcome.committed_batches.len() as u64)
+        {
+            return false;
+        }
+        match (&pending.prepared, &outcome.prepared_group) {
+            (Some(expected), Some(actual)) => {
+                if !Arc::ptr_eq(expected, actual) {
+                    return false;
+                }
+                let source = expected.source_observation();
+                let rev = source.revision();
+                if rev.source_id() != &pending.record.key.source_id
+                    || rev.lifecycle_generation() != pending.record.key.lifecycle_generation
+                    || rev.root_identity() != &pending.record.root
+                    || rev.revision() != pending.initial_revision
+                    || source.directory_generation() != pending.record.generation
+                {
+                    return false;
+                }
+                if outcome.failure.is_some()
+                    && (outcome.failure_index != Some(outcome.committed_batches.len())
+                        || outcome.failure_error.is_none())
+                {
+                    return false;
+                }
+            }
+            (None, None) => {}
+            _ => return false,
+        }
+        if outcome.failure.is_none() {
+            if outcome.committed_batches.len() != pending.batches.len()
+                || outcome.failure_index.is_some()
+                || outcome.failure_error.is_some()
+            {
+                return false;
+            }
+        } else if outcome.committed_batches.len() >= pending.batches.len()
+            || outcome
+                .failure_index
+                .is_some_and(|i| i != outcome.committed_batches.len())
+        {
+            return false;
+        }
+        outcome
+            .committed_batches
+            .iter()
+            .enumerate()
+            .all(|(index, r)| {
+                let paths = &pending.batches[index];
+                r.valid
+                    && r.source_revision == pending.initial_revision + index as u64 + 1
+                    && r.root_identity == pending.record.root
+                    && r.directory_generation == pending.record.generation
+                    && r.files.len() == paths.len()
+                    && paths.iter().all(|p| {
+                        let Some((before, after)) = pending.record.bits.get(p) else {
+                            return false;
+                        };
+                        let target = if pending.direction == Some(Direction::Undo) {
+                            *before
+                        } else {
+                            *after
+                        };
+                        r.files
+                            .get(p)
+                            .is_some_and(|f| f.has_collection(pending.record.slot) == target)
+                    })
+            })
     }
 
     pub(super) fn complete(
@@ -324,42 +531,65 @@ impl History {
             }
             return (None, None);
         }
-        let pending = self.pending.take().expect("matching pending history");
-        if outcome.committed_batches.is_empty() && outcome.failure.is_some() {
-            return (None, None);
-        }
-        let valid = lineage_valid
-            && outcome.failure.is_none()
-            && outcome.initial_revision == Some(pending.initial_revision)
-            && outcome.committed_batches.len() == 1
-            && outcome.final_revision == pending.initial_revision.checked_add(1)
-            && outcome.committed_batches.first().is_some_and(|receipt| {
-                receipt.valid
-                    && Some(receipt.source_revision) == pending.initial_revision.checked_add(1)
-                    && receipt.root_identity == pending.record.root
-                    && receipt.directory_generation == pending.record.generation
-                    && receipt.files.len() == pending.record.bits.len()
-                    && pending.record.bits.iter().all(|(path, (before, after))| {
-                        let target = if pending.direction == Some(Direction::Undo) {
-                            *before
-                        } else {
-                            *after
-                        };
-                        receipt
-                            .files
-                            .get(path)
-                            .is_some_and(|file| file.has_collection(pending.record.slot) == target)
-                    })
-            });
+        let mut pending = self.pending.take().expect("matching pending history");
+        let valid = lineage_valid && Self::valid_receipts(&pending, outcome);
         if !valid {
             self.clear();
+            return (None,Some("Collection undo unavailable: result could not be confirmed; refresh the catalog".into()));
+        }
+        if outcome.committed_batches.is_empty() && outcome.failure.is_some() {
             return (
                 None,
-                Some(
-                    "Collection undo unavailable: result could not be confirmed; refresh the catalog"
-                        .into(),
-                ),
+                Some(format!(
+                    "Collection save failed: 0/{} batches confirmed · 0 changed paths committed · {} remain; {} · directions unavailable",
+                    pending.batches.len(),
+                    pending.batches.iter().map(Vec::len).sum::<usize>(),
+                    outcome.failure.as_deref().unwrap_or("batch failed")
+                )),
             );
+        }
+        if outcome.failure.is_some() {
+            let committed = outcome.committed_batches.len();
+            let total = pending.batches.len();
+            let paths = pending
+                .batches
+                .iter()
+                .take(committed)
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            match pending.direction {
+                None => {
+                    pending.record.bits.retain(|p, _| paths.contains(p));
+                    pending.record.applied = paths.clone();
+                    self.redo.clear();
+                }
+                Some(Direction::Undo) => {
+                    for p in &paths {
+                        pending.record.applied.remove(p);
+                    }
+                    self.undo.pop_back();
+                }
+                Some(Direction::Redo) => {
+                    pending.record.applied.extend(paths.iter().cloned());
+                    self.redo.pop_back();
+                }
+            }
+            pending.record.partial = true;
+            self.revision = outcome.final_revision;
+            let message = format!(
+                "Collection partially saved: {committed}/{total} batches · {} changed paths committed · {} remain; {} · directions unavailable",
+                paths.len(),
+                pending
+                    .batches
+                    .iter()
+                    .skip(committed)
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                outcome.failure.as_deref().unwrap_or("batch failed")
+            );
+            self.undo.push_back(pending.record);
+            return (None, Some(message));
         }
         self.revision = outcome.final_revision;
         let (restore, message) = match pending.direction {
@@ -378,12 +608,14 @@ impl History {
             Some(Direction::Undo) => {
                 self.undo.pop_back();
                 let restore = pending.record.presentation.clone();
+                pending.record.applied.clear();
                 self.redo.push_back(pending.record);
                 (Some(restore), "Collection undo saved · Redo available")
             }
             Some(Direction::Redo) => {
                 self.redo.pop_back();
                 let restore = pending.record.presentation.clone();
+                pending.record.applied = pending.record.bits.keys().cloned().collect();
                 self.undo.push_back(pending.record);
                 (Some(restore), "Collection redo saved · Undo available")
             }

@@ -34,6 +34,7 @@ use crate::theme::{color, transparent};
 use super::{Browser, catalog, tag_chips, tag_filter};
 
 mod collection_history;
+mod collection_preparation;
 
 const COMPACT_FILTER_LABEL_WIDTH: f32 = 82.0;
 const LATEST_CURATION_WINDOW: Duration = Duration::from_millis(40);
@@ -173,6 +174,7 @@ pub(super) struct CurationState {
     lineages: HashMap<CurationLifecycleKey, CurationLineage>,
     retired_pending: HashSet<(CurationLifecycleKey, u64)>,
     collection_history: collection_history::History,
+    collection_preparation: Option<collection_preparation::Preparation>,
 }
 
 /// One operation ready for immediate catalog admission.
@@ -184,6 +186,9 @@ pub(super) struct CurationOperationPlan {
     overlays: BTreeMap<PathBuf, AudioFileCuration>,
     trash_required: usize,
     history_direction: Option<collection_history::Direction>,
+    prepared_group: Option<std::sync::Arc<yield_session::CatalogCollectionHistoryGroup>>,
+    history_unavailable: bool,
+    captured_presentation: Option<collection_history::Presentation>,
 }
 
 impl CurationOperationPlan {
@@ -232,6 +237,9 @@ struct CurationOutcome {
     final_revision: Option<u64>,
     committed_batches: Vec<CurationReceipt>,
     failure: Option<String>,
+    failure_index: Option<usize>,
+    failure_error: Option<yield_session::CatalogError>,
+    prepared_group: Option<std::sync::Arc<yield_session::CatalogCollectionHistoryGroup>>,
 }
 
 /// Applied state returned after one terminal catalog outcome is consumed.
@@ -260,8 +268,17 @@ impl CurationState {
         revision: u64,
         entries: &[AudioFile],
     ) {
+        if let Some(preparation) = self.collection_preparation.take() {
+            preparation.cancel();
+        }
+        let unresolved = self.collection_history.pending_key();
+        if let Some(prior) = unresolved.as_ref().and_then(|k| self.lineages.get_mut(k)) {
+            prior.history_unresolved = true;
+        }
         self.collection_history.clear();
+        let mut history_unresolved = unresolved.as_ref() == Some(&key);
         if let Some(previous) = self.lineages.remove(&key) {
+            history_unresolved |= previous.history_unresolved;
             self.retired_pending.extend(
                 previous
                     .pending
@@ -288,7 +305,7 @@ impl CurationState {
                 staged_latest: None,
                 failed: None,
                 invalidated: None,
-                history_unresolved: false,
+                history_unresolved,
                 message: None,
             },
         );
@@ -340,6 +357,13 @@ impl CurationState {
     pub(super) fn status_for(&self, key: &CurationLifecycleKey) -> Option<String> {
         let lineage = self.lineages.get(key)?;
         if let Some(error) = lineage.failed.as_ref() {
+            if let Some(message) = lineage
+                .message
+                .as_ref()
+                .filter(|m| m.starts_with("Collection "))
+            {
+                return Some(format!("{message}; refresh the catalog before editing"));
+            }
             return Some(format!(
                 "Curation failed: {error}; refresh the catalog before editing"
             ));
@@ -388,6 +412,9 @@ impl CurationState {
     /// Stage one single-row rating or listen value before assigning a durable request ID.
     /// Distinct paths and non-latest updates must first flush the previous stage.
     fn stage_latest(&mut self, key: &CurationLifecycleKey, plan: &CurationOperationPlan) -> bool {
+        if self.collection_preparation.is_some() {
+            return false;
+        }
         let next_request_id = self.next_request_id();
         let Some(lineage) = self.lineages.get_mut(key) else {
             return false;
@@ -463,6 +490,9 @@ impl CurationState {
             overlays: BTreeMap::from([(staged.path.clone(), staged.overlay)]),
             trash_required: staged.trash_required,
             history_direction: None,
+            prepared_group: None,
+            history_unavailable: false,
+            captured_presentation: None,
         })
     }
 
@@ -494,6 +524,15 @@ impl CurationState {
     /// Drop completed inactive lifecycle mappings while retaining accepted outcomes still in
     /// flight and the active lifecycle's confirmed metadata.
     pub(super) fn prune_completed_except(&mut self, active: Option<&CurationLifecycleKey>) {
+        if self
+            .collection_preparation
+            .as_ref()
+            .is_some_and(|p| active != Some(&p.key))
+        {
+            if let Some(preparation) = self.collection_preparation.take() {
+                preparation.cancel();
+            }
+        }
         if let Some(key) = self.collection_history.retire_except(active)
             && let Some(lineage) = self.lineages.get_mut(&key)
         {
@@ -510,6 +549,9 @@ impl CurationState {
         action: CurationAction,
         target_paths: &[PathBuf],
     ) -> CurationPlan {
+        if self.collection_preparation.is_some() {
+            return CurationPlan::Rejected("Collection preparation is pending".into());
+        }
         let Some(lineage) = self.lineages.get(key) else {
             return CurationPlan::Rejected(String::from(
                 "Curation requires a successful audited catalog projection",
@@ -640,6 +682,9 @@ impl CurationState {
             overlays,
             trash_required,
             history_direction: None,
+            prepared_group: None,
+            history_unavailable: false,
+            captured_presentation: None,
         })
     }
 
@@ -654,6 +699,10 @@ impl CurationState {
         labels: &[String],
         target_paths: &[PathBuf],
     ) -> CurationPlan {
+        if self.collection_preparation.is_some() {
+            return CurationPlan::Rejected("Collection preparation is pending".into());
+        }
+
         let Some(lineage) = self.lineages.get(key) else {
             return CurationPlan::Rejected(String::from(
                 "Curation requires a successful audited catalog projection",
@@ -922,6 +971,9 @@ impl CurationState {
             overlays: BTreeMap::new(),
             trash_required: 0,
             history_direction: None,
+            prepared_group: None,
+            history_unavailable: false,
+            captured_presentation: None,
         })
     }
 
@@ -1121,6 +1173,26 @@ impl CurationState {
         {
             valid = false;
         }
+        if outcome
+            .failure_index
+            .is_some_and(|index| index != completed_batch_count || index >= batch_count)
+            || (outcome.failure.is_none()
+                && (outcome.failure_index.is_some() || outcome.failure_error.is_some()))
+        {
+            valid = false;
+        }
+        if !self
+            .collection_history
+            .validate_bound_outcome(&key, request_id, &outcome)
+        {
+            valid = false;
+        }
+        let history_was_pending = self.collection_history.is_pending(&key, request_id);
+        let history_unknown = !valid
+            && operation_collection_edit
+            && (history_was_pending
+                || outcome.prepared_group.is_some()
+                || !outcome.committed_batches.is_empty());
         let (history_restore, history_message) = self
             .collection_history
             .complete(&key, request_id, &outcome, valid);
@@ -1154,7 +1226,7 @@ impl CurationState {
         };
         let success = failed.is_none();
         lineage.pending.remove(operation_index);
-        lineage.history_unresolved = false;
+        lineage.history_unresolved = history_unknown;
         if let Some(error) = failed.as_ref() {
             lineage.failed = Some(error.clone());
             if let Some(staged) = lineage.staged_latest.take() {
@@ -1265,6 +1337,9 @@ impl CurationOutcome {
                 .iter()
                 .map(CurationReceipt::from_catalog)
                 .collect(),
+            failure_index: outcome.failure().map(|f| f.batch_index()),
+            failure_error: outcome.failure().map(|f| f.error().clone()),
+            prepared_group: outcome.prepared_collection_group().cloned(),
             failure: outcome
                 .failure()
                 .map(|failure| format!("batch {}: {}", failure.batch_index(), failure.error())),
@@ -1694,7 +1769,8 @@ impl Browser {
 
     fn collection_history_ready(&self, direction: collection_history::Direction) -> bool {
         self.collection_history_key().is_some_and(|key| {
-            !tag_filter::scope_pending(self)
+            self.curation_state.collection_preparation.is_none()
+                && !tag_filter::scope_pending(self)
                 && self
                     .curation_state
                     .lineages
@@ -1749,9 +1825,9 @@ impl Browser {
         plan: &CurationOperationPlan,
     ) -> Option<collection_history::Presentation> {
         if plan.history_direction.is_some()
-            || plan.batches.len() != 1
-            || plan.batches[0].len() > MAX_CURATION_UPDATES
-            || !plan.batches[0].iter().all(|update| {
+            || plan.history_unavailable
+            || !plan.batches.iter().all(|b| b.len() <= MAX_CURATION_UPDATES)
+            || !plan.batches.iter().flatten().all(|update| {
                 matches!(
                     update,
                     SourceCurationUpdate::AddCollection { .. }
@@ -1779,9 +1855,15 @@ impl Browser {
             .chain(self.selection.anchor())
             .chain(self.browser_focus_override.iter())
             .chain(anchor)
-            .fold(1024usize, |bytes, id| {
-                bytes.saturating_add(128 + path_byte_len(id.path()))
-            })
+            .fold(
+                1024usize.saturating_add(
+                    self.selection
+                        .selected()
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<AudioFileId>() + 32),
+                ),
+                |bytes, id| bytes.saturating_add(128 + path_byte_len(id.path())),
+            )
             .saturating_add(
                 self.selected_audio_path()
                     .map_or(0, |path| 128 + path_byte_len(path)),
@@ -2529,20 +2611,40 @@ impl Browser {
         playback_history: bool,
         cx: &mut Context<Self>,
     ) -> Result<bool, CatalogSubmitError> {
+        if plan.prepared_group.is_none()
+            && !plan.history_unavailable
+            && collection_preparation::is_collection_plan(&plan)
+        {
+            return self.begin_collection_preparation(key, plan, playback_history, cx);
+        }
         let request_id = plan.request_id;
-        let presentation = self.capture_collection_history_presentation(&key, &plan);
+        let presentation = plan
+            .captured_presentation
+            .clone()
+            .or_else(|| self.capture_collection_history_presentation(&key, &plan));
         let tags_may_change = plan.tags_may_change();
         let reusable_tag_mask = (!tags_may_change)
             .then(|| tag_filter::capture_ready_mask(self))
             .flatten();
         let optimistic = plan.overlays.clone();
-        let command = yield_session::CatalogCommand::ApplyCurationOperation {
-            source_id: key.source_id.clone(),
-            lifecycle_generation: key.lifecycle_generation,
-            fence: plan.fence,
-            root_identity: plan.root_identity.clone(),
-            request_id,
-            batches: plan.batches.clone(),
+        let command = if let Some(group) = plan.prepared_group.as_ref() {
+            yield_session::CatalogCommand::ApplyPreparedCollectionOperation {
+                operation: yield_session::PreparedCollectionOperation::new(
+                    std::sync::Arc::clone(group),
+                    request_id,
+                )
+                .map_err(|_| CatalogSubmitError::Closed)?,
+            }
+        } else {
+            let command = yield_session::CatalogCommand::ApplyCurationOperation {
+                source_id: key.source_id.clone(),
+                lifecycle_generation: key.lifecycle_generation,
+                fence: plan.fence,
+                root_identity: plan.root_identity.clone(),
+                request_id,
+                batches: plan.batches.clone(),
+            };
+            command
         };
         catalog::submit_catalog_command(command, cx)?;
         if !self
@@ -3803,6 +3905,10 @@ mod tests {
                 key(),
                 tag_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(10),
                     final_revision: Some(11),
                     committed_batches: vec![receipt_with_playback(
@@ -3832,6 +3938,10 @@ mod tests {
                 key(),
                 rating_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(11),
                     final_revision: Some(12),
                     committed_batches: vec![receipt_with_playback(
@@ -3857,6 +3967,10 @@ mod tests {
                 key(),
                 collection_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(12),
                     final_revision: Some(13),
                     committed_batches: vec![receipt_with_playback(
@@ -3882,6 +3996,10 @@ mod tests {
                 key(),
                 history_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(13),
                     final_revision: Some(14),
                     committed_batches: vec![receipt_with_playback(
@@ -3954,6 +4072,10 @@ mod tests {
                 key(),
                 request_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(10),
                     final_revision: Some(12),
                     committed_batches: vec![
@@ -3993,6 +4115,10 @@ mod tests {
                 key(),
                 request_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(10),
                     final_revision: Some(11),
                     committed_batches: vec![invalid_receipt(11, "kick.wav", curation(0, false, 0))],
@@ -4023,6 +4149,10 @@ mod tests {
                 key(),
                 request_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(10),
                     final_revision: Some(11),
                     committed_batches: vec![receipt(11, "kick.wav", curation(1, false, 0))],
@@ -4172,6 +4302,10 @@ mod tests {
                 key(),
                 1,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(10),
                     final_revision: Some(11),
                     committed_batches: vec![receipt(11, "kick.wav", committed)],
@@ -4266,6 +4400,10 @@ mod tests {
                 key(),
                 1,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(10),
                     final_revision: Some(10),
                     committed_batches: Vec::new(),
@@ -4309,6 +4447,10 @@ mod tests {
                 key(),
                 first_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(10),
                     final_revision: Some(11),
                     committed_batches: vec![receipt(11, "kick.wav", curation(1, false, 0))],
@@ -4325,6 +4467,10 @@ mod tests {
                 key(),
                 second_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(11),
                     final_revision: Some(12),
                     committed_batches: vec![receipt(12, "kick.wav", curation(2, false, 0))],
@@ -4373,6 +4519,10 @@ mod tests {
                 key(),
                 history_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(10),
                     final_revision: Some(11),
                     committed_batches: vec![receipt(
@@ -4397,6 +4547,10 @@ mod tests {
                 key(),
                 rating_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(11),
                     final_revision: Some(12),
                     committed_batches: vec![receipt(
@@ -4447,6 +4601,10 @@ mod tests {
                 key(),
                 rating_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(10),
                     final_revision: Some(11),
                     committed_batches: vec![receipt(
@@ -4468,6 +4626,10 @@ mod tests {
                 key(),
                 history_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(11),
                     final_revision: Some(12),
                     committed_batches: vec![receipt(
@@ -4510,6 +4672,10 @@ mod tests {
                 key(),
                 first_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: Some(10),
                     final_revision: Some(10),
                     committed_batches: Vec::new(),
@@ -4532,6 +4698,10 @@ mod tests {
                 key(),
                 second_id,
                 CurationOutcome {
+                    failure_index: None,
+                    failure_error: None,
+                    prepared_group: None,
+
                     initial_revision: None,
                     final_revision: None,
                     committed_batches: Vec::new(),
@@ -4699,6 +4869,10 @@ mod tests {
                     key(),
                     request_id,
                     CurationOutcome {
+                        failure_index: None,
+                        failure_error: None,
+                        prepared_group: None,
+
                         initial_revision: Some(10),
                         final_revision: Some(11),
                         committed_batches: vec![receipt(11, "kick.wav", curation(1, false, 0))],
