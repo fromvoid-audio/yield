@@ -90,7 +90,7 @@ impl Ledger {
 #[derive(Clone)]
 enum Key {
     Compiled,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Fixture(VerifyingKey),
 }
 impl Key {
@@ -107,7 +107,7 @@ impl Key {
                 }
                 VerifyingKey::from_bytes(&raw).map_err(|_| SelectionError::Invalid)
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::Fixture(key) => Ok(key),
         }
     }

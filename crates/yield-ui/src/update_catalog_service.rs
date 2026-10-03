@@ -206,6 +206,7 @@ fn platform(platform: UpdatePlatform) -> Platform {
 
 pub(crate) fn register(cx: &mut gpui::App) {
     register_context(cx, InstalledContext::compiled(), CatalogService::default());
+    crate::update_payload_service::register(cx);
 }
 
 fn register_context(

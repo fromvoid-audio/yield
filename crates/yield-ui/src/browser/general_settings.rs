@@ -33,6 +33,7 @@ use super::user_shader_runtime::{PreparationPermit, validate_user_shader_abi};
 
 pub(super) struct GeneralSettings {
     pub(super) updates: super::update_check::UpdateCheck,
+    pub(super) payload: super::update_payload::UpdatePayload,
     pub(super) text_scale_percent: u16,
     pub(super) rating_decay_weeks: u16,
     pub(super) trash_folder: Option<PathBuf>,
@@ -198,6 +199,7 @@ impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
             updates: super::update_check::UpdateCheck::default(),
+            payload: super::update_payload::UpdatePayload::default(),
             text_scale_percent: DEFAULT_TEXT_SCALE_PERCENT,
             rating_decay_weeks: DEFAULT_RATING_DECAY_WEEKS,
             trash_folder: None,
@@ -851,6 +853,7 @@ impl Browser {
     pub(super) fn close_general_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.theme_settings_open = false;
         self.general_settings.updates.close();
+        self.general_settings.payload.close();
         self.general_settings.invalidate_picker();
         let restore = self
             .general_settings
@@ -1932,6 +1935,7 @@ impl Browser {
                     ),
             )
             .child(self.render_update_check(&theme, cx))
+            .child(self.render_update_payload(&theme, cx))
             .child(
                 div()
                     .flex()

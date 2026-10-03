@@ -300,3 +300,63 @@ struct TestWitness {
 }
 #[cfg(test)]
 mod tests;
+
+// Feature is default-off and enabled only by dependent test harnesses. Normal compiled entry
+// always uses the original hardcoded pin and immutable compiled identity, even in fixture builds.
+#[cfg(feature = "test-support")]
+impl PayloadStagingService {
+    /// Controlled loopback fixture owner; absent from normal builds and never native qualification.
+    /// The fixed fixture key is deliberately distinct from the compiled production pin.
+    pub fn for_loopback_tests(
+        address: std::net::SocketAddr,
+        full_version: &str,
+        number: u64,
+        commit: [u8; 20],
+        platform: Platform,
+    ) -> Option<Self> {
+        if !address.ip().is_loopback()
+            || number == 0
+            || commit == [0; 20]
+            || full_version.len() > 100
+        {
+            return None;
+        }
+        let version = semver::Version::parse(full_version).ok()?;
+        let core = [
+            version.major.try_into().ok()?,
+            version.minor.try_into().ok()?,
+            version.patch.try_into().ok()?,
+        ];
+        // Public fixture-key bytes only; no caller-supplied key can replace the production pin.
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&[
+            190, 215, 210, 171, 102, 141, 163, 239, 173, 97, 57, 152, 240, 111, 122, 191, 120, 117,
+            243, 166, 183, 103, 122, 159, 60, 233, 71, 215, 125, 119, 96, 166,
+        ])
+        .ok()?;
+        Some(Self::new(
+            Installed {
+                version,
+                full_version: full_version.into(),
+                core,
+                number,
+                commit,
+                platform,
+            },
+            protocol::Transport::Loopback(address),
+            engine::Engine::global()?,
+            Key::Fixture(key),
+        ))
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl PayloadStageAttempt {
+    /// Read-only controlled-loopback socket-entry observation; absent from normal builds.
+    /// Never reports production reads or grants resource-retirement/verified-byte authority.
+    pub fn loopback_read_pending(&self) -> bool {
+        let job = &self.client.job;
+        matches!(job.transport, protocol::Transport::Loopback(_))
+            && job.traffic.plaintext.load(Ordering::Acquire) > 0
+            && job.traffic.reading.load(Ordering::Acquire)
+    }
+}

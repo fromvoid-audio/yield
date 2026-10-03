@@ -80,6 +80,9 @@ const TRASH_CHOOSE: &str = "settings-trash-choose";
 const TRASH_CLEAR: &str = "settings-trash-clear";
 const STORAGE_REFRESH: &str = "settings-storage-refresh";
 const CACHE_CLEAR: &str = "settings-cache-clear";
+const PAYLOAD_DOWNLOAD: &str = super::update_payload::DOWNLOAD_ID;
+const PAYLOAD_RETIRE: &str = super::update_payload::RETIRE_ID;
+const PAYLOAD_STATUS: &str = super::update_payload::STATUS_ID;
 const THEME_STATUS: &str = "settings-theme-status";
 const GENERAL_STATUS: &str = "settings-general-status";
 const MAINTENANCE_STATUS: &str = "settings-maintenance-status";
@@ -110,6 +113,8 @@ const SETTINGS_ORDER: &[&str] = &[
     TRASH_CLEAR,
     STORAGE_REFRESH,
     CACHE_CLEAR,
+    PAYLOAD_DOWNLOAD,
+    PAYLOAD_RETIRE,
 ];
 
 fn button(
@@ -976,6 +981,9 @@ impl Browser {
             TRASH_CHOOSE => editable && !busy && !self.general_settings.picking(),
             TRASH_CLEAR => editable && !busy,
             STORAGE_REFRESH => !busy,
+            PAYLOAD_DOWNLOAD | PAYLOAD_RETIRE => {
+                self.payload_control_enabled(id, cx).unwrap_or(false)
+            }
             CACHE_CLEAR => {
                 !busy && self.preferences.loaded() && editable && !self.preferences.has_pending()
             }
@@ -1006,6 +1014,9 @@ impl Browser {
             TRASH_CHOOSE => self.choose_trash_folder_from_accessibility(cx),
             TRASH_CLEAR => self.clear_trash_folder_from_accessibility(cx),
             STORAGE_REFRESH => self.refresh_global_storage(cx),
+            PAYLOAD_DOWNLOAD | PAYLOAD_RETIRE => {
+                self.perform_payload_action(id, cx);
+            }
             CACHE_CLEAR => self.clear_rebuildable_cache(cx),
             USER_SHADER_IMPORT => self.choose_user_shader_from_accessibility(window, cx),
             USER_SHADER_CANCEL => self.cancel_user_shader_import(cx),
@@ -1598,6 +1609,34 @@ impl Browser {
                         enabled: true,
                     },
                 ]);
+                controls.push(button(
+                    PAYLOAD_DOWNLOAD,
+                    "Download and Verify Update",
+                    None,
+                    self.settings_control_enabled(PAYLOAD_DOWNLOAD, cx),
+                ));
+                controls.push(button(
+                    PAYLOAD_RETIRE,
+                    if self.general_settings.payload.phase()
+                        == Some(yield_platform::payload_selection::PayloadStagePhase::Staged)
+                    {
+                        "Discard Download"
+                    } else {
+                        "Cancel Download"
+                    },
+                    None,
+                    self.settings_control_enabled(PAYLOAD_RETIRE, cx),
+                ));
+                controls.push(AxChild {
+                    id: PAYLOAD_STATUS.into(),
+                    role: AxRole::Group,
+                    label: "Update download status".into(),
+                    value: Some(self.general_settings.payload.message(
+                        cx.try_global::<crate::update_payload_service::UpdatePayloadService>(),
+                        self.theme_settings_open,
+                    )),
+                    enabled: true,
+                });
                 controls.push(AxChild {
                     id: USER_SHADER_STATUS.into(),
                     role: AxRole::Group,
@@ -2259,5 +2298,68 @@ mod tests {
         assert_eq!(approve.role, AxRole::Button);
         assert_eq!(approve.value.as_deref(), Some("exact-source-fingerprint"));
         assert!(approve.enabled);
+    }
+}
+
+#[cfg(test)]
+mod payload_actions {
+    use super::*;
+    use crate::update_payload_service::tests::{OWNER_TEST, install, responses, serve};
+    use yield_platform::{payload_selection::PayloadStagePhase, update_catalog::Channel};
+    #[gpui::test]
+    fn actual_settings_ax_action_download_and_retire_share_guarded_payload_owner(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _guard = OWNER_TEST.lock().unwrap();
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let (service, server) = serve(responses("0.19.2", Channel::Stable, false), Channel::Stable);
+        cx.update(|window, app| {
+            install(app, service);
+            browser.update(app, |view, cx| {
+                view.theme_settings_open = true;
+                assert!(view.settings_control_enabled(PAYLOAD_DOWNLOAD, cx));
+                assert!(!view.settings_control_enabled(PAYLOAD_RETIRE, cx));
+                view.perform_settings_action(PAYLOAD_DOWNLOAD, window, cx);
+                assert!(!view.settings_control_enabled(PAYLOAD_DOWNLOAD, cx));
+                assert!(view.settings_control_enabled(PAYLOAD_RETIRE, cx));
+                view.perform_settings_action(PAYLOAD_DOWNLOAD, window, cx);
+            });
+        });
+        for phase in [PayloadStagePhase::Staged, PayloadStagePhase::Unstaged] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                cx.executor().allow_parking();
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(60));
+                cx.run_until_parked();
+                if cx.update(|_, app| browser.read(app).general_settings.payload.phase())
+                    == Some(phase)
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if phase == PayloadStagePhase::Staged {
+                cx.update(|window, app| {
+                    browser.update(app, |view, cx| {
+                        view.perform_settings_action(PAYLOAD_RETIRE, window, cx)
+                    })
+                });
+            }
+        }
+        assert_eq!(server.join().unwrap().len(), 5);
+        cx.update(|_, app| {
+            browser.update(app, |view, cx| {
+                assert!(view.settings_control_enabled(PAYLOAD_DOWNLOAD, cx));
+                assert!(!view.settings_control_enabled(PAYLOAD_RETIRE, cx));
+                let order = SETTINGS_ORDER
+                    .iter()
+                    .position(|id| *id == PAYLOAD_DOWNLOAD)
+                    .unwrap();
+                assert_eq!(SETTINGS_ORDER[order + 1], PAYLOAD_RETIRE);
+            })
+        });
     }
 }
