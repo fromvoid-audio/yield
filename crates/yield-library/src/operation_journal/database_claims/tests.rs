@@ -27,6 +27,7 @@ fn fixture(count: usize) -> DatabaseClaimInventory {
                 media_root: "media-root".into(),
                 lease_owner: "owner".into(),
                 lease_epoch: 1,
+                lease_fence: None,
             }),
             current_revision: 0,
             participants: vec![DatabaseParticipant {

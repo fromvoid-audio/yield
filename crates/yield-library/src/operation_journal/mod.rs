@@ -54,6 +54,8 @@ pub mod retained_resolution_commands;
 pub mod selection_normalize_commands;
 pub mod selection_output_commands;
 pub mod source_layout_commands;
+pub mod source_lease_binding;
+pub mod source_registry_retirement;
 pub mod status;
 pub mod store;
 pub mod validation;

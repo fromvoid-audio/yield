@@ -84,6 +84,7 @@ pub use source_file_observation::{
 };
 pub use source_lease::{SourceLeaseError, SourcePublicationFence, SourcePublicationFenceError};
 pub use source_reference_fence::{SourceReferenceFence, SourceReferenceFenceError};
+pub(crate) use source_registry_reference::validate_subject as validate_registry_reference_subject;
 pub use starmap_layout::{
     STARMAP_LAYOUT_MAX_REQUEST_BYTES, STARMAP_LAYOUT_MAX_SAMPLES, StarmapLayoutError,
     StarmapLayoutLoad, StarmapLayoutPoint, StarmapLayoutRequest, StarmapLayoutSample,
@@ -156,14 +157,14 @@ pub use write::{
     SourceDirectoryTruthCommitResult, SourceFeaturePublicationMetrics, SourceFileWrite,
     SourceIndexCommitResult, SourceLayoutMetadataBudget, SourceLayoutMetadataPolicy,
     SourceLayoutWalPreparation, SourceLayoutWalPreparationFailure,
-    SourceLeaseMaintenanceAllocation, SourceLeaseMaintenancePreparation,
-    SourceLeaseMaintenancePreparationError, SourceLeaseMaintenancePreparationFailure,
-    SourceRevision, SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage,
-    SourceSnapshotQueueMetrics, SourceTagAdmissionObservation, SourceTagAssignmentMutation,
-    SourceTagAssignmentSelection, SourceTagMetadataBudget, SourceTagMetadataPolicy,
-    SourceTagWalPreparation, SourceTagWalPreparationFailure, SourceTagWrite, SourceWriteCommand,
-    SourceWriter, SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt,
-    SourceWriterRequest,
+    SourceLeaseMaintenanceAllocation, SourceLeaseMaintenanceBinding,
+    SourceLeaseMaintenancePreparation, SourceLeaseMaintenancePreparationError,
+    SourceLeaseMaintenancePreparationFailure, SourceRevision, SourceScanFence, SourceSnapshotOwner,
+    SourceSnapshotPage, SourceSnapshotQueueMetrics, SourceTagAdmissionObservation,
+    SourceTagAssignmentMutation, SourceTagAssignmentSelection, SourceTagMetadataBudget,
+    SourceTagMetadataPolicy, SourceTagWalPreparation, SourceTagWalPreparationFailure,
+    SourceTagWrite, SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity,
+    SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 
 /// Hidden filename used for per-source databases.

@@ -6099,6 +6099,11 @@ impl WorkProgress {
                 | ParticipantKind::Projection
                 | ParticipantKind::Readiness
                 | ParticipantKind::Artifact => Some(CompensationParticipantKind::Coordinator),
+                ParticipantKind::SourceLeaseMaintenance => {
+                    return Err(WorkProgressError::Plan(WorkPlanError::IncompleteTopology(
+                        "source lease maintenance compensation has no admitted bridge",
+                    )));
+                }
                 ParticipantKind::LegacySource => {
                     return Err(WorkProgressError::Plan(WorkPlanError::IncompleteTopology(
                         "legacy adoption compensation has no admitted bridge",
@@ -29947,6 +29952,9 @@ mod tests {
                     | ParticipantKind::Projection
                     | ParticipantKind::Readiness
                     | ParticipantKind::Artifact => Some(CompensationParticipantKind::Coordinator),
+                    ParticipantKind::SourceLeaseMaintenance => {
+                        panic!("lease-maintenance effects have no fixture compensation authority")
+                    }
                     ParticipantKind::LegacySource => {
                         panic!("pre-lease legacy effects have no fixture compensation authority")
                     }

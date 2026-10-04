@@ -3,6 +3,7 @@
 mod exact_database_claim_persistence {
     include!("database_attempt_metadata_tests.rs");
     include!("database_attempts_tests.rs");
+    include!("source_lease_binding_tests.rs");
     use super::*;
     use crate::operation_journal::database_claims::{
         ClaimDirection, DatabaseBinding, DatabaseClaimInventory, DatabaseClaimSlice,
@@ -101,6 +102,7 @@ mod exact_database_claim_persistence {
                         media_root: source.root_identity().into(),
                         lease_owner: "owner".into(),
                         lease_epoch: source.lease_epoch(),
+                        lease_fence: None,
                     }),
                     current_revision: if role == DatabaseRole::Source {
                         source.source_revision()
@@ -654,6 +656,7 @@ mod exact_database_claim_persistence {
                         media_root: f.root_identity().into(),
                         lease_owner: "owner".into(),
                         lease_epoch: f.lease_epoch(),
+                        lease_fence: None,
                     }),
                     current_revision: f.source_revision(),
                     participants: vec![DatabaseParticipant {

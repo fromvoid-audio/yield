@@ -653,3 +653,34 @@ fn expired_requested_deadline_and_reacquired_writer_never_create_a_preparation()
         SourceLeaseMaintenancePreparationError::Allocation(_)
     ));
 }
+
+#[test]
+fn genuine_binding_refuses_changed_lease_epoch_owner_or_state_in_retained_main() {
+    // Deliberate private SQLite fault injection, not a production lease writer or permit.
+    for sql in [
+        "UPDATE source_lease SET lease_epoch=lease_epoch+1",
+        "UPDATE source_lease SET owner_identity='foreign'",
+        "UPDATE source_lease SET state='released',released_at=acquired_at",
+        "UPDATE source_lease SET expires_at=acquired_at",
+    ] {
+        let (_f, writer) = fixture();
+        let registration = writer.database.prepare_source_authority().unwrap();
+        let held = prepare_owner(writer);
+        let binding = held.capture_lease_binding(&registration).unwrap();
+        held.custody
+            .writer()
+            .database
+            .connection
+            .execute_batch(sql)
+            .unwrap();
+        assert!(
+            held.validate_lease_binding(&binding, &registration)
+                .is_err()
+        );
+        assert!(held.capture_lease_binding(&registration).is_err());
+        // Confirmed abort restores the real original rows, never authorizes the injected facts.
+        let writer = held.abort().unwrap();
+        drop(registration);
+        writer.close().unwrap();
+    }
+}

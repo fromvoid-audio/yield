@@ -49,7 +49,7 @@ use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, OperationActor, OperationDisposition,
     OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
-    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17,
+    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18,
 };
 use super::namespace_commands::NamespaceCommandArgs;
 use super::owner::ChunkUnusedReleaseAuthorization;
@@ -5303,6 +5303,7 @@ impl OperationJournalStore {
                 | SCHEMA_V15
                 | SCHEMA_V16
                 | SCHEMA_V17
+                | SCHEMA_V18
         ) && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
         {
             if current.record.cancellation_request() == Some(&observation) {
@@ -5338,6 +5339,7 @@ impl OperationJournalStore {
                 | SCHEMA_V15
                 | SCHEMA_V16
                 | SCHEMA_V17
+                | SCHEMA_V18
         ) {
             return Err(OperationJournalStoreError::UnsupportedCancellationSchema {
                 schema_version: current.record.schema_version,
@@ -5400,7 +5402,7 @@ impl OperationJournalStore {
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
-            SCHEMA_V16 | SCHEMA_V17 => matches!(
+            SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18 => matches!(
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
@@ -5419,7 +5421,9 @@ impl OperationJournalStore {
                 SCHEMA_V13 => "V13 IntentDurable/None or RetryPending",
                 SCHEMA_V14 => "V14 IntentDurable/None or RetryPending",
                 SCHEMA_V15 => "V15 IntentDurable/None or RetryPending",
-                SCHEMA_V16 | SCHEMA_V17 => "Full initial intent / None or RetryPending",
+                SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18 => {
+                    "Full initial intent / None or RetryPending"
+                }
                 _ => "V3 IntentDurable/None",
             };
             return Err(OperationJournalStoreError::UnsupportedCancellationState {
@@ -5606,6 +5610,7 @@ impl OperationJournalStore {
                 | SCHEMA_V15
                 | SCHEMA_V16
                 | SCHEMA_V17
+                | SCHEMA_V18
         ) && current.record.disposition == OperationDisposition::RetryPending
             && current.record.retry_observation() == Some(&observation)
         {
@@ -5638,6 +5643,7 @@ impl OperationJournalStore {
                 | SCHEMA_V15
                 | SCHEMA_V16
                 | SCHEMA_V17
+                | SCHEMA_V18
         ) {
             return Err(OperationJournalStoreError::UnsupportedRetrySchema {
                 schema_version: current.record.schema_version,

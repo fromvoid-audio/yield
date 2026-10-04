@@ -74,6 +74,8 @@ const STEP_ARTIFACT: u16 = 50;
 /// Semantic obligation represented by one derived work unit.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum WorkUnitRole {
+    /// Required admitted release of the original source lease; no audit-qualified source edit.
+    SourceLeaseMaintenance,
     /// Adopt one exact original legacy source under future genuine admission.
     SourceLegacyAdoption,
     /// Publish or reconcile one admitted canonical source SQL layout generation.
@@ -818,6 +820,11 @@ impl Topology {
 
         for descriptor in participants.descriptors() {
             match descriptor.kind() {
+                ParticipantKind::SourceLeaseMaintenance => {
+                    return Err(WorkPlanError::IncompleteTopology(
+                        "source lease maintenance cannot use an authoritative-source/filesystem topology",
+                    ));
+                }
                 ParticipantKind::LegacySource => {
                     return Err(WorkPlanError::IncompleteTopology(
                         "pre-lease legacy source requires the V3 adoption planner",
@@ -1049,6 +1056,11 @@ fn collect_topology(
     collected: &mut CollectedTopology,
 ) -> Result<(), WorkPlanError> {
     match args {
+        UniversalCommandArgs::SourceRegistryRetirement(_) => {
+            return Err(WorkPlanError::IncompleteTopology(
+                "source registry retirement requires its actual separately admitted lifecycle planner",
+            ));
+        }
         UniversalCommandArgs::SourceLegacyAdoption(_) => {
             return Err(WorkPlanError::IncompleteTopology(
                 "legacy adoption requires the pre-lease V3 planner",
@@ -1344,6 +1356,11 @@ fn derive_actions(
     action_spans: &mut Vec<ActionSpan>,
 ) -> Result<(), WorkPlanError> {
     match args {
+        UniversalCommandArgs::SourceRegistryRetirement(_) => {
+            return Err(WorkPlanError::IncompleteTopology(
+                "source registry retirement requires its actual separately admitted lifecycle planner",
+            ));
+        }
         UniversalCommandArgs::SourceLegacyAdoption(_) => {
             return Err(WorkPlanError::IncompleteTopology(
                 "legacy adoption requires the pre-lease V3 planner",

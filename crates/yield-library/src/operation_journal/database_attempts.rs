@@ -212,7 +212,11 @@ impl DatabaseAttemptStart {
             participant.after
         };
         let value = Self {
-            version: 1,
+            version: if inventory.encode()?.starts_with(b"YWCB\x02\x00") {
+                2
+            } else {
+                1
+            },
             attempt,
             nonce,
             operation: record.operation_id.as_uuid(),
@@ -271,16 +275,31 @@ impl DatabaseAttemptStart {
     }
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         require(
-            self.version == 1 && self.inventory.len() <= database_claims::MAX_INVENTORY_BYTES,
+            self.inventory.len() <= database_claims::MAX_INVENTORY_BYTES
+                && match self.version {
+                    1 => {
+                        self.inventory.starts_with(b"YWCB\x01\x00")
+                            && self.revision_domain != RevisionDomain::SourceLeaseLifecycle
+                    }
+                    2 => self.inventory.starts_with(b"YWCB\x02\x00"),
+                    _ => false,
+                },
             "attempt image shape",
         )?;
+        DatabaseClaimInventory::decode(&self.inventory)?;
         encode_bounded(self, MAX_START_BYTES)
     }
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-        decode_canonical(bytes, MAX_START_BYTES)
+        let value: Self = decode_canonical(bytes, MAX_START_BYTES)?;
+        value.encode()?;
+        Ok(value)
     }
     pub(crate) fn digest(&self) -> Result<[u8; 32]> {
-        let mut h = blake3::Hasher::new_derive_key("yield.database-attempt-start.v1");
+        let mut h = blake3::Hasher::new_derive_key(if self.version == 2 {
+            "yield.database-attempt-start.v2"
+        } else {
+            "yield.database-attempt-start.v1"
+        });
         h.update(&self.encode()?);
         Ok(*h.finalize().as_bytes())
     }
