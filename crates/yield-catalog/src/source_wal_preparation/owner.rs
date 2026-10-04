@@ -32,6 +32,9 @@ impl Drop for LostOwner {
 }
 struct Slot {
     source: RegisteredSource<ParkedDatabase>,
+    // Declaration order keeps the genuine binding ahead of its shared byte credit on drop.
+    binding: Option<yield_library::sample_sources::db::write::SourceWalBinding>,
+    scope: Option<ScopeView>,
     owner: LostOwner,
     expected: SourceRevision,
     deadline: Instant,
@@ -140,6 +143,22 @@ impl WorkerReservations {
             Ok(source) => source,
             Err(never) => match never.database {},
         };
+        let mut binding = None;
+        let mut scope = None;
+        if request.require_binding && rejection.is_none() {
+            match (&parked.database, parked.source_authority.as_ref()) {
+                (ParkedDatabase::Held(held), Some(authority)) => {
+                    match self.control.capture_scope(held, authority) {
+                        Ok((actual, view)) => {
+                            binding = Some(actual);
+                            scope = Some(view);
+                        }
+                        Err(reason) => rejection = Some(reason),
+                    }
+                }
+                _ => rejection = Some(CatalogSourceWalRejection::Scope),
+            }
+        }
         // Successful holders contain actual owner-validated physical main-file observations,
         // never a caller-supplied pathname or serialized identity used as authority.
         if let ParkedDatabase::Held(held) = &parked.database {
@@ -156,6 +175,8 @@ impl WorkerReservations {
         }
         let mut slot = Slot {
             source: parked,
+            binding,
+            scope,
             owner: LostOwner(Arc::clone(&request.ticket), false),
             expected: request.expected.clone(),
             deadline: request.deadline,
@@ -175,6 +196,7 @@ impl WorkerReservations {
                         correlation: request.correlation,
                         nonce: held.nonce().to_string(),
                         wal_bytes: held.wal_bytes(),
+                        scope: slot.scope.clone(),
                     },
                 ));
             }
@@ -204,7 +226,17 @@ impl WorkerReservations {
                 let changed = !current(admission, &slot.expected);
                 let validation = match &slot.source.database {
                     ParkedDatabase::Held(held) => {
-                        held.revalidate_owner().err().map(|e| classify(&e))
+                        if let Some(binding) = &slot.binding {
+                            match slot.source.source_authority.as_ref() {
+                                Some(authority) => held
+                                    .validate_wal_binding(binding, authority)
+                                    .err()
+                                    .map(|e| classify(&e)),
+                                None => Some(CatalogSourceWalRejection::Scope),
+                            }
+                        } else {
+                            held.revalidate_owner().err().map(|e| classify(&e))
+                        }
                     }
                     ParkedDatabase::Failed(_) => slot.rejection,
                 };
@@ -245,6 +277,8 @@ impl WorkerReservations {
                     "parked source cannot acquire a second SQL owner"
                 );
                 sources.insert(id.clone(), source);
+                drop(slot.binding.take());
+                drop(slot.scope.take());
                 slot.owner.1 = true;
                 slot.owner.0.finish(slot.rejection.map_or(
                     CatalogSourceWalStatus::Aborted,
@@ -302,6 +336,8 @@ impl WorkerReservations {
             };
             match retire_source(id.clone(), source, journal, pending) {
                 RetireSourceOutcome::Removed | RetireSourceOutcome::FinalizationPending { .. } => {
+                    drop(slot.binding.take());
+                    drop(slot.scope.take());
                     slot.owner.1 = true;
                     slot.owner.0.finish(CatalogSourceWalStatus::Retired);
                 }
@@ -388,7 +424,7 @@ fn current(admission: &Arc<Mutex<AdmissionState>>, revision: &SourceRevision) ->
             .get(revision.source_id())
             .is_some_and(|s| s.active && s.lifecycle_generation == revision.lifecycle_generation())
 }
-fn classify(error: &SourceWalPreparationError) -> CatalogSourceWalRejection {
+pub(super) fn classify(error: &SourceWalPreparationError) -> CatalogSourceWalRejection {
     match error {
         SourceWalPreparationError::Deadline => CatalogSourceWalRejection::Deadline,
         SourceWalPreparationError::LeaseRenewalRequired => {

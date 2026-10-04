@@ -77,6 +77,21 @@ pub struct SourceWalBinding {
     deadline: Instant,
 }
 impl SourceWalBinding {
+    /// Actual separately owned scalar/encoding buffers plus this binding's inline headers.
+    /// Coordinators must additionally charge shared wrapper, queue and reply ownership.
+    /// None means accounting is unavailable and must reject; this is never a capacity grant.
+    pub fn retained_memory_bytes(&self) -> Option<usize> {
+        [
+            std::mem::size_of::<Self>(),
+            self.bytes.capacity(),
+            self.subject().retained_heap_bytes()?,
+            self.main().identity.capacity(),
+            self.wal().identity.capacity(),
+            self.shm().identity.capacity(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+    }
     /// Historical complete source/lease/registration scope; phase is not journal readiness.
     pub fn subject(&self) -> &SourceRegistryReferenceSubject {
         &self.descriptor.subject

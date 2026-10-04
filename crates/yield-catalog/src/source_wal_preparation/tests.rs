@@ -10,6 +10,7 @@ mod integration {
         base: crate::tests::Fixture,
         second: tempfile::TempDir,
         long_id: bool,
+        local_prepared_authorities: bool,
     }
     impl Fixture {
         fn new() -> Self {
@@ -17,6 +18,7 @@ mod integration {
                 base: crate::tests::Fixture::new("catalog-wal-custody"),
                 second: tempfile::tempdir().unwrap(),
                 long_id: false,
+                local_prepared_authorities: false,
             };
             for root in [f.base.root.path(), f.second.path()] {
                 let mut wav = hound::WavWriter::create(
@@ -65,6 +67,7 @@ mod integration {
                 self.second.path().to_path_buf(),
             ];
             let long_id = self.long_id;
+            let local_prepared_authorities = self.local_prepared_authorities;
             let worker_admission = admission.clone();
             let worker_events = events.clone();
             let gate = Arc::new(CatalogTestGate::new());
@@ -113,6 +116,9 @@ mod integration {
                                 .unwrap()
                                 .unwrap();
                             (Some(authority), Some(receipt))
+                        } else if local_prepared_authorities {
+                            // Genuine local Prepared guards; never pretend journal/reserve registration.
+                            (Some(db.prepare_source_authority().unwrap()), None)
                         } else {
                             (None, None)
                         };
@@ -1258,6 +1264,331 @@ mod integration {
         assert_eq!((lease(&db), metadata(&db)), before);
         assert_eq!(credits(&service), (0, 0));
         drop(held);
+        service.shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_scope_two_actual_sources_share_bounded_views_and_retain_bytes_after_abort() {
+        let mut f = Fixture::new();
+        f.local_prepared_authorities = true;
+        let (service, revisions, _) = f.start(None);
+        let a = f.external(&revisions[0]);
+        let b = f.external(&revisions[1]);
+        let before = [(lease(&a), metadata(&a)), (lease(&b), metadata(&b))];
+        let common = deadline();
+        let mut first = service
+            .prepare_source_wal_with_binding(revisions[0].clone(), correlation(), common)
+            .unwrap();
+        let mut second = service
+            .prepare_source_wal_with_binding(revisions[1].clone(), correlation(), common)
+            .unwrap();
+        let ha = prepared(&mut first);
+        let hb = prepared(&mut second);
+        let CatalogSourceWalStatus::Prepared(oa) = ha.status() else {
+            panic!("actual held first scope")
+        };
+        let CatalogSourceWalStatus::Prepared(ob) = hb.status() else {
+            panic!("actual held second scope")
+        };
+        let copy = oa.clone();
+        assert_eq!(
+            oa.scope_descriptor_bytes().unwrap().as_ptr(),
+            copy.scope_descriptor_bytes().unwrap().as_ptr()
+        );
+        assert_ne!(oa.scope_descriptor_bytes(), ob.scope_descriptor_bytes());
+        let d: serde_json::Value =
+            serde_json::from_slice(oa.scope_descriptor_bytes().unwrap()).unwrap();
+        assert_eq!(d["subject"]["registration"]["phase"], "prepared");
+        assert_eq!(
+            d["subject"]["database_identity"],
+            revisions[0].database_identity()
+        );
+        assert!(credits(&service).1 <= CATALOG_WAL_MAX_CONTEXT_BYTES);
+        busy(&a);
+        busy(&b);
+        assert_eq!(
+            [(lease(&a), metadata(&a)), (lease(&b), metadata(&b))],
+            before
+        );
+        assert_eq!(
+            ha.acknowledge_settlement(),
+            Err(CatalogSourceWalRejection::SettlementUnsupported)
+        );
+        drop(ha);
+        drop(hb);
+        wait(&first, |s| *s == CatalogSourceWalStatus::Aborted);
+        wait(&second, |s| *s == CatalogSourceWalStatus::Aborted);
+        assert_eq!(credits(&service).0, 0);
+        let retained = credits(&service).1;
+        assert!(retained > 0);
+        drop(oa);
+        assert_eq!(
+            credits(&service).1,
+            retained,
+            "shared copy keeps exact credit"
+        );
+        drop(copy);
+        assert!(credits(&service).1 < retained);
+        drop(ob);
+        assert_eq!(credits(&service), (0, 0));
+        a.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        b.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert_eq!(
+            [(lease(&a), metadata(&a)), (lease(&b), metadata(&b))],
+            before
+        );
+        service.shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_scope_missing_actual_registration_rejects_and_restores_original_owner() {
+        let f = Fixture::new();
+        let (service, revisions, _) = f.start(None);
+        let a = f.external(&revisions[0]);
+        let before = (lease(&a), metadata(&a));
+        let request = service
+            .prepare_source_wal_with_binding(revisions[0].clone(), correlation(), deadline())
+            .unwrap();
+        wait(&request, |s| {
+            *s == CatalogSourceWalStatus::Rejected(CatalogSourceWalRejection::Scope)
+        });
+        assert!(request.status() != CatalogSourceWalStatus::Aborted);
+        assert_eq!(credits(&service), (0, 0));
+        a.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert_eq!((lease(&a), metadata(&a)), before);
+        let mut unbound = service
+            .prepare_source_wal(revisions[0].clone(), correlation(), deadline())
+            .unwrap();
+        let held = prepared(&mut unbound);
+        assert!(
+            matches!(held.status(), CatalogSourceWalStatus::Prepared(ref o) if o.scope_descriptor_bytes().is_none())
+        );
+        drop(held);
+        wait(&unbound, |s| *s == CatalogSourceWalStatus::Aborted);
+        service.shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_scope_shutdown_releases_sql_owner_but_retains_copied_descriptor_credits() {
+        let mut f = Fixture::new();
+        f.local_prepared_authorities = true;
+        let (service, revisions, _) = f.start(None);
+        let a = f.external(&revisions[0]);
+        let mut request = service
+            .prepare_source_wal_with_binding(revisions[0].clone(), correlation(), deadline())
+            .unwrap();
+        let held = prepared(&mut request);
+        let CatalogSourceWalStatus::Prepared(observation) = held.status() else {
+            panic!("actual scope")
+        };
+        service.shutdown();
+        assert_eq!(credits(&service).0, 0);
+        assert!(credits(&service).1 > 0);
+        assert!(observation.scope_descriptor_bytes().is_some());
+        let accounting = Arc::downgrade(&service.admission.lock().unwrap().source_wal.shared);
+        drop(held);
+        drop(request);
+        drop(service);
+        let retained = accounting
+            .upgrade()
+            .expect("report retains closed accounting");
+        assert!(retained.queue.lock().unwrap().closed);
+        assert!(retained.queue.lock().unwrap().bytes > 0);
+        drop(retained);
+        drop(observation);
+        assert!(
+            accounting.upgrade().is_none(),
+            "final view releases accounting without a cycle"
+        );
+        a.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_scope_actual_sidecar_substitution_is_detected_by_parked_owner() {
+        let mut f = Fixture::new();
+        f.local_prepared_authorities = true;
+        let (service, revisions, _) = f.start(None);
+        let mut request = service
+            .prepare_source_wal_with_binding(revisions[0].clone(), correlation(), deadline())
+            .unwrap();
+        let held = prepared(&mut request);
+        let path = f
+            .base
+            .guard
+            .profile_root()
+            .join(catalog_profile_child(revisions[0].source_id()))
+            .join(format!("{DB_FILE_NAME}-shm"));
+        let saved = path.with_extension("retained-original");
+        std::fs::rename(&path, &saved).unwrap();
+        let bytes = std::fs::metadata(&saved).unwrap().len();
+        let replacement = std::fs::File::create(&path).unwrap();
+        replacement.set_len(bytes).unwrap();
+        wait(&request, |s| {
+            *s == CatalogSourceWalStatus::Rejected(CatalogSourceWalRejection::Scope)
+        });
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert_eq!(credits(&service), (0, 0));
+        drop(held);
+        let mut again = service
+            .prepare_source_wal_with_binding(revisions[0].clone(), correlation(), deadline())
+            .unwrap();
+        let held = prepared(&mut again);
+        drop(held);
+        wait(&again, |s| *s == CatalogSourceWalStatus::Aborted);
+        service.shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_scope_retained_reports_exhaust_capture_budget_and_return_every_temporary_credit() {
+        let mut f = Fixture::new();
+        f.local_prepared_authorities = true;
+        let (service, revisions, _) = f.start(None);
+        let a = f.external(&revisions[0]);
+        let before = (lease(&a), metadata(&a));
+        let mut reports = Vec::new();
+        let mut refused = false;
+        for _ in 0..20 {
+            let prior = credits(&service);
+            let mut request = service
+                .prepare_source_wal_with_binding(revisions[0].clone(), correlation(), deadline())
+                .unwrap();
+            let status = wait(&request, |s| {
+                matches!(
+                    s,
+                    CatalogSourceWalStatus::Prepared(_) | CatalogSourceWalStatus::Rejected(_)
+                )
+            });
+            match status {
+                CatalogSourceWalStatus::Prepared(o) => {
+                    reports.push(o);
+                    let held = request.try_prepared().unwrap();
+                    drop(held);
+                    wait(&request, |s| *s == CatalogSourceWalStatus::Aborted);
+                    assert_eq!(credits(&service).0, 0);
+                    assert!(credits(&service).1 > prior.1);
+                }
+                CatalogSourceWalStatus::Rejected(CatalogSourceWalRejection::Full) => {
+                    assert_eq!(
+                        credits(&service),
+                        prior,
+                        "rejected staging returned every temporary byte"
+                    );
+                    refused = true;
+                    break;
+                }
+                other => panic!("unexpected strict budget outcome {other:?}"),
+            }
+            assert!(credits(&service).1 <= CATALOG_WAL_MAX_CONTEXT_BYTES);
+        }
+        assert!(
+            refused,
+            "actual retained report credits must bound subsequent capture"
+        );
+        assert!(!reports.is_empty());
+        assert_eq!((lease(&a), metadata(&a)), before);
+        a.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        drop(reports);
+        assert_eq!(credits(&service), (0, 0));
+        let mut again = service
+            .prepare_source_wal_with_binding(revisions[0].clone(), correlation(), deadline())
+            .unwrap();
+        let held = prepared(&mut again);
+        drop(held);
+        wait(&again, |s| *s == CatalogSourceWalStatus::Aborted);
+        service.shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_scope_busy_unknown_vfs_and_original_expiry_keep_rows_and_return_owner_credits() {
+        let mut f = Fixture::new();
+        f.local_prepared_authorities = true;
+        let (service, revisions, _) = f.start(None);
+        let a = f.external(&revisions[0]);
+        let before = (lease(&a), metadata(&a));
+        a.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let request = service
+            .prepare_source_wal_with_binding(revisions[0].clone(), correlation(), deadline())
+            .unwrap();
+        wait(&request, |s| {
+            *s == CatalogSourceWalStatus::Rejected(CatalogSourceWalRejection::WalUnavailable)
+        });
+        a.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(credits(&service), (0, 0));
+        let control = service.admission.lock().unwrap().source_wal.clone();
+        control.shared.unknown_wal.store(true, Ordering::Release);
+        let request = service
+            .prepare_source_wal_with_binding(revisions[0].clone(), correlation(), deadline())
+            .unwrap();
+        wait(&request, |s| {
+            *s == CatalogSourceWalStatus::Rejected(CatalogSourceWalRejection::WalUnavailable)
+        });
+        control.shared.unknown_wal.store(false, Ordering::Release);
+        assert_eq!(credits(&service), (0, 0));
+        let mut request = service
+            .prepare_source_wal_with_binding(
+                revisions[0].clone(),
+                correlation(),
+                Instant::now() + Duration::from_millis(500),
+            )
+            .unwrap();
+        let held = prepared(&mut request);
+        let CatalogSourceWalStatus::Prepared(o) = held.status() else {
+            panic!("real bounded scope")
+        };
+        busy(&a);
+        wait(&request, |s| {
+            *s == CatalogSourceWalStatus::Rejected(CatalogSourceWalRejection::Deadline)
+        });
+        assert_eq!(credits(&service).0, 0);
+        assert!(credits(&service).1 > 0);
+        assert_eq!((lease(&a), metadata(&a)), before);
+        drop(held);
+        drop(o);
+        assert_eq!(credits(&service), (0, 0));
+        a.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        service.shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_scope_failed_real_rollback_keeps_binding_credit_and_exclusion_until_confirmation() {
+        let mut f = Fixture::new();
+        f.local_prepared_authorities = true;
+        let deny = Arc::new(AtomicBool::new(false));
+        let (service, revisions, _) = f.start(Some(deny.clone()));
+        let a = f.external(&revisions[0]);
+        let before = (lease(&a), metadata(&a));
+        let mut request = service
+            .prepare_source_wal_with_binding(revisions[0].clone(), correlation(), deadline())
+            .unwrap();
+        let held = prepared(&mut request);
+        let CatalogSourceWalStatus::Prepared(o) = held.status() else {
+            panic!("actual scope")
+        };
+        deny.store(true, Ordering::Release);
+        held.abort();
+        wait(&request, |s| {
+            *s == CatalogSourceWalStatus::Unavailable(CatalogSourceWalRejection::OwnerLost)
+        });
+        assert_eq!(credits(&service).0, 1);
+        assert!(credits(&service).1 > 0);
+        busy(&a);
+        assert_eq!((lease(&a), metadata(&a)), before);
+        deny.store(false, Ordering::Release);
+        wait(&request, |s| *s == CatalogSourceWalStatus::Aborted);
+        assert_eq!(credits(&service).0, 0);
+        assert!(credits(&service).1 > 0);
+        drop(held);
+        drop(o);
+        assert_eq!(credits(&service), (0, 0));
+        a.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
         service.shutdown();
     }
 }

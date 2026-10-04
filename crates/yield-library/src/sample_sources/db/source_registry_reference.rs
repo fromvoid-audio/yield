@@ -85,6 +85,18 @@ pub struct SourceRegistryReferenceSubject {
     registration: Option<SourceRegistryRegistrationObservation>,
 }
 impl SourceRegistryReferenceSubject {
+    // Complete separately allocated scalar payload; inline headers are charged by its owner.
+    pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
+        [
+            self.source_id.capacity(),
+            self.media_root_identity.capacity(),
+            self.database_root_identity.capacity(),
+            self.database_identity.capacity(),
+            self.root_binding_identity.capacity(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+    }
     /// Captured source identity.
     pub fn source_id(&self) -> &str {
         &self.source_id
