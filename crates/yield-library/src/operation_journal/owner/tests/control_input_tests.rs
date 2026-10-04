@@ -22,7 +22,21 @@ mod integration {
         (shared, rx)
     }
     fn exhausted(shared: &Arc<OwnerShared>, class: InputClass) -> InputPermit {
-        shared.reserve_input(class, class.limit()).unwrap()
+        let remaining = snapshot(shared).remaining[class.index()];
+        shared.reserve_input(class, remaining).unwrap()
+    }
+    struct PausedWorkerRelease(Option<Arc<std::sync::Barrier>>);
+    impl PausedWorkerRelease {
+        fn release(&mut self) {
+            if let Some(barrier) = self.0.take() {
+                barrier.wait();
+            }
+        }
+    }
+    impl Drop for PausedWorkerRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
     }
     fn retry() -> RetryObservation {
         RetryObservation::new(
@@ -97,23 +111,25 @@ mod integration {
         wait_until_available(&owner);
         let client = owner.client();
         let id = OperationId::new();
+        let ordinary_before = snapshot(&owner.shared).remaining[0];
         let (record, _) = v5_copy_record(id);
         let bytes = bounded_encoded_record(&record).unwrap().len();
         let accepted = client.persist_intent(record).unwrap();
         ready.wait();
+        let mut paused = PausedWorkerRelease(Some(release.clone()));
         // We are INSIDE real SQLite's transaction, after decoding; queue arrival is insufficient.
         assert_eq!(
             snapshot(&owner.shared).remaining,
-            [ORDINARY_INPUT_BYTES - bytes, CONTROL_INPUT_RESERVED_BYTES]
+            [ordinary_before - bytes, CONTROL_INPUT_RESERVED_BYTES]
         );
         drop(accepted); // Accepted reply loss returns result credit, never executing input credit.
         assert_eq!(
             snapshot(&owner.shared).remaining[0],
-            ORDINARY_INPUT_BYTES - bytes
+            ordinary_before - bytes
         );
         let backing = owner
             .shared
-            .reserve_input(InputClass::Ordinary, ORDINARY_INPUT_BYTES - bytes)
+            .reserve_input(InputClass::Ordinary, ordinary_before - bytes)
             .unwrap();
         assert!(matches!(
             client.get(id),
@@ -126,7 +142,7 @@ mod integration {
             .request_cancel_before_publish(id, 1, CancellationRequestObservation::new(56).unwrap())
             .unwrap();
         assert!(snapshot(&owner.shared).remaining[1] < CONTROL_INPUT_RESERVED_BYTES);
-        release.wait();
+        paused.release();
         let receipt = cancel
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
@@ -199,6 +215,7 @@ mod integration {
         let client = owner.client();
         let first = client.get(OperationId::new()).unwrap();
         ready.wait();
+        let mut paused = PausedWorkerRelease(Some(release.clone()));
         let mut queued = Vec::new();
         for _ in 0..ORDINARY_COMMAND_CAPACITY {
             queued.push(client.get(OperationId::new()).unwrap());
@@ -237,7 +254,7 @@ mod integration {
         assert_eq!(snapshot(&owner.shared), before);
         drop(first);
         drop(queued);
-        release.wait();
+        paused.release();
         owner.shutdown();
         full(&owner.shared);
     }
@@ -316,6 +333,7 @@ mod integration {
         let client = owner.client();
         let accepted = client.get(OperationId::new()).unwrap();
         ready.wait();
+        let mut paused = PausedWorkerRelease(Some(release.clone()));
         let pending = client
             .request_cancel_before_publish(
                 OperationId::new(),
@@ -331,7 +349,7 @@ mod integration {
         drop(pending);
         drop(queued_ordinary);
         assert_eq!(snapshot(&owner.shared), before);
-        release.wait();
+        paused.release();
         owner.shutdown();
         full(&owner.shared);
         assert!(matches!(
@@ -361,6 +379,7 @@ mod integration {
         let (record, _) = v5_copy_record(id);
         let mut first = client.persist_intent(record).unwrap();
         ready.wait();
+        let mut paused = PausedWorkerRelease(Some(release.clone()));
         let mut pending = client
             .request_cancel_before_publish(id, 1, CancellationRequestObservation::new(56).unwrap())
             .unwrap();
@@ -368,7 +387,7 @@ mod integration {
         let before = snapshot(&owner.shared);
         assert!(before.remaining[0] < ORDINARY_INPUT_BYTES);
         assert!(before.remaining[1] < CONTROL_INPUT_RESERVED_BYTES);
-        release.wait();
+        paused.release();
         assert!(first.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
         assert!(
             pending
