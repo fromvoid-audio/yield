@@ -3844,56 +3844,76 @@ impl OperationJournalOwner {
             .load(Ordering::Relaxed)
     }
 
+    /// Close new command admission without disconnecting or joining the worker.
+    ///
+    /// Returns `true` only for the first Initializing/Available-to-Closing transition.
+    /// Accepted commands continue draining and the idle worker retains its store/profile
+    /// resources until a later [`Self::shutdown`] or Drop disconnects and joins it.
+    /// Worker failure remains Unavailable; repeated drain never reopens admission.
+    ///
+    /// This is command admission only, not publication/effect closure, physical quiescence,
+    /// durable settlement or clean handoff. Publication-aware shutdown must also install
+    /// its independent effect gates and native-resource lifetime protocol.
+    pub fn begin_command_drain(&self) -> bool {
+        matches!(
+            self.close_command_admission(),
+            OwnerLifecycle::Initializing | OwnerLifecycle::Available
+        )
+    }
+
+    fn close_command_admission(&self) -> OwnerLifecycle {
+        let _admission = self
+            .shared
+            .admission_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            let current = self.shared.lifecycle.load(Ordering::Acquire);
+            let current_state = OwnerLifecycle::from_u8(current);
+            if matches!(
+                current_state,
+                OwnerLifecycle::Closing | OwnerLifecycle::Unavailable | OwnerLifecycle::Closed
+            ) {
+                break current_state;
+            }
+            #[cfg(test)]
+            if let Some((ready, release)) = self
+                .shared
+                .shutdown_cas_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                ready.wait();
+                release.wait();
+            }
+            match self.shared.lifecycle.compare_exchange(
+                current,
+                OwnerLifecycle::Closing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break current_state,
+                Err(_) => continue,
+            }
+        }
+    }
+
     /// Stop new admission, drain accepted commands, release the journal, and join the worker.
     ///
+    /// Also completes a previously begun command drain. Never call while holding a native
+    /// effect, source/control or admission lock needed by worker completion.
     /// Returns `true` only when the worker drained and stopped cleanly. A worker failure returns
     /// `false` and remains visible as [`OperationJournalOwnerStatus::Unavailable`] to retained
     /// clients after the worker resources have been released. Calling shutdown again after a
     /// clean close also returns `false`.
     pub fn shutdown(&mut self) -> bool {
-        let previous = {
-            let _admission = self
-                .shared
-                .admission_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let previous = loop {
-                let current = self.shared.lifecycle.load(Ordering::Acquire);
-                let current_state = OwnerLifecycle::from_u8(current);
-                if matches!(
-                    current_state,
-                    OwnerLifecycle::Unavailable | OwnerLifecycle::Closed
-                ) {
-                    break current_state;
-                }
-                #[cfg(test)]
-                if let Some((ready, release)) = self
-                    .shared
-                    .shutdown_cas_gate
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take()
-                {
-                    ready.wait();
-                    release.wait();
-                }
-                match self.shared.lifecycle.compare_exchange(
-                    current,
-                    OwnerLifecycle::Closing as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break current_state,
-                    Err(_) => continue,
-                }
-            };
-            self.shared
-                .commands
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            previous
-        };
+        let previous = self.close_command_admission();
+        self.shared
+            .commands
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         if let Some(worker) = self.worker.take() {
             if worker.join().is_err() {
                 self.shared
@@ -5810,6 +5830,7 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 
 #[cfg(test)]
 mod tests {
+    mod command_drain;
     mod source_registry_handoff_tests;
     #[test]
     fn recording_dispatch_binding_checks_actual_bytes_range_output_and_root() {

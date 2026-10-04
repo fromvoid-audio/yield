@@ -302,3 +302,31 @@ The existing `cancelled_operation_blocks_chunk_issue_and_entry_but_allows_unused
 case is macOS-only and its Linux filter runs zero tests. It is not a Linux
 pass. The V16 store test above provides portable cancellation/restart evidence,
 not the new cross-owner entry/release race acceptance required by OPT-2215.
+
+## Command-drain lifecycle foundation (OPT-2250)
+
+`OperationJournalOwner::begin_command_drain` now separates the existing command
+admission boundary from sender disconnect and blocking join. It moves actual
+Initializing/Available lifecycle to Closing under the same admission mutex used
+by command submission. Repeated calls report no new transition; Closed and
+Unavailable remain sticky. New requests reject before taking input/result
+credits, while already accepted commands finish through the original worker.
+The sender remains connected, so normal idle/queue-drained runtime resources
+remain held until later external `shutdown` or owner Drop disconnects and joins.
+
+This method closes only command admission. It does not close a publication slot,
+count native resource reads/effects, poll completion, protect resource custody
+through exceptional unwind, prove physical quiescence or establish settlement.
+Full OPT-2215 publication-aware `begin_shutdown` must compose those actual gates
+and resource-use rules; it must not alias command drain and claim completion.
+Existing synchronous shutdown remains an external join and must never run while
+holding an effect/source/control/admission lock needed by worker completion.
+
+Actual worker tests hold an accepted command at a deterministic barrier, prove
+the drain call returns before that barrier is released, preserve request credits,
+drain/commit through actual profile-owned SQLite, and verify store acquisition
+stays excluded both before and after queue drain until external join. Idle,
+immediate-bootstrap and genuine worker-panic cases preserve the same lifecycle
+and unavailable behavior. These portable fixtures supply no native reserve or
+publication authority. All original OPT-2215/2216/2217/2218/2219 and OPT-1632/1634
+acceptance remains open.
