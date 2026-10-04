@@ -136,15 +136,7 @@ pub(super) fn capture(
     };
     // SQL guards the payload before Rust materializes it. LEFT JOIN retains invalid/orphan
     // assignments so they reject the whole scope instead of silently disappearing.
-    let sql = format!(
-        "SELECT CASE WHEN length(CAST(wft.path AS BLOB)) <= 1024 THEN wft.path ELSE NULL END,
-        wf.path IS NOT NULL AND wf.missing=0 AND ({supported})
-        FROM wav_file_tags AS wft LEFT JOIN wav_files AS wf ON wf.path=wft.path
-        WHERE wft.tag_id=?1 LIMIT ?2",
-        supported = crate::sample_sources::supported_audio_where_clause()
-            .replace("extension", "wf.extension")
-            .replace("path", "wf.path")
-    );
+    let sql = assignment_query();
     let mut statement = connection.prepare(&sql).map_err(map_sql_error)?;
     let mut rows = statement
         .query(params![old_tag_id, limit + 1])
@@ -187,4 +179,107 @@ pub(super) fn capture(
         mutation,
         paths,
     })
+}
+
+// Trusted fixed supported-extension inventory; this construction has no caller payload.
+fn assignment_query() -> String {
+    format!(
+        "SELECT CASE WHEN length(CAST(wft.path AS BLOB)) <= 1024 THEN wft.path ELSE NULL END,
+        wf.path IS NOT NULL AND wf.missing=0 AND ({supported})
+        FROM wav_file_tags AS wft LEFT JOIN wav_files AS wf ON wf.path=wft.path
+        WHERE wft.tag_id=?1 LIMIT ?2",
+        supported = crate::sample_sources::supported_audio_where_clause()
+            .replace("extension", "wf.extension")
+            .replace("path", "wf.path")
+    )
+}
+
+/// Compare the complete original finite selection with current borrowed SQLite rows.
+/// Private capture validated canonical paths; exact byte membership preserves that witness.
+/// No second selection, revision/mutation clone, owned row path or SQLite sorter is built.
+pub(super) fn validate_current(
+    connection: &Connection,
+    selected: &SourceTagAssignmentSelection,
+) -> Result<(), SourceWriterError> {
+    let limit = match selected.mutation() {
+        SourceTagAssignmentMutation::Rename(_) => 64,
+        SourceTagAssignmentMutation::Delete => 128,
+    };
+    if selected.old_tag_id() <= 0 || selected.paths().len() > limit {
+        return Err(SourceWriterError::SnapshotBudgetExceeded);
+    }
+    let current_id = connection
+        .query_row(
+            "SELECT id FROM source_tags WHERE normalized_text=?1",
+            [selected.old_identity()],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(map_sql_error)?;
+    if current_id != Some(selected.old_tag_id()) {
+        return Err(SourceWriterError::StaleFence);
+    }
+    if let SourceTagAssignmentMutation::Rename(target) = selected.mutation() {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM source_tags WHERE normalized_text=?1)",
+                [target],
+                |r| r.get(0),
+            )
+            .map_err(map_sql_error)?;
+        if target == selected.old_identity() || exists {
+            return Err(SourceWriterError::InvalidRequest(
+                "assignment rename target collides",
+            ));
+        }
+    }
+    let sql = assignment_query();
+    let mut statement = connection.prepare(&sql).map_err(map_sql_error)?;
+    let mut rows = statement
+        .query(params![selected.old_tag_id(), limit + 1])
+        .map_err(map_sql_error)?;
+    let mut seen = [false; 128];
+    let mut count = 0;
+    while let Some(row) = rows.next().map_err(map_sql_error)? {
+        if count == limit {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        let path = match row.get_ref(0).map_err(map_sql_error)? {
+            rusqlite::types::ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+                .map_err(|_| SourceWriterError::InvalidRequest("assignment path is malformed"))?,
+            rusqlite::types::ValueRef::Null => {
+                return Err(SourceWriterError::SnapshotBudgetExceeded);
+            }
+            _ => {
+                return Err(SourceWriterError::InvalidRequest(
+                    "assignment path is malformed",
+                ));
+            }
+        };
+        let supported: bool = row.get(1).map_err(map_sql_error)?;
+        if !supported || !crate::sample_sources::is_supported_audio(std::path::Path::new(path)) {
+            return Err(SourceWriterError::InvalidRequest(
+                "assignment has no live supported manifest member",
+            ));
+        }
+        let index = selected
+            .paths()
+            .binary_search_by(|original| {
+                original
+                    .as_path()
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .cmp(path.as_bytes())
+            })
+            .map_err(|_| SourceWriterError::StaleFence)?;
+        if seen[index] {
+            return Err(SourceWriterError::StaleFence);
+        }
+        seen[index] = true;
+        count += 1;
+    }
+    if count != selected.paths().len() || seen[..count].iter().any(|present| !present) {
+        return Err(SourceWriterError::StaleFence);
+    }
+    Ok(())
 }

@@ -32,19 +32,29 @@ pub(super) fn acquire(
 ) -> SourceWalTransportOwner {
     let mut request = command.request.take().expect("original source command");
     let expected = request.expected.as_ref().expect("pending revision");
-    #[cfg(feature = "test-support")]
-    let native = if command.shared.unknown_wal.load(Ordering::Acquire) {
-        // Negative I/O fault only: no family policy or positive preparation is published.
-        match writer.prepare_wal_reservation_unknown_for_tests(expected, request.deadline) {
-            Ok(held) => Native::Held(held),
-            Err(failed) => Native::Failed(failed),
-        }
+    let mut staging = ByteCredit::new(&command.shared);
+    // Full current owner/schema/native validation shares the original bounded capture pool.
+    // Reserve its conservative staging BEFORE native preparation executes or allocates.
+    let staging_rejection = staging.resize(scope::CAPTURE_BYTES).err();
+    let native = if staging_rejection.is_some() {
+        Native::Unprepared(writer, request.policy.take())
     } else {
-        Native::acquire(writer, expected, request.deadline, request.policy.take())
+        #[cfg(feature = "test-support")]
+        let native = if command.shared.unknown_wal.load(Ordering::Acquire) {
+            // Negative I/O fault only: no family policy or positive preparation is published.
+            match writer.prepare_wal_reservation_unknown_for_tests(expected, request.deadline) {
+                Ok(held) => Native::Held(held),
+                Err(failed) => Native::Failed(failed),
+            }
+        } else {
+            Native::acquire(writer, expected, request.deadline, request.policy.take())
+        };
+        #[cfg(not(feature = "test-support"))]
+        let native = Native::acquire(writer, expected, request.deadline, request.policy.take());
+        native
     };
-    #[cfg(not(feature = "test-support"))]
-    let native = Native::acquire(writer, expected, request.deadline, request.policy.take());
-    let rejection = native.error().map(classify);
+    drop(staging);
+    let rejection = staging_rejection.or_else(|| native.error().map(classify));
     let owner = SourceWalTransportOwner {
         native: Some(native),
         scope: None,

@@ -106,6 +106,9 @@ fn tag_metadata_budget_child() {
         case if case.starts_with("layout-intent-") => {
             super::layout_capture::source_layout_intent_case(case)
         }
+        case if case.starts_with("tag-streaming-") => {
+            super::tag_streaming_validation::dispatch(case)
+        }
         case if case.starts_with("policy-transport-") => super::policy_transport::dispatch(case),
         case if case.starts_with("layout-owned-") => super::layout_wal_preparation::dispatch(case),
         case if case.starts_with("tag-owned-") => super::tag_wal_preparation::dispatch(case),

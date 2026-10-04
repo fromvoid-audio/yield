@@ -21,6 +21,23 @@ complete active directory publication/generation, and every sorted assignment
 that connection without a nested BEGIN. Owner validation reuses OPT-2208 and
 never renews the lease or falls back to command admission.
 
+OPT-2261 validates each current assignment directly against the immutable original
+selection using borrowed SQLite text and a fixed seen bitmap. It checks exact
+membership, duplicates, omissions, supported live manifest membership, the old tag
+ID and rename collisions without building a second path payload. Passive
+validation uses the same complete comparison in a bounded read transaction and
+retains the original capture deadline. Known schema and runtime validation also
+streams current rows against the compiled reference instead of collecting another
+schema/runtime image; the existing image APIs remain available for workload evidence.
+
+The shared source WAL transport charges conservative native validation staging to
+its original 64-KiB pool before preparation runs, for audited, tag and layout
+requests. A complete original selection can fit enqueue yet be refused when its
+retained input leaves insufficient validation capacity. This does not reduce the
+64/128 mutation limits or admit an uncharged second buffer. Such refusal keeps the
+unchanged owner and input private; only an original autocommit owner can return to
+dispatch, and an unentered preparation cannot retire a pre-existing transaction.
+
 The borrowing `SourceTagMetadataPolicy` and this owning composition share a
 private policy state that stores every original setting before installing any
 restriction. Its extension guard remains retained even after partial entry.
@@ -58,6 +75,7 @@ objects and does not qualify any physical backend.
 ```sh
 cargo test -p yield-library --lib tag_owned_preparation -- --nocapture
 cargo test -p yield-library --lib tag_metadata -- --nocapture
+cargo test --locked -p yield-library --lib tag_streaming_validation -- --nocapture
 cargo test -p yield-library --lib wal_reservation -- --nocapture
 cargo test -p yield-library --lib --locked -- --test-threads=1
 bash scripts/agent.sh preflight

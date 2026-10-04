@@ -19,6 +19,10 @@ fn writer(media: &Path, profile: &WritableProfileGuard, id: &str) -> SourceWrite
         1,
     )
     .unwrap();
+    writer
+        .catalog_database()
+        .upsert_file(Path::new("one.wav"), 1, 1)
+        .unwrap();
     let generation = writer.begin_scan_directory_truth_generation(0).unwrap();
     let fence = writer.current_scan_fence().unwrap();
     let batch = writer.catalog_database().write_batch().unwrap();
@@ -92,19 +96,23 @@ fn normal_build_original_tag_and_layout_policies_cross_the_source_inbox() {
         other.busy_timeout(Duration::ZERO).unwrap();
         // Fixture seed only; this creates no production admission/settlement authority.
         other.execute("INSERT INTO source_tags(normalized_text, display_label) VALUES ('old tag','Old Tag')", []).unwrap();
+        other.execute("INSERT INTO wav_file_tags(path,tag_id) SELECT 'one.wav',id FROM source_tags WHERE normalized_text='old tag'", []).unwrap();
         let before = row(&other);
         let (transport, mut inbox) = SourceWalTransport::channel();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut request = match family {
-            Family::Tag => transport
-                .submit_tag_with_binding(
-                    original
-                        .capture_tag_admission_observation(&revision, "old tag", Mutation::Delete)
-                        .unwrap(),
-                    transport_correlation(),
-                    deadline,
-                )
-                .unwrap(),
+            Family::Tag => {
+                let observation = original
+                    .capture_tag_admission_observation(&revision, "old tag", Mutation::Delete)
+                    .unwrap();
+                assert_eq!(observation.selection().paths().len(), 1);
+                original
+                    .validate_tag_admission_observation(&observation)
+                    .unwrap();
+                transport
+                    .submit_tag_with_binding(observation, transport_correlation(), deadline)
+                    .unwrap()
+            }
             Family::Layout => transport
                 .submit_layout_with_binding(
                     original.capture_layout_metadata_budget(&revision).unwrap(),

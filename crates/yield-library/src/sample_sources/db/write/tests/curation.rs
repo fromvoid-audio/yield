@@ -4421,3 +4421,6 @@ mod tag_wal_preparation;
 mod layout_wal_preparation;
 
 mod policy_transport;
+
+#[path = "curation/tag_streaming_validation.rs"]
+mod tag_streaming_validation;
