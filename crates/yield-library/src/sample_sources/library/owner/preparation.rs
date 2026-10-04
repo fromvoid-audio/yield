@@ -96,9 +96,20 @@ pub struct GlobalPreparationRequest {
     deadline: Instant,
     expected_mutation_revision: Option<u64>,
     lifecycle_allocation: bool,
+    lifecycle_policy: bool,
     wal_binding: bool,
 }
 impl GlobalPreparationRequest {
+    /// Retain the exact capped lifecycle settings policy on the original global worker.
+    /// This pre-intent restriction includes strict native scope; it grants no SQL effect,
+    /// journal decision, physical qualification or required commit permit.
+    pub fn with_lifecycle_policy(mut self) -> Self {
+        self.lifecycle_allocation = true;
+        self.lifecycle_policy = true;
+        self.wal_binding = true;
+        self
+    }
+
     /// Request exact original native MAIN/WAL/SHM scope and bounded shared reply custody.
     /// This diagnostic route grants no decision latch, allocation policy or durable intent.
     pub fn with_wal_binding(mut self) -> Self {
@@ -157,6 +168,7 @@ impl GlobalPreparationRequest {
             deadline,
             expected_mutation_revision: None,
             lifecycle_allocation: false,
+            lifecycle_policy: false,
             wal_binding: false,
         })
     }
@@ -185,8 +197,15 @@ struct ObservationData {
     mutation_revision: u64,
     lifecycle_allocation: Option<crate::lifecycle_allocation::LifecycleDatabaseAllocation>,
     wal_scope: Option<GlobalWalScope>,
+    lifecycle_policy_entered: bool,
 }
 impl GlobalPreparationObservation {
+    /// Historical observation that the original worker installed/validated its capped policy.
+    /// A copy cannot retain the native reservation or authorize a later write.
+    pub fn lifecycle_policy_was_entered(&self) -> bool {
+        self.data.lifecycle_policy_entered
+    }
+
     /// Exact historical native scope, when requested on the original actual worker.
     /// Clones share immutable payload and its byte custody, never a live decision grant.
     pub fn wal_scope(&self) -> Option<&GlobalWalScope> {
@@ -397,6 +416,7 @@ pub(super) fn run(
     mutation_fence: &mutation_fence::MutationFence,
 ) -> bool {
     let mut began = false;
+    let mut policy = None;
     let preparation = (|| {
         canceled(&command, lifecycle)?;
         if command.request.owner.acquisition.as_str() != guard.owner_identity()
@@ -421,6 +441,19 @@ pub(super) fn run(
         validate(database, guard, &file)?;
         if !database.connection.is_autocommit() {
             return Err(GlobalPreparationError::ConnectionRetired);
+        }
+        if command.request.lifecycle_policy {
+            policy = Some(
+                super::super::lifecycle_allocation::policy::EnteredLifecyclePolicy::new(
+                    database,
+                    command.request.deadline,
+                )?,
+            );
+            policy
+                .as_mut()
+                .expect("original lifecycle policy")
+                .install()?;
+            canceled(&command, lifecycle)?;
         }
         let timeout: u64 = database
             .connection
@@ -450,7 +483,10 @@ pub(super) fn run(
             crate::sqlite_wal::enforce_wal_admission(&database.connection)?.observed_bytes();
         canceled(&command, lifecycle)?;
         mutation_fence.validate(Some(mutation_revision))?;
-        let lifecycle_allocation = if command.request.lifecycle_allocation {
+        let lifecycle_allocation = if let Some(policy) = &policy {
+            policy.validate_reserved(command.request.deadline)?;
+            Some(policy.allocation().clone())
+        } else if command.request.lifecycle_allocation {
             Some(database.capture_lifecycle_allocation(command.request.deadline)?)
         } else {
             None
@@ -483,6 +519,7 @@ pub(super) fn run(
                 mutation_revision,
                 lifecycle_allocation,
                 wal_scope,
+                lifecycle_policy_entered: policy.is_some(),
             }),
             _binding_credit: command.binding_credit.as_ref().map(Arc::clone),
         };
@@ -514,6 +551,11 @@ pub(super) fn run(
             {
                 break error;
             }
+            if let Some(policy) = &policy
+                && let Err(error) = policy.validate_settings()
+            {
+                break GlobalPreparationError::LifecycleAllocation(error);
+            }
             let wait = OWNER_POLL_INTERVAL.min(
                 command
                     .request
@@ -527,12 +569,30 @@ pub(super) fn run(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         };
+        // Cancellation/deadline can win before the next parked native poll. Revalidate
+        // original binding while still held before deciding reuse; this cleanup allowance
+        // does not extend preparation or publish another acknowledgement.
+        let cleanup_binding = retained_observation.wal_scope().map_or(Ok(()), |scope| {
+            validate(database, guard, &file).and_then(|_| {
+                binding::validate(
+                    database,
+                    scope,
+                    Instant::now() + GLOBAL_PREPARATION_MAX_DURATION,
+                )
+            })
+        });
         let rollback = database.connection.execute_batch("ROLLBACK");
         began = !database.connection.is_autocommit();
-        let reusable =
-            rollback.is_ok() && !began && outcome != GlobalPreparationError::DatabaseBinding;
-        let result = if rollback.is_err() || began {
+        let policy_restored = policy.as_mut().is_none_or(|policy| policy.finish().is_ok());
+        let reusable = rollback.is_ok()
+            && !began
+            && policy_restored
+            && cleanup_binding.is_ok()
+            && outcome != GlobalPreparationError::DatabaseBinding;
+        let result = if rollback.is_err() || began || !policy_restored {
             Err(GlobalPreparationError::ConnectionRetired)
+        } else if let Err(error) = cleanup_binding {
+            Err(error)
         } else if outcome == GlobalPreparationError::Canceled {
             Ok(())
         } else {
@@ -547,14 +607,18 @@ pub(super) fn run(
             let rollback_ok = !began
                 || (database.connection.execute_batch("ROLLBACK").is_ok()
                     && database.connection.is_autocommit());
+            let policy_restored = policy.as_mut().is_none_or(|policy| policy.finish().is_ok());
             let reusable = rollback_ok
+                && policy_restored
                 && error != GlobalPreparationError::ConnectionRetired
                 && error != GlobalPreparationError::DatabaseBinding;
-            let _ = command.ready.try_send(Err(if rollback_ok {
-                error
-            } else {
-                GlobalPreparationError::ConnectionRetired
-            }));
+            let _ = command
+                .ready
+                .try_send(Err(if rollback_ok && policy_restored {
+                    error
+                } else {
+                    GlobalPreparationError::ConnectionRetired
+                }));
             reusable
         }
     }
@@ -562,3 +626,6 @@ pub(super) fn run(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lifecycle_policy_tests;

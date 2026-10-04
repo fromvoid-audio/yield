@@ -79,9 +79,22 @@ impl LibraryDatabase {
         &self,
         deadline: Instant,
     ) -> Result<LifecycleDatabaseAllocation, LifecycleAllocationError> {
-        // Existing worker BEGIN IMMEDIATE owns writer exclusion. Never start a second owner
-        // or adopt an arbitrary autocommit connection as an actual retained reservation.
-        if self.connection.is_autocommit() {
+        self.capture_lifecycle_allocation_checked(deadline, false)
+    }
+    // Passive policy selection is never a reservation; exact facts MUST be revalidated
+    // after the sole worker acquires BEGIN IMMEDIATE on this same original connection.
+    pub(super) fn capture_lifecycle_policy_input(
+        &self,
+        deadline: Instant,
+    ) -> Result<LifecycleDatabaseAllocation, LifecycleAllocationError> {
+        self.capture_lifecycle_allocation_checked(deadline, true)
+    }
+    fn capture_lifecycle_allocation_checked(
+        &self,
+        deadline: Instant,
+        autocommit: bool,
+    ) -> Result<LifecycleDatabaseAllocation, LifecycleAllocationError> {
+        if self.connection.is_autocommit() != autocommit {
             return Err(LifecycleAllocationError::Unknown);
         }
         let _extensions = crate::sqlite_ext::try_extension_free_metadata_scope()
@@ -115,6 +128,8 @@ impl LibraryDatabase {
         })
     }
 }
+
+pub(super) mod policy;
 
 #[cfg(test)]
 mod tests;
