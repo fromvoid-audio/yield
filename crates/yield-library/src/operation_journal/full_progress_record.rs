@@ -92,6 +92,15 @@ impl FullProgressIntentObservation {
     /// not prove that capacity remains available, that claims are live reservations, or that the
     /// values authorize a physical operation.
     pub fn validate(&self) -> Result<(), FullProgressIntentObservationError> {
+        if matches!(&self.args, UniversalCommandArgs::SourceLegacyAdoption(_))
+            || self
+                .participants
+                .descriptors()
+                .iter()
+                .any(|d| d.kind() == super::ParticipantKind::LegacySource)
+        {
+            return Err(FullProgressIntentObservationError::LegacyAdoptionAdmissionUnavailable);
+        }
         if self.operation_id.as_uuid().is_nil() {
             return Err(FullProgressIntentObservationError::NilOperationId);
         }
@@ -153,6 +162,9 @@ impl FullProgressIntentObservation {
 /// Why a full-progress intent observation failed closed validation.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum FullProgressIntentObservationError {
+    /// This passive family has no genuine capacity-class/claim and durable adoption bridge yet.
+    #[error("legacy adoption requires the original-owner capacity and durable admission bridge")]
+    LegacyAdoptionAdmissionUnavailable,
     /// Source layout must cover its complete finite source peak and bounded journal transport only.
     #[error("source layout allocation inventory omits its peak or includes unrelated effects")]
     SourceLayoutAllocation,

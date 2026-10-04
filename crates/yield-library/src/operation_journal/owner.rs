@@ -556,6 +556,11 @@ impl PreparedAdmissionInput {
                 ),
             });
         }
+        if matches!(&self.args, UniversalCommandArgs::SourceLegacyAdoption(_)) {
+            return Err(PreparedAdmissionError::Unsupported {
+                reason: "legacy adoption requires the original-owner capacity and durable admission bridge".into(),
+            });
+        }
         if matches!(
             &self.args,
             UniversalCommandArgs::SourceDerivedLayout(_)
@@ -3546,6 +3551,14 @@ fn prepared_record(
     operation_id: OperationId,
     prepared: &PreparedAdmissionInput,
 ) -> Result<StoredOperationRecord, OperationJournalOwnerError> {
+    if matches!(prepared.args, UniversalCommandArgs::SourceLegacyAdoption(_)) {
+        return Err(PreparedAdmissionError::Unsupported {
+            reason:
+                "legacy adoption requires the original-owner capacity and durable admission bridge"
+                    .into(),
+        }
+        .into());
+    }
     if matches!(
         prepared.args,
         UniversalCommandArgs::SourceDerivedLayout(_)
@@ -5408,6 +5421,11 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
         } => {
             drop(input);
             execute_store_result(result, || {
+                if matches!(&args, UniversalCommandArgs::SourceLegacyAdoption(_)) {
+                    return Err(PreparedAdmissionError::Unsupported {
+                        reason: "legacy adoption requires the original-owner capacity and durable admission bridge".into(),
+                    }.into());
+                }
                 if matches!(&args, UniversalCommandArgs::SourceDerivedLayout(_)) {
                     return Err(PreparedAdmissionError::Unsupported {
                         reason: "source layout requires the actual retained all-owner pre-intent admission latch".into(),

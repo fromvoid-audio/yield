@@ -38,6 +38,7 @@ pub(crate) mod full_progress_codec;
 pub mod full_progress_record;
 pub mod full_status;
 pub mod history_commands;
+pub mod legacy_adoption_commands;
 pub mod metadata_tag_commands;
 pub mod model;
 pub mod namespace_commands;
@@ -284,10 +285,10 @@ pub use store::{
 };
 pub use validation::{RecordConsistency, classify_record};
 pub use work_plan::{
-    MAX_WORK_PLAN_EDGES, MAX_WORK_PLAN_UNITS, WORK_PLAN_VERSION, WORK_PLAN_VERSION_SOURCE_LAYOUT,
-    WORK_PLAN_VERSION_V1, WorkPlan, WorkPlanError, WorkPrerequisite, WorkUnit,
-    WorkUnitApplicability, WorkUnitKey, WorkUnitRole, derive_work_plan, derive_work_plan_v1,
-    validate_work_plan,
+    MAX_WORK_PLAN_EDGES, MAX_WORK_PLAN_UNITS, WORK_PLAN_VERSION, WORK_PLAN_VERSION_LEGACY_ADOPTION,
+    WORK_PLAN_VERSION_SOURCE_LAYOUT, WORK_PLAN_VERSION_V1, WorkPlan, WorkPlanError,
+    WorkPrerequisite, WorkUnit, WorkUnitApplicability, WorkUnitKey, WorkUnitRole, derive_work_plan,
+    derive_work_plan_v1, validate_work_plan,
 };
 pub use work_progress::{
     AfterEffectReconciliationObservation, AuditTarget, AuditTargetValidationError,

@@ -1633,6 +1633,27 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
             reason: String::from("schema_version must be an unsigned 32-bit integer"),
         })?;
     if version <= SCHEMA_V17
+        && (value.pointer("/intent/kind").and_then(Value::as_str) == Some("SourceLegacyAdoption")
+            || value
+                .pointer("/universal_intent/command_kind")
+                .and_then(Value::as_str)
+                == Some("SourceLegacyAdoption")
+            || value
+                .pointer("/universal_command_args/SourceLegacyAdoption")
+                .is_some()
+            || value
+                .pointer("/universal_intent/participants/descriptors")
+                .and_then(Value::as_array)
+                .is_some_and(|ds| {
+                    ds.iter()
+                        .any(|d| d.get("kind").and_then(Value::as_str) == Some("LegacySource"))
+                }))
+    {
+        return Err(malformed(
+            "legacy adoption requires a separately admitted durable codec",
+        ));
+    }
+    if version <= SCHEMA_V17
         && (value.pointer("/intent/kind").and_then(Value::as_str) == Some("SourceDerivedLayout")
             || value
                 .pointer("/universal_intent/command_kind")
@@ -1909,6 +1930,23 @@ impl<'de> Visitor<'de> for UniqueValueVisitor {
 /// V4 and V5 encode their explicitly bounded pre-publication observations; later transition and
 /// publication-policy validation belongs to the owner boundary.
 pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
+    if record.intent.kind == OperationKind::SourceLegacyAdoption
+        || matches!(
+            &record.universal_command_args,
+            Some(UniversalCommandArgs::SourceLegacyAdoption(_))
+        )
+        || record.universal_intent.as_ref().is_some_and(|i| {
+            i.command_kind() == super::model::UniversalCommandKind::SourceLegacyAdoption
+                || i.participants()
+                    .descriptors()
+                    .iter()
+                    .any(|d| d.kind() == super::ParticipantKind::LegacySource)
+        })
+    {
+        return Err(EncodeError::InvalidV16Record {
+            reason: "legacy adoption requires a separately admitted durable codec".into(),
+        });
+    }
     if record.intent.kind == OperationKind::SourceDerivedLayout
         || record.universal_intent.as_ref().is_some_and(|i| {
             i.command_kind() == super::model::UniversalCommandKind::SourceDerivedLayout
@@ -3625,6 +3663,9 @@ pub(crate) fn validate_v6_coordinator_shape(record: &StoredOperationRecord) -> R
         UniversalCommandArgs::Copy(_)
         | UniversalCommandArgs::Import(_)
         | UniversalCommandArgs::DuplicateSame(_) => {}
+        UniversalCommandArgs::SourceLegacyAdoption(_) => {
+            return Err("legacy adoption is not a legacy filesystem command".into());
+        }
         UniversalCommandArgs::SourceDerivedLayout(_) => {
             return Err("source layout is not a legacy filesystem command".into());
         }
@@ -4000,6 +4041,9 @@ pub(crate) fn validate_full_initial_shape(record: &StoredOperationRecord) -> Res
 
 pub(crate) fn validate_v16_coordinator_shape(record: &StoredOperationRecord) -> Result<(), String> {
     match record.intent.kind {
+        OperationKind::SourceLegacyAdoption => {
+            Err("legacy adoption requires a separately admitted durable codec".into())
+        }
         OperationKind::SourceDerivedLayout => {
             Err("source layout requires its separate full-progress family".into())
         }
@@ -4074,6 +4118,7 @@ fn validate_tagged_coordinator_shape(
             OperationActor::ExternalFs => "an external-fs",
         };
         let operation_kind_label = match expected_operation_kind {
+            OperationKind::SourceLegacyAdoption => "source-legacy-adoption",
             OperationKind::SourceDerivedLayout => "source-derived-layout",
             OperationKind::FileMutation => "file-mutation",
             OperationKind::FileHistory => "file-history",
@@ -4102,6 +4147,7 @@ fn validate_tagged_coordinator_shape(
         .as_ref()
         .ok_or_else(|| format!("{schema_name} record requires tagged command arguments"))?;
     let variant = match command_args {
+        UniversalCommandArgs::SourceLegacyAdoption(_) => "SourceLegacyAdoption",
         UniversalCommandArgs::SourceDerivedLayout(_) => "SourceDerivedLayout",
         UniversalCommandArgs::Recording(_) => "Recording",
         UniversalCommandArgs::Copy(_) => "Copy",
