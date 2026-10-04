@@ -362,3 +362,296 @@ fn failed_empty_reservation_cannot_use_another_sources_actual_guard() {
     drop(wrong_authority);
     drop(different);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_wal_binding_revalidates_without_ordinary_sql_and_rejects_new_nonce() {
+    let (_fixture, writer) = fixture();
+    let revision = writer.current_revision().unwrap();
+    let registration = writer.database.prepare_source_authority().unwrap();
+    let other = external(&writer);
+    let lease_before = lease_row(&other);
+    let metadata_before = metadata(&other);
+    let main_changes = writer.database.connection.total_changes();
+    let control_changes = writer
+        .database
+        .source_lease_control_total_changes_for_tests()
+        .unwrap()
+        .unwrap();
+    let handle = unsafe { writer.database.connection.handle() };
+    let preparation = writer
+        .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    let binding = preparation.capture_wal_binding(&registration).unwrap();
+    assert_eq!(
+        binding.subject().registration().unwrap().phase(),
+        crate::sample_sources::SourceRegistryRegistrationPhase::Prepared
+    );
+    assert_eq!(
+        binding.subject().profile_acquisition().to_string(),
+        _fixture._profile.owner_identity()
+    );
+    assert_eq!(binding.main().identity(), revision.database_identity());
+    assert_ne!(binding.main().identity(), binding.wal().identity());
+    assert_ne!(binding.wal().identity(), binding.shm().identity());
+    assert_eq!(binding.main().device(), binding.shm().device());
+    assert!(binding.descriptor_bytes().len() <= super::SOURCE_WAL_BINDING_MAX_BYTES);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let calls = attempts.clone();
+    preparation
+        .writer()
+        .database
+        .connection
+        .authorizer(Some(move |_: AuthContext<'_>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Authorization::Deny
+        }));
+    for _ in 0..5 {
+        preparation
+            .validate_wal_binding(&binding, &registration)
+            .unwrap();
+        busy(&other);
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        preparation.writer().database.connection.total_changes(),
+        main_changes
+    );
+    assert_eq!(
+        preparation
+            .writer()
+            .database
+            .source_lease_control_total_changes_for_tests()
+            .unwrap()
+            .unwrap(),
+        control_changes
+    );
+    assert_eq!(lease_row(&other), lease_before);
+    assert_eq!(metadata(&other), metadata_before);
+    preparation
+        .writer()
+        .database
+        .connection
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    let writer = preparation.abort().unwrap();
+    assert_eq!(unsafe { writer.database.connection.handle() }, handle);
+    let again = writer
+        .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    assert!(matches!(
+        again.validate_wal_binding(&binding, &registration),
+        Err(SourceWalPreparationError::BindingUnavailable)
+    ));
+    again.capture_wal_binding(&registration).unwrap();
+    let writer = again.abort().unwrap();
+    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    drop(registration);
+    writer.close().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_wal_binding_rejects_foreign_registration_and_native_sidecar_replacements() {
+    let (fixture, writer) = fixture();
+    let foreign = SourceDatabase::open_for_catalog_with_profile_guard(
+        &fixture.media,
+        &fixture._profile,
+        Path::new("foreign-wal-binding"),
+    )
+    .unwrap();
+    let wrong = foreign.prepare_source_authority().unwrap();
+    let actual = writer.database.prepare_source_authority().unwrap();
+    let revision = writer.current_revision().unwrap();
+    let other = external(&writer);
+    let path = writer.database.db_path.clone();
+    let preparation = writer
+        .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    assert!(matches!(
+        preparation.capture_wal_binding(&wrong),
+        Err(SourceWalPreparationError::BindingUnavailable)
+    ));
+    let binding = preparation.capture_wal_binding(&actual).unwrap();
+    assert!(matches!(
+        preparation.validate_wal_binding(&binding, &wrong),
+        Err(SourceWalPreparationError::BindingUnavailable)
+    ));
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+        let saved = sidecar.with_extension("original");
+        fs::rename(&sidecar, &saved).unwrap();
+        let len = fs::metadata(&saved).unwrap().len();
+        let replacement = fs::File::create(&sidecar).unwrap();
+        replacement.set_len(len).unwrap();
+        assert!(matches!(
+            preparation.validate_wal_binding(&binding, &actual),
+            Err(SourceWalPreparationError::BindingUnavailable)
+        ));
+        assert!(matches!(
+            preparation.capture_wal_binding(&actual),
+            Err(SourceWalPreparationError::BindingUnavailable)
+        ));
+        assert!(!preparation.writer().database.connection.is_autocommit());
+        fs::remove_file(&sidecar).unwrap();
+        fs::rename(&saved, &sidecar).unwrap();
+        preparation.validate_wal_binding(&binding, &actual).unwrap();
+        busy(&other);
+    }
+    let writer = preparation.abort().unwrap();
+    drop(actual);
+    drop(wrong);
+    foreign.close().unwrap();
+    writer.close().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_wal_binding_rejects_unknown_schema_without_releasing_main() {
+    let (_fixture, writer) = fixture();
+    writer
+        .database
+        .connection
+        .execute_batch("CREATE TABLE unsupported_binding_schema(x INTEGER)")
+        .unwrap();
+    let revision = writer.current_revision().unwrap();
+    let actual = writer.database.prepare_source_authority().unwrap();
+    let other = external(&writer);
+    let preparation = writer
+        .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    assert!(matches!(
+        preparation.capture_wal_binding(&actual),
+        Err(SourceWalPreparationError::BindingUnavailable)
+    ));
+    busy(&other);
+    let writer = preparation.abort().unwrap();
+    writer
+        .database
+        .connection
+        .execute_batch("DROP TABLE unsupported_binding_schema")
+        .unwrap();
+    let preparation = writer
+        .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    preparation.capture_wal_binding(&actual).unwrap();
+    let writer = preparation.abort().unwrap();
+    drop(actual);
+    writer.close().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_wal_binding_never_extends_original_deadline_or_releases_on_expiry() {
+    let (_fixture, writer) = fixture();
+    let revision = writer.current_revision().unwrap();
+    let registration = writer.database.prepare_source_authority().unwrap();
+    let other = external(&writer);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let preparation = writer.prepare_wal_reservation(&revision, deadline).unwrap();
+    let binding = preparation.capture_wal_binding(&registration).unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    for _ in 0..3 {
+        assert!(matches!(
+            preparation.validate_wal_binding(&binding, &registration),
+            Err(SourceWalPreparationError::Deadline)
+        ));
+        assert!(matches!(
+            preparation.capture_wal_binding(&registration),
+            Err(SourceWalPreparationError::Deadline)
+        ));
+        assert_eq!(preparation.deadline, deadline);
+        busy(&other);
+    }
+    let writer = preparation.abort().unwrap();
+    drop(registration);
+    writer.close().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_wal_binding_refuses_unknown_runtime_and_missing_completed_audit() {
+    unsafe extern "C" fn callback(
+        context: *mut rusqlite::ffi::sqlite3_context,
+        _: std::ffi::c_int,
+        _: *mut *mut rusqlite::ffi::sqlite3_value,
+    ) {
+        // SAFETY: SQLite supplies the callback's live result context; no borrowed state.
+        unsafe { rusqlite::ffi::sqlite3_result_int(context, 1) };
+    }
+    for runtime_fault in [true, false] {
+        let (_fixture, writer) = fixture();
+        let revision = writer.current_revision().unwrap();
+        let registration = writer.database.prepare_source_authority().unwrap();
+        let other = external(&writer);
+        let before = metadata(&other);
+        let preparation = writer
+            .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        preparation.capture_wal_binding(&registration).unwrap();
+        // Private fault injection on the original connection. Public preparations expose no SQL.
+        if runtime_fault {
+            // SAFETY: actual exclusively retained connection; callback has static lifetime
+            // and no application state. Only this private test registers it.
+            let code = unsafe {
+                rusqlite::ffi::sqlite3_create_function_v2(
+                    preparation.writer().database.connection.handle(),
+                    c"unsupported_wal_binding_callback".as_ptr(),
+                    0,
+                    rusqlite::ffi::SQLITE_UTF8,
+                    std::ptr::null_mut(),
+                    Some(callback),
+                    None,
+                    None,
+                    None,
+                )
+            };
+            assert_eq!(code, rusqlite::ffi::SQLITE_OK);
+        } else {
+            preparation
+                .writer()
+                .database
+                .connection
+                .execute(
+                    "DELETE FROM metadata WHERE key=?1",
+                    [crate::sample_sources::db::META_LAST_AUTHORITATIVE_AUDIT_REVISION],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            preparation.capture_wal_binding(&registration),
+            Err(SourceWalPreparationError::BindingUnavailable)
+        ));
+        busy(&other);
+        assert_eq!(
+            metadata(&other),
+            before,
+            "fault did not publish an audit change"
+        );
+        let writer = preparation.abort().unwrap();
+        if runtime_fault {
+            // SAFETY: same returned connection, no outstanding statements or callback state.
+            let code = unsafe {
+                rusqlite::ffi::sqlite3_create_function_v2(
+                    writer.database.connection.handle(),
+                    c"unsupported_wal_binding_callback".as_ptr(),
+                    0,
+                    rusqlite::ffi::SQLITE_UTF8,
+                    std::ptr::null_mut(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            assert_eq!(code, rusqlite::ffi::SQLITE_OK);
+        }
+        assert_eq!(writer.current_revision().unwrap(), revision);
+        let preparation = writer
+            .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        preparation.capture_wal_binding(&registration).unwrap();
+        let writer = preparation.abort().unwrap();
+        drop(registration);
+        writer.close().unwrap();
+    }
+}

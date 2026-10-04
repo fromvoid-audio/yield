@@ -394,7 +394,9 @@ fn classify(error: &SourceWalPreparationError) -> CatalogSourceWalRejection {
         SourceWalPreparationError::LeaseRenewalRequired => {
             CatalogSourceWalRejection::LeaseRenewalRequired
         }
-        SourceWalPreparationError::Owner(_) => CatalogSourceWalRejection::Scope,
+        SourceWalPreparationError::Owner(_) | SourceWalPreparationError::BindingUnavailable => {
+            CatalogSourceWalRejection::Scope
+        }
         SourceWalPreparationError::Wal(_) | SourceWalPreparationError::Sqlite(_) => {
             CatalogSourceWalRejection::WalUnavailable
         }

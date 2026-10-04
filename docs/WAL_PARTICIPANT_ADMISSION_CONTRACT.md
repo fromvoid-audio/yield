@@ -230,3 +230,42 @@ bash scripts/agent.sh preflight
 New leaves must add the real-owner cases above, rebase and rerun affected checks,
 and record exact commands/results. Source-model latches, finite fixtures and Linux
 VFS observations alone are not production multi-owner or physical qualification.
+
+## Original source reservation binding (OPT-2247)
+
+`SourceWalPreparation::capture_wal_binding` now produces a non-Clone,
+non-deserializable `SourceWalBinding` from the actual retained empty MAIN
+transaction and its genuine `SourceAuthorityRegistration`. It captures the
+source/lifecycle, original profile acquisition and lease owner/epoch, media and
+database roots, MAIN/root binding, current completed audit and observed local
+registration phase. The initial bounded read checks the compiled source schema
+and SQLite runtime; missing/stale audit, unknown schema/runtime, foreign
+registration and unverified native objects reject without releasing MAIN.
+
+The binding also observes actual retained forwarding-VFS MAIN and WAL objects
+and SQLite's mapped SHM object: distinct native identities, the same database
+device/allocation unit and captured lengths. Its historical version-1 descriptor
+is bounded to 16 KiB while being encoded. A coordinator still must account for
+all owned in-memory copies and the entire 64 KiB handshake; these bytes are not
+a new durable journal inventory format. The private binding additionally retains
+original writer liveness, preparation nonce and the unchanged original deadline.
+Another preparation on the same writer cannot reuse it.
+
+`validate_wal_binding` performs no ordinary SQL. It checks original custody,
+read-only CONTROL ownership, the genuine registration observation and the
+current retained native objects, with the original deadline checked again after
+validation. Captured object lengths must still match exactly; any change fails
+closed and requires a fresh pre-intent capture, never renewal or retry permission.
+Before any future decision latch, expiry/drop/abort keep the existing empty
+preparation semantics: failure itself does not prove rollback, and reuse requires
+confirmed abort on the original connection.
+
+A genuine local Prepared registration is deliberately observable and remains
+insufficient for complete journal/reserve installation. These APIs establish no
+selected allocation policy, physical qualification, capacity claim, operation
+ID, decision latch, required/recovery permit or settlement. Retained native
+object capture currently supports the Linux forwarding VFS only; other native
+adapters return unavailable. OPT-2136 still owns actual catalog/global transport,
+complete database inventory and all-owner acknowledgements before admission,
+the atomic decision nonce, and indefinite lock/custody retention once settlement
+can commit. Those requirements are unchanged by this binding prerequisite.
