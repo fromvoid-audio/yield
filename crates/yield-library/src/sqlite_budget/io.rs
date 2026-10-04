@@ -761,7 +761,7 @@ static V3: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
 
 /// Borrow the actual Unix descriptor only from this exact wrapper and locked bundled layout.
 /// sqlite3.c 3.50.2 unixFile begins with these four fields before any conditional fields.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) unsafe fn known_unix_descriptor(
     file: *mut ffi::sqlite3_file,
     ctx: &Context,
@@ -791,11 +791,14 @@ pub(super) unsafe fn known_unix_descriptor(
             || (*ctx.native).szOsFile < std::mem::size_of::<UnixPrefix>() as c_int {
             return None;
         }
+        #[cfg(target_os = "linux")]
         let expected = ffi::sqlite3_vfs_find(c"yield-linux-retained-root-v1".as_ptr());
+        #[cfg(target_os = "macos")]
+        let expected = ffi::sqlite3_vfs_find(c"unix".as_ptr());
         if expected.is_null() || ctx.native != expected {
             return None;
         }
-        // Exact adapter delegates xOpen unchanged to the pinned bundled Unix VFS. No
+        // The Linux adapter delegates xOpen unchanged; macOS uses the pinned Unix VFS. No
         // conditional field precedes descriptor; alignment is the wrapper's native alignment.
         let native = &*inner(file).cast::<UnixPrefix>();
         if native.vfs != ctx.native || native.methods.is_null() || native.descriptor < 0 {
