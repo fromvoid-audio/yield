@@ -173,6 +173,9 @@ mod integration {
             let next = reserve_strict(writer, Duration::from_secs(1));
             assert_ne!(view.nonce(), next.observation().nonce());
             release(next);
+            // Release delivery precedes disposal of the worker's final observation.
+            // A following actual command proves that custody has dropped.
+            empty(writer);
             drop(view);
             assert_eq!(charged(writer), 0);
         });
