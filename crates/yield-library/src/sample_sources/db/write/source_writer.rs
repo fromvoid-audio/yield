@@ -467,6 +467,17 @@ impl Drop for SnapshotProgressGuard<'_> {
 }
 
 impl SourceRevision {
+    pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
+        [
+            self.source_id.retained_heap_bytes(),
+            self.root_identity.retained_heap_bytes(),
+            self.root_binding_identity.capacity(),
+            self.database_identity.capacity(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+    }
+
     /// Borrow the source identity named by the owner.
     pub fn source_id(&self) -> &SourceId {
         &self.source_id

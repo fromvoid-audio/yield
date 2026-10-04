@@ -443,3 +443,48 @@ cargo test --locked -p yield-library --doc GlobalWalPreparationClient
 cargo test --locked -p yield-library --lib
 bash scripts/agent.sh preflight
 ```
+
+## Genuine source family policy transport (OPT-2258)
+
+The sealed source requester consumes an original `SourceTagAdmissionObservation`
+or `SourceLayoutMetadataBudget`, deriving the revision and the minimum original
+observation/request deadline. The existing catalog inbox moves the same actual
+source writer into its original typed tag/layout preparation. Full family facts
+are checked before entry and inside the empty immediate transaction. The original
+finite settings and extension guard remain held during strict MAIN/WAL/SHM scope
+capture. No alternate SQLite owner or caller-defined positive policy is accepted.
+
+After initial complete scope capture, parked validation checks original CONTROL
+custody, native objects, source registration and entered settings. It performs no
+ordinary source row, schema, page, assignment or generation reads, and no lease
+renewal. Actual SQLite authorizer tests deny those operations while parked.
+Policy family in copied diagnostics describes successful original entry only;
+it carries no current journal acknowledgement, physical grant or settlement right.
+
+The existing 64-slot/64 KiB handshake pool charges complete typed input allocations,
+including selection vector backing capacity, path/string capacities and retained
+revision copies, in addition to native/context bookkeeping and strict scope staging.
+A valid standalone selection that cannot fit this transport is rejected before
+acquiring SQLite custody. Pending rejection drops policy payloads before refunding
+input credits. Historical diagnostics retain independent shared credits after abort.
+
+Cancellation returns the identical writer only after real empty rollback and exact
+settings restoration. Failed rollback/settings restoration retains typed custody;
+a preexisting transaction is never adopted or returned. Failed custody uses the
+original source authority close path, and Retired requires its genuine returned
+acknowledgement. Prepared authority rejection is tested without a manufactured
+journal drain. Positive protected-reserve retirement qualification still requires
+OPT-2026 resources; the portable rejection tests do not complete that qualification.
+
+Full OPT-2136 remains open: complete affected-family inventory and directions,
+genuine current journal registration, sealed decision custody, atomic nonce/intent/
+claims, uncertain settlement readback/restart and native qualification are required.
+This transport retains pre-intent abort semantics and cannot acknowledge settlement.
+
+```sh
+cargo test --locked -p yield-library --lib policy_transport
+cargo test --locked -p yield-library --test source_wal_policy_transport
+cargo test --locked -p yield-library --lib
+cargo check --locked -p yield-catalog
+bash scripts/agent.sh preflight
+```

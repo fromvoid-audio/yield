@@ -87,6 +87,9 @@ pub use source_entry::{
 pub struct SourceId(String);
 
 impl SourceId {
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        self.0.capacity()
+    }
     /// Create a new unique source identifier.
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string())

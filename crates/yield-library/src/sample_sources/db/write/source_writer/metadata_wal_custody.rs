@@ -17,6 +17,58 @@ pub(super) enum Owner {
     Failed(SourceWalPreparationFailure),
 }
 impl Custody {
+    pub(super) fn held(&self) -> Result<&SourceWalPreparation, SourceWalPreparationError> {
+        match self.owner.as_ref() {
+            Some(Owner::Held(held)) => Ok(held),
+            _ => Err(SourceWalPreparationError::RollbackUnconfirmed),
+        }
+    }
+    pub(super) fn validate_parked(&self) -> Result<(), SourceWalPreparationError> {
+        let held = self.held()?;
+        held.revalidate_owner()?;
+        self.policy
+            .as_ref()
+            .ok_or(SourceWalPreparationError::RollbackUnconfirmed)?
+            .validate_parked(&held.writer().database)?;
+        Ok(())
+    }
+    pub(super) fn retained_database_identity(&self) -> Option<&str> {
+        self.writer()
+            .database
+            .database_file_binding
+            .as_deref()
+            .map(|b| b.identity())
+    }
+    pub(super) fn source_authority_close_ready(&self) -> bool {
+        self.writer().database.source_authority_close_ready()
+    }
+    pub(super) fn close_for_retirement(
+        mut self,
+        authority: &mut crate::sample_sources::db::SourceAuthorityRegistration,
+    ) -> Result<
+        crate::sample_sources::db::SourceAuthorityRetirementAck,
+        crate::sample_sources::db::SourceAuthorityError,
+    > {
+        use crate::sample_sources::db::SourceAuthorityError;
+        match self.owner.take().expect("original policy custody") {
+            Owner::Unprepared {
+                writer,
+                created_transaction,
+            } => {
+                if !created_transaction && !writer.database.connection.is_autocommit() {
+                    self.owner = Some(Owner::Unprepared {
+                        writer,
+                        created_transaction,
+                    });
+                    return Err(SourceAuthorityError::InvalidLifecycle);
+                }
+                authority.close_database(writer.into_catalog_database())
+            }
+            Owner::Held(held) => held.close_for_retirement(authority),
+            Owner::Failed(failed) => failed.close_for_retirement(authority),
+        }
+    }
+
     pub(super) fn writer(&self) -> &SourceWriter {
         match self.owner.as_ref().expect("retained tag owner") {
             Owner::Unprepared { writer, .. } => writer,

@@ -140,6 +140,18 @@ impl fmt::Debug for SourceWalPreparation {
 }
 
 impl SourceWalPreparation {
+    pub(crate) fn close_for_retirement(
+        mut self,
+        authority: &mut SourceAuthorityRegistration,
+    ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
+        if !self.held.reservation && !self.held.writer().database.connection.is_autocommit() {
+            return Err(SourceAuthorityError::InvalidLifecycle);
+        }
+        let writer = self.held.writer.take().expect("original empty reservation");
+        self.held.reservation = false;
+        authority.close_database(writer.into_catalog_database())
+    }
+
     pub(super) fn writer(&self) -> &SourceWriter {
         self.held.writer()
     }

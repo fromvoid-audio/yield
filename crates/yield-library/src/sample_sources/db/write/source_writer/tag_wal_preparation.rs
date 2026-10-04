@@ -121,6 +121,13 @@ impl SourceWriter {
     }
 }
 impl SourceTagWalPreparation {
+    pub(crate) fn original_wal_preparation(
+        &self,
+    ) -> Result<&super::SourceWalPreparation, SourceWalPreparationError> {
+        self.custody.validate_parked()?;
+        self.custody.held()
+    }
+
     /// Frozen observations only, never a commit or journal decision grant.
     pub fn observation(&self) -> &SourceTagAdmissionObservation {
         &self.observation
@@ -170,6 +177,22 @@ impl SourceTagWalPreparation {
     }
 }
 impl SourceTagWalPreparationFailure {
+    pub(crate) fn retained_database_identity(&self) -> Option<&str> {
+        self.custody.retained_database_identity()
+    }
+    pub(crate) fn source_authority_close_ready(&self) -> bool {
+        self.custody.source_authority_close_ready()
+    }
+    pub(crate) fn close_for_retirement(
+        self,
+        authority: &mut crate::sample_sources::db::SourceAuthorityRegistration,
+    ) -> Result<
+        crate::sample_sources::db::SourceAuthorityRetirementAck,
+        crate::sample_sources::db::SourceAuthorityError,
+    > {
+        self.custody.close_for_retirement(authority)
+    }
+
     /// Typed failure while the exact owner remains inaccessible.
     pub fn error(&self) -> &SourceWalPreparationError {
         if let Some(Owner::Failed(failed)) = self.custody.owner.as_ref() {

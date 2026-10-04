@@ -18,6 +18,15 @@ pub struct SourceTagAdmissionObservation {
     lease: Weak<SourceLease>,
 }
 impl SourceTagAdmissionObservation {
+    pub(crate) fn original_deadline(&self) -> Instant {
+        self.deadline()
+    }
+    pub(crate) fn retained_input_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>()
+            .checked_add(self.selection.retained_heap_bytes()?)?
+            .checked_add(self.budget.revision().retained_heap_bytes()?)
+    }
+
     pub(super) fn deadline(&self) -> Instant {
         self.deadline.min(self.budget.deadline())
     }
