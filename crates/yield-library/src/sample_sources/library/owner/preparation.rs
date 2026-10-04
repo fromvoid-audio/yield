@@ -4,10 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::*;
+
+pub(super) mod binding;
 use crate::sample_sources::db::sqlite_identity::{
     OpenedDatabaseFile, open_existing_database_file, validate_connection_identity,
     validate_database_file_identity,
 };
+pub use binding::{GlobalWalObjectObservation, GlobalWalScope};
 
 /// Maximum complete preparation handshake encoding, across all participants.
 pub const GLOBAL_PREPARATION_MAX_BYTES: usize = 64 * 1024;
@@ -93,8 +96,16 @@ pub struct GlobalPreparationRequest {
     deadline: Instant,
     expected_mutation_revision: Option<u64>,
     lifecycle_allocation: bool,
+    wal_binding: bool,
 }
 impl GlobalPreparationRequest {
+    /// Request exact original native MAIN/WAL/SHM scope and bounded shared reply custody.
+    /// This diagnostic route grants no decision latch, allocation policy or durable intent.
+    pub fn with_wal_binding(mut self) -> Self {
+        self.wal_binding = true;
+        self
+    }
+
     /// Request exact finite lifecycle allocation observations under this empty reservation.
     /// Unknown schema/native objects refuse; this selects no SQL effect or physical permit.
     pub fn with_lifecycle_allocation(mut self) -> Self {
@@ -112,13 +123,13 @@ impl GlobalPreparationRequest {
         handshake_bytes: usize,
     ) -> Result<Self, GlobalPreparationError> {
         let mut request = Self::new(
-            observation.owner.clone(),
+            observation.owner().clone(),
             command_digest,
             deadline,
             affected_databases,
             handshake_bytes,
         )?;
-        request.expected_mutation_revision = Some(observation.mutation_revision);
+        request.expected_mutation_revision = Some(observation.mutation_revision());
         Ok(request)
     }
     /// Use the coordinator's original deadline; never restart it on delayed submission.
@@ -146,13 +157,26 @@ impl GlobalPreparationRequest {
             deadline,
             expected_mutation_revision: None,
             lifecycle_allocation: false,
+            wal_binding: false,
         })
     }
 }
 
 /// Copyable diagnostics from the actual retained worker, not a reusable grant or latch.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct GlobalPreparationObservation {
+    data: Arc<ObservationData>,
+    // Shared with the original worker; final view releases only this local memory credit.
+    _binding_credit: Option<Arc<binding::Credit>>,
+}
+impl PartialEq for GlobalPreparationObservation {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+impl Eq for GlobalPreparationObservation {}
+#[derive(Debug, Eq, PartialEq)]
+struct ObservationData {
     owner: GlobalPreparationOwner,
     database_identity: String,
     command_digest: [u8; 32],
@@ -160,48 +184,55 @@ pub struct GlobalPreparationObservation {
     wal_bytes: u64,
     mutation_revision: u64,
     lifecycle_allocation: Option<crate::lifecycle_allocation::LifecycleDatabaseAllocation>,
+    wal_scope: Option<GlobalWalScope>,
 }
 impl GlobalPreparationObservation {
+    /// Exact historical native scope, when requested on the original actual worker.
+    /// Clones share immutable payload and its byte custody, never a live decision grant.
+    pub fn wal_scope(&self) -> Option<&GlobalWalScope> {
+        self.data.wal_scope.as_ref()
+    }
+
     /// Actual bounded lifecycle facts from this exact held worker, when requested.
     /// Copying observations grants no admission, required commit or capacity qualification.
     pub fn lifecycle_allocation(
         &self,
     ) -> Option<&crate::lifecycle_allocation::LifecycleDatabaseAllocation> {
-        self.lifecycle_allocation.as_ref()
+        self.data.lifecycle_allocation.as_ref()
     }
 
     /// Checked mutation dispatch revision within this exact worker registration.
     /// It is neither a durable database revision nor a capacity/commit permission.
     pub fn mutation_revision(&self) -> u64 {
-        self.mutation_revision
+        self.data.mutation_revision
     }
     /// Profile acquisition actually validated by the issuing worker.
     pub fn acquisition(&self) -> &ProfileAcquisitionId {
-        self.owner.acquisition()
+        self.data.owner.acquisition()
     }
     /// Exact worker registration behind this diagnostic.
     pub fn owner(&self) -> &GlobalPreparationOwner {
-        &self.owner
+        &self.data.owner
     }
     /// Descriptor-derived physical identity for coordinator alias/conflict checks.
     pub fn database_identity(&self) -> &str {
-        &self.database_identity
+        &self.data.database_identity
     }
     /// Immutable command correlation; not proof of a validated journal command.
     pub fn command_digest(&self) -> &[u8; 32] {
-        &self.command_digest
+        &self.data.command_digest
     }
     /// Owner-issued, non-durable correlation, never an OperationId.
     pub fn nonce(&self) -> uuid::Uuid {
-        self.nonce
+        self.data.nonce
     }
     /// Actual retained WAL size under the empty writer lock.
     pub fn wal_bytes(&self) -> u64 {
-        self.wal_bytes
+        self.data.wal_bytes
     }
     /// Diagnostic request for passive catch-up after release, not a checkpoint request.
     pub fn needs_catch_up(&self) -> bool {
-        self.wal_bytes >= crate::WAL_SOFT_WATERMARK_BYTES
+        self.data.wal_bytes >= crate::WAL_SOFT_WATERMARK_BYTES
     }
 }
 
@@ -275,6 +306,7 @@ pub(super) struct Command {
     request: GlobalPreparationRequest,
     canceled: Arc<AtomicBool>,
     ready: SyncSender<Result<GlobalPreparationReservation, GlobalPreparationError>>,
+    binding_credit: Option<Arc<binding::Credit>>,
 }
 impl Command {
     pub(super) fn reject(self) {
@@ -292,12 +324,19 @@ impl GlobalLibraryWriter {
         &self,
         request: GlobalPreparationRequest,
     ) -> Result<GlobalPreparationPending, GlobalLibraryWriterQueueError> {
+        self.ensure_available()?;
+        let binding_credit = if request.wal_binding {
+            Some(self.preparation_binding_budget.reserve()?)
+        } else {
+            None
+        };
         let (ready, receiver) = mpsc::sync_channel(1);
         let canceled = Arc::new(AtomicBool::new(false));
         self.send(WriterCommand::Prepare(Command {
             request,
             canceled: Arc::clone(&canceled),
             ready,
+            binding_credit,
         }))?;
         Ok(GlobalPreparationPending {
             ready: receiver,
@@ -418,18 +457,39 @@ pub(super) fn run(
         };
         canceled(&command, lifecycle)?;
         validate(database, guard, &file)?;
+        let nonce = uuid::Uuid::new_v4();
+        let wal_scope = if command.request.wal_binding {
+            Some(binding::capture(
+                database,
+                &command.request,
+                nonce,
+                mutation_revision,
+                &file.identity,
+                lifecycle_allocation.as_ref(),
+            )?)
+        } else {
+            None
+        };
+        canceled(&command, lifecycle)?;
         let (control, controls) = mpsc::sync_channel(1);
         let (released, release_rx) = mpsc::sync_channel(1);
-        let reservation = GlobalPreparationReservation {
-            observation: GlobalPreparationObservation {
+        let observation = GlobalPreparationObservation {
+            data: Arc::new(ObservationData {
                 owner: command.request.owner.clone(),
                 database_identity: file.identity.clone(),
                 command_digest: command.request.command_digest,
-                nonce: uuid::Uuid::new_v4(),
+                nonce,
                 wal_bytes,
                 mutation_revision,
                 lifecycle_allocation,
-            },
+                wal_scope,
+            }),
+            _binding_credit: command.binding_credit.as_ref().map(Arc::clone),
+        };
+        // Original worker keeps the same immutable scope and byte custody until rollback.
+        let retained_observation = observation.clone();
+        let reservation = GlobalPreparationReservation {
+            observation,
             canceled: Arc::clone(&command.canceled),
             control,
             released: Some(release_rx),
@@ -447,6 +507,11 @@ pub(super) fn run(
                 break error;
             }
             if let Err(error) = validate(database, guard, &file) {
+                break error;
+            }
+            if let Some(scope) = retained_observation.wal_scope()
+                && let Err(error) = binding::validate(database, scope, command.request.deadline)
+            {
                 break error;
             }
             let wait = OWNER_POLL_INTERVAL.min(
