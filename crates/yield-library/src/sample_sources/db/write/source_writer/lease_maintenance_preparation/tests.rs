@@ -23,8 +23,12 @@ struct Fixture {
     profile: WritableProfileGuard,
     media: std::path::PathBuf,
     path: std::path::PathBuf,
+    // AppRootGuard pins only this thread. Keep process profile/extension/CWD settings
+    // stable against other test owners through all native fixture cleanup.
+    _runtime: crate::test_runtime::TestRuntimeGuard,
 }
 fn fixture() -> (Fixture, SourceWriter) {
+    let runtime = crate::test_runtime::TestRuntimeGuard::acquire();
     let temp = tempfile::tempdir().unwrap();
     let media = temp.path().join("media");
     fs::create_dir(&media).unwrap();
@@ -45,6 +49,7 @@ fn fixture() -> (Fixture, SourceWriter) {
             profile,
             media,
             path,
+            _runtime: runtime,
         },
         writer,
     )

@@ -330,3 +330,62 @@ immediate-bootstrap and genuine worker-panic cases preserve the same lifecycle
 and unavailable behavior. These portable fixtures supply no native reserve or
 publication authority. All original OPT-2215/2216/2217/2218/2219 and OPT-1632/1634
 acceptance remains open.
+
+## Reserved journal control input (OPT-2255)
+
+The actual shared journal input pool now has disjoint private ordinary and control
+credit classes: 4128768 bytes (4 MiB minus 64 KiB) and 65536 bytes, respectively.
+Their aggregate remains exactly 4194304 bytes. Ordinary requests, including
+one-byte lookups, new source registration, payload persistence/admission and new
+chunk claims/effect issuance, cannot borrow the control margin. Classification
+comes from fixed private client callsites, never the caller's requested byte count
+or a public flag. Cancellation, retry/exhaustion observations, chunk release/retry/
+cancellation and source drain/final retirement use the control class. Existing
+codec bounds and source/claim/store validation remain authoritative; a queued
+cancellation still requests cancellation and does not acknowledge completed
+cancellation, publication exclusion or charge release.
+
+Each non-Clone input permit retains its exact class and debit through command
+queueing, decoding, actual SQLite execution and response delivery. The worker
+previously refunded input at command arrival while still retaining the payload;
+it now keeps the original permit through the command scope. Rejected commands
+remain intact through rejection delivery and then drop their payload before the
+input field. Accepted reply loss returns the result-handle credit but cannot
+refund a queued/executing command's input. Full/disconnected queues, result
+backpressure, completion, rejection and unwind return that debit exactly once.
+Poisoned or inconsistent input accounting closes admission; Drop neither panics,
+resets the pool nor manufactures a confirmed refund.
+
+Actual profile-owned SQLite tests hold the transaction before precommit, verify
+executing input remains charged after reply loss, saturate ordinary credit, and
+queue/execute genuine store-validated cancellation through the remaining control
+margin. Further cases cover real retry/CAS refusal, exact aggregate/class
+exhaustion, tiny ordinary requests, queue/result saturation, disconnect, command
+drain, outer worker panic, inner SQLite command panic/rollback, mutex poison and
+unconfirmable refund. The explicit no-capacity bootstrap fixture grants command/
+storage behavior only; no native capacity or publication capability is fabricated.
+
+This is the input-margin prerequisite, not the full lifetime gate. The existing
+32-command FIFO and 64-result limits can still reject a control request. Reserved
+queue/result responsiveness, the 2 MiB publication-backing debit, 32 real slots,
+exact grant/charge/target associations, provider mirrors, native resource-use
+counts, cancellation/release fences, completion polling, resource unwind guard,
+settlement and publication-aware shutdown remain mandatory OPT-2215 work.
+Command drain is still not physical quiescence. Native interfaces/consumers and
+qualification remain their original gates. Full parallel verification also exposed
+an existing source lease fixture's missing shared runtime guard: a thread-local
+app root alone does not isolate process profile/extension/CWD changes. Its actual
+fixture now retains `TestRuntimeGuard` through native cleanup; Unknown refusal
+and original source assertions remain unchanged. Input credit supplies no effect
+permit, clean handoff, capacity refund or genuine settlement.
+
+```sh
+cargo test --locked -p yield-library --lib control_input -- --test-threads=1
+cargo test --locked -p yield-library --lib operation_journal::owner::tests -- --test-threads=1
+cargo test --locked -p yield-library --lib
+bash scripts/agent.sh preflight
+```
+
+Run canonical preflight on a stable committed HEAD. These sibling test modules
+have explicit test-only scope; no include! formatting exemption or guard waiver
+is required.
