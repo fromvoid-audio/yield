@@ -219,3 +219,36 @@ Portable baseline commands are `cargo test --locked -p reson --lib recording::` 
 pass 18 and 14 tests respectively. Existing journal tests include synthetic claim/capacity
 observations; real SQLite bytes/reopen evidence does not qualify physical reserves. Future
 leaves must run their actual implementations and record exact commands/results/limitations.
+
+## Exact producer terminal byte custody (OPT-2249)
+
+The actual Reson serializer now retains its original `std::BufWriter` behind a
+private, single-producer inspector. The genuine pre-finalize barrier exposes a
+bounded immutable `RecordingTerminalWriteInventory`: the actual pending offset
+and bytes (at most 16 KiB), exact final object extent, and the pinned hound 3.5.1
+RIFF/data length patches at offsets 4 and 64. The snapshot performs no transport
+I/O. It checks the real transport position plus buffer length against the actual
+successful encoded-sample coverage before issuing the barrier. Initialization
+still uses the real hound flush, and no terminal bytes leave before acknowledgement.
+
+The finalizer checks its actual tail/patch writes and seeks against this inventory,
+including partial transport writes. Missing, changed, extra or reordered bytes
+cannot produce successful completion. The successful actual join retains the same
+immutable inventory; neither the plan nor accounting has a public constructor or
+can reconstruct a producer proof. Denied, late, lost or failed acknowledgement,
+transport errors and unwind preserve the existing fail-closed Drop fence.
+
+A pending transport fragment can begin within an interleaved frame for channels
+3, 5, 6 or 7. The future admitted adapter must combine it with its existing
+bounded rechunking custody; this fragment is not a journal PCM slot. The journal
+must still bind stable tail/header chunk identities, current source/profile/sink
+admission, immutable Finalizing/Frozen rows and exact retained acknowledgements.
+OPT-2145 remains responsible for those production transactions and seals. This
+producer evidence supplies no file-owner result, physical qualification,
+publication, retention retirement or charge release. OPT-2058 and native
+OPT-2066/2067 remain open.
+
+Actual hound tests cover all eight channel counts, zero/short/exact/multiple-buffer
+recordings, exact final byte reconstruction, three-byte partial transport writes,
+private buffer corruption and terminal trace refusal. Full Reson and compile-fail
+privacy tests run separately from the canonical repository preflight.

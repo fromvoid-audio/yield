@@ -142,12 +142,52 @@ impl RecordingTerminalAccounting {
         })
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct TerminalFacts {
     pub(super) state: RecordingPrefixState,
     pub(super) accounting: RecordingTerminalAccounting,
     pub(super) frames: u64,
     pub(super) limits: RecordingLimits,
+    pub(super) inventory: Arc<RecordingTerminalWriteInventory>,
+}
+
+/// Exact serializer-owned bytes awaiting finalization, observed before acknowledgement.
+/// This value authenticates producer byte custody only through its enclosing private proof;
+/// it grants no journal or physical authority. It has no public constructor or decoder.
+///
+/// ```compile_fail
+/// let _ = reson::recording::RecordingTerminalWriteInventory {};
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+pub struct RecordingTerminalWriteInventory {
+    pub(super) pending_offset: u64,
+    pub(super) pending: Vec<u8>,
+    pub(super) object_bytes: u64,
+    pub(super) riff_length: [u8; 4],
+    pub(super) data_length: [u8; 4],
+}
+impl RecordingTerminalWriteInventory {
+    /// Actual retained-transport offset at the start of the still-buffered fragment.
+    /// This may fall within a frame; the retained adapter must rechunk complete frames.
+    pub fn pending_offset(&self) -> u64 {
+        self.pending_offset
+    }
+    /// Exact pending serializer fragment, bounded by the 16 KiB producer buffer.
+    pub fn pending_bytes(&self) -> &[u8] {
+        &self.pending
+    }
+    /// Exact final WAV extent including the 68-byte extensible header.
+    pub fn object_bytes(&self) -> u64 {
+        self.object_bytes
+    }
+    /// The pinned hound 3.5.1 final RIFF-length patch at offset 4.
+    pub fn riff_length_patch(&self) -> &[u8; 4] {
+        &self.riff_length
+    }
+    /// The pinned hound 3.5.1 final data-length patch at offset 64.
+    pub fn data_length_patch(&self) -> &[u8; 4] {
+        &self.data_length
+    }
 }
 
 /// Issued only after actual callback settlement and Stop drain/Cancel abandonment,
@@ -176,6 +216,10 @@ impl RecordingTerminalBarrier {
     }
     pub fn limits(&self) -> RecordingLimits {
         self.facts.limits
+    }
+    /// Exact immutable pending-byte and final-header inventory of this producer instance.
+    pub fn write_inventory(&self) -> &RecordingTerminalWriteInventory {
+        &self.facts.inventory
     }
     /// Permit this serializer to attempt its final bytes only after the admitted owner accepts
     /// its own bound immutable inventory. This never publishes, validates or releases output.
@@ -214,6 +258,10 @@ impl RecordingJoinedCompletion {
     }
     pub fn limits(&self) -> RecordingLimits {
         self.facts.limits
+    }
+    /// Exact immutable pending-byte and final-header inventory of this producer instance.
+    pub fn write_inventory(&self) -> &RecordingTerminalWriteInventory {
+        &self.facts.inventory
     }
 }
 
@@ -319,12 +367,26 @@ impl BarrierIssuer {
         frames: u64,
         limits: RecordingLimits,
         health: &RecordingHealthState,
+        inventory: Arc<RecordingTerminalWriteInventory>,
     ) -> Result<TerminalFacts, AudioInputError> {
+        let accounting = RecordingTerminalAccounting::capture(health.snapshot())?;
+        if frames.checked_mul(u64::from(limits.channels())) != Some(accounting.encoded_samples)
+            || accounting
+                .encoded_samples
+                .checked_mul(4)
+                .and_then(|n| n.checked_add(68))
+                != Some(inventory.object_bytes)
+        {
+            return Err(failed(
+                "recording terminal inventory/accounting coverage differs",
+            ));
+        }
         Ok(TerminalFacts {
             state,
             frames,
             limits,
-            accounting: RecordingTerminalAccounting::capture(health.snapshot())?,
+            accounting,
+            inventory,
         })
     }
 }

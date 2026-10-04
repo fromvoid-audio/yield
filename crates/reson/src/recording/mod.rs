@@ -25,6 +25,7 @@ pub use health::RecordingHealth;
 pub use settlement::{
     RECORDING_TERMINAL_ACK_TIMEOUT, RecordingJoinedCompletion, RecordingSettlements,
     RecordingSinkBinding, RecordingTerminalAccounting, RecordingTerminalBarrier,
+    RecordingTerminalWriteInventory,
 };
 pub use writer::{RecordingLimits, RecordingPrefixState, RecordingSink};
 

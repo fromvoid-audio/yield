@@ -97,6 +97,7 @@ fn retained_writer_bounds_each_transport_write_and_seek_without_fallback() {
         position: 0,
         limit: 4,
         terminal_fence: None,
+        terminal_bytes: None,
     };
     bounded.write_all(&[1, 2, 3, 4]).unwrap();
     assert!(bounded.write_all(&[5]).is_err());
