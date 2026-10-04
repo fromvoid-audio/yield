@@ -11,6 +11,8 @@ use crate::sample_sources::db::sqlite_identity::{
     validate_database_file_identity,
 };
 pub use binding::{GlobalWalObjectObservation, GlobalWalScope};
+mod requester;
+pub use requester::GlobalWalPreparationClient;
 
 /// Maximum complete preparation handshake encoding, across all participants.
 pub const GLOBAL_PREPARATION_MAX_BYTES: usize = 64 * 1024;
@@ -343,25 +345,7 @@ impl GlobalLibraryWriter {
         &self,
         request: GlobalPreparationRequest,
     ) -> Result<GlobalPreparationPending, GlobalLibraryWriterQueueError> {
-        self.ensure_available()?;
-        let binding_credit = if request.wal_binding {
-            Some(self.preparation_binding_budget.reserve()?)
-        } else {
-            None
-        };
-        let (ready, receiver) = mpsc::sync_channel(1);
-        let canceled = Arc::new(AtomicBool::new(false));
-        self.send(WriterCommand::Prepare(Command {
-            request,
-            canceled: Arc::clone(&canceled),
-            ready,
-            binding_credit,
-        }))?;
-        Ok(GlobalPreparationPending {
-            ready: receiver,
-            canceled,
-            armed: true,
-        })
+        self.wal_preparation_client().submit_preparation(request)
     }
 }
 

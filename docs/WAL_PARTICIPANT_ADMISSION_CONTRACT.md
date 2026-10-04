@@ -397,3 +397,49 @@ sealed decision custody and cleanup fencing on both real owners, atomic durable
 nonce/intent/claims and uncertain readback/restart. Historical scope, transport
 privacy or a local reservation cannot issue that latch, a permit or physical
 qualification. The original parent acceptance remains open.
+
+## Limited original global requester (OPT-2257)
+
+`GlobalLibraryWriter::wal_preparation_client` privately issues a cloneable
+`GlobalWalPreparationClient` for the same actual global worker. It exposes only
+registration/lifecycle diagnostics and bounded preparation submission. It retains
+no SQLite connection, writable profile capability or join handle, and exposes no
+mutation, shutdown, positive acknowledgement or settlement method. Both the
+original writer API and requester clones use one submission implementation with
+the existing queue, admission mutex, lifecycle, metrics and strict handoff budget.
+No alternate owner, preparation queue or caller-defined producer is introduced.
+
+Original registration/deadline/policy validation still runs on the retained worker;
+strict captures retain the same MAIN/WAL/mapped-SHM identities and shared historical
+byte credit. All requester clones and the writer share the existing 64 KiB strict
+handoff ceiling, including copied observations retained after empty rollback.
+Closing the original owner's shared sender disconnects every requester; a clone
+cannot prolong worker shutdown. Restart creates another registration even within
+the same profile acquisition, and the original request is stale. Pending Drop,
+confirmed abort, lost delivery, failed acquisition, deadline and panic retain the
+original typed outcomes. Global shutdown reports remain the existing typed drain
+observations; a closed client does not assert successful settlement.
+
+Actual worker/SQLite and normal-build Linux tests request through limited clones,
+verify original strict scope and external/queued writer exclusion, exhaust shared
+historical byte custody, cancel lost pending replies and reject original requests
+on restart. Queue failures, expired queued deadlines and original worker panic
+preserve the same fail-closed boundaries. A compile-fail test prevents constructing
+a requester from caller fields. These are genuine empty preparation tests, never
+fake physical grants or all-owner decision qualification.
+
+The requester enables the missing journal-to-global access without transferring
+external owner lifetime. Full OPT-2136 still requires family-derived complete
+inventory/directions and accounting, current genuine acknowledgements, native
+custody after a shared decision, cleanup fencing, atomic durable nonce/claims/
+intent and uncertain readback/restart. Existing pre-intent timer, Drop and shutdown
+abort behavior must not be used after settlement starts; this requester cannot
+acknowledge that transition. Required permits and native qualification stay open.
+
+```sh
+cargo test --locked -p yield-library --lib global_requester
+cargo test --locked -p yield-library --test global_wal_requester
+cargo test --locked -p yield-library --doc GlobalWalPreparationClient
+cargo test --locked -p yield-library --lib
+bash scripts/agent.sh preflight
+```
