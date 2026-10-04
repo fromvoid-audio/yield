@@ -71,6 +71,47 @@ use super::store::{ReleaseTestBoundary, ReleaseTestDirective};
 use super::work_plan::derive_work_plan;
 
 const CONTROL_INPUT_BYTES: usize = 1;
+// Disjoint credit classes on the original four-MiB pool; no ordinary caller can borrow control.
+const CONTROL_INPUT_RESERVED_BYTES: usize = 64 * 1024;
+const ORDINARY_INPUT_BYTES: usize =
+    OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES - CONTROL_INPUT_RESERVED_BYTES;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputClass {
+    Ordinary,
+    Control,
+}
+impl InputClass {
+    fn index(self) -> usize {
+        match self {
+            Self::Ordinary => 0,
+            Self::Control => 1,
+        }
+    }
+    fn limit(self) -> usize {
+        match self {
+            Self::Ordinary => ORDINARY_INPUT_BYTES,
+            Self::Control => CONTROL_INPUT_RESERVED_BYTES,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InputBudget {
+    remaining: [usize; 2],
+    unavailable: bool,
+}
+impl InputBudget {
+    fn new() -> Self {
+        Self {
+            remaining: [ORDINARY_INPUT_BYTES, CONTROL_INPUT_RESERVED_BYTES],
+            unavailable: false,
+        }
+    }
+    fn valid(&self) -> bool {
+        !self.unavailable
+            && self.remaining[0] <= ORDINARY_INPUT_BYTES
+            && self.remaining[1] <= CONTROL_INPUT_RESERVED_BYTES
+    }
+}
 
 #[cfg(all(test, target_os = "macos"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,7 +130,7 @@ pub const OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY: usize = 32;
 /// Maximum number of results that may remain outstanding across all journal clients.
 pub const OPERATION_JOURNAL_OWNER_RESULT_CAPACITY: usize = 64;
 
-/// Maximum encoded record bytes reserved by queued journal commands.
+/// Aggregate input credit for accepted queued and executing commands, including a 64 KiB control margin.
 pub const OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES: usize = MAX_RECORD_BYTES * 4;
 
 /// Lifecycle state visible at the profile-owned journal boundary.
@@ -135,7 +176,7 @@ pub enum OperationJournalOwnerQueueError {
         "operation journal owner queued input exceeds its {limit}-byte budget (requested {requested} bytes)"
     )]
     InputBytesFull {
-        /// Total encoded command input bytes available to the queue.
+        /// Encoded input limit of the private ordinary or control credit class.
         limit: usize,
         /// Encoded command input bytes requested by this submission.
         requested: usize,
@@ -3986,7 +4027,7 @@ impl OperationJournalClient {
         &self,
         receipt: SourceAuthorityRegistrationReceipt,
     ) -> Result<OperationJournalRequest<()>, OperationJournalOwnerQueueError> {
-        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+        self.submit_control(CONTROL_INPUT_BYTES, move |input, result| {
             JournalCommand::BeginSourceDrain {
                 receipt,
                 input,
@@ -4001,7 +4042,7 @@ impl OperationJournalClient {
         receipt: SourceAuthorityRegistrationReceipt,
         acknowledgement: SourceAuthorityRetirementAck,
     ) -> Result<OperationJournalRequest<()>, OperationJournalOwnerQueueError> {
-        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+        self.submit_control(CONTROL_INPUT_BYTES, move |input, result| {
             JournalCommand::FinalizeSourceRetirement {
                 receipt,
                 acknowledgement,
@@ -4040,7 +4081,7 @@ impl OperationJournalClient {
     ) -> Result<OperationJournalRequest<JournalCancelRequestReceipt>, OperationJournalOwnerQueueError>
     {
         let encoded = bounded_cancellation_input(observation)?;
-        self.submit(encoded.len(), move |input, result| JournalCommand::Cancel {
+        self.submit_control(encoded.len(), move |input, result| JournalCommand::Cancel {
             operation_id,
             expected_sequence,
             encoded,
@@ -4057,7 +4098,7 @@ impl OperationJournalClient {
         observation: RetryObservation,
     ) -> Result<OperationJournalRequest<JournalRetryReceipt>, OperationJournalOwnerQueueError> {
         let encoded = bounded_retry_input(&observation)?;
-        self.submit(encoded.len(), move |input, result| JournalCommand::Retry {
+        self.submit_control(encoded.len(), move |input, result| JournalCommand::Retry {
             operation_id,
             expected_sequence,
             encoded,
@@ -4079,7 +4120,7 @@ impl OperationJournalClient {
         OperationJournalOwnerQueueError,
     > {
         let encoded = bounded_retry_input(&observation)?;
-        self.submit(encoded.len(), move |input, result| {
+        self.submit_control(encoded.len(), move |input, result| {
             JournalCommand::ChunkExhaustion {
                 operation_id,
                 expected_sequence,
@@ -4309,7 +4350,7 @@ impl OperationJournalClient {
                 reason: String::from("chunk release identity is nil"),
             });
         }
-        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+        self.submit_control(CONTROL_INPUT_BYTES, move |input, result| {
             JournalCommand::ReleaseChunk {
                 permit,
                 release_id,
@@ -4334,7 +4375,7 @@ impl OperationJournalClient {
                 reason: String::from("chunk release identity is nil"),
             });
         }
-        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+        self.submit_control(CONTROL_INPUT_BYTES, move |input, result| {
             JournalCommand::RetryChunkRelease {
                 chunk_id,
                 operation_id,
@@ -4360,7 +4401,7 @@ impl OperationJournalClient {
                 reason: String::from("chunk release identity is nil"),
             });
         }
-        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+        self.submit_control(CONTROL_INPUT_BYTES, move |input, result| {
             JournalCommand::CancelChunk {
                 chunk_id,
                 operation_id,
@@ -4555,6 +4596,29 @@ impl OperationJournalClient {
     where
         F: FnOnce(InputPermit, SyncSender<Result<T, OperationJournalOwnerError>>) -> JournalCommand,
     {
+        self.submit_class(InputClass::Ordinary, input_bytes, build)
+    }
+
+    fn submit_control<T, F>(
+        &self,
+        input_bytes: usize,
+        build: F,
+    ) -> Result<OperationJournalRequest<T>, OperationJournalOwnerQueueError>
+    where
+        F: FnOnce(InputPermit, SyncSender<Result<T, OperationJournalOwnerError>>) -> JournalCommand,
+    {
+        self.submit_class(InputClass::Control, input_bytes, build)
+    }
+
+    fn submit_class<T, F>(
+        &self,
+        class: InputClass,
+        input_bytes: usize,
+        build: F,
+    ) -> Result<OperationJournalRequest<T>, OperationJournalOwnerQueueError>
+    where
+        F: FnOnce(InputPermit, SyncSender<Result<T, OperationJournalOwnerError>>) -> JournalCommand,
+    {
         let _admission = self
             .shared
             .admission_gate
@@ -4569,7 +4633,7 @@ impl OperationJournalClient {
             .as_ref()
             .cloned()
             .ok_or(OperationJournalOwnerQueueError::Closed)?;
-        let input = self.shared.reserve_input(input_bytes)?;
+        let input = self.shared.reserve_input(class, input_bytes)?;
         let result_permit = self.shared.reserve_result()?;
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let command = build(input, result_tx);
@@ -4710,7 +4774,7 @@ struct OwnerShared {
     admission_gate: Mutex<()>,
     lifecycle: AtomicU8,
     unavailable: Mutex<Option<String>>,
-    input_bytes: Mutex<usize>,
+    input_bytes: Mutex<InputBudget>,
     results: Mutex<usize>,
     #[cfg(test)]
     shutdown_cas_gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
@@ -4723,7 +4787,7 @@ impl OwnerShared {
             admission_gate: Mutex::new(()),
             lifecycle: AtomicU8::new(OwnerLifecycle::Initializing as u8),
             unavailable: Mutex::new(None),
-            input_bytes: Mutex::new(OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES),
+            input_bytes: Mutex::new(InputBudget::new()),
             results: Mutex::new(OPERATION_JOURNAL_OWNER_RESULT_CAPACITY),
             #[cfg(test)]
             shutdown_cas_gate: Mutex::new(None),
@@ -4779,22 +4843,40 @@ impl OwnerShared {
 
     fn reserve_input(
         self: &Arc<Self>,
+        class: InputClass,
         requested: usize,
     ) -> Result<InputPermit, OperationJournalOwnerQueueError> {
-        let mut remaining = self
-            .input_bytes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if requested > *remaining {
-            return Err(OperationJournalOwnerQueueError::InputBytesFull {
-                limit: OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES,
-                requested,
+        if requested == 0 {
+            return Err(OperationJournalOwnerQueueError::InvalidInput {
+                reason: String::from("journal input credit must be nonzero"),
             });
         }
-        *remaining -= requested;
+        let mut budget = self.input_bytes.lock().map_err(|_| {
+            self.mark_unavailable("journal input credit mutex is poisoned");
+            OperationJournalOwnerQueueError::Unavailable {
+                reason: "journal input credit mutex is poisoned".into(),
+            }
+        })?;
+        if !budget.valid() {
+            budget.unavailable = true;
+            drop(budget);
+            self.mark_unavailable("journal input credit accounting is unavailable");
+            return Err(OperationJournalOwnerQueueError::Unavailable {
+                reason: "journal input credit accounting is unavailable".into(),
+            });
+        }
+        let remaining = &mut budget.remaining[class.index()];
+        let after = remaining.checked_sub(requested).ok_or(
+            OperationJournalOwnerQueueError::InputBytesFull {
+                limit: class.limit(),
+                requested,
+            },
+        )?;
+        *remaining = after;
         Ok(InputPermit {
             shared: Arc::clone(self),
             bytes: requested,
+            class,
         })
     }
 
@@ -4812,15 +4894,23 @@ impl OwnerShared {
         })
     }
 
-    fn release_input(&self, bytes: usize) {
-        let mut remaining = self
-            .input_bytes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *remaining = remaining
+    fn release_input(&self, class: InputClass, bytes: usize) {
+        let Ok(mut budget) = self.input_bytes.lock() else {
+            // Unknown accounting is retained and closes admission. Do not panic in Drop or
+            // recover/reset a poisoned pool while another owner's backing may still exist.
+            self.mark_unavailable("journal input credit mutex is poisoned");
+            return;
+        };
+        let after = budget.remaining[class.index()]
             .checked_add(bytes)
-            .expect("operation journal input credit overflow");
-        assert!(*remaining <= OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES);
+            .filter(|n| *n <= class.limit());
+        if !budget.valid() || bytes == 0 || after.is_none() {
+            budget.unavailable = true;
+            drop(budget);
+            self.mark_unavailable("journal input credit refund cannot be confirmed");
+            return;
+        }
+        budget.remaining[class.index()] = after.expect("checked finite refund");
     }
 
     fn release_result(&self) {
@@ -4847,11 +4937,12 @@ impl OwnerShared {
 struct InputPermit {
     shared: Arc<OwnerShared>,
     bytes: usize,
+    class: InputClass,
 }
 
 impl Drop for InputPermit {
     fn drop(&mut self) {
-        self.shared.release_input(self.bytes);
+        self.shared.release_input(self.class, self.bytes);
     }
 }
 
@@ -5266,6 +5357,8 @@ fn run_owner(
     }
 }
 
+// Move each payload into its executed closure: nonescaping backing drops before the debit.
+// Returned outputs retain their independent result/producer custody. Input is not settlement.
 fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool {
     match command {
         JournalCommand::AuthenticateSourceMetadata {
@@ -5273,8 +5366,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime.authenticate_source_registry_metadata(candidate)
             })
         }
@@ -5283,16 +5376,16 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || runtime.register_source_authority(request))
+            let _input = input;
+            execute_store_result(result, move || runtime.register_source_authority(request))
         }
         JournalCommand::BeginSourceDrain {
             receipt,
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || runtime.begin_source_drain(receipt))
+            let _input = input;
+            execute_store_result(result, move || runtime.begin_source_drain(receipt))
         }
         JournalCommand::FinalizeSourceRetirement {
             receipt,
@@ -5300,8 +5393,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime.finalize_source_retirement(receipt, acknowledgement)
             })
         }
@@ -5313,8 +5406,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 let operation = runtime.store().get(operation_id)?.ok_or_else(|| {
                     OperationJournalOwnerError::ChunkClaim {
                         reason: "recording operation absent".into(),
@@ -5341,8 +5434,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime
                     .store()
                     .recording_chunk_page(operation_id, after_sequence)
@@ -5354,8 +5447,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 let record = decode(&encoded)?;
                 Ok::<JournalInsertOutcome, DecodeError>(
                     runtime.store().insert_intent_with_outcome(&record),
@@ -5368,8 +5461,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 let record = decode_full_progress(&encoded).map_err(|error| {
                     OperationJournalOwnerError::InvalidInput {
                         reason: error.to_string(),
@@ -5388,8 +5481,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 let observation = decode_control_input(&encoded)?;
                 runtime
                     .store()
@@ -5404,8 +5497,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 let observation = decode_control_input(&encoded)?;
                 runtime
                     .store()
@@ -5420,8 +5513,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 let observation = decode_control_input(&encoded)?;
                 runtime
                     .store()
@@ -5439,8 +5532,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 if matches!(&args, UniversalCommandArgs::SourceLegacyAdoption(_)) {
                     return Err(PreparedAdmissionError::Unsupported {
                         reason: "legacy adoption requires the original-owner capacity and durable admission bridge".into(),
@@ -5467,16 +5560,16 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || runtime.admit_prepared(prepared))
+            let _input = input;
+            execute_store_result(result, move || runtime.admit_prepared(prepared))
         }
         JournalCommand::ClaimChunk {
             request,
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || runtime.claim_chunk(request))
+            let _input = input;
+            execute_store_result(result, move || runtime.claim_chunk(request))
         }
         JournalCommand::IssueChunk {
             chunk_id,
@@ -5484,8 +5577,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || runtime.issue_chunk(chunk_id, operation_id))
+            let _input = input;
+            execute_store_result(result, move || runtime.issue_chunk(chunk_id, operation_id))
         }
         JournalCommand::IssueLiveChunk {
             chunk_id,
@@ -5496,8 +5589,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime.issue_live_chunk_effect(
                     chunk_id,
                     operation_id,
@@ -5514,8 +5607,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime.checkpoint_and_grant_staging(validation, registration, source_pin)
             })
         }
@@ -5528,8 +5621,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime.checkpoint_live_chunk_staging(
                     chunk_id,
                     issue_id,
@@ -5546,8 +5639,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime.begin_chunk_write(permit, identity, logical_bytes)
             })
         }
@@ -5557,8 +5650,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || runtime.release_chunk(permit, release_id))
+            let _input = input;
+            execute_store_result(result, move || runtime.release_chunk(permit, release_id))
         }
         JournalCommand::RetryChunkRelease {
             chunk_id,
@@ -5567,8 +5660,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime.retry_chunk_release(chunk_id, operation_id, release_id)
             })
         }
@@ -5579,8 +5672,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime.cancel_chunk(chunk_id, operation_id, release_id)
             })
         }
@@ -5592,8 +5685,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime.store().insert_active_recovery_charge_for_test(
                     operation_id,
                     &volume,
@@ -5603,8 +5696,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
         }
         #[cfg(test)]
         JournalCommand::InspectCapacity { input, result } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 Ok::<CapacityLedgerTestSnapshot, OperationJournalOwnerError>(
                     runtime.capacity_ledger_snapshot_for_test(),
                 )
@@ -5615,16 +5708,16 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || runtime.store().get(operation_id))
+            let _input = input;
+            execute_store_result(result, move || runtime.store().get(operation_id))
         }
         JournalCommand::Recovery {
             cursor,
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || runtime.store().scan_recovery_page(cursor))
+            let _input = input;
+            execute_store_result(result, move || runtime.store().scan_recovery_page(cursor))
         }
         JournalCommand::ObserveCopy {
             operation_id,
@@ -5633,8 +5726,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 frozen_copy::execute(runtime, operation_id, harvest_key, observer_owner)
             })
         }
@@ -5643,8 +5736,8 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime
                     .store()
                     .get_full(operation_id)
@@ -5656,16 +5749,18 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || runtime.store().scan_recovery_status_page(cursor))
+            let _input = input;
+            execute_store_result(result, move || {
+                runtime.store().scan_recovery_status_page(cursor)
+            })
         }
         JournalCommand::CoordinatorRecovery {
             cursor,
             input,
             result,
         } => {
-            drop(input);
-            execute_store_result(result, || {
+            let _input = input;
+            execute_store_result(result, move || {
                 runtime.store().scan_coordinator_recovery_page(cursor)
             })
         }
@@ -5702,127 +5797,97 @@ where
 }
 
 fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
-    match command {
-        JournalCommand::AuthenticateSourceMetadata { input, result, .. } => {
-            drop(input);
+    match &command {
+        JournalCommand::AuthenticateSourceMetadata { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::RegisterSource { input, result, .. } => {
-            drop(input);
+        JournalCommand::RegisterSource { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::BeginSourceDrain { input, result, .. } => {
-            drop(input);
+        JournalCommand::BeginSourceDrain { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::FinalizeSourceRetirement { input, result, .. } => {
-            drop(input);
+        JournalCommand::FinalizeSourceRetirement { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::RetainRecording { input, result, .. } => {
-            drop(input);
+        JournalCommand::RetainRecording { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::RecordingRecovery { input, result, .. } => {
-            drop(input);
+        JournalCommand::RecordingRecovery { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::PersistIntent { input, result, .. } => {
-            drop(input);
+        JournalCommand::PersistIntent { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::PersistFull { input, result, .. } => {
-            drop(input);
+        JournalCommand::PersistFull { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::Cancel { input, result, .. } => {
-            drop(input);
+        JournalCommand::Cancel { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::Retry { input, result, .. } => {
-            drop(input);
+        JournalCommand::Retry { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::ChunkExhaustion { input, result, .. } => {
-            drop(input);
+        JournalCommand::ChunkExhaustion { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::AdmitFull { input, result, .. } => {
-            drop(input);
+        JournalCommand::AdmitFull { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::AdmitPrepared { input, result, .. } => {
-            drop(input);
+        JournalCommand::AdmitPrepared { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::ClaimChunk { input, result, .. } => {
-            drop(input);
+        JournalCommand::ClaimChunk { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::IssueChunk { input, result, .. } => {
-            drop(input);
+        JournalCommand::IssueChunk { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::IssueLiveChunk { input, result, .. } => {
-            drop(input);
+        JournalCommand::IssueLiveChunk { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::CheckpointStaging { input, result, .. } => {
-            drop(input);
+        JournalCommand::CheckpointStaging { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::CheckpointLiveChunkStaging { input, result, .. } => {
-            drop(input);
+        JournalCommand::CheckpointLiveChunkStaging { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::BeginChunkWrite { input, result, .. } => {
-            drop(input);
+        JournalCommand::BeginChunkWrite { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::ReleaseChunk { input, result, .. } => {
-            drop(input);
+        JournalCommand::ReleaseChunk { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::RetryChunkRelease { input, result, .. } => {
-            drop(input);
+        JournalCommand::RetryChunkRelease { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::CancelChunk { input, result, .. } => {
-            drop(input);
+        JournalCommand::CancelChunk { result, .. } => {
             let _ = result.send(Err(error));
         }
         #[cfg(test)]
-        JournalCommand::InjectActiveRecoveryCharge { input, result, .. } => {
-            drop(input);
+        JournalCommand::InjectActiveRecoveryCharge { result, .. } => {
             let _ = result.send(Err(error));
         }
         #[cfg(test)]
-        JournalCommand::InspectCapacity { input, result } => {
-            drop(input);
+        JournalCommand::InspectCapacity { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::Get { input, result, .. } => {
-            drop(input);
+        JournalCommand::Get { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::Recovery { input, result, .. } => {
-            drop(input);
+        JournalCommand::Recovery { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::ObserveCopy { input, result, .. } => {
-            drop(input);
+        JournalCommand::ObserveCopy { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::GetFull { input, result, .. } => {
-            drop(input);
+        JournalCommand::GetFull { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::RecoveryStatus { input, result, .. } => {
-            drop(input);
+        JournalCommand::RecoveryStatus { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::CoordinatorRecovery { input, result, .. } => {
-            drop(input);
+        JournalCommand::CoordinatorRecovery { result, .. } => {
             let _ = result.send(Err(error));
         }
     }
@@ -5831,6 +5896,7 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 #[cfg(test)]
 mod tests {
     mod command_drain_tests;
+    mod control_input_tests;
     mod source_registry_handoff_tests;
     #[test]
     fn recording_dispatch_binding_checks_actual_bytes_range_output_and_root() {
