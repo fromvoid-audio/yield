@@ -19,6 +19,9 @@ pub struct SourceLeaseMaintenanceBinding {
     deadline: Instant,
 }
 impl SourceLeaseMaintenanceBinding {
+    pub(crate) fn retained_memory_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>().checked_add(self.stored.retained_heap_bytes()?)
+    }
     /// Borrow historical finite scope. Prepared/registered phase is not full journal readiness.
     pub fn stored_fence(&self) -> &StoredSourceLeaseFence {
         &self.stored

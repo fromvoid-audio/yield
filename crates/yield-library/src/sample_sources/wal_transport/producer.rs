@@ -18,7 +18,7 @@ pub struct SourceWalTransportOwner {
 }
 /// Read-only owner outcome witness. It cannot publish readiness, rollback or retirement.
 #[derive(Clone)]
-pub struct SourceWalOwnerObservation(Arc<Ticket>);
+pub struct SourceWalOwnerObservation(pub(super) Arc<Ticket>);
 impl SourceWalOwnerObservation {
     /// Observe actual producer status without SQL or effect authority.
     pub fn status(&self) -> SourceWalTransportStatus {

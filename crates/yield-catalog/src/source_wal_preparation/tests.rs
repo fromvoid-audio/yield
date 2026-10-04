@@ -11,6 +11,7 @@ mod integration {
         base: crate::tests::Fixture,
         second: tempfile::TempDir,
         long_id: bool,
+        mixed: bool,
         local_prepared_authorities: bool,
     }
     impl Fixture {
@@ -19,6 +20,7 @@ mod integration {
                 base: crate::tests::Fixture::new("catalog-wal-custody"),
                 second: tempfile::tempdir().unwrap(),
                 long_id: false,
+                mixed: false,
                 local_prepared_authorities: false,
             };
             for root in [f.base.root.path(), f.second.path()] {
@@ -58,6 +60,34 @@ mod integration {
             restore_fault: Option<Arc<AtomicBool>>,
             journal: Option<OperationJournalClient>,
         ) -> (CatalogService, Vec<SourceRevision>, Arc<CatalogTestGate>) {
+            let (service, revisions, _, gate) =
+                self.start_mode(deny, restore_fault, journal, false);
+            (service, revisions, gate)
+        }
+        fn start_lease(
+            &self,
+            deny: Option<Arc<AtomicBool>>,
+            restore_fault: Option<Arc<AtomicBool>>,
+        ) -> (
+            CatalogService,
+            Vec<yield_library::sample_sources::db::write::SourceLeaseMaintenanceAllocation>,
+            Arc<CatalogTestGate>,
+        ) {
+            let (service, _, inputs, gate) = self.start_mode(deny, restore_fault, None, true);
+            (service, inputs, gate)
+        }
+        fn start_mode(
+            &self,
+            deny: Option<Arc<AtomicBool>>,
+            restore_fault: Option<Arc<AtomicBool>>,
+            journal: Option<OperationJournalClient>,
+            preaudit: bool,
+        ) -> (
+            CatalogService,
+            Vec<SourceRevision>,
+            Vec<yield_library::sample_sources::db::write::SourceLeaseMaintenanceAllocation>,
+            Arc<CatalogTestGate>,
+        ) {
             let admission = Arc::new(Mutex::new(AdmissionState::new()));
             let events = Arc::new(EventHub::new());
             let (commands, rx) = mpsc::sync_channel(COMMAND_CAPACITY);
@@ -68,7 +98,8 @@ mod integration {
                 self.second.path().to_path_buf(),
             ];
             let long_id = self.long_id;
-            let local_prepared_authorities = self.local_prepared_authorities;
+            let mixed = self.mixed;
+            let local_prepared_authorities = self.local_prepared_authorities || preaudit;
             let worker_admission = admission.clone();
             let worker_events = events.clone();
             let gate = Arc::new(CatalogTestGate::new());
@@ -76,6 +107,7 @@ mod integration {
             let worker = thread::spawn(move || {
                 let mut sources = HashMap::new();
                 let mut revisions = Vec::new();
+                let mut lease_inputs = Vec::new();
                 for (index, root) in roots.into_iter().enumerate() {
                     let id = SourceId::from_string(if long_id {
                         format!("wal-{index}-{}", "x".repeat(200))
@@ -90,22 +122,24 @@ mod integration {
                     .unwrap();
                     let publication_fence = database.source_publication_fence().unwrap();
                     let mut db = CatalogSourceDatabase::new(database, id.clone(), 1).unwrap();
-                    let scan_writer = CatalogScanWriter {
-                        profile_guard: &guard,
-                        database: &db,
-                        cancel: None,
-                        owner: Some(&db.writer),
-                        lifecycle: None,
-                    };
-                    audit_manifest_for_catalog_with_budget_and_progress_and_writer(
-                        &db,
-                        None,
-                        now_epoch_seconds(),
-                        &mut |_, _| {},
-                        &scan_writer,
-                        None,
-                    )
-                    .unwrap();
+                    if !preaudit || (mixed && index == 1) {
+                        let scan_writer = CatalogScanWriter {
+                            profile_guard: &guard,
+                            database: &db,
+                            cancel: None,
+                            owner: Some(&db.writer),
+                            lifecycle: None,
+                        };
+                        audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+                            &db,
+                            None,
+                            now_epoch_seconds(),
+                            &mut |_, _| {},
+                            &scan_writer,
+                            None,
+                        )
+                        .unwrap();
+                    }
                     let (source_authority, source_authority_receipt) =
                         if let Some(journal) = journal.as_ref() {
                             let authority = db.prepare_source_authority().unwrap();
@@ -134,12 +168,28 @@ mod integration {
                             db.writer.set_wal_rollback_denial_for_tests(deny.clone());
                         }
                     }
-                    revisions.push(db.writer.current_revision().unwrap());
+                    if preaudit {
+                        if !(mixed && index == 1) {
+                            assert!(db.writer.current_revision().is_err());
+                        }
+                        lease_inputs.push(
+                            db.writer
+                                .capture_lease_maintenance_allocation(deadline())
+                                .unwrap(),
+                        );
+                    }
+                    if let Ok(revision) = db.writer.current_revision() {
+                        revisions.push(revision);
+                    }
                     let identity = source_root_identity(&root).unwrap();
-                    let snapshot = Some(
-                        read_snapshot_from_database(&db, &guard, &id, 1, &identity, || false)
-                            .unwrap(),
-                    );
+                    let snapshot = if preaudit && !(mixed && index == 1) {
+                        None
+                    } else {
+                        Some(
+                            read_snapshot_from_database(&db, &guard, &id, 1, &identity, || false)
+                                .unwrap(),
+                        )
+                    };
                     worker_admission.lock().unwrap().sources.insert(
                         id.clone(),
                         DesiredSource {
@@ -170,7 +220,7 @@ mod integration {
                         },
                     );
                 }
-                ready.send(revisions).unwrap();
+                ready.send((revisions, lease_inputs)).unwrap();
                 run_worker_with_sources(
                     guard,
                     rx,
@@ -183,7 +233,7 @@ mod integration {
                     sources,
                 );
             });
-            let revisions = startup.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (revisions, lease_inputs) = startup.recv_timeout(Duration::from_secs(5)).unwrap();
             (
                 CatalogService {
                     commands,
@@ -192,15 +242,19 @@ mod integration {
                     worker: Mutex::new(Some(worker)),
                 },
                 revisions,
+                lease_inputs,
                 gate,
             )
         }
         fn external(&self, revision: &SourceRevision) -> Connection {
+            self.external_id(revision.source_id())
+        }
+        fn external_id(&self, id: &SourceId) -> Connection {
             let path = self
                 .base
                 .guard
                 .profile_root()
-                .join(catalog_profile_child(revision.source_id()))
+                .join(catalog_profile_child(id))
                 .join(DB_FILE_NAME);
             let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
             db.busy_timeout(Duration::ZERO).unwrap();
@@ -1618,4 +1672,5 @@ mod integration {
             .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
             .unwrap();
     }
+    mod lease;
 }

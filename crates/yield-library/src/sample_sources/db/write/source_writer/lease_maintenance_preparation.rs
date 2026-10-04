@@ -200,33 +200,50 @@ impl SourceWriter {
         observation: SourceLeaseMaintenanceAllocation,
         requested_deadline: Instant,
     ) -> Result<SourceLeaseMaintenancePreparation, SourceLeaseMaintenancePreparationFailure> {
-        let deadline = requested_deadline.min(observation.deadline());
-        let preexisting_transaction = !self.database.connection.is_autocommit();
-        let ordinary_changes = self.database.connection.total_changes();
-        let mut custody = Custody {
-            writer: Some(self),
-            policy: None,
-            observation,
-            deadline,
-            created_transaction: false,
-            preexisting_transaction,
-            restore_timeout: None,
-            poisoned: false,
-            ordinary_changes,
-            #[cfg(test)]
-            timeout_restore_fault: false,
-        };
+        let mut custody = new_custody(self, observation, requested_deadline);
         let result = prepare(&mut custody);
-        match result {
-            Ok(wal_bytes) => Ok(SourceLeaseMaintenancePreparation {
-                custody,
-                nonce: Uuid::new_v4(),
-                wal_bytes,
-            }),
-            Err(error) => Err(SourceLeaseMaintenancePreparationFailure { custody, error }),
-        }
+        finish(custody, result)
+    }
+    pub(crate) fn lease_transport_unprepared_is_reusable(&self) -> bool {
+        self.database.connection.is_autocommit()
     }
 }
+fn new_custody(
+    writer: SourceWriter,
+    observation: SourceLeaseMaintenanceAllocation,
+    requested_deadline: Instant,
+) -> Custody {
+    let deadline = requested_deadline.min(observation.deadline());
+    let preexisting_transaction = !writer.database.connection.is_autocommit();
+    let ordinary_changes = writer.database.connection.total_changes();
+    Custody {
+        writer: Some(writer),
+        policy: None,
+        observation,
+        deadline,
+        created_transaction: false,
+        preexisting_transaction,
+        restore_timeout: None,
+        poisoned: false,
+        ordinary_changes,
+        #[cfg(test)]
+        timeout_restore_fault: false,
+    }
+}
+fn finish(
+    custody: Custody,
+    result: Result<u64, SourceLeaseMaintenancePreparationError>,
+) -> Result<SourceLeaseMaintenancePreparation, SourceLeaseMaintenancePreparationFailure> {
+    match result {
+        Ok(wal_bytes) => Ok(SourceLeaseMaintenancePreparation {
+            custody,
+            nonce: Uuid::new_v4(),
+            wal_bytes,
+        }),
+        Err(error) => Err(SourceLeaseMaintenancePreparationFailure { custody, error }),
+    }
+}
+
 fn prepare(custody: &mut Custody) -> Result<u64, SourceLeaseMaintenancePreparationError> {
     if custody.preexisting_transaction {
         return Err(SourceLeaseMaintenancePreparationError::TransactionActive);
@@ -385,16 +402,43 @@ impl SourceLeaseMaintenancePreparation {
     }
 }
 impl SourceLeaseMaintenancePreparationFailure {
+    pub(crate) fn retained_database_identity(&self) -> Option<&str> {
+        self.custody
+            .writer()
+            .database
+            .database_file_binding
+            .as_deref()
+            .map(|b| b.identity())
+    }
+    pub(crate) fn close_for_retirement(
+        mut self,
+        authority: &mut crate::sample_sources::db::SourceAuthorityRegistration,
+    ) -> Result<
+        crate::sample_sources::db::SourceAuthorityRetirementAck,
+        crate::sample_sources::db::SourceAuthorityError,
+    > {
+        if self.custody.preexisting_transaction {
+            return Err(crate::sample_sources::db::SourceAuthorityError::InvalidLifecycle);
+        }
+        let writer = self
+            .custody
+            .writer
+            .take()
+            .expect("original failed lease custody");
+        authority.close_database(writer.into_catalog_database())
+    }
     /// Inspect the rejection while the original owner remains inaccessible.
     pub fn error(&self) -> &SourceLeaseMaintenancePreparationError {
         &self.error
     }
     /// Diagnostic snapshot readiness; never close/release authority.
     pub fn source_authority_close_ready(&self) -> bool {
-        self.custody
-            .writer()
-            .database
-            .source_authority_close_ready()
+        !self.custody.preexisting_transaction
+            && self
+                .custody
+                .writer()
+                .database
+                .source_authority_close_ready()
     }
     /// Cleanup may retry a confirmed-empty rollback/timeout; poisoned policy never revives.
     pub fn into_writer(mut self) -> Result<SourceWriter, Self> {
@@ -417,3 +461,6 @@ mod tests;
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 mod workload_tests;
+
+#[cfg(feature = "test-support")]
+mod test_vfs;

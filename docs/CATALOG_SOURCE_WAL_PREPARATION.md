@@ -117,3 +117,67 @@ Record commit, OS/filesystem and
 commands/results. This source implementation and its portable tests do not finish
 tracking parents, physical qualification, admitted generation publication or the
 post-latch coordinator.
+
+## Genuine pre-audit lease transport (OPT-2260)
+
+`submit_lease_with_binding` consumes the original
+`SourceLeaseMaintenanceAllocation`. The actual catalog exposes
+`prepare_source_lease_wal_with_binding` and dispatches the closed
+`SourceWalProducerCommand` on the same source FIFO, 64 slots and 64 KiB context
+pool. It moves the existing `RegisteredSource` writer, snapshots, watcher and
+source-authority evidence into typed native lease custody. There is no additional
+SQL worker or budget. The minimum original observation/request deadline includes
+queue time. Lease commands and `PreparedLease` historical diagnostics have no
+`SourceRevision` accessor; a never-audited subject remains explicitly unavailable
+for authoritative audit. Existing audited/tag/layout APIs remain available.
+The audited-only inbox accessor leaves a lease at the FIFO head; the actual catalog
+uses `try_next_any` to dispatch both typed families without reordering.
+
+Original input heap capacities and complete concrete custody/command headers are
+charged before queue entry. The input moves inline into the request, without an
+uncharged boxed copy. Initial native validation and subsequent original binding
+capture reserve bounded staging in the same context pool before allocating. The
+binding, canonical bytes and historical report retain their actual allocation
+capacities and credit in one shared `Arc`; historical copies remain charged after
+abort and transport close until the last copy drops. Full combined input pressure
+can reject capture rather than exceed the pool. Pending rejection drops input
+backing allocations before refund. Native cleanup returns the identical writer
+only after empty rollback and exact entered settings/timeout restoration.
+
+Initial lease binding checks full original subject, optional audit, source
+registration and native allocation under the actual empty MAIN reservation.
+Parked checks use OPT-2259's original CONTROL/native/registration/settings path,
+without ordinary SQL, renewal, or a hidden lease write queued behind MAIN. Native
+allocation I/O failure can reject `Scope` before the later WAL-specific check;
+neither rejection authorizes an effect. Actual worker tests cover cancellation,
+original deadlines, lost delivery, busy/unknown WAL, failed rollback/timeout
+restoration, lifecycle exclusion, normal deferral, shutdown, and mixed audited
+plus lease exhaustion. Normal-build and compile-fail tests retain the sealed
+constructor and audited-accessor boundary.
+
+Failed pre-existing transactions are not adopted or rolled back and cannot become
+empty-close-ready. Failed genuine lease preparation can retire only through its
+original source authority; `Retired` still requires a real sealed close
+acknowledgement. A local Prepared authority can retain its lease after ordinary
+connection loss, so connection drop is neither lease retirement nor acknowledgement.
+Positive protected-reserve source retirement qualification remains OPT-2026.
+OPT-2136's full inventory, current registered acknowledgements, shared post-decision
+custody, atomic intent claims, uncertainty/readback and restart remain open, as do
+required permits and admitted source lease release. This transport issues none of
+those authorities.
+
+The genuine pre-audit positive native harness is also compiled explicitly:
+
+```sh
+cargo test --locked -p yield-catalog --lib \
+  source_wal_preparation::tests::integration::lease::native_pre_audit_lease_failed_owner_uses_original_registered_drain_close_and_finalization \
+  -- --ignored --exact --test-threads=1
+```
+
+OPT-2262 under OPT-2026 tracks this exact unexecuted case and qualified-host
+requirements. It requires exactly one executed passing test, real native Available
+journal/registration and original never-audited typed preparation, actual rollback
+denial, original drain/close/lease acknowledgement and finalization to Removed.
+Linux protected-reserve bootstrap is unsupported. Missing native source-object
+adapter/backend implementation remains an actual OPT-2194 prerequisite; neither
+an ignored harness nor this verification issue completes that code or qualification.

@@ -1,8 +1,8 @@
 //! Worker-local adapter. Genuine native custody and outcomes belong to the library.
 use super::*;
 struct Slot {
-    source: RegisteredSource<SourceWalTransportOwner>,
-    expected: SourceRevision,
+    source: RegisteredSource<SourceWalProducerOwner>,
+    lifecycle_generation: u64,
     deadline: Instant,
     rejection: Option<CatalogSourceWalRejection>,
 }
@@ -26,7 +26,7 @@ impl WorkerReservations {
     ) {
         self.sweep(admission, sources);
         for _ in 0..CATALOG_WAL_MAX_SLOTS {
-            let Some(command) = self.inbox.try_next() else {
+            let Some(command) = self.inbox.try_next_any() else {
                 break;
             };
             self.prepare(command, admission, sources);
@@ -34,7 +34,7 @@ impl WorkerReservations {
     }
     fn prepare(
         &mut self,
-        command: SourceWalTransportCommand,
+        command: SourceWalProducerCommand,
         admission: &Arc<Mutex<AdmissionState>>,
         sources: &mut HashMap<SourceId, RegisteredSource>,
     ) {
@@ -46,12 +46,12 @@ impl WorkerReservations {
             command.reject(CatalogSourceWalRejection::Deadline);
             return;
         }
-        let expected = command.expected_revision().clone();
-        if !current(admission, &expected) {
+        let id = SourceId::from_string(command.source_id().to_owned());
+        let lifecycle_generation = command.lifecycle_generation();
+        if !current(admission, &id, lifecycle_generation) {
             command.reject(CatalogSourceWalRejection::Scope);
             return;
         }
-        let id = expected.source_id().clone();
         if self.is_held(&id) {
             command.reject(CatalogSourceWalRejection::Busy);
             return;
@@ -64,14 +64,14 @@ impl WorkerReservations {
             command.reject(CatalogSourceWalRejection::Scope);
             return;
         };
-        if source.lifecycle_generation != expected.lifecycle_generation() {
+        if source.lifecycle_generation != lifecycle_generation {
             sources.insert(id, source);
             command.reject(CatalogSourceWalRejection::Scope);
             return;
         }
         let deadline = command.deadline();
         let mapped: Result<
-            RegisteredSource<SourceWalTransportOwner>,
+            RegisteredSource<SourceWalProducerOwner>,
             RegisteredSource<std::convert::Infallible>,
         > = source.try_map_database(|database| Ok(command.acquire(database.writer)));
         let mut parked = match mapped {
@@ -89,7 +89,8 @@ impl WorkerReservations {
         {
             rejection = Some(CatalogSourceWalRejection::Busy);
         }
-        if rejection.is_none() && (parked.database.is_cancelled() || !current(admission, &expected))
+        if rejection.is_none()
+            && (parked.database.is_cancelled() || !current(admission, &id, lifecycle_generation))
         {
             rejection = Some(CatalogSourceWalRejection::Cancelled);
         }
@@ -106,7 +107,7 @@ impl WorkerReservations {
             id,
             Slot {
                 source: parked,
-                expected,
+                lifecycle_generation,
                 deadline,
                 rejection,
             },
@@ -123,7 +124,7 @@ impl WorkerReservations {
             .iter_mut()
             .filter_map(|(id, slot)| {
                 let cancelled = slot.source.database.is_cancelled();
-                let changed = !current(admission, &slot.expected);
+                let changed = !current(admission, id, slot.lifecycle_generation);
                 let validation = slot
                     .source
                     .database
@@ -271,14 +272,18 @@ impl Drop for WorkerReservations {
         self.inbox.close();
     }
 }
-fn current(admission: &Arc<Mutex<AdmissionState>>, revision: &SourceRevision) -> bool {
+fn current(
+    admission: &Arc<Mutex<AdmissionState>>,
+    id: &SourceId,
+    lifecycle_generation: u64,
+) -> bool {
     let state = admission.lock().unwrap_or_else(|p| p.into_inner());
     !state.shutdown
         && !state.closed
         && state
             .sources
-            .get(revision.source_id())
-            .is_some_and(|s| s.active && s.lifecycle_generation == revision.lifecycle_generation())
+            .get(id)
+            .is_some_and(|s| s.active && s.lifecycle_generation == lifecycle_generation)
 }
 pub(crate) fn lifecycle(command: &CatalogCommand) -> bool {
     matches!(
