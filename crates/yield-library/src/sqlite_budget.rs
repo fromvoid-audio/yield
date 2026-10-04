@@ -15,6 +15,7 @@ use std::sync::{
 mod io;
 #[cfg(test)]
 mod tests;
+pub(crate) mod wal_objects;
 
 const CLIENT_NAME: &str = "yield-owned-budget-v1";
 
@@ -179,6 +180,7 @@ struct State {
     main_name: Vec<u8>,
     open_auxiliary: u32,
     mapped_shm_bytes: u64,
+    mapped_shm_region_zero: Option<usize>,
     mapped_database: u32,
     attempt: Option<Attempt>,
 }
@@ -456,6 +458,7 @@ pub(crate) fn open_owned(
                 main_name: Vec::new(),
                 open_auxiliary: 0,
                 mapped_shm_bytes: 0,
+                mapped_shm_region_zero: None,
                 mapped_database: 0,
                 attempt: None,
             }),

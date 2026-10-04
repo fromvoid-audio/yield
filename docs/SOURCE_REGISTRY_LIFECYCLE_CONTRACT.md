@@ -298,3 +298,60 @@ no lifecycle command, registration publication, claim, native permit or
 physical allocation qualification. OPT-2194/2195 and their production and
 native dependents remain open. Journal schema 12 and source schema 13 are
 unchanged.
+
+## Actual allocation capture leaf (OPT-2244)
+
+The existing global empty preparation can request lifecycle allocation
+observations with `with_lifecycle_allocation()`. Its worker validates the exact
+current compiled whole-global schema and finite built-in runtime image under
+its actual empty `BEGIN IMMEDIATE`, checks the 8192-per-table/4096-non-retired
+limits without eviction, and captures actual MAIN/WAL/mapped-SHM objects. An
+unknown/legacy-altered global schema remains refusal, even if ordinary global
+migration/configured persistence continues to work. Read-only capture issues
+no SQL transition, receipt, intent, claim or required-effect permission.
+
+The original source writer separately captures and revalidates weak-owner-bound
+lease-maintenance planning observations with optional completed audit metadata.
+It preserves the real source/lifecycle/lease/root/database tuple and original
+two-second deadline, never auto-renews a lease, and cannot manufacture an
+authoritative `SourceRevision` for a pre-audit source. Reacquisition with equal
+paths does not rebind the observation. Whole source schema/runtime validation
+retains the existing strict metadata guard. Global and source objects on the
+same device retain distinct identities and separately rounded logical ceilings.
+
+Object capture currently supports the known retained-root Linux forwarding VFS
+with libsqlite3-sys 0.35.0 bundled SQLite 3.50.2, source ID
+`2025-06-28 14:00:48 2af157d77fb1304a74176eaee7fbc7c7e932d946bf25325e9c26c91db19e3079`.
+The exact wrapper/context/parent role and adapter are checked before reading the
+reviewed four-field native `unixFile` prefix and `fstat` of the borrowed MAIN/WAL
+descriptors. `HAS_MOVED` alone is insufficient for WAL: bundled `fileHasMoved`
+requires `pInode`, which WAL lacks; an actual equal-size replacement regression
+proved that gap. SHM region zero is observed from the original `xShmMap` callback;
+a bounded (at most 2 MiB) `/proc/self/maps` kernel read compares its shared mapping
+device/inode with the no-follow current SHM descriptor. It reads no process
+memory and trusts no displayed pathname. SQLite close/unmap clears the mapping
+witness. Exact-size substitutions, absent/symlink sidecars and unknown/unowned
+VFS/mappings refuse. Unknown versions or other hosts have no guessed ABI fallback.
+
+The selected page bounds are at most 64 MiB for source MAIN and 512 MiB for
+global MAIN, limited further by the existing pager maximum. The logical WAL
+window is `32 + M*(P+24)`, and the SHM window is `32768 + 16*M`. Each object has
+a unit-rounded logical refusal ceiling of four times the sum of its window
+and resident bytes, plus 4 MiB of bookkeeping. These are finite I/O restrictions, not claims
+that all workloads finish or that filesystem overwrite/metadata overhead is
+physically reserved. The future entered policy must enforce the selected pager
+maximum, known schema/runtime, no uncontrolled mmap/temp/spill/checkpoint path,
+and genuine journal-issued attempt restrictions. Actual private SQL maximum-blob
+and VFS refusal tests supply storage evidence only, never authentic subjects,
+receipts or admission.
+
+Full OPT-2194 remains open for qualified physical policy and exact legal
+per-direction DB claim slices. Existing `SourceWalPreparation` and the stored
+`SourceAuthoritative` domain require a completed audit. A distinct genuine
+pre-audit lifecycle/lease binding and owned preparation must be implemented
+before unaudited source lease-maintenance can be admitted; silently reusing an
+authoritative audit fence is forbidden. This is a portable contract/implementation
+gap, not deferred native verification. OPT-2136/2168/2169/2170/2202/2195/2196 and
+tracking parents remain open; native OPT-2199/2200 must also establish their
+actual descriptor/mapped-object primitive and genuine physical/backend evidence.
+Contract fixtures or these observers do not complete those production routes.

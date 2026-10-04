@@ -13,6 +13,7 @@ mod harvest;
 mod harvest_authored;
 mod harvest_copy;
 mod harvest_facts;
+mod lifecycle_allocation;
 mod migrations;
 mod mutation_context;
 mod operation_link_participant;

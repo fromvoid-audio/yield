@@ -11,6 +11,9 @@ use super::util::map_sql_error;
 mod ddl;
 mod metadata_budget;
 pub(super) use metadata_budget::require_known_metadata_schema;
+pub(crate) use metadata_budget::{
+    image as bounded_schema_image, runtime_image as bounded_runtime_image,
+};
 mod migrations;
 
 pub(crate) use migrations::table_columns;

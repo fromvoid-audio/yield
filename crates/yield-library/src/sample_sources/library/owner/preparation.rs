@@ -43,6 +43,9 @@ pub enum GlobalPreparationError {
     /// The retained root/main file/native SQLite binding cannot be proven.
     #[error("preparation database binding unavailable")]
     DatabaseBinding,
+    /// Exact lifecycle schema/runtime/retained allocation observations are unavailable.
+    #[error(transparent)]
+    LifecycleAllocation(#[from] crate::lifecycle_allocation::LifecycleAllocationError),
     /// Exactly one nonblocking acquisition failed; preserve SQLite's extended code.
     #[error("preparation SQLite acquisition failed (code {sqlite_code})")]
     Acquisition {
@@ -89,8 +92,16 @@ pub struct GlobalPreparationRequest {
     command_digest: [u8; 32],
     deadline: Instant,
     expected_mutation_revision: Option<u64>,
+    lifecycle_allocation: bool,
 }
 impl GlobalPreparationRequest {
+    /// Request exact finite lifecycle allocation observations under this empty reservation.
+    /// Unknown schema/native objects refuse; this selects no SQL effect or physical permit.
+    pub fn with_lifecycle_allocation(mut self) -> Self {
+        self.lifecycle_allocation = true;
+        self
+    }
+
     /// Form a delayed preparation from an actual historical observation. This comparison
     /// conveys no authority: the current owner and held transaction must validate it again.
     pub fn from_observation(
@@ -134,6 +145,7 @@ impl GlobalPreparationRequest {
             command_digest,
             deadline,
             expected_mutation_revision: None,
+            lifecycle_allocation: false,
         })
     }
 }
@@ -147,8 +159,17 @@ pub struct GlobalPreparationObservation {
     nonce: uuid::Uuid,
     wal_bytes: u64,
     mutation_revision: u64,
+    lifecycle_allocation: Option<crate::lifecycle_allocation::LifecycleDatabaseAllocation>,
 }
 impl GlobalPreparationObservation {
+    /// Actual bounded lifecycle facts from this exact held worker, when requested.
+    /// Copying observations grants no admission, required commit or capacity qualification.
+    pub fn lifecycle_allocation(
+        &self,
+    ) -> Option<&crate::lifecycle_allocation::LifecycleDatabaseAllocation> {
+        self.lifecycle_allocation.as_ref()
+    }
+
     /// Checked mutation dispatch revision within this exact worker registration.
     /// It is neither a durable database revision nor a capacity/commit permission.
     pub fn mutation_revision(&self) -> u64 {
@@ -390,6 +411,13 @@ pub(super) fn run(
             crate::sqlite_wal::enforce_wal_admission(&database.connection)?.observed_bytes();
         canceled(&command, lifecycle)?;
         mutation_fence.validate(Some(mutation_revision))?;
+        let lifecycle_allocation = if command.request.lifecycle_allocation {
+            Some(database.capture_lifecycle_allocation(command.request.deadline)?)
+        } else {
+            None
+        };
+        canceled(&command, lifecycle)?;
+        validate(database, guard, &file)?;
         let (control, controls) = mpsc::sync_channel(1);
         let (released, release_rx) = mpsc::sync_channel(1);
         let reservation = GlobalPreparationReservation {
@@ -400,6 +428,7 @@ pub(super) fn run(
                 nonce: uuid::Uuid::new_v4(),
                 wal_bytes,
                 mutation_revision,
+                lifecycle_allocation,
             },
             canceled: Arc::clone(&command.canceled),
             control,

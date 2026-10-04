@@ -32,6 +32,8 @@ pub use layout_generation::{
 mod manifest_enrollment;
 pub use feature_rebuild_metrics::FeatureRebuildMetrics;
 mod layout_metadata_budget;
+mod lease_maintenance_allocation;
+pub use lease_maintenance_allocation::SourceLeaseMaintenanceAllocation;
 mod layout_metadata_policy;
 pub use layout_metadata_budget::{SOURCE_LAYOUT_GENERATION_MAX_BYTES, SourceLayoutMetadataBudget};
 pub use layout_metadata_policy::SourceLayoutMetadataPolicy;

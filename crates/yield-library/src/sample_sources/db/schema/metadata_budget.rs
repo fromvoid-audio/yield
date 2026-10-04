@@ -7,7 +7,7 @@ const MAX_OBJECTS: usize = 512;
 const MAX_SQL_BYTES: usize = 16384;
 const MAX_IMAGE_BYTES: usize = 256 * 1024;
 
-type SchemaImage = Vec<(String, String, String, Option<String>)>;
+pub(crate) type SchemaImage = Vec<(String, String, String, Option<String>)>;
 
 /// Reject unknown objects/SQL, triggers, attached/temp schemas and dynamic extension callbacks.
 pub(in crate::sample_sources::db) fn require_known_metadata_schema(
@@ -57,7 +57,7 @@ fn reference_image() -> Result<(SchemaImage, Vec<String>), SourceDbError> {
 }
 
 // Sort bounded owned vectors in Rust; no SQLite temporary-sort disk writes before admission.
-fn image(connection: &Connection) -> Result<SchemaImage, SourceDbError> {
+pub(crate) fn image(connection: &Connection) -> Result<SchemaImage, SourceDbError> {
     let mut query = connection
         .prepare(
             "SELECT CASE WHEN length(CAST(type AS BLOB))<=16 THEN type ELSE NULL END,
@@ -96,7 +96,7 @@ fn image(connection: &Connection) -> Result<SchemaImage, SourceDbError> {
     Ok(result)
 }
 
-fn runtime_image(connection: &Connection) -> Result<Vec<String>, SourceDbError> {
+pub(crate) fn runtime_image(connection: &Connection) -> Result<Vec<String>, SourceDbError> {
     // SQLite lazily registers its own eponymous pragma modules when queried. Prewarm the
     // finite read-only set used by source maintenance/inspection on both connections, so
     // prior owned observations do not look like an unknown extension. Never allow a prefix.
