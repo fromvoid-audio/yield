@@ -85,6 +85,8 @@ fn normal_build_original_never_audited_lease_owner_crosses_shared_fifo_and_prese
         &SourceRegistryAuditObservation::Unavailable {}
     );
     drop(holder);
+    // Original cleanup remains funded after admission closes during shutdown.
+    inbox.close();
     let writer = owner
         .into_writer()
         .unwrap_or_else(|_| panic!("original cleanup"));

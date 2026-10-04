@@ -301,7 +301,7 @@ impl SourceLeaseWalTransportOwner {
             .as_ref()
             .expect("original lease custody")
             .cleanup_staging_bytes();
-        if let Err(reason) = staging.resize(bytes) {
+        if let Err(reason) = staging.resize_for_cleanup(bytes) {
             self.mark_unavailable(reason);
             return Err(self);
         }
@@ -364,7 +364,10 @@ impl Drop for SourceLeaseWalTransportOwner {
         if let Some(native) = self.native.take() {
             let mut staging =
                 ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
-            if staging.resize(native.cleanup_staging_bytes()).is_ok() {
+            if staging
+                .resize_for_cleanup(native.cleanup_staging_bytes())
+                .is_ok()
+            {
                 drop(native);
             } else {
                 native.close_without_reuse();

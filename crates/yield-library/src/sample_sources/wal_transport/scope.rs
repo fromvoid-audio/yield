@@ -74,8 +74,23 @@ impl ByteCredit {
         credit
     }
     pub(super) fn resize(&mut self, bytes: usize) -> Result<(), SourceWalTransportRejection> {
+        self.resize_inner(bytes, false)
+    }
+    // Existing original custody must be able to fund cleanup after admission closes.
+    // Both byte ceilings still apply; this never enqueues a new request or publishes readiness.
+    pub(super) fn resize_for_cleanup(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), SourceWalTransportRejection> {
+        self.resize_inner(bytes, true)
+    }
+    fn resize_inner(
+        &mut self,
+        bytes: usize,
+        cleanup: bool,
+    ) -> Result<(), SourceWalTransportRejection> {
         let mut q = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
-        if q.closed {
+        if q.closed && !cleanup {
             return Err(SourceWalTransportRejection::Closed);
         }
         let remaining = q.bytes.checked_sub(self.bytes).expect("scope byte credit");
