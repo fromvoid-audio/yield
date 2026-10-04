@@ -132,6 +132,58 @@ impl MetadataTagSourceIntentArgs {
             .map_err(|_| MetadataTagArgsError::Observation)?;
         Ok(value)
     }
+    pub(crate) fn matches_original_observation(
+        &self,
+        writer: &SourceWriter,
+        observation: &SourceTagAdmissionObservation,
+    ) -> Result<(), MetadataTagArgsError> {
+        self.validate()?;
+        writer
+            .validate_tag_admission_observation(observation)
+            .map_err(|_| MetadataTagArgsError::Observation)?;
+        let reference = writer
+            .reference_read_fence()
+            .map_err(|_| MetadataTagArgsError::Observation)?;
+        let selected = observation.selection();
+        let r = selected.revision();
+        let mutation_matches = match (&self.mutation, selected.mutation()) {
+            (
+                MetadataTagMutation::MetadataTagRename { target_identity },
+                SourceTagAssignmentMutation::Rename(target),
+            ) => target_identity == target,
+            (MetadataTagMutation::MetadataTagDelete, SourceTagAssignmentMutation::Delete) => true,
+            _ => false,
+        };
+        if reference.source_revision() != r
+            || reference.profile_acquisition_identity().as_deref()
+                != Some(&self.scope.profile_acquisition_identity)
+            || self.scope.source_id != r.source_id().as_str()
+            || self.scope.root_identity != r.root_identity().as_bytes()
+            || self.scope.root_binding_identity != r.root_binding_identity()
+            || self.scope.database_identity != r.database_identity()
+            || self.scope.lifecycle_generation != r.lifecycle_generation()
+            || self.scope.lease_epoch != r.lease_epoch()
+            || self.scope.revision != r.revision()
+            || self.directory_generation != observation.directory_generation()
+            || self.old_tag_id != selected.old_tag_id()
+            || self.old_identity != selected.old_identity()
+            || !mutation_matches
+            || self.paths.len() != selected.paths().len()
+            || self
+                .paths
+                .iter()
+                .zip(selected.paths())
+                .any(|(path, original)| {
+                    original.as_path().as_os_str().as_encoded_bytes() != path.as_bytes()
+                })
+        {
+            return Err(MetadataTagArgsError::Observation);
+        }
+        reference
+            .validate()
+            .map_err(|_| MetadataTagArgsError::Observation)
+    }
+
     /// Source, physical binding and initial live incarnation represented by this historical data.
     pub fn scope(&self) -> &MetadataTagHistoricalScope {
         &self.scope

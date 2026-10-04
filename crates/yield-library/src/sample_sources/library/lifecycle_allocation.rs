@@ -3,7 +3,9 @@ use super::{LIBRARY_DB_FILE_NAME, connection::LibraryDatabase};
 use crate::lifecycle_allocation::{
     self, LifecycleAllocationError, LifecycleAllocationRole, LifecycleDatabaseAllocation,
 };
-use crate::sample_sources::db::schema::{bounded_runtime_image, bounded_schema_image};
+use crate::sample_sources::db::schema::{
+    bounded_runtime_image, bounded_schema_image, validate_bounded_runtime, validate_bounded_schema,
+};
 use std::{path::Path, sync::OnceLock, time::Instant};
 
 type Image = (Vec<(String, String, String, Option<String>)>, Vec<String>);
@@ -41,13 +43,8 @@ fn known_schema(database: &LibraryDatabase) -> Result<(), LifecycleAllocationErr
         })
         .as_ref()
         .ok_or(Unknown)?;
-    let actual = (
-        bounded_schema_image(connection).map_err(|_| Unknown)?,
-        bounded_runtime_image(connection).map_err(|_| Unknown)?,
-    );
-    if &actual != expected {
-        return Err(Unknown);
-    }
+    validate_bounded_schema(connection, &expected.0).map_err(|_| Unknown)?;
+    validate_bounded_runtime(connection, &expected.1).map_err(|_| Unknown)?;
     Ok(())
 }
 fn counts(database: &LibraryDatabase) -> Result<(u64, u64, u64), LifecycleAllocationError> {

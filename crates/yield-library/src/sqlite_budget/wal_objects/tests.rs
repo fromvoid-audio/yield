@@ -139,3 +139,48 @@ fn unknown_unowned_delete_expired_or_wrong_root_has_no_retained_wal_observation(
         "closed WAL mapping cannot survive journal-mode change"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_map_stream_checks_complete_input_with_fixed_backing() {
+    use std::{
+        io::Cursor,
+        time::{Duration, Instant},
+    };
+    let device = libc::makedev(8, 1) as u64;
+    let scan = |bytes: &[u8]| {
+        super::mapped_identity_stream(
+            Cursor::new(bytes),
+            0x10000,
+            device,
+            42,
+            Instant::now() + Duration::from_secs(2),
+        )
+    };
+    let valid = b"10000-18000 rw-s 00000000 08:01 42 /ignored-path\n";
+    assert_eq!(scan(valid), Some(true));
+    let mut duplicate = valid.to_vec();
+    duplicate.extend(valid);
+    assert_eq!(scan(&duplicate), None);
+    assert_eq!(scan(b"10000-18000 rw-p 00000000 08:01 42\n"), None);
+    assert_eq!(scan(b"10000-18000 rw-s 00000001 08:01 42\n"), None);
+    assert_eq!(scan(b"10000-18000 rw-s 00000000 08:02 42\n"), None);
+    assert_eq!(scan(b"10000-18000 rw-s 00000000 08:01 43\n"), None);
+    assert_eq!(scan(b"20000-28000 rw-s 00000000 08:01 42\n"), Some(false));
+    assert_eq!(scan(b"10000-18000 rw-s 00000000 08:01"), None);
+    let mut long = valid[..valid.len() - 1].to_vec();
+    long.extend(std::iter::repeat_n(b'x', 100_000));
+    long.push(b'\n');
+    assert_eq!(scan(&long), Some(true));
+    let mut oversized = long.clone();
+    oversized.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
+    assert_eq!(scan(&oversized), None);
+    let expired =
+        super::mapped_identity_stream(Cursor::new(valid), 0x10000, device, 42, Instant::now());
+    assert_eq!(expired, None);
+    // A fifth token split at the prefix ceiling cannot silently become an accepted inode.
+    let mut partial = b"10000-18000 rw-s 00000000 08:01 ".to_vec();
+    partial.extend(std::iter::repeat_n(b'0', 250));
+    partial.extend(b"42\n");
+    assert_eq!(scan(&partial), None);
+}

@@ -34,6 +34,7 @@ mod integration {
                 canceled: Arc::new(AtomicBool::new(false)),
                 ready,
                 binding_credit: Some(writer.preparation_binding_budget.reserve().unwrap()),
+                handshake_credit: None,
             },
             receiver,
         )

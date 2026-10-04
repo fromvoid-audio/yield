@@ -100,8 +100,18 @@ pub struct GlobalPreparationRequest {
     lifecycle_allocation: bool,
     lifecycle_policy: bool,
     wal_binding: bool,
+    handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
 }
 impl GlobalPreparationRequest {
+    pub(crate) fn in_handshake(
+        mut self,
+        budget: Arc<crate::operation_journal::wal_admission::HandshakeBudget>,
+    ) -> Self {
+        self.handshake = Some(budget);
+        self.wal_binding = true;
+        self
+    }
+
     /// Retain the exact capped lifecycle settings policy on the original global worker.
     /// This pre-intent restriction includes strict native scope; it grants no SQL effect,
     /// journal decision, physical qualification or required commit permit.
@@ -172,6 +182,7 @@ impl GlobalPreparationRequest {
             lifecycle_allocation: false,
             lifecycle_policy: false,
             wal_binding: false,
+            handshake: None,
         })
     }
 }
@@ -182,6 +193,7 @@ pub struct GlobalPreparationObservation {
     data: Arc<ObservationData>,
     // Shared with the original worker; final view releases only this local memory credit.
     _binding_credit: Option<Arc<binding::Credit>>,
+    _handshake_credit: Option<Arc<binding::SharedHandshakeCredit>>,
 }
 impl PartialEq for GlobalPreparationObservation {
     fn eq(&self, other: &Self) -> bool {
@@ -262,8 +274,12 @@ pub struct GlobalPreparationPending {
     ready: Receiver<Result<GlobalPreparationReservation, GlobalPreparationError>>,
     canceled: Arc<AtomicBool>,
     armed: bool,
+    _handshake_credit: Option<Arc<binding::SharedHandshakeCredit>>,
 }
 impl GlobalPreparationPending {
+    pub(crate) fn cancel(&self) {
+        self.canceled.store(true, Ordering::Release);
+    }
     /// Poll without blocking the caller; successful delivery transfers cancellation ownership.
     pub fn try_recv(
         &mut self,
@@ -302,8 +318,28 @@ pub struct GlobalPreparationReservation {
     canceled: Arc<AtomicBool>,
     control: SyncSender<Control>,
     released: Option<Receiver<Result<(), GlobalPreparationError>>>,
+    observed_release: Option<Result<(), GlobalPreparationError>>,
 }
 impl GlobalPreparationReservation {
+    pub(crate) fn try_release_outcome(
+        &mut self,
+    ) -> Result<Option<Result<(), GlobalPreparationError>>, mpsc::TryRecvError> {
+        if let Some(result) = &self.observed_release {
+            return Ok(Some(result.clone()));
+        }
+        let Some(receiver) = &self.released else {
+            return Ok(None);
+        };
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.observed_release = Some(result.clone());
+                Ok(Some(result))
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Borrow authority-free diagnostics while the owner may still hold the reservation.
     pub fn observation(&self) -> &GlobalPreparationObservation {
         &self.observation
@@ -313,7 +349,15 @@ impl GlobalPreparationReservation {
     pub fn abort(mut self) -> Receiver<Result<(), GlobalPreparationError>> {
         self.canceled.store(true, Ordering::Release);
         let _ = self.control.try_send(Control::Abort);
-        self.released.take().expect("single release receiver")
+        if let Some(actual_result) = self.observed_release.take() {
+            // Forward only the actual original worker result already consumed by internal
+            // liveness polling. This cached result cannot be set by a caller or decoder.
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let _ = sender.try_send(actual_result);
+            receiver
+        } else {
+            self.released.take().expect("single release receiver")
+        }
     }
 }
 impl Drop for GlobalPreparationReservation {
@@ -328,6 +372,7 @@ pub(super) struct Command {
     canceled: Arc<AtomicBool>,
     ready: SyncSender<Result<GlobalPreparationReservation, GlobalPreparationError>>,
     binding_credit: Option<Arc<binding::Credit>>,
+    handshake_credit: Option<Arc<binding::SharedHandshakeCredit>>,
 }
 impl Command {
     pub(super) fn reject(self) {
@@ -506,7 +551,13 @@ pub(super) fn run(
                 lifecycle_policy_entered: policy.is_some(),
             }),
             _binding_credit: command.binding_credit.as_ref().map(Arc::clone),
+            _handshake_credit: command.handshake_credit.as_ref().map(Arc::clone),
         };
+        if let Some(credit) = &command.handshake_credit {
+            // Capture staging is over. Keep complete retained data, headers and conservative
+            // original parked-native scratch charged before publishing to another owner.
+            credit.retain(database, &observation)?;
+        }
         // Original worker keeps the same immutable scope and byte custody until rollback.
         let retained_observation = observation.clone();
         let reservation = GlobalPreparationReservation {
@@ -514,6 +565,7 @@ pub(super) fn run(
             canceled: Arc::clone(&command.canceled),
             control,
             released: Some(release_rx),
+            observed_release: None,
         };
         if command.ready.try_send(Ok(reservation)).is_err() {
             command.canceled.store(true, Ordering::Release);

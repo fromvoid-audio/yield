@@ -254,3 +254,75 @@ pub(super) fn validate(
 
 #[cfg(all(test, target_os = "linux"))]
 mod binding_tests;
+
+// One private combined debit shared by the original command/pending/immutable replies.
+#[derive(Debug)]
+pub(super) struct SharedHandshakeCredit(
+    Mutex<crate::operation_journal::wal_admission::HandshakeCredit>,
+);
+impl SharedHandshakeCredit {
+    pub(super) fn reserve(
+        budget: &Arc<crate::operation_journal::wal_admission::HandshakeBudget>,
+    ) -> Result<Arc<Self>, GlobalLibraryWriterQueueError> {
+        let mut credit = budget.credit();
+        credit
+            .resize(HANDOFF_BYTES)
+            .map_err(|_| GlobalLibraryWriterQueueError::Full)?;
+        Ok(Arc::new(Self(Mutex::new(credit))))
+    }
+    pub(super) fn retain(
+        &self,
+        database: &LibraryDatabase,
+        observation: &GlobalPreparationObservation,
+    ) -> Result<(), GlobalPreparationError> {
+        let data = &observation.data;
+        let root = database
+            .preparation_root()
+            .ok_or(GlobalPreparationError::DatabaseBinding)?;
+        // Existing root paths are borrowed. Native validation can create bounded joined paths
+        // and current object facts, so retain their scratch as well as the immutable scope.
+        let paths = root
+            .path()
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(4 * 64))
+            .ok_or(GlobalPreparationError::InputBound)?;
+        let scope = data
+            .wal_scope
+            .as_ref()
+            .ok_or(GlobalPreparationError::DatabaseBinding)?;
+        let objects = [&scope.objects.main, &scope.objects.wal, &scope.objects.shm]
+            .into_iter()
+            .try_fold(0usize, |n, o| n.checked_add(o.identity.capacity()))
+            .ok_or(GlobalPreparationError::InputBound)?;
+        let lifecycle = data
+            .lifecycle_allocation
+            .as_ref()
+            .map_or(Some(0), |a| a.retained_heap_bytes())
+            .ok_or(GlobalPreparationError::InputBound)?;
+        let bytes = [
+            DESCRIPTOR_MAX_BYTES,
+            objects,
+            lifecycle,
+            data.database_identity.capacity(),
+            data.owner.acquisition.as_str().len(),
+            paths,
+            3 * 512,
+            2048,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .ok_or(GlobalPreparationError::InputBound)?;
+        // The original stage must already cover retained backing. Never enlarge after publishing.
+        if bytes > HANDOFF_BYTES {
+            return Err(GlobalPreparationError::InputBound);
+        }
+        self.0
+            .lock()
+            .map_err(|_| GlobalPreparationError::InputBound)?
+            .resize(bytes)
+            .map_err(|_| GlobalPreparationError::InputBound)
+    }
+}

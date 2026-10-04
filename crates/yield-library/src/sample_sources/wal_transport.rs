@@ -28,6 +28,7 @@ pub use policy::SourceWalPolicyFamily;
 use policy::{Native, RequestPolicy};
 mod scope;
 pub use producer::{SourceWalOwnerObservation, SourceWalTransportOwner};
+pub(crate) use scope::CAPTURE_BYTES as VALIDATION_STAGING_BYTES;
 use scope::{ByteCredit, ScopeView};
 
 /// Maximum pending plus held source preparation slots for one catalog worker.
@@ -301,6 +302,7 @@ struct PrepareRequest {
     require_binding: bool,
     policy: Option<RequestPolicy>,
     lease: Option<crate::sample_sources::db::write::SourceLeaseMaintenanceAllocation>,
+    handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
 }
 impl PrepareRequest {
     fn finish(self, status: SourceWalTransportStatus) {
@@ -334,6 +336,7 @@ struct Shared {
 struct Credit {
     shared: Weak<Shared>,
     bytes: usize,
+    _handshake: Option<crate::operation_journal::wal_admission::HandshakeCredit>,
 }
 impl Drop for Credit {
     fn drop(&mut self) {
@@ -395,7 +398,7 @@ impl SourceWalTransport {
         correlation: SourceWalTransportCorrelation,
         deadline: Instant,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
-        self.submit_scoped(expected, correlation, deadline, false, None)
+        self.submit_scoped(expected, correlation, deadline, false, None, None)
     }
     /// Submit strict original-binding capture; its actor must supply a genuine registration.
     pub fn submit_with_binding(
@@ -404,7 +407,7 @@ impl SourceWalTransport {
         correlation: SourceWalTransportCorrelation,
         deadline: Instant,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
-        self.submit_scoped(expected, correlation, deadline, true, None)
+        self.submit_scoped(expected, correlation, deadline, true, None, None)
     }
     /// Consume a genuine tag observation into strict preparation on its original source actor.
     /// Retains the entered finite policy; original observation deadline can never be extended.
@@ -423,6 +426,7 @@ impl SourceWalTransport {
             deadline,
             true,
             Some(RequestPolicy::Tag(Box::new(observation))),
+            None,
         )
     }
     /// Consume genuine layout allocation observations into original strict owned preparation.
@@ -441,7 +445,49 @@ impl SourceWalTransport {
             deadline,
             true,
             Some(RequestPolicy::Layout(Box::new(budget))),
+            None,
         )
+    }
+    pub(crate) fn submit_in_handshake(
+        &self,
+        input: crate::operation_journal::wal_admission::SourceInput,
+        correlation: SourceWalTransportCorrelation,
+        deadline: Instant,
+        handshake: Arc<crate::operation_journal::wal_admission::HandshakeBudget>,
+    ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
+        use crate::operation_journal::wal_admission::SourceInput;
+        match input {
+            SourceInput::Audited(revision) => {
+                self.submit_scoped(revision, correlation, deadline, true, None, Some(handshake))
+            }
+            SourceInput::Tag(observation) => {
+                let deadline = deadline.min(observation.original_deadline());
+                let revision = observation.selection().revision().clone();
+                self.submit_scoped(
+                    revision,
+                    correlation,
+                    deadline,
+                    true,
+                    Some(RequestPolicy::Tag(Box::new(observation))),
+                    Some(handshake),
+                )
+            }
+            SourceInput::Layout(budget) => {
+                let deadline = deadline.min(budget.observation_deadline());
+                let revision = budget.revision().clone();
+                self.submit_scoped(
+                    revision,
+                    correlation,
+                    deadline,
+                    true,
+                    Some(RequestPolicy::Layout(Box::new(budget))),
+                    Some(handshake),
+                )
+            }
+            SourceInput::Lease(input) => {
+                self.submit_lease_scoped(input, correlation, deadline, Some(handshake))
+            }
+        }
     }
     fn submit_scoped(
         &self,
@@ -450,6 +496,7 @@ impl SourceWalTransport {
         deadline: Instant,
         require_binding: bool,
         policy: Option<RequestPolicy>,
+        handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
         let now = Instant::now();
         if deadline <= now || deadline.duration_since(now) > MAX_DEADLINE {
@@ -494,6 +541,7 @@ impl SourceWalTransport {
             policy,
             None,
             size,
+            handshake,
         )
     }
     fn enqueue(
@@ -505,6 +553,7 @@ impl SourceWalTransport {
         policy: Option<RequestPolicy>,
         lease: Option<crate::sample_sources::db::write::SourceLeaseMaintenanceAllocation>,
         size: usize,
+        handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
         if size > SOURCE_WAL_TRANSPORT_MAX_CONTEXT_BYTES {
             return Err(SourceWalTransportRejection::InvalidContext);
@@ -518,6 +567,16 @@ impl SourceWalTransport {
         {
             return Err(SourceWalTransportRejection::Full);
         }
+        let handshake_credit = handshake
+            .as_ref()
+            .map(|budget| {
+                let mut credit = budget.credit();
+                credit
+                    .resize(size)
+                    .map_err(|_| SourceWalTransportRejection::Full)?;
+                Ok(credit)
+            })
+            .transpose()?;
         q.slots += 1;
         q.bytes += size;
         let ticket = Arc::new(Ticket {
@@ -526,6 +585,7 @@ impl SourceWalTransport {
             credit: Mutex::new(Some(Credit {
                 shared: Arc::downgrade(&self.shared),
                 bytes: size,
+                _handshake: handshake_credit,
             })),
         });
         q.requests.push_back(PrepareRequest {
@@ -536,6 +596,7 @@ impl SourceWalTransport {
             require_binding,
             policy,
             lease,
+            handshake,
         });
         Ok(SourceWalTransportRequest {
             ticket,

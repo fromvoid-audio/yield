@@ -160,7 +160,7 @@ fn borrowed_text<'row>(
         _ => Err(SourceDbError::Unexpected),
     }
 }
-fn validate_current_schema(
+pub(crate) fn validate_current_schema(
     connection: &Connection,
     expected: &SchemaImage,
 ) -> Result<(), SourceDbError> {
@@ -206,7 +206,7 @@ fn validate_current_schema(
     }
     Ok(())
 }
-fn validate_current_runtime(
+pub(crate) fn validate_current_runtime(
     connection: &Connection,
     expected: &[String],
 ) -> Result<(), SourceDbError> {

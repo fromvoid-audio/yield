@@ -13,6 +13,8 @@ mod metadata_budget;
 pub(super) use metadata_budget::require_known_metadata_schema;
 pub(crate) use metadata_budget::{
     image as bounded_schema_image, runtime_image as bounded_runtime_image,
+    validate_current_runtime as validate_bounded_runtime,
+    validate_current_schema as validate_bounded_schema,
 };
 mod migrations;
 

@@ -139,6 +139,30 @@ impl StoredSourceLeaseFence {
     pub fn subject(&self) -> &SourceRegistryReferenceSubject {
         &self.subject
     }
+    // The original passive allocation factory captures no registration. A stored
+    // phase/nonce is history; compare every original owner/audit scalar without
+    // constructing a registered current subject or treating phase as an ACK.
+    pub(crate) fn matches_allocation_subject(
+        &self,
+        current: &SourceRegistryReferenceSubject,
+    ) -> bool {
+        let s = &self.subject;
+        current.registration().is_none()
+            && s.source_id() == current.source_id()
+            && s.lifecycle_generation() == current.lifecycle_generation()
+            && s.profile_acquisition() == current.profile_acquisition()
+            && s.lease_owner() == current.lease_owner()
+            && s.lease_epoch() == current.lease_epoch()
+            && s.media_root_identity() == current.media_root_identity()
+            && s.database_root_identity() == current.database_root_identity()
+            && s.database_identity() == current.database_identity()
+            && s.root_binding_identity() == current.root_binding_identity()
+            && s.scan_revision() == current.scan_revision()
+            && s.audit() == current.audit()
+    }
+    pub(crate) fn database_device(&self) -> u64 {
+        self.objects[0].device
+    }
     /// Original local preparation identity, not the journal decision nonce or live custody.
     pub fn preparation_nonce(&self) -> Uuid {
         self.preparation_nonce

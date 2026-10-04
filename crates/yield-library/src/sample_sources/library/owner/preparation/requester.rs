@@ -57,6 +57,11 @@ impl GlobalWalPreparationClient {
         } else {
             None
         };
+        let handshake_credit = request
+            .handshake
+            .as_ref()
+            .map(|budget| binding::SharedHandshakeCredit::reserve(budget))
+            .transpose()?;
         let (ready, receiver) = mpsc::sync_channel(1);
         let canceled = Arc::new(AtomicBool::new(false));
         self.queue.send(WriterCommand::Prepare(Command {
@@ -64,11 +69,13 @@ impl GlobalWalPreparationClient {
             canceled: Arc::clone(&canceled),
             ready,
             binding_credit,
+            handshake_credit: handshake_credit.as_ref().map(Arc::clone),
         }))?;
         Ok(GlobalPreparationPending {
             ready: receiver,
             canceled,
             armed: true,
+            _handshake_credit: handshake_credit,
         })
     }
 }

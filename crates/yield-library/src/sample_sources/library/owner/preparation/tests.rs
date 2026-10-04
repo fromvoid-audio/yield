@@ -400,6 +400,7 @@ fn preparation_retained_unknown_mode_and_rollback_denial_require_no_fake_complet
             canceled: Arc::new(AtomicBool::new(false)),
             ready,
             binding_credit: None,
+            handshake_credit: None,
         };
         let lifecycle = std::sync::atomic::AtomicU8::new(WriterLifecycle::Available as u8);
         assert!(run(
@@ -445,6 +446,7 @@ fn preparation_retained_unknown_mode_and_rollback_denial_require_no_fake_complet
             canceled: Arc::new(AtomicBool::new(false)),
             ready,
             binding_credit: None,
+            handshake_credit: None,
         };
         let client = std::thread::spawn(move || {
             receiver
@@ -610,6 +612,7 @@ fn preparation_one_actual_begin_and_timeout_restore_with_no_row_or_checkpoint_sq
             canceled: Arc::new(AtomicBool::new(false)),
             ready,
             binding_credit: None,
+            handshake_credit: None,
         };
         let lifecycle = std::sync::atomic::AtomicU8::new(WriterLifecycle::Available as u8);
         assert!(run(
@@ -647,6 +650,7 @@ fn preparation_one_actual_begin_and_timeout_restore_with_no_row_or_checkpoint_sq
             canceled: Arc::new(AtomicBool::new(false)),
             ready,
             binding_credit: strict.then(|| writer.preparation_binding_budget.reserve().unwrap()),
+            handshake_credit: None,
         };
         let client = std::thread::spawn(move || {
             let held = receiver
