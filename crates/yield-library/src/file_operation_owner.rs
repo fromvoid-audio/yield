@@ -32,8 +32,10 @@ use crate::app_dirs::WritableProfileGuard;
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use crate::operation_journal::owner::LiveChunkEffectGrant;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
+mod publication_binding;
 use crate::sample_sources::SourceId;
 use crate::sample_sources::db::{BoundDatabaseRoot, SourceAuthorityRequest};
+use publication_binding::{BindingData, BindingError, BindingRequest};
 
 /// Maximum number of effect commands waiting for the file owner.
 pub const FILE_OPERATION_OWNER_COMMAND_CAPACITY: usize = 32;
@@ -2722,9 +2724,16 @@ struct AdmissionRecord {
 }
 
 struct RootRegistrationState {
+    alive: Arc<AtomicBool>,
     authority: AuthorityFence,
     _label: String,
     capability: Option<ProductionRootCapability>,
+}
+
+impl Drop for RootRegistrationState {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
 }
 
 /// Descriptor-bound custody retained by the worker, never reconstructed from a root reference.
@@ -2748,6 +2757,8 @@ impl ProductionRootCapability {
 }
 
 struct WorkerState {
+    publication_bindings: BTreeMap<EffectKey, Weak<BindingData>>,
+    publication_binding_header: Option<InputPermit>,
     registrations: BTreeMap<RootRegistrationRef, RootRegistrationState>,
     receipts: BTreeMap<EffectKey, ReceiptEntry>,
     tombstones: BTreeMap<EffectKey, ReceiptTombstone>,
@@ -2756,6 +2767,8 @@ struct WorkerState {
 impl WorkerState {
     fn new() -> Self {
         Self {
+            publication_bindings: BTreeMap::new(),
+            publication_binding_header: None,
             registrations: BTreeMap::new(),
             receipts: BTreeMap::new(),
             tombstones: BTreeMap::new(),
@@ -2777,6 +2790,10 @@ impl WorkerState {
 
     fn handle(&mut self, command: OwnerCommand, shared: &Arc<OwnerShared>) {
         match command {
+            OwnerCommand::PreparePublicationTarget { request, result } => {
+                let response = self.prepare_publication_target(request, shared);
+                let _ = result.send(response);
+            }
             OwnerCommand::Execute {
                 enqueued_at,
                 command,
@@ -2849,6 +2866,7 @@ impl WorkerState {
                         self.registrations.insert(
                             registration,
                             RootRegistrationState {
+                                alive: Arc::new(AtomicBool::new(true)),
                                 authority,
                                 _label: label,
                                 capability,
@@ -3131,6 +3149,10 @@ impl WorkerState {
 }
 
 enum OwnerCommand {
+    PreparePublicationTarget {
+        request: BindingRequest,
+        result: SyncSender<Result<Arc<BindingData>, BindingError>>,
+    },
     Execute {
         enqueued_at: Instant,
         command: FileOperationCommand,
