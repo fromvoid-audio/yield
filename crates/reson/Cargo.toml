@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 cpal = "0.17.1"
-hound = "3.5.1"
+hound = "=3.5.1"
 ringbuf = "0.4"
 serde = { version = "1.0.228", features = ["derive"] }
 symphonia = { version = "0.5.4", features = ["wav", "pcm", "mp3", "flac"] }

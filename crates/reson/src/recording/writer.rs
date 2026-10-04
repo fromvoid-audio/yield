@@ -4,13 +4,14 @@
 //! responsible for admission, retained staging identity, sync/validation and publication.
 use super::health::RecordingHealthState;
 use super::settlement::{
-    BarrierIssuer, JoinedIssuer, ProducerSettlement, TerminalFacts, TerminalWriteFence,
+    BarrierIssuer, JoinedIssuer, ProducerSettlement, RecordingTerminalWriteInventory,
+    TerminalFacts, TerminalWriteFence,
 };
 use crate::input::AudioInputError;
 use ringbuf::{HeapRb, traits::*};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU8, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -90,7 +91,7 @@ pub enum RecordingPrefixState {
     CancelledRetained,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct RecordingStats {
     pub(super) frames: u64,
     pub(super) state: RecordingPrefixState,
@@ -262,6 +263,7 @@ impl RecorderWriter {
             issuer.publish(
                 stats
                     .terminal
+                    .clone()
                     .ok_or_else(|| failed("recording terminal proof unavailable"))?,
             )?;
         }
@@ -341,12 +343,13 @@ fn writer_loop(
             writer.written_samples / u64::from(writer.limits.channels),
             writer.limits,
             health,
+            writer.prepare_terminal_inventory()?,
         )?;
         writer
             .barrier
             .as_ref()
             .unwrap()
-            .acknowledge(facts, health)?;
+            .acknowledge(facts.clone(), health)?;
         writer.terminal = Some(facts);
     }
     let result = writer.finalize(state);
@@ -373,6 +376,7 @@ struct BoundedSink {
     position: u64,
     limit: u64,
     terminal_fence: Option<Arc<TerminalWriteFence>>,
+    terminal_bytes: Option<TerminalByteCursor>,
 }
 impl BoundedSink {
     fn transport_error(&self, error: io::Error) -> io::Error {
@@ -387,6 +391,9 @@ impl Write for BoundedSink {
         if let Some(fence) = &self.terminal_fence {
             fence.check()?;
         }
+        if let Some(cursor) = &self.terminal_bytes {
+            cursor.check_write(self.position, bytes)?;
+        }
         let end = self
             .position
             .checked_add(bytes.len() as u64)
@@ -400,6 +407,9 @@ impl Write for BoundedSink {
             return Err(self.transport_error(io::Error::other("invalid sink write result")));
         }
         self.position = end - (bytes.len() - written) as u64;
+        if let Some(cursor) = &mut self.terminal_bytes {
+            cursor.written += written;
+        }
         Ok(written)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -429,6 +439,9 @@ impl Seek for BoundedSink {
             .ok()
             .filter(|v| *v <= self.limit)
             .ok_or_else(|| io::Error::other("recording seek exceeds retained allocation"))?;
+        if let Some(cursor) = &mut self.terminal_bytes {
+            cursor.seek(offset)?;
+        }
         let observed = self
             .inner
             .seek(SeekFrom::Start(offset))
@@ -443,8 +456,81 @@ impl Seek for BoundedSink {
     }
 }
 
+// The real std BufWriter stays private and single-producer. The second Arc is only an
+// inspector retained by WavSampleWriter, never a caller/owner transport handle.
+#[derive(Clone)]
+struct InspectableBuffer(Arc<Mutex<BufWriter<BoundedSink>>>);
+impl Write for InspectableBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("recording buffer poisoned"))?
+            .write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("recording buffer poisoned"))?
+            .flush()
+    }
+}
+impl Seek for InspectableBuffer {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("recording buffer poisoned"))?
+            .seek(position)
+    }
+}
+
+// Enforce the exact pinned hound finalization trace against the actual privately captured
+// pending buffer. Partial writes advance only their confirmed prefix. No extra patch/retry
+// becomes a successful join, including implicit hound Drop after a failed finalization.
+struct TerminalByteCursor {
+    inventory: Arc<RecordingTerminalWriteInventory>,
+    stage: u8,
+    written: usize,
+}
+impl TerminalByteCursor {
+    fn expected(&self) -> (u64, &[u8]) {
+        match self.stage {
+            0 => (self.inventory.pending_offset, &self.inventory.pending),
+            1 => (4, &self.inventory.riff_length),
+            _ => (64, &self.inventory.data_length),
+        }
+    }
+    fn check_write(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        let (start, expected) = self.expected();
+        if offset != start + self.written as u64
+            || expected.get(self.written..self.written.saturating_add(bytes.len())) != Some(bytes)
+            || bytes.is_empty()
+        {
+            return Err(io::Error::other(
+                "recording terminal bytes differ from frozen producer inventory",
+            ));
+        }
+        Ok(())
+    }
+    fn seek(&mut self, offset: u64) -> io::Result<()> {
+        if self.written != self.expected().1.len()
+            || !matches!((self.stage, offset), (0, 4) | (1, 64))
+        {
+            return Err(io::Error::other(
+                "recording terminal seek differs from frozen producer inventory",
+            ));
+        }
+        self.stage += 1;
+        self.written = 0;
+        Ok(())
+    }
+    fn complete(&self) -> bool {
+        self.stage == 2 && self.written == 4
+    }
+}
+
 struct WavSampleWriter {
-    writer: Option<hound::WavWriter<BufWriter<BoundedSink>>>,
+    writer: Option<hound::WavWriter<InspectableBuffer>>,
+    buffer: InspectableBuffer,
     barrier: Option<BarrierIssuer>,
     terminal: Option<TerminalFacts>,
     limits: RecordingLimits,
@@ -475,19 +561,18 @@ impl WavSampleWriter {
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
         };
-        let mut writer = hound::WavWriter::new(
-            BufWriter::with_capacity(
-                16_384,
-                BoundedSink {
-                    inner: sink,
-                    position: 0,
-                    limit: limits.max_bytes,
-                    terminal_fence: barrier.as_ref().map(|issuer| issuer.guard.clone()),
-                },
-            ),
-            spec,
-        )
-        .map_err(|error| failed(&format!("WAV header unavailable: {error}")))?;
+        let buffer = InspectableBuffer(Arc::new(Mutex::new(BufWriter::with_capacity(
+            16_384,
+            BoundedSink {
+                inner: sink,
+                position: 0,
+                limit: limits.max_bytes,
+                terminal_fence: barrier.as_ref().map(|issuer| issuer.guard.clone()),
+                terminal_bytes: None,
+            },
+        ))));
+        let mut writer = hound::WavWriter::new(buffer.clone(), spec)
+            .map_err(|error| failed(&format!("WAV header unavailable: {error}")))?;
         writer.flush().map_err(|error| {
             failed(&format!(
                 "WAV initial header transport unconfirmed: {error}"
@@ -495,6 +580,7 @@ impl WavSampleWriter {
         })?;
         Ok(Self {
             writer: Some(writer),
+            buffer,
             barrier,
             terminal: None,
             limits,
@@ -522,16 +608,75 @@ impl WavSampleWriter {
         self.written_samples = next;
         Ok(())
     }
+    fn prepare_terminal_inventory(
+        &self,
+    ) -> Result<Arc<RecordingTerminalWriteInventory>, AudioInputError> {
+        let mut buffer = self
+            .buffer
+            .0
+            .lock()
+            .map_err(|_| failed("recording buffer poisoned"))?;
+        let pcm_bytes = self
+            .written_samples
+            .checked_mul(4)
+            .ok_or_else(|| failed("recording extent overflow"))?;
+        let object_bytes = pcm_bytes
+            .checked_add(68)
+            .filter(|n| *n <= self.limits.max_bytes && *n - 8 <= u64::from(u32::MAX))
+            .ok_or_else(|| failed("recording extent exceeds finite format"))?;
+        let pending_offset = buffer.get_ref().position;
+        if buffer.capacity() != 16_384
+            || buffer.buffer().len() > 16_384
+            || pending_offset < 68
+            || pending_offset % 4 != 0
+            || pending_offset.checked_add(buffer.buffer().len() as u64) != Some(object_bytes)
+            || buffer.get_ref().terminal_bytes.is_some()
+        {
+            return Err(failed(
+                "recording serialized buffer differs from terminal coverage",
+            ));
+        }
+        let inventory = Arc::new(RecordingTerminalWriteInventory {
+            pending_offset,
+            pending: buffer.buffer().to_vec(),
+            object_bytes,
+            riff_length: u32::try_from(object_bytes - 8)
+                .map_err(|_| failed("RIFF length overflow"))?
+                .to_le_bytes(),
+            data_length: u32::try_from(pcm_bytes)
+                .map_err(|_| failed("data length overflow"))?
+                .to_le_bytes(),
+        });
+        buffer.get_mut().terminal_bytes = Some(TerminalByteCursor {
+            inventory: inventory.clone(),
+            stage: 0,
+            written: 0,
+        });
+        Ok(inventory)
+    }
     fn finalize(mut self, state: RecordingPrefixState) -> Result<RecordingStats, AudioInputError> {
         self.writer
             .take()
             .unwrap()
             .finalize()
             .map_err(|error| failed(&format!("recording header/flush unconfirmed: {error}")))?;
+        if self.terminal.is_some()
+            && !self
+                .buffer
+                .0
+                .lock()
+                .map_err(|_| failed("recording buffer poisoned"))?
+                .get_ref()
+                .terminal_bytes
+                .as_ref()
+                .is_some_and(TerminalByteCursor::complete)
+        {
+            return Err(failed("recording terminal byte inventory incomplete"));
+        }
         Ok(RecordingStats {
             frames: self.written_samples / u64::from(self.limits.channels),
             state,
-            terminal: self.terminal,
+            terminal: self.terminal.take(),
         })
     }
 }

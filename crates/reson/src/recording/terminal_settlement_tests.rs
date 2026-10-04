@@ -528,3 +528,178 @@ fn terminal_settlement_real_counter_overflow_is_observation_only_and_never_authe
     assert!(receiver.recv_barrier(Duration::from_millis(1)).is_err());
     no_joined(&mut receiver);
 }
+
+#[test]
+fn terminal_inventory_exact_real_hound_bytes_all_channels_and_buffer_boundaries() {
+    for channels in 1..=8 {
+        for frames in [0, 1, 4096 / channels as usize, 4097, 10_001] {
+            let output = SharedSink::default();
+            let health = Arc::new(RecordingHealthState::default());
+            let settings = limits(channels, 20_000);
+            let (mut capture, consumer) = RecorderWriter::prepare_capture(settings, health.clone());
+            let data: Vec<f32> = (0..frames * channels as usize)
+                .map(|i| (i % 31) as f32 / 32.0 - 0.5)
+                .collect();
+            capture.submit(&data);
+            capture.mode.store(STOPPED, Ordering::SeqCst);
+            let (binding, mut receiver) = RecordingSinkBinding::bind(Box::new(output.clone()));
+            let mut writer = RecorderWriter::spawn_prepared_with_settlement(
+                binding.sink,
+                settings,
+                consumer,
+                capture.mode.clone(),
+                health,
+                Some(binding.producer),
+            )
+            .unwrap();
+            let terminal = barrier(&mut receiver);
+            let inventory = terminal.write_inventory();
+            let before = bytes(&output);
+            assert_eq!(inventory.pending_offset(), before.len() as u64);
+            assert!(inventory.pending_bytes().len() <= 16_384);
+            assert_eq!(inventory.object_bytes(), 68 + data.len() as u64 * 4);
+            assert_eq!(
+                inventory.pending_offset() + inventory.pending_bytes().len() as u64,
+                inventory.object_bytes()
+            );
+            let mut expected = before.clone();
+            expected.extend_from_slice(inventory.pending_bytes());
+            expected[4..8].copy_from_slice(inventory.riff_length_patch());
+            expected[64..68].copy_from_slice(inventory.data_length_patch());
+            let expected_pending = inventory.pending_bytes().to_vec();
+            let expected_offset = inventory.pending_offset();
+            assert_eq!(bytes(&output), before, "snapshot does no transport IO");
+            no_joined(&mut receiver);
+            terminal.acknowledge().unwrap();
+            let stats = writer.join().unwrap();
+            let joined = receiver.recv_joined(Duration::from_secs(1)).unwrap();
+            assert_eq!(stats.frames, frames as u64);
+            assert_eq!(bytes(&output), expected);
+            assert_eq!(samples(&output), data);
+            assert_eq!(joined.write_inventory().pending_bytes(), expected_pending);
+            assert_eq!(joined.write_inventory().pending_offset(), expected_offset);
+            assert_eq!(
+                joined.write_inventory().object_bytes(),
+                expected.len() as u64
+            );
+        }
+    }
+}
+
+struct PartialTransport(SharedSink);
+impl Write for PartialTransport {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write(&bytes[..bytes.len().min(3)])
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+impl Seek for PartialTransport {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.0.seek(position)
+    }
+}
+
+#[test]
+fn terminal_inventory_partial_transport_writes_preserve_exact_plan_and_join() {
+    let output = SharedSink::default();
+    let data: Vec<f32> = (0..12_000).map(|i| i as f32 / 16_384.0).collect();
+    let (mut writer, _, mut receiver, _) =
+        bound_writer(Box::new(PartialTransport(output.clone())), false, &data);
+    let terminal = barrier(&mut receiver);
+    let mut expected = bytes(&output);
+    let inventory = terminal.write_inventory();
+    expected.extend_from_slice(inventory.pending_bytes());
+    expected[4..8].copy_from_slice(inventory.riff_length_patch());
+    expected[64..68].copy_from_slice(inventory.data_length_patch());
+    terminal.acknowledge().unwrap();
+    writer.join().unwrap();
+    let joined = receiver.recv_joined(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        joined.write_inventory().object_bytes(),
+        expected.len() as u64
+    );
+    assert_eq!(bytes(&output), expected);
+    assert_eq!(samples(&output), data);
+}
+
+#[test]
+fn terminal_inventory_real_buffer_mismatch_refuses_without_snapshot_io() {
+    for fault in 0..4 {
+        let output = SharedSink::default();
+        let mut writer = WavSampleWriter::new(Box::new(output.clone()), limits(3, 10)).unwrap();
+        writer.write_samples(&[0.25, 0.5, 0.75]).unwrap();
+        let before = bytes(&output);
+        match fault {
+            0 => writer.buffer.0.lock().unwrap().get_mut().position += 4,
+            1 => writer.written_samples += 3,
+            2 => writer.buffer.0.lock().unwrap().get_mut().position = 64,
+            _ => writer.buffer.0.lock().unwrap().get_mut().position = u64::MAX,
+        }
+        assert!(writer.prepare_terminal_inventory().is_err());
+        assert_eq!(bytes(&output), before);
+    }
+}
+
+#[test]
+fn terminal_inventory_cursor_rejects_changed_extra_missing_or_reordered_actual_writes() {
+    let output = SharedSink::default();
+    let mut writer = WavSampleWriter::new(Box::new(output), limits(1, 10)).unwrap();
+    writer.write_samples(&[0.25, 0.5]).unwrap();
+    let inventory = writer.prepare_terminal_inventory().unwrap();
+    assert!(
+        writer.prepare_terminal_inventory().is_err(),
+        "cannot reissue inventory"
+    );
+    let mut cursor = TerminalByteCursor {
+        inventory,
+        stage: 0,
+        written: 0,
+    };
+    assert!(cursor.seek(4).is_err(), "cannot omit buffered tail");
+    assert!(cursor.check_write(68, &[0xff]).is_err());
+    let tail = cursor.inventory.pending.clone();
+    cursor.check_write(68, &tail[..3]).unwrap();
+    cursor.written = 3;
+    cursor.check_write(71, &tail[3..]).unwrap();
+    cursor.written = tail.len();
+    assert!(cursor.seek(64).is_err());
+    cursor.seek(4).unwrap();
+    assert!(cursor.check_write(4, &[0; 4]).is_err());
+    cursor
+        .check_write(4, cursor.inventory.riff_length_patch())
+        .unwrap();
+    cursor.written = 4;
+    assert!(!cursor.complete());
+    cursor.seek(64).unwrap();
+    cursor
+        .check_write(64, cursor.inventory.data_length_patch())
+        .unwrap();
+    cursor.written = 4;
+    assert!(cursor.complete());
+    assert!(cursor.seek(4).is_err());
+    assert!(cursor.check_write(68, &[1]).is_err());
+}
+
+#[test]
+fn terminal_inventory_actual_finalizer_refuses_changed_buffer_without_transport_writes() {
+    let output = SharedSink::default();
+    let mut writer = WavSampleWriter::new(Box::new(output.clone()), limits(1, 10)).unwrap();
+    writer.write_samples(&[0.25, 0.5]).unwrap();
+    let inventory = writer.prepare_terminal_inventory().unwrap();
+    let before = bytes(&output);
+    // Adversarial private serializer corruption after the genuine snapshot, never caller authority.
+    writer.buffer.write_all(&[0xff]).unwrap();
+    assert!(
+        writer
+            .finalize(RecordingPrefixState::StoppedUnpublished)
+            .is_err()
+    );
+    assert_eq!(inventory.pending_bytes().len(), 8);
+    assert_eq!(
+        bytes(&output),
+        before,
+        "neither finalize nor Drop can dispatch changed tail"
+    );
+}
