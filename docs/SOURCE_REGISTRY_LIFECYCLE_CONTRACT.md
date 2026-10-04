@@ -252,10 +252,10 @@ publication. A report is not authority.
 | [OPT-2193](https://linear.app/boostnlvp/issue/OPT-2193) | Authenticated registered-source candidate/consumer and carrier limits; needs2192. |
 | [OPT-2194](https://linear.app/boostnlvp/issue/OPT-2194) | Exact finite source/global allocation requirements; needs2166 and2167, no logical-size qualification. |
 | [OPT-2195](https://linear.app/boostnlvp/issue/OPT-2195) | Owned global relation/migration/immutable transition SQL; needs2192/2193/2194,2136,2166,2168,2170. |
-| [OPT-2196](https://linear.app/boostnlvp/issue/OPT-2196) | Admitted durable journal intent/claim/checkpoint family; needs2192/2193/2194/2195/2201,2136,2166,2168,2169,2170. |
-| [OPT-2197](https://linear.app/boostnlvp/issue/OPT-2197) | Existing catalog/session enrollment/drain/close/capsule routing and honest shutdown; needs2193/2195/2196/2201. |
+| [OPT-2196](https://linear.app/boostnlvp/issue/OPT-2196) | Admitted durable journal intent/claim/checkpoint family; needs2192/2193/2194/2195/2202,2136,2166,2168,2169,2170. |
+| [OPT-2197](https://linear.app/boostnlvp/issue/OPT-2197) | Existing catalog/session enrollment/drain/close/capsule routing and honest shutdown; needs2193/2195/2196/2202. |
 | [OPT-2202](https://linear.app/boostnlvp/issue/OPT-2202) | Admitted main-connection lease release plus sealed close evidence; needs2192/2194,2168,2169. |
-| [OPT-2198](https://linear.app/boostnlvp/issue/OPT-2198) | Actual bounded restart settlement/reacquisition observers; needs2195/2196/2197/2201. |
+| [OPT-2198](https://linear.app/boostnlvp/issue/OPT-2198) | Actual bounded restart settlement/reacquisition observers; needs2195/2196/2197/2202. |
 
 These are unclaimed implementation scopes; shared production files require their
 own claims. Only2192 is initially Linux-ready after this decision; the remaining
@@ -268,3 +268,33 @@ rejection, drain racing enrollment, retained snapshot, failed close, exact
 post-close retry and reacquisition. Tests using synthetic reserve/registration
 providers must say so; they do not qualify native physical capacity. The contract
 and any model fixtures leave OPT-1828/1357/1670 and full restart acceptance open.
+
+
+## Installed lifecycle schema prerequisite (OPT-2243)
+
+The profile-owned global `LibraryDatabase` now installs the version-one
+`source_lifecycle_references` and `source_lifecycle_reference_receipts` layout
+before initialization pragmas, optional extensions or unrelated migrations.
+Both tables and their indexes are installed in one actual SQLite transaction.
+The exact compiled `sqlite_schema` image identifies this version; a future DDL
+change requires an explicit migration. Existing exact relations are inspected
+without a schema transaction. Partial, altered, case-shadowed or extra-index/
+trigger layouts refuse without repair or evidence deletion. Family inspection
+retains at most five objects, bounds names to 128 bytes and SQL to 16 KiB before
+Rust materialization, and limits SQLite VM work to 100,000 operations with a
+cooperative two-second deadline. It does not inspect or qualify the entire
+global schema, runtime extensions or lifecycle row contents.
+
+The partial unique index enforces at most one Enrolled/Draining registration
+per source; retired history remains retained. SQL constrains stored subject and
+receipt blobs to 16 KiB, identities to their fixed sizes, full work keys to 256
+bytes, states/dispositions to their finite domains, and receipt sequences to
+positive integers. Receipts have a unique operation plus full-work key.
+SQL fixtures demonstrate these constraints and atomic rollback; they neither
+construct genuine receipts nor authorize transitions. The forthcoming owned
+command must enforce canonical subjects, immutable receipts, CAS/replay,
+8192-row ledger caps and the 4096 non-retired-reference cap. This schema adds
+no lifecycle command, registration publication, claim, native permit or
+physical allocation qualification. OPT-2194/2195 and their production and
+native dependents remain open. Journal schema 12 and source schema 13 are
+unchanged.
