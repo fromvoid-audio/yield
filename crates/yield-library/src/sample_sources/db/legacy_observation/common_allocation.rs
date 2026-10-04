@@ -137,7 +137,7 @@ impl LegacySourceReadOwner {
     ) -> Result<LegacyCommonAllocationObservation> {
         self.capture_common_until(profile, journal, Instant::now() + Duration::from_secs(2))
     }
-    fn capture_common_until(
+    pub(super) fn capture_common_until(
         &self,
         profile: &WritableProfileGuard,
         journal: &OperationJournalStore,

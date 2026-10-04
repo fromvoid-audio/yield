@@ -1827,6 +1827,12 @@ impl WorkProgress {
         if operation_id.as_uuid().is_nil() {
             return Err(WorkProgressError::InvalidOperationId);
         }
+        if matches!(args, UniversalCommandArgs::SourceLegacyAdoption(_)) {
+            return Err(WorkPlanError::IncompleteTopology(
+                "legacy adoption requires its genuine durable admission bridge before progress",
+            )
+            .into());
+        }
         plan.validate_against(args, participants)?;
         let scopes = participants
             .descriptors()
@@ -6093,6 +6099,11 @@ impl WorkProgress {
                 | ParticipantKind::Projection
                 | ParticipantKind::Readiness
                 | ParticipantKind::Artifact => Some(CompensationParticipantKind::Coordinator),
+                ParticipantKind::LegacySource => {
+                    return Err(WorkProgressError::Plan(WorkPlanError::IncompleteTopology(
+                        "legacy adoption compensation has no admitted bridge",
+                    )));
+                }
                 ParticipantKind::Filesystem => None,
             };
             if let Some(kind) = kind {
@@ -29936,6 +29947,9 @@ mod tests {
                     | ParticipantKind::Projection
                     | ParticipantKind::Readiness
                     | ParticipantKind::Artifact => Some(CompensationParticipantKind::Coordinator),
+                    ParticipantKind::LegacySource => {
+                        panic!("pre-lease legacy effects have no fixture compensation authority")
+                    }
                     ParticipantKind::Filesystem => None,
                 };
                 let Some(kind) = kind else { continue };

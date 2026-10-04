@@ -66,6 +66,8 @@ impl fmt::Display for ParticipantId {
 /// Universal operation participant family.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ParticipantKind {
+    /// Original source reservation before any current source lease/audit exists.
+    LegacySource,
     /// Filesystem mutation or publication participant.
     Filesystem,
     /// Source-database participant.
@@ -229,6 +231,9 @@ impl ParticipantDescriptor {
         }
         if self.kind.requires_source_fence() && self.source_fence.is_none() {
             return Err(ParticipantValidationError::SourceFenceRequired { kind: self.kind });
+        }
+        if self.kind == ParticipantKind::LegacySource && self.source_fence.is_some() {
+            return Err(ParticipantValidationError::LegacySourceFenceForbidden);
         }
         if self.kind == ParticipantKind::GlobalLibrary && self.source_fence.is_some() {
             return Err(ParticipantValidationError::GlobalLibrarySourceFenceForbidden);
@@ -687,6 +692,9 @@ pub enum ParticipantValidationError {
     /// A global-library participant cannot bind itself to one source.
     #[error("global-library participant cannot carry a source fence")]
     GlobalLibrarySourceFenceForbidden,
+    /// A pre-lease reservation cannot be represented by a current source lease/audit fence.
+    #[error("pre-lease legacy source cannot carry a current source fence")]
+    LegacySourceFenceForbidden,
     /// Optional rebuildable work is valid only for artifact participants.
     #[error("optional rebuildable requirement is valid only for artifact participants")]
     OptionalRequirementOnlyArtifact,

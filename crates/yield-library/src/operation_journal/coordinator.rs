@@ -1470,6 +1470,8 @@ pub enum WaveformEditValidationError {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub enum UniversalCommandArgs {
+    /// Bounded original-owner legacy preparation, never live admission.
+    SourceLegacyAdoption(super::legacy_adoption_commands::LegacyAdoptionIntentArgs),
     /// Bounded historical source-only derived layout; not live admission.
     SourceDerivedLayout(super::source_layout_commands::SourceLayoutIntentArgs),
     /// Frozen finite recording; captured bytes are retained separately before dispatch.
@@ -1510,6 +1512,9 @@ impl UniversalCommandArgs {
     /// Return the universal command kind represented by these arguments.
     pub const fn command_kind(&self) -> super::model::UniversalCommandKind {
         match self {
+            Self::SourceLegacyAdoption(_) => {
+                super::model::UniversalCommandKind::SourceLegacyAdoption
+            }
             Self::SourceDerivedLayout(_) => super::model::UniversalCommandKind::SourceDerivedLayout,
             Self::Recording(_) => super::model::UniversalCommandKind::CreateFile,
             Self::Copy(_) => super::model::UniversalCommandKind::Copy,
@@ -1536,6 +1541,9 @@ impl UniversalCommandArgs {
         participants: &ParticipantSet,
     ) -> Result<(), UniversalCommandArgsValidationError> {
         match self {
+            Self::SourceLegacyAdoption(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::SourceLegacyAdoption),
             Self::SourceDerivedLayout(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::SourceDerivedLayout),
@@ -1594,6 +1602,9 @@ impl UniversalCommandArgs {
 /// Failure while validating a tagged V6 command argument envelope.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum UniversalCommandArgsValidationError {
+    /// Original pre-lease legacy identity, policy or topology does not agree.
+    #[error("invalid source legacy adoption arguments: {0}")]
+    SourceLegacyAdoption(#[source] super::legacy_adoption_commands::LegacyAdoptionInputError),
     /// Source-only layout identity, topology or canonical data was inconsistent.
     #[error("invalid source-derived layout arguments: {0}")]
     SourceDerivedLayout(#[source] super::source_layout_commands::SourceLayoutIntentError),

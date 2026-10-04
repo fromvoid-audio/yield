@@ -35,6 +35,8 @@ use crate::sample_sources::SourceId;
 pub const WORK_PLAN_VERSION_V1: u16 = 1;
 /// Source-only SQL layout plan; V1 file topology remains frozen.
 pub const WORK_PLAN_VERSION_SOURCE_LAYOUT: u16 = 2;
+/// Exact original-reservation legacy adoption topology; no current lease is invented.
+pub const WORK_PLAN_VERSION_LEGACY_ADOPTION: u16 = 3;
 /// Alias for the current work-plan version.
 pub const WORK_PLAN_VERSION: u16 = WORK_PLAN_VERSION_V1;
 /// Maximum number of derived participant work units in one plan.
@@ -72,6 +74,8 @@ const STEP_ARTIFACT: u16 = 50;
 /// Semantic obligation represented by one derived work unit.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum WorkUnitRole {
+    /// Adopt one exact original legacy source under future genuine admission.
+    SourceLegacyAdoption,
     /// Publish or reconcile one admitted canonical source SQL layout generation.
     SourceDerivedLayout,
     /// Read an existing source-database observation.
@@ -279,8 +283,33 @@ impl WorkPlan {
     pub fn validate(&self) -> Result<(), WorkPlanError> {
         if !matches!(
             self.plan_version,
-            WORK_PLAN_VERSION_V1 | WORK_PLAN_VERSION_SOURCE_LAYOUT
+            WORK_PLAN_VERSION_V1
+                | WORK_PLAN_VERSION_SOURCE_LAYOUT
+                | WORK_PLAN_VERSION_LEGACY_ADOPTION
         ) {
+            return Err(WorkPlanError::UnsupportedPlanVersion {
+                actual: self.plan_version,
+            });
+        }
+        if self.plan_version == WORK_PLAN_VERSION_LEGACY_ADOPTION
+            && (self.units.len() != 1
+                || !self.prerequisites.is_empty()
+                || self.units[0].key.role != WorkUnitRole::SourceLegacyAdoption
+                || self.units[0].key.action_ordinal != 0
+                || self.units[0].key.step_ordinal != STEP_SOURCE_AFFECT
+                || self.units[0].requirement != ParticipantRequirement::Required
+                || self.units[0].applicability != WorkUnitApplicability::Required)
+        {
+            return Err(WorkPlanError::UnsupportedPlanVersion {
+                actual: self.plan_version,
+            });
+        }
+        if self.plan_version != WORK_PLAN_VERSION_LEGACY_ADOPTION
+            && self
+                .units
+                .iter()
+                .any(|u| u.key.role == WorkUnitRole::SourceLegacyAdoption)
+        {
             return Err(WorkPlanError::UnsupportedPlanVersion {
                 actual: self.plan_version,
             });
@@ -426,6 +455,31 @@ pub fn derive_work_plan(
     args: &UniversalCommandArgs,
     participants: &ParticipantSet,
 ) -> Result<WorkPlan, WorkPlanError> {
+    if let UniversalCommandArgs::SourceLegacyAdoption(command) = args {
+        participants.validate_for_new_intent()?;
+        command
+            .validate_against_participants(participants)
+            .map_err(|e| {
+                WorkPlanError::CommandArguments(
+                    UniversalCommandArgsValidationError::SourceLegacyAdoption(e),
+                )
+            })?;
+        let key = WorkUnitKey::new(
+            0,
+            STEP_SOURCE_AFFECT,
+            command.participant_id(),
+            WorkUnitRole::SourceLegacyAdoption,
+        );
+        let mut builder = PlanBuilder::default();
+        builder.add_unit(
+            key,
+            ParticipantRequirement::Required,
+            WorkUnitApplicability::Required,
+        )?;
+        let plan = builder.finish_with_version(WORK_PLAN_VERSION_LEGACY_ADOPTION)?;
+        plan.validate()?;
+        return Ok(plan);
+    }
     if let UniversalCommandArgs::SourceDerivedLayout(command) = args {
         participants.validate_for_new_intent()?;
         command
@@ -764,6 +818,11 @@ impl Topology {
 
         for descriptor in participants.descriptors() {
             match descriptor.kind() {
+                ParticipantKind::LegacySource => {
+                    return Err(WorkPlanError::IncompleteTopology(
+                        "pre-lease legacy source requires the V3 adoption planner",
+                    ));
+                }
                 ParticipantKind::SourceDatabase => {
                     if !collected
                         .sources
@@ -990,6 +1049,11 @@ fn collect_topology(
     collected: &mut CollectedTopology,
 ) -> Result<(), WorkPlanError> {
     match args {
+        UniversalCommandArgs::SourceLegacyAdoption(_) => {
+            return Err(WorkPlanError::IncompleteTopology(
+                "legacy adoption requires the pre-lease V3 planner",
+            ));
+        }
         UniversalCommandArgs::SourceDerivedLayout(_) => {
             return Err(WorkPlanError::IncompleteTopology(
                 "source layout requires the source-only V2 planner",
@@ -1280,6 +1344,11 @@ fn derive_actions(
     action_spans: &mut Vec<ActionSpan>,
 ) -> Result<(), WorkPlanError> {
     match args {
+        UniversalCommandArgs::SourceLegacyAdoption(_) => {
+            return Err(WorkPlanError::IncompleteTopology(
+                "legacy adoption requires the pre-lease V3 planner",
+            ));
+        }
         UniversalCommandArgs::SourceDerivedLayout(_) => {
             return Err(WorkPlanError::IncompleteTopology(
                 "source layout requires the source-only V2 planner",

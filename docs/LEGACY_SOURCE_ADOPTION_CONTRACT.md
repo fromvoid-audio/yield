@@ -2,8 +2,9 @@
 
 This decision resolves the allocation and recovery ownership prerequisite for
 OPT-2098. Retained source/journal/profile observers now return bounded historical
-images and conditional logical allocation allowances. They install no migration
-command, capacity grant or receipt. Normal catalog opens continue to reject
+images and conditional logical allocation allowances. They install no admitted migration
+command, capacity grant or receipt. The explicit passive command family described
+below does not supply those effect authorities. Normal catalog opens continue to reject
 version 11 before source lease bootstrap. OPT-2098 and OPT-1745 remain open for implementation and
 their original acceptance.
 
@@ -105,9 +106,10 @@ and all volume aliases exactly once in the common capacity owner's requirement.
 An existing page cap limits database growth, not all physical allocation.
 
 The production consumer must extend the existing prepared metadata admission
-boundary with an explicit source-adoption input/work kind. The present
-`UniversalCommandKind` has no source migration family; do not relabel migration as
-CreateFile, ExternalReconciliation or a tag edit. Reuse the existing journal and
+boundary with an explicit source-adoption input/work kind. The explicit `SourceLegacyAdoption` family now describes passive original-owner
+input and pre-lease topology, but its genuine capacity/admission adapter remains
+unimplemented. Do not relabel migration as CreateFile, ExternalReconciliation or
+a tag edit. Reuse the existing journal and
 capacity owners, with a versioned frozen proposal and genuine descriptor-bound
 claim for every affected volume, before migration writes. The observer, fixture,
 decision, schema version and UUID cannot mint that claim. No new parallel
@@ -368,3 +370,59 @@ cargo test --locked -p yield-library --test legacy_source_read_owner --test lega
 Ordinary v11 opens still return `MigrationRequired`. These observations create no
 source lease/audit, operation ID, intent, claim or adoption receipt. OPT-2098 and
 OPT-1745 remain open until genuine admitted implementation and original acceptance.
+
+
+## Original-owner command preparation (OPT-2242)
+
+`LegacySourceReadOwner::prepare_legacy_adoption_input` uses the original retained
+source reservation/read connection and actual existing journal/profile owner.
+It captures and revalidates the full common observation under one original
+cooperative two-second deadline, holding process extension exclusion throughout.
+Cancellation is checked before capture and before/after final revalidation. It
+writes no database/control bytes and allocates no OperationId. The producer never
+accepts decoded command bytes or caller-authored scalar observations as custody.
+
+Version 1 freezes participant/source-command correlation, original profile owner
+and root, media/database directories, exact bounded combined original schema/row/
+physical digest, original semantic revision/row counts, source and journal pager
+facts and all eight fixed-order logical object identities/device/unit/length/
+conditional allowances. Source schema 11, intended target 13, journal schema 12
+and bundled SQLite 3.50.2 are explicit. Future changes need a reviewed codec/policy
+version; they are not silently adopted from a current schema stamp. Main and
+future sidecar placement remain distinct; checked totals count each original
+object once and reject conflicting volume units. They expose no free capacity or
+rounded physical charge.
+
+The binary envelope is `YLADOPT\0`, a little-endian u64 version and canonical
+strict finite JSON. Its cap is 24KiB minus three bytes, so canonical base64 plus
+JSON quotes occupies at most 32KiB, leaving at least 32KiB of the original combined
+64KiB source-local request/receipt ceiling for a future actual receipt. Duplicate/
+unknown supported fields, incorrect policy/arithmetic, ambiguous identities,
+trailing/noncanonical data and unbounded input refuse. Bounded unknown envelope
+versions remain exact historical bytes; successful decode never reacquires owners.
+
+`SourceLegacyAdoption` is a distinct operation/command/work role. Work-plan version
+3 contains one required `LegacySource` participant and one adoption obligation.
+The pre-lease participant explicitly forbids a current `StoredSourceFence`.
+Changed, omitted, extra or completed participants and V1/file topology coercion
+refuse. Ordinary source/database revisions and lease epochs are not invented.
+
+Existing initial operation codecs, full-progress observations/persistence, progress
+construction and journal owner admission explicitly reject this passive family
+until the genuine original-owner capacity-class/claim and durable adoption bridge
+exists. Normal-build owner fixtures prove deterministic preparation, byte/row
+preservation, cancellation and foreign/replaced/stale-owner refusals, strict wire
+handling and topology isolation. Actual journal owner/store fixtures also prove
+rejection before rows, unchanged recovery inventory and reopen retention. Neither
+these tests nor the passive work plan certify migration or capacity.
+
+```
+cargo test --locked -p yield-library --test legacy_adoption_input
+cargo test --locked -p yield-library --lib operation_journal::legacy_adoption_commands::tests -- --test-threads=1
+```
+
+OPT-2117 remains open for genuine per-volume capacity claims and durable intent,
+retained writable promotion and entered policy, the preserving atomic migration/
+receipt transaction, exact replay/uncertainty/recovery and separately accounted
+lease bootstrap. OPT-2098/1745 and native allocation/durability acceptance remain
+open. Normal v11 opens still return `MigrationRequired`; journal schema stays 12.

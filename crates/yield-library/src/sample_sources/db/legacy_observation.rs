@@ -171,6 +171,72 @@ impl LegacySourceReadOwner {
         }
         Ok(())
     }
+    /// Prepare passive command data from original source/journal/profile custody. A decoded
+    /// input cannot call this route without the original retained owner. No OperationId, intent,
+    /// claim, writable connection, lease or receipt is created.
+    pub fn prepare_legacy_adoption_input(
+        &self,
+        profile: &WritableProfileGuard,
+        journal: &crate::operation_journal::store::OperationJournalStore,
+        participant: crate::operation_journal::ParticipantId,
+        command: super::SourceCommandId,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> std::result::Result<
+        crate::operation_journal::legacy_adoption_commands::LegacyAdoptionIntentArgs,
+        crate::operation_journal::legacy_adoption_commands::LegacyAdoptionInputError,
+    > {
+        use crate::operation_journal::legacy_adoption_commands::{
+            LegacyAdoptionInputError as E, LegacyAdoptionIntentArgs,
+        };
+        use std::sync::atomic::Ordering;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        if cancel.load(Ordering::Acquire) {
+            return Err(E::Cancelled);
+        }
+        if super::schema::SOURCE_DB_SCHEMA_VERSION != 13 {
+            return Err(E::Observation);
+        }
+        if participant.as_uuid().is_nil() || command.as_uuid().is_nil() {
+            return Err(E::Invalid);
+        }
+        let _extensions =
+            crate::sqlite_ext::try_extension_free_metadata_scope().ok_or(E::Observation)?;
+        let observation = self
+            .capture_common_until(profile, journal, deadline)
+            .map_err(|_| {
+                if Instant::now() >= deadline {
+                    E::Deadline
+                } else {
+                    E::Observation
+                }
+            })?;
+        let args = LegacyAdoptionIntentArgs::from_original(&observation, participant, command)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err(E::Cancelled);
+        }
+        if self
+            .capture_common_until(profile, journal, deadline)
+            .map_err(|_| {
+                if Instant::now() >= deadline {
+                    E::Deadline
+                } else {
+                    E::Observation
+                }
+            })?
+            != observation
+        {
+            return Err(E::Observation);
+        }
+        self.validate(profile).map_err(|_| E::Observation)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err(E::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(E::Deadline);
+        }
+        Ok(args)
+    }
+
     /// Capture one coherent bounded image under the actual retained read connection.
     /// The result has no allocation estimate, current lease, audit or adoption permission.
     pub fn capture(&self, profile: &WritableProfileGuard) -> Result<LegacySourceImage> {
