@@ -1,54 +1,20 @@
-//! Worker-local parked owners. This module never transfers a SQLite owner off its worker.
+//! Worker-local adapter. Genuine native custody and outcomes belong to the library.
 use super::*;
-use yield_library::sample_sources::db::write::SourceWalPreparationError;
-
-enum ParkedDatabase {
-    Held(SourceWalPreparation),
-    Failed(SourceWalPreparationFailure),
-}
-impl ParkedDatabase {
-    fn abort(self) -> Result<CatalogSourceDatabase, Self> {
-        match self {
-            Self::Held(held) => held
-                .abort()
-                .map(|writer| CatalogSourceDatabase { writer })
-                .map_err(Self::Failed),
-            Self::Failed(failed) => failed
-                .into_writer()
-                .map(|writer| CatalogSourceDatabase { writer })
-                .map_err(Self::Failed),
-        }
-    }
-}
-struct LostOwner(Arc<Ticket>, bool);
-impl Drop for LostOwner {
-    fn drop(&mut self) {
-        if !self.1 {
-            self.0.set(CatalogSourceWalStatus::Unavailable(
-                CatalogSourceWalRejection::OwnerLost,
-            ));
-        }
-    }
-}
 struct Slot {
-    source: RegisteredSource<ParkedDatabase>,
-    // Declaration order keeps the genuine binding ahead of its shared byte credit on drop.
-    binding: Option<yield_library::sample_sources::db::write::SourceWalBinding>,
-    scope: Option<ScopeView>,
-    owner: LostOwner,
+    source: RegisteredSource<SourceWalTransportOwner>,
     expected: SourceRevision,
     deadline: Instant,
     rejection: Option<CatalogSourceWalRejection>,
 }
 pub(crate) struct WorkerReservations {
-    control: Control,
+    inbox: SourceWalTransportInbox,
     slots: HashMap<SourceId, Slot>,
-    unresolved: HashMap<SourceId, LostOwner>,
+    unresolved: HashMap<SourceId, SourceWalOwnerObservation>,
 }
 impl WorkerReservations {
-    pub(crate) fn new(control: Control) -> Self {
+    pub(crate) fn new(inbox: SourceWalTransportInbox) -> Self {
         Self {
-            control,
+            inbox,
             slots: HashMap::new(),
             unresolved: HashMap::new(),
         }
@@ -60,157 +26,91 @@ impl WorkerReservations {
     ) {
         self.sweep(admission, sources);
         for _ in 0..CATALOG_WAL_MAX_SLOTS {
-            let Some(request) = self.control.take() else {
+            let Some(command) = self.inbox.try_next() else {
                 break;
             };
-            self.prepare(request, admission, sources);
+            self.prepare(command, admission, sources);
         }
     }
     fn prepare(
         &mut self,
-        request: PrepareRequest,
+        command: SourceWalTransportCommand,
         admission: &Arc<Mutex<AdmissionState>>,
         sources: &mut HashMap<SourceId, RegisteredSource>,
     ) {
-        let deny = |reason| {
-            request
-                .ticket
-                .finish(CatalogSourceWalStatus::Rejected(reason))
-        };
-        if request.ticket.cancelled.load(Ordering::Acquire) {
-            deny(CatalogSourceWalRejection::Cancelled);
+        if command.is_cancelled() {
+            command.reject(CatalogSourceWalRejection::Cancelled);
             return;
         }
-        if Instant::now() >= request.deadline {
-            deny(CatalogSourceWalRejection::Deadline);
+        if Instant::now() >= command.deadline() {
+            command.reject(CatalogSourceWalRejection::Deadline);
             return;
         }
-        if !current(admission, &request.expected) {
-            deny(CatalogSourceWalRejection::Scope);
+        let expected = command.expected_revision().clone();
+        if !current(admission, &expected) {
+            command.reject(CatalogSourceWalRejection::Scope);
             return;
         }
-        let id = request.expected.source_id().clone();
+        let id = expected.source_id().clone();
         if self.is_held(&id) {
-            deny(CatalogSourceWalRejection::Busy);
+            command.reject(CatalogSourceWalRejection::Busy);
             return;
         }
         if !self.unresolved.is_empty() {
-            // A consumed owner lacking an exact acknowledgement has no trustworthy live
-            // identity to exclude physical aliases. Keep new pre-intent work fail-closed.
-            deny(CatalogSourceWalRejection::OwnerLost);
+            command.reject(CatalogSourceWalRejection::OwnerLost);
             return;
         }
         let Some(source) = sources.remove(&id) else {
-            deny(CatalogSourceWalRejection::Scope);
+            command.reject(CatalogSourceWalRejection::Scope);
             return;
         };
-        // Full revision/physical binding validation belongs INSIDE the retained primitive.
-        // Its audit getter can fail rollback; an extra getter here would return a callable
-        // writer with an unconfirmed transaction before that primitive acquired custody.
-        if source.lifecycle_generation != request.expected.lifecycle_generation() {
+        if source.lifecycle_generation != expected.lifecycle_generation() {
             sources.insert(id, source);
-            deny(CatalogSourceWalRejection::Scope);
+            command.reject(CatalogSourceWalRejection::Scope);
             return;
         }
-        let mut rejection = None;
+        let deadline = command.deadline();
         let mapped: Result<
-            RegisteredSource<ParkedDatabase>,
+            RegisteredSource<SourceWalTransportOwner>,
             RegisteredSource<std::convert::Infallible>,
-        > = source.try_map_database(|database| {
-            #[cfg(test)]
-            let prepared = if self.control.shared.unknown_wal.load(Ordering::Acquire) {
-                database
-                    .writer
-                    .prepare_wal_reservation_unknown_for_tests(&request.expected, request.deadline)
-            } else {
-                database
-                    .writer
-                    .prepare_wal_reservation(&request.expected, request.deadline)
-            };
-            #[cfg(not(test))]
-            let prepared = database
-                .writer
-                .prepare_wal_reservation(&request.expected, request.deadline);
-            match prepared {
-                Ok(held) => Ok(ParkedDatabase::Held(held)),
-                Err(failed) => {
-                    rejection = Some(classify(failed.error()));
-                    Ok(ParkedDatabase::Failed(failed))
-                }
-            }
-        });
-        let parked = match mapped {
+        > = source.try_map_database(|database| Ok(command.acquire(database.writer)));
+        let mut parked = match mapped {
             Ok(source) => source,
             Err(never) => match never.database {},
         };
-        let mut binding = None;
-        let mut scope = None;
-        if request.require_binding && rejection.is_none() {
-            match (&parked.database, parked.source_authority.as_ref()) {
-                (ParkedDatabase::Held(held), Some(authority)) => {
-                    match self.control.capture_scope(held, authority) {
-                        Ok((actual, view)) => {
-                            binding = Some(actual);
-                            scope = Some(view);
-                        }
-                        Err(reason) => rejection = Some(reason),
-                    }
-                }
-                _ => rejection = Some(CatalogSourceWalRejection::Scope),
-            }
-        }
-        // Successful holders contain actual owner-validated physical main-file observations,
-        // never a caller-supplied pathname or serialized identity used as authority.
-        if let ParkedDatabase::Held(held) = &parked.database {
-            if self.slots.values().any(|slot| match &slot.source.database {
-                ParkedDatabase::Held(other) => {
-                    other.revision().database_identity() == held.revision().database_identity()
-                }
-                ParkedDatabase::Failed(failure) => failure
-                    .retained_database_identity()
-                    .is_none_or(|identity| identity == held.revision().database_identity()),
-            }) {
-                rejection = Some(CatalogSourceWalRejection::Busy);
-            }
-        }
-        let mut slot = Slot {
-            source: parked,
-            binding,
-            scope,
-            owner: LostOwner(Arc::clone(&request.ticket), false),
-            expected: request.expected.clone(),
-            deadline: request.deadline,
-            rejection,
-        };
-        if slot.rejection.is_none()
-            && (request.ticket.cancelled.load(Ordering::Acquire)
-                || !current(admission, &request.expected))
+        let mut rejection = parked.database.rejection();
+        if parked.database.is_prepared()
+            && self.slots.values().any(|slot| {
+                slot.source
+                    .database
+                    .database_identity()
+                    .is_none_or(|identity| Some(identity) == parked.database.database_identity())
+            })
         {
-            slot.rejection = Some(CatalogSourceWalRejection::Cancelled);
+            rejection = Some(CatalogSourceWalRejection::Busy);
         }
-        match &slot.source.database {
-            ParkedDatabase::Held(held) if slot.rejection.is_none() && !held.is_expired() => {
-                request.ticket.set(CatalogSourceWalStatus::Prepared(
-                    CatalogSourceWalObservation {
-                        revision: request.expected,
-                        correlation: request.correlation,
-                        nonce: held.nonce().to_string(),
-                        wal_bytes: held.wal_bytes(),
-                        scope: slot.scope.clone(),
-                    },
-                ));
-            }
-            ParkedDatabase::Held(_) => {
-                slot.rejection
-                    .get_or_insert(CatalogSourceWalRejection::Deadline);
-                request.ticket.set(CatalogSourceWalStatus::Aborting);
-            }
-            ParkedDatabase::Failed(_) => request
-                .ticket
-                .set(CatalogSourceWalStatus::Unavailable(slot.rejection.unwrap())),
+        if rejection.is_none() && (parked.database.is_cancelled() || !current(admission, &expected))
+        {
+            rejection = Some(CatalogSourceWalRejection::Cancelled);
         }
-        self.slots.insert(id, slot);
-        // A rejected/expired preparation is immediately rolled back, without another receive.
+        if rejection.is_none() {
+            rejection = parked
+                .database
+                .publish_prepared(parked.source_authority.as_ref())
+                .err();
+        }
+        if rejection.is_some() {
+            parked.database.request_abort(rejection);
+        }
+        self.slots.insert(
+            id,
+            Slot {
+                source: parked,
+                expected,
+                deadline,
+                rejection,
+            },
+        );
         self.sweep(admission, sources);
     }
     fn sweep(
@@ -222,24 +122,13 @@ impl WorkerReservations {
             .slots
             .iter_mut()
             .filter_map(|(id, slot)| {
-                let cancelled = slot.owner.0.cancelled.load(Ordering::Acquire);
+                let cancelled = slot.source.database.is_cancelled();
                 let changed = !current(admission, &slot.expected);
-                let validation = match &slot.source.database {
-                    ParkedDatabase::Held(held) => {
-                        if let Some(binding) = &slot.binding {
-                            match slot.source.source_authority.as_ref() {
-                                Some(authority) => held
-                                    .validate_wal_binding(binding, authority)
-                                    .err()
-                                    .map(|e| classify(&e)),
-                                None => Some(CatalogSourceWalRejection::Scope),
-                            }
-                        } else {
-                            held.revalidate_owner().err().map(|e| classify(&e))
-                        }
-                    }
-                    ParkedDatabase::Failed(_) => slot.rejection,
-                };
+                let validation = slot
+                    .source
+                    .database
+                    .revalidate(slot.source.source_authority.as_ref())
+                    .err();
                 if slot.rejection.is_some()
                     || cancelled
                     || changed
@@ -269,28 +158,21 @@ impl WorkerReservations {
         let Some(mut slot) = self.slots.remove(id) else {
             return;
         };
-        slot.owner.0.set(CatalogSourceWalStatus::Aborting);
-        match slot.source.try_map_database(ParkedDatabase::abort) {
+        slot.source.database.request_abort(slot.rejection);
+        match slot.source.try_map_database(|owner| {
+            owner
+                .into_writer()
+                .map(|writer| CatalogSourceDatabase { writer })
+        }) {
             Ok(source) => {
                 assert!(
                     !sources.contains_key(id),
                     "parked source cannot acquire a second SQL owner"
                 );
                 sources.insert(id.clone(), source);
-                drop(slot.binding.take());
-                drop(slot.scope.take());
-                slot.owner.1 = true;
-                slot.owner.0.finish(slot.rejection.map_or(
-                    CatalogSourceWalStatus::Aborted,
-                    CatalogSourceWalStatus::Rejected,
-                ));
             }
             Err(source) => {
                 slot.source = source;
-                slot.owner.0.set(CatalogSourceWalStatus::Unavailable(
-                    slot.rejection
-                        .unwrap_or(CatalogSourceWalRejection::OwnerLost),
-                ));
                 self.slots.insert(id.clone(), slot);
             }
         }
@@ -301,8 +183,6 @@ impl WorkerReservations {
             self.abort_one(&id, sources);
         }
     }
-    // Called only after every successful reservation has aborted, before any journal wait.
-    // Sticky failures cannot be replaced by a freshly opened owner for the same source ID.
     pub(crate) fn retire_failed(
         &mut self,
         journal: Option<&OperationJournalClient>,
@@ -314,40 +194,19 @@ impl WorkerReservations {
         let ids: Vec<_> = self.slots.keys().cloned().collect();
         for id in ids {
             let mut slot = self.slots.remove(&id).expect("retained failed slot");
-            // No scalar, fixture ID, or missing registration can stand in for original authority.
             let _ = poll_pending_source_authority(&mut slot.source);
             if slot.source.source_authority_receipt.is_none()
                 || slot.source.source_authority.is_none()
+                || slot.source.database.is_prepared()
             {
                 self.slots.insert(id, slot);
                 continue;
             }
-            let failed = slot.source.try_map_database(|db| match db {
-                ParkedDatabase::Failed(failure) => Ok(failure),
-                held => Err(held),
-            });
-            let source = match failed {
-                Ok(source) => source,
-                Err(source) => {
-                    slot.source = source;
-                    self.slots.insert(id, slot);
-                    continue;
-                }
-            };
-            match retire_source(id.clone(), source, journal, pending) {
-                RetireSourceOutcome::Removed | RetireSourceOutcome::FinalizationPending { .. } => {
-                    drop(slot.binding.take());
-                    drop(slot.scope.take());
-                    slot.owner.1 = true;
-                    slot.owner.0.finish(CatalogSourceWalStatus::Retired);
-                }
+            let outcome = slot.source.database.outcome_observation();
+            match retire_source(id.clone(), slot.source, journal, pending) {
+                RetireSourceOutcome::Removed | RetireSourceOutcome::FinalizationPending { .. } => {}
                 RetireSourceOutcome::Retained { source, reason } => {
-                    slot.source = match source.try_map_database(|failure| {
-                        Ok::<_, std::convert::Infallible>(ParkedDatabase::Failed(failure))
-                    }) {
-                        Ok(source) => source,
-                        Err(never) => match never.database {},
-                    };
+                    slot.source = source;
                     report_source_authority_issue_for_source(
                         &id,
                         "failed preparation retains original drain evidence",
@@ -361,10 +220,7 @@ impl WorkerReservations {
                         "failed preparation closed without a retirement acknowledgement",
                         reason,
                     );
-                    slot.owner.0.set(CatalogSourceWalStatus::Unavailable(
-                        CatalogSourceWalRejection::OwnerLost,
-                    ));
-                    self.unresolved.insert(id, slot.owner);
+                    self.unresolved.insert(id, outcome);
                 }
             }
         }
@@ -406,13 +262,13 @@ impl WorkerReservations {
         !self.slots.is_empty() || !self.unresolved.is_empty()
     }
     pub(crate) fn close(&mut self, sources: &mut HashMap<SourceId, RegisteredSource>) {
-        self.control.close();
+        self.inbox.close();
         self.abort_all(sources);
     }
 }
 impl Drop for WorkerReservations {
     fn drop(&mut self) {
-        self.control.close();
+        self.inbox.close();
     }
 }
 fn current(admission: &Arc<Mutex<AdmissionState>>, revision: &SourceRevision) -> bool {
@@ -424,23 +280,6 @@ fn current(admission: &Arc<Mutex<AdmissionState>>, revision: &SourceRevision) ->
             .get(revision.source_id())
             .is_some_and(|s| s.active && s.lifecycle_generation == revision.lifecycle_generation())
 }
-pub(super) fn classify(error: &SourceWalPreparationError) -> CatalogSourceWalRejection {
-    match error {
-        SourceWalPreparationError::Deadline => CatalogSourceWalRejection::Deadline,
-        SourceWalPreparationError::LeaseRenewalRequired => {
-            CatalogSourceWalRejection::LeaseRenewalRequired
-        }
-        SourceWalPreparationError::Owner(_) | SourceWalPreparationError::BindingUnavailable => {
-            CatalogSourceWalRejection::Scope
-        }
-        SourceWalPreparationError::Wal(_) | SourceWalPreparationError::Sqlite(_) => {
-            CatalogSourceWalRejection::WalUnavailable
-        }
-        SourceWalPreparationError::TransactionActive
-        | SourceWalPreparationError::RollbackUnconfirmed => CatalogSourceWalRejection::OwnerLost,
-    }
-}
-
 pub(crate) fn lifecycle(command: &CatalogCommand) -> bool {
     matches!(
         command,

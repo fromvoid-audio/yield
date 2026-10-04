@@ -15,6 +15,8 @@ pub mod readiness;
 /// Backend-neutral Finder observation reconciliation contracts.
 pub mod reconciliation;
 mod source_entry;
+/// Sealed bounded pre-intent transport on the genuine source producer.
+pub mod wal_transport;
 
 pub use audio_support::{
     is_apple_double_sidecar, is_recognized_audio, is_supported_audio, supported_audio_where_clause,
