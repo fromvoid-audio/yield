@@ -9,6 +9,12 @@ use super::tag_vocabulary::ProfileTagVocabularyInputError;
 /// Errors returned when operating on the library database.
 #[derive(Debug, Error)]
 pub enum LibraryError {
+    /// The lifecycle family has a partial, altered or unsupported schema; preserve evidence.
+    #[error("source lifecycle schema is incompatible; explicit migration required")]
+    SourceLifecycleSchemaIncompatible,
+    /// The lifecycle schema inspection exhausted its finite VM/deadline budget.
+    #[error("source lifecycle schema inspection budget exhausted")]
+    SourceLifecycleSchemaBudget,
     /// This worker exhausted its checked registration-local mutation fence before effects.
     #[error("global mutation fence exhausted; reacquire the global worker")]
     GlobalMutationFenceExhausted,

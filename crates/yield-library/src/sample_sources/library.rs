@@ -25,6 +25,7 @@ mod registry_limits;
 mod registry_participant;
 mod schema_checks;
 mod schema_defs;
+mod source_lifecycle_schema;
 mod sources;
 mod tag_vocabulary;
 mod telemetry;

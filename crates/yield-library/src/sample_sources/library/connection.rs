@@ -79,6 +79,7 @@ impl LibraryDatabase {
             ordinary_wal_maintenance: Default::default(),
             _database_root_binding: database_root_binding,
         };
+        db.install_source_lifecycle_schema()?;
         db.apply_pragmas()?;
         db.apply_schema()?;
         db.migrate_source_roles()?;
