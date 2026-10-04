@@ -436,3 +436,31 @@ cargo test --locked -p yield-library --lib control_
 cargo test --locked -p yield-library --lib
 bash scripts/agent.sh preflight
 ```
+
+## Original-ledger observation prerequisite (OPT-2267)
+
+The provider now brackets its actual admissions, restart installation, acknowledged
+ordinary releases, provisional release/Drop, persistence disposition and confirmed
+rollback release with a private charge mirror. Validation refusals before mutation
+preserve the preceding generation. Pending starts before the first ledger write;
+confirmed completion publishes checked incremental totals for at most 32 genuinely
+charged bound volumes and advances a checked generation. Existing destination and
+recovery-payload bytes remain excluded under the original accounting rule.
+
+Only the original provider can bind an observer. It shares scalar synchronization
+and immutable device correlation, without transferring the actor-local ledger,
+profile or native resources. Copied observations are historical. A private scalar
+transition can check the exact generation while excluding mirror mutation; the full
+issuer must also hold its independent admission gate, then its slot lock. Neither
+that check nor a known zero total grants entry or qualifies capacity. Pending,
+unconfirmed mutation/unwind, poison, checked overflow and provider retirement
+make observations unavailable; closure stays sticky while real charge cleanup
+remains possible. Observer bindings reuse expired weak slots, never evict live
+readers, and contain no unbounded worker queue or completion channel.
+
+This does not install publication slots, effect entry, resource-use accounting,
+settlement or publication-aware shutdown. Full OPT-2215 must debit all slot and
+shared mirror backing from its original journal input pool, bind exact claims and
+current native descriptor/reserve provenance, and compose cancellation/retirement
+and completion fences. The actual provider arithmetic/barrier tests exercise the
+original ledger and leases with accounting fixtures, not Native grants or effects.

@@ -24,6 +24,9 @@ use crate::durable_capacity::{PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIde
 use crate::operation_journal::model::OperationId;
 use uuid::Uuid;
 
+mod charge_observer;
+use charge_observer::{ChargeMirror, ChargeMutation, ChargeObserver};
+use std::sync::Arc;
 const INITIAL_LEASE_TOKEN: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +65,7 @@ impl PartialOrd for ChargeKey {
 
 #[derive(Debug)]
 struct ProvisionalLedger {
+    mirror: Arc<ChargeMirror>,
     next_token: u64,
     charges_by_token: BTreeMap<u64, LedgerCharge>,
     aggregate_charges: BTreeMap<ChargeKey, u64>,
@@ -138,6 +142,7 @@ impl CapacityRebuildReadiness {
 impl Default for ProvisionalLedger {
     fn default() -> Self {
         Self {
+            mirror: Arc::new(ChargeMirror::default()),
             next_token: INITIAL_LEASE_TOKEN,
             charges_by_token: BTreeMap::new(),
             aggregate_charges: BTreeMap::new(),
@@ -168,15 +173,37 @@ pub(crate) struct CapacityProvider {
     qualification: ProviderQualification,
     facts: Option<CapacityFacts>,
     ledger: Rc<RefCell<ProvisionalLedger>>,
+    mirror: Arc<ChargeMirror>,
 }
 
 impl CapacityProvider {
-    pub(crate) fn unavailable() -> Self {
+    fn with_qualification(
+        qualification: ProviderQualification,
+        facts: Option<CapacityFacts>,
+    ) -> Self {
+        let ledger = Rc::new(RefCell::new(ProvisionalLedger::default()));
+        let mirror = ledger.borrow().mirror.clone();
         Self {
-            qualification: ProviderQualification::Unavailable,
-            facts: None,
-            ledger: Rc::new(RefCell::new(ProvisionalLedger::default())),
+            qualification,
+            facts,
+            ledger,
+            mirror,
         }
+    }
+    pub(crate) fn unavailable() -> Self {
+        Self::with_qualification(ProviderQualification::Unavailable, None)
+    }
+
+    /// Observe only an actual currently charged original-ledger volume; never native authority.
+    pub(crate) fn publication_charge_observer(
+        &self,
+        volume: &VolumeIdentity,
+    ) -> Result<Arc<ChargeObserver>, CapacityProviderError> {
+        let ledger = self
+            .ledger
+            .try_borrow()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        ledger.mirror.bind(&ledger, volume)
     }
 
     /// Prove that this owner-thread ledger has no live charge that could be lost by a clean
@@ -225,6 +252,7 @@ impl CapacityProvider {
         let fail_release = ledger.fail_release;
         #[cfg(test)]
         let fail_disposition = ledger.fail_disposition;
+        let mutation = ChargeMutation::begin(&ledger);
         ledger.next_token = staged.next_token;
         ledger.charges_by_token = staged.charges_by_token;
         ledger.aggregate_charges = staged.aggregate_charges;
@@ -234,6 +262,7 @@ impl CapacityProvider {
             ledger.fail_release = fail_release;
             ledger.fail_disposition = fail_disposition;
         }
+        mutation.finish(&ledger);
         Ok(())
     }
 
@@ -261,11 +290,10 @@ impl CapacityProvider {
 
     #[cfg(test)]
     pub(crate) fn qualified_fixture(facts: BTreeMap<VolumeIdentity, VolumeFacts>) -> Self {
-        Self {
-            qualification: ProviderQualification::QualifiedFixture,
-            facts: Some(CapacityFacts::new(facts)),
-            ledger: Rc::new(RefCell::new(ProvisionalLedger::default())),
-        }
+        Self::with_qualification(
+            ProviderQualification::QualifiedFixture,
+            Some(CapacityFacts::new(facts)),
+        )
     }
 
     pub(crate) fn admit(
@@ -568,6 +596,7 @@ impl CapacityProvider {
                 .checked_add(*bytes)
                 .ok_or(CapacityProviderError::ArithmeticOverflow)?;
         }
+        let mutation = ChargeMutation::begin(&ledger);
         ledger.next_token = next_token;
         for (key, bytes) in &charge_by_key {
             let aggregate = ledger.aggregate_charges.entry(key.clone()).or_insert(0);
@@ -605,6 +634,7 @@ impl CapacityProvider {
             .map(AdmissionClaim::claim_id)
             .collect();
 
+        mutation.finish(&ledger);
         Ok(ProvisionalCapacityLease {
             ledger: Rc::clone(&self.ledger),
             token: next_token - 1,
@@ -741,6 +771,7 @@ impl CapacityProvider {
             return Err(CapacityProviderError::ReleaseFailed);
         }
 
+        let mutation = ChargeMutation::begin(&ledger);
         {
             let current = ledger
                 .aggregate_charges
@@ -811,6 +842,7 @@ impl CapacityProvider {
         if all_released {
             ledger.charges_by_token.remove(&token);
         }
+        mutation.finish(&ledger);
         Ok(())
     }
 
@@ -908,6 +940,13 @@ impl CapacityProvider {
     }
 }
 
+impl Drop for CapacityProvider {
+    fn drop(&mut self) {
+        // Observer custody cannot outlive the original actor/provider incarnation.
+        self.mirror.close();
+    }
+}
+
 fn stage_rebuilt_ledger(
     claims: &[RebuildClaim],
     initial_next_token: u64,
@@ -940,6 +979,7 @@ fn stage_rebuilt_ledger(
     }
 
     let mut staged = ProvisionalLedger {
+        mirror: Arc::new(ChargeMirror::default()),
         next_token: initial_next_token,
         charges_by_token: BTreeMap::new(),
         aggregate_charges: BTreeMap::new(),
@@ -1296,6 +1336,7 @@ impl ProvisionalCapacityLease {
                 return Err(CapacityProviderError::ReleaseFailed);
             }
         }
+        let mutation = ChargeMutation::begin(&ledger);
         for (key, bytes) in &self.charges {
             let current = ledger
                 .aggregate_charges
@@ -1308,6 +1349,7 @@ impl ProvisionalCapacityLease {
         }
         ledger.charges_by_token.remove(&self.token);
         self.disposition = ProvisionalLeaseDisposition::Released;
+        mutation.finish(&ledger);
         Ok(())
     }
 
@@ -1413,8 +1455,14 @@ impl ProvisionalCapacityLease {
             } if audit_pending && *current == operation_id => return Ok(()),
             _ => return Err(CapacityProviderError::LeaseDispositionConflict),
         };
-        entry.disposition = next.clone();
+        let mutation = ChargeMutation::begin(&ledger);
+        ledger
+            .charges_by_token
+            .get_mut(&self.token)
+            .expect("validated disposition token")
+            .disposition = next.clone();
         self.disposition = next;
+        mutation.finish(&ledger);
         Ok(())
     }
 
@@ -1452,6 +1500,7 @@ impl ProvisionalCapacityLease {
                 return Err(CapacityProviderError::ReleaseFailed);
             }
         }
+        let mutation = ChargeMutation::begin(&ledger);
         for (key, bytes) in &owned_charges {
             let current = ledger
                 .aggregate_charges
@@ -1464,6 +1513,7 @@ impl ProvisionalCapacityLease {
         }
         ledger.charges_by_token.remove(&self.token);
         self.disposition = ProvisionalLeaseDisposition::Released;
+        mutation.finish(&ledger);
         Ok(())
     }
 
@@ -1562,7 +1612,7 @@ mod tests {
         AdmissionClaim, AdmissionClaimId, FullCapacityAllocation, FullCapacityPlan,
     };
 
-    fn facts(device: u64, free_bytes: u64, allocation_unit: u64) -> VolumeFacts {
+    pub(super) fn facts(device: u64, free_bytes: u64, allocation_unit: u64) -> VolumeFacts {
         VolumeFacts {
             identity: VolumeIdentity { device },
             free_bytes,
@@ -1570,7 +1620,7 @@ mod tests {
         }
     }
 
-    fn plan_and_claims(
+    pub(super) fn plan_and_claims(
         rows: &[(VolumeIdentity, FullCapacityAllocationClass, u64, u64)],
     ) -> (FullCapacityPlan, AdmissionClaimInventory) {
         let allocations = rows
@@ -1615,7 +1665,7 @@ mod tests {
         crate::durable_capacity::round_up_allocation(bytes, allocation_unit).expect("test round")
     }
 
-    fn rebuild_claim(
+    pub(super) fn rebuild_claim(
         operation_id: OperationId,
         claim_id: AdmissionClaimId,
         volume: VolumeIdentity,
@@ -1635,7 +1685,7 @@ mod tests {
         )
     }
 
-    fn rebuild_snapshot(claims: Vec<RebuildClaim>) -> OrdinaryClaimRebuildSnapshot {
+    pub(super) fn rebuild_snapshot(claims: Vec<RebuildClaim>) -> OrdinaryClaimRebuildSnapshot {
         OrdinaryClaimRebuildSnapshot::for_test(claims, CapacityRebuildReadiness::ready())
     }
 
