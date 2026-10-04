@@ -495,6 +495,21 @@ impl SourceDatabase {
         Ok(state)
     }
 
+    /// Read only finite generation metadata inside the original caller-owned transaction.
+    pub(crate) fn source_directory_truth_state_bounded_in_transaction(
+        &self,
+    ) -> Result<SourceDirectoryTruthState, SourceDbError> {
+        if self.connection.is_autocommit() {
+            return Err(SourceDbError::Unexpected);
+        }
+        if !directory_truth_schema_available(&self.connection)? {
+            return Ok(SourceDirectoryTruthState::Unavailable {
+                reason: SourceDirectoryTruthUnavailableReason::SchemaUnavailable,
+            });
+        }
+        inspect_directory_truth_state(&self.connection, DirectoryTruthInspection::BoundedPage)
+    }
+
     /// Read one bounded, revision-fenced page of the active directory generation.
     pub fn source_directory_truth_page(
         &self,

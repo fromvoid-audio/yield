@@ -107,6 +107,16 @@ impl LifecycleDatabaseAllocation {
         &self.shm
     }
 
+    // Exact passive facts after installing only the selected pager restriction.
+    pub(crate) fn matches_entered(&self, actual: &Self) -> bool {
+        if actual.original_max_pages != self.selected_max_pages {
+            return false;
+        }
+        let mut normalized = actual.clone();
+        normalized.original_max_pages = self.original_max_pages;
+        self == &normalized
+    }
+
     // I/O restriction only. Genuine journal attempts/capacity/entered policy remain mandatory.
     pub(crate) fn logical_restriction(&self) -> Option<LogicalBudget> {
         let unit = self.main.allocation_unit();
