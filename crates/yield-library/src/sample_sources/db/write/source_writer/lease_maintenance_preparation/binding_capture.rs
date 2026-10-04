@@ -71,7 +71,7 @@ impl SourceLeaseMaintenancePreparation {
             deadline: self.deadline(),
         })
     }
-    /// Reobserve with the original retained preparation and actual registration guard.
+    /// Validate parked original custody and actual registration without ordinary SQL.
     /// Matching stored tuples, nonce strings or decoded observations cannot substitute custody.
     pub fn validate_lease_binding(
         &self,
@@ -87,10 +87,14 @@ impl SourceLeaseMaintenancePreparation {
         {
             return Err(LifecycleAllocationError::Unknown.into());
         }
-        let current = self.capture_lease_binding(registration)?;
-        if binding.stored != current.stored {
+        self.revalidate_owner()?;
+        let current = registration
+            .registry_reference_observation(&self.custody.writer().database)
+            .map_err(|_| LifecycleAllocationError::Unknown)?;
+        if binding.stored.subject().registration() != Some(&current) {
             return Err(LifecycleAllocationError::Unknown.into());
         }
+        self.revalidate_owner()?;
         Ok(())
     }
 }

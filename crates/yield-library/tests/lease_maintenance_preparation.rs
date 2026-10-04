@@ -299,3 +299,49 @@ fn captured_binding_refuses_replaced_root_and_elapsed_original_deadline() {
     drop(registration);
     prepared.abort().unwrap().close().unwrap();
 }
+
+#[test]
+fn normal_parked_never_audited_lease_binding_preserves_original_owner_and_registration() {
+    let temp = tempfile::tempdir().unwrap();
+    let _root = AppRootGuard::set(temp.path().join("profile")).unwrap();
+    let profile = WritableProfileGuard::acquire_current().unwrap();
+    let media = temp.path().join("media");
+    fs::create_dir(&media).unwrap();
+    let a = source(&media, &profile, "parked-a");
+    let b = source(&media, &profile, "parked-b");
+    let ar = a.catalog_database().prepare_source_authority().unwrap();
+    let br = b.catalog_database().prepare_source_authority().unwrap();
+    let other =
+        Connection::open(profile.profile_root().join("parked-a").join(DB_FILE_NAME)).unwrap();
+    other.busy_timeout(Duration::ZERO).unwrap();
+    let before = row(&other);
+    let scan = a.current_scan_fence().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let observation = a.capture_lease_maintenance_allocation(deadline).unwrap();
+    let a = a.prepare_lease_maintenance(observation, deadline).unwrap();
+    let binding = a.capture_lease_binding(&ar).unwrap();
+    assert!(matches!(
+        binding.stored_fence().subject().audit(),
+        SourceRegistryAuditObservation::Unavailable {}
+    ));
+    a.revalidate_owner().unwrap();
+    a.validate_lease_binding(&binding, &ar).unwrap();
+    assert!(a.validate_lease_binding(&binding, &br).is_err());
+    assert_eq!(
+        other
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap_err()
+            .sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy)
+    );
+    assert_eq!(row(&other), before);
+    let a = a.abort().unwrap();
+    assert_eq!(a.current_scan_fence().unwrap(), scan);
+    assert!(a.current_revision().is_err());
+    assert_eq!(row(&other), before);
+    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    drop(ar);
+    drop(br);
+    a.close().unwrap();
+    b.close().unwrap();
+}

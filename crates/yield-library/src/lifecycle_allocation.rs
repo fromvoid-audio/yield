@@ -107,6 +107,27 @@ impl LifecycleDatabaseAllocation {
         &self.shm
     }
 
+    // Compare only original retained native/mapped objects; no schema or pager-row SQL.
+    pub(crate) fn validate_parked_objects(
+        &self,
+        connection: &OwnedConnection,
+        root: &BoundDatabaseRoot,
+        name: &std::path::Path,
+        deadline: Instant,
+    ) -> Result<(), LifecycleAllocationError> {
+        let actual = connection
+            .retained_wal_objects(root, name, deadline)
+            .ok_or(LifecycleAllocationError::Unknown)?;
+        if actual.main != self.main.facts
+            || actual.wal != self.wal.facts
+            || actual.shm != self.shm.facts
+            || Instant::now() >= deadline
+        {
+            return Err(LifecycleAllocationError::Unknown);
+        }
+        Ok(())
+    }
+
     // Exact passive facts after installing only the selected pager restriction.
     pub(crate) fn matches_entered(&self, actual: &Self) -> bool {
         if actual.original_max_pages != self.selected_max_pages {

@@ -488,3 +488,37 @@ cargo test --locked -p yield-library --lib
 cargo check --locked -p yield-catalog
 bash scripts/agent.sh preflight
 ```
+
+## Parked original pre-audit lease custody (OPT-2259)
+
+`SourceLeaseMaintenancePreparation::revalidate_owner` validates only the retained
+original issuer/source/lifecycle, current CONTROL lease and required expiry,
+original native MAIN/WAL/mapped-SHM identities/lengths/device/allocation unit,
+entered settings and empty-transaction custody under the original common deadline.
+It performs no ordinary row, schema, page, scan or optional-audit queries, no renewal
+and no nested transaction. The retained extension guard excludes extension entry.
+A SQL-free original SQLite total-change counter rejects accidental uncommitted
+ordinary writes that a separate CONTROL snapshot cannot see.
+
+Initial acquisition and `capture_lease_binding` retain complete original schema,
+scan/optional-audit/subject/allocation validation inside the empty transaction.
+Existing full `revalidate` and cleanup retain their full checks. After capture,
+`validate_lease_binding` checks its private original issuer/nonce/deadline and exact
+current genuine source registration using parked validation. The original exclusive
+writer prevents intervening ordinary row changes; a stored or decoded fence cannot
+replace this preparation. Abort still requires actual rollback and exact original
+settings/timeout restoration before the same writer becomes callable.
+
+Actual never-audited SQLite tests deny ordinary reads, schema/page queries, writes
+and nested BEGIN with an authorizer while original parked binding validation
+succeeds. Settings/sidecar substitution or length changes, original epoch/owner
+changes, uncommitted accidental mutation, wrong registration/issuer and expiry
+reject without authorizing reuse. Normal-build tests use actual owners and genuine
+Prepared registrations; they do not fabricate an authoritative audit or physical
+grant. No V18/V2 encoding or journal/source schema changes.
+
+Compatible pre-audit source transport and full OPT-2136 inventory/directions,
+genuine current Registered acknowledgements, post-decision native cleanup fencing,
+atomic nonce/intent/claims and uncertain settlement remain open. These original
+parked checks provide no latch, permit, retry/refund, release or close acknowledgement;
+qualified allocation OPT-2194 and genuine admitted release OPT-2202 remain open.
