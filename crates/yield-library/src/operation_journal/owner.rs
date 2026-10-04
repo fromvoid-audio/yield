@@ -5830,7 +5830,7 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 
 #[cfg(test)]
 mod tests {
-    mod command_drain;
+    mod command_drain_tests;
     mod source_registry_handoff_tests;
     #[test]
     fn recording_dispatch_binding_checks_actual_bytes_range_output_and_root() {
