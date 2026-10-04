@@ -349,3 +349,51 @@ registrations, exact direction allocations, sealed all-owner acknowledgements,
 atomic intent/claims/nonce settlement and unresolved lock retention. Neither a
 shared view nor its encoded bytes can supply those authorities or physical
 qualification. All original parent acceptance stays open.
+
+## Genuine library source transport (OPT-2252)
+
+`sample_sources::wal_transport` defines the bounded requester and single original
+source-actor inbox independently of the catalog crate. The catalog's existing
+public names remain aliases, and `CatalogService::source_wal_transport` exposes
+the same actual producer route to library consumers. Its original ceilings remain
+64 pending-plus-held slots, 64 KiB of complete retained context and a two-second
+common deadline including queue wait. Closing admission rejects queued requests;
+it does not confirm cleanup of an already acquired native owner.
+
+A non-Clone command can acquire only a genuine `SourceWriter`. Private producer
+custody retains the actual preparation or failed native writer. There is no public
+positive status setter, callback or producer trait. Publication revalidates the
+original owner; strict publication additionally requires that owner's genuine
+source registration and captures the actual original binding. Missing or
+mismatched registration refuses. A second publication from the same command
+refuses before native work. The catalog retains source desired-state, lifecycle,
+alias exclusion, normal dispatch and failed-owner retirement on its original
+worker; it never moves the SQLite owner into the requester or reply.
+
+Complete immutable observations share their revision, correlations, nonce and
+optional original binding. Historical binding access borrows the actual private
+binding, without decoding caller bytes or making a second descriptor buffer.
+Capture staging and retained scope use the same checked local byte pool; copies
+retain all observation and scope credits across abort and shutdown until the last
+view drops. Even diagnostic-only copied observations retain their memory credits.
+These local source bounds do not replace combined source-plus-global coordinator
+accounting or prove current journal registration.
+
+Only actual rollback and busy-timeout restoration returns the original writer and
+finishes `Aborted` or `Rejected`. Failed cleanup retains inaccessible native
+custody. `Retired` requires the original failed owner's genuine source-close
+acknowledgement; journal finalization may still be pending. Producer Drop publishes
+`Unavailable(OwnerLost)` before native custody drops, never inferred reuse or a
+retirement acknowledgement. Existing catalog tests exercise real rollback denial,
+timeout-restoration failures, lifecycle exclusion, external writer pressure,
+sidecar substitution, copied memory custody and shutdown. Normal-build source
+tests exercise the library route and missing/wrong original registration directly.
+The native protected-reserve retirement case retains its OPT-2026 prerequisite.
+
+This is still the existing pre-intent preparation route. A holder explicitly
+refuses settlement acknowledgement. Full OPT-2136 must implement complete family
+inventory and direction allocations, genuine journal registration validation,
+sealed decision custody and cleanup fencing on both real owners, atomic durable
+nonce/intent/claims and uncertain readback/restart. Historical scope, transport
+privacy or a local reservation cannot issue that latch, a permit or physical
+qualification. The original parent acceptance remains open.

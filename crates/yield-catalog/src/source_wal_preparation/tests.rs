@@ -4,6 +4,7 @@ mod integration {
     //! Actual catalog-worker/profile SQLite tests; no native capacity qualification is fabricated.
     use super::super::*;
     use rusqlite::{Connection, ErrorCode, OpenFlags};
+    use yield_library::operation_journal::{AdmissionClaimId, ParticipantId};
     use yield_library::sample_sources::db::DB_FILE_NAME;
 
     struct Fixture {
@@ -253,8 +254,7 @@ mod integration {
     }
     fn credits(service: &CatalogService) -> (usize, usize) {
         let state = service.admission.lock().unwrap();
-        let q = state.source_wal.shared.queue.lock().unwrap();
-        (q.slots, q.bytes)
+        state.source_wal.context_usage_for_tests()
     }
     fn lease(db: &Connection) -> (String, i64, i64, i64, String) {
         db.query_row("SELECT owner_identity,lease_epoch,acquired_at,expires_at,state FROM source_lease WHERE singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap()
@@ -390,7 +390,7 @@ mod integration {
         let request = service
             .prepare_source_wal(revisions[0].clone(), correlation(), deadline())
             .unwrap();
-        let ticket = request.ticket.clone();
+        let ticket = request.outcome_probe_for_tests();
         drop(request);
         assert_eq!(credits(&service).0, 1);
         let expired = service
@@ -653,8 +653,7 @@ mod integration {
         assert_eq!(credits_after_unlock(&state), (0, 0));
     }
     fn credits_after_unlock(state: &AdmissionState) -> (usize, usize) {
-        let q = state.source_wal.shared.queue.lock().unwrap();
-        (q.slots, q.bytes)
+        state.source_wal.context_usage_for_tests()
     }
 
     #[test]
@@ -883,9 +882,7 @@ mod integration {
             .lock()
             .unwrap()
             .source_wal
-            .shared
-            .unknown_wal
-            .store(true, Ordering::Release);
+            .set_unknown_wal_for_tests(true);
         let request = service
             .prepare_source_wal(revisions[0].clone(), correlation(), deadline())
             .unwrap();
@@ -900,9 +897,7 @@ mod integration {
             .lock()
             .unwrap()
             .source_wal
-            .shared
-            .unknown_wal
-            .store(false, Ordering::Release);
+            .set_unknown_wal_for_tests(false);
         let mut retry = service
             .prepare_source_wal(revisions[0].clone(), correlation(), deadline())
             .unwrap();
@@ -988,7 +983,7 @@ mod integration {
         wait(&request, |s| {
             matches!(s, CatalogSourceWalStatus::Prepared(_))
         });
-        let witness = request.ticket.clone();
+        let witness = request.outcome_probe_for_tests();
         let pause = gate.pause_next();
         drop(request);
         busy(&db);
@@ -1388,19 +1383,18 @@ mod integration {
         assert_eq!(credits(&service).0, 0);
         assert!(credits(&service).1 > 0);
         assert!(observation.scope_descriptor_bytes().is_some());
-        let accounting = Arc::downgrade(&service.admission.lock().unwrap().source_wal.shared);
+        let accounting = service.source_wal_transport().accounting_probe_for_tests();
         drop(held);
         drop(request);
         drop(service);
         let retained = accounting
-            .upgrade()
+            .observe()
             .expect("report retains closed accounting");
-        assert!(retained.queue.lock().unwrap().closed);
-        assert!(retained.queue.lock().unwrap().bytes > 0);
-        drop(retained);
+        assert!(retained.2);
+        assert!(retained.1 > 0);
         drop(observation);
         assert!(
-            accounting.upgrade().is_none(),
+            accounting.observe().is_none(),
             "final view releases accounting without a cycle"
         );
         a.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
@@ -1522,14 +1516,14 @@ mod integration {
         a.execute_batch("ROLLBACK").unwrap();
         assert_eq!(credits(&service), (0, 0));
         let control = service.admission.lock().unwrap().source_wal.clone();
-        control.shared.unknown_wal.store(true, Ordering::Release);
+        control.set_unknown_wal_for_tests(true);
         let request = service
             .prepare_source_wal_with_binding(revisions[0].clone(), correlation(), deadline())
             .unwrap();
         wait(&request, |s| {
             *s == CatalogSourceWalStatus::Rejected(CatalogSourceWalRejection::WalUnavailable)
         });
-        control.shared.unknown_wal.store(false, Ordering::Release);
+        control.set_unknown_wal_for_tests(false);
         assert_eq!(credits(&service), (0, 0));
         let mut request = service
             .prepare_source_wal_with_binding(
@@ -1590,5 +1584,38 @@ mod integration {
         assert_eq!(credits(&service), (0, 0));
         a.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
         service.shutdown();
+    }
+    #[test]
+    fn library_requester_on_actual_catalog_retains_complete_diagnostic_views_until_last_copy() {
+        let f = Fixture::new();
+        let (service, revisions, _) = f.start(None);
+        let transport = service.source_wal_transport();
+        let mut request = transport
+            .submit(revisions[0].clone(), correlation(), deadline())
+            .unwrap();
+        let held = prepared(&mut request);
+        let CatalogSourceWalStatus::Prepared(observation) = held.status() else {
+            panic!("actual native source")
+        };
+        let copy = observation.clone();
+        assert_eq!(observation.revision(), &revisions[0]);
+        assert!(observation.original_binding().is_none());
+        drop(held);
+        wait(&request, |s| *s == CatalogSourceWalStatus::Aborted);
+        assert_eq!(credits(&service).0, 0);
+        let retained = credits(&service).1;
+        assert!(
+            retained > 0,
+            "complete revision/correlation/nonce memory remains charged"
+        );
+        drop(observation);
+        assert_eq!(credits(&service).1, retained);
+        service.shutdown();
+        assert_eq!(credits(&service).1, retained);
+        drop(copy);
+        assert_eq!(credits(&service), (0, 0));
+        f.external(&revisions[0])
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
     }
 }

@@ -2210,6 +2210,7 @@ struct CurationLineage {
 struct AdmissionState {
     retained_harvest: harvest_facts::filter::lifetime::RetainedMasks,
     source_wal: source_wal_preparation::Control,
+    source_wal_inbox: Option<yield_library::sample_sources::wal_transport::SourceWalTransportInbox>,
     queued_commands: usize,
     #[cfg(feature = "test-support")]
     compound_batch_fault: Option<test_support::CompoundBatchFault>,
@@ -2230,11 +2231,13 @@ struct AdmissionState {
 
 impl AdmissionState {
     fn new() -> Self {
+        let (source_wal, source_wal_inbox) = source_wal_preparation::Control::channel();
         Self {
             #[cfg(feature = "test-support")]
             compound_batch_fault: None,
             retained_harvest: Default::default(),
-            source_wal: source_wal_preparation::Control::new(),
+            source_wal,
+            source_wal_inbox: Some(source_wal_inbox),
             queued_commands: 0,
             command_metrics: command_metrics::CommandMetrics::new(),
             feature_analysis_metrics: FeatureAnalysisMetrics::default(),
@@ -4099,8 +4102,9 @@ fn run_worker_with_sources(
     let control = admission
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .source_wal
-        .clone();
+        .source_wal_inbox
+        .take()
+        .expect("single original source worker inbox");
     let mut preparations = source_wal_preparation::WorkerReservations::new(control);
     let mut deferred = VecDeque::<QueuedCatalogCommand>::new();
     let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
@@ -6580,7 +6584,7 @@ impl SourceRetirementDatabase for CatalogSourceDatabase {
     }
 }
 impl SourceRetirementDatabase
-    for yield_library::sample_sources::db::write::SourceWalPreparationFailure
+    for yield_library::sample_sources::wal_transport::SourceWalTransportOwner
 {
     fn close_ready(&self) -> bool {
         self.source_authority_close_ready()
