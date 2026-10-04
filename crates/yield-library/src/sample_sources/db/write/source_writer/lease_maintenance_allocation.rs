@@ -18,6 +18,11 @@ pub struct SourceLeaseMaintenanceAllocation {
     deadline: Instant,
 }
 impl SourceLeaseMaintenanceAllocation {
+    pub(crate) fn retained_input_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>()
+            .checked_add(self.subject.retained_heap_bytes()?)?
+            .checked_add(self.allocation.retained_heap_bytes()?)
+    }
     // Original live custody and native facts only. Full subject/schema/pager facts were
     // validated at entry; the exclusive empty writer prevents intervening row mutations.
     pub(super) fn validate_parked(

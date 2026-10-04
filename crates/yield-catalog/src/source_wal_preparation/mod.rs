@@ -12,8 +12,8 @@ pub use yield_library::sample_sources::wal_transport::{
     SourceWalTransportStatus as CatalogSourceWalStatus,
 };
 use yield_library::sample_sources::wal_transport::{
-    SourceWalOwnerObservation, SourceWalTransportCommand, SourceWalTransportInbox,
-    SourceWalTransportOwner,
+    SourceWalOwnerObservation, SourceWalProducerCommand, SourceWalProducerOwner,
+    SourceWalTransportInbox,
 };
 mod owner;
 pub(super) use owner::{WorkerReservations, deferred, interrupts_preparation, lifecycle};
@@ -49,6 +49,28 @@ impl CatalogService {
         deadline: Instant,
     ) -> Result<CatalogSourceWalRequest, CatalogSourceWalRejection> {
         self.prepare_source_wal_scoped(expected, correlation, deadline, false)
+    }
+    /// Consume genuine pre-audit lease allocation into this catalog's original source FIFO.
+    /// Original registration and empty writer custody are captured by the owning worker.
+    pub fn prepare_source_lease_wal_with_binding(
+        &self,
+        input: yield_library::sample_sources::db::write::SourceLeaseMaintenanceAllocation,
+        correlation: CatalogSourceWalCorrelation,
+        deadline: Instant,
+    ) -> Result<CatalogSourceWalRequest, CatalogSourceWalRejection> {
+        let state = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutdown || state.closed {
+            return Err(CatalogSourceWalRejection::Closed);
+        }
+        let id = SourceId::from_string(input.subject().source_id().to_owned());
+        if !state.sources.get(&id).is_some_and(|source| {
+            source.active && source.lifecycle_generation == input.subject().lifecycle_generation()
+        }) {
+            return Err(CatalogSourceWalRejection::Scope);
+        }
+        state
+            .source_wal
+            .submit_lease_with_binding(input, correlation, deadline)
     }
     fn prepare_source_wal_scoped(
         &self,

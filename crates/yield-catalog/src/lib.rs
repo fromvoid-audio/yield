@@ -6584,7 +6584,7 @@ impl SourceRetirementDatabase for CatalogSourceDatabase {
     }
 }
 impl SourceRetirementDatabase
-    for yield_library::sample_sources::wal_transport::SourceWalTransportOwner
+    for yield_library::sample_sources::wal_transport::SourceWalProducerOwner
 {
     fn close_ready(&self) -> bool {
         self.source_authority_close_ready()

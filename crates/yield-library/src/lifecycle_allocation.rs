@@ -74,6 +74,15 @@ pub struct LifecycleDatabaseAllocation {
     shm: LifecycleObjectAllocation,
 }
 impl LifecycleDatabaseAllocation {
+    pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
+        [
+            self.main.facts.identity.capacity(),
+            self.wal.facts.identity.capacity(),
+            self.shm.facts.identity.capacity(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+    }
     /// Family scope, requiring the original actual owner to revalidate before admission.
     pub fn role(&self) -> LifecycleAllocationRole {
         self.role

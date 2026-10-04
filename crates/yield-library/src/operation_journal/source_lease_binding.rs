@@ -35,6 +35,13 @@ pub struct StoredSourceLeaseFence {
     objects: [Object; 3],
 }
 impl StoredSourceLeaseFence {
+    pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
+        self.objects
+            .iter()
+            .try_fold(self.subject.retained_heap_bytes()?, |n, o| {
+                n.checked_add(o.identity.capacity())
+            })
+    }
     pub(crate) fn from_capture(
         subject: SourceRegistryReferenceSubject,
         allocation: &LifecycleDatabaseAllocation,

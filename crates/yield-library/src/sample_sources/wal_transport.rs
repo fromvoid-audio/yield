@@ -15,6 +15,13 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
+mod lease;
+pub use lease::{
+    SourceLeaseWalTransportCommand, SourceLeaseWalTransportObservation,
+    SourceLeaseWalTransportOwner,
+};
+mod dispatch;
+pub use dispatch::{SourceWalProducerCommand, SourceWalProducerOwner};
 mod policy;
 mod producer;
 pub use policy::SourceWalPolicyFamily;
@@ -186,6 +193,8 @@ pub enum SourceWalTransportStatus {
     Pending,
     /// Actual writer is parked under the original live pre-intent reservation.
     Prepared(SourceWalTransportObservation),
+    /// Original pre-audit lease owner is parked; this cannot fabricate an audited revision.
+    PreparedLease(SourceLeaseWalTransportObservation),
     /// Abort has been requested; the writer is still exclusively retained.
     Aborting,
     /// The original writer was returned only after confirmed rollback and timeout restoration.
@@ -234,7 +243,10 @@ impl SourceWalTransportRequest {
     /// A copied observation cannot perform this transfer or acquire any authority.
     pub fn try_prepared(&mut self) -> Option<SourceWalTransportReservation> {
         if self.transferred
-            || !matches!(self.ticket.status(), SourceWalTransportStatus::Prepared(_))
+            || !matches!(
+                self.ticket.status(),
+                SourceWalTransportStatus::Prepared(_) | SourceWalTransportStatus::PreparedLease(_)
+            )
         {
             return None;
         }
@@ -288,6 +300,7 @@ struct PrepareRequest {
     ticket: Arc<Ticket>,
     require_binding: bool,
     policy: Option<RequestPolicy>,
+    lease: Option<crate::sample_sources::db::write::SourceLeaseMaintenanceAllocation>,
 }
 impl PrepareRequest {
     fn finish(self, status: SourceWalTransportStatus) {
@@ -473,6 +486,29 @@ impl SourceWalTransport {
         if size > SOURCE_WAL_TRANSPORT_MAX_CONTEXT_BYTES {
             return Err(SourceWalTransportRejection::InvalidContext);
         }
+        self.enqueue(
+            Some(expected),
+            correlation,
+            deadline,
+            require_binding,
+            policy,
+            None,
+            size,
+        )
+    }
+    fn enqueue(
+        &self,
+        expected: Option<SourceRevision>,
+        correlation: SourceWalTransportCorrelation,
+        deadline: Instant,
+        require_binding: bool,
+        policy: Option<RequestPolicy>,
+        lease: Option<crate::sample_sources::db::write::SourceLeaseMaintenanceAllocation>,
+        size: usize,
+    ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
+        if size > SOURCE_WAL_TRANSPORT_MAX_CONTEXT_BYTES {
+            return Err(SourceWalTransportRejection::InvalidContext);
+        }
         let mut q = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
         if q.closed {
             return Err(SourceWalTransportRejection::Closed);
@@ -493,12 +529,13 @@ impl SourceWalTransport {
             })),
         });
         q.requests.push_back(PrepareRequest {
-            expected: Some(expected),
+            expected,
             correlation,
             deadline,
             ticket: Arc::clone(&ticket),
             require_binding,
             policy,
+            lease,
         });
         Ok(SourceWalTransportRequest {
             ticket,
@@ -529,6 +566,18 @@ impl SourceWalTransportInbox {
     }
     /// Take one original bounded producer command without executing SQL or extending its deadline.
     pub fn try_next(&mut self) -> Option<SourceWalTransportCommand> {
+        let mut q = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+        // Preserve audited-only API without reordering or coercing a lease subject into a revision.
+        if q.requests.front()?.lease.is_some() {
+            return None;
+        }
+        Some(SourceWalTransportCommand {
+            request: q.requests.pop_front(),
+            shared: Arc::clone(&self.shared),
+        })
+    }
+    /// Take the next genuine typed command in the original FIFO, including pre-audit leases.
+    pub fn try_next_any(&mut self) -> Option<SourceWalProducerCommand> {
         let request = self
             .shared
             .queue
@@ -536,9 +585,15 @@ impl SourceWalTransportInbox {
             .unwrap_or_else(|p| p.into_inner())
             .requests
             .pop_front()?;
-        Some(SourceWalTransportCommand {
+        let lease = request.lease.is_some();
+        let command = SourceWalTransportCommand {
             request: Some(request),
             shared: Arc::clone(&self.shared),
+        };
+        Some(if lease {
+            SourceWalProducerCommand::Lease(SourceLeaseWalTransportCommand(command))
+        } else {
+            SourceWalProducerCommand::Audited(command)
         })
     }
 }
