@@ -381,3 +381,85 @@ fn lease_lost_request_delivery_and_shutdown_require_actual_original_owner_cleanu
     assert_eq!(credits(&service), (0, 0));
     drop(held_b);
 }
+
+#[test]
+#[ignore = "requires qualified native protected reserve and source-object adapter; OPT-2262"]
+fn native_pre_audit_lease_failed_owner_uses_original_registered_drain_close_and_finalization() {
+    use yield_library::operation_journal::{
+        OperationJournalOwner, OperationJournalOwnerStatus, OperationJournalStore,
+    };
+    let f = Fixture::new();
+    let registry = tempfile::tempdir().unwrap();
+    let registry_path = registry.path().join("registry");
+    fs::create_dir(&registry_path).unwrap();
+    let mut journal = OperationJournalOwner::start_with_capacity_fixture_for_test(
+        OperationJournalStore::open(&f.base.guard).unwrap(),
+        registry_path,
+    )
+    .unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    while journal.status() == OperationJournalOwnerStatus::Initializing {
+        assert!(Instant::now() < end);
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        journal.status(),
+        OperationJournalOwnerStatus::Available,
+        "native bootstrap must actually qualify; no model substitute"
+    );
+    let deny = Arc::new(AtomicBool::new(false));
+    let (service, revisions, inputs, _) =
+        f.start_mode(Some(deny.clone()), None, Some(journal.client()), true);
+    assert!(
+        revisions.is_empty(),
+        "native lease source must remain never audited"
+    );
+    let id = source(&inputs[0]);
+    let db = f.external_id(&id);
+    let mut request = service
+        .prepare_source_lease_wal_with_binding(inputs[0].clone(), correlation(), deadline())
+        .unwrap();
+    let held = held(&mut request);
+    deny.store(true, Ordering::Release);
+    held.abort();
+    wait(&request, |s| {
+        matches!(s, CatalogSourceWalStatus::Unavailable(_))
+    });
+    busy(&db);
+    service
+        .submit(CatalogCommand::Remove {
+            source_id: id.clone(),
+            lifecycle_generation: 1,
+        })
+        .unwrap();
+    wait(&request, |s| *s == CatalogSourceWalStatus::Retired);
+    assert_eq!(credits(&service), (0, 0));
+    db.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    assert_eq!(lease(&db).4, "released");
+    // Removal is published only after the exact sealed acknowledgement has finalized.
+    // A transient pending callback must be retried with that original carrier, not recreated.
+    let end = Instant::now() + Duration::from_secs(2);
+    let mut removed = false;
+    while !removed {
+        while let Ok(event) = service.try_recv_event() {
+            if matches!(event,CatalogEvent::Removed { ref source_id, .. } if source_id==&id) {
+                removed = true;
+            }
+        }
+        if !removed {
+            assert!(
+                Instant::now() < end,
+                "original retirement acknowledgement did not finalize"
+            );
+            service
+                .submit(CatalogCommand::Remove {
+                    source_id: id.clone(),
+                    lifecycle_generation: 1,
+                })
+                .unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    service.shutdown();
+    assert!(journal.shutdown());
+}

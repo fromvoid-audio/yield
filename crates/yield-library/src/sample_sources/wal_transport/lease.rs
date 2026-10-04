@@ -6,6 +6,17 @@ use crate::sample_sources::db::write::{
     SourceLeaseMaintenancePreparation, SourceLeaseMaintenancePreparationError,
     SourceLeaseMaintenancePreparationFailure,
 };
+// The original SourceWriter/database already exists in RegisteredSource and moves
+// without duplication. Charge the concrete lease family, not unrelated audited native
+// headers or another copy of that original owner. Include complete shared bookkeeping.
+const LEASE_CONTEXT_FIXED_BYTES: usize = std::mem::size_of::<PrepareRequest>()
+    + std::mem::size_of::<SourceLeaseWalTransportOwner>()
+        .saturating_sub(std::mem::size_of::<SourceWriter>())
+    + std::mem::size_of::<Ticket>()
+    + std::mem::size_of::<Credit>()
+    + std::mem::size_of::<SourceLeaseMaintenancePreparation>()
+        .saturating_sub(std::mem::size_of::<SourceWriter>())
+    + 160;
 mod native;
 use native::LeaseNative;
 
@@ -90,14 +101,7 @@ impl SourceWalTransport {
         }
         let size = input
             .retained_input_bytes()
-            .and_then(|n| n.checked_add(CONTEXT_FIXED_BYTES))
-            .and_then(|n| {
-                n.checked_add(
-                    std::mem::size_of::<SourceLeaseWalTransportOwner>()
-                        + std::mem::size_of::<SourceLeaseMaintenancePreparation>()
-                            .saturating_sub(std::mem::size_of::<SourceWriter>()),
-                )
-            })
+            .and_then(|n| n.checked_add(LEASE_CONTEXT_FIXED_BYTES))
             .ok_or(SourceWalTransportRejection::InvalidContext)?;
         self.enqueue(None, correlation, deadline, true, None, Some(input), size)
     }

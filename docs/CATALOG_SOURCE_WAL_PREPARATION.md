@@ -165,3 +165,19 @@ OPT-2136's full inventory, current registered acknowledgements, shared post-deci
 custody, atomic intent claims, uncertainty/readback and restart remain open, as do
 required permits and admitted source lease release. This transport issues none of
 those authorities.
+
+The genuine pre-audit positive native harness is also compiled explicitly:
+
+```sh
+cargo test --locked -p yield-catalog --lib \
+  source_wal_preparation::tests::integration::lease::native_pre_audit_lease_failed_owner_uses_original_registered_drain_close_and_finalization \
+  -- --ignored --exact --test-threads=1
+```
+
+OPT-2262 under OPT-2026 tracks this exact unexecuted case and qualified-host
+requirements. It requires exactly one executed passing test, real native Available
+journal/registration and original never-audited typed preparation, actual rollback
+denial, original drain/close/lease acknowledgement and finalization to Removed.
+Linux protected-reserve bootstrap is unsupported. Missing native source-object
+adapter/backend implementation remains an actual OPT-2194 prerequisite; neither
+an ignored harness nor this verification issue completes that code or qualification.
