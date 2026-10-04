@@ -1,7 +1,7 @@
 //! Historical original binding and complete shared observation bytes use the same context pool.
 use super::*;
 use crate::sample_sources::db::write::{SOURCE_WAL_BINDING_MAX_BYTES, SourceWalBinding};
-const CAPTURE_BYTES: usize =
+pub(super) const CAPTURE_BYTES: usize =
     3 * SOURCE_WAL_BINDING_MAX_BYTES + std::mem::size_of::<SourceWalBinding>() + 512;
 const REPORT_BYTES: usize = std::mem::size_of::<Report>() + 64;
 

@@ -28,6 +28,9 @@ impl RequestPolicy {
 }
 
 pub(super) enum Native {
+    // Credits unavailable before any preparation: retain the unchanged original owner/input.
+    // This variant has no empty-reservation retirement authority.
+    Unprepared(SourceWriter, Option<RequestPolicy>),
     Held(SourceWalPreparation),
     Failed(SourceWalPreparationFailure),
     HeldTag(SourceTagWalPreparation),
@@ -91,6 +94,7 @@ impl Native {
     }
     pub(super) fn database_identity(&self) -> Option<&str> {
         match self {
+            Self::Unprepared(_, _) => None,
             Self::Held(held) => Some(held.revision().database_identity()),
             Self::HeldTag(held) => Some(held.revision().database_identity()),
             Self::HeldLayout(held) => Some(held.revision().database_identity()),
@@ -101,6 +105,14 @@ impl Native {
     }
     pub(super) fn into_writer(self) -> Result<SourceWriter, Self> {
         match self {
+            Self::Unprepared(writer, policy) => {
+                if !writer.lease_transport_unprepared_is_reusable() {
+                    return Err(Self::Unprepared(writer, policy));
+                }
+                // Actual policy/selection backing drops before owner slot credit is refunded.
+                drop(policy);
+                Ok(writer)
+            }
             Self::Held(held) => held.abort().map_err(Self::Failed),
             Self::Failed(failed) => failed.into_writer().map_err(Self::Failed),
             Self::HeldTag(held) => held.abort().map_err(Self::FailedTag),

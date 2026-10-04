@@ -83,18 +83,29 @@ impl SourceWriter {
     ) -> Result<(), SourceWriterError> {
         let _extensions = crate::sqlite_ext::try_extension_free_metadata_scope()
             .ok_or(SourceWriterError::MetadataBoundNotDefined)?;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = observation
+            .deadline()
+            .min(Instant::now() + Duration::from_secs(2));
         observation.validate_live_origin()?;
         self.validate_tag_metadata_budget(&observation.budget)?;
-        let selected = &observation.selection;
-        let current = self.capture_tag_admission_observation(
-            selected.revision(),
-            selected.old_identity(),
-            selected.mutation().clone(),
-        )?;
-        if current.selection != *selected
-            || current.directory_generation != observation.directory_generation
+        let before = self.current_revision()?;
+        if &before != observation.selection.revision() {
+            return Err(SourceWriterError::StaleFence);
+        }
         {
+            let _progress = SnapshotProgressGuard::install(&self.database.connection, deadline);
+            let tx = self
+                .database
+                .connection
+                .unchecked_transaction()
+                .map_err(map_sql_error)?;
+            if self.database.get_revision()? != before.revision() {
+                return Err(SourceWriterError::StaleFence);
+            }
+            self.validate_tag_scope_in_connection(observation, &before, deadline)?;
+            tx.commit().map_err(map_sql_error)?;
+        }
+        if self.current_revision()? != before {
             return Err(SourceWriterError::StaleFence);
         }
         self.validate_tag_metadata_budget(&observation.budget)?;
@@ -126,15 +137,9 @@ impl SourceWriter {
         self.validate_tag_metadata_facts(&observation.budget, deadline)?;
         let _progress = SnapshotProgressGuard::install(&self.database.connection, deadline);
         let selected = &observation.selection;
-        let current = tag_assignment_selection::capture(
-            &self.database.connection,
-            revision.clone(),
-            selected.old_identity(),
-            selected.mutation().clone(),
-        )?;
-        if current != *selected
-            || active_generation(&self.database.connection, revision.revision())?
-                != observation.directory_generation
+        tag_assignment_selection::validate_current(&self.database.connection, selected)?;
+        if active_generation(&self.database.connection, revision.revision())?
+            != observation.directory_generation
         {
             return Err(SourceWriterError::StaleFence);
         }
