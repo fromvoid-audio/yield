@@ -379,3 +379,7 @@ pub use binding_capture::SourceLeaseMaintenanceBinding;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod workload_tests;

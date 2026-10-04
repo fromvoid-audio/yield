@@ -537,3 +537,15 @@ OPT-2136/2195/2202 admission, post-latch custody and required-commit requirement
 remain open. An entered logical restriction, a copied scope or fixture cannot
 issue a permit, reserve/refund capacity, settle a decision or qualify physical
 allocation.
+
+## Actual full-limit SQLite workload evidence (OPT-2254)
+
+[Owned lifecycle workload evidence](LIFECYCLE_ALLOCATION_WORKLOADS.md) records
+32 bounded actual SQLite/VFS child cases over full SQL row/blob/key limits,
+three page sizes, lower original pager caps, near-cap pre-audit source storage,
+separate same-volume identities, actual FULL refusal and irreversible-budget
+mmap restoration failure. Each measured effect uses one original reservation and
+one fresh owned connection restriction; fixtures issue no authenticated lifecycle
+receipt, lease-release witness, admission permit or settlement. Logical evidence
+leaves OPT-2194's qualified physical policy and exact direction claim requirements,
+production required consumers and native verification OPEN.
