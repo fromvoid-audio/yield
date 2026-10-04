@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 use super::*;
 use crate::app_dirs::{AppRootGuard, WritableProfileGuard};
 use std::{fs, time::Duration};

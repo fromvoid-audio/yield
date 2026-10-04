@@ -3,6 +3,9 @@ use super::*;
 use crate::sample_sources::db::BoundDatabaseRoot;
 use std::{path::Path, time::Instant};
 
+#[cfg(any(target_os = "macos", test))]
+mod darwin;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WalObjectFacts {
     pub(crate) identity: String,
@@ -27,12 +30,12 @@ impl OwnedConnection {
         name: &Path,
         deadline: Instant,
     ) -> Option<WalObjects> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (root, name, deadline);
             None
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::{ffi::OsString, os::unix::fs::MetadataExt};
             if Instant::now() >= deadline
@@ -48,7 +51,10 @@ impl OwnedConnection {
             let registration = self.registration.as_ref()?;
             // SAFETY: the adapter has process lifetime; this private registration owns the
             // forwarding VFS and every file callback for the borrowed live connection.
+            #[cfg(target_os = "linux")]
             let native = unsafe { ffi::sqlite3_vfs_find(c"yield-linux-retained-root-v1".as_ptr()) };
+            #[cfg(target_os = "macos")]
+            let native = unsafe { ffi::sqlite3_vfs_find(c"unix".as_ptr()) };
             if native.is_null() || registration.context.native != native {
                 return None;
             }
@@ -80,22 +86,25 @@ impl OwnedConnection {
                 return None;
             }
             let shm_metadata = shm.metadata().ok()?;
-            if !mapped_identity(mapping, shm_metadata.dev(), shm_metadata.ino(), deadline)?
-                || !native_identity(
-                    self,
-                    &registration.context,
-                    ffi::SQLITE_FCNTL_FILE_POINTER,
-                    0,
-                    &main,
-                )
-                || !native_identity(
-                    self,
-                    &registration.context,
-                    ffi::SQLITE_FCNTL_JOURNAL_POINTER,
-                    1,
-                    &wal,
-                )
-            {
+            if !mapped_identity(
+                mapping,
+                shm_metadata.dev(),
+                shm_metadata.ino(),
+                shm_metadata.len(),
+                deadline,
+            )? || !native_identity(
+                self,
+                &registration.context,
+                ffi::SQLITE_FCNTL_FILE_POINTER,
+                0,
+                &main,
+            ) || !native_identity(
+                self,
+                &registration.context,
+                ffi::SQLITE_FCNTL_JOURNAL_POINTER,
+                1,
+                &wal,
+            ) {
                 return None;
             }
             // Reopen all three current direct children and compare while original handles stay
@@ -112,7 +121,7 @@ impl OwnedConnection {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn facts(file: &std::fs::File) -> Option<WalObjectFacts> {
     let metadata = file.metadata().ok()?;
     if !metadata.is_file() {
@@ -133,7 +142,7 @@ fn facts(file: &std::fs::File) -> Option<WalObjectFacts> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn native_identity(
     connection: &Connection,
     context: &Context,
@@ -175,9 +184,26 @@ fn native_identity(
 }
 
 #[cfg(target_os = "linux")]
-fn mapped_identity(address: usize, device: u64, inode: u64, deadline: Instant) -> Option<bool> {
+fn mapped_identity(
+    address: usize,
+    device: u64,
+    inode: u64,
+    _bytes: u64,
+    deadline: Instant,
+) -> Option<bool> {
     let file = std::fs::File::open("/proc/self/maps").ok()?;
     mapped_identity_stream(file, address, device, inode, deadline)
+}
+
+#[cfg(target_os = "macos")]
+fn mapped_identity(
+    address: usize,
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    deadline: Instant,
+) -> Option<bool> {
+    darwin::mapped_identity(address, device, inode, bytes, deadline)
 }
 
 // Read the complete bounded kernel stream, including after a match, to reject duplicate
