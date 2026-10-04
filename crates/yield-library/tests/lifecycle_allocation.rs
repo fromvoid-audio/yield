@@ -288,3 +288,118 @@ fn actual_global_unknown_schema_capture_rolls_back_empty_reservation_and_retains
         .unwrap();
     assert!(writer.shutdown());
 }
+
+#[test]
+fn actual_global_lifecycle_policy_keeps_original_scope_until_abort_and_preserves_capped_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let _root = AppRootGuard::set(temp.path().join("profile")).unwrap();
+    let profile = WritableProfileGuard::acquire_current().unwrap();
+    let mut writer = global(&profile);
+    let before = writer
+        .submit_preparation(request(&writer))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let facts = before.observation().lifecycle_allocation().unwrap().clone();
+    assert!(!before.observation().lifecycle_policy_was_entered());
+    before
+        .abort()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let held = writer
+        .submit_preparation(request(&writer).with_lifecycle_policy())
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let observation = held.observation().clone();
+    assert!(observation.lifecycle_policy_was_entered());
+    assert_eq!(observation.lifecycle_allocation(), Some(&facts));
+    assert_eq!(
+        observation.wal_scope().unwrap().main().identity(),
+        facts.main().identity()
+    );
+    let other = Connection::open(profile.profile_root().join(LIBRARY_DB_FILE_NAME)).unwrap();
+    other.busy_timeout(Duration::ZERO).unwrap();
+    assert_eq!(
+        other
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap_err()
+            .sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy)
+    );
+    held.abort()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let after = writer
+        .submit_preparation(request(&writer))
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.observation().lifecycle_allocation(), Some(&facts));
+    assert!(!after.observation().lifecycle_policy_was_entered());
+    after
+        .abort()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    assert!(writer.shutdown());
+    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    assert!(
+        observation.lifecycle_policy_was_entered(),
+        "copied diagnostic stays historical after cleanup"
+    );
+}
+
+#[test]
+fn actual_global_lifecycle_policy_native_sidecar_replacement_denies_reuse() {
+    let temp = tempfile::tempdir().unwrap();
+    let _root = AppRootGuard::set(temp.path().join("profile")).unwrap();
+    let profile = WritableProfileGuard::acquire_current().unwrap();
+    let mut writer = global(&profile);
+    let held = writer
+        .submit_preparation(request(&writer).with_lifecycle_policy())
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let wal = profile
+        .profile_root()
+        .join(format!("{LIBRARY_DB_FILE_NAME}-wal"));
+    let original = wal.with_extension("held-policy-wal");
+    fs::rename(&wal, &original).unwrap();
+    fs::copy(&original, &wal).unwrap();
+    assert_eq!(
+        fs::metadata(&wal).unwrap().len(),
+        fs::metadata(&original).unwrap().len()
+    );
+    let queued = writer
+        .replace_ui_preferences_payload("must-not-dispatch".into())
+        .unwrap();
+    assert_eq!(
+        held.abort().recv_timeout(Duration::from_secs(3)).unwrap(),
+        Err(GlobalPreparationError::DatabaseBinding)
+    );
+    assert!(
+        queued
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .is_err()
+    );
+    writer.shutdown_with_report();
+    if wal.exists() {
+        fs::remove_file(&wal).unwrap();
+    }
+    fs::rename(&original, &wal).unwrap();
+    assert_eq!(
+        count(
+            &read(&profile.profile_root().join(LIBRARY_DB_FILE_NAME)),
+            "source_lifecycle_reference_receipts"
+        ),
+        0
+    );
+}

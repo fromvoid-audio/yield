@@ -479,3 +479,61 @@ actual admitted lifecycle bridge is implemented. No storage API issues an attemp
 permit, authorizes retry, refunds claims, supplies settlement or produces release
 or sealed-close acknowledgements. OPT-2194 physical/exact family allocation,
 OPT-2136, OPT-2168/2169, OPT-2195/2196 and OPT-2202 remain open.
+
+## Original global lifecycle policy (OPT-2253)
+
+`GlobalPreparationRequest::with_lifecycle_policy` selects a distinct pre-intent
+restriction on the existing global worker. The diagnostic-only and allocation
+observation routes retain their original behavior. Policy selection first reads
+known compiled schema/runtime, bounded retained relation/receipt counts, pager
+configuration and actual native MAIN/WAL/mapped-SHM objects on the original
+connection. This passive input is not writer exclusion; the worker must compare
+it again after its sole nonblocking `BEGIN IMMEDIATE`.
+
+A private guard owns the original settings and extension exclusion. Before BEGIN
+it installs the selected maximum pages (at most 512 MiB, respecting a lower
+original cap), memory-only temporary storage, disabled cache spilling, disabled
+automatic checkpoint and disabled database mmap. The worker validates exact
+original allocation facts after acquiring the writer lock. It also captures the
+compatible strict native scope, using the existing 16-KiB shared handoff credit
+and 64-KiB local pool. While parked, bounded configuration pragmas revalidate the
+selected settings; no ordinary row query, mutation, checkpoint, renewal or queued
+dispatch runs. Queue wait, policy work and acquisition share the original
+cooperative two-second deadline.
+
+Cancellation and expiry may win before the next native poll. Strict-scope cleanup
+therefore performs a final original root/MAIN/native scope check while still held
+before deciding reuse. Its bounded cleanup inspection does not extend preparation
+or publish a new grant. Failed binding retires the connection after rollback;
+accepted queued writes cannot dispatch against a substituted sidecar. The original
+diagnostic-only route retains its existing profile-loss rejection behavior.
+
+The worker acknowledges release only after confirmed empty rollback, autocommit
+quiescence and exact restoration of all original pager/temp/spill/checkpoint/mmap
+settings. Partial installation and busy acquisition take the same restoration
+path. Lost delivery, cancellation, expiry and shutdown keep the actual native
+connection borrowed until cleanup. Unwind uses the same guard to attempt empty
+rollback and restoration. Unconfirmed rollback or restoration makes the
+connection query-only as defense in depth and the worker retires it before any
+ordinary dispatch; failed cleanup never acknowledges reuse. Cleanup has its own
+bounded inspection allowance after an expired preparation, without renewing that
+preparation. Normal shutdown still drains already accepted ordinary work after
+successful reservation cleanup.
+
+`lifecycle_policy_was_entered` is historical observation only. A copied reply can
+outlive rollback and shutdown; it cannot preserve native custody, reenter the
+policy, grant SQL or supply qualified physical capacity. Genuine file-backed
+tests cover all five installation/restoration denial boundaries, lower caps,
+nondefault exact restoration, rollback denial, stale original WAL facts, unknown
+schema/active transactions, unwind, actual worker busy/lost delivery/lifecycle
+cleanup and write exclusion. A deterministic parked-settings barrier proves
+that cancellation winning the next poll still refuses native sidecar reuse.
+Normal-build tests exercise the actual worker and same-size WAL replacement.
+
+This supplies neither a production lifecycle transition nor source lease release.
+Full OPT-2194 remains open for SQLite/VFS workload evidence and exact direction
+allocation requirements with separate native physical qualification. All original
+OPT-2136/2195/2202 admission, post-latch custody and required-commit requirements
+remain open. An entered logical restriction, a copied scope or fixture cannot
+issue a permit, reserve/refund capacity, settle a decision or qualify physical
+allocation.
