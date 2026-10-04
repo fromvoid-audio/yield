@@ -34,12 +34,12 @@ pub use source_writer::{
     SourceLayoutComputedView, SourceLayoutFeature, SourceLayoutGeneration,
     SourceLayoutGenerationError, SourceLayoutGenerationRow, SourceLayoutMetadataBudget,
     SourceLayoutMetadataPolicy, SourceLayoutWalPreparation, SourceLayoutWalPreparationFailure,
-    SourcePreparedLayoutGeneration, SourceRevision, SourceScanFence, SourceSnapshotOwner,
-    SourceSnapshotPage, SourceSnapshotQueueMetrics, SourceTagAdmissionObservation,
-    SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceTagWalPreparation,
-    SourceTagWalPreparationFailure, SourceWalPreparation, SourceWalPreparationError,
-    SourceWalPreparationFailure, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
-    SourceWriterReceipt, SourceWriterRequest,
+    SourceLeaseMaintenanceAllocation, SourcePreparedLayoutGeneration, SourceRevision,
+    SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage, SourceSnapshotQueueMetrics,
+    SourceTagAdmissionObservation, SourceTagMetadataBudget, SourceTagMetadataPolicy,
+    SourceTagWalPreparation, SourceTagWalPreparationFailure, SourceWalPreparation,
+    SourceWalPreparationError, SourceWalPreparationFailure, SourceWriter,
+    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};
 pub use transaction::{

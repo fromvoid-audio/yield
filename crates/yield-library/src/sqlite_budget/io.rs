@@ -329,6 +329,9 @@ unsafe extern "C" fn shm_map(
         if rc == ffi::SQLITE_OK && !(*output).is_null() {
             if let Ok(mut s) = ctx.state.lock() {
                 s.mapped_shm_bytes = s.mapped_shm_bytes.max(end);
+                if page == 0 && size == 32768 {
+                    s.mapped_shm_region_zero = Some(*output as usize);
+                }
             }
         }
         ctx.native_result(rc)
@@ -343,6 +346,7 @@ unsafe extern "C" fn shm_unmap(f: *mut ffi::sqlite3_file, delete: c_int) -> c_in
         if rc == ffi::SQLITE_OK {
             if let Ok(mut s) = ctx.state.lock() {
                 s.mapped_shm_bytes = 0;
+                s.mapped_shm_region_zero = None;
             }
         }
         ctx.native_result(rc)
@@ -754,3 +758,49 @@ static V3: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
     xFetch: Some(fetch),
     xUnfetch: Some(unfetch),
 };
+
+/// Borrow the actual Unix descriptor only from this exact wrapper and locked bundled layout.
+/// sqlite3.c 3.50.2 unixFile begins with these four fields before any conditional fields.
+#[cfg(target_os = "linux")]
+pub(super) unsafe fn known_unix_descriptor(
+    file: *mut ffi::sqlite3_file,
+    ctx: &Context,
+    expected_role: usize,
+) -> Option<c_int> {
+    #[repr(C)]
+    struct UnixPrefix {
+        methods: *const ffi::sqlite3_io_methods,
+        vfs: *mut ffi::sqlite3_vfs,
+        inode: *mut c_void,
+        descriptor: c_int,
+    }
+    // SAFETY: the caller borrows the live SQLite owner. Check the wrapper method identity
+    // before interpreting our own header. Its validated context/role proves native parentage.
+    unsafe {
+        let wrapper = file.as_ref()?;
+        if ![&V1 as *const _, &V2 as *const _, &V3 as *const _].contains(&wrapper.pMethods) {
+            return None;
+        }
+        let h = header(file);
+        if !ptr::eq(h.context, ctx) || h.role != expected_role {
+            return None;
+        }
+        if rusqlite::version_number() != 3_050_002
+            || CStr::from_ptr(ffi::sqlite3_sourceid()).to_bytes()
+                != b"2025-06-28 14:00:48 2af157d77fb1304a74176eaee7fbc7c7e932d946bf25325e9c26c91db19e3079"
+            || (*ctx.native).szOsFile < std::mem::size_of::<UnixPrefix>() as c_int {
+            return None;
+        }
+        let expected = ffi::sqlite3_vfs_find(c"yield-linux-retained-root-v1".as_ptr());
+        if expected.is_null() || ctx.native != expected {
+            return None;
+        }
+        // Exact adapter delegates xOpen unchanged to the pinned bundled Unix VFS. No
+        // conditional field precedes descriptor; alignment is the wrapper's native alignment.
+        let native = &*inner(file).cast::<UnixPrefix>();
+        if native.vfs != ctx.native || native.methods.is_null() || native.descriptor < 0 {
+            return None;
+        }
+        Some(native.descriptor)
+    }
+}

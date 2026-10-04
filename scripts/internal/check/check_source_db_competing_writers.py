@@ -52,6 +52,8 @@ RAW_EXCEPTIONS = {
     ("crates/yield-library/src/sample_sources/db/open/read_only.rs", "open_read_only_source_database", "open_with_flags"): 1,
     ("crates/yield-library/src/sample_sources/db/schema/mod.rs", "current_table_shape", "open_in_memory"): 1,
     ("crates/yield-library/src/sample_sources/library/connection.rs", "open_at", "open"): 1,
+    # Compiled-only whole-global schema/runtime reference; no filesystem/owner/pragmas.
+    ("crates/yield-library/src/sample_sources/library/connection.rs", "compiled_schema_reference", "open_in_memory"): 1,
     ("crates/yield-library/src/sample_sources/library/read_only.rs", "observe_source_registry", "open_with_flags"): 1,
 }
 
@@ -176,6 +178,8 @@ def inventory_label(call: Call) -> str:
     if call.path.endswith("/operation_journal/store.rs"):
         return "operation-journal"
     if call.path.endswith("/library/connection.rs"):
+        if call.function == "compiled_schema_reference" and call.opener == "open_in_memory":
+            return "in-memory-schema-probe"
         return "global-library"
     if call.path.endswith("/open/read_only.rs") or call.path.endswith(
         "/library/read_only.rs"

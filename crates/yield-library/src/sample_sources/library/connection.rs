@@ -81,17 +81,34 @@ impl LibraryDatabase {
         };
         db.install_source_lifecycle_schema()?;
         db.apply_pragmas()?;
-        db.apply_schema()?;
-        db.migrate_source_roles()?;
-        db.migrate_analysis_jobs_content_hash()?;
-        db.migrate_samples_analysis_metadata()?;
-        db.migrate_features_table()?;
-        db.migrate_layout_umap_table()?;
-        db.migrate_hdbscan_clusters_table()?;
-        db.migrate_embeddings_table()?;
-        db.migrate_ann_index_meta_table()?;
-        db.migrate_harvest_tables()?;
+        db.initialize_schema()?;
         Ok(db)
+    }
+
+    fn initialize_schema(&mut self) -> Result<(), LibraryError> {
+        self.apply_schema()?;
+        self.migrate_source_roles()?;
+        self.migrate_analysis_jobs_content_hash()?;
+        self.migrate_samples_analysis_metadata()?;
+        self.migrate_features_table()?;
+        self.migrate_layout_umap_table()?;
+        self.migrate_hdbscan_clusters_table()?;
+        self.migrate_embeddings_table()?;
+        self.migrate_ann_index_meta_table()?;
+        self.migrate_harvest_tables()?;
+        Ok(())
+    }
+
+    // Compiled empty schema/runtime reference only. No file, pragmas, extensions or owner.
+    pub(super) fn compiled_schema_reference() -> Result<Self, LibraryError> {
+        let mut database = Self {
+            connection: Connection::open_in_memory()?.into(),
+            ordinary_wal_maintenance: Default::default(),
+            _database_root_binding: None,
+        };
+        database.install_source_lifecycle_schema()?;
+        database.initialize_schema()?;
+        Ok(database)
     }
 
     pub(super) fn validate_profile_guard(

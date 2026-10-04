@@ -18,6 +18,8 @@ mod env_flags;
 pub mod file_operation_owner;
 /// Stable cross-platform filesystem-object identity helpers.
 pub mod filesystem_identity;
+/// Bounded lifecycle storage observations; never physical allocation or admission grants.
+pub mod lifecycle_allocation;
 /// Storage-neutral profile operation identities, intents, phases, and dispositions.
 pub mod operation_journal;
 /// Sample-source identifiers and persistent storage helpers.
