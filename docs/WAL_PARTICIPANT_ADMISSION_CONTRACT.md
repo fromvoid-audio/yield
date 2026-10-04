@@ -306,3 +306,46 @@ decision and atomic durable nonce, and cleanup fencing after settlement can
 commit. Pre-intent timeout/drop/shutdown behavior here does not implement that
 post-settlement retention requirement. Native physical qualification and the
 unsupported retained-object adapters remain separate.
+
+## Bounded original global scope handoff (OPT-2251)
+
+`GlobalPreparationRequest::with_wal_binding` selects exact original native scope
+on the existing global worker. Inside its original empty immediate transaction,
+the worker captures the forwarding-VFS MAIN and WAL objects and SQLite's mapped
+SHM object. Distinct identities, a common native device/allocation unit and exact
+observed lengths are required. The version-1 historical descriptor additionally
+binds the actual profile acquisition, worker registration, command digest,
+preparation nonce and checked mutation revision; encoding stops at 4 KiB. It is
+not the durable journal inventory or a capacity claim. It can additionally carry
+existing bounded lifecycle allocation observations from the same held transaction;
+all three objects must match that capture exactly. The existing lifecycle and
+diagnostic-only routes remain available.
+
+All observation clones now share complete immutable data. Each strict request
+reserves a conservative 16-KiB local handoff credit before queue retention,
+covering its finite capture/encoding staging, retained identity/descriptor data
+and queue/reply headers. The owner's aggregate strict handoff pool is 64 KiB;
+four retained strict handoffs exhaust it even after their empty transactions
+have rolled back. A worker and every delivered historical view share the credit;
+only the last holder releases it, including after shutdown. Input/schema/native
+inspection scratch remains subject to its independently bounded original
+observation limits. A future coordinator must still account the complete
+source-plus-global handshake; these local credits are not that proof.
+
+While parked, the original worker revalidates all three native objects without
+ordinary SQL or a changed deadline. Missing or same-size substituted sidecars
+refuse and retire the connection after original rollback rather than dispatching
+queued writes against a changed binding. Unknown native adapters fail closed;
+capture currently supports the Linux retained-root adapter. Real worker tests
+exercise external and queued write exclusion, native substitutions/missing
+objects, original expiry, shared view exhaustion and shutdown. The strict capture
+also runs under a real SQLite authorizer that denies row reads, mutations and
+checkpoint SQL, preserving the exact original busy timeout.
+
+This remains pre-intent custody and historical scope only. Existing drop,
+cancellation, expiry and shutdown abort behavior cannot acknowledge a decision.
+OPT-2136 must implement complete family-derived inventory, current genuine
+registrations, exact direction allocations, sealed all-owner acknowledgements,
+atomic intent/claims/nonce settlement and unresolved lock retention. Neither a
+shared view nor its encoded bytes can supply those authorities or physical
+qualification. All original parent acceptance stays open.

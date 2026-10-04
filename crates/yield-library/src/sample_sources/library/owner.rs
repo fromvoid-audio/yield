@@ -54,7 +54,7 @@ pub use preparation::{
     GLOBAL_PREPARATION_MAX_BYTES, GLOBAL_PREPARATION_MAX_DATABASES,
     GLOBAL_PREPARATION_MAX_DURATION, GlobalPreparationError, GlobalPreparationObservation,
     GlobalPreparationOwner, GlobalPreparationPending, GlobalPreparationRequest,
-    GlobalPreparationReservation,
+    GlobalPreparationReservation, GlobalWalObjectObservation, GlobalWalScope,
 };
 
 mod shutdown;
@@ -665,6 +665,7 @@ struct OwnerHooks {
 /// remains on one owner thread for the handle's lifetime and is never exposed to callers.
 pub struct GlobalLibraryWriter {
     preparation_owner: GlobalPreparationOwner,
+    preparation_binding_budget: Arc<preparation::binding::Budget>,
     acquisition: ProfileAcquisitionId,
     commands: Arc<Mutex<Option<SyncSender<QueuedCommand>>>>,
     admission_gate: Arc<Mutex<()>>,
@@ -809,6 +810,7 @@ impl GlobalLibraryWriter {
 
         Ok(Self {
             preparation_owner,
+            preparation_binding_budget: Arc::default(),
             acquisition: ProfileAcquisitionId::from_guard(profile_guard),
             commands: Arc::clone(&commands),
             admission_gate,
@@ -897,6 +899,7 @@ impl GlobalLibraryWriter {
             mpsc::sync_channel(GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY);
         Self {
             preparation_owner: GlobalPreparationOwner::new(ProfileAcquisitionId::test_only()),
+            preparation_binding_budget: Arc::default(),
             acquisition: ProfileAcquisitionId::test_only(),
             commands: Arc::new(Mutex::new(Some(commands))),
             admission_gate: Arc::new(Mutex::new(())),

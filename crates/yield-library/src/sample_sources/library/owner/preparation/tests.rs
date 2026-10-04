@@ -4,7 +4,9 @@ use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
 use crate::test_runtime::TestRuntimeGuard;
 use rusqlite::{Connection, OpenFlags};
 
-fn fixture(test: impl FnOnce(&mut GlobalLibraryWriter, &WritableProfileGuard, &tempfile::TempDir)) {
+pub(super) fn fixture(
+    test: impl FnOnce(&mut GlobalLibraryWriter, &WritableProfileGuard, &tempfile::TempDir),
+) {
     let _runtime = TestRuntimeGuard::acquire();
     let temp = tempfile::tempdir().unwrap();
     let _base = ConfigBaseGuard::set(std::fs::canonicalize(temp.path()).unwrap());
@@ -18,7 +20,10 @@ fn fixture(test: impl FnOnce(&mut GlobalLibraryWriter, &WritableProfileGuard, &t
     }
     test(&mut writer, &guard, &temp);
 }
-fn request(writer: &GlobalLibraryWriter, duration: Duration) -> GlobalPreparationRequest {
+pub(super) fn request(
+    writer: &GlobalLibraryWriter,
+    duration: Duration,
+) -> GlobalPreparationRequest {
     GlobalPreparationRequest::new(
         writer.preparation_owner(),
         [7; 32],
@@ -36,7 +41,7 @@ fn reserve(writer: &GlobalLibraryWriter, duration: Duration) -> GlobalPreparatio
         .unwrap()
         .unwrap()
 }
-fn external(guard: &WritableProfileGuard) -> Connection {
+pub(super) fn external(guard: &WritableProfileGuard) -> Connection {
     let connection = Connection::open(
         guard
             .profile_root()
@@ -46,14 +51,14 @@ fn external(guard: &WritableProfileGuard) -> Connection {
     connection.busy_timeout(Duration::ZERO).unwrap();
     connection
 }
-fn release(reservation: GlobalPreparationReservation) {
+pub(super) fn release(reservation: GlobalPreparationReservation) {
     reservation
         .abort()
         .recv_timeout(Duration::from_secs(3))
         .unwrap()
         .unwrap();
 }
-fn empty(writer: &GlobalLibraryWriter) {
+pub(super) fn empty(writer: &GlobalLibraryWriter) {
     assert_eq!(
         writer
             .load_ui_preferences_payload()
@@ -394,6 +399,7 @@ fn preparation_retained_unknown_mode_and_rollback_denial_require_no_fake_complet
             request: request(writer, Duration::from_secs(1)),
             canceled: Arc::new(AtomicBool::new(false)),
             ready,
+            binding_credit: None,
         };
         let lifecycle = std::sync::atomic::AtomicU8::new(WriterLifecycle::Available as u8);
         assert!(run(
@@ -438,6 +444,7 @@ fn preparation_retained_unknown_mode_and_rollback_denial_require_no_fake_complet
             request: request(writer, Duration::from_secs(1)),
             canceled: Arc::new(AtomicBool::new(false)),
             ready,
+            binding_credit: None,
         };
         let client = std::thread::spawn(move || {
             receiver
@@ -602,6 +609,7 @@ fn preparation_one_actual_begin_and_timeout_restore_with_no_row_or_checkpoint_sq
             request: request(writer, Duration::from_secs(1)),
             canceled: Arc::new(AtomicBool::new(false)),
             ready,
+            binding_credit: None,
         };
         let lifecycle = std::sync::atomic::AtomicU8::new(WriterLifecycle::Available as u8);
         assert!(run(
@@ -628,19 +636,25 @@ fn preparation_one_actual_begin_and_timeout_restore_with_no_row_or_checkpoint_sq
         );
         external.execute_batch("ROLLBACK").unwrap();
         let (ready, receiver) = mpsc::sync_channel(1);
+        let strict = cfg!(target_os = "linux");
+        let request = request(writer, Duration::from_secs(1));
         let command = Command {
-            request: request(writer, Duration::from_secs(1)),
+            request: if strict {
+                request.with_wal_binding()
+            } else {
+                request
+            },
             canceled: Arc::new(AtomicBool::new(false)),
             ready,
+            binding_credit: strict.then(|| writer.preparation_binding_budget.reserve().unwrap()),
         };
         let client = std::thread::spawn(move || {
-            receiver
+            let held = receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap()
-                .unwrap()
-                .abort()
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap()
+                .unwrap();
+            assert_eq!(held.observation().wal_scope().is_some(), strict);
+            held.abort().recv_timeout(Duration::from_secs(1)).unwrap()
         });
         assert!(run(
             command,
