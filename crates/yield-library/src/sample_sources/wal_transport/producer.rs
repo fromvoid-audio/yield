@@ -32,7 +32,7 @@ pub(super) fn acquire(
 ) -> SourceWalTransportOwner {
     let mut request = command.request.take().expect("original source command");
     let expected = request.expected.as_ref().expect("pending revision");
-    let mut staging = ByteCredit::new(&command.shared);
+    let mut staging = ByteCredit::in_handshake(&command.shared, request.handshake.as_ref());
     // Full current owner/schema/native validation shares the original bounded capture pool.
     // Reserve its conservative staging BEFORE native preparation executes or allocates.
     let staging_rejection = staging.resize(scope::CAPTURE_BYTES).err();
@@ -116,12 +116,16 @@ impl SourceWalTransportOwner {
             .as_ref()
             .ok_or(SourceWalTransportRejection::OwnerLost)?;
         let held = native.held().map_err(|e| classify(&e))?;
+        let mut staging = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
+        staging.resize(scope::PARKED_BYTES)?;
         held.revalidate_owner().map_err(|e| classify(&e))?;
+        drop(staging);
         if self.request.require_binding {
             self.scope = Some(scope::capture_scope(
                 &self.shared,
                 held,
                 registration.ok_or(SourceWalTransportRejection::Scope)?,
+                self.request.handshake.as_ref(),
             )?);
         }
         // Charge complete immutable view before moving the original expected revision into it.
@@ -141,7 +145,7 @@ impl SourceWalTransportOwner {
         .and_then(|n| n.checked_mul(3))
         .and_then(|n| n.checked_add(std::mem::size_of::<ObservationData>() + 128))
         .ok_or(SourceWalTransportRejection::InvalidContext)?;
-        let mut credit = ByteCredit::new(&self.shared);
+        let mut credit = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
         credit.resize(heap)?;
         if Instant::now() >= self.request.deadline {
             return Err(SourceWalTransportRejection::Deadline);
@@ -167,6 +171,8 @@ impl SourceWalTransportOwner {
         &self,
         registration: Option<&SourceAuthorityRegistration>,
     ) -> Result<(), SourceWalTransportRejection> {
+        let mut staging = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
+        staging.resize(scope::PARKED_BYTES)?;
         let native = self
             .native
             .as_ref()

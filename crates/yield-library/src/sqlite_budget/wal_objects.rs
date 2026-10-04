@@ -176,52 +176,123 @@ fn native_identity(
 
 #[cfg(target_os = "linux")]
 fn mapped_identity(address: usize, device: u64, inode: u64, deadline: Instant) -> Option<bool> {
-    use std::io::Read;
-    const MAX_MAP_BYTES: u64 = 2 * 1024 * 1024;
-    let mut bytes = Vec::new();
-    // Kernel observation only. Bounded whole read; never interpret a displayed pathname as
-    // object identity and never open the mapping's target or inspect arbitrary process memory.
-    std::fs::File::open("/proc/self/maps")
-        .ok()?
-        .take(MAX_MAP_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_MAP_BYTES || Instant::now() >= deadline {
-        return None;
-    }
-    let maps = std::str::from_utf8(&bytes).ok()?;
+    let file = std::fs::File::open("/proc/self/maps").ok()?;
+    mapped_identity_stream(file, address, device, inode, deadline)
+}
+
+// Read the complete bounded kernel stream, including after a match, to reject duplicate
+// mappings and oversized observations. Only the first five fields carry identity; a pathname
+// is never authority. Fixed backing also bounds pathological long pathname lines.
+#[cfg(target_os = "linux")]
+fn mapped_identity_stream(
+    mut reader: impl std::io::Read,
+    address: usize,
+    device: u64,
+    inode: u64,
+    deadline: Instant,
+) -> Option<bool> {
+    const MAX_MAP_BYTES: usize = 2 * 1024 * 1024;
+    let mut chunk = [0u8; 512];
+    let mut prefix = [0u8; 256];
+    let mut len = 0usize;
+    let mut truncated = false;
+    let mut total = 0usize;
     let mut found = false;
-    for line in maps.lines() {
+    loop {
         if Instant::now() >= deadline {
             return None;
         }
-        let mut fields = line.split_ascii_whitespace();
-        let range = fields.next()?;
-        let permissions = fields.next()?;
-        let offset = u64::from_str_radix(fields.next()?, 16).ok()?;
-        let (major, minor) = fields.next()?.split_once(':')?;
-        let mapped_inode: u64 = fields.next()?.parse().ok()?;
-        let (start, end) = range.split_once('-')?;
-        let start = usize::from_str_radix(start, 16).ok()?;
-        let end = usize::from_str_radix(end, 16).ok()?;
-        if !(start..end).contains(&address) {
-            continue;
-        }
-        if found
-            || permissions != "rw-s"
-            || address.checked_add(32768)? > end
-            || offset.checked_add(u64::try_from(address.checked_sub(start)?).ok()?)? != 0
-        {
+        let n = match reader.read(&mut chunk) {
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        total = total.checked_add(n)?;
+        if total > MAX_MAP_BYTES {
             return None;
         }
-        let major = u32::from_str_radix(major, 16).ok()?;
-        let minor = u32::from_str_radix(minor, 16).ok()?;
-        if libc::makedev(major, minor) as u64 != device || mapped_inode != inode {
-            return Some(false);
+        if n == 0 {
+            if len != 0 {
+                mapped_identity_line(
+                    &prefix[..len],
+                    truncated,
+                    address,
+                    device,
+                    inode,
+                    &mut found,
+                )?;
+            }
+            return (Instant::now() < deadline).then_some(found);
         }
-        found = true;
+        for &byte in &chunk[..n] {
+            if byte == b'\n' {
+                mapped_identity_line(
+                    &prefix[..len],
+                    truncated,
+                    address,
+                    device,
+                    inode,
+                    &mut found,
+                )?;
+                len = 0;
+                truncated = false;
+            } else if len < prefix.len() {
+                prefix[len] = byte;
+                len += 1;
+            } else {
+                truncated = true;
+            }
+        }
     }
-    Some(found)
+}
+#[cfg(target_os = "linux")]
+fn mapped_identity_line(
+    prefix: &[u8],
+    truncated: bool,
+    address: usize,
+    device: u64,
+    inode: u64,
+    found: &mut bool,
+) -> Option<()> {
+    let mut fields = prefix
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    let range = std::str::from_utf8(fields.next()?).ok()?;
+    let permissions = fields.next()?;
+    let offset = u64::from_str_radix(std::str::from_utf8(fields.next()?).ok()?, 16).ok()?;
+    let (major, minor) = std::str::from_utf8(fields.next()?).ok()?.split_once(':')?;
+    let inode_bytes = fields.next()?;
+    let inode_field = std::str::from_utf8(inode_bytes).ok()?;
+    // A truncated fifth token must not become a different valid inode number.
+    if truncated
+        && std::ptr::eq(
+            inode_field.as_ptr().wrapping_add(inode_field.len()),
+            prefix.as_ptr().wrapping_add(prefix.len()),
+        )
+    {
+        return None;
+    }
+    let mapped_inode: u64 = inode_field.parse().ok()?;
+    let (start, end) = range.split_once('-')?;
+    let start = usize::from_str_radix(start, 16).ok()?;
+    let end = usize::from_str_radix(end, 16).ok()?;
+    if !(start..end).contains(&address) {
+        return Some(());
+    }
+    if *found
+        || permissions != b"rw-s"
+        || address.checked_add(32768)? > end
+        || offset.checked_add(u64::try_from(address.checked_sub(start)?).ok()?)? != 0
+    {
+        return None;
+    }
+    let major = u32::from_str_radix(major, 16).ok()?;
+    let minor = u32::from_str_radix(minor, 16).ok()?;
+    if libc::makedev(major, minor) as u64 != device || mapped_inode != inode {
+        return None;
+    }
+    *found = true;
+    Some(())
 }
 
 #[cfg(test)]

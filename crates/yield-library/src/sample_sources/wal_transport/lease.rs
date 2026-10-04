@@ -58,7 +58,7 @@ impl SourceLeaseWalTransportCommand {
         let mut request = self.0.request.take().expect("original lease command");
         let input = request.lease.take().expect("original lease input");
         // Bound initial scope/native capture temporaries before native preparation allocates.
-        let mut staging = ByteCredit::new(&self.0.shared);
+        let mut staging = ByteCredit::in_handshake(&self.0.shared, request.handshake.as_ref());
         let native = match staging.resize(3 * MAX_SOURCE_LEASE_SCOPE_BYTES + 512) {
             Ok(()) => LeaseNative::acquire(
                 writer,
@@ -94,6 +94,15 @@ impl SourceWalTransport {
         correlation: SourceWalTransportCorrelation,
         deadline: Instant,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
+        self.submit_lease_scoped(input, correlation, deadline, None)
+    }
+    pub(super) fn submit_lease_scoped(
+        &self,
+        input: SourceLeaseMaintenanceAllocation,
+        correlation: SourceWalTransportCorrelation,
+        deadline: Instant,
+        handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
+    ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
         let deadline = deadline.min(input.deadline());
         let now = Instant::now();
         if deadline <= now || deadline.duration_since(now) > MAX_DEADLINE {
@@ -103,7 +112,16 @@ impl SourceWalTransport {
             .retained_input_bytes()
             .and_then(|n| n.checked_add(LEASE_CONTEXT_FIXED_BYTES))
             .ok_or(SourceWalTransportRejection::InvalidContext)?;
-        self.enqueue(None, correlation, deadline, true, None, Some(input), size)
+        self.enqueue(
+            None,
+            correlation,
+            deadline,
+            true,
+            None,
+            Some(input),
+            size,
+            handshake,
+        )
     }
 }
 
@@ -203,8 +221,11 @@ impl SourceLeaseWalTransportOwner {
             .as_ref()
             .ok_or(SourceWalTransportRejection::OwnerLost)?
             .held()?;
+        let mut staging = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
+        staging.resize(scope::PARKED_BYTES)?;
         held.revalidate_owner().map_err(classify)?;
-        let mut credit = ByteCredit::new(&self.shared);
+        drop(staging);
+        let mut credit = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
         credit
             .resize(3 * MAX_SOURCE_LEASE_SCOPE_BYTES + std::mem::size_of::<LeaseReport>() + 512)?;
         let binding = held
@@ -241,6 +262,8 @@ impl SourceLeaseWalTransportOwner {
         &self,
         registration: Option<&SourceAuthorityRegistration>,
     ) -> Result<(), SourceWalTransportRejection> {
+        let mut staging = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
+        staging.resize(scope::PARKED_BYTES)?;
         let held = self
             .native
             .as_ref()
@@ -272,6 +295,16 @@ impl SourceLeaseWalTransportOwner {
     /// Recover only the identical original writer after confirmed rollback and policy restoration.
     pub fn into_writer(mut self) -> Result<SourceWriter, Self> {
         self.request.ticket.set(SourceWalTransportStatus::Aborting);
+        let mut staging = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
+        let bytes = self
+            .native
+            .as_ref()
+            .expect("original lease custody")
+            .cleanup_staging_bytes();
+        if let Err(reason) = staging.resize(bytes) {
+            self.mark_unavailable(reason);
+            return Err(self);
+        }
         match self
             .native
             .take()
@@ -327,6 +360,15 @@ impl Drop for SourceLeaseWalTransportOwner {
     fn drop(&mut self) {
         if !self.resolved {
             self.mark_unavailable(SourceWalTransportRejection::OwnerLost);
+        }
+        if let Some(native) = self.native.take() {
+            let mut staging =
+                ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
+            if staging.resize(native.cleanup_staging_bytes()).is_ok() {
+                drop(native);
+            } else {
+                native.close_without_reuse();
+            }
         }
     }
 }

@@ -10,6 +10,22 @@ pub(super) enum LeaseNative {
     ),
 }
 impl LeaseNative {
+    pub(super) fn cleanup_staging_bytes(&self) -> usize {
+        match self {
+            Self::Unprepared(..) => 0,
+            _ => 3 * MAX_SOURCE_LEASE_SCOPE_BYTES + 512,
+        }
+    }
+    pub(super) fn close_without_reuse(self) {
+        match self {
+            Self::Held(held) => held.close_without_reuse(),
+            Self::Failed(failed) => failed.close_without_reuse(),
+            Self::Unprepared(writer, input, _) => {
+                drop(writer);
+                drop(input);
+            }
+        }
+    }
     pub(super) fn acquire(
         writer: SourceWriter,
         input: SourceLeaseMaintenanceAllocation,

@@ -59,6 +59,7 @@ pub mod source_registry_retirement;
 pub mod status;
 pub mod store;
 pub mod validation;
+pub(crate) mod wal_admission;
 pub mod work_plan;
 pub mod work_progress;
 

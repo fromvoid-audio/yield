@@ -84,6 +84,12 @@ struct Custody {
     timeout_restore_fault: bool,
 }
 impl Custody {
+    fn close_without_reuse(&mut self) {
+        // No full capture or reuse/retirement acknowledgement. The actual connection
+        // closes before its source lease and before the retained extension gate.
+        drop(self.writer.take());
+        drop(self.policy.take());
+    }
     fn writer(&self) -> &SourceWriter {
         self.writer
             .as_ref()
@@ -316,6 +322,9 @@ fn prepare(custody: &mut Custody) -> Result<u64, SourceLeaseMaintenancePreparati
     Ok(wal.observed_bytes())
 }
 impl SourceLeaseMaintenancePreparation {
+    pub(crate) fn close_without_reuse(mut self) {
+        self.custody.close_without_reuse();
+    }
     /// Local opaque identity, not durable acceptance or reservation authority.
     pub fn nonce(&self) -> Uuid {
         self.nonce
@@ -402,6 +411,9 @@ impl SourceLeaseMaintenancePreparation {
     }
 }
 impl SourceLeaseMaintenancePreparationFailure {
+    pub(crate) fn close_without_reuse(mut self) {
+        self.custody.close_without_reuse();
+    }
     pub(crate) fn retained_database_identity(&self) -> Option<&str> {
         self.custody
             .writer()

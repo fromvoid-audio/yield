@@ -6,6 +6,11 @@
 //! worker. It does not grant operation admission, filesystem authority, capacity authority, or a
 //! tentative persistence receipt.
 
+pub use super::wal_admission::{
+    SourceInput as SourceWalPreparationInput, SourcePreparation as WalPreparationSource,
+    WalPreparationError, WalPreparationHandle, WalPreparationInput, WalPreparationObservation,
+    WalPreparationStatus, WalPreparedDatabase,
+};
 mod frozen_copy;
 pub use frozen_copy::{FrozenCopyObservation, FrozenCopyValidationError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -199,8 +204,13 @@ impl OwnerCommandReceivers {
 
     // FIFO within each class; no global FIFO promise. A control request arriving after the
     // control check may follow one selected ordinary command. No running SQL is preempted.
+    #[cfg(test)]
     fn recv(&self) -> Option<JournalCommand> {
+        self.recv_with_idle(|| {})
+    }
+    fn recv_with_idle(&self, mut idle: impl FnMut()) -> Option<JournalCommand> {
         loop {
+            idle();
             let control_disconnected = match self.control.try_recv() {
                 Ok(command) => return Some(command),
                 Err(TryRecvError::Disconnected) => true,
@@ -508,6 +518,9 @@ pub enum OperationJournalOwnerError {
     /// A source-owner authority handshake failed closed.
     #[error(transparent)]
     SourceAuthority(#[from] SourceAuthorityError),
+    /// Original-owner pre-intent WAL preparation refused; no identity or intent was issued.
+    #[error(transparent)]
+    WalPreparation(#[from] WalPreparationError),
     /// An authenticated metadata handoff failed closed without effect permission.
     #[error(transparent)]
     SourceMetadata(#[from] crate::sample_sources::db::SourceRegistryMetadataHandoffError),
@@ -1550,6 +1563,8 @@ fn prepared_admission_fault_facts(
 }
 
 struct OwnerRuntime {
+    wal_preparation: Option<super::wal_admission::Collector>,
+    wal_preparation_unconfirmed: bool,
     store: Option<OperationJournalStore>,
     capacity_provider: Option<CapacityProvider>,
     capacity_rebuild_readiness: CapacityRebuildReadiness,
@@ -1581,6 +1596,8 @@ impl OwnerRuntime {
             .try_clone_profile_guard_for_owner()
             .map_err(|error| error.to_string())?;
         Ok(Self {
+            wal_preparation: None,
+            wal_preparation_unconfirmed: false,
             store: Some(store),
             capacity_provider: None,
             capacity_rebuild_readiness: CapacityRebuildReadiness::reconciliation_required(vec![
@@ -1644,6 +1661,42 @@ impl OwnerRuntime {
     fn install_reserve(&mut self, reserve: OwnedReserveAllocation) {
         debug_assert!(self.reserve.is_none());
         self.reserve = Some(reserve);
+    }
+
+    fn begin_wal_preparation(
+        &mut self,
+        input: WalPreparationInput,
+        debit: InputPermit,
+    ) -> Result<WalPreparationHandle, OperationJournalOwnerError> {
+        if self.wal_preparation.is_some() || self.wal_preparation_unconfirmed {
+            return Err(WalPreparationError::Busy.into());
+        }
+        if std::time::Instant::now() >= input.deadline() {
+            return Err(WalPreparationError::Deadline.into());
+        }
+        self.store().validate_for_admission()?;
+        let acquisition = uuid::Uuid::parse_str(
+            self.final_profile_guard
+                .as_ref()
+                .expect("original journal profile guard")
+                .owner_identity(),
+        )
+        .map_err(|_| WalPreparationError::InvalidInput)?;
+        let (collector, handle) = super::wal_admission::Collector::new(input, debit, acquisition);
+        self.wal_preparation = Some(collector);
+        self.poll_wal_preparation();
+        Ok(handle)
+    }
+    fn poll_wal_preparation(&mut self) {
+        let done = self
+            .wal_preparation
+            .as_mut()
+            .is_some_and(|collector| collector.poll());
+        if done {
+            let collector = self.wal_preparation.take().expect("original collector");
+            self.wal_preparation_unconfirmed |= collector.is_unavailable();
+            drop(collector);
+        }
     }
 
     fn admit_prepared(
@@ -3324,6 +3377,9 @@ impl OwnerRuntime {
     /// after every retained source and durable ledger proof has passed; any marker uncertainty
     /// fences this runtime and returns no clean receipt.
     fn handoff_volume_to_clean_owner(&mut self) -> Result<(), String> {
+        if self.wal_preparation.is_some() || self.wal_preparation_unconfirmed {
+            return Err("original WAL preparation cleanup remains unconfirmed".into());
+        }
         let volume_owner = self
             .volume_owner
             .as_ref()
@@ -3789,6 +3845,8 @@ fn map_initial_settlement_error(
 
 impl Drop for OwnerRuntime {
     fn drop(&mut self) {
+        // Publish loss/cancel original owners before journal authority teardown.
+        drop(self.wal_preparation.take());
         // Source registrations retain non-Send authority guards and external reserve/volume
         // bindings. Release these maps before the journal/profile core so a global shutdown is
         // visibly conservative and never mistaken for a successful per-source retirement.
@@ -4269,6 +4327,32 @@ impl OperationJournalClient {
                 result,
             }
         })
+    }
+
+    /// Collect complete ordered original-owner WAL scope asynchronously on this journal actor.
+    /// Queue/Ready observations provide no current registration acknowledgement, decision latch,
+    /// capacity grant or durable intent. Abort/Drop requests original-owner cleanup only.
+    pub fn prepare_wal_owners(
+        &self,
+        input: WalPreparationInput,
+    ) -> Result<OperationJournalRequest<WalPreparationHandle>, OperationJournalOwnerQueueError>
+    {
+        input
+            .retained_bytes()
+            .ok_or_else(|| OperationJournalOwnerQueueError::InvalidInput {
+                reason: "bounded original WAL preparation input".into(),
+            })?;
+        // Reserve its full finite backing on the original four-MiB pool before
+        // async native replies grow. Collector and copied inventory share this sole
+        // original debit until cleanup and the last observation backing drop.
+        self.submit(
+            super::wal_admission::HANDSHAKE_MAX_BYTES,
+            move |debit, result| JournalCommand::PrepareWalOwners {
+                preparation: input,
+                input: debit,
+                result,
+            },
+        )
     }
 
     /// Queue one common prepared-admission request. The input is validated before queue
@@ -5061,7 +5145,7 @@ impl OwnerShared {
     }
 }
 
-struct InputPermit {
+pub(super) struct InputPermit {
     shared: Arc<OwnerShared>,
     bytes: usize,
     class: InputClass,
@@ -5101,6 +5185,11 @@ struct CapacityLedgerTestSnapshot {
 
 #[allow(dead_code)]
 enum JournalCommand {
+    PrepareWalOwners {
+        preparation: WalPreparationInput,
+        input: InputPermit,
+        result: SyncSender<Result<WalPreparationHandle, OperationJournalOwnerError>>,
+    },
     RetainRecording {
         operation_id: OperationId,
         encoded: Vec<u8>,
@@ -5445,7 +5534,18 @@ fn run_owner(
     let panic_on_command = panic_on_command;
     let mut orderly_shutdown = true;
     loop {
-        let Some(command) = command_rx.recv() else {
+        let Some(command) = command_rx.recv_with_idle(|| runtime.poll_wal_preparation()) else {
+            if let Some(collector) = &runtime.wal_preparation {
+                collector.cancel();
+            }
+            // Pre-intent drain retains the original journal resources while original actors
+            // confirm cleanup. No source/slot/native mutex is held by this polling loop.
+            while runtime.wal_preparation.is_some() {
+                runtime.poll_wal_preparation();
+                if runtime.wal_preparation.is_some() {
+                    thread::park_timeout(CONTROL_RECEIVE_POLL);
+                }
+            }
             break;
         };
         #[cfg(any(test, feature = "test-support"))]
@@ -5464,6 +5564,10 @@ fn run_owner(
             command_rx.reject_pending(|| OperationJournalOwnerError::WorkerPanicked);
             break;
         }
+    }
+    if runtime.wal_preparation_unconfirmed {
+        orderly_shutdown = false;
+        shared.mark_unavailable("original WAL preparation cleanup remains unconfirmed");
     }
     if orderly_shutdown {
         if let Err(error) = runtime.handoff_volume_to_clean_owner() {
@@ -5484,6 +5588,13 @@ fn run_owner(
 // Returned outputs retain their independent result/producer custody. Input is not settlement.
 fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool {
     match command {
+        JournalCommand::PrepareWalOwners {
+            preparation,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            runtime.begin_wal_preparation(preparation, input)
+        }),
         JournalCommand::AuthenticateSourceMetadata {
             candidate,
             input,
@@ -5921,6 +6032,10 @@ where
 
 fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
     match &command {
+        JournalCommand::PrepareWalOwners { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+
         JournalCommand::AuthenticateSourceMetadata { result, .. } => {
             let _ = result.send(Err(error));
         }
@@ -6018,6 +6133,9 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod wal_preparation;
+
     mod command_drain_tests;
     mod control_input_tests;
     mod control_responsiveness_tests;
