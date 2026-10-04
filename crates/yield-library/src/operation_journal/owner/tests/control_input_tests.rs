@@ -2,7 +2,8 @@
 #[cfg(test)]
 mod integration {
     use super::super::super::{
-        CONTROL_INPUT_RESERVED_BYTES, InputBudget, InputClass, InputPermit, ORDINARY_INPUT_BYTES,
+        CONTROL_INPUT_RESERVED_BYTES, InputBudget, InputClass, InputPermit,
+        ORDINARY_COMMAND_CAPACITY, ORDINARY_INPUT_BYTES, OwnerCommandReceivers, ResultBudget,
     };
     use super::super::*;
     use crate::operation_journal::store::{InsertTestBoundary, InsertTestDirective};
@@ -12,8 +13,8 @@ mod integration {
     fn full(shared: &Arc<OwnerShared>) {
         assert_eq!(snapshot(shared), InputBudget::new());
     }
-    fn shared() -> (Arc<OwnerShared>, Receiver<JournalCommand>) {
-        let (tx, rx) = mpsc::sync_channel(OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY);
+    fn shared() -> (Arc<OwnerShared>, OwnerCommandReceivers) {
+        let (tx, rx) = OwnerCommandReceivers::channel();
         let shared = Arc::new(OwnerShared::new(tx));
         shared
             .lifecycle
@@ -199,8 +200,19 @@ mod integration {
         let first = client.get(OperationId::new()).unwrap();
         ready.wait();
         let mut queued = Vec::new();
-        for _ in 0..OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY {
+        for _ in 0..ORDINARY_COMMAND_CAPACITY {
             queued.push(client.get(OperationId::new()).unwrap());
+        }
+        for _ in 0..super::super::super::CONTROL_COMMAND_CAPACITY {
+            drop(
+                client
+                    .request_cancel_before_publish(
+                        OperationId::new(),
+                        1,
+                        CancellationRequestObservation::new(56).unwrap(),
+                    )
+                    .unwrap(),
+            );
         }
         let before = snapshot(&owner.shared);
         assert!(matches!(
@@ -233,8 +245,10 @@ mod integration {
     fn control_input_result_backpressure_and_control_exhaustion_restore_before_queue_admission() {
         let (_fixture, mut owner) = open_owner("journal-control-input-results");
         let client = owner.client();
-        let permits: Vec<_> = (0..OPERATION_JOURNAL_OWNER_RESULT_CAPACITY)
-            .map(|_| owner.shared.reserve_result().unwrap())
+        let permits: Vec<_> = [InputClass::Ordinary, InputClass::Control]
+            .into_iter()
+            .flat_map(|class| (0..class.result_limit()).map(move |_| class))
+            .map(|class| owner.shared.reserve_result(class).unwrap())
             .collect();
         let before = snapshot(&owner.shared);
         assert!(matches!(
@@ -289,10 +303,7 @@ mod integration {
                 s.status(),
                 OperationJournalOwnerStatus::Unavailable { .. }
             ));
-            assert_eq!(
-                *s.results.lock().unwrap(),
-                OPERATION_JOURNAL_OWNER_RESULT_CAPACITY
-            );
+            assert_eq!(*s.results.lock().unwrap(), ResultBudget::new());
         }
     }
     #[test]
@@ -312,11 +323,13 @@ mod integration {
                 CancellationRequestObservation::new(56).unwrap(),
             )
             .unwrap();
+        let queued_ordinary = client.get(OperationId::new()).unwrap();
         let before = snapshot(&owner.shared);
         assert!(before.remaining[0] < ORDINARY_INPUT_BYTES);
         assert!(before.remaining[1] < CONTROL_INPUT_RESERVED_BYTES);
         drop(accepted);
         drop(pending);
+        drop(queued_ordinary);
         assert_eq!(snapshot(&owner.shared), before);
         release.wait();
         owner.shutdown();
@@ -351,6 +364,7 @@ mod integration {
         let mut pending = client
             .request_cancel_before_publish(id, 1, CancellationRequestObservation::new(56).unwrap())
             .unwrap();
+        let mut queued_ordinary = client.get(OperationId::new()).unwrap();
         let before = snapshot(&owner.shared);
         assert!(before.remaining[0] < ORDINARY_INPUT_BYTES);
         assert!(before.remaining[1] < CONTROL_INPUT_RESERVED_BYTES);
@@ -358,6 +372,12 @@ mod integration {
         assert!(first.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
         assert!(
             pending
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            queued_ordinary
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap()
                 .is_err()
