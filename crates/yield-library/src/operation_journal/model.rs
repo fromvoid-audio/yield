@@ -53,6 +53,8 @@ pub const SCHEMA_V15: u32 = 15;
 pub const SCHEMA_V16: u32 = 16;
 /// Finite recording initial intent with full allocation observations.
 pub const SCHEMA_V17: u32 = 17;
+/// Explicit pre-audit source registry retirement command/fence record version.
+pub const SCHEMA_V18: u32 = 18;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.
@@ -117,6 +119,8 @@ pub enum OperationActor {
 /// Typed operation family. Payload details remain bounded and opaque to this foundation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum OperationKind {
+    /// Retire one original registered source through bounded global and lease-maintenance work.
+    SourceRegistryRetirement,
     /// Adopt one exact pre-lease legacy source, separate from files and audited source edits.
     SourceLegacyAdoption,
     /// Source-local rebuildable SQL layout, separate from user history and files.
@@ -146,6 +150,8 @@ pub struct OperationIntent {
 /// an explicit model and schema decision; unknown command values remain retained data.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum UniversalCommandKind {
+    /// Original source registry drain/release/retired metadata, without authoritative audit coercion.
+    SourceRegistryRetirement,
     /// Adopt one original reservation-owned known legacy source.
     SourceLegacyAdoption,
     /// Replace one bounded source-owned canonical layout generation.
@@ -190,6 +196,7 @@ impl UniversalCommandKind {
     /// Return the stable documentation identifier for this command family.
     pub const fn stable_id(self) -> &'static str {
         match self {
+            Self::SourceRegistryRetirement => "family.source_registry_retirement",
             Self::SourceLegacyAdoption => "family.source_legacy_adoption",
             Self::SourceDerivedLayout => "family.source_derived_layout",
             Self::Extract => "family.extract",
@@ -312,6 +319,9 @@ fn command_matches_intent(
     kind: &OperationKind,
 ) -> bool {
     match command_kind {
+        UniversalCommandKind::SourceRegistryRetirement => {
+            actor == OperationActor::User && *kind == OperationKind::SourceRegistryRetirement
+        }
         UniversalCommandKind::SourceLegacyAdoption => {
             actor == OperationActor::User && *kind == OperationKind::SourceLegacyAdoption
         }

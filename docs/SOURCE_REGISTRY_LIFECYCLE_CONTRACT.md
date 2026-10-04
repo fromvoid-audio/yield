@@ -408,3 +408,74 @@ qualification. The existing audit-qualified `SourceAuthoritative` domain cannot 
 reinterpreted. This preparation grants no intent, claim, permit, lease release,
 receipt, retry, refund or settlement. Journal schema 12 and source schema remain
 unchanged; native unsupported facts continue to refuse.
+
+## Versioned pre-audit lease bindings (OPT-2246)
+
+`SourceLeaseMaintenancePreparation::capture_lease_binding` observes the genuine
+original registration and source inside the retained empty MAIN transaction. It
+revalidates the original weak issuer, local preparation nonce, unchanged deadline,
+lease owner/epoch/expiry, profile acquisition, selected pager policy, roots and
+native MAIN/WAL/mapped SHM objects. `validate_lease_binding` requires that same
+preparation and actual registration guard. Moving a stored image, decoding it,
+or reacquiring an equal-looking source cannot recreate this carrier. Ordinary
+abort still requires confirmed rollback and exact original policy restoration.
+
+`StoredSourceLeaseFence` is historical data, not `StoredSourceFence` or
+`SourceRevision`. It separately retains scan revision and either a current audit
+observation or explicit audit unavailability. A genuine Prepared registration can
+be captured before any audit, but that phase cannot form a retirement intent or
+lease database inventory. A stored registered/draining phase is still an
+observation: actual journal installation and full registration readiness must be
+authenticated by the future admitted owner boundary.
+
+The scope is version 1, strict canonical JSON, at most 16 KiB. Source and native
+text identities have 256-byte ceilings; media-root identity is at most 176 raw
+bytes. The database claim uses the distinct lossless `lease-root-v1:` base64url
+encoding of those bytes, never an authoritative UTF-8 root identity. UUIDs are
+non-nil. Page size is a power of two from 512 through 65,536; selected page bytes
+are at most 64 MiB. Three distinct objects share the observed device and allocation
+unit (a power of two at most 1 MiB). Each retained logical ceiling must equal the
+existing passive allocation formula: four times the sum of the complete page window and observed
+bytes, plus 4 MiB bookkeeping, rounded to the unit. These are restrictive logical
+limits, not qualified physical allocation guarantees.
+
+Operation record **V18** exclusively stores the bounded
+`SourceRegistryRetirement` family, with one required `SourceLeaseMaintenance`
+participant and one required global participant. Its version-1 arguments contain
+the exact lease scope and canonical global Draining/Retired proposals, bounded
+collectively to 64 KiB. The proposals share an operation/subject and explicit work
+keys: global drain `(0,0)`, source lease maintenance `(0,1)`, global retired `(0,2)`.
+Historical registration phase may advance to Draining while the original frozen
+proposal subject remains unchanged. This does not apply a CAS, create a receipt,
+or authorize the source release or Retired transition.
+
+Database inventory **V2** (`YWCB` followed by version bytes `02 00`) adds a bounded
+canonical scope frame to source bindings. `SourceLeaseLifecycle` is domain tag 6;
+its before/after values equal the existing lease epoch, not the historical scan
+revision. Owner generation equals that lease epoch; current revision separately
+retains the historical scan revision. Only required source `LeaseMaintenance`
+slices are legal in this domain. The immutable descriptor, arguments, source,
+registration, acquisition, roots, native objects, logical ceilings and command
+digest must agree. Complete participant coverage, 64 databases, 256 slices,
+64 KiB aggregate bytes and exact ordinary-claim conservation still apply.
+
+Attempt start **V2** binds the complete V2 inventory and the actual immutable
+V18 command. Its domain-specific start digest distinguishes V1 and V2. Existing
+outcome V1 remains unchanged and correlates to the exact versioned start digest.
+Actual owned journal transactions, rollback/lost-commit handling, immutable nonce
+readback and restart validation support both versions. The SQLite journal remains
+schema **12**: existing blob columns need no migration. Legacy participant bytes
+omit the absent lease field; V1 inventories/starts, their digests and all existing
+migration rows retain their previous encoding. Operation versions 1–17 reject the
+new family/participant/lease field (including explicit null); V1 inventories and
+starts reject new domain/scope shapes.
+
+Normal Linux tests exercise actual never-audited original preparation and genuine
+Prepared registration capture/refusal. Positive registered-phase journal tests use
+explicit historical scalar and logical capacity fixtures on real profile-owned
+SQLite; they do not fabricate a live registration. Production estimation,
+filesystem planning and compensation explicitly refuse this family until the
+actual admitted lifecycle bridge is implemented. No storage API issues an attempt
+permit, authorizes retry, refunds claims, supplies settlement or produces release
+or sealed-close acknowledgements. OPT-2194 physical/exact family allocation,
+OPT-2136, OPT-2168/2169, OPT-2195/2196 and OPT-2202 remain open.

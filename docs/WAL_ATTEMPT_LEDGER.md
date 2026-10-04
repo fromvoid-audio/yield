@@ -46,3 +46,14 @@ OPT-2169, OPT-2170 and OPT-2171 retain receipt, reconciliation and settlement sc
 OPT-2136 and native physical qualification remain required. Full-progress admission
 and production execution are not enabled by these storage APIs. Tracking parents
 remain open until those implementations and qualifications are complete.
+
+## Pre-audit lease inventory compatibility (OPT-2246)
+
+Start V2 retains the distinct V2 source lifecycle/lease inventory and actual V18
+retirement command. The lease domain correlates before/after to the original lease
+epoch; it does not invent an audited revision. Legacy V1 inventories and starts
+retain their exact bytes/digests, and V1 refuses the new scope/domain. Outcome V1
+continues to bind the exact versioned start digest. Actual transaction and restart
+readback support both without changing SQLite schema 12. See
+[SOURCE_REGISTRY_LIFECYCLE_CONTRACT.md](SOURCE_REGISTRY_LIFECYCLE_CONTRACT.md) for
+finite bounds, original-owner capture and the still-open admitted execution gates.

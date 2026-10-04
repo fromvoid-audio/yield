@@ -129,6 +129,22 @@ impl LifecycleDatabaseAllocation {
     }
 }
 
+// Exact existing passive restriction formula, not a physical allocation qualification.
+pub(crate) fn logical_ceiling(bytes: u64, window: u64, unit: u64) -> Option<u64> {
+    if unit == 0 {
+        return None;
+    }
+    let ceiling = window
+        .checked_add(bytes)?
+        .checked_mul(4)?
+        .checked_add(4 * 1024 * 1024)?;
+    let ceiling = ceiling
+        .checked_add(unit - 1)?
+        .checked_div(unit)?
+        .checked_mul(unit)?;
+    (ceiling > 0 && ceiling <= i64::MAX as u64).then_some(ceiling)
+}
+
 pub(crate) const MAX_OBSERVATION: Duration = Duration::from_secs(2);
 const MAX_VM_OPS: u64 = 10_000_000;
 const PROGRESS_OPS: i32 = 1000;
@@ -233,16 +249,8 @@ pub(crate) fn capture(
     // Restrict logical charged I/O to four complete page windows plus fixed bookkeeping.
     // This is an explicit conservative refusal ceiling, NOT a physical worst-case grant.
     let object = |facts: WalObjectFacts, window: u64| -> Option<LifecycleObjectAllocation> {
-        let ceiling = window
-            .checked_add(facts.bytes)?
-            .checked_mul(4)?
-            .checked_add(4 * 1024 * 1024)?;
-        let ceiling = ceiling
-            .checked_add(unit - 1)?
-            .checked_div(unit)?
-            .checked_mul(unit)?;
-        (ceiling > 0 && ceiling <= i64::MAX as u64)
-            .then_some(LifecycleObjectAllocation { facts, ceiling })
+        let ceiling = logical_ceiling(facts.bytes, window, unit)?;
+        Some(LifecycleObjectAllocation { facts, ceiling })
     };
     let WalObjects { main, wal, shm } = objects;
     let result = LifecycleDatabaseAllocation {

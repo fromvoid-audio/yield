@@ -1470,6 +1470,8 @@ pub enum WaveformEditValidationError {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub enum UniversalCommandArgs {
+    /// Frozen original-source registry retirement metadata, without live admission.
+    SourceRegistryRetirement(super::source_registry_retirement::SourceRegistryRetirementIntentArgs),
     /// Bounded original-owner legacy preparation, never live admission.
     SourceLegacyAdoption(super::legacy_adoption_commands::LegacyAdoptionIntentArgs),
     /// Bounded historical source-only derived layout; not live admission.
@@ -1512,6 +1514,9 @@ impl UniversalCommandArgs {
     /// Return the universal command kind represented by these arguments.
     pub const fn command_kind(&self) -> super::model::UniversalCommandKind {
         match self {
+            Self::SourceRegistryRetirement(_) => {
+                super::model::UniversalCommandKind::SourceRegistryRetirement
+            }
             Self::SourceLegacyAdoption(_) => {
                 super::model::UniversalCommandKind::SourceLegacyAdoption
             }
@@ -1541,6 +1546,9 @@ impl UniversalCommandArgs {
         participants: &ParticipantSet,
     ) -> Result<(), UniversalCommandArgsValidationError> {
         match self {
+            Self::SourceRegistryRetirement(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::SourceRegistryRetirement),
             Self::SourceLegacyAdoption(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::SourceLegacyAdoption),
@@ -1602,6 +1610,9 @@ impl UniversalCommandArgs {
 /// Failure while validating a tagged V6 command argument envelope.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum UniversalCommandArgsValidationError {
+    /// The finite original source lease/global retirement metadata is inconsistent.
+    #[error("invalid source registry retirement metadata: {0}")]
+    SourceRegistryRetirement(#[source] super::source_lease_binding::SourceLeaseBindingError),
     /// Original pre-lease legacy identity, policy or topology does not agree.
     #[error("invalid source legacy adoption arguments: {0}")]
     SourceLegacyAdoption(#[source] super::legacy_adoption_commands::LegacyAdoptionInputError),

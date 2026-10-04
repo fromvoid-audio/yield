@@ -34,14 +34,14 @@ pub use source_writer::{
     SourceLayoutComputedView, SourceLayoutFeature, SourceLayoutGeneration,
     SourceLayoutGenerationError, SourceLayoutGenerationRow, SourceLayoutMetadataBudget,
     SourceLayoutMetadataPolicy, SourceLayoutWalPreparation, SourceLayoutWalPreparationFailure,
-    SourceLeaseMaintenanceAllocation, SourceLeaseMaintenancePreparation,
-    SourceLeaseMaintenancePreparationError, SourceLeaseMaintenancePreparationFailure,
-    SourcePreparedLayoutGeneration, SourceRevision, SourceScanFence, SourceSnapshotOwner,
-    SourceSnapshotPage, SourceSnapshotQueueMetrics, SourceTagAdmissionObservation,
-    SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceTagWalPreparation,
-    SourceTagWalPreparationFailure, SourceWalPreparation, SourceWalPreparationError,
-    SourceWalPreparationFailure, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
-    SourceWriterReceipt, SourceWriterRequest,
+    SourceLeaseMaintenanceAllocation, SourceLeaseMaintenanceBinding,
+    SourceLeaseMaintenancePreparation, SourceLeaseMaintenancePreparationError,
+    SourceLeaseMaintenancePreparationFailure, SourcePreparedLayoutGeneration, SourceRevision,
+    SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage, SourceSnapshotQueueMetrics,
+    SourceTagAdmissionObservation, SourceTagMetadataBudget, SourceTagMetadataPolicy,
+    SourceTagWalPreparation, SourceTagWalPreparationFailure, SourceWalPreparation,
+    SourceWalPreparationError, SourceWalPreparationFailure, SourceWriter,
+    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};
 pub use transaction::{

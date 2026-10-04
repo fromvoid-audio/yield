@@ -306,7 +306,7 @@ fn text(value: &str, limit: usize) -> bool {
 fn integer(value: u64, positive: bool) -> bool {
     value <= i64::MAX as u64 && (!positive || value > 0)
 }
-fn validate_subject(
+pub(crate) fn validate_subject(
     s: &SourceRegistryReferenceSubject,
 ) -> Result<(), SourceRegistryReferenceError> {
     if !text(&s.source_id, 256)
@@ -451,6 +451,17 @@ pub(crate) fn capture_in_transaction(
         return Err(SourceDbError::Unexpected.into());
     }
     capture_impl(database, fence, None, true)
+}
+
+pub(crate) fn capture_registered_in_transaction(
+    database: &SourceDatabase,
+    fence: &SourceScanFence,
+    registration: &SourceAuthorityRegistration,
+) -> Result<SourceRegistryReferenceObservation, SourceRegistryReferenceError> {
+    if database.connection.is_autocommit() {
+        return Err(SourceDbError::Unexpected.into());
+    }
+    capture_impl(database, fence, Some(registration), true)
 }
 
 fn capture_impl(

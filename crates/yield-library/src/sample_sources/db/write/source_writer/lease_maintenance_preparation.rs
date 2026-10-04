@@ -22,6 +22,9 @@ pub enum SourceLeaseMaintenancePreparationError {
     /// Original owner, schema or exact native allocation cannot be confirmed.
     #[error(transparent)]
     Allocation(#[from] LifecycleAllocationError),
+    /// The genuine bounded lease binding cannot be formed or validated.
+    #[error(transparent)]
+    Binding(#[from] crate::operation_journal::source_lease_binding::SourceLeaseBindingError),
     /// Actual source owner or restrictive settings validation failed.
     #[error(transparent)]
     Owner(#[from] SourceWriterError),
@@ -370,6 +373,9 @@ impl SourceLeaseMaintenancePreparationFailure {
         }
     }
 }
+
+mod binding_capture;
+pub use binding_capture::SourceLeaseMaintenanceBinding;
 
 #[cfg(test)]
 mod tests;

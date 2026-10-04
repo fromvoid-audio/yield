@@ -66,6 +66,8 @@ impl fmt::Display for ParticipantId {
 /// Universal operation participant family.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ParticipantKind {
+    /// Original source lease maintenance without requiring an authoritative audit.
+    SourceLeaseMaintenance,
     /// Original source reservation before any current source lease/audit exists.
     LegacySource,
     /// Filesystem mutation or publication participant.
@@ -201,6 +203,8 @@ pub struct ParticipantDescriptor {
     kind: ParticipantKind,
     requirement: ParticipantRequirement,
     source_fence: Option<StoredSourceFence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease_fence: Option<super::source_lease_binding::StoredSourceLeaseFence>,
     artifact_key: Option<String>,
 }
 
@@ -218,14 +222,51 @@ impl ParticipantDescriptor {
             kind,
             requirement,
             source_fence,
+            lease_fence: None,
             artifact_key,
         };
         descriptor.validate()?;
         Ok(descriptor)
     }
 
+    /// Create a required pre-audit-capable stored lease participant. No live custody is issued.
+    pub fn source_lease_maintenance(
+        id: ParticipantId,
+        fence: super::source_lease_binding::StoredSourceLeaseFence,
+    ) -> Result<Self, ParticipantValidationError> {
+        let descriptor = Self {
+            id,
+            kind: ParticipantKind::SourceLeaseMaintenance,
+            requirement: ParticipantRequirement::Required,
+            source_fence: None,
+            lease_fence: Some(fence),
+            artifact_key: None,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+    /// Historical lease fence, distinct from an audit-qualified source observation.
+    pub fn lease_fence(&self) -> Option<&super::source_lease_binding::StoredSourceLeaseFence> {
+        self.lease_fence.as_ref()
+    }
+
     /// Validate this descriptor as untrusted stored data.
     pub fn validate(&self) -> Result<(), ParticipantValidationError> {
+        match (self.kind, &self.lease_fence) {
+            (ParticipantKind::SourceLeaseMaintenance, Some(fence))
+                if self.source_fence.is_none()
+                    && self.requirement == ParticipantRequirement::Required
+                    && self.artifact_key.is_none() =>
+            {
+                fence
+                    .validate()
+                    .map_err(|_| ParticipantValidationError::InvalidLeaseFence)?;
+            }
+            (ParticipantKind::SourceLeaseMaintenance, _) | (_, Some(_)) => {
+                return Err(ParticipantValidationError::InvalidLeaseFence);
+            }
+            _ => {}
+        }
         if let Some(source_fence) = &self.source_fence {
             source_fence.validate()?;
         }
@@ -607,6 +648,9 @@ pub enum ParticipantTextViolation {
 /// Typed validation failure for untrusted participant observations.
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
 pub enum ParticipantValidationError {
+    /// A lease participant is missing its finite lease scope or has an authoritative/foreign shape.
+    #[error("invalid source lease-maintenance participant fence")]
+    InvalidLeaseFence,
     /// The descriptor list exceeds [`MAX_PARTICIPANTS`].
     #[error("participant descriptor count {actual} exceeds maximum {maximum}")]
     TooManyDescriptors {

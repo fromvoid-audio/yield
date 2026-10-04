@@ -37,6 +37,7 @@ pub(crate) enum ClaimDirection {
 #[repr(u8)]
 pub(crate) enum RevisionDomain {
     SourceAuthoritative = 1,
+    SourceLeaseLifecycle = 6,
     GlobalMutationGeneration = 2,
     GlobalRegistry = 3,
     GlobalPreferences = 4,
@@ -56,7 +57,30 @@ pub(crate) struct SourceBinding {
     pub media_root: String,
     pub lease_owner: String,
     pub lease_epoch: u64,
+    pub lease_fence: Option<super::source_lease_binding::StoredSourceLeaseFence>,
 }
+impl SourceBinding {
+    pub(crate) fn from_lease_fence(
+        fence: &super::source_lease_binding::StoredSourceLeaseFence,
+    ) -> Result<Self> {
+        fence
+            .validate()
+            .map_err(|_| DatabaseClaimError("lease fence"))?;
+        require(
+            fence.lifecycle_observed_registered(),
+            "lease registration phase",
+        )?;
+        let subject = fence.subject();
+        Ok(Self {
+            source_id: subject.source_id().into(),
+            media_root: fence.claim_media_root(),
+            lease_owner: subject.lease_owner().to_string(),
+            lease_epoch: subject.lease_epoch(),
+            lease_fence: Some(fence.clone()),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DatabaseParticipant {
     pub id: Uuid,
@@ -181,6 +205,38 @@ impl DatabaseClaimInventory {
                 )?;
                 match b.role {
                     DatabaseRole::Source => {
+                        if p.revision_domain == RevisionDomain::SourceLeaseLifecycle {
+                            require(
+                                record.schema_version == super::model::SCHEMA_V18
+                                    && record.intent.kind
+                                        == super::model::OperationKind::SourceRegistryRetirement
+                                    && d.kind() == ParticipantKind::SourceLeaseMaintenance
+                                    && d.source_fence().is_none(),
+                                "lease participant/family/version",
+                            )?;
+                            let Some(
+                                super::coordinator::UniversalCommandArgs::SourceRegistryRetirement(
+                                    args,
+                                ),
+                            ) = record.universal_command_args()
+                            else {
+                                return Err(DatabaseClaimError("lease command family"));
+                            };
+                            args.validate_against_participants(universal.participants())
+                                .map_err(|_| DatabaseClaimError("lease command envelope"))?;
+                            let fence = b
+                                .source
+                                .as_ref()
+                                .and_then(|s| s.lease_fence.as_ref())
+                                .ok_or(DatabaseClaimError("missing lease scope"))?;
+                            require(
+                                d.lease_fence() == Some(fence)
+                                    && args.lease_fence() == fence
+                                    && args.source_participant().as_uuid() == p.id,
+                                "immutable lease fence mismatch",
+                            )?;
+                            continue;
+                        }
                         require(
                             matches!(
                                 d.kind(),
@@ -218,6 +274,7 @@ impl DatabaseClaimInventory {
             if matches!(
                 d.kind(),
                 ParticipantKind::SourceDatabase
+                    | ParticipantKind::SourceLeaseMaintenance
                     | ParticipantKind::GlobalLibrary
                     | ParticipantKind::Harvest
                     | ParticipantKind::Readiness
@@ -331,11 +388,51 @@ impl DatabaseClaimInventory {
                     "total participant bound",
                 )?;
                 require(matches!(p.requirement, 1 | 2), "requirement tag")?;
+                let lease = b.source.as_ref().and_then(|s| s.lease_fence.as_ref());
                 require(
-                    (b.role == DatabaseRole::Source)
-                        == (p.revision_domain == RevisionDomain::SourceAuthoritative),
+                    match p.revision_domain {
+                        RevisionDomain::SourceAuthoritative => {
+                            b.role == DatabaseRole::Source && lease.is_none()
+                        }
+                        RevisionDomain::SourceLeaseLifecycle => {
+                            b.role == DatabaseRole::Source && lease.is_some()
+                        }
+                        _ => b.role == DatabaseRole::Global && lease.is_none(),
+                    },
                     "revision domain/role",
                 )?;
+                if let Some(fence) = lease {
+                    fence
+                        .validate()
+                        .map_err(|_| DatabaseClaimError("lease fence"))?;
+                    require(
+                        fence.lifecycle_observed_registered(),
+                        "lease registration phase",
+                    )?;
+                    let subject = fence.subject();
+                    let source = b.source.as_ref().expect("source binding");
+                    require(
+                        source == &SourceBinding::from_lease_fence(fence)?
+                            && b.main_file == subject.database_identity()
+                            && b.database_root == subject.database_root_identity()
+                            && b.root_binding == subject.root_binding_identity()
+                            && b.lifecycle == subject.lifecycle_generation()
+                            && b.owner_generation == subject.lease_epoch()
+                            && b.current_revision == subject.scan_revision()
+                            && b.registration
+                                == subject
+                                    .registration()
+                                    .expect("validated registration")
+                                    .registration_id()
+                            && self.header.acquisition == subject.profile_acquisition().to_string()
+                            && b.volume == fence.device()
+                            && b.allocation_unit == fence.allocation_unit()
+                            && p.requirement == 1
+                            && p.before == subject.lease_epoch()
+                            && p.after == subject.lease_epoch(),
+                        "lease binding/epoch/context mismatch",
+                    )?;
+                }
                 integer(p.before, false)?;
                 integer(p.after, false)?;
                 if matches!(
@@ -366,7 +463,23 @@ impl DatabaseClaimInventory {
                 .iter()
                 .find(|p| p.id == s.participant)
                 .ok_or(DatabaseClaimError("missing participant"))?;
+            require(
+                p.revision_domain != RevisionDomain::SourceLeaseLifecycle
+                    || s.direction == ClaimDirection::LeaseMaintenance,
+                "lease-only direction",
+            )?;
             let tag = class_tag(s.class)?;
+            if let Some(fence) = b.source.as_ref().and_then(|s| s.lease_fence.as_ref()) {
+                let [main, wal, shm] = fence.write_ceilings();
+                require(
+                    if tag % 2 == 0 {
+                        s.wal_ceiling <= wal && s.shm_ceiling <= shm
+                    } else {
+                        s.ceiling <= main
+                    },
+                    "lease slice exceeds captured logical policy",
+                )?;
+            }
             require(
                 (tag <= 2) == (b.role == DatabaseRole::Source),
                 "slice class/role",
@@ -399,6 +512,33 @@ impl DatabaseClaimInventory {
         }
         for b in &self.bindings {
             for p in &b.participants {
+                if p.revision_domain == RevisionDomain::SourceLeaseLifecycle {
+                    let selected = self
+                        .slices
+                        .iter()
+                        .filter(|s| s.binding == b.id && s.participant == p.id)
+                        .collect::<Vec<_>>();
+                    require(
+                        selected.len() == 2
+                            && selected
+                                .iter()
+                                .filter(|s| {
+                                    s.class == FullCapacityAllocationClass::SourceDatabaseCommit
+                                })
+                                .count()
+                                == 1
+                            && selected
+                                .iter()
+                                .filter(|s| {
+                                    s.class == FullCapacityAllocationClass::SourceWalShm
+                                        && s.wal_ceiling > 0
+                                        && s.shm_ceiling > 0
+                                })
+                                .count()
+                                == 1,
+                        "lease requires exact MAIN and WAL/SHM slice pair",
+                    )?;
+                }
                 require(
                     self.slices
                         .iter()
@@ -471,6 +611,10 @@ impl DatabaseClaimInventory {
     fn encoded_len(&self) -> Result<usize> {
         let mut n =
             6 + 2 + self.header.profile.len() + 2 + self.header.acquisition.len() + 8 + 16 + 4;
+        let version2 = self
+            .bindings
+            .iter()
+            .any(|b| b.source.as_ref().is_some_and(|s| s.lease_fence.is_some()));
         for b in &self.bindings {
             n = n
                 .checked_add(
@@ -502,6 +646,21 @@ impl DatabaseClaimInventory {
                     )
                     .ok_or(DatabaseClaimError("encoding overflow"))?;
             }
+            if version2 && b.source.is_some() {
+                n = n
+                    .checked_add(4)
+                    .ok_or(DatabaseClaimError("encoding overflow"))?;
+                if let Some(fence) = b.source.as_ref().and_then(|s| s.lease_fence.as_ref()) {
+                    n = n
+                        .checked_add(
+                            fence
+                                .canonical_bytes()
+                                .map_err(|_| DatabaseClaimError("lease fence"))?
+                                .len(),
+                        )
+                        .ok_or(DatabaseClaimError("encoding overflow"))?;
+                }
+            }
             n = n
                 .checked_add(
                     b.participants
@@ -522,7 +681,15 @@ impl DatabaseClaimInventory {
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let mut out = Vec::with_capacity(self.encoded_len()?);
-        out.extend_from_slice(b"YWCB\x01\x00");
+        let version2 = self
+            .bindings
+            .iter()
+            .any(|b| b.source.as_ref().is_some_and(|s| s.lease_fence.is_some()));
+        out.extend_from_slice(if version2 {
+            b"YWCB\x02\x00"
+        } else {
+            b"YWCB\x01\x00"
+        });
         put_string(&mut out, &self.header.profile);
         put_string(&mut out, &self.header.acquisition);
         put_u64(&mut out, self.header.ownership_generation);
@@ -545,6 +712,17 @@ impl DatabaseClaimInventory {
                 put_string(&mut out, &s.media_root);
                 put_string(&mut out, &s.lease_owner);
                 put_u64(&mut out, s.lease_epoch);
+                if version2 {
+                    let bytes = s
+                        .lease_fence
+                        .as_ref()
+                        .map(|f| f.canonical_bytes())
+                        .transpose()
+                        .map_err(|_| DatabaseClaimError("lease fence"))?
+                        .unwrap_or_default();
+                    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&bytes);
+                }
             }
             put_u64(&mut out, b.current_revision);
             out.extend_from_slice(&(b.participants.len() as u16).to_le_bytes());
@@ -570,10 +748,13 @@ impl DatabaseClaimInventory {
         Ok(out)
     }
     pub(crate) fn digest(&self) -> Result<[u8; 32]> {
-        Ok(blake3::derive_key(
-            "yield.database-claim-inventory.v1",
-            &self.encode()?,
-        ))
+        let bytes = self.encode()?;
+        let domain = if bytes.starts_with(b"YWCB\x02\x00") {
+            "yield.database-claim-inventory.v2"
+        } else {
+            "yield.database-claim-inventory.v1"
+        };
+        Ok(blake3::derive_key(domain, &bytes))
     }
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         require(
@@ -581,7 +762,12 @@ impl DatabaseClaimInventory {
             "aggregate encoding bound",
         )?;
         let mut r = Reader(bytes);
-        require(r.take(6)? == b"YWCB\x01\x00", "inventory magic/version")?;
+        let magic = r.take(6)?;
+        let version2 = magic == b"YWCB\x02\x00";
+        require(
+            version2 || magic == b"YWCB\x01\x00",
+            "inventory magic/version",
+        )?;
         let header = InventoryHeader {
             profile: r.string()?,
             acquisition: r.string()?,
@@ -617,6 +803,26 @@ impl DatabaseClaimInventory {
                     media_root: r.string()?,
                     lease_owner: r.string()?,
                     lease_epoch: r.u64()?,
+                    lease_fence: if version2 {
+                        let len = u32::from_le_bytes(r.take(4)?.try_into().expect("scope length"))
+                            as usize;
+                        require(
+                            len <= super::source_lease_binding::MAX_SOURCE_LEASE_SCOPE_BYTES,
+                            "lease scope bound",
+                        )?;
+                        if len == 0 {
+                            None
+                        } else {
+                            Some(
+                                super::source_lease_binding::StoredSourceLeaseFence::decode(
+                                    r.take(len)?,
+                                )
+                                .map_err(|_| DatabaseClaimError("lease scope image"))?,
+                            )
+                        }
+                    } else {
+                        None
+                    },
                 })
             } else {
                 None
@@ -640,6 +846,7 @@ impl DatabaseClaimInventory {
                     3 => RevisionDomain::GlobalRegistry,
                     4 => RevisionDomain::GlobalPreferences,
                     5 => RevisionDomain::GlobalVocabulary,
+                    6 if version2 => RevisionDomain::SourceLeaseLifecycle,
                     _ => return Err(DatabaseClaimError("revision tag")),
                 };
                 participants.push(DatabaseParticipant {
@@ -708,7 +915,8 @@ impl DatabaseClaimInventory {
 
 /// Digest the actual bounded, validated family as represented by its existing versioned codec.
 /// Canonical object ordering is chosen by serde_json::Value, not supplied JSON order. Mutable
-/// phase/disposition/checkpoints, OperationId and timestamps are excluded. Requirement is bound.
+/// phase/disposition/checkpoints, outer OperationId and timestamps are excluded. Requirement is bound.
+/// Explicit frozen families retain their nested operation/work correlations (including V18).
 pub(crate) fn command_digest(
     record: &super::codec::StoredOperationRecord,
     requirement: u8,

@@ -133,3 +133,169 @@ fn actual_busy_empty_preparation_restores_owner_and_drop_closes_before_lease_rel
     other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
     assert_eq!(row(&other).3, "released");
 }
+
+#[test]
+fn original_pre_audit_preparation_captures_exact_registration_and_rejects_foreign_or_reused_binding()
+ {
+    use yield_library::operation_journal::source_lease_binding::StoredSourceLeaseFence;
+    use yield_library::sample_sources::db::SourceRegistryRegistrationPhase;
+    let temp = tempfile::tempdir().unwrap();
+    let _root = AppRootGuard::set(temp.path().join("profile")).unwrap();
+    let profile = WritableProfileGuard::acquire_current().unwrap();
+    let media = temp.path().join("media");
+    let foreign_media = temp.path().join("foreign");
+    fs::create_dir(&media).unwrap();
+    fs::create_dir(&foreign_media).unwrap();
+    let owner = source(&media, &profile, "source");
+    let registration = owner.catalog_database().prepare_source_authority().unwrap();
+    let foreign = source(&foreign_media, &profile, "foreign");
+    let foreign_registration = foreign
+        .catalog_database()
+        .prepare_source_authority()
+        .unwrap();
+    let before = owner.current_scan_fence().unwrap();
+    assert!(owner.current_revision().is_err());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let observation = owner
+        .capture_lease_maintenance_allocation(deadline)
+        .unwrap();
+    let prepared = owner
+        .prepare_lease_maintenance(observation, deadline)
+        .unwrap();
+    let binding = prepared.capture_lease_binding(&registration).unwrap();
+    assert_eq!(binding.stored_fence().preparation_nonce(), prepared.nonce());
+    let subject = binding.stored_fence().subject();
+    assert_eq!(
+        subject.audit(),
+        &SourceRegistryAuditObservation::Unavailable {}
+    );
+    assert_eq!(subject.scan_revision(), before.revision());
+    assert_eq!(
+        subject.registration().unwrap().phase(),
+        SourceRegistryRegistrationPhase::Prepared
+    );
+    let bytes = binding.stored_fence().canonical_bytes().unwrap();
+    assert_eq!(
+        StoredSourceLeaseFence::decode(&bytes).unwrap(),
+        *binding.stored_fence()
+    );
+    prepared
+        .validate_lease_binding(&binding, &registration)
+        .unwrap();
+    assert!(
+        prepared
+            .capture_lease_binding(&foreign_registration)
+            .is_err()
+    );
+    assert!(
+        prepared
+            .validate_lease_binding(&binding, &foreign_registration)
+            .is_err()
+    );
+    let owner = prepared.abort().unwrap();
+    assert_eq!(owner.current_scan_fence().unwrap(), before);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let observation = owner
+        .capture_lease_maintenance_allocation(deadline)
+        .unwrap();
+    let prepared = owner
+        .prepare_lease_maintenance(observation, deadline)
+        .unwrap();
+    assert!(
+        prepared
+            .validate_lease_binding(&binding, &registration)
+            .is_err()
+    );
+    let new_binding = prepared.capture_lease_binding(&registration).unwrap();
+    assert_ne!(
+        new_binding.stored_fence().preparation_nonce(),
+        binding.stored_fence().preparation_nonce()
+    );
+    // A new preparation cannot reuse the previous capture, even with unchanged stored facts.
+    let owner = prepared.abort().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let observation = owner
+        .capture_lease_maintenance_allocation(deadline)
+        .unwrap();
+    let prepared = owner
+        .prepare_lease_maintenance(observation, deadline)
+        .unwrap();
+    assert!(
+        prepared
+            .validate_lease_binding(&new_binding, &registration)
+            .is_err()
+    );
+    drop(registration);
+    drop(foreign_registration);
+    prepared.abort().unwrap().close().unwrap();
+    foreign.close().unwrap();
+    let owner = source(&media, &profile, "source");
+    let registration = owner.catalog_database().prepare_source_authority().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let observation = owner
+        .capture_lease_maintenance_allocation(deadline)
+        .unwrap();
+    let prepared = owner
+        .prepare_lease_maintenance(observation, deadline)
+        .unwrap();
+    assert!(
+        prepared
+            .validate_lease_binding(&binding, &registration)
+            .is_err()
+    );
+    assert_ne!(
+        prepared
+            .capture_lease_binding(&registration)
+            .unwrap()
+            .stored_fence()
+            .subject()
+            .lease_epoch(),
+        binding.stored_fence().subject().lease_epoch()
+    );
+    drop(registration);
+    prepared.abort().unwrap().close().unwrap();
+}
+
+#[test]
+fn captured_binding_refuses_replaced_root_and_elapsed_original_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    let _root = AppRootGuard::set(temp.path().join("profile")).unwrap();
+    let profile = WritableProfileGuard::acquire_current().unwrap();
+    let media = temp.path().join("media");
+    fs::create_dir(&media).unwrap();
+    let owner = source(&media, &profile, "source");
+    let registration = owner.catalog_database().prepare_source_authority().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let observation = owner
+        .capture_lease_maintenance_allocation(deadline)
+        .unwrap();
+    let prepared = owner
+        .prepare_lease_maintenance(observation, deadline)
+        .unwrap();
+    let binding = prepared.capture_lease_binding(&registration).unwrap();
+    let retained = temp.path().join("original-media");
+    fs::rename(&media, &retained).unwrap();
+    fs::create_dir(&media).unwrap();
+    assert!(
+        prepared
+            .validate_lease_binding(&binding, &registration)
+            .is_err()
+    );
+    assert!(prepared.capture_lease_binding(&registration).is_err());
+    fs::remove_dir(&media).unwrap();
+    fs::rename(&retained, &media).unwrap();
+    prepared
+        .validate_lease_binding(&binding, &registration)
+        .unwrap();
+    std::thread::sleep(
+        deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+    );
+    assert!(
+        prepared
+            .validate_lease_binding(&binding, &registration)
+            .is_err()
+    );
+    assert!(prepared.capture_lease_binding(&registration).is_err());
+    drop(registration);
+    prepared.abort().unwrap().close().unwrap();
+}
