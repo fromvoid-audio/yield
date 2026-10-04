@@ -268,3 +268,7 @@ pub(crate) fn capture(
     }
     Ok(result)
 }
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+pub(crate) mod workloads;

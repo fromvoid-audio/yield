@@ -176,3 +176,7 @@ impl Drop for EnteredLifecyclePolicy<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod workload_tests;
