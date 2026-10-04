@@ -18,6 +18,71 @@ pub struct SourceLeaseMaintenanceAllocation {
     deadline: Instant,
 }
 impl SourceLeaseMaintenanceAllocation {
+    pub(super) fn validate_retained(
+        &self,
+        writer: &SourceWriter,
+        deadline: Instant,
+        entered: bool,
+    ) -> Result<(), LifecycleAllocationError> {
+        use LifecycleAllocationError::Unknown;
+        if !Weak::ptr_eq(&self.owner, &Arc::downgrade(&writer.reference_liveness)) {
+            return Err(Unknown);
+        }
+        let _extensions = crate::sqlite_ext::try_extension_free_metadata_scope().ok_or(Unknown)?;
+        lifecycle_allocation::bounded_read(&writer.database.connection, deadline, || {
+            let lease = writer.database.source_lease.as_deref().ok_or(Unknown)?;
+            let expiry = lease.validate_current_owner().map_err(|_| Unknown)?;
+            require_expiry(expiry, deadline)?;
+            super::super::super::schema::require_known_metadata_schema(&writer.database.connection)
+                .map_err(|_| Unknown)?;
+            let scan = writer.current_scan_fence().map_err(|_| Unknown)?;
+            let actual = if writer.database.connection.is_autocommit() {
+                writer.capture_registry_reference_observation(None)
+            } else {
+                super::super::super::source_registry_reference::capture_in_transaction(
+                    &writer.database,
+                    &scan,
+                )
+            }
+            .map_err(|_| Unknown)?;
+            if actual.subject() != &self.subject {
+                return Err(Unknown);
+            }
+            let binding = writer
+                .database
+                .database_file_binding
+                .as_deref()
+                .ok_or(Unknown)?;
+            let allocation = lifecycle_allocation::capture(
+                &writer.database.connection,
+                binding.root(),
+                binding.name(),
+                LifecycleAllocationRole::SourceLeaseMaintenance,
+                deadline,
+            )?;
+            if (entered && !self.allocation.matches_entered(&allocation))
+                || (!entered && self.allocation != allocation)
+            {
+                return Err(Unknown);
+            }
+            if lifecycle_allocation::capture(
+                &writer.database.connection,
+                binding.root(),
+                binding.name(),
+                LifecycleAllocationRole::SourceLeaseMaintenance,
+                deadline,
+            )? != allocation
+            {
+                return Err(Unknown);
+            }
+            super::super::super::schema::require_known_metadata_schema(&writer.database.connection)
+                .map_err(|_| Unknown)?;
+            writer.validate_scan_fence(&scan).map_err(|_| Unknown)?;
+            lease.validate_current_owner().map_err(|_| Unknown)?;
+            Ok(())
+        })
+    }
+
     /// Historical original source/lifecycle/lease tuple; it conveys no live source custody.
     pub fn subject(&self) -> &super::super::super::SourceRegistryReferenceSubject {
         &self.subject
@@ -46,19 +111,7 @@ impl SourceWriter {
         lifecycle_allocation::bounded_read(&self.database.connection, deadline, || {
             let lease = self.database.source_lease.as_deref().ok_or(Unknown)?;
             let expiry = lease.validate_current_owner().map_err(|_| Unknown)?;
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(LifecycleAllocationError::Budget)?;
-            let required = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| Unknown)?
-                .checked_add(remaining)
-                .and_then(|v| v.as_secs().checked_add(u64::from(v.subsec_nanos() != 0)))
-                .and_then(|v| i64::try_from(v).ok())
-                .ok_or(Unknown)?;
-            if expiry <= required {
-                return Err(Unknown);
-            }
+            require_expiry(expiry, deadline)?;
             super::super::super::schema::require_known_metadata_schema(&self.database.connection)
                 .map_err(|_| Unknown)?;
             let before = self
@@ -117,6 +170,24 @@ impl SourceWriter {
         if actual.subject != observation.subject || actual.allocation != observation.allocation {
             return Err(LifecycleAllocationError::Unknown);
         }
+        Ok(())
+    }
+}
+
+fn require_expiry(expiry: i64, deadline: Instant) -> Result<(), LifecycleAllocationError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(LifecycleAllocationError::Budget)?;
+    let required = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| LifecycleAllocationError::Unknown)?
+        .checked_add(remaining)
+        .and_then(|v| v.as_secs().checked_add(u64::from(v.subsec_nanos() != 0)))
+        .and_then(|v| i64::try_from(v).ok())
+        .ok_or(LifecycleAllocationError::Unknown)?;
+    if expiry <= required {
+        Err(LifecycleAllocationError::Unknown)
+    } else {
         Ok(())
     }
 }

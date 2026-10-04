@@ -355,3 +355,56 @@ gap, not deferred native verification. OPT-2136/2168/2169/2170/2202/2195/2196 an
 tracking parents remain open; native OPT-2199/2200 must also establish their
 actual descriptor/mapped-object primitive and genuine physical/backend evidence.
 Contract fixtures or these observers do not complete those production routes.
+
+## Original pre-audit source MAIN preparation (OPT-2245)
+
+`SourceWriter::prepare_lease_maintenance` consumes the original weak-issuer-bound
+OPT-2244 allocation observation and the same genuine writer. Its distinct owned
+`SourceLeaseMaintenancePreparation` holds one nonblocking empty `BEGIN IMMEDIATE`,
+the selected source pager maximum (at most 64 MiB), memory temp storage, disabled
+cache spill and automatic checkpointing, original settings, and extension exclusion.
+It exposes only historical source/lease/root/profile/scan/optional-audit observations,
+a local nonce and actual retained WAL length. It does not require or manufacture
+an authoritative `SourceRevision`. Existing audited tag/layout/source preparations
+retain their acceptance and types.
+
+The preparation checks readonly actual lease ownership/expiry, the original weak
+writer identity, finite exact known source schema/runtime, optional bounded audit
+and directory metadata, and current original MAIN/WAL/mapped-SHM identities and
+lengths. The original deadline is the minimum requested/captured deadline, at most
+two seconds; revalidation never extends it or renews the lease. Changed, moved,
+foreign or reacquired issuers, unknown native objects, hard/unknown WAL, expired or
+superseded leases and competing MAIN writers fail closed. Snapshot readiness remains
+a diagnostic of the existing genuine source-authority close rules; no close or
+retirement acknowledgement is produced here.
+
+Explicit `abort` is the pre-intent cancellation boundary. It confirms rollback,
+reads back the original busy timeout, validates retained scope/native facts and
+restores exact original pager/temp/spill/checkpoint settings before returning the
+same writer. Cleanup uses a separate cooperative two-second window solely to prove
+safe reuse after an expired preparation; it cannot refresh the original deadline,
+observation or nonce, or admit an effect. Failed acquisition, rollback, timeout
+readback, object/owner validation or settings restoration retains private original
+custody. A partially installed policy can be restored; failed settings restoration
+is sticky and never revives the owner. A pre-existing transaction is never adopted
+or rolled back. Drop/unwind closes the original ordinary connection before lease
+release and before extension exclusion ends, including uncertain cleanup. It does
+not queue a separate control writer behind retained MAIN.
+
+Actual normal-build never-audited source owners exercise simultaneous empty MAIN
+reservations, unchanged durable lease rows/revisions/audit absence/receipt inventory,
+competing-writer refusal, busy failure, explicit abort and drop. Actual SQLite/unit
+faults cover each pager setting's install/restore, acquisition, rollback and timeout
+readback, original expiry/deadline, changed native SHM/media root, weak issuer
+substitution/reacquisition, retained genuine snapshot custody, hard/unknown native
+WAL facts and unwind. Corrupted lease, settings, method and schema fixtures are
+negative boundary tests; they are not journal registration or physical qualification.
+
+This is owned empty preparation only. OPT-2136 still needs the real all-owner
+pre-intent decision latch; OPT-2168/2169 need genuine attempts and retained required
+commit; OPT-2202 needs admitted release and actual sealed close. OPT-2194 still needs
+legally versioned lease-maintenance DB-claim/lifecycle binding and physical policy
+qualification. The existing audit-qualified `SourceAuthoritative` domain cannot be
+reinterpreted. This preparation grants no intent, claim, permit, lease release,
+receipt, retry, refund or settlement. Journal schema 12 and source schema remain
+unchanged; native unsupported facts continue to refuse.

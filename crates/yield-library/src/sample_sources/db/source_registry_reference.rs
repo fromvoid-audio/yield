@@ -440,6 +440,25 @@ pub(crate) fn capture(
     fence: &SourceScanFence,
     registration: Option<&SourceAuthorityRegistration>,
 ) -> Result<SourceRegistryReferenceObservation, SourceRegistryReferenceError> {
+    capture_impl(database, fence, registration, false)
+}
+
+pub(crate) fn capture_in_transaction(
+    database: &SourceDatabase,
+    fence: &SourceScanFence,
+) -> Result<SourceRegistryReferenceObservation, SourceRegistryReferenceError> {
+    if database.connection.is_autocommit() {
+        return Err(SourceDbError::Unexpected.into());
+    }
+    capture_impl(database, fence, None, true)
+}
+
+fn capture_impl(
+    database: &SourceDatabase,
+    fence: &SourceScanFence,
+    registration: Option<&SourceAuthorityRegistration>,
+    in_transaction: bool,
+) -> Result<SourceRegistryReferenceObservation, SourceRegistryReferenceError> {
     let profile = database
         .profile_guard
         .as_ref()
@@ -456,9 +475,17 @@ pub(crate) fn capture(
     let registration = registration
         .map(|r| r.registry_reference_observation(database))
         .transpose()?;
-    let audit = database.last_authoritative_audit_metadata()?;
+    let audit = if in_transaction {
+        database.last_authoritative_audit_metadata_in_transaction()?
+    } else {
+        database.last_authoritative_audit_metadata()?
+    };
     // Existing BoundedPage inspection, not FullIntegrity's table traversal.
-    let directory_state = database.source_directory_truth_state_bounded()?;
+    let directory_state = if in_transaction {
+        database.source_directory_truth_state_bounded_in_transaction()?
+    } else {
+        database.source_directory_truth_state_bounded()?
+    };
     let audit = match (audit, directory_state) {
         (
             Some(a),
