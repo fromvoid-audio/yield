@@ -365,9 +365,8 @@ drain, outer worker panic, inner SQLite command panic/rollback, mutex poison and
 unconfirmable refund. The explicit no-capacity bootstrap fixture grants command/
 storage behavior only; no native capacity or publication capability is fabricated.
 
-This is the input-margin prerequisite, not the full lifetime gate. The existing
-32-command FIFO and 64-result limits can still reject a control request. Reserved
-queue/result responsiveness, the 2 MiB publication-backing debit, 32 real slots,
+This completes the input-margin prerequisite. OPT-2256 below supplies reserved
+queue/result responsiveness. The 2 MiB publication-backing debit, 32 real slots,
 exact grant/charge/target associations, provider mirrors, native resource-use
 counts, cancellation/release fences, completion polling, resource unwind guard,
 settlement and publication-aware shutdown remain mandatory OPT-2215 work.
@@ -389,3 +388,51 @@ bash scripts/agent.sh preflight
 Run canonical preflight on a stable committed HEAD. These sibling test modules
 have explicit test-only scope; no include! formatting exemption or guard waiver
 is required.
+
+
+## Reserved journal command/results and control scheduling (OPT-2256)
+
+The actual worker now receives two private bounded queues: 28 ordinary entries and
+four control entries, preserving the original aggregate 32 queued commands. The
+64 outstanding-result credits are similarly partitioned into 60 ordinary and
+four control handles. The fixed private command classification above selects
+all three credit classes together. A tiny ordinary lookup cannot consume the
+control margin; callers cannot set a priority or borrow unused control credits.
+A dropped result handle returns only its exact result-class credit. Accepted
+command backing remains charged until execution/rejection/drop, including after
+lost replies. Poisoned or unconfirmable result debits/refunds make admission
+unavailable without resetting unknown accounting or panicking in Drop.
+
+The worker checks control before selecting another ordinary command and preserves
+FIFO within each class. Idle control receive wakes immediately; a finite 50ms
+receive poll revisits ordinary arrival and disconnection. One already-selected
+ordinary command may precede newly arrived control, and running SQL is never
+preempted. Queue acceptance does not acknowledge a committed intent. A control
+request may overtake an ordinary intent and therefore be rejected by the real
+store's unchanged missing-intent, expected-sequence, family and ownership checks.
+There is no global cross-class FIFO, scheduler latency guarantee, physical
+quiescence or completed-cancellation claim. Sustained control traffic may delay
+ordinary work; bounded queue capacity does not bound SQL execution time.
+
+Command drain closes admission while retaining both queues and original runtime
+resources. External shutdown disconnects both senders, drains accepted work and
+joins the worker. Bootstrap failure/outer panic drops both receivers; command
+panic rejects both pending queues. None of this supplies publication-aware
+shutdown, a native resource-use guard or clean physical settlement.
+
+Actual profile-owned SQLite tests block inside the first transaction, fill all
+28 ordinary entries, then enqueue four controls. Durable sequence values prove
+control priority and each class's FIFO; overtaken missing intent and stale CAS
+are refused. Both queues drain after admission closes while the original store
+lease remains retained until external join. Other real worker tests retain 60
+ordinary results while executing four controls, verify exact class refunds,
+queue saturation with lost replies, idle wake, each half disconnected, both-queue
+inner/outer panic and checked/poisoned accounting. Explicit no-capacity fixtures
+exercise storage/command behavior only. Full OPT-2215 and all its physical,
+publication, completion and settlement dependencies remain open.
+
+```sh
+cargo test --locked -p yield-library --lib control_
+cargo test --locked -p yield-library --lib
+bash scripts/agent.sh preflight
+```

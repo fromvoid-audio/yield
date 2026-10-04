@@ -124,11 +124,118 @@ enum PreparedAdmissionFactsFault {
     Replaced,
 }
 
-/// Maximum number of journal commands waiting for the storage owner.
+/// Aggregate queued-command limit, privately split into 28 ordinary and four control entries.
 pub const OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY: usize = 32;
 
-/// Maximum number of results that may remain outstanding across all journal clients.
+/// Aggregate outstanding-result limit, privately split into 60 ordinary and four control entries.
 pub const OPERATION_JOURNAL_OWNER_RESULT_CAPACITY: usize = 64;
+
+const CONTROL_COMMAND_CAPACITY: usize = 4;
+const ORDINARY_COMMAND_CAPACITY: usize =
+    OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY - CONTROL_COMMAND_CAPACITY;
+const CONTROL_RESULT_CAPACITY: usize = 4;
+const ORDINARY_RESULT_CAPACITY: usize =
+    OPERATION_JOURNAL_OWNER_RESULT_CAPACITY - CONTROL_RESULT_CAPACITY;
+const CONTROL_RECEIVE_POLL: Duration = Duration::from_millis(50);
+
+impl InputClass {
+    fn result_limit(self) -> usize {
+        match self {
+            Self::Ordinary => ORDINARY_RESULT_CAPACITY,
+            Self::Control => CONTROL_RESULT_CAPACITY,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResultBudget {
+    remaining: [usize; 2],
+    unavailable: bool,
+}
+impl ResultBudget {
+    fn new() -> Self {
+        Self {
+            remaining: [ORDINARY_RESULT_CAPACITY, CONTROL_RESULT_CAPACITY],
+            unavailable: false,
+        }
+    }
+    fn valid(&self) -> bool {
+        !self.unavailable
+            && self.remaining[0] <= ORDINARY_RESULT_CAPACITY
+            && self.remaining[1] <= CONTROL_RESULT_CAPACITY
+    }
+}
+
+#[derive(Clone)]
+struct OwnerCommandSenders {
+    ordinary: SyncSender<JournalCommand>,
+    control: SyncSender<JournalCommand>,
+}
+impl OwnerCommandSenders {
+    fn sender(&self, class: InputClass) -> &SyncSender<JournalCommand> {
+        match class {
+            InputClass::Ordinary => &self.ordinary,
+            InputClass::Control => &self.control,
+        }
+    }
+}
+
+struct OwnerCommandReceivers {
+    ordinary: Receiver<JournalCommand>,
+    control: Receiver<JournalCommand>,
+}
+impl OwnerCommandReceivers {
+    fn channel() -> (OwnerCommandSenders, Self) {
+        let (ordinary_tx, ordinary) = mpsc::sync_channel(ORDINARY_COMMAND_CAPACITY);
+        let (control_tx, control) = mpsc::sync_channel(CONTROL_COMMAND_CAPACITY);
+        (
+            OwnerCommandSenders {
+                ordinary: ordinary_tx,
+                control: control_tx,
+            },
+            Self { ordinary, control },
+        )
+    }
+
+    // FIFO within each class; no global FIFO promise. A control request arriving after the
+    // control check may follow one selected ordinary command. No running SQL is preempted.
+    fn recv(&self) -> Option<JournalCommand> {
+        loop {
+            let control_disconnected = match self.control.try_recv() {
+                Ok(command) => return Some(command),
+                Err(TryRecvError::Disconnected) => true,
+                Err(TryRecvError::Empty) => false,
+            };
+            let ordinary_disconnected = match self.ordinary.try_recv() {
+                Ok(command) => return Some(command),
+                Err(TryRecvError::Disconnected) => true,
+                Err(TryRecvError::Empty) => false,
+            };
+            if control_disconnected && ordinary_disconnected {
+                return None;
+            }
+            // Wait on control when connected, so controls wake an idle worker immediately.
+            // Ordinary arrival is revisited within 50ms; disconnection wakes the wait too.
+            let receiver = if control_disconnected {
+                &self.ordinary
+            } else {
+                &self.control
+            };
+            match receiver.recv_timeout(CONTROL_RECEIVE_POLL) {
+                Ok(command) => return Some(command),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+            }
+        }
+    }
+
+    fn reject_pending(&self, error: impl Fn() -> OperationJournalOwnerError) {
+        for receiver in [&self.control, &self.ordinary] {
+            while let Ok(command) = receiver.try_recv() {
+                reject_command(command, error());
+            }
+        }
+    }
+}
 
 /// Aggregate input credit for accepted queued and executing commands, including a 64 KiB control margin.
 pub const OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES: usize = MAX_RECORD_BYTES * 4;
@@ -165,10 +272,10 @@ pub enum OperationJournalOwnerQueueError {
     /// The owner worker has not entered its command loop.
     #[error("operation journal owner is initializing")]
     Initializing,
-    /// The fixed-capacity command queue is full.
+    /// The private ordinary or control command queue is full.
     #[error("operation journal owner command queue is full")]
     Full,
-    /// All bounded result handles are already outstanding.
+    /// All result handles in the private ordinary or control class are outstanding.
     #[error("operation journal owner result capacity is full")]
     ResultsFull,
     /// The bounded input-byte budget is currently exhausted.
@@ -3808,7 +3915,7 @@ impl OperationJournalOwner {
             std::path::PathBuf,
         >,
     ) -> Result<Self, OperationJournalOwnerStartError> {
-        let (command_tx, command_rx) = mpsc::sync_channel(OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY);
+        let (command_tx, command_rx) = OwnerCommandReceivers::channel();
         let shared = Arc::new(OwnerShared::new(command_tx));
         #[cfg(test)]
         let prepared_admission_id_allocations = Arc::new(AtomicUsize::new(0));
@@ -4634,10 +4741,10 @@ impl OperationJournalClient {
             .cloned()
             .ok_or(OperationJournalOwnerQueueError::Closed)?;
         let input = self.shared.reserve_input(class, input_bytes)?;
-        let result_permit = self.shared.reserve_result()?;
+        let result_permit = self.shared.reserve_result(class)?;
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let command = build(input, result_tx);
-        match sender.try_send(command) {
+        match sender.sender(class).try_send(command) {
             Ok(()) => Ok(OperationJournalRequest {
                 receiver: result_rx,
                 result_permit: Some(result_permit),
@@ -4770,25 +4877,25 @@ fn bounded_json_input<T: serde::Serialize>(
 }
 
 struct OwnerShared {
-    commands: Mutex<Option<SyncSender<JournalCommand>>>,
+    commands: Mutex<Option<OwnerCommandSenders>>,
     admission_gate: Mutex<()>,
     lifecycle: AtomicU8,
     unavailable: Mutex<Option<String>>,
     input_bytes: Mutex<InputBudget>,
-    results: Mutex<usize>,
+    results: Mutex<ResultBudget>,
     #[cfg(test)]
     shutdown_cas_gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
 }
 
 impl OwnerShared {
-    fn new(commands: SyncSender<JournalCommand>) -> Self {
+    fn new(commands: OwnerCommandSenders) -> Self {
         Self {
             commands: Mutex::new(Some(commands)),
             admission_gate: Mutex::new(()),
             lifecycle: AtomicU8::new(OwnerLifecycle::Initializing as u8),
             unavailable: Mutex::new(None),
             input_bytes: Mutex::new(InputBudget::new()),
-            results: Mutex::new(OPERATION_JOURNAL_OWNER_RESULT_CAPACITY),
+            results: Mutex::new(ResultBudget::new()),
             #[cfg(test)]
             shutdown_cas_gate: Mutex::new(None),
         }
@@ -4880,17 +4987,31 @@ impl OwnerShared {
         })
     }
 
-    fn reserve_result(self: &Arc<Self>) -> Result<ResultPermit, OperationJournalOwnerQueueError> {
-        let mut remaining = self
-            .results
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *remaining == 0 {
-            return Err(OperationJournalOwnerQueueError::ResultsFull);
+    fn reserve_result(
+        self: &Arc<Self>,
+        class: InputClass,
+    ) -> Result<ResultPermit, OperationJournalOwnerQueueError> {
+        let mut budget = self.results.lock().map_err(|_| {
+            self.mark_unavailable("journal result credit mutex is poisoned");
+            OperationJournalOwnerQueueError::Unavailable {
+                reason: "journal result credit mutex is poisoned".into(),
+            }
+        })?;
+        if !budget.valid() {
+            budget.unavailable = true;
+            drop(budget);
+            self.mark_unavailable("journal result credit accounting is unavailable");
+            return Err(OperationJournalOwnerQueueError::Unavailable {
+                reason: "journal result credit accounting is unavailable".into(),
+            });
         }
-        *remaining -= 1;
+        let remaining = &mut budget.remaining[class.index()];
+        *remaining = remaining
+            .checked_sub(1)
+            .ok_or(OperationJournalOwnerQueueError::ResultsFull)?;
         Ok(ResultPermit {
             shared: Arc::clone(self),
+            class,
         })
     }
 
@@ -4913,15 +5034,21 @@ impl OwnerShared {
         budget.remaining[class.index()] = after.expect("checked finite refund");
     }
 
-    fn release_result(&self) {
-        let mut remaining = self
-            .results
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *remaining = remaining
+    fn release_result(&self, class: InputClass) {
+        let Ok(mut budget) = self.results.lock() else {
+            self.mark_unavailable("journal result credit mutex is poisoned");
+            return;
+        };
+        let after = budget.remaining[class.index()]
             .checked_add(1)
-            .expect("operation journal result credit overflow");
-        assert!(*remaining <= OPERATION_JOURNAL_OWNER_RESULT_CAPACITY);
+            .filter(|n| *n <= class.result_limit());
+        if !budget.valid() || after.is_none() {
+            budget.unavailable = true;
+            drop(budget);
+            self.mark_unavailable("journal result credit refund cannot be confirmed");
+            return;
+        }
+        budget.remaining[class.index()] = after.expect("checked finite result refund");
     }
 
     fn mark_unavailable(&self, reason: &str) {
@@ -4948,11 +5075,12 @@ impl Drop for InputPermit {
 
 struct ResultPermit {
     shared: Arc<OwnerShared>,
+    class: InputClass,
 }
 
 impl Drop for ResultPermit {
     fn drop(&mut self) {
-        self.shared.release_result();
+        self.shared.release_result(self.class);
     }
 }
 
@@ -5192,7 +5320,7 @@ impl OwnerLifecycle {
 
 fn run_owner(
     store: OperationJournalStore,
-    command_rx: Receiver<JournalCommand>,
+    command_rx: OwnerCommandReceivers,
     shared: Arc<OwnerShared>,
     #[cfg(any(test, feature = "test-support"))] command_gate: Option<(
         Arc<std::sync::Barrier>,
@@ -5307,9 +5435,7 @@ fn run_owner(
     );
     if let Err(state) = starting {
         if OwnerLifecycle::from_u8(state) != OwnerLifecycle::Closing {
-            while let Ok(command) = command_rx.try_recv() {
-                reject_command(command, OperationJournalOwnerError::Closed);
-            }
+            command_rx.reject_pending(|| OperationJournalOwnerError::Closed);
             return;
         }
     }
@@ -5319,9 +5445,8 @@ fn run_owner(
     let panic_on_command = panic_on_command;
     let mut orderly_shutdown = true;
     loop {
-        let command = match command_rx.recv() {
-            Ok(command) => command,
-            Err(mpsc::RecvError) => break,
+        let Some(command) = command_rx.recv() else {
+            break;
         };
         #[cfg(any(test, feature = "test-support"))]
         if let Some((ready, release)) = command_gate.take() {
@@ -5336,9 +5461,7 @@ fn run_owner(
         if panicked {
             orderly_shutdown = false;
             shared.mark_unavailable("operation journal owner command panicked");
-            while let Ok(command) = command_rx.try_recv() {
-                reject_command(command, OperationJournalOwnerError::WorkerPanicked);
-            }
+            command_rx.reject_pending(|| OperationJournalOwnerError::WorkerPanicked);
             break;
         }
     }
@@ -5897,6 +6020,7 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 mod tests {
     mod command_drain_tests;
     mod control_input_tests;
+    mod control_responsiveness_tests;
     mod source_registry_handoff_tests;
     #[test]
     fn recording_dispatch_binding_checks_actual_bytes_range_output_and_root() {
@@ -12124,7 +12248,7 @@ mod tests {
         let (_fixture, mut owner) = open_owner("journal-owner-results");
         let client = owner.client();
         let mut requests = Vec::new();
-        for _ in 0..OPERATION_JOURNAL_OWNER_RESULT_CAPACITY {
+        for _ in 0..ORDINARY_RESULT_CAPACITY {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {
                 match client.get(OperationId::new()) {
@@ -12173,7 +12297,7 @@ mod tests {
         let client = owner.client();
         let first = client.get(OperationId::new()).expect("first admission");
         ready.wait();
-        for _ in 0..OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY {
+        for _ in 0..ORDINARY_COMMAND_CAPACITY {
             let request = client.get(OperationId::new()).expect("queue admission");
             drop(request);
         }
