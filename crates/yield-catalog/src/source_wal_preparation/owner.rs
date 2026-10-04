@@ -123,27 +123,37 @@ impl WorkerReservations {
             .slots
             .iter_mut()
             .filter_map(|(id, slot)| {
-                let cancelled = slot.source.database.is_cancelled();
-                let changed = !current(admission, id, slot.lifecycle_generation);
+                // Validation can race service shutdown. Observe admission again afterwards;
+                // invalidation caused by closing is cancellation, not a changed source scope.
+                // Never hold admission across the original owner's SQLite validation.
                 let validation = slot
                     .source
                     .database
                     .revalidate(slot.source.source_authority.as_ref())
                     .err();
+                let (closing, changed) = {
+                    let state = admission.lock().unwrap_or_else(|p| p.into_inner());
+                    (
+                        state.shutdown || state.closed,
+                        !state.sources.get(id).is_some_and(|source| {
+                            source.active
+                                && source.lifecycle_generation == slot.lifecycle_generation
+                        }),
+                    )
+                };
+                let cancelled = closing || slot.source.database.is_cancelled();
                 if slot.rejection.is_some()
                     || cancelled
                     || changed
                     || Instant::now() >= slot.deadline
                     || validation.is_some()
                 {
-                    if slot.rejection.is_none() {
-                        slot.rejection = if cancelled {
-                            None
-                        } else if changed {
-                            Some(CatalogSourceWalRejection::Scope)
+                    if slot.rejection.is_none() && !cancelled {
+                        slot.rejection = Some(if changed {
+                            CatalogSourceWalRejection::Scope
                         } else {
-                            Some(validation.unwrap_or(CatalogSourceWalRejection::Deadline))
-                        };
+                            validation.unwrap_or(CatalogSourceWalRejection::Deadline)
+                        });
                     }
                     Some(id.clone())
                 } else {

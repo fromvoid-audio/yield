@@ -463,3 +463,61 @@ fn native_pre_audit_lease_failed_owner_uses_original_registered_drain_close_and_
     service.shutdown();
     assert!(journal.shutdown());
 }
+
+#[test]
+fn lease_shutdown_invalidation_before_original_sweep_is_cancelled_after_sqlite_cleanup() {
+    for closing in [true, false] {
+        let f = Fixture::new();
+        let (service, inputs, gate) = f.start_lease(None, None);
+        let id = source(&inputs[0]);
+        let db = f.external_id(&id);
+        let before = (lease(&db), metadata(&db));
+        let mut request = service
+            .prepare_source_lease_wal_with_binding(inputs[0].clone(), correlation(), deadline())
+            .unwrap();
+        let holder = held(&mut request);
+        let pause = gate.pause_next();
+        busy(&db);
+        if closing {
+            thread::scope(|scope| {
+                let shutdown = scope.spawn(|| service.shutdown());
+                let end = Instant::now() + Duration::from_secs(1);
+                while !service.admission.lock().unwrap().shutdown {
+                    assert!(Instant::now() < end);
+                    thread::yield_now();
+                }
+                // Original actor is paused after its preceding sweep. Shutdown has
+                // invalidated admission, but the genuine SQLite writer is still held.
+                busy(&db);
+                pause.release();
+                shutdown.join().unwrap();
+            });
+            assert_eq!(request.status(), CatalogSourceWalStatus::Aborted);
+        } else {
+            // Actual lifecycle changes while open must retain Scope refusal.
+            service
+                .admission
+                .lock()
+                .unwrap()
+                .sources
+                .get_mut(&id)
+                .unwrap()
+                .lifecycle_generation += 1;
+            pause.release();
+            wait(&request, |status| {
+                *status == CatalogSourceWalStatus::Rejected(CatalogSourceWalRejection::Scope)
+            });
+            service.shutdown();
+        }
+        db.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        let after = lease(&db);
+        assert_eq!(
+            (&after.0, after.1, after.2, after.3),
+            (&before.0.0, before.0.1, before.0.2, before.0.3)
+        );
+        assert_eq!(after.4, "released");
+        assert_eq!(metadata(&db), before.1);
+        assert_eq!(credits(&service), (0, 0));
+        drop(holder);
+    }
+}
