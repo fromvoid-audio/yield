@@ -183,6 +183,9 @@ impl std::error::Error for RootRelativePathError {}
 pub struct RootIdentity(Vec<u8>);
 
 impl RootIdentity {
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        self.0.capacity()
+    }
     /// Construct an opaque root identity from backend-supplied bytes.
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self(bytes)
@@ -1194,6 +1197,9 @@ impl WatcherContinuityProof {
 pub struct RootRelativePath(PathBuf);
 
 impl RootRelativePath {
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        self.0.capacity()
+    }
     /// Validate and retain a native path spelling exactly as supplied.
     pub fn try_from_path(path: PathBuf) -> Result<Self, RootRelativePathError> {
         if path.as_os_str().is_empty() {

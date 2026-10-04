@@ -33,6 +33,26 @@ pub struct SourceTagAssignmentSelection {
 }
 
 impl SourceTagAssignmentSelection {
+    pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
+        let mutation = match &self.mutation {
+            SourceTagAssignmentMutation::Rename(s) => s.capacity(),
+            SourceTagAssignmentMutation::Delete => 0,
+        };
+        let base = self
+            .revision
+            .retained_heap_bytes()?
+            .checked_add(self.old_identity.capacity())?
+            .checked_add(mutation)?
+            .checked_add(
+                self.paths
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<RootRelativePath>())?,
+            )?;
+        self.paths
+            .iter()
+            .try_fold(base, |n, p| n.checked_add(p.retained_heap_bytes()))
+    }
+
     /// Source, physical binding and lifecycle represented by this observation.
     pub fn revision(&self) -> &SourceRevision {
         &self.revision

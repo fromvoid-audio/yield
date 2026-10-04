@@ -27,6 +27,10 @@ pub struct SourceLayoutMetadataBudget {
     required_bytes: u64,
 }
 impl SourceLayoutMetadataBudget {
+    pub(crate) fn retained_input_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>().checked_add(self.revision.retained_heap_bytes()?)
+    }
+
     fn same_facts(&self, other: &Self) -> bool {
         (
             self.page_size,

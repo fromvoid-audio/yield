@@ -105,14 +105,24 @@ impl EnteredMetadataPolicy {
             .map_err(SourceWriterError::from)
     }
 
-    pub(super) fn validate(&self, database: &SourceDatabase) -> Result<(), SourceWriterError> {
-        database.validate_profile_owned_mutation()?;
+    pub(super) fn validate_parked(
+        &self,
+        database: &SourceDatabase,
+    ) -> Result<(), SourceWriterError> {
+        // The original held owner separately validates CONTROL/native custody.
+        // Do not read ordinary source rows or renew its lease while parked.
         if self.finished
             || database.tag_metadata_policy_state.get() != TAG_METADATA_POLICY_ENTERED
             || Settings::read(&database.connection)? != self.entered
         {
             return Err(SourceWriterError::MetadataBoundNotDefined);
         }
+        Ok(())
+    }
+
+    pub(super) fn validate(&self, database: &SourceDatabase) -> Result<(), SourceWriterError> {
+        database.validate_profile_owned_mutation()?;
+        self.validate_parked(database)?;
         schema::require_known_metadata_schema(&database.connection)
             .map_err(|_| SourceWriterError::MetadataBoundNotDefined)?;
         let page_size: u64 = database

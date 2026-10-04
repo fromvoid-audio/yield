@@ -15,7 +15,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
+mod policy;
 mod producer;
+pub use policy::SourceWalPolicyFamily;
+use policy::{Native, RequestPolicy};
 mod scope;
 pub use producer::{SourceWalOwnerObservation, SourceWalTransportOwner};
 use scope::{ByteCredit, ScopeView};
@@ -126,6 +129,7 @@ struct ObservationData {
     nonce: String,
     wal_bytes: u64,
     scope: Option<ScopeView>,
+    policy_family: Option<SourceWalPolicyFamily>,
     _credit: ByteCredit,
 }
 impl PartialEq for SourceWalTransportObservation {
@@ -135,10 +139,17 @@ impl PartialEq for SourceWalTransportObservation {
             && self.data.nonce == other.data.nonce
             && self.data.wal_bytes == other.data.wal_bytes
             && self.data.scope == other.data.scope
+            && self.data.policy_family == other.data.policy_family
     }
 }
 impl Eq for SourceWalTransportObservation {}
 impl SourceWalTransportObservation {
+    /// Historical family marker issued only after the actual owned policy entered successfully.
+    /// This never proves current journal registration, physical allocation or settlement.
+    pub fn policy_family(&self) -> Option<SourceWalPolicyFamily> {
+        self.data.policy_family
+    }
+
     /// Borrow typed historical original scope. It cannot recreate live owner custody or a latch.
     pub fn original_binding(&self) -> Option<&crate::sample_sources::db::write::SourceWalBinding> {
         self.data.scope.as_ref().map(ScopeView::binding)
@@ -276,7 +287,17 @@ struct PrepareRequest {
     deadline: Instant,
     ticket: Arc<Ticket>,
     require_binding: bool,
+    policy: Option<RequestPolicy>,
 }
+impl PrepareRequest {
+    fn finish(self, status: SourceWalTransportStatus) {
+        let ticket = Arc::clone(&self.ticket);
+        // Drop boxed policy, selections and revision allocations before refunding input.
+        drop(self);
+        ticket.finish(status);
+    }
+}
+
 struct Queue {
     requests: VecDeque<PrepareRequest>,
     slots: usize,
@@ -323,7 +344,7 @@ fn close(shared: &Arc<Shared>) {
         q.requests.drain(..).collect::<Vec<_>>()
     };
     for request in pending {
-        request.ticket.finish(SourceWalTransportStatus::Rejected(
+        request.finish(SourceWalTransportStatus::Rejected(
             SourceWalTransportRejection::Closed,
         ));
     }
@@ -361,7 +382,7 @@ impl SourceWalTransport {
         correlation: SourceWalTransportCorrelation,
         deadline: Instant,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
-        self.submit_scoped(expected, correlation, deadline, false)
+        self.submit_scoped(expected, correlation, deadline, false, None)
     }
     /// Submit strict original-binding capture; its actor must supply a genuine registration.
     pub fn submit_with_binding(
@@ -370,7 +391,44 @@ impl SourceWalTransport {
         correlation: SourceWalTransportCorrelation,
         deadline: Instant,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
-        self.submit_scoped(expected, correlation, deadline, true)
+        self.submit_scoped(expected, correlation, deadline, true, None)
+    }
+    /// Consume a genuine tag observation into strict preparation on its original source actor.
+    /// Retains the entered finite policy; original observation deadline can never be extended.
+    /// No caller settings, decoded policy, journal decision or effect permission is accepted.
+    pub fn submit_tag_with_binding(
+        &self,
+        observation: crate::sample_sources::db::SourceTagAdmissionObservation,
+        correlation: SourceWalTransportCorrelation,
+        deadline: Instant,
+    ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
+        let deadline = deadline.min(observation.original_deadline());
+        let expected = observation.selection().revision().clone();
+        self.submit_scoped(
+            expected,
+            correlation,
+            deadline,
+            true,
+            Some(RequestPolicy::Tag(Box::new(observation))),
+        )
+    }
+    /// Consume genuine layout allocation observations into original strict owned preparation.
+    /// Copies cannot substitute a current owner; the actor revalidates full facts before entry.
+    pub fn submit_layout_with_binding(
+        &self,
+        budget: crate::sample_sources::db::SourceLayoutMetadataBudget,
+        correlation: SourceWalTransportCorrelation,
+        deadline: Instant,
+    ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
+        let deadline = deadline.min(budget.observation_deadline());
+        let expected = budget.revision().clone();
+        self.submit_scoped(
+            expected,
+            correlation,
+            deadline,
+            true,
+            Some(RequestPolicy::Layout(Box::new(budget))),
+        )
     }
     fn submit_scoped(
         &self,
@@ -378,6 +436,7 @@ impl SourceWalTransport {
         correlation: SourceWalTransportCorrelation,
         deadline: Instant,
         require_binding: bool,
+        policy: Option<RequestPolicy>,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
         let now = Instant::now();
         if deadline <= now || deadline.duration_since(now) > MAX_DEADLINE {
@@ -403,6 +462,14 @@ impl SourceWalTransport {
         .and_then(|n| n.checked_mul(3))
         .and_then(|n| n.checked_add(CONTEXT_FIXED_BYTES))
         .ok_or(SourceWalTransportRejection::InvalidContext)?;
+        let size = size
+            .checked_add(match &policy {
+                Some(policy) => policy
+                    .input_bytes()
+                    .ok_or(SourceWalTransportRejection::InvalidContext)?,
+                None => 0,
+            })
+            .ok_or(SourceWalTransportRejection::InvalidContext)?;
         if size > SOURCE_WAL_TRANSPORT_MAX_CONTEXT_BYTES {
             return Err(SourceWalTransportRejection::InvalidContext);
         }
@@ -431,6 +498,7 @@ impl SourceWalTransport {
             deadline,
             ticket: Arc::clone(&ticket),
             require_binding,
+            policy,
         });
         Ok(SourceWalTransportRequest {
             ticket,
@@ -438,7 +506,7 @@ impl SourceWalTransport {
         })
     }
     /// Observe actual local queue/retained bytes in explicit test-support builds only.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn context_usage_for_tests(&self) -> (usize, usize) {
         let q = self.shared.queue.lock().unwrap();
         (q.slots, q.bytes)
@@ -510,7 +578,6 @@ impl SourceWalTransportCommand {
         self.request
             .take()
             .expect("original source command")
-            .ticket
             .finish(SourceWalTransportStatus::Rejected(reason));
     }
     /// Move the genuine actual source writer into sealed private producer custody.
@@ -522,7 +589,7 @@ impl SourceWalTransportCommand {
 impl Drop for SourceWalTransportCommand {
     fn drop(&mut self) {
         if let Some(request) = self.request.take() {
-            request.ticket.finish(SourceWalTransportStatus::Rejected(
+            request.finish(SourceWalTransportStatus::Rejected(
                 SourceWalTransportRejection::OwnerLost,
             ));
         }

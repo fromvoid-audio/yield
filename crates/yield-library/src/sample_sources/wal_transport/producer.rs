@@ -1,10 +1,6 @@
 //! Private genuine source custody. No caller-provided state can publish Prepared or cleanup.
 use super::*;
 
-enum Native {
-    Held(SourceWalPreparation),
-    Failed(SourceWalPreparationFailure),
-}
 /// Original source actor's genuine native preparation/failure custody.
 /// No public constructor, Clone, decoder or arbitrary positive outcome setter exists.
 ///
@@ -34,23 +30,21 @@ pub(super) fn acquire(
     mut command: SourceWalTransportCommand,
     writer: SourceWriter,
 ) -> SourceWalTransportOwner {
-    let request = command.request.take().expect("original source command");
+    let mut request = command.request.take().expect("original source command");
     let expected = request.expected.as_ref().expect("pending revision");
     #[cfg(feature = "test-support")]
-    let prepared = if command.shared.unknown_wal.load(Ordering::Acquire) {
-        writer.prepare_wal_reservation_unknown_for_tests(expected, request.deadline)
+    let native = if command.shared.unknown_wal.load(Ordering::Acquire) {
+        // Negative I/O fault only: no family policy or positive preparation is published.
+        match writer.prepare_wal_reservation_unknown_for_tests(expected, request.deadline) {
+            Ok(held) => Native::Held(held),
+            Err(failed) => Native::Failed(failed),
+        }
     } else {
-        writer.prepare_wal_reservation(expected, request.deadline)
+        Native::acquire(writer, expected, request.deadline, request.policy.take())
     };
     #[cfg(not(feature = "test-support"))]
-    let prepared = writer.prepare_wal_reservation(expected, request.deadline);
-    let (native, rejection) = match prepared {
-        Ok(held) => (Native::Held(held), None),
-        Err(failure) => {
-            let reason = classify(failure.error());
-            (Native::Failed(failure), Some(reason))
-        }
-    };
+    let native = Native::acquire(writer, expected, request.deadline, request.policy.take());
+    let rejection = native.error().map(classify);
     let owner = SourceWalTransportOwner {
         native: Some(native),
         scope: None,
@@ -74,7 +68,7 @@ impl SourceWalTransportOwner {
     }
     /// Genuine successful preparation is distinct from a retained failed native owner.
     pub fn is_prepared(&self) -> bool {
-        matches!(self.native, Some(Native::Held(_)))
+        self.native.as_ref().is_some_and(Native::is_prepared)
     }
     /// Initial or later pre-intent rejection, never a grant or retry permission.
     pub fn rejection(&self) -> Option<SourceWalTransportRejection> {
@@ -90,10 +84,7 @@ impl SourceWalTransportOwner {
     }
     /// Strict original native MAIN identity for alias exclusion, not reopen authority.
     pub fn database_identity(&self) -> Option<&str> {
-        match self.native.as_ref()? {
-            Native::Held(held) => Some(held.revision().database_identity()),
-            Native::Failed(failure) => failure.retained_database_identity(),
-        }
+        self.native.as_ref()?.database_identity()
     }
     /// Publish only after this exact native owner is held and original scope is validated.
     /// Strict requests require the genuine registration; there is no caller-authored acknowledgement.
@@ -110,9 +101,11 @@ impl SourceWalTransportOwner {
         if self.is_cancelled() {
             return Err(SourceWalTransportRejection::Cancelled);
         }
-        let Some(Native::Held(held)) = self.native.as_ref() else {
-            return Err(SourceWalTransportRejection::OwnerLost);
-        };
+        let native = self
+            .native
+            .as_ref()
+            .ok_or(SourceWalTransportRejection::OwnerLost)?;
+        let held = native.held().map_err(|e| classify(&e))?;
         held.revalidate_owner().map_err(|e| classify(&e))?;
         if self.request.require_binding {
             self.scope = Some(scope::capture_scope(
@@ -150,6 +143,7 @@ impl SourceWalTransportOwner {
                 nonce: held.nonce().to_string(),
                 wal_bytes: held.wal_bytes(),
                 scope: self.scope.clone(),
+                policy_family: native.family(),
                 _credit: credit,
             }),
         };
@@ -163,19 +157,19 @@ impl SourceWalTransportOwner {
         &self,
         registration: Option<&SourceAuthorityRegistration>,
     ) -> Result<(), SourceWalTransportRejection> {
-        match self.native.as_ref() {
-            Some(Native::Held(held)) => match self.scope.as_ref() {
-                Some(scope) => held
-                    .validate_wal_binding(
-                        scope.binding(),
-                        registration.ok_or(SourceWalTransportRejection::Scope)?,
-                    )
-                    .map_err(|e| classify(&e)),
-                None => held.revalidate_owner().map_err(|e| classify(&e)),
-            },
-            _ => Err(self
-                .rejection
-                .unwrap_or(SourceWalTransportRejection::OwnerLost)),
+        let native = self
+            .native
+            .as_ref()
+            .ok_or(SourceWalTransportRejection::OwnerLost)?;
+        let held = native.held().map_err(|e| classify(&e))?;
+        match self.scope.as_ref() {
+            Some(scope) => held
+                .validate_wal_binding(
+                    scope.binding(),
+                    registration.ok_or(SourceWalTransportRejection::Scope)?,
+                )
+                .map_err(|e| classify(&e)),
+            None => held.revalidate_owner().map_err(|e| classify(&e)),
         }
     }
     /// Begin pre-intent abort; the original writer remains exclusively held until real cleanup.
@@ -194,14 +188,17 @@ impl SourceWalTransportOwner {
     /// Return only the exact original writer after confirmed rollback and timeout restoration.
     pub fn into_writer(mut self) -> Result<SourceWriter, Self> {
         self.request.ticket.set(SourceWalTransportStatus::Aborting);
-        let result = match self.native.take().expect("original native custody") {
-            Native::Held(held) => held.abort(),
-            Native::Failed(failed) => failed.into_writer(),
-        };
+        let result = self
+            .native
+            .take()
+            .expect("original native custody")
+            .into_writer();
         match result {
             Ok(writer) => {
                 self.resolved = true;
                 drop(self.scope.take());
+                drop(self.request.expected.take());
+                drop(self.request.policy.take());
                 self.request.ticket.finish(self.rejection.map_or(
                     SourceWalTransportStatus::Aborted,
                     SourceWalTransportStatus::Rejected,
@@ -209,7 +206,7 @@ impl SourceWalTransportOwner {
                 Ok(writer)
             }
             Err(failed) => {
-                self.native = Some(Native::Failed(failed));
+                self.native = Some(failed);
                 self.mark_unavailable(
                     self.rejection
                         .unwrap_or(SourceWalTransportRejection::OwnerLost),
@@ -220,7 +217,7 @@ impl SourceWalTransportOwner {
     }
     /// Failed original owner is close-ready only under its original source authority.
     pub fn source_authority_close_ready(&self) -> bool {
-        matches!(self.native.as_ref(), Some(Native::Failed(failure)) if failure.source_authority_close_ready())
+        self.native.as_ref().is_some_and(Native::close_ready)
     }
     /// Consume only actual failed custody through original draining source authority.
     /// Retired is published only after the genuine close/release acknowledgement returns.
@@ -228,14 +225,11 @@ impl SourceWalTransportOwner {
         mut self,
         authority: &mut SourceAuthorityRegistration,
     ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
-        let failure = match self.native.take() {
-            Some(Native::Failed(failure)) => failure,
-            native => {
-                self.native = native;
-                return Err(SourceAuthorityError::InvalidLifecycle);
-            }
-        };
-        let ack = failure.close_for_retirement(authority)?;
+        if !self.source_authority_close_ready() {
+            return Err(SourceAuthorityError::InvalidLifecycle);
+        }
+        let native = self.native.take().expect("original failed custody");
+        let ack = native.close(authority)?;
         self.resolved = true;
         drop(self.scope.take());
         self.request
