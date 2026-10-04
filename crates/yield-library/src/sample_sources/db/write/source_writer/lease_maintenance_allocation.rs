@@ -18,6 +18,49 @@ pub struct SourceLeaseMaintenanceAllocation {
     deadline: Instant,
 }
 impl SourceLeaseMaintenanceAllocation {
+    // Original live custody and native facts only. Full subject/schema/pager facts were
+    // validated at entry; the exclusive empty writer prevents intervening row mutations.
+    pub(super) fn validate_parked(
+        &self,
+        writer: &SourceWriter,
+        deadline: Instant,
+    ) -> Result<(), LifecycleAllocationError> {
+        use LifecycleAllocationError::{Budget, Unknown};
+        if deadline > self.deadline || Instant::now() >= deadline {
+            return Err(Budget);
+        }
+        if !Weak::ptr_eq(&self.owner, &Arc::downgrade(&writer.reference_liveness))
+            || self.subject.source_id() != writer.source_id.as_str()
+            || self.subject.lifecycle_generation() != writer.lifecycle_generation
+        {
+            return Err(Unknown);
+        }
+        let lease = writer.database.source_lease.as_deref().ok_or(Unknown)?;
+        require_expiry(
+            lease.validate_current_owner().map_err(|_| Unknown)?,
+            deadline,
+        )?;
+        let binding = writer
+            .database
+            .database_file_binding
+            .as_deref()
+            .ok_or(Unknown)?;
+        self.allocation.validate_parked_objects(
+            &writer.database.connection,
+            binding.root(),
+            binding.name(),
+            deadline,
+        )?;
+        require_expiry(
+            lease.validate_current_owner().map_err(|_| Unknown)?,
+            deadline,
+        )?;
+        if Instant::now() >= deadline {
+            return Err(Budget);
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_retained(
         &self,
         writer: &SourceWriter,

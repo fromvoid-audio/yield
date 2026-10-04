@@ -79,6 +79,7 @@ struct Custody {
     preexisting_transaction: bool,
     restore_timeout: Option<Duration>,
     poisoned: bool,
+    ordinary_changes: u64,
     #[cfg(test)]
     timeout_restore_fault: bool,
 }
@@ -201,6 +202,7 @@ impl SourceWriter {
     ) -> Result<SourceLeaseMaintenancePreparation, SourceLeaseMaintenancePreparationFailure> {
         let deadline = requested_deadline.min(observation.deadline());
         let preexisting_transaction = !self.database.connection.is_autocommit();
+        let ordinary_changes = self.database.connection.total_changes();
         let mut custody = Custody {
             writer: Some(self),
             policy: None,
@@ -210,6 +212,7 @@ impl SourceWriter {
             preexisting_transaction,
             restore_timeout: None,
             poisoned: false,
+            ordinary_changes,
             #[cfg(test)]
             timeout_restore_fault: false,
         };
@@ -319,6 +322,37 @@ impl SourceLeaseMaintenancePreparation {
             .database
             .source_authority_close_ready()
     }
+    /// Validate original parked CONTROL/native custody and entered settings without ordinary SQL.
+    /// Full schema/scan/allocation facts are checked at acquisition and initial binding capture.
+    /// Success is not journal readiness, lease renewal or settlement authority.
+    pub fn revalidate_owner(&self) -> Result<(), SourceLeaseMaintenancePreparationError> {
+        if Instant::now() >= self.deadline() {
+            return Err(SourceLeaseMaintenancePreparationError::Deadline);
+        }
+        if self.custody.poisoned
+            || self.custody.preexisting_transaction
+            || self.custody.writer().database.connection.total_changes()
+                != self.custody.ordinary_changes
+            || !self.custody.created_transaction
+            || self.custody.writer().database.connection.is_autocommit()
+        {
+            return Err(SourceLeaseMaintenancePreparationError::RollbackUnconfirmed);
+        }
+        self.custody
+            .observation
+            .validate_parked(self.custody.writer(), self.deadline())?;
+        self.custody
+            .policy
+            .as_ref()
+            .ok_or(SourceLeaseMaintenancePreparationError::PolicyUnconfirmed)?
+            .validate_parked(&self.custody.writer().database)?;
+        crate::sqlite_wal::enforce_wal_admission(&self.custody.writer().database.connection)?;
+        if Instant::now() >= self.deadline() {
+            return Err(SourceLeaseMaintenancePreparationError::Deadline);
+        }
+        Ok(())
+    }
+
     /// Readonly original owner, exact scope/native objects/settings and WAL health checks.
     /// Failure retains exclusive custody; cancellation and cleanup remain explicit.
     pub fn revalidate(&self) -> Result<(), SourceLeaseMaintenancePreparationError> {

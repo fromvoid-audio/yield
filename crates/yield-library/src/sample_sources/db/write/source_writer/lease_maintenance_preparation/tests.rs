@@ -689,3 +689,241 @@ fn genuine_binding_refuses_changed_lease_epoch_owner_or_state_in_retained_main()
         writer.close().unwrap();
     }
 }
+
+fn deny_parked_sql(context: AuthContext<'_>) -> Authorization {
+    match context.action {
+        AuthAction::Read { .. }
+        | AuthAction::Insert { .. }
+        | AuthAction::Update { .. }
+        | AuthAction::Delete { .. }
+        | AuthAction::Transaction {
+            operation: TransactionOperation::Begin,
+        } => Authorization::Deny,
+        AuthAction::Pragma { pragma_name, .. }
+            if matches!(pragma_name, "page_size" | "page_count" | "schema_version") =>
+        {
+            Authorization::Deny
+        }
+        _ => Authorization::Allow,
+    }
+}
+
+#[test]
+fn parked_lease_binding_validates_actual_control_native_and_settings_without_ordinary_sql() {
+    let (f, writer) = fixture();
+    let registration = writer.database.prepare_source_authority().unwrap();
+    let original = settings(&writer);
+    let ordinary = writer.database.connection.total_changes();
+    let control = writer
+        .database
+        .source_lease_control_total_changes_for_tests()
+        .unwrap()
+        .unwrap();
+    let handle = unsafe { writer.database.connection.handle() };
+    let other = external(&f);
+    let rows = lease(&other);
+    let held = prepare_owner(writer);
+    let binding = held.capture_lease_binding(&registration).unwrap();
+    assert!(matches!(
+        binding.stored_fence().subject().audit(),
+        crate::sample_sources::SourceRegistryAuditObservation::Unavailable {}
+    ));
+    held.custody
+        .writer()
+        .database
+        .connection
+        .authorizer(Some(deny_parked_sql));
+    // Prove the callback actually denies ordinary queries, not merely a permissive fixture.
+    assert!(
+        held.custody
+            .writer()
+            .database
+            .connection
+            .query_row("SELECT count(*) FROM source_lease", [], |r| r
+                .get::<_, u64>(0))
+            .is_err()
+    );
+    assert!(
+        held.revalidate().is_err(),
+        "full validation still requires original SQL facts"
+    );
+    for _ in 0..3 {
+        held.revalidate_owner().unwrap();
+        held.validate_lease_binding(&binding, &registration)
+            .unwrap();
+    }
+    assert_eq!(
+        other
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap_err()
+            .sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy)
+    );
+    assert_eq!(lease(&other), rows);
+    assert_eq!(
+        held.custody.writer().database.connection.total_changes(),
+        ordinary
+    );
+    assert_eq!(
+        held.custody
+            .writer()
+            .database
+            .source_lease_control_total_changes_for_tests()
+            .unwrap()
+            .unwrap(),
+        control
+    );
+    clear_authorizer(held.custody.writer());
+    let returned = held.abort().unwrap();
+    assert_eq!(unsafe { returned.database.connection.handle() }, handle);
+    assert_eq!(settings(&returned), original);
+    assert!(
+        returned.current_revision().is_err(),
+        "no authoritative audit was fabricated"
+    );
+    assert_eq!(lease(&other), rows);
+    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+}
+
+#[test]
+fn parked_lease_binding_rejects_changed_entered_settings_until_original_settings_return() {
+    let (f, writer) = fixture();
+    let registration = writer.database.prepare_source_authority().unwrap();
+    let original = settings(&writer);
+    let other = external(&f);
+    let held = prepare_owner(writer);
+    let binding = held.capture_lease_binding(&registration).unwrap();
+    for (name, value) in [
+        ("max_page_count", 16385),
+        ("temp_store", 0),
+        ("cache_spill", 123),
+        ("wal_autocheckpoint", 17),
+    ] {
+        let connection = &held.custody.writer().database.connection;
+        let before: u64 = connection
+            .pragma_query_value(None, name, |r| r.get(0))
+            .unwrap();
+        if name == "temp_store" {
+            // SQLite itself refuses changing TEMP storage while this transaction is held.
+            assert!(connection.pragma_update(None, name, value).is_err());
+            held.revalidate_owner().unwrap();
+            held.validate_lease_binding(&binding, &registration)
+                .unwrap();
+            continue;
+        }
+        connection.pragma_update(None, name, value).unwrap();
+        assert!(held.revalidate_owner().is_err());
+        assert!(
+            held.validate_lease_binding(&binding, &registration)
+                .is_err()
+        );
+        assert_eq!(
+            other
+                .execute_batch("BEGIN IMMEDIATE")
+                .unwrap_err()
+                .sqlite_error_code(),
+            Some(ErrorCode::DatabaseBusy)
+        );
+        connection.pragma_update(None, name, before).unwrap();
+        held.revalidate_owner().unwrap();
+        held.validate_lease_binding(&binding, &registration)
+            .unwrap();
+    }
+    assert_eq!(settings(&held.abort().unwrap()), original);
+}
+
+#[test]
+fn parked_lease_binding_rejects_original_native_sidecar_identity_or_length_change() {
+    for suffix in ["-wal", "-shm"] {
+        for replace in [false, true] {
+            let (f, writer) = fixture();
+            let registration = writer.database.prepare_source_authority().unwrap();
+            let held = prepare_owner(writer);
+            let binding = held.capture_lease_binding(&registration).unwrap();
+            let path = f.path.with_file_name(format!("{DB_FILE_NAME}{suffix}"));
+            let before = fs::read(&path).unwrap();
+            let saved = f._temp.path().join("original-sidecar");
+            if replace {
+                fs::rename(&path, &saved).unwrap();
+            }
+            fs::write(
+                &path,
+                if replace {
+                    before.clone()
+                } else {
+                    let mut changed = before.clone();
+                    changed.push(0);
+                    changed
+                },
+            )
+            .unwrap();
+            assert!(held.revalidate_owner().is_err());
+            assert!(
+                held.validate_lease_binding(&binding, &registration)
+                    .is_err()
+            );
+            if replace {
+                fs::remove_file(&path).unwrap();
+                fs::rename(saved, path).unwrap();
+            } else {
+                fs::write(path, before).unwrap();
+            }
+            held.revalidate_owner().unwrap();
+            held.validate_lease_binding(&binding, &registration)
+                .unwrap();
+            held.abort().unwrap();
+        }
+    }
+}
+
+#[test]
+fn parked_lease_rejects_uncommitted_write_and_original_deadline_without_reuse() {
+    let (f, writer) = fixture();
+    let registration = writer.database.prepare_source_authority().unwrap();
+    let held = prepare_owner(writer);
+    let binding = held.capture_lease_binding(&registration).unwrap();
+    // A private fault writes inside the supposedly empty preparation. SQL-free total-change
+    // custody detects it, including uncommitted changes invisible to the CONTROL snapshot.
+    held.custody
+        .writer()
+        .database
+        .connection
+        .execute_batch("INSERT INTO metadata(key,value) VALUES ('parked-fault','unadmitted')")
+        .unwrap();
+    assert!(held.revalidate_owner().is_err());
+    assert!(
+        held.validate_lease_binding(&binding, &registration)
+            .is_err()
+    );
+    let returned = held.abort().unwrap();
+    assert_eq!(
+        external(&f)
+            .query_row(
+                "SELECT count(*) FROM metadata WHERE key='parked-fault'",
+                [],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let observation = returned
+        .capture_lease_maintenance_allocation(deadline)
+        .unwrap();
+    let held = returned
+        .prepare_lease_maintenance(observation, deadline)
+        .unwrap();
+    let binding = held.capture_lease_binding(&registration).unwrap();
+    std::thread::sleep(
+        deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+    );
+    assert!(matches!(
+        held.revalidate_owner(),
+        Err(SourceLeaseMaintenancePreparationError::Deadline)
+    ));
+    assert!(
+        held.validate_lease_binding(&binding, &registration)
+            .is_err()
+    );
+    held.abort().unwrap();
+}
