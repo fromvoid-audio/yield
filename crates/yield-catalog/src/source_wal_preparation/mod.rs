@@ -5,7 +5,9 @@ use yield_library::operation_journal::{AdmissionClaimId, ParticipantId};
 use yield_library::sample_sources::SourceRevision;
 use yield_library::sample_sources::db::write::{SourceWalPreparation, SourceWalPreparationFailure};
 mod owner;
+mod scope;
 pub(super) use owner::{WorkerReservations, deferred, interrupts_preparation, lifecycle};
+use scope::ScopeView;
 
 /// Maximum pending plus held source preparation slots for one catalog worker.
 pub const CATALOG_WAL_MAX_SLOTS: usize = 64;
@@ -21,7 +23,7 @@ const CONTEXT_FIXED_BYTES: usize = std::mem::size_of::<PrepareRequest>()
     + std::mem::size_of::<Credit>()
     + std::mem::size_of::<SourceWalPreparation>()
         .saturating_sub(std::mem::size_of::<SourceWriter>())
-    + 128; // Arc headers, slot deadline/cancellation state, nonce spelling and map bookkeeping.
+    + 160; // Arc headers, slot deadline/cancellation, scope option tags, nonce and map bookkeeping.
 
 /// Bounded immutable correlations; these IDs do not issue or reserve any capacity.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,8 +103,15 @@ pub struct CatalogSourceWalObservation {
     correlation: CatalogSourceWalCorrelation,
     nonce: String,
     wal_bytes: u64,
+    scope: Option<ScopeView>,
 }
 impl CatalogSourceWalObservation {
+    /// Shared historical original owner descriptor, when explicitly requested.
+    /// This never proves current journal registration or issues settlement authority.
+    /// Clones share the buffer and retain its byte credit until the last view is dropped.
+    pub fn scope_descriptor_bytes(&self) -> Option<&[u8]> {
+        self.scope.as_ref().map(ScopeView::bytes)
+    }
     /// Complete source revision observed by the original retained writer.
     pub fn revision(&self) -> &SourceRevision {
         &self.revision
@@ -227,6 +236,7 @@ struct PrepareRequest {
     correlation: CatalogSourceWalCorrelation,
     deadline: Instant,
     ticket: Arc<Ticket>,
+    require_binding: bool,
 }
 struct Queue {
     requests: VecDeque<PrepareRequest>,
@@ -283,9 +293,27 @@ impl Control {
         correlation: CatalogSourceWalCorrelation,
         deadline: Instant,
     ) -> Result<CatalogSourceWalRequest, CatalogSourceWalRejection> {
+        self.submit_scoped(expected, correlation, deadline, false)
+    }
+    fn submit_scoped(
+        &self,
+        expected: SourceRevision,
+        correlation: CatalogSourceWalCorrelation,
+        deadline: Instant,
+        require_binding: bool,
+    ) -> Result<CatalogSourceWalRequest, CatalogSourceWalRejection> {
         let now = Instant::now();
         if deadline <= now || deadline.duration_since(now) > MAX_DEADLINE {
             return Err(CatalogSourceWalRejection::Deadline);
+        }
+        // Bound the original subject clone before owner capture staging is allocated.
+        if require_binding
+            && (expected.source_id().as_str().len() > 256
+                || expected.root_identity().as_bytes().len() > 4096
+                || expected.root_binding_identity().len() > 1024
+                || expected.database_identity().len() > 1024)
+        {
+            return Err(CatalogSourceWalRejection::InvalidContext);
         }
         let size = [
             expected.source_id().as_str().len(),
@@ -323,6 +351,7 @@ impl Control {
             correlation,
             deadline,
             ticket: Arc::clone(&ticket),
+            require_binding,
         });
         Ok(CatalogSourceWalRequest {
             ticket,
@@ -351,6 +380,18 @@ impl Control {
     }
 }
 impl CatalogService {
+    /// Queue strict original-reservation scope capture on the actual source worker.
+    /// Requires that worker's already-retained genuine registration, not a caller phase/UUID.
+    /// Complete shared scope bytes remain charged across copied diagnostics and abort.
+    /// This pre-intent route cannot acknowledge settlement or issue physical/capacity permits.
+    pub fn prepare_source_wal_with_binding(
+        &self,
+        expected: SourceRevision,
+        correlation: CatalogSourceWalCorrelation,
+        deadline: Instant,
+    ) -> Result<CatalogSourceWalRequest, CatalogSourceWalRejection> {
+        self.prepare_source_wal_scoped(expected, correlation, deadline, true)
+    }
     /// Queue genuine retained-source pre-intent preparation on the original catalog worker.
     /// Expected revision is owner-produced and nonserializable. Correlations are observations;
     /// this operation never issues an ordinary ID, physical claim, journal latch or write grant.
@@ -359,6 +400,15 @@ impl CatalogService {
         expected: SourceRevision,
         correlation: CatalogSourceWalCorrelation,
         deadline: Instant,
+    ) -> Result<CatalogSourceWalRequest, CatalogSourceWalRejection> {
+        self.prepare_source_wal_scoped(expected, correlation, deadline, false)
+    }
+    fn prepare_source_wal_scoped(
+        &self,
+        expected: SourceRevision,
+        correlation: CatalogSourceWalCorrelation,
+        deadline: Instant,
+        require_binding: bool,
     ) -> Result<CatalogSourceWalRequest, CatalogSourceWalRejection> {
         let state = self.admission.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutdown || state.closed {
@@ -371,7 +421,13 @@ impl CatalogService {
         if !desired.active || desired.lifecycle_generation != expected.lifecycle_generation() {
             return Err(CatalogSourceWalRejection::Scope);
         }
-        state.source_wal.submit(expected, correlation, deadline)
+        if require_binding {
+            state
+                .source_wal
+                .submit_scoped(expected, correlation, deadline, true)
+        } else {
+            state.source_wal.submit(expected, correlation, deadline)
+        }
     }
 }
 

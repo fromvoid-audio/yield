@@ -269,3 +269,40 @@ adapters return unavailable. OPT-2136 still owns actual catalog/global transport
 complete database inventory and all-owner acknowledgements before admission,
 the atomic decision nonce, and indefinite lock/custody retention once settlement
 can commit. Those requirements are unchanged by this binding prerequisite.
+
+## Bounded catalog binding handoff (OPT-2248)
+
+`CatalogService::prepare_source_wal_with_binding` explicitly requests original
+scope from the actual catalog source worker. That worker requires its retained
+genuine registration, captures the binding under the newly-held empty MAIN
+transaction before reporting Prepared, and retains the non-Clone binding on its
+original owner. Missing registration, unknown schema/audit/VFS, insufficient
+credits or substituted native objects reject; returning a callable writer still
+requires confirmed original rollback. The original diagnostic-only API is
+unchanged. Parked strict slots validate the genuine binding without ordinary
+SQL, renewal or a new deadline.
+
+The existing 64-slot/64-KiB context pool also pays for this handoff. Strict input
+identities are bounded before capture. A short accounting step reserves bounded
+capture staging before owner reads, then charges actual binding headers and
+buffer capacities plus the shared descriptor buffer/wrapper before copying it.
+No accounting/control mutex is held during SQL or owner/native validation.
+`scope_descriptor_bytes` borrows historical bytes; observation clones share
+that buffer. Their shared byte credit and closed accounting object outlive
+abort, request drop and worker shutdown until the final view drops. The genuine
+binding is dropped before its owner-side byte custody is released. Retained
+views can therefore cause a subsequent capture to report Full even when no SQL
+preparation slot remains; dropping them restores available context bytes, not
+physical claims or retry authority. Capture scratch for the separately bounded
+schema/runtime inspection is not a handoff descriptor and remains subject to
+its original observation limits.
+
+Real worker tests use actual locally Prepared registration guards and retained
+Linux SQLite/VFS objects. They do not install pretend fully-registered journal
+or reserve authority. The strict pre-intent holder still refuses
+`acknowledge_settlement`. OPT-2136 must supply the actual registered all-owner
+bridge, aggregate source/global inventory and direction slices, a sealed common
+decision and atomic durable nonce, and cleanup fencing after settlement can
+commit. Pre-intent timeout/drop/shutdown behavior here does not implement that
+post-settlement retention requirement. Native physical qualification and the
+unsupported retained-object adapters remain separate.
