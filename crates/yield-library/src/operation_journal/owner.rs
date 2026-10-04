@@ -12,7 +12,9 @@ pub use super::wal_admission::{
     WalPreparationStatus, WalPreparedDatabase,
 };
 mod frozen_copy;
+mod resource_custody;
 pub use frozen_copy::{FrozenCopyObservation, FrozenCopyValidationError};
+use resource_custody::ResourceAdmission;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -1563,6 +1565,8 @@ fn prepared_admission_fault_facts(
 }
 
 struct OwnerRuntime {
+    resource_admission: Arc<ResourceAdmission>,
+    resource_input: Option<InputPermit>,
     wal_preparation: Option<super::wal_admission::Collector>,
     wal_preparation_unconfirmed: bool,
     store: Option<OperationJournalStore>,
@@ -1596,6 +1600,8 @@ impl OwnerRuntime {
             .try_clone_profile_guard_for_owner()
             .map_err(|error| error.to_string())?;
         Ok(Self {
+            resource_admission: ResourceAdmission::new(),
+            resource_input: None,
             wal_preparation: None,
             wal_preparation_unconfirmed: false,
             store: Some(store),
@@ -3377,6 +3383,9 @@ impl OwnerRuntime {
     /// after every retained source and durable ledger proof has passed; any marker uncertainty
     /// fences this runtime and returns no clean receipt.
     fn handoff_volume_to_clean_owner(&mut self) -> Result<(), String> {
+        if !self.resource_admission.close_and_wait() {
+            return Err("publication resource use remains unknown or unsettled".into());
+        }
         if self.wal_preparation.is_some() || self.wal_preparation_unconfirmed {
             return Err("original WAL preparation cleanup remains unconfirmed".into());
         }
@@ -3845,6 +3854,17 @@ fn map_initial_settlement_error(
 
 impl Drop for OwnerRuntime {
     fn drop(&mut self) {
+        // Close and wait before ANY original actor resource is released, including unwind.
+        // Native-use Drop wakes directly; no actor queue or source/slot mutex is held.
+        if thread::panicking() {
+            self.resource_admission.invalidate();
+            if let Some(input) = self.resource_input.as_ref() {
+                input
+                    .shared
+                    .mark_unavailable("original journal runtime is unwinding");
+            }
+        }
+        self.resource_admission.close_and_wait();
         // Publish loss/cancel original owners before journal authority teardown.
         drop(self.wal_preparation.take());
         // Source registrations retain non-Send authority guards and external reserve/volume
@@ -3877,6 +3897,7 @@ impl Drop for OwnerRuntime {
         }
         self.volume_owner.take();
         self.final_profile_guard.take();
+        self.resource_input.take();
         #[cfg(test)]
         if let (Some(observer), Some(probe)) = (observer.as_ref(), probe) {
             let mut observation =
@@ -4057,9 +4078,9 @@ impl OperationJournalOwner {
     /// resources until a later [`Self::shutdown`] or Drop disconnects and joins it.
     /// Worker failure remains Unavailable; repeated drain never reopens admission.
     ///
-    /// This is command admission only, not publication/effect closure, physical quiescence,
-    /// durable settlement or clean handoff. Publication-aware shutdown must also install
-    /// its independent effect gates and native-resource lifetime protocol.
+    /// Also closes new counted publication resource uses, without waiting for quiescence.
+    /// This does not settle effects or supply clean handoff. Complete publication shutdown
+    /// must compose the exact slot/source/charge gates and settlement protocol.
     pub fn begin_command_drain(&self) -> bool {
         matches!(
             self.close_command_admission(),
@@ -4068,6 +4089,7 @@ impl OperationJournalOwner {
     }
 
     fn close_command_admission(&self) -> OwnerLifecycle {
+        self.shared.resource_admission.close();
         let _admission = self
             .shared
             .admission_gate
@@ -4961,6 +4983,7 @@ fn bounded_json_input<T: serde::Serialize>(
 }
 
 struct OwnerShared {
+    resource_admission: Arc<ResourceAdmission>,
     commands: Mutex<Option<OwnerCommandSenders>>,
     admission_gate: Mutex<()>,
     lifecycle: AtomicU8,
@@ -4974,6 +4997,7 @@ struct OwnerShared {
 impl OwnerShared {
     fn new(commands: OwnerCommandSenders) -> Self {
         Self {
+            resource_admission: ResourceAdmission::new(),
             commands: Mutex::new(Some(commands)),
             admission_gate: Mutex::new(()),
             lifecycle: AtomicU8::new(OwnerLifecycle::Initializing as u8),
@@ -5136,6 +5160,7 @@ impl OwnerShared {
     }
 
     fn mark_unavailable(&self, reason: &str) {
+        self.resource_admission.invalidate();
         *self
             .unavailable
             .lock()
@@ -5437,6 +5462,15 @@ fn run_owner(
         }
     };
 
+    runtime.resource_admission = Arc::clone(&shared.resource_admission);
+    match shared.reserve_input(InputClass::Ordinary, resource_custody::HEADER_BYTES) {
+        Ok(input) => runtime.resource_input = Some(input),
+        Err(error) => {
+            shared.mark_unavailable(&format!("publication resource header unavailable: {error}"));
+            return;
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     let bootstrap_capacity = bootstrap_capacity;
     #[cfg(any(test, feature = "test-support"))]
@@ -5516,12 +5550,16 @@ fn run_owner(
         return;
     }
 
-    let starting = shared.lifecycle.compare_exchange(
-        OwnerLifecycle::Initializing as u8,
-        OwnerLifecycle::Available as u8,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+    let mut starting = Err(shared.lifecycle.load(Ordering::Acquire));
+    shared.resource_admission.activate(|| {
+        starting = shared.lifecycle.compare_exchange(
+            OwnerLifecycle::Initializing as u8,
+            OwnerLifecycle::Available as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        starting.is_ok()
+    });
     if let Err(state) = starting {
         if OwnerLifecycle::from_u8(state) != OwnerLifecycle::Closing {
             command_rx.reject_pending(|| OperationJournalOwnerError::Closed);
@@ -5563,6 +5601,14 @@ fn run_owner(
             shared.mark_unavailable("operation journal owner command panicked");
             command_rx.reject_pending(|| OperationJournalOwnerError::WorkerPanicked);
             break;
+        }
+    }
+    if !runtime.resource_admission.close_and_wait() {
+        orderly_shutdown = false;
+        if OwnerLifecycle::from_u8(shared.lifecycle.load(Ordering::Acquire))
+            != OwnerLifecycle::Unavailable
+        {
+            shared.mark_unavailable("publication resource use is unknown or unsettled");
         }
     }
     if runtime.wal_preparation_unconfirmed {
@@ -6139,6 +6185,7 @@ mod tests {
     mod command_drain_tests;
     mod control_input_tests;
     mod control_responsiveness_tests;
+    mod resource_custody_tests;
     mod source_registry_handoff_tests;
     #[test]
     fn recording_dispatch_binding_checks_actual_bytes_range_output_and_root() {
