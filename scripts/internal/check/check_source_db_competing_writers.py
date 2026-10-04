@@ -41,6 +41,8 @@ SOURCE_EXCEPTIONS = {
 RAW_EXCEPTIONS = {
     # Connection-owned budget VFS, same retained root/no-follow source/global/control boundary.
     ("crates/yield-library/src/sqlite_budget.rs", "open_owned", "open_with_flags_and_vfs"): 1,
+    # Exact compiled global lifecycle DDL reference; no path or durable writer is opened.
+    ("crates/yield-library/src/sample_sources/library/source_lifecycle_schema.rs", "expected_image", "open_in_memory"): 1,
     # Bundled in-memory schema/runtime reference; no source path or durable writer is opened.
     ("crates/yield-library/src/sample_sources/db/schema/metadata_budget.rs", "reference_image", "open_in_memory"): 1,
     ("crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io.rs", "open_sqlite", "open_with_flags"): 1,
@@ -185,6 +187,8 @@ def inventory_label(call: Call) -> str:
         return "source-owner"
     if call.path.endswith("/source_lease.rs"):
         return "source-lease-control"
+    if call.path.endswith("/library/source_lifecycle_schema.rs") and call.function == "expected_image" and call.opener == "open_in_memory":
+        return "in-memory-schema-probe"
     if call.path.endswith("/schema/metadata_budget.rs") and call.function == "reference_image" and call.opener == "open_in_memory":
         return "in-memory-schema-probe"
     if call.path.endswith("/schema/mod.rs"):
