@@ -27,8 +27,8 @@ pub use source_writer::{
     ManifestEnrollmentReceipt, ManifestEnrollmentRequest, ManifestEnrollmentResult,
     SOURCE_COLLECTION_HISTORY_GROUP_MAX_BYTES, SOURCE_COLLECTION_HISTORY_GROUP_MAX_PATHS,
     SOURCE_LAYOUT_ALGORITHM_V1, SOURCE_LAYOUT_CANONICAL_MAX_BYTES, SOURCE_LAYOUT_GENERATION_KEY,
-    SOURCE_LAYOUT_GENERATION_MAX_BYTES, SourceCollectionHistoryChange,
-    SourceCollectionHistoryExecution, SourceCollectionHistoryGroup,
+    SOURCE_LAYOUT_GENERATION_MAX_BYTES, SOURCE_WAL_BINDING_MAX_BYTES,
+    SourceCollectionHistoryChange, SourceCollectionHistoryExecution, SourceCollectionHistoryGroup,
     SourceCollectionHistorySelection, SourceCommandId, SourceFeaturePublicationMetrics,
     SourceLayoutCapture, SourceLayoutCaptureError, SourceLayoutComputedPoint,
     SourceLayoutComputedView, SourceLayoutFeature, SourceLayoutGeneration,
@@ -39,9 +39,10 @@ pub use source_writer::{
     SourceLeaseMaintenancePreparationFailure, SourcePreparedLayoutGeneration, SourceRevision,
     SourceScanFence, SourceSnapshotOwner, SourceSnapshotPage, SourceSnapshotQueueMetrics,
     SourceTagAdmissionObservation, SourceTagMetadataBudget, SourceTagMetadataPolicy,
-    SourceTagWalPreparation, SourceTagWalPreparationFailure, SourceWalPreparation,
-    SourceWalPreparationError, SourceWalPreparationFailure, SourceWriter,
-    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
+    SourceTagWalPreparation, SourceTagWalPreparationFailure, SourceWalBinding,
+    SourceWalObjectObservation, SourceWalPreparation, SourceWalPreparationError,
+    SourceWalPreparationFailure, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
+    SourceWriterReceipt, SourceWriterRequest,
 };
 pub use tag_assignment_selection::{SourceTagAssignmentMutation, SourceTagAssignmentSelection};
 pub use transaction::{

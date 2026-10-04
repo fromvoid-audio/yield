@@ -12,9 +12,15 @@ use uuid::Uuid;
 
 const MAX_PREPARATION: Duration = Duration::from_secs(2);
 
+mod binding;
+pub use binding::{SOURCE_WAL_BINDING_MAX_BYTES, SourceWalBinding, SourceWalObjectObservation};
+
 /// Failure before any preparation metadata, revision or receipt is written.
 #[derive(Debug, Error)]
 pub enum SourceWalPreparationError {
+    /// Complete original registration, audited scope or native VFS objects cannot be proved.
+    #[error("source WAL reservation binding is unavailable or does not match original custody")]
+    BindingUnavailable,
     /// Queue/SQL/validation consumed the cooperative preparation deadline.
     #[error("source WAL preparation deadline expired or exceeds two seconds")]
     Deadline,

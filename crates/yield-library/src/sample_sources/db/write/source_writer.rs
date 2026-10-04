@@ -59,6 +59,7 @@ mod wal_reservation;
 pub use tag_metadata_budget::SourceTagMetadataBudget;
 pub use tag_metadata_policy::SourceTagMetadataPolicy;
 pub use wal_reservation::{
+    SOURCE_WAL_BINDING_MAX_BYTES, SourceWalBinding, SourceWalObjectObservation,
     SourceWalPreparation, SourceWalPreparationError, SourceWalPreparationFailure,
 };
 #[path = "readiness_targets.rs"]
