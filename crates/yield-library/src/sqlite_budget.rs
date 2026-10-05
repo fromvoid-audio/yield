@@ -13,6 +13,7 @@ use std::sync::{
 };
 
 mod io;
+pub(crate) mod no_effect;
 #[cfg(test)]
 mod tests;
 pub(crate) mod wal_objects;
@@ -163,6 +164,10 @@ impl Drop for Registration {
 }
 
 struct Context {
+    // Immutable from before sqlite3_open until the final native close.
+    no_effect: bool,
+    #[cfg(test)]
+    native_effect_calls: std::sync::atomic::AtomicU64,
     native: *mut ffi::sqlite3_vfs,
     main: AtomicPtr<ffi::sqlite3_file>,
     state: Mutex<State>,
@@ -423,6 +428,15 @@ pub(crate) fn open_owned(
     flags: rusqlite::OpenFlags,
     directory_descriptor: Option<std::sync::Arc<std::fs::File>>,
 ) -> rusqlite::Result<OwnedConnection> {
+    open_owned_mode(path, flags, directory_descriptor, false)
+}
+
+pub(super) fn open_owned_mode(
+    path: impl AsRef<std::path::Path>,
+    flags: rusqlite::OpenFlags,
+    directory_descriptor: Option<std::sync::Arc<std::fs::File>>,
+    no_effect: bool,
+) -> rusqlite::Result<OwnedConnection> {
     #[cfg(target_os = "linux")]
     let native_name = CString::new(crate::sqlite_linux::vfs_name()?).expect("fixed VFS name");
     #[cfg(target_os = "windows")]
@@ -447,6 +461,9 @@ pub(crate) fn open_owned(
         let name =
             CString::new(format!("{CLIENT_NAME}-{}", uuid::Uuid::new_v4())).expect("UUID name");
         let mut context = Box::new(Context {
+            no_effect,
+            #[cfg(test)]
+            native_effect_calls: std::sync::atomic::AtomicU64::new(0),
             native,
             main: AtomicPtr::new(ptr::null_mut()),
             state: Mutex::new(State {
