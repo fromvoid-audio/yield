@@ -2,6 +2,7 @@
 use super::*;
 use crate::operation_journal::work_plan::WorkUnitRole;
 use rusqlite::{Connection, limits::Limit};
+use std::sync::{Arc, atomic::AtomicBool};
 
 // SQLite can compare an unindexed foreign key before any matching-row shape predicate.
 // This caps that native value/record allocation, not only Rust row materialization.
@@ -32,7 +33,8 @@ impl Drop for HistoricalValueLimit<'_> {
     }
 }
 fn map_history_error(error: LibraryError) -> LibraryError {
-    if matches!(&error, LibraryError::Sql(rusqlite::Error::SqliteFailure(code, _))
+    if matches!(&error, LibraryError::HarvestFactsQueryBudget)
+        || matches!(&error, LibraryError::Sql(rusqlite::Error::SqliteFailure(code, _))
         if code.extended_code == rusqlite::ffi::SQLITE_TOOBIG)
     {
         LibraryError::HarvestCopyMalformedReceipt
@@ -132,7 +134,13 @@ impl LibraryDatabase {
         // No source/journal queue round trips, mutable family dispatch or SQLite write occurs.
         let tx = self.connection.transaction()?;
         let value_limit = HistoricalValueLimit::new(&tx)?;
-        let observed = read_snapshot(&tx, profile, key).map_err(map_history_error);
+        // A corrupted view can consume VM work before LIMIT emits its first row.
+        // Reuse the original scoped budget; this command exposes no cancellation authority.
+        let canceled = Arc::new(AtomicBool::new(false));
+        let observed = super::super::harvest_facts::budget::run(&tx, &canceled, || {
+            read_snapshot(&tx, profile, key)
+        })
+        .map_err(map_history_error);
         drop(value_limit);
         let observed = observed?;
         tx.commit()?;

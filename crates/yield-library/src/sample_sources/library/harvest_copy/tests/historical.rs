@@ -290,3 +290,42 @@ fn harvest_historical_receipt_sqlite_limit_restores_on_refusal_and_unwind() {
     assert!(unwind.is_err());
     assert_eq!(c.limit(Limit::SQLITE_LIMIT_LENGTH).unwrap(), 32768);
 }
+
+#[test]
+fn harvest_historical_receipt_bounds_recursive_schema_work_and_restores_queue() {
+    let f = Fixture::new();
+    let request = f.request();
+    let selected = key(&request);
+    f.apply(request.clone()).unwrap();
+    let original = observe(&f, selected).unwrap().unwrap();
+    let revision = f.global().observed_mutation_revision_for_test();
+    let c = f.db();
+    c.execute_batch(
+        "ALTER TABLE harvest_copy_receipts RENAME TO saved_history;
+         CREATE VIEW harvest_copy_receipts AS
+         WITH RECURSIVE n(x) AS (
+           VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000
+         )
+         SELECT saved_history.* FROM saved_history JOIN n ON n.x=1000000;",
+    )
+    .unwrap();
+    assert!(matches!(
+        observe(&f, selected),
+        Err(LibraryError::HarvestCopyMalformedReceipt)
+    ));
+    assert_eq!(f.count("saved_history"), 1);
+    assert_eq!(f.count("harvest_derivations"), 1);
+    assert_eq!(f.global().observed_mutation_revision_for_test(), revision);
+    c.execute_batch(
+        "DROP VIEW harvest_copy_receipts;
+         ALTER TABLE saved_history RENAME TO harvest_copy_receipts;",
+    )
+    .unwrap();
+    assert_eq!(observe(&f, selected).unwrap(), Some(original));
+    assert!(matches!(
+        f.apply(request).unwrap(),
+        HarvestCopyResult::Replayed(_)
+    ));
+    assert_eq!(f.count("harvest_copy_receipts"), 1);
+    assert_eq!(f.count("harvest_derivations"), 1);
+}

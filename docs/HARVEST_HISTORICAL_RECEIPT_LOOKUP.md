@@ -20,7 +20,12 @@ profile scope. At most 8192 retained rows are accepted by this reader; selected
 payload/result buffers are each capped at 65536 bytes. A temporary 256KiB
 SQLite value/record limit also caps native comparison allocation for a corrupted
 unindexed foreign key; it preserves an existing lower limit and restores the
-original connection limit before commit, on refusal and during worker unwind. Malformed, ambiguous,
+original connection limit before commit, on refusal and during worker unwind. The
+original scoped HarvestFacts VM budget also bounds corrupted recursive-view work
+before any row is emitted: a two-second deadline and interruption after 1024
+callbacks of 1000 SQLite instructions. Its progress handler clears on return,
+refusal and unwind; actual exhaustion is classified as malformed history while
+unrelated SQLite errors retain their original classification. Malformed, ambiguous,
 oversized or foreign history rejects without changing it. Original effect/replay
 capacity policy remains unchanged, including exact replay before new-receipt
 capacity checks. The new read command advances neither the original mutation
@@ -30,7 +35,7 @@ Portable original-queue tests execute the existing producer with the explicitly
 logical `cfg(test)` journal fixture, then exercise lost reply, exact historical
 read, missing/wrong keys, real global/profile reacquisition without source or
 journal custody, corruption, rehashed foreign scope, duplicate and row-limit
-refusal. They preserve original graph/receipt state and original exact replay.
+refusal, native value limits and finite recursive-view budget exhaustion/recovery. They preserve original graph/receipt state and original exact replay.
 These fixtures supply no physical authority.
 
 `harvest_receipt_process.rs` has a normal-build Linux missing-history case using
