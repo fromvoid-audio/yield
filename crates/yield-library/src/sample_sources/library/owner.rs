@@ -939,7 +939,8 @@ impl GlobalLibraryWriter {
     }
 
     /// Observe this acquisition's actual worker dequeue counts and fixed wait buckets.
-    /// Never queue depth, SQL execution, durable completion or capacity authority.
+    /// Includes successful queue backlog/peak and abandoned envelopes.
+    /// Excludes executing SQL, durable completion and capacity authority.
     pub fn dispatch_metrics(&self) -> GlobalDispatchMetricsSnapshot {
         self.admission_metrics.dispatch.snapshot()
     }
@@ -1448,11 +1449,13 @@ fn send_command(
             .as_ref()
             .cloned()
             .ok_or(GlobalLibraryWriterQueueError::Closed)?;
-        let queued = QueuedCommand::new(command, Arc::clone(&metrics.dispatch));
-        sender.try_send(queued).map_err(|error| match error {
-            TrySendError::Full(_) => GlobalLibraryWriterQueueError::Full,
-            TrySendError::Disconnected(_) => GlobalLibraryWriterQueueError::Closed,
-        })
+        metrics
+            .dispatch
+            .try_send(&sender, command)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => GlobalLibraryWriterQueueError::Full,
+                TrySendError::Disconnected(_) => GlobalLibraryWriterQueueError::Closed,
+            })
     })();
     // Telemetry subscribers never execute while the admission/shutdown gate is held.
     drop(admission);
@@ -2888,6 +2891,7 @@ mod tests {
         let queued_result = writer
             .load_source_registry_snapshot()
             .expect("queued load admission");
+        assert_eq!(writer.dispatch_metrics().queued, 1);
         let displaced = temp.path().join("inflight-replacement-old");
         fs::rename(&root, &displaced).expect("displace original profile root");
         fs::create_dir(&root).expect("replacement profile root");
@@ -2915,6 +2919,9 @@ mod tests {
             Err(GlobalLibraryWriterQueueError::Closed)
         ));
         assert!(displaced.join(super::super::LIBRARY_DB_FILE_NAME).is_file());
+        assert_eq!(writer.dispatch_metrics().queued, 0);
+        assert_eq!(writer.dispatch_metrics().abandoned, 1);
+        assert_eq!(writer.dispatch_metrics().dequeued, 1);
         assert!(!writer.shutdown());
         drop(writable_guard);
         drop(profile_guard);

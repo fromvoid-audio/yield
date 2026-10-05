@@ -31,14 +31,14 @@ fn fixed_numeric_storage_saturates_and_buckets_cover_boundaries() {
         increment(counter);
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
-    assert_eq!(std::mem::size_of::<GlobalDispatchMetricsSnapshot>(), 6 * 8);
-    assert_eq!(std::mem::size_of::<DispatchMetrics>(), 6 * 8);
+    assert_eq!(std::mem::size_of::<GlobalDispatchMetricsSnapshot>(), 9 * 8);
+    assert!(std::mem::size_of::<DispatchMetrics>() <= 128);
 }
 
 #[test]
 fn real_bounded_channel_rejection_discard_and_unvalidated_dequeue_are_excluded() {
     let metrics = Arc::new(DispatchMetrics::default());
-    let (send, receive) = mpsc::sync_channel(1);
+    let (send, receive) = mpsc::sync_channel::<QueuedCommand>(1);
     assert!(send.try_send(command(&metrics)).is_ok());
     assert!(matches!(
         send.try_send(command(&metrics)),
@@ -68,7 +68,7 @@ fn real_bounded_channel_rejection_discard_and_unvalidated_dequeue_are_excluded()
 #[test]
 fn actual_queued_delay_is_captured_before_sql_or_profile_validation_delay() {
     let metrics = Arc::new(DispatchMetrics::default());
-    let (send, receive) = mpsc::sync_channel(1);
+    let (send, receive) = mpsc::sync_channel::<QueuedCommand>(1);
     assert!(send.try_send(command(&metrics)).is_ok());
     thread::sleep(Duration::from_millis(20));
     let (_, pending) = receive
@@ -98,15 +98,13 @@ fn production_queue_keeps_capacity_and_discard_does_not_become_dispatch() {
         client.lookup_profile_tag_categories(vec![]),
         Err(GlobalLibraryWriterQueueError::Full)
     ));
-    assert_eq!(
-        writer.dispatch_metrics(),
-        GlobalDispatchMetricsSnapshot::default()
-    );
+    let capacity = super::super::GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY as u64;
+    assert_eq!(writer.dispatch_metrics().queued, capacity);
+    assert_eq!(writer.dispatch_metrics().peak_queued, capacity);
     writer.begin_shutdown();
-    assert_eq!(
-        writer.dispatch_metrics(),
-        GlobalDispatchMetricsSnapshot::default()
-    );
+    assert_eq!(writer.dispatch_metrics().queued, 0);
+    assert_eq!(writer.dispatch_metrics().abandoned, capacity);
+    assert_eq!(writer.dispatch_metrics().dequeued, 0);
     assert!(matches!(
         client.lookup_profile_tag_categories(vec![]),
         Err(GlobalLibraryWriterQueueError::Closed)
@@ -188,8 +186,126 @@ fn real_registry_vocabulary_and_source_fenced_harvest_routes_record_dequeue_once
         .unwrap()
         .unwrap();
     let snapshot = writer.dispatch_metrics();
+    assert_eq!(snapshot.queued, 0);
+    assert!(snapshot.peak_queued >= 1);
+    assert_eq!(snapshot.abandoned, 0);
     assert_eq!(snapshot.dequeued, 3);
     assert_eq!(snapshot.wait_buckets.iter().sum::<u64>(), 3);
     assert!(writer.shutdown());
     assert_eq!(writer.dispatch_metrics(), snapshot);
+}
+
+#[test]
+fn accepted_envelopes_release_once_on_discard_and_receiver_destruction() {
+    let metrics = Arc::new(DispatchMetrics::default());
+    let (send, receive) = mpsc::sync_channel(2);
+    let enqueue = || {
+        let (result, _) = mpsc::sync_channel(1);
+        metrics.try_send(&send, WriterCommand::LoadSourceRegistry { result })
+    };
+    assert!(enqueue().is_ok());
+    assert!(enqueue().is_ok());
+    assert!(matches!(enqueue(), Err(mpsc::TrySendError::Full(_))));
+    assert_eq!(metrics.snapshot().queued, 2);
+    assert_eq!(metrics.snapshot().peak_queued, 2);
+    drop(receive.recv().unwrap().discard());
+    assert_eq!(metrics.snapshot().queued, 1);
+    assert_eq!(metrics.snapshot().abandoned, 1);
+    drop(receive);
+    assert_eq!(metrics.snapshot().queued, 0);
+    assert_eq!(metrics.snapshot().abandoned, 2);
+    assert!(matches!(
+        enqueue(),
+        Err(mpsc::TrySendError::Disconnected(_))
+    ));
+    assert_eq!(metrics.snapshot().abandoned, 2);
+}
+
+#[test]
+fn immediate_receiver_race_preserves_exact_backlog_and_never_counts_rejections() {
+    let metrics = Arc::new(DispatchMetrics::default());
+    let (send, receive) = mpsc::sync_channel::<QueuedCommand>(1);
+    let worker = thread::spawn(move || {
+        while let Ok(queued) = receive.recv() {
+            let (_, pending) = queued.received();
+            pending.record();
+        }
+    });
+    let mut accepted = 0;
+    for _ in 0..2000 {
+        let (result, _) = mpsc::sync_channel(1);
+        if metrics
+            .try_send(&send, WriterCommand::LoadSourceRegistry { result })
+            .is_ok()
+        {
+            accepted += 1;
+        }
+    }
+    drop(send);
+    worker.join().unwrap();
+    let snapshot = metrics.snapshot();
+    assert!(accepted > 0);
+    assert_eq!(snapshot.queued, 0);
+    assert_eq!(snapshot.dequeued, accepted);
+    assert_eq!(snapshot.abandoned, 0);
+    // A removed envelope may await the telemetry lock while a new envelope enters
+    // the channel; the metric includes that short dequeue-accounting boundary.
+    assert!((1..=2).contains(&snapshot.peak_queued));
+}
+
+#[test]
+fn actual_worker_unwind_abandons_waiting_envelopes_without_dispatch_samples() {
+    let _runtime = TestRuntimeGuard::acquire();
+    let base = tempfile::tempdir().unwrap();
+    let _config = ConfigBaseGuard::set(base.path().into());
+    let _profile = PersistenceProfileGuard::named("global-backlog-unwind");
+    let guard = WritableProfileGuard::acquire_current().unwrap();
+    let (mut writer, ready, release) =
+        GlobalLibraryWriter::start_with_post_command_gate_for_test(&guard);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while writer.status() != GlobalLibraryWriterStatus::Available {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    let first = writer.load_source_registry_snapshot().unwrap();
+    ready.wait(); // The actual worker has dequeued/executed the first command.
+    let panic_reply = writer.panic_owner_for_test().unwrap();
+    let pending1 = writer.load_source_registry_snapshot().unwrap();
+    let pending2 = writer.load_source_registry_snapshot().unwrap();
+    assert_eq!(writer.dispatch_metrics().queued, 3);
+    release.wait();
+    first.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    assert!(panic_reply.recv_timeout(Duration::from_secs(5)).is_err());
+    assert!(pending1.recv_timeout(Duration::from_secs(5)).is_err());
+    assert!(pending2.recv_timeout(Duration::from_secs(5)).is_err());
+    let report = writer.shutdown_with_report();
+    assert_eq!(
+        report.outcome(),
+        &super::super::GlobalLibraryWriterDrainOutcome::WorkerPanicked
+    );
+    let snapshot = writer.dispatch_metrics();
+    assert_eq!(snapshot.queued, 0);
+    assert_eq!(snapshot.peak_queued, 3);
+    assert_eq!(snapshot.abandoned, 2);
+    assert_eq!(snapshot.dequeued, 2); // Normal first command and actual panic-command dequeue.
+    assert_eq!(snapshot.wait_buckets.iter().sum::<u64>(), 2);
+}
+
+#[test]
+fn actual_discard_saturates_abandonment_without_losing_backlog_release() {
+    let metrics = Arc::new(DispatchMetrics::default());
+    let (send, receive) = mpsc::sync_channel(1);
+    metrics.queue.lock().unwrap().abandoned = u64::MAX - 1;
+    for _ in 0..2 {
+        let (result, _) = mpsc::sync_channel(1);
+        assert!(
+            metrics
+                .try_send(&send, WriterCommand::LoadSourceRegistry { result })
+                .is_ok()
+        );
+        drop(receive.recv().unwrap().discard());
+    }
+    assert_eq!(metrics.snapshot().abandoned, u64::MAX);
+    assert_eq!(metrics.snapshot().queued, 0);
+    assert_eq!(metrics.snapshot().peak_queued, 1);
 }
