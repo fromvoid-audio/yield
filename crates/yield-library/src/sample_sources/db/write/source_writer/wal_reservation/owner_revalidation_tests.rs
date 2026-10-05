@@ -559,6 +559,10 @@ fn original_wal_binding_never_extends_original_deadline_or_releases_on_expiry() 
             preparation.capture_wal_binding(&registration),
             Err(SourceWalPreparationError::Deadline)
         ));
+        assert!(matches!(
+            preparation.validate_registered_wal_binding(&binding, &registration),
+            Err(SourceWalPreparationError::Deadline)
+        ));
         assert_eq!(preparation.deadline, deadline);
         busy(&other);
     }
@@ -654,4 +658,67 @@ fn original_wal_binding_refuses_unknown_runtime_and_missing_completed_audit() {
         drop(registration);
         writer.close().unwrap();
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn registered_boundary_refuses_prepared_without_ordinary_sql_or_owner_release() {
+    let (_fixture, writer) = fixture();
+    let registration = writer.database.prepare_source_authority().unwrap();
+    let revision = writer.current_revision().unwrap();
+    let other = external(&writer);
+    let before = (lease_row(&other), metadata(&other));
+    let control = writer
+        .database
+        .source_lease_control_total_changes_for_tests()
+        .unwrap()
+        .unwrap();
+    let handle = unsafe { writer.database.connection.handle() };
+    let preparation = writer
+        .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    let binding = preparation.capture_wal_binding(&registration).unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::clone(&count);
+    preparation
+        .writer()
+        .database
+        .connection
+        .authorizer(Some(move |_: AuthContext<'_>| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Authorization::Deny
+        }));
+    for _ in 0..8 {
+        assert!(matches!(
+            preparation.validate_registered_wal_binding(&binding, &registration),
+            Err(SourceWalPreparationError::BindingUnavailable)
+        ));
+        preparation
+            .validate_wal_binding(&binding, &registration)
+            .unwrap();
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        preparation
+            .writer()
+            .database
+            .source_lease_control_total_changes_for_tests()
+            .unwrap()
+            .unwrap(),
+        control
+    );
+    assert_eq!((lease_row(&other), metadata(&other)), before);
+    busy(&other);
+    preparation
+        .writer()
+        .database
+        .connection
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    let writer = preparation.abort().unwrap();
+    assert_eq!(unsafe { writer.database.connection.handle() }, handle);
+    assert_eq!(writer.current_revision().unwrap(), revision);
+    assert_eq!((lease_row(&other), metadata(&other)), before);
+    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    drop(registration);
+    writer.close().unwrap();
 }

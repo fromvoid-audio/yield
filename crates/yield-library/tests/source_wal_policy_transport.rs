@@ -126,6 +126,8 @@ fn normal_build_original_tag_and_layout_policies_cross_the_source_inbox() {
         busy(&other);
         owner.publish_prepared(Some(&authority)).unwrap();
         owner.revalidate(Some(&authority)).unwrap();
+        assert_eq!(owner.validate_registered(&authority), Err(Rejection::Scope));
+        owner.revalidate(Some(&authority)).unwrap();
         let holder = request.try_prepared().unwrap();
         let Status::Prepared(observation) = holder.status() else {
             panic!("original policy entered")

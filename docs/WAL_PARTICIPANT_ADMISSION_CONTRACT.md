@@ -522,3 +522,39 @@ genuine current Registered acknowledgements, post-decision native cleanup fencin
 atomic nonce/intent/claims and uncertain settlement remain open. These original
 parked checks provide no latch, permit, retry/refund, release or close acknowledgement;
 qualified allocation OPT-2194 and genuine admitted release OPT-2202 remain open.
+
+
+## Original current Registered source validation (OPT-2274)
+
+The actual audited/tag/layout and pre-audit lease preparation owners expose an
+explicit `validate_registered` boundary on the sealed source producer dispatch.
+It requires the original published parked scope, original nonexpired preparation,
+unchanged retained native objects and entered policy, and the genuine source
+registration. The registration checks that the actual database retains the same
+private lease, roots and MAIN binding; it validates current profile ownership,
+lease liveness and read-only CONTROL under a transient original lifecycle gate
+use. Locally Prepared registrations and historical Registered phase observations
+cannot satisfy this check. Missing scope, foreign registration, abort/cancellation,
+drain and expiry refuse without rolling back or returning the writer.
+
+`SourceWalPreparation::validate_registered_wal_binding` and
+`SourceLeaseMaintenancePreparation::validate_registered_lease_binding` perform
+original parked scope checks before and after the current registration check.
+They perform no ordinary SQL, lease renewal or deadline extension. The existing
+diagnostic capture and parked validation APIs still accept genuine locally
+Prepared registrations for their documented observation-only purpose.
+
+Success is current validation only. The transient gate use ends before return;
+it does not protect a subsequent journal transaction, publish an asynchronous
+all-owner acknowledgement, retain post-start custody, issue a claim or permit,
+settle an intent, authorize retry or refund reservations. OPT-2136 still owns
+those complete production boundaries and atomic nonce/readback/restart behavior.
+
+Portable real-owner tests deny ordinary SQL while checking refusal, preserve MAIN
+exclusivity and exact lease/metadata rows and connection identity through confirmed
+abort, and cover audited/tag/layout and pre-audit producer dispatch. The native
+`native_registered_parked_source_boundaries_refuse_foreign_and_drained_authority`
+harness registers through the actual journal, checks audited and pre-audit original
+producers, and drains/retires through actual journal commands. Its macOS execution
+requires native capacity/bootstrap resources; a logical registration model cannot
+replace that execution or qualify the production per-user reserve registry.

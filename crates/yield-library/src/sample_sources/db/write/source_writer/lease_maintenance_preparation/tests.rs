@@ -751,6 +751,10 @@ fn parked_lease_binding_validates_actual_control_native_and_settings_without_ord
         held.revalidate_owner().unwrap();
         held.validate_lease_binding(&binding, &registration)
             .unwrap();
+        assert!(
+            held.validate_registered_lease_binding(&binding, &registration)
+                .is_err()
+        );
     }
     assert_eq!(
         other

@@ -118,6 +118,17 @@ impl SourceWalProducerOwner {
             Self::Lease(o) => o.publish_prepared(registration),
         }
     }
+    /// Validate current genuine Registered authority on this exact original parked owner.
+    /// Success is a current check only, never a settlement acknowledgement or permit.
+    pub fn validate_registered(
+        &self,
+        registration: &SourceAuthorityRegistration,
+    ) -> Result<(), SourceWalTransportRejection> {
+        match self {
+            Self::Audited(owner) => owner.validate_registered(registration),
+            Self::Lease(owner) => owner.validate_registered(registration),
+        }
+    }
     /// Validate the genuine original owner and registration.
     pub fn revalidate(
         &self,
