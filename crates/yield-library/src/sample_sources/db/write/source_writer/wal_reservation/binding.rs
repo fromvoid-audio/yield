@@ -233,10 +233,40 @@ impl SourceWalPreparation {
         registration: &SourceAuthorityRegistration,
     ) -> Result<(), SourceWalPreparationError> {
         self.validate_wal_binding(binding, registration)?;
+        if let Some(custody) = self.held.registered.as_ref() {
+            custody
+                .validate(&self.writer().database, registration)
+                .map_err(|_| SourceWalPreparationError::BindingUnavailable)?;
+        }
         registration
             .validate_registered_database_boundary(&self.writer().database)
             .map_err(|_| SourceWalPreparationError::BindingUnavailable)?;
         self.validate_wal_binding(binding, registration)
+    }
+
+    /// Retain one genuine currently Registered database use on this original empty reservation.
+    /// The fixed owner-local custody survives failed rollback/restoration until actual close.
+    /// It grants no decision, write, deadline extension, capacity or settlement authority.
+    /// Repeated acquisition refuses; existing parked validation remains read-only.
+    pub fn retain_registered_wal_binding(
+        &mut self,
+        binding: &SourceWalBinding,
+        registration: &SourceAuthorityRegistration,
+    ) -> Result<(), SourceWalPreparationError> {
+        use SourceWalPreparationError::BindingUnavailable;
+        if self.held.registered.is_some() {
+            return Err(BindingUnavailable);
+        }
+        self.validate_registered_wal_binding(binding, registration)?;
+        let custody = registration
+            .retain_registered_database_boundary(&self.writer().database)
+            .map_err(|_| BindingUnavailable)?;
+        self.validate_wal_binding(binding, registration)?;
+        custody
+            .validate(&self.writer().database, registration)
+            .map_err(|_| BindingUnavailable)?;
+        self.held.registered = Some(custody);
+        Ok(())
     }
 
     fn binding_objects(&self) -> Result<WalObjects, SourceWalPreparationError> {

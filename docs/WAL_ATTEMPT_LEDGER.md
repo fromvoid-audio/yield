@@ -110,3 +110,34 @@ Windows APIs. Native execution and supported SDK/toolchain validation are tracke
 in OPT-2280; native capacity/quota execution remains OPT-2278. No physical
 allocation qualification, database claim slice, permit, retry, reservation refund,
 lifecycle release or genuine settlement is supplied. Full OPT-2194 remains open.
+
+### Original Registered source reservation custody (OPT-2287)
+
+`SourceWalPreparation::retain_registered_wal_binding` retains one private,
+non-cloneable counted use of the exact original Registered source registration,
+request, database and lease. It checks the current CONTROL/profile and original
+native MAIN/WAL/SHM binding before retention. A Prepared diagnostic, foreign or
+expired binding cannot acquire this custody; repeated acquisition refuses. Its
+fixed header is bounded to 512 bytes and is included in the concrete preparation
+size used by transport accounting. Parked validation executes no ordinary SQL.
+
+The count and original lease reference survive rollback or timeout-restoration
+failure. Confirmed empty rollback and policy restoration release them before
+returning the same writer. Drop closes ordinary SQLite before releasing the count
+and its lease reference, including after registration abandonment. Draining close
+validates the original guard and distinguishes precisely this one owned lease
+reference from external snapshot fences. It closes ordinary SQLite, releases its
+own counted use, then enters the existing lease-release/retirement-ack boundary.
+Wrong guards and external snapshots cannot obtain a retirement acknowledgement.
+
+Tests use real original source connections, the actual confirmation lifecycle and
+real rollback denial. A SQLite function-userdata destructor observes the held count
+at actual connection close. The timeout test injects pending restoration at the
+existing private failure boundary; normal preparation already restores the timeout.
+The harness is compiled for Linux, macOS and Windows; only Linux execution was
+available here. Native execution remains separate verification. These fixtures
+install no production capacity provider and qualify no physical allocation. This core primitive supplies no write permission, decision latch,
+retry, reservation refund or genuine journal settlement. Full OPT-2136 still needs
+audited/pre-audit transport retention and acknowledgements, aggregate budgets,
+all-owner decision and post-start cleanup fences, atomic nonce/intent/claims,
+readback/restart handling and qualified directions with required permits.

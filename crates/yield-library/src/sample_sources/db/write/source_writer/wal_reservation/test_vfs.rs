@@ -14,6 +14,7 @@ impl SourceWriter {
             writer: Some(self),
             reservation: false,
             restore_timeout: None,
+            registered: None,
         };
         unsafe extern "C" fn unknown(_: *mut ffi::sqlite3_file, _: *mut ffi::sqlite3_int64) -> i32 {
             ffi::SQLITE_IOERR_FSTAT

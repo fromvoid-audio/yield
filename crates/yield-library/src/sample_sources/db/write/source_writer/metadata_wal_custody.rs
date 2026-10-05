@@ -40,7 +40,11 @@ impl Custody {
             .map(|b| b.identity())
     }
     pub(super) fn source_authority_close_ready(&self) -> bool {
-        self.writer().database.source_authority_close_ready()
+        match self.owner.as_ref().expect("retained policy owner") {
+            Owner::Held(held) => held.source_authority_close_ready(),
+            Owner::Failed(failed) => failed.source_authority_close_ready(),
+            Owner::Unprepared { writer, .. } => writer.database.source_authority_close_ready(),
+        }
     }
     pub(super) fn close_for_retirement(
         mut self,

@@ -84,7 +84,7 @@ impl SourceWalPreparationFailure {
 
     /// Check snapshot custody without executing SQL on the unavailable writer.
     pub fn source_authority_close_ready(&self) -> bool {
-        self.held.writer().database.source_authority_close_ready()
+        self.held.close_ready()
     }
 
     /// Consume an empty failed reservation through its original draining source authority.
@@ -100,9 +100,7 @@ impl SourceWalPreparationFailure {
         if !self.held.reservation && !self.held.writer().database.connection.is_autocommit() {
             return Err(SourceAuthorityError::InvalidLifecycle);
         }
-        let writer = self.held.writer.take().expect("retained source writer");
-        self.held.reservation = false;
-        authority.close_database(writer.into_catalog_database())
+        self.held.close_for_retirement(authority)
     }
 
     /// Return the exact retained writer only after confirming empty rollback and timeout policy.
@@ -147,9 +145,11 @@ impl SourceWalPreparation {
         if !self.held.reservation && !self.held.writer().database.connection.is_autocommit() {
             return Err(SourceAuthorityError::InvalidLifecycle);
         }
-        let writer = self.held.writer.take().expect("original empty reservation");
-        self.held.reservation = false;
-        authority.close_database(writer.into_catalog_database())
+        self.held.close_for_retirement(authority)
+    }
+
+    pub(super) fn source_authority_close_ready(&self) -> bool {
+        self.held.close_ready()
     }
 
     pub(super) fn writer(&self) -> &SourceWriter {
@@ -215,9 +215,29 @@ struct HeldWriter {
     writer: Option<SourceWriter>,
     reservation: bool,
     restore_timeout: Option<Duration>,
+    // Native writer/ordinary SQLite drops first. This lease reference then keeps final lease
+    // cleanup from waiting on our own count until the counted use has released.
+    registered: Option<crate::sample_sources::db::source_authority::RegisteredDatabaseCustody>,
 }
 
 impl HeldWriter {
+    fn close_ready(&self) -> bool {
+        self.registered.as_ref().map_or_else(
+            || self.writer().database.source_authority_close_ready(),
+            |custody| custody.close_ready(&self.writer().database),
+        )
+    }
+    fn close_for_retirement(
+        &mut self,
+        authority: &mut SourceAuthorityRegistration,
+    ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
+        let writer = self.writer.take().expect("original empty reservation");
+        self.reservation = false;
+        authority.close_database_with_registered_custody(
+            writer.into_catalog_database(),
+            self.registered.take(),
+        )
+    }
     fn writer(&self) -> &SourceWriter {
         self.writer.as_ref().expect("retained source writer")
     }
@@ -250,6 +270,8 @@ impl HeldWriter {
             self.restore_busy_timeout(timeout)?;
             self.restore_timeout = None;
         }
+        // The original transaction is rolled back and timeout restoration confirmed.
+        drop(self.registered.take());
         Ok(self.writer.take().expect("retained source writer"))
     }
 }
@@ -325,6 +347,7 @@ impl SourceWriter {
             writer: Some(self),
             reservation: false,
             restore_timeout: None,
+            registered: None,
         };
         let prepared = prepare(&mut held, expected, deadline, true);
         finish_preparation(held, prepared, deadline, false)
@@ -338,6 +361,7 @@ impl SourceWriter {
             writer: Some(self),
             reservation: false,
             restore_timeout: None,
+            registered: None,
         };
         let prepared = prepare(&mut held, expected, deadline, false);
         finish_preparation(held, prepared, deadline, true)
@@ -520,3 +544,6 @@ fn prepare(
     }
     Ok((revision, wal_bytes))
 }
+
+#[cfg(test)]
+mod registered_custody_tests;
