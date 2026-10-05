@@ -14,6 +14,11 @@ use std::{
     rc::Rc,
 };
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 use thiserror::Error;
@@ -312,11 +317,162 @@ pub(crate) struct VolumeOwnershipCapability {
     /// Set before attempting a clean write.  A failed or uncertain write must never let this
     /// runtime continue using the old generation as if the handoff had not started.
     handoff_fenced: Rc<Cell<bool>>,
+    read_fenced: Arc<AtomicBool>,
     _owner_thread: PhantomData<Rc<()>>,
+}
+
+impl Drop for VolumeOwnershipCapability {
+    fn drop(&mut self) {
+        // Every original context alias shares the actual flock open-file description.
+        // Fence readonly observers before the LAST original alias releases ownership.
+        if Rc::strong_count(&self.handoff_fenced) == 1 {
+            self.read_fenced.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Independent readonly registry/marker and native-volume observation. No flock descriptor,
+/// profile authority, Rc fence or ownership capability is transferred to this witness.
+#[allow(dead_code)]
+pub(super) struct ReadonlyVolumeOwner {
+    registry: RegistryRoot,
+    volume: VolumeIdentity,
+    lock_path: PathBuf,
+    lock_identity: String,
+    marker: OwnershipMarker,
+    #[cfg(target_os = "macos")]
+    mac_volume: MacVolumeBinding,
+    fenced: Arc<AtomicBool>,
+}
+#[allow(dead_code)]
+impl ReadonlyVolumeOwner {
+    pub(super) fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.fenced, &other.fenced)
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.registry.path.capacity()
+            + self.registry.identity.capacity()
+            + self.lock_path.capacity()
+            + self.lock_identity.capacity()
+            + self.marker.owner_profile_identity.capacity()
+    }
+    pub(super) fn generation(&self) -> u64 {
+        self.marker.generation
+    }
+    pub(super) fn volume(&self) -> &VolumeIdentity {
+        &self.volume
+    }
+    pub(super) fn validate(&self) -> Result<(), VolumeOwnershipError> {
+        if self.fenced.load(Ordering::Acquire) {
+            return Err(VolumeOwnershipError::HandoffFenced {
+                path: self.lock_path.clone(),
+            });
+        }
+        #[cfg(target_os = "macos")]
+        self.mac_volume.validate(&self.volume)?;
+        self.registry.validate()?;
+        let name = self
+            .lock_path
+            .file_name()
+            .ok_or(VolumeOwnershipError::InvalidVolumeIdentity)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        {
+            use cap_primitives::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let lock = self
+            .registry
+            .capability
+            .open_with(Path::new(name), &options)
+            .map_err(|source| VolumeOwnershipError::MarkerIo {
+                path: self.lock_path.clone(),
+                source,
+            })?
+            .into_std();
+        validate_lock_file(&lock, &self.lock_path)?;
+        if identity_from_file(&lock).as_deref() != Some(self.lock_identity.as_str()) {
+            return Err(VolumeOwnershipError::LockReplaced {
+                path: self.lock_path.clone(),
+            });
+        }
+        if read_marker(lock, &self.lock_path)?.as_ref() != Some(&self.marker) {
+            return Err(VolumeOwnershipError::MarkerChanged {
+                path: self.lock_path.clone(),
+            });
+        }
+        self.registry.validate()?;
+        if self.fenced.load(Ordering::Acquire) {
+            return Err(VolumeOwnershipError::HandoffFenced {
+                path: self.lock_path.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl VolumeOwnershipCapability {
     /// Return the live volume identity bound to this capability.
+    #[allow(dead_code)]
+    pub(super) fn readonly_observation(&self) -> Result<ReadonlyVolumeOwner, VolumeOwnershipError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Err(VolumeOwnershipError::Unsupported {
+                path: self.lock_path.clone(),
+                reason: "qualified native readonly volume witness unavailable".into(),
+            });
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.revalidate()?;
+            let bounded = |p: &Path| {
+                p.as_os_str().as_encoded_bytes().len() <= 4096 && p.components().count() <= 64
+            };
+            if !bounded(&self.registry.path)
+                || !bounded(&self.lock_path)
+                || self.registry.identity.len() > 256
+                || self.lock_identity.len() > 256
+                || self.marker.owner_profile_identity.len() > 256
+            {
+                return Err(VolumeOwnershipError::InvalidVolumeIdentity);
+            }
+            let binding = self
+                .mac_volume
+                .as_ref()
+                .ok_or(VolumeOwnershipError::VolumeIdentityUnavailable)?;
+            // Do not duplicate a mutation-capable native observation descriptor.
+            use std::os::fd::AsRawFd;
+            let flags = unsafe { libc::fcntl(binding.descriptor.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 || flags & libc::O_ACCMODE != libc::O_RDONLY {
+                return Err(VolumeOwnershipError::VolumeIdentityUnavailable);
+            }
+            let observer = ReadonlyVolumeOwner {
+                registry: RegistryRoot {
+                    path: self.registry.path.to_path_buf(),
+                    identity: self.registry.identity.to_string(),
+                    capability: self.registry.capability.try_clone().map_err(|source| {
+                        VolumeOwnershipError::MarkerIo {
+                            path: self.registry.path.clone(),
+                            source,
+                        }
+                    })?,
+                },
+                volume: self.volume.clone(),
+                lock_path: self.lock_path.to_path_buf(),
+                lock_identity: self.lock_identity.to_string(),
+                marker: self.marker.clone(),
+                mac_volume: binding.try_clone()?,
+                fenced: Arc::clone(&self.read_fenced),
+            };
+            observer.validate()?;
+            self.revalidate()?;
+            Ok(observer)
+        }
+    }
+
     pub(super) fn volume(&self) -> &VolumeIdentity {
         &self.volume
     }
@@ -373,6 +529,7 @@ impl VolumeOwnershipCapability {
             #[cfg(target_os = "macos")]
             mac_volume,
             handoff_fenced: Rc::clone(&self.handoff_fenced),
+            read_fenced: Arc::clone(&self.read_fenced),
             _owner_thread: PhantomData,
         })
     }
@@ -443,6 +600,7 @@ impl VolumeOwnershipCapability {
             });
         }
         self.revalidate()?;
+        self.read_fenced.store(true, Ordering::Release);
         self.handoff_fenced.set(true);
         let mut clean_marker = self.marker.clone();
         clean_marker.state = MarkerState::Clean;
@@ -775,6 +933,7 @@ where
         #[cfg(target_os = "macos")]
         mac_volume: binding,
         handoff_fenced: Rc::new(Cell::new(false)),
+        read_fenced: Arc::new(AtomicBool::new(false)),
         _owner_thread: PhantomData,
     };
     capability.revalidate()?;
@@ -1193,6 +1352,39 @@ pub(super) fn acquire_fixture_with_clean_marker_for_test(
     )
 }
 
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn acquire_native_reader_fixture_test(
+    descriptor: &File,
+    registry_path: &Path,
+    profile: &WritableProfileGuard,
+) -> Result<VolumeOwnershipCapability, VolumeOwnershipError> {
+    profile
+        .validate_current()
+        .map_err(|error| root_error(registry_path.to_path_buf(), error))?;
+    let facts = descriptor_capacity_facts(descriptor)
+        .map_err(|_| VolumeOwnershipError::VolumeIdentityUnavailable)?;
+    let binding = MacVolumeBinding::acquire(descriptor, &facts.identity)?;
+    let capability = open_no_follow_directory(registry_path).map_err(|error| {
+        VolumeOwnershipError::RootUnavailable {
+            path: registry_path.to_path_buf(),
+            reason: error.to_string(),
+        }
+    })?;
+    let identity =
+        identity_from_dir(&capability).ok_or(VolumeOwnershipError::VolumeIdentityUnavailable)?;
+    acquire_inner_with_binding(
+        RegistryRoot {
+            path: registry_path.to_path_buf(),
+            identity,
+            capability,
+        },
+        facts.identity,
+        profile.profile_root_identity().to_owned(),
+        false,
+        Some(binding),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
@@ -1236,6 +1428,43 @@ mod tests {
         VolumeIdentity { device }
     }
 
+    #[test]
+    fn native_reader_last_original_volume_owner_alias_fences_before_lock_release() {
+        let fixture = fixture();
+        let owner = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(77),
+            "reader-profile",
+        )
+        .unwrap();
+        let observed_fence = Arc::clone(&owner.read_fenced);
+        let context = owner.try_clone_for_context().unwrap();
+        assert!(!observed_fence.load(Ordering::Acquire));
+        drop(owner);
+        assert!(!observed_fence.load(Ordering::Acquire));
+        context.revalidate().unwrap();
+        assert!(
+            acquire_fixture_for_test(
+                &fixture.descriptor,
+                &fixture.registry,
+                volume(77),
+                "reader-profile"
+            )
+            .is_err()
+        );
+        drop(context);
+        assert!(observed_fence.load(Ordering::Acquire));
+        let reacquired = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(77),
+            "reader-profile",
+        )
+        .unwrap();
+        assert!(!reacquired.read_fenced.load(Ordering::Acquire));
+        assert!(observed_fence.load(Ordering::Acquire));
+    }
     #[test]
     fn old_v1_unseen_device_ignores_uuid_dirty_owner_and_active_policy_keeps_shared_key() {
         let fixture = fixture();

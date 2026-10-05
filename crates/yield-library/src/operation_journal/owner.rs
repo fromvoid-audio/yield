@@ -12,8 +12,10 @@ pub use super::wal_admission::{
     WalPreparationStatus, WalPreparedDatabase,
 };
 mod frozen_copy;
+mod native_read_capsule;
 mod resource_custody;
 pub use frozen_copy::{FrozenCopyObservation, FrozenCopyValidationError};
+use native_read_capsule::NativeCapsuleData;
 use resource_custody::ResourceAdmission;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
@@ -1565,6 +1567,8 @@ fn prepared_admission_fault_facts(
 }
 
 struct OwnerRuntime {
+    native_readers: BTreeMap<VolumeIdentity, std::sync::Weak<NativeCapsuleData>>,
+    native_reader_registry_input: Option<InputPermit>,
     resource_admission: Arc<ResourceAdmission>,
     resource_input: Option<InputPermit>,
     wal_preparation: Option<super::wal_admission::Collector>,
@@ -1600,6 +1604,8 @@ impl OwnerRuntime {
             .try_clone_profile_guard_for_owner()
             .map_err(|error| error.to_string())?;
         Ok(Self {
+            native_readers: BTreeMap::new(),
+            native_reader_registry_input: None,
             resource_admission: ResourceAdmission::new(),
             resource_input: None,
             wal_preparation: None,
@@ -3865,6 +3871,8 @@ impl Drop for OwnerRuntime {
             }
         }
         self.resource_admission.close_and_wait();
+        self.native_readers.clear();
+        self.native_reader_registry_input.take();
         // Publish loss/cancel original owners before journal authority teardown.
         drop(self.wal_preparation.take());
         // Source registrations retain non-Send authority guards and external reserve/volume
@@ -5462,13 +5470,9 @@ fn run_owner(
         }
     };
 
-    runtime.resource_admission = Arc::clone(&shared.resource_admission);
-    match shared.reserve_input(InputClass::Ordinary, resource_custody::HEADER_BYTES) {
-        Ok(input) => runtime.resource_input = Some(input),
-        Err(error) => {
-            shared.mark_unavailable(&format!("publication resource header unavailable: {error}"));
-            return;
-        }
+    if let Err(error) = runtime.attach_resource_custody(&shared) {
+        shared.mark_unavailable(&format!("publication resource header unavailable: {error}"));
+        return;
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -6185,6 +6189,7 @@ mod tests {
     mod command_drain_tests;
     mod control_input_tests;
     mod control_responsiveness_tests;
+    mod native_read_capsule_tests;
     mod resource_custody_tests;
     mod source_registry_handoff_tests;
     #[test]

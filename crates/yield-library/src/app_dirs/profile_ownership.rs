@@ -13,7 +13,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
-const PROFILE_OWNER_LOCK_FILE_NAME: &str = "profile-owner.lock";
+pub(crate) const PROFILE_OWNER_LOCK_FILE_NAME: &str = "profile-owner.lock";
 
 /// Errors returned while acquiring writable ownership of the current profile.
 #[derive(Debug, Error)]

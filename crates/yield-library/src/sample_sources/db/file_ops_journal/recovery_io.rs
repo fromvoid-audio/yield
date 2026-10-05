@@ -728,6 +728,46 @@ fn open_index_component(
     Ok(file)
 }
 
+/// Read-only root observation. No profile-child lease or namespace mutation API is exposed.
+#[allow(dead_code)] // Private native publication reader, OPT-2272.
+pub(crate) struct ReadonlyDatabaseRoot {
+    root: BoundDatabaseRoot,
+}
+#[allow(dead_code)]
+impl ReadonlyDatabaseRoot {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.root.path.capacity()
+            + self.root.named_path.as_ref().map_or(0, PathBuf::capacity)
+            + self.root.identity.capacity()
+            + self.root.profile_identity.capacity()
+    }
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        if let Some(named) = &self.root.named_path {
+            let current = open_root_nofollow(named)?;
+            if root_identity_from_open_file(&current)? != self.root.identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "readonly root replaced",
+                ));
+            }
+        }
+        validate_database_root_alias(&self.root._capability, &self.root.path, &self.root.identity)
+            .map_err(|e| io::Error::other(format!("{e:?}")))
+    }
+    pub(crate) fn verify_direct_child(&self, name: &Path, expected: &str) -> io::Result<()> {
+        self.validate()?;
+        let file = self.root.open_observation_file_nofollow(name)?;
+        if stable_filesystem_identity_from_open_file(&file).as_deref() != Some(expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "readonly child replaced",
+            ));
+        }
+        self.validate()
+    }
+}
+
 impl BoundDatabaseRoot {
     /// Hold a bounded normal-component chain without data access or symlink traversal.
     pub(crate) fn inspect_index_file(
@@ -843,6 +883,46 @@ impl BoundDatabaseRoot {
     }
 
     /// Duplicate the retained directory descriptor for descriptor-derived volume facts.
+    /// Capture only observation descriptors; the original owner retains its child lease.
+    #[allow(dead_code)]
+    pub(crate) fn readonly_observation(&self) -> io::Result<ReadonlyDatabaseRoot> {
+        let bounded = |path: &Path| {
+            path.as_os_str().as_encoded_bytes().len() <= 4096 && path.components().count() <= 64
+        };
+        if !bounded(&self.path)
+            || self.named_path.as_ref().is_some_and(|p| !bounded(p))
+            || self.identity.len() > 256
+            || self.profile_identity.len() > 256
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "readonly root backing limit",
+            ));
+        }
+        let capability = self._capability.try_clone()?;
+        // A copied /proc alias must refer to THIS retained descriptor, not the original
+        // temporary/actor descriptor. The readonly witness owns no lease or authority.
+        let path = database_root_alias(
+            &capability,
+            self.named_path.as_deref().unwrap_or(&self.path),
+            &self.identity,
+        )
+        .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        let observer = ReadonlyDatabaseRoot {
+            root: Self {
+                path,
+                _capability: capability,
+                identity: self.identity.to_string(),
+                profile_identity: self.profile_identity.to_string(),
+                named_path: self.named_path.as_ref().map(|p| p.to_path_buf()),
+                namespace_kind: self.namespace_kind,
+                _lease: None,
+            },
+        };
+        observer.validate()?;
+        Ok(observer)
+    }
+
     pub(crate) fn try_clone_descriptor(&self) -> io::Result<fs::File> {
         self._capability.try_clone()
     }

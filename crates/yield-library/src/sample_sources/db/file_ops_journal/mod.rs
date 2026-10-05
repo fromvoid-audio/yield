@@ -23,7 +23,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use recovery_io::{BoundDatabaseRoot, HeldIndexFile};
+pub(crate) use recovery_io::{BoundDatabaseRoot, HeldIndexFile, ReadonlyDatabaseRoot};
 
 pub use entry::{
     CopyJournalEntryInit, FileOpJournalEntry, FileOpStage, MoveJournalEntryInit, new_op_id,
