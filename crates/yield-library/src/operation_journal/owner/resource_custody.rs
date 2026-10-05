@@ -231,6 +231,18 @@ impl ResourceUse {
         &mut self,
         validate_slot: impl FnOnce() -> bool,
     ) -> Result<(), UseError> {
+        self.enter_effect_checked(|| {
+            if validate_slot() {
+                Ok(())
+            } else {
+                Err(UseError::Closed)
+            }
+        })
+    }
+    pub(super) fn enter_effect_checked(
+        &mut self,
+        validate_slot: impl FnOnce() -> Result<(), UseError>,
+    ) -> Result<(), UseError> {
         let mut state = self.admission.lock();
         if !state.valid() || state.unknown {
             state.close_unknown();
@@ -248,8 +260,11 @@ impl ResourceUse {
             state.close_unknown();
             return Err(UseError::Unknown);
         }
-        if !validate_slot() {
-            return Err(UseError::Closed);
+        if let Err(error) = validate_slot() {
+            if error == UseError::Unknown {
+                state.close_unknown();
+            }
+            return Err(error);
         }
         // No decrement/reincrement: original native read stays counted throughout entry.
         state.uses[self.index]
