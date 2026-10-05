@@ -119,3 +119,28 @@ callbacks, finite distinct claim slices, genuine issuance/replay/recovery and
 sealed-close settlement. Missing adapters or consumers are implementation gaps,
 not platform-test waivers. Contract SQL fixtures, logical caps and Linux measurements
 supply no native physical grant, required permit, refund or genuine settlement.
+
+## Retained-row structural refusal (OPT-2298)
+
+The original global owner now validates stored V1 reference and receipt shapes before
+selecting its lifecycle allocation policy or capturing original MAIN/WAL/SHM objects.
+Exact schema DDL and normal CHECK enforcement do not establish that existing rows satisfy
+those constraints: an earlier writer could have disabled CHECK enforcement. Two SQL scalar
+aggregate scans inspect at most 8193 rows per relation and reject storage classes, byte
+extents, embedded NULs, unknown states/dispositions, nonpositive sequence values and malformed
+nullable identities. The original 8192-row and 4096-active-reference limits remain unchanged.
+No subject or receipt is copied into Rust by this scan. Both observation passes stay inside
+the existing VM/deadline scope.
+
+Unknown retained shapes refuse passive capture and entered-policy construction without
+installing settings, repairing rows, evicting evidence or authorizing effects. Tests write
+24 distinct malformed values with CHECK enforcement temporarily disabled, restore normal
+enforcement, and exercise the actual original preparation path. They check unchanged settings,
+row retention and zero mutation from observation; an oversized original subject is preserved
+across a real database close/reopen. Legal nullable identities and existing full-limit storage
+workloads remain covered.
+
+These checks establish storage shape only. A shape-valid blob is not an authenticated
+lifecycle subject or immutable receipt, and the logical workload ceilings do not qualify
+physical allocation or furnish exact admitted direction claims. OPT-2194/2195 and their
+production permit/transition/settlement consumers remain open.
