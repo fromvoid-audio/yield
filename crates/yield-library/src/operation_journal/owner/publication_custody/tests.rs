@@ -151,7 +151,7 @@ fn original_target_expiring_during_source_acquisition_refuses_count_upgrade() {
         counted_entry_checked(
             &original,
             || Ok(Custody(original.clone(), released.clone())),
-            |_| false
+            |_| Err(UseError::Closed)
         )
         .is_err()
     );
@@ -169,7 +169,7 @@ fn counted_entry_retains_original_publication_credit_until_source_and_target_dro
     let input = shared.reserve_publication_input(64 * 1024).unwrap();
     let initial = super::super::PUBLICATION_INPUT_BYTES;
     struct Custody(super::super::InputPermit);
-    let entered = counted_entry_checked(admission, || Ok(Custody(input)), |_| true).unwrap();
+    let entered = counted_entry_checked(admission, || Ok(Custody(input)), |_| Ok(())).unwrap();
     assert_eq!(
         shared.input_bytes.lock().unwrap().publication_remaining,
         initial - 64 * 1024

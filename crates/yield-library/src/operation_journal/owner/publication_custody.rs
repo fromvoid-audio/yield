@@ -16,6 +16,7 @@ pub(crate) struct PublicationCustody {
     _source: SourceEffectPermit,
     target: PreparedPublicationTarget,
     _input: InputPermit,
+    fence: super::publication_fence::PendingFence,
 }
 pub(crate) type PublicationSourceUse = CountedSourceEntry<PublicationCustody>;
 #[cfg(all(test, target_os = "macos"))]
@@ -36,6 +37,7 @@ pub(super) fn begin_source_entry(
     pin: SourceEffectPin,
     target: PreparedPublicationTarget,
     input: InputPermit,
+    fence: super::publication_fence::PendingFence,
 ) -> Result<PublicationSourceUse, OperationJournalOwnerError> {
     super::validate_publication_target(&target)?;
     counted_entry_checked(
@@ -46,9 +48,15 @@ pub(super) fn begin_source_entry(
                 _source: source,
                 target,
                 _input: input,
+                fence,
             })
         },
-        |custody| custody.target.is_current(),
+        |custody| {
+            if !custody.target.is_current() {
+                return Err(super::resource_custody::UseError::Closed);
+            }
+            custody.fence.enter_checked()
+        },
     )
 }
 
@@ -57,22 +65,22 @@ fn counted_entry<T>(
     admission: &Arc<ResourceAdmission>,
     acquire_source: impl FnOnce() -> Result<T, OperationJournalOwnerError>,
 ) -> Result<CountedSourceEntry<T>, OperationJournalOwnerError> {
-    counted_entry_checked(admission, acquire_source, |_| true)
+    counted_entry_checked(admission, acquire_source, |_| Ok(()))
 }
 
 fn counted_entry_checked<T>(
     admission: &Arc<ResourceAdmission>,
     acquire_source: impl FnOnce() -> Result<T, OperationJournalOwnerError>,
-    is_current: impl FnOnce(&T) -> bool,
+    is_current: impl FnOnce(&mut T) -> Result<(), super::resource_custody::UseError>,
 ) -> Result<CountedSourceEntry<T>, OperationJournalOwnerError> {
     // Count before touching the source gate. Source acquisition holds no admission mutex;
     // closing between acquisition and upgrade refuses and drops source before runtime use.
     let mut runtime = admission.begin_read(|| true).map_err(closed)?;
-    let source = acquire_source()?;
-    // This is only the aggregate original-runtime gate, not a per-operation lifetime slot
-    // or capacity/target/native namespace check. The qualified adapter must add those.
+    let mut source = acquire_source()?;
+    // Original admission and the issuer cancellation fence only. Exact capacity,
+    // qualified namespace entry and other mutation fences still belong to the adapter.
     runtime
-        .enter_effect(|| is_current(&source))
+        .enter_effect_checked(|| is_current(&mut source))
         .map_err(closed)?;
     Ok(CountedSourceEntry {
         _source: source,

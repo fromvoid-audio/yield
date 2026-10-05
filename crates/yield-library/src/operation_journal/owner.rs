@@ -16,6 +16,7 @@ mod legacy_adoption_custody;
 pub use legacy_adoption_custody::{LegacyAdoptionCustody, LegacyAdoptionCustodyError};
 mod native_read_capsule;
 mod publication_custody;
+mod publication_fence;
 mod resource_custody;
 pub use frozen_copy::{FrozenCopyObservation, FrozenCopyValidationError};
 use native_read_capsule::NativeCapsuleData;
@@ -578,6 +579,12 @@ pub enum OperationJournalOwnerError {
         /// Bounded staging diagnostic.
         reason: String,
     },
+    /// Publication already entered or remains unsettled; cancellation was not recorded.
+    #[error("operation {operation_id:?} cancellation awaits publication reconciliation")]
+    PublicationCancellationPending {
+        /// Original operation whose publication custody prevents cancellation.
+        operation_id: OperationId,
+    },
     /// An internally serialized control input could not be decoded on the owner thread.
     #[error("operation journal owner control input could not be decoded: {reason}")]
     InvalidInput {
@@ -1098,6 +1105,7 @@ pub(crate) struct LiveChunkEffectGrant {
 #[allow(dead_code)] // The publication effect itself belongs to the subsequent route.
 pub(crate) struct StagingPublicationGrant {
     target: PreparedPublicationTarget,
+    fence: publication_fence::PendingFence,
     source_pin: SourceEffectPin,
     resource_admission: Arc<ResourceAdmission>,
     input: InputPermit,
@@ -1123,6 +1131,7 @@ impl StagingPublicationGrant {
             self.source_pin,
             self.target,
             self.input,
+            self.fence,
         )
     }
 }
@@ -1597,6 +1606,7 @@ fn prepared_admission_fault_facts(
 }
 
 struct OwnerRuntime {
+    publication_fences: publication_fence::Registry,
     legacy_adoption: Option<legacy_adoption_custody::RetainedLegacyAdoption>,
     native_readers: BTreeMap<VolumeIdentity, std::sync::Weak<NativeCapsuleData>>,
     native_reader_registry_input: Option<InputPermit>,
@@ -1635,6 +1645,7 @@ impl OwnerRuntime {
             .try_clone_profile_guard_for_owner()
             .map_err(|error| error.to_string())?;
         Ok(Self {
+            publication_fences: publication_fence::Registry::new(),
             legacy_adoption: None,
             native_readers: BTreeMap::new(),
             native_reader_registry_input: None,
@@ -2371,6 +2382,9 @@ impl OwnerRuntime {
                 reason: String::from("staging source fence differs from live registration"),
             });
         }
+        let fence = self
+            .publication_fences
+            .issue(validation.operation_id(), &input.shared)?;
         let checkpoint_result = self.store().checkpoint_staging_result(validation);
         let checkpoint: StagingCheckpointAck = self
             .publication_write_result(checkpoint_result)?
@@ -2384,10 +2398,24 @@ impl OwnerRuntime {
         validate_publication_target(&target)?;
         Ok(StagingPublicationGrant {
             target,
+            fence,
             input,
             source_pin,
             resource_admission: Arc::clone(&self.resource_admission),
         })
+    }
+
+    fn request_cancel_before_publish(
+        &self,
+        operation_id: OperationId,
+        expected_sequence: i64,
+        observation: CancellationRequestObservation,
+    ) -> Result<JournalCancelRequestReceipt, OperationJournalOwnerError> {
+        self.publication_fences
+            .close_for_cancellation(operation_id)?;
+        self.store()
+            .request_cancel_before_publish(operation_id, expected_sequence, observation)
+            .map_err(Into::into)
     }
 
     fn publication_write_result<T>(
@@ -3446,6 +3474,9 @@ impl OwnerRuntime {
     /// after every retained source and durable ledger proof has passed; any marker uncertainty
     /// fences this runtime and returns no clean receipt.
     fn handoff_volume_to_clean_owner(&mut self) -> Result<(), String> {
+        if self.publication_fences.unresolved() {
+            self.resource_admission.invalidate();
+        }
         if !self.resource_admission.close_and_wait() {
             return Err("publication resource use remains unknown or unsettled".into());
         }
@@ -3919,6 +3950,9 @@ impl Drop for OwnerRuntime {
     fn drop(&mut self) {
         // Close and wait before ANY original actor resource is released, including unwind.
         // Native-use Drop wakes directly; no actor queue or source/slot mutex is held.
+        if self.publication_fences.unresolved() {
+            self.resource_admission.invalidate();
+        }
         if thread::panicking() {
             self.resource_admission.invalidate();
             if let Some(input) = self.resource_input.as_ref() {
@@ -5930,10 +5964,7 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             let _input = input;
             execute_store_result(result, move || {
                 let observation = decode_control_input(&encoded)?;
-                runtime
-                    .store()
-                    .request_cancel_before_publish(operation_id, expected_sequence, observation)
-                    .map_err(OperationJournalOwnerError::from)
+                runtime.request_cancel_before_publish(operation_id, expected_sequence, observation)
             })
         }
         JournalCommand::Retry {
@@ -6355,6 +6386,7 @@ mod tests {
     mod control_input_tests;
     mod control_responsiveness_tests;
     mod native_read_capsule_tests;
+    mod publication_fence_tests;
     mod publication_input_tests;
     mod publication_uncertainty_tests;
     mod resource_custody_tests;
@@ -9049,7 +9081,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn live_chunk_grant_crosses_to_file_owner_once_after_dropped_reply() {
-        native_live_chunk_and_staging_issuer(None, None, None);
+        native_live_chunk_and_staging_issuer(None, None, None, None);
     }
 
     #[cfg(target_os = "macos")]
@@ -9058,7 +9090,7 @@ mod tests {
         use super::super::store::InsertTestBoundary;
         for nth in [1, 2] {
             for boundary in [InsertTestBoundary::Commit, InsertTestBoundary::AfterCommit] {
-                native_live_chunk_and_staging_issuer(Some((nth, boundary)), None, None);
+                native_live_chunk_and_staging_issuer(Some((nth, boundary)), None, None, None);
             }
         }
     }
@@ -9067,7 +9099,7 @@ mod tests {
     #[test]
     fn native_preissued_publication_grant_refuses_original_drain_and_unavailable() {
         for unavailable in [false, true] {
-            native_live_chunk_and_staging_issuer(None, Some(unavailable), None);
+            native_live_chunk_and_staging_issuer(None, Some(unavailable), None, None);
         }
     }
 
@@ -9075,7 +9107,15 @@ mod tests {
     #[test]
     fn native_publication_issuer_refuses_stale_original_targets() {
         for kind in 0..3 {
-            native_live_chunk_and_staging_issuer(None, None, Some(kind));
+            native_live_chunk_and_staging_issuer(None, None, Some(kind), None);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_publication_issuer_cancellation_fences_original_pending_and_unsettled_grants() {
+        for entered in [false, true] {
+            native_live_chunk_and_staging_issuer(None, None, None, Some(entered));
         }
     }
 
@@ -9084,6 +9124,7 @@ mod tests {
         fault: Option<(usize, super::super::store::InsertTestBoundary)>,
         close_before_entry: Option<bool>,
         stale_target: Option<u8>,
+        cancel_after_entry: Option<bool>,
     ) {
         use super::super::store::{InsertTestBoundary, InsertTestDirective};
         let fixture = fixture("journal-owner-live-chunk-grant");
@@ -9985,8 +10026,66 @@ mod tests {
                 .lock()
                 .unwrap()
                 .publication_remaining,
-            input_before - 64 * 1024
+            input_before - 64 * 1024 - publication_fence::HEADER_BYTES
         );
+        if let Some(entered) = cancel_after_entry {
+            let mut scan = client.scan_recovery_page(None).unwrap();
+            let page = scan.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+            let sequence = page
+                .entries()
+                .iter()
+                .find(|entry| {
+                    matches!(entry.key(),
+                super::super::store::recovery::RecoveryKey::OperationId(id) if *id == operation_id)
+                })
+                .unwrap()
+                .sequence();
+            let before = encode(&operation).unwrap();
+            let observation =
+                CancellationRequestObservation::new(operation.updated_unix_ms + 1).unwrap();
+            if entered {
+                let permit = publication.begin_publication().unwrap();
+                assert_eq!(owner.shared.resource_admission.snapshot().1, 1);
+                // Queue admission is nonblocking; never wait for a reply while holding source custody.
+                let mut cancel = client
+                    .request_cancel_before_publish(operation_id, sequence, observation)
+                    .unwrap();
+                drop(permit);
+                assert!(matches!(
+                    cancel.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    Err(OperationJournalOwnerError::PublicationCancellationPending { .. })
+                ));
+                let mut lookup = client.get(operation_id).unwrap();
+                assert_eq!(
+                    encode(
+                        &lookup
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap()
+                            .unwrap()
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    before
+                );
+                assert_eq!(owner.shared.resource_admission.snapshot(), (false, 0, true));
+            } else {
+                let mut cancel = client
+                    .request_cancel_before_publish(operation_id, sequence, observation)
+                    .unwrap();
+                cancel
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap();
+                assert!(publication.begin_publication().is_err());
+                assert_eq!(owner.shared.resource_admission.snapshot().1, 0);
+                drop(guard.pin_for_effect().unwrap().begin_effect().unwrap());
+            }
+            staged.acknowledge().unwrap();
+            let _ = file_owner.shutdown();
+            drop(database);
+            let _ = owner.shutdown();
+            return;
+        }
         if let Some(unavailable) = close_before_entry {
             assert_eq!(owner.shared.resource_admission.snapshot().1, 0);
             if unavailable {
@@ -10025,7 +10124,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .publication_remaining,
-            input_before - 64 * 1024
+            input_before - 64 * 1024 - publication_fence::HEADER_BYTES
         );
         drop(permit);
         assert_eq!(
@@ -10035,7 +10134,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .publication_remaining,
-            input_before
+            input_before - publication_fence::HEADER_BYTES
         );
         assert_eq!(owner.shared.resource_admission.snapshot(), (false, 0, true));
         let mut replay_checkpoint = client

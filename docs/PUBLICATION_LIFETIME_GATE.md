@@ -23,10 +23,11 @@ It does not install it. [OPT-1632](https://linear.app/boostnlvp/issue/OPT-1632),
 
 Today only staging validation executes in the general file owner. Publication
 effects are `Unsupported`. Its validation result contains identity/content
-observations, not a retained native staged-file handle. Current journal
-`Cancel` calls the store directly; chunk release removes tickets and releases
-charges without a publication-slot association. These paths must change before
-the new grant can enable an effect. Current cancellation accepts eligible
+observations, not a retained native staged-file handle. Journal
+`Cancel` now closes pending original issuer fences and refuses entered/unsettled
+cancellation before calling the store. Chunk release still removes tickets and
+releases charges without a publication-slot association. All remaining mutation
+and release paths must be fenced before the new grant can enable an effect. Current cancellation accepts eligible
 `IntentDurable` operations; a staging checkpoint does not itself advance that
 operation phase. Do not infer that its stored cancellation receipt excludes a
 newly begun namespace effect.
@@ -625,3 +626,23 @@ requirements remain in OPT-2215/2216/2217/2218. The genuine macOS issuer harness
 uses original staging replies and production profile root registrations to prepare
 targets; SDK compilation and native execution require the linked macOS verification
 [OPT-2302](https://linear.app/boostnlvp/issue/OPT-2302). Linux or Windows compilation cannot verify macOS-only bodies.
+
+## Original cancellation fence (OPT-2303)
+
+The actual issuer registers at most 32 private operation fences before checkpointing.
+A fixed 8 KiB registry debit uses the original composed publication input pool;
+no actor ledger or native resource moves into the scalar fence. Original counted
+source entry takes admission then fence, with no queue or IO under those locks.
+The real cancellation command closes pending entry before writing its receipt.
+Entered and physically quiescent but unsettled fences return typed
+`PublicationCancellationPending` without touching the operation row. A rejected
+or stale cancellation may conservatively close pending entry; this never remints
+a reserved checkpoint. Only unentered fences with no executable holder can be
+reclaimed; unknown and unsettled attempts remain bounded retained evidence.
+
+This installs the cancellation fence only. Exact charge association, qualified
+native facts/namespace entry, every other mutation/release/retirement fence and
+completion/settlement remain required by OPT-2215. Scalar race tests confer no
+source or native authority. Supported macOS compilation and genuine issuer
+execution remain in [OPT-2304](https://linear.app/boostnlvp/issue/OPT-2304).
+Unknown fences refuse new issuance and unresolved fences prevent clean runtime handoff.
