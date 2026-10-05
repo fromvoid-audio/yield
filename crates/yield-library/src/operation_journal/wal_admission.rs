@@ -13,3 +13,7 @@ pub use collector::{
     WalPreparationHandle, WalPreparationObservation, WalPreparationStatus, WalPreparedDatabase,
 };
 pub(crate) use current::{CurrentCustody, CurrentRequest, CurrentRound};
+
+pub(super) use current::OriginalDecision;
+
+pub(super) use plan::prepared_digest;

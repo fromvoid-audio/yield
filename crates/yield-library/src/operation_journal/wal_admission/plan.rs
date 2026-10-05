@@ -88,6 +88,14 @@ fn digest_with_bytes(
     serde_json::to_writer(&mut writer, value).map_err(|_| WalPreparationError::InvalidInput)?;
     Ok((*writer.hash.finalize().as_bytes(), writer.bytes))
 }
+pub(in crate::operation_journal) fn prepared_digest(
+    args: &UniversalCommandArgs,
+    participants: &ParticipantSet,
+    plan: &FullCapacityPlan,
+    claims: &AdmissionClaimInventory,
+) -> Result<[u8; 32], WalPreparationError> {
+    digest(&(args, participants, plan, claims))
+}
 fn digest(value: &impl serde::Serialize) -> Result<[u8; 32], WalPreparationError> {
     digest_with_bytes(value).map(|(digest, _)| digest)
 }

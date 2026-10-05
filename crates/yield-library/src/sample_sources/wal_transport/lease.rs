@@ -203,6 +203,25 @@ impl SourceLeaseWalTransportOwner {
             .map(|guard| guard.original_round_for_tests())
     }
 
+    /// Original journal decision currently prevents native cleanup. Historical replies cannot set it.
+    pub fn settlement_held(&self) -> bool {
+        self.current
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|custody| custody.settlement_held())
+    }
+    fn begin_cleanup(&self) -> bool {
+        let mut current = self.current.lock().unwrap_or_else(|p| p.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|custody| !custody.begin_cleanup())
+        {
+            return false;
+        }
+        drop(current.take());
+        true
+    }
     fn invalidate_current(&self) {
         drop(
             self.current
@@ -316,6 +335,10 @@ impl SourceLeaseWalTransportOwner {
         &self,
         registration: Option<&SourceAuthorityRegistration>,
     ) -> Result<(), SourceWalTransportRejection> {
+        if self.settlement_held() {
+            // Cleanup custody is not current validation or effect authority.
+            return Err(SourceWalTransportRejection::Busy);
+        }
         let mut staging = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
         staging.resize(scope::PARKED_BYTES)?;
         let held = self
@@ -398,7 +421,9 @@ impl SourceLeaseWalTransportOwner {
 
     /// Request pre-intent abort while preserving original native custody.
     pub fn request_abort(&mut self, reason: Option<SourceWalTransportRejection>) {
-        self.invalidate_current();
+        if !self.begin_cleanup() {
+            return;
+        }
         if self.rejection.is_none() {
             self.rejection = reason;
         }
@@ -406,14 +431,18 @@ impl SourceLeaseWalTransportOwner {
     }
     /// Explicitly preserve unconfirmed cleanup, never an automatic refund or reuse.
     pub fn mark_unavailable(&self, reason: SourceWalTransportRejection) {
-        self.invalidate_current();
+        if !self.begin_cleanup() {
+            return;
+        }
         self.request
             .ticket
             .set(SourceWalTransportStatus::Unavailable(reason));
     }
     /// Recover only the identical original writer after confirmed rollback and policy restoration.
     pub fn into_writer(mut self) -> Result<SourceWriter, Self> {
-        self.invalidate_current();
+        if !self.begin_cleanup() {
+            return Err(self);
+        }
         self.request.ticket.set(SourceWalTransportStatus::Aborting);
         let mut staging = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
         let bytes = self

@@ -1,6 +1,6 @@
-//! Original parked-worker validation replies; these never fence cleanup or admit settlement.
+//! One original owner round. Journal decisions and native cleanup compete under a short lock.
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::Instant,
 };
 
@@ -8,11 +8,74 @@ pub(crate) struct CurrentRound {
     deadline: Instant,
     expected: u64,
     acknowledged: Mutex<RoundState>,
+    resolved: Condvar,
+    nonce: uuid::Uuid,
     _credit: super::HandshakeCredit,
 }
 struct RoundState {
     slots: u64,
     invalidated: bool,
+    decision: Decision,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Decision {
+    Preparing,
+    Deciding,
+    Resolved,
+}
+/// Sole journal-side decision custody. Drop before SQLite starts is a definite refusal;
+/// Drop after start leaves the original native owners unresolved until exact readback.
+pub(in crate::operation_journal) struct OriginalDecision {
+    round: Arc<CurrentRound>,
+    sqlite_started: bool,
+}
+impl OriginalDecision {
+    pub(in crate::operation_journal) fn sqlite_started(&self) -> bool {
+        self.sqlite_started
+    }
+    pub(in crate::operation_journal) fn nonce(&self) -> uuid::Uuid {
+        self.round.nonce
+    }
+    pub(in crate::operation_journal) fn acknowledged(&self) -> bool {
+        self.round.acknowledged.lock().is_ok_and(|state| {
+            state.decision == Decision::Deciding
+                && !state.invalidated
+                && state.slots == self.round.expected
+                && Instant::now() < self.round.deadline
+        })
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::operation_journal) fn start_sqlite(&mut self) -> bool {
+        let Ok(state) = self.round.acknowledged.lock() else {
+            return false;
+        };
+        if state.decision != Decision::Deciding
+            || state.invalidated
+            || state.slots != self.round.expected
+            || Instant::now() >= self.round.deadline
+        {
+            return false;
+        }
+        self.sqlite_started = true;
+        true
+    }
+    /// Caller must have a definite initial transaction outcome or exact durable readback.
+    pub(in crate::operation_journal) fn resolve(&self) {
+        let mut state = self
+            .round
+            .acknowledged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        state.decision = Decision::Resolved;
+        self.round.resolved.notify_all();
+    }
+}
+impl Drop for OriginalDecision {
+    fn drop(&mut self) {
+        if !self.sqlite_started {
+            self.resolve();
+        }
+    }
 }
 /// Only an actual parked worker retains this non-Clone acknowledgement custody.
 pub(crate) struct CurrentCustody(Arc<CurrentRound>);
@@ -30,9 +93,49 @@ impl CurrentRound {
 }
 impl Drop for CurrentCustody {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.0.acknowledged.lock() {
-            state.invalidated = true;
+        let mut state = self
+            .0
+            .acknowledged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Ordinary owner loops poll without waiting. This destruction fence is only the
+        // last-resort unwind boundary: Native fields must not drop beneath in-flight SQL.
+        while matches!(state.decision, Decision::Deciding) {
+            state = self
+                .0
+                .resolved
+                .wait(state)
+                .unwrap_or_else(|p| p.into_inner());
         }
+        state.invalidated = true;
+    }
+}
+impl CurrentCustody {
+    pub(crate) fn settlement_held(&self) -> bool {
+        self.0
+            .acknowledged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .decision
+            .is_unresolved()
+    }
+    /// Claim cleanup before touching SQLite, competing atomically with journal Start.
+    pub(crate) fn begin_cleanup(&self) -> bool {
+        let mut state = self
+            .0
+            .acknowledged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if state.decision.is_unresolved() {
+            return false;
+        }
+        state.invalidated = true;
+        true
+    }
+}
+impl Decision {
+    fn is_unresolved(self) -> bool {
+        matches!(self, Self::Deciding)
     }
 }
 pub(crate) struct CurrentRequest {
@@ -54,7 +157,10 @@ impl CurrentRound {
             acknowledged: Mutex::new(RoundState {
                 slots: 0,
                 invalidated: false,
+                decision: Decision::Preparing,
             }),
+            resolved: Condvar::new(),
+            nonce: uuid::Uuid::new_v4(),
             _credit: credit,
         }))
     }
@@ -76,11 +182,30 @@ impl CurrentRound {
     pub(super) fn complete(&self) -> bool {
         self.with_complete(|| ()).is_some()
     }
+    /// Start a new sealed commit-acknowledgement round. The sole journal-side guard
+    /// resolves NoAttempt on every pre-SQL refusal, including partial acknowledgement.
+    pub(in crate::operation_journal) fn decision_round(
+        count: usize,
+        deadline: Instant,
+        credit: super::HandshakeCredit,
+    ) -> Option<(Arc<Self>, OriginalDecision)> {
+        let round = Self::new(count, deadline, credit)?;
+        round.acknowledged.lock().ok()?.decision = Decision::Deciding;
+        let decision = OriginalDecision {
+            round: Arc::clone(&round),
+            sqlite_started: false,
+        };
+        Some((round, decision))
+    }
     /// Scalar publication competes with original worker cleanup under this same mutex.
     /// Never run native I/O, SQLite or owner waits inside this closure.
     pub(super) fn with_complete<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
         let state = self.acknowledged.lock().ok()?;
-        if Instant::now() >= self.deadline || state.invalidated || state.slots != self.expected {
+        if Instant::now() >= self.deadline
+            || state.invalidated
+            || state.slots != self.expected
+            || state.decision != Decision::Preparing
+        {
             return None;
         }
         Some(publish())
@@ -92,6 +217,7 @@ impl CurrentRequest {
         if Instant::now() < self.round.deadline
             && let Ok(mut state) = self.round.acknowledged.lock()
             && !state.invalidated
+            && matches!(state.decision, Decision::Preparing | Decision::Deciding)
         {
             state.slots |= self.bit;
         }
@@ -103,6 +229,52 @@ impl CurrentRequest {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn current_round_no_attempt_resolves_partial_ack_without_late_revival() {
+        let budget = super::super::HandshakeBudget::new();
+        let mut credit = budget.credit();
+        credit.resize(128).unwrap();
+        let (round, decision) =
+            CurrentRound::decision_round(2, Instant::now() + Duration::from_secs(2), credit)
+                .unwrap();
+        let first = round.request(0).acknowledge();
+        let late = round.request(1);
+        assert!(!decision.acknowledged());
+        assert!(first.settlement_held());
+        assert!(!first.begin_cleanup());
+        drop(decision); // Definite NoAttempt, before any journal transaction.
+        assert!(first.begin_cleanup());
+        let late = late.acknowledge();
+        assert!(!late.settlement_held());
+        assert!(!round.complete());
+        drop(round);
+        assert_eq!(budget.used(), 128);
+        drop(first);
+        drop(late);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn current_round_commit_ack_is_separate_from_historical_ready() {
+        let budget = super::super::HandshakeBudget::new();
+        let (round, decision) = CurrentRound::decision_round(
+            1,
+            Instant::now() + Duration::from_secs(2),
+            budget.credit(),
+        )
+        .unwrap();
+        let custody = round.request(0).acknowledge();
+        assert!(decision.acknowledged());
+        assert!(
+            !round.complete(),
+            "a commit ACK must not republish historical Ready"
+        );
+        assert!(!custody.begin_cleanup());
+        assert!(!round.invalidated());
+        drop(decision);
+        assert!(custody.begin_cleanup());
+    }
 
     #[test]
     fn current_round_original_global_worker_holds_and_invalidates_before_release_delivery() {

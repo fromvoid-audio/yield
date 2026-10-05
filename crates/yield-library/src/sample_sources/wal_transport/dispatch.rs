@@ -69,6 +69,14 @@ impl SourceWalProducerOwner {
         }
     }
 
+    /// Read-only original cleanup fence; this cannot create a journal decision.
+    pub fn settlement_held(&self) -> bool {
+        match self {
+            Self::Audited(owner) => owner.settlement_held(),
+            Self::Lease(owner) => owner.settlement_held(),
+        }
+    }
+
     /// Inspect original owner deadline.
     pub fn deadline(&self) -> Instant {
         match self {

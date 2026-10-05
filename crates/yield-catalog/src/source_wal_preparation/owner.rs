@@ -123,6 +123,11 @@ impl WorkerReservations {
             .slots
             .iter_mut()
             .filter_map(|(id, slot)| {
+                // The genuine journal decision fences deadline, cancellation and shutdown.
+                // Continue polling; never wait for the journal with this original Native owner.
+                if slot.source.database.settlement_held() {
+                    return None;
+                }
                 // Validation can race service shutdown. Observe admission again afterwards;
                 // invalidation caused by closing is cancellation, not a changed source scope.
                 // Never hold admission across the original owner's SQLite validation.
@@ -268,6 +273,11 @@ impl WorkerReservations {
     }
     pub(crate) fn is_held(&self, source: &SourceId) -> bool {
         self.slots.contains_key(source) || self.unresolved.contains_key(source)
+    }
+    pub(crate) fn has_settling(&self) -> bool {
+        self.slots
+            .values()
+            .any(|slot| slot.source.database.settlement_held())
     }
     pub(crate) fn has_slots(&self) -> bool {
         !self.slots.is_empty() || !self.unresolved.is_empty()

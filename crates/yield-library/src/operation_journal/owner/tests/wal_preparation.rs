@@ -445,6 +445,26 @@ mod integration {
                     }
                     let mut remaining = HashMap::new();
                     for (id, mut owner) in held.drain() {
+                        if owner.settlement_held() {
+                            owner.request_abort(None);
+                            assert!(owner.settlement_held());
+                            assert!(
+                                !owner
+                                    .current_round_for_tests()
+                                    .unwrap()
+                                    .invalidated_for_tests()
+                            );
+                            assert_eq!(owner.revalidate(authorities.get(&id)), Err(crate::sample_sources::wal_transport::SourceWalTransportRejection::Busy));
+                            match owner.into_writer() {
+                                Err(retained) => {
+                                    remaining.insert(id, retained);
+                                }
+                                Ok(_) => {
+                                    panic!("unresolved original acknowledgement restored a writer")
+                                }
+                            }
+                            continue;
+                        }
                         if !stopped.load(Ordering::Acquire)
                             && owner.is_cancelled()
                             && paused.load(Ordering::Acquire)
@@ -1463,6 +1483,21 @@ mod integration {
 
     #[test]
     fn all_owner_real_registry_retirement_collects_global_and_pre_audit_lease_with_exact_graph() {
+        original_retirement_custody(0);
+    }
+
+    #[test]
+    fn retirement_original_ack_fences_real_commit_cancel_deadline_and_shutdown() {
+        original_retirement_custody(1);
+    }
+
+    #[test]
+    fn retirement_original_ack_fences_confirmed_rollback_and_unconfirmed_commit_delivery() {
+        original_retirement_custody(2);
+        original_retirement_custody(3);
+    }
+
+    fn original_retirement_custody(outcome: u8) {
         use crate::operation_journal::source_registry_retirement::SourceRegistryRetirementIntentArgs;
         use crate::operation_journal::work_plan::{
             WORK_PLAN_VERSION_REGISTRY_RETIREMENT, WorkPlan, WorkPrerequisite, WorkUnitKey,
@@ -1472,7 +1507,31 @@ mod integration {
             SourceRegistryReferenceExpected, SourceRegistryReferenceProposal,
             SourceRegistryReferenceTransition as Transition,
         };
-        let (fixture, mut journal) = open_owner("all-owner-registry-retirement");
+        let fixture = fixture("all-owner-registry-retirement");
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        if outcome == 2 || outcome == 3 {
+            use crate::operation_journal::store::{InsertTestBoundary, InsertTestDirective};
+            store.set_insert_test_hook(move |boundary| {
+                let selected = if outcome == 2 {
+                    InsertTestBoundary::BeforePrecommitValidation
+                } else {
+                    InsertTestBoundary::Commit
+                };
+                if boundary != selected {
+                    return InsertTestDirective::Continue;
+                }
+                let error = OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: "original custody outcome fixture".into(),
+                };
+                if outcome == 3 {
+                    InsertTestDirective::ExecuteThenFail(error)
+                } else {
+                    InsertTestDirective::Fail(error)
+                }
+            });
+        }
+        let mut journal = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+        wait_until_available(&journal);
         let mut global = GlobalLibraryWriter::start(&fixture.owner).unwrap();
         let startup = Instant::now() + Duration::from_secs(5);
         while global.status() != GlobalLibraryWriterStatus::Available {
@@ -1596,7 +1655,32 @@ mod integration {
                 .validate()
                 .is_err()
         );
-        let (plan, claims, main, side) = plan(&fixture);
+        let (base_plan, base_claims, main, side) = plan(&fixture);
+        let original = &base_plan.allocations()[0];
+        let mut allocations = base_plan.allocations().to_vec();
+        allocations.push(
+            FullCapacityAllocation::new(
+                original.volume().clone(),
+                original.allocation_unit(),
+                Class::JournalRecord,
+                8192,
+                8192,
+                PROTECTED_FREE_SPACE_FLOOR,
+            )
+            .unwrap(),
+        );
+        let plan = FullCapacityPlan::new(allocations).unwrap();
+        let mut correlations = base_claims.claims().to_vec();
+        correlations.push(
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                original.volume().clone(),
+                Class::JournalRecord,
+                8192,
+            )
+            .unwrap(),
+        );
+        let claims = AdmissionClaimInventory::new(correlations).unwrap();
         let source_input = || {
             WalPreparationSource::new(
                 requester.clone(),
@@ -1768,14 +1852,42 @@ mod integration {
             deadline,
         )
         .unwrap();
+        let digest = crate::operation_journal::wal_admission::prepared_digest(
+            &args,
+            &participants,
+            &plan,
+            &claims,
+        )
+        .unwrap();
         let budget = input.budget_for_test();
-        let handle = journal
-            .client()
-            .prepare_wal_owners(input)
-            .unwrap()
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap()
-            .unwrap();
+        let mut local_collector = None;
+        let handle = if outcome == 0 {
+            journal
+                .client()
+                .prepare_wal_owners(input)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap()
+        } else {
+            let permit = journal
+                .shared
+                .reserve_input(
+                    InputClass::Ordinary,
+                    crate::operation_journal::wal_admission::HANDSHAKE_MAX_BYTES,
+                )
+                .unwrap();
+            let acquisition = Uuid::parse_str(fixture.owner.owner_identity()).unwrap();
+            let (mut collector, handle) =
+                crate::operation_journal::wal_admission::Collector::new(input, permit, acquisition);
+            while matches!(handle.status(), WalPreparationStatus::Preparing) {
+                assert!(Instant::now() < deadline);
+                collector.poll();
+                thread::sleep(Duration::from_millis(1));
+            }
+            local_collector = Some(collector);
+            handle
+        };
         let WalPreparationStatus::Ready(view) = wait(&handle, |status| {
             matches!(status, WalPreparationStatus::Ready(_)) || terminal(status)
         }) else {
@@ -1836,9 +1948,97 @@ mod integration {
         );
         assert_eq!(policy.family_digest(), &expected_digest);
 
+        if let Some(collector) = local_collector.as_mut() {
+            collector.begin_decision(digest).unwrap();
+            let nonce = collector.decision_nonce().unwrap();
+            while !collector.decision_acknowledged() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(collector.decision_nonce(), Some(nonce));
+            assert!(collector.start_settlement());
+            // An actual journal transaction exercises the owner fence, not admission:
+            // this V1 storage fixture has no retirement inventory, qualified provider or permit.
+            let record = intent_record(OperationId::new());
+            let observed = journal
+                .client()
+                .persist_intent(record.clone())
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            if outcome == 1 {
+                assert!(observed.receipt().is_some());
+            } else {
+                let failure = observed.failure().unwrap();
+                assert_eq!(
+                    failure.stage(),
+                    if outcome == 2 {
+                        JournalInsertWriteStage::RolledBackBeforeCommit
+                    } else {
+                        JournalInsertWriteStage::CommitOutcomeUnknown
+                    }
+                );
+            }
+            handle.abort();
+            actor.stop.store(true, Ordering::Release);
+            // Shutdown requests must not tear down the original Global SQLite writer.
+            let closing = thread::spawn(move || global.shutdown());
+            while Instant::now() <= deadline + Duration::from_millis(20) {
+                collector.poll();
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!closing.is_finished());
+            assert!(!actor.worker.as_ref().unwrap().is_finished());
+            assert!(
+                !actor
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.starts_with("reuse:"))
+            );
+            let outside =
+                rusqlite::Connection::open(fixture.owner.profile_root().join(LIBRARY_DB_FILE_NAME))
+                    .unwrap();
+            outside.busy_timeout(Duration::ZERO).unwrap();
+            assert_eq!(
+                outside
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .unwrap_err()
+                    .sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            let stored = journal
+                .client()
+                .get(record.operation_id)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            if outcome == 2 {
+                assert!(stored.is_none());
+            } else {
+                assert_eq!(encode(&stored.unwrap()).unwrap(), encode(&record).unwrap());
+            }
+            // Resolve only the genuine completed transaction or its exact durable image.
+            // Mere elapsed time, dropped response or owner shutdown is insufficient.
+            collector.resolve_settlement();
+            while !collector.poll() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            drop(local_collector.take());
+            drop(view);
+            drop(handle);
+            assert_eq!(budget.used(), 0);
+            drop(actor);
+            assert!(closing.join().unwrap());
+            assert!(journal.shutdown());
+            return;
+        }
         let result = journal
             .client()
-            .admit_full(args, participants)
+            .admit_full(args.clone(), participants.clone())
             .unwrap()
             .recv_timeout(Duration::from_secs(3))
             .unwrap();
@@ -1848,6 +2048,69 @@ mod integration {
                 PreparedAdmissionError::Unsupported { .. }
             ))
         ));
+        let intent = OperationIntent {
+            actor: crate::operation_journal::model::OperationActor::User,
+            kind: crate::operation_journal::model::OperationKind::SourceRegistryRetirement,
+            label: "Original owner retirement acknowledgement".into(),
+        };
+        let universal = UniversalIntent::new(
+            None,
+            crate::operation_journal::model::UniversalCommandKind::SourceRegistryRetirement,
+            "operation.status.source_registry_retirement",
+            participants.clone(),
+        )
+        .unwrap();
+        let prepared = PreparedAdmissionInput::try_new(
+            intent.clone(),
+            universal.clone(),
+            args.clone(),
+            participants.clone(),
+            plan.clone(),
+            claims.clone(),
+            1,
+        )
+        .unwrap();
+        // A valid envelope with a different ordinary-claim identity cannot consume
+        // the existing original preparation, even though its plan totals match.
+        let mut foreign_claims = claims.claims().to_vec();
+        let old = &foreign_claims[0];
+        foreign_claims[0] = AdmissionClaim::new(
+            AdmissionClaimId::new(),
+            old.volume().clone(),
+            old.allocation_class(),
+            old.allocated_bytes(),
+        )
+        .unwrap();
+        let foreign = PreparedAdmissionInput::try_new(
+            intent,
+            universal,
+            args,
+            participants,
+            plan,
+            AdmissionClaimInventory::new(foreign_claims).unwrap(),
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            journal
+                .client()
+                .admit_prepared(foreign)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap(),
+            Err(OperationJournalOwnerError::WalPreparation(
+                WalPreparationError::InvalidInput
+            ))
+        ));
+        let result = journal
+            .client()
+            .admit_prepared(prepared)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert!(
+            matches!(result, Err(OperationJournalOwnerError::PreparedAdmission(PreparedAdmissionError::Unsupported { reason })) if reason.contains("original owners acknowledged"))
+        );
         assert_eq!(
             journal
                 .prepared_admission_id_allocations

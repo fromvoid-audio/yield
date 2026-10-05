@@ -24,6 +24,7 @@ mod publication_charge;
 mod publication_custody;
 mod publication_fence;
 mod resource_custody;
+mod retirement_admission;
 pub use frozen_copy::{FrozenCopyObservation, FrozenCopyValidationError};
 use native_read_capsule::NativeCapsuleData;
 use resource_custody::ResourceAdmission;
@@ -827,14 +828,6 @@ impl PreparedAdmissionInput {
                 ),
             });
         }
-        if matches!(
-            &self.args,
-            UniversalCommandArgs::SourceRegistryRetirement(_)
-        ) {
-            return Err(PreparedAdmissionError::Unsupported {
-                reason: "registry retirement requires the original all-owner settlement latch and qualified lifecycle admission".into(),
-            });
-        }
         if matches!(&self.args, UniversalCommandArgs::SourceLegacyAdoption(_)) {
             return Err(PreparedAdmissionError::Unsupported {
                 reason: "legacy adoption requires the original-owner capacity and durable admission bridge".into(),
@@ -889,6 +882,11 @@ impl PreparedAdmissionInput {
     fn validation_operation_id(&self) -> OperationId {
         if let UniversalCommandArgs::Recording(proposal) = &self.args {
             return proposal.operation_id();
+        }
+        if let UniversalCommandArgs::SourceRegistryRetirement(args) = &self.args {
+            return args
+                .operation_id()
+                .expect("validated frozen retirement operation");
         }
         let parent = self.universal_intent.parent_operation_id();
         [
@@ -1724,6 +1722,7 @@ struct OwnerRuntime {
     resource_input: Option<InputPermit>,
     wal_preparation: Option<super::wal_admission::Collector>,
     wal_preparation_unconfirmed: bool,
+    retirement_admission: Option<retirement_admission::Pending>,
     store: Option<OperationJournalStore>,
     capacity_provider: Option<CapacityProvider>,
     capacity_rebuild_readiness: CapacityRebuildReadiness,
@@ -1764,6 +1763,7 @@ impl OwnerRuntime {
             resource_input: None,
             wal_preparation: None,
             wal_preparation_unconfirmed: false,
+            retirement_admission: None,
             store: Some(store),
             capacity_provider: None,
             capacity_rebuild_readiness: CapacityRebuildReadiness::reconciliation_required(vec![
@@ -1854,6 +1854,7 @@ impl OwnerRuntime {
         Ok(handle)
     }
     fn poll_wal_preparation(&mut self) {
+        self.poll_retirement_admission();
         let done = self
             .wal_preparation
             .as_mut()
@@ -1869,6 +1870,14 @@ impl OwnerRuntime {
         &mut self,
         prepared: PreparedAdmissionInput,
     ) -> Result<OperationId, OperationJournalOwnerError> {
+        if matches!(
+            prepared.args,
+            UniversalCommandArgs::SourceRegistryRetirement(_)
+        ) {
+            return Err(PreparedAdmissionError::Unsupported {
+                reason: "retirement must use the original acknowledgement consumer and qualified physical-family admission".into(),
+            }.into());
+        }
         prepared
             .validate_shape()
             .map_err(OperationJournalOwnerError::from)?;
@@ -4077,6 +4086,11 @@ fn prepared_record(
     }
     let construct = if matches!(prepared.args, UniversalCommandArgs::Recording(_)) {
         StoredOperationRecord::new_v17_recording
+    } else if matches!(
+        prepared.args,
+        UniversalCommandArgs::SourceRegistryRetirement(_)
+    ) {
+        StoredOperationRecord::new_v18_source_retirement
     } else {
         StoredOperationRecord::new_v16_command
     };
@@ -4160,6 +4174,7 @@ impl Drop for OwnerRuntime {
         self.native_readers.clear();
         self.native_reader_registry_input.take();
         // Publish loss/cancel original owners before journal authority teardown.
+        self.retirement_admission.take();
         drop(self.wal_preparation.take());
         // Original readonly SQLite closes before its pre-lease reservation/profile custody.
         self.legacy_adoption.take();
@@ -6290,8 +6305,24 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            let _input = input;
-            execute_store_result(result, move || runtime.admit_prepared(prepared))
+            if matches!(
+                prepared.args,
+                UniversalCommandArgs::SourceRegistryRetirement(_)
+            ) {
+                let panic_result = result.clone();
+                match panic::catch_unwind(AssertUnwindSafe(|| {
+                    runtime.begin_retirement_admission(prepared, input, result)
+                })) {
+                    Ok(()) => false,
+                    Err(_) => {
+                        let _ = panic_result.send(Err(OperationJournalOwnerError::WorkerPanicked));
+                        true
+                    }
+                }
+            } else {
+                let _input = input;
+                execute_store_result(result, move || runtime.admit_prepared(prepared))
+            }
         }
         JournalCommand::ClaimChunk {
             request,
