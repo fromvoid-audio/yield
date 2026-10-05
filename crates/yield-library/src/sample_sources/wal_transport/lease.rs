@@ -78,6 +78,7 @@ impl SourceLeaseWalTransportCommand {
             shared: Arc::clone(&self.0.shared),
             rejection,
             resolved: false,
+            current: Mutex::new(None),
         };
         if let Some(reason) = rejection {
             owner.mark_unavailable(reason);
@@ -186,8 +187,28 @@ pub struct SourceLeaseWalTransportOwner {
     shared: Arc<Shared>,
     rejection: Option<SourceWalTransportRejection>,
     resolved: bool,
+    current: Mutex<Option<crate::operation_journal::wal_admission::CurrentCustody>>,
 }
 impl SourceLeaseWalTransportOwner {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn current_round_for_tests(
+        &self,
+    ) -> Option<Arc<crate::operation_journal::wal_admission::CurrentRound>> {
+        self.current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|guard| guard.original_round_for_tests())
+    }
+
+    fn invalidate_current(&self) {
+        drop(
+            self.current
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take(),
+        );
+    }
     /// Read-only outcome witness retained across cleanup or owner loss.
     pub fn outcome_observation(&self) -> SourceWalOwnerObservation {
         SourceWalOwnerObservation(Arc::clone(&self.request.ticket))
@@ -323,7 +344,7 @@ impl SourceLeaseWalTransportOwner {
             if Instant::now() >= self.request.deadline {
                 return Err(SourceWalTransportRejection::Deadline);
             }
-            request.acknowledge();
+            *self.current.lock().unwrap_or_else(|p| p.into_inner()) = Some(request.acknowledge());
         }
         Ok(())
     }
@@ -372,6 +393,7 @@ impl SourceLeaseWalTransportOwner {
 
     /// Request pre-intent abort while preserving original native custody.
     pub fn request_abort(&mut self, reason: Option<SourceWalTransportRejection>) {
+        self.invalidate_current();
         if self.rejection.is_none() {
             self.rejection = reason;
         }
@@ -379,12 +401,14 @@ impl SourceLeaseWalTransportOwner {
     }
     /// Explicitly preserve unconfirmed cleanup, never an automatic refund or reuse.
     pub fn mark_unavailable(&self, reason: SourceWalTransportRejection) {
+        self.invalidate_current();
         self.request
             .ticket
             .set(SourceWalTransportStatus::Unavailable(reason));
     }
     /// Recover only the identical original writer after confirmed rollback and policy restoration.
     pub fn into_writer(mut self) -> Result<SourceWriter, Self> {
+        self.invalidate_current();
         self.request.ticket.set(SourceWalTransportStatus::Aborting);
         let mut staging = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
         let bytes = self
@@ -431,6 +455,7 @@ impl SourceLeaseWalTransportOwner {
         mut self,
         authority: &mut SourceAuthorityRegistration,
     ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
+        self.invalidate_current();
         if !self.source_authority_close_ready() {
             return Err(SourceAuthorityError::InvalidLifecycle);
         }
@@ -449,6 +474,7 @@ impl SourceLeaseWalTransportOwner {
 }
 impl Drop for SourceLeaseWalTransportOwner {
     fn drop(&mut self) {
+        self.invalidate_current();
         if !self.resolved {
             self.mark_unavailable(SourceWalTransportRejection::OwnerLost);
         }

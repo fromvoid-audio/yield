@@ -15,6 +15,7 @@ pub struct SourceWalTransportOwner {
     shared: Arc<Shared>,
     rejection: Option<SourceWalTransportRejection>,
     resolved: bool,
+    current: Mutex<Option<crate::operation_journal::wal_admission::CurrentCustody>>,
 }
 /// Read-only owner outcome witness. It cannot publish readiness, rollback or retirement.
 #[derive(Clone)]
@@ -62,6 +63,7 @@ pub(super) fn acquire(
         shared: Arc::clone(&command.shared),
         rejection,
         resolved: false,
+        current: Mutex::new(None),
     };
     if let Some(reason) = owner.rejection {
         owner
@@ -72,6 +74,25 @@ pub(super) fn acquire(
     owner
 }
 impl SourceWalTransportOwner {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn current_round_for_tests(
+        &self,
+    ) -> Option<Arc<crate::operation_journal::wal_admission::CurrentRound>> {
+        self.current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|guard| guard.original_round_for_tests())
+    }
+
+    fn invalidate_current(&self) {
+        drop(
+            self.current
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take(),
+        );
+    }
     /// Retain a read-only outcome witness across native cleanup/owner loss.
     pub fn outcome_observation(&self) -> SourceWalOwnerObservation {
         SourceWalOwnerObservation(Arc::clone(&self.request.ticket))
@@ -230,7 +251,7 @@ impl SourceWalTransportOwner {
             if Instant::now() >= self.request.deadline {
                 return Err(SourceWalTransportRejection::Deadline);
             }
-            request.acknowledge();
+            *self.current.lock().unwrap_or_else(|p| p.into_inner()) = Some(request.acknowledge());
         }
         Ok(())
     }
@@ -279,6 +300,7 @@ impl SourceWalTransportOwner {
 
     /// Begin pre-intent abort; the original writer remains exclusively held until real cleanup.
     pub fn request_abort(&mut self, reason: Option<SourceWalTransportRejection>) {
+        self.invalidate_current();
         if self.rejection.is_none() {
             self.rejection = reason;
         }
@@ -286,12 +308,14 @@ impl SourceWalTransportOwner {
     }
     /// Keep a cleanup failure explicitly unavailable, without claiming rollback or close.
     pub fn mark_unavailable(&self, reason: SourceWalTransportRejection) {
+        self.invalidate_current();
         self.request
             .ticket
             .set(SourceWalTransportStatus::Unavailable(reason));
     }
     /// Return only the exact original writer after confirmed rollback and timeout restoration.
     pub fn into_writer(mut self) -> Result<SourceWriter, Self> {
+        self.invalidate_current();
         self.request.ticket.set(SourceWalTransportStatus::Aborting);
         let result = self
             .native
@@ -330,6 +354,7 @@ impl SourceWalTransportOwner {
         mut self,
         authority: &mut SourceAuthorityRegistration,
     ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
+        self.invalidate_current();
         if !self.source_authority_close_ready() {
             return Err(SourceAuthorityError::InvalidLifecycle);
         }
@@ -345,6 +370,7 @@ impl SourceWalTransportOwner {
 }
 impl Drop for SourceWalTransportOwner {
     fn drop(&mut self) {
+        self.invalidate_current();
         if !self.resolved {
             // Publish loss BEFORE private native custody drops; never report automatic reuse.
             self.request

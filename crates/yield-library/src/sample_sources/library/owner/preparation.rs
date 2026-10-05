@@ -609,6 +609,7 @@ pub(super) fn run(
         // No SQL/row query/checkpoint/renewal/ordinary dispatch while held. The main-file FD
         // remains alive, and actual owner/path/native binding is rechecked cooperatively.
         let mut current: Option<crate::operation_journal::wal_admission::CurrentRequest> = None;
+        let mut current_custody = None;
         let outcome = loop {
             if let Err(error) = canceled(&command, lifecycle) {
                 break error;
@@ -636,7 +637,7 @@ pub(super) fn run(
                 if let Err(error) = canceled(&command, lifecycle) {
                     break error;
                 }
-                request.acknowledge();
+                current_custody = Some(request.acknowledge());
             }
             let wait = OWNER_POLL_INTERVAL.min(
                 command
@@ -654,6 +655,8 @@ pub(super) fn run(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         };
+        // Invalidate the original round before native cleanup or release-result delivery.
+        drop(current_custody);
         // Cancellation/deadline can win before the next parked native poll. Revalidate
         // original binding while still held before deciding reuse; this cleanup allowance
         // does not extend preparation or publish another acknowledgement.

@@ -670,3 +670,28 @@ OPT-2136 still requires the real atomic commit-decision/cleanup protocol, exact
 qualified directions, sealed nonce persisted with intent/claims, and uncertain
 outcome readback/restart custody. No permit, retry/refund authority, genuine
 settlement or physical qualification follows from this validation round.
+
+## Retained validation custody and cleanup race (OPT-2316)
+
+A source or global worker retains private non-Clone custody after answering the
+current round. Dropping that custody permanently invalidates the shared round;
+late or duplicate replies cannot reopen it. The original source producer drops
+it before abort status publication, rollback/reuse, failed cleanup, retirement or
+ordinary SQLite close. Audited, tag/layout and pre-audit native owners use the
+same rule without changing Registered count/lease/connection close order. The
+global worker invalidates it before actual rollback and release-result delivery.
+All original references continue to retain the round's combined byte debit.
+
+The collector refuses an invalidated round and publishes its initial historical
+Ready under the same short scalar mutex that worker invalidation uses. That
+mutex never surrounds native I/O, SQLite, source acquisition or owner waits.
+Thus cleanup cannot already have invalidated a round that passes that initial
+publication boundary. Later cleanup still makes an already-copied Ready view
+historical; the next actor poll begins original prefix cleanup. No new positive
+constructor, serialized guard or independently callable settlement path exists.
+
+This invalidation ordering is not a settlement-start fence. Owners still obey
+pre-intent abort/deadline rules. OPT-2136 must supply the actual atomic transition
+that protects their native transactions while journal settlement may commit,
+then definite outcome/readback reconciliation and atomic authoritative nonce
+persistence. Validation custody cannot issue permits or complete those steps.

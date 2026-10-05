@@ -301,6 +301,7 @@ mod integration {
         events: Arc<Mutex<Vec<String>>>,
         pause_abort: Arc<AtomicBool>,
         pause_validation: Arc<AtomicBool>,
+        current_validations: Arc<AtomicUsize>,
     }
     impl SourceActor {
         fn start(
@@ -342,6 +343,8 @@ mod integration {
             let paused = Arc::clone(&pause_abort);
             let pause_validation = Arc::new(AtomicBool::new(false));
             let validation_paused = Arc::clone(&pause_validation);
+            let current_validations = Arc::new(AtomicUsize::new(0));
+            let validated_count = Arc::clone(&current_validations);
             let worker = thread::spawn(move || {
                 let mut writers = writers
                     .into_iter()
@@ -403,6 +406,7 @@ mod integration {
                     sender.send((allocation, fence, deadline)).unwrap();
                 }
                 let mut held: HashMap<String, SourceWalProducerOwner> = HashMap::new();
+                let mut validated = std::collections::HashSet::new();
                 loop {
                     if stopped.load(Ordering::Acquire) {
                         inbox.close();
@@ -449,7 +453,14 @@ mod integration {
                             || (!validation_paused.load(Ordering::Acquire)
                                 && owner.revalidate(authorities.get(&id)).is_err())
                         {
+                            let original_round = owner.current_round_for_tests();
                             owner.request_abort(None);
+                            if let Some(round) = original_round {
+                                assert!(
+                                    round.invalidated_for_tests(),
+                                    "round must close before actual SQLite rollback"
+                                );
+                            }
                             match owner.into_writer() {
                                 Ok(writer) => {
                                     assert_eq!(
@@ -465,6 +476,11 @@ mod integration {
                                 }
                             }
                         } else {
+                            if owner.current_round_for_tests().is_some()
+                                && validated.insert(id.clone())
+                            {
+                                validated_count.fetch_add(1, Ordering::Release);
+                            }
                             remaining.insert(id, owner);
                         }
                     }
@@ -485,6 +501,7 @@ mod integration {
                 events,
                 pause_abort,
                 pause_validation,
+                current_validations,
             }
         }
     }
@@ -610,6 +627,12 @@ mod integration {
             panic!("{ready:?}");
         };
         assert_eq!(view.databases().len(), 3);
+        let counted_deadline = Instant::now() + Duration::from_secs(1);
+        while actor.current_validations.load(Ordering::Acquire) < 2 {
+            assert!(Instant::now() < counted_deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(actor.current_validations.load(Ordering::Acquire), 2);
         assert!(matches!(
             view.databases()[0],
             WalPreparedDatabase::Global(_)

@@ -230,6 +230,14 @@ impl Collector {
         if self.reason.is_some() {
             return self.poll_abort();
         }
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|round| round.invalidated())
+        {
+            self.fail(WalPreparationError::OwnerLost);
+            return self.poll_abort();
+        }
         // Native producer status is current; the immutable snapshot itself is not.
         for owner in &mut self.held {
             match owner {
@@ -500,7 +508,19 @@ impl Collector {
         if self.snapshot.is_none() {
             match self.make_snapshot() {
                 Ok(snapshot) => {
-                    self.publish(WalPreparationStatus::Ready(snapshot.clone()));
+                    if let Some(round) = &self.current {
+                        if round
+                            .with_complete(|| {
+                                self.publish(WalPreparationStatus::Ready(snapshot.clone()))
+                            })
+                            .is_none()
+                        {
+                            self.fail(WalPreparationError::OwnerLost);
+                            return self.poll_abort();
+                        }
+                    } else {
+                        self.publish(WalPreparationStatus::Ready(snapshot.clone()));
+                    }
                     self.snapshot = Some(snapshot);
                 }
                 Err(error) => {
