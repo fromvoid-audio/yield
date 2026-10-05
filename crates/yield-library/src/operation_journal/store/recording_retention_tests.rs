@@ -1,5 +1,137 @@
 // Actual journal/SQLite tests with authority-free synthetic proposal observations.
 // No fixture below reserves physical capacity or issues a live source/write grant.
+#[test]
+fn recording_metadata_policy_tightens_default_and_preserves_stricter_owner_cap() {
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    store.configure_recording_metadata_policy().unwrap();
+    let page_size: i64 = store
+        .connection
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap();
+    let ceiling = crate::operation_journal::recording_commands::MAX_RECORDING_JOURNAL_DATABASE_BYTES
+        / page_size as u64;
+    assert_eq!(
+        store
+            .connection
+            .query_row("PRAGMA max_page_count", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        ceiling as i64
+    );
+    let current: i64 = store
+        .connection
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    let tighter = current + 64;
+    assert!(tighter < ceiling as i64);
+    store
+        .connection
+        .query_row(&format!("PRAGMA max_page_count={tighter}"), [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+    let proposal =
+        crate::operation_journal::recording_commands::recording_proposal_for_test(2, 10_000);
+    store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    store
+        .retain_recording_chunk(&initial_recording_header(&proposal))
+        .unwrap();
+    for _ in 0..3 {
+        store.configure_recording_metadata_policy().unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row("PRAGMA max_page_count", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            tighter
+        );
+    }
+    assert!(store.verify_recording_reservation(&proposal, true).unwrap());
+}
+
+#[test]
+fn recording_exhausted_owner_page_cap_refuses_growth_and_preserves_retained_evidence() {
+    use crate::operation_journal::recording_commands::{
+        RecordingCapturedChunk, RecordingChunkRole, recording_proposal_for_test,
+    };
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let proposal = recording_proposal_for_test(2, 10_000);
+    let record = finite_recording_record(&proposal);
+    let header = initial_recording_header(&proposal);
+    store.insert_intent(&record).unwrap();
+    store.retain_recording_chunk(&header).unwrap();
+    let before = store.recording_retained_totals().unwrap();
+    let current: i64 = store
+        .connection
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        store
+            .connection
+            .query_row(&format!("PRAGMA max_page_count={current}"), [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        current
+    );
+    let pcm = RecordingCapturedChunk::new(
+        &proposal,
+        Uuid::new_v4(),
+        RecordingChunkRole::Pcm { ordinal: 0 },
+        68,
+        vec![255; 16_384],
+    )
+    .unwrap();
+    let failure = store.retain_recording_chunk(&pcm).unwrap_err();
+    assert!(
+        matches!(failure, OperationJournalStoreError::Sql(rusqlite::Error::SqliteFailure(ref code, _)) if code.code == rusqlite::ErrorCode::DiskFull)
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("PRAGMA max_page_count", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        current
+    );
+    assert_eq!(store.recording_retained_totals().unwrap(), before);
+    assert_eq!(
+        store.get(proposal.operation_id()).unwrap(),
+        Some(record.clone())
+    );
+    assert!(store.verify_recording_reservation(&proposal, true).unwrap());
+    assert_eq!(
+        store
+            .get_recording_chunk(proposal.operation_id(), header.chunk_id())
+            .unwrap(),
+        Some(header.clone())
+    );
+    assert!(
+        store
+            .get_recording_chunk(proposal.operation_id(), pcm.chunk_id())
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    assert_eq!(store.recording_retained_totals().unwrap(), before);
+    assert_eq!(store.get(proposal.operation_id()).unwrap(), Some(record));
+    assert!(store.verify_recording_reservation(&proposal, true).unwrap());
+    assert_eq!(
+        store
+            .get_recording_chunk(proposal.operation_id(), header.chunk_id())
+            .unwrap(),
+        Some(header)
+    );
+    assert!(
+        store
+            .get_recording_chunk(proposal.operation_id(), pcm.chunk_id())
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn finite_recording_record(
     proposal: &crate::operation_journal::recording_commands::RecordingProposal,
 ) -> StoredOperationRecord {

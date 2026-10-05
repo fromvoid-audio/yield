@@ -252,3 +252,16 @@ Actual hound tests cover all eight channel counts, zero/short/exact/multiple-buf
 recordings, exact final byte reconstruction, three-byte partial transport writes,
 private buffer corruption and terminal trace refusal. Full Reson and compile-fail
 privacy tests run separately from the canonical repository preflight.
+
+## Original SQLite growth policy (OPT-2285)
+
+Recording metadata setup reads the existing `max_page_count` on the original
+journal connection and enforces the smaller of that limit and the 512 MiB
+recording ceiling. Repeated setup, initial control reservation and byte retention
+cannot enlarge a stricter owner limit. Exact pager readback and current page count
+must satisfy the resulting limit. Actual SQLITE_FULL during retention preserves
+the original proposal, retained chunks and full terminal-control charges; reopen
+recovers those observations. SQLite page limits are connection policy and must
+be applied again by their owning acquisition after reopen. This does not reserve
+physical storage, implement terminal closure or qualify publication. Full
+OPT-2145 terminal integration and OPT-2058 physical transport remain open.
