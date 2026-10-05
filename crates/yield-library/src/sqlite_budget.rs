@@ -42,14 +42,14 @@ impl Deref for OwnedConnection {
     }
 }
 impl OwnedConnection {
-    /// Inspect the retained known Unix pager used by DELETE allocation observations.
+    /// Inspect the original known native pager used by DELETE allocation observations.
     /// This reads a native scalar only; it installs no budget or mutation permission.
     pub(crate) fn known_delete_sector_size(&self) -> Option<u64> {
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             None
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         {
             if rusqlite::version_number() != 3_050_002 {
                 return None;
@@ -62,21 +62,16 @@ impl OwnedConnection {
             // SAFETY: the private owned constructor verified this main pointer belongs to this
             // registration. Both outlive the borrowed connection. No concurrent close is possible.
             unsafe {
-                #[cfg(target_os = "linux")]
-                let expected = ffi::sqlite3_vfs_find(c"yield-linux-retained-root-v1".as_ptr());
-                #[cfg(target_os = "macos")]
-                let expected = ffi::sqlite3_vfs_find(c"unix".as_ptr());
-                {
-                    if expected.is_null() || registration.context.native != expected {
-                        return None;
-                    }
-                    let methods = (*file).pMethods.as_ref()?;
-                    let sector = (methods.xSectorSize?)(file);
-                    let sector = u64::try_from(sector).ok()?;
-                    // Bundled pager clamps JOURNAL_HDR_SZ to MAX_SECTOR_SIZE=0x10000.
-                    // Refuse unknown callbacks/values rather than presume that clamp is sufficient.
-                    ((512..=65536).contains(&sector) && sector.is_power_of_two()).then_some(sector)
-                }
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                io::known_unix_descriptor(file, &registration.context, 0)?;
+                #[cfg(windows)]
+                io::known_windows_file(file, &registration.context, 0)?;
+                let methods = (*file).pMethods.as_ref()?;
+                let sector = (methods.xSectorSize?)(file);
+                let sector = u64::try_from(sector).ok()?;
+                // Bundled pager clamps JOURNAL_HDR_SZ to MAX_SECTOR_SIZE=0x10000.
+                // Refuse unknown callbacks/values rather than presume that clamp is sufficient.
+                ((512..=65536).contains(&sector) && sector.is_power_of_two()).then_some(sector)
             }
         }
     }

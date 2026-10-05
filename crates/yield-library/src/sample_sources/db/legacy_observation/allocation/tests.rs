@@ -1,6 +1,46 @@
 use super::*;
 use crate::sample_sources::db::SourceDatabase;
 
+#[test]
+fn original_delete_sector_callback_observation_never_uses_ordinary_sql_or_writes() {
+    with_owner(|owner, _profile, path| {
+        let bytes = std::fs::read(path).unwrap();
+        let before = owner.connection.known_delete_sector_size().unwrap();
+        assert!(before.is_power_of_two() && (512..=65536).contains(&before));
+        #[cfg(windows)]
+        assert_eq!(before, 4096, "actual bundled winSectorSize callback");
+        owner
+            .connection
+            .authorizer(Some(|_: rusqlite::hooks::AuthContext<'_>| {
+                rusqlite::hooks::Authorization::Deny
+            }));
+        for _ in 0..8 {
+            assert_eq!(owner.connection.known_delete_sector_size(), Some(before));
+        }
+        assert!(owner.connection.is_autocommit());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        owner.connection.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
+        assert_eq!(owner.connection.known_delete_sector_size(), Some(before));
+        assert!(
+            !path
+                .with_file_name(format!("{}-wal", crate::sample_sources::DB_FILE_NAME))
+                .exists()
+        );
+        assert!(
+            !path
+                .with_file_name(format!("{}-shm", crate::sample_sources::DB_FILE_NAME))
+                .exists()
+        );
+        assert!(
+            !path
+                .with_file_name(format!("{}-journal", crate::sample_sources::DB_FILE_NAME))
+                .exists()
+        );
+    });
+}
+
 fn with_owner(run: impl FnOnce(&LegacySourceReadOwner, &WritableProfileGuard, &std::path::Path)) {
     let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
     let profile = tempfile::tempdir().unwrap();

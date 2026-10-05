@@ -199,6 +199,6 @@ fn peak(p: u64, m: u64) -> Option<Peak> {
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[cfg(test)]
 mod tests;
