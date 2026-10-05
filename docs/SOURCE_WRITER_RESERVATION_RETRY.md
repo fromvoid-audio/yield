@@ -48,3 +48,5 @@ Full source/saga/recovery scheduling, lease/jitter/cancellation, universal
 pre-intent WAL reservations and durable failure dispositions remain OPT-1686,
 OPT-1685 and OPT-1348. This leaf completes only the ordinary source batch
 acquisition boundary.
+
+OPT-2329 adds [fixed cumulative acquisition counters and return-wait buckets](SOURCE_SQLITE_ACQUISITION_METRICS.md) at this actual helper boundary. The finite retry/ownership/timeout/body behavior above is unchanged.

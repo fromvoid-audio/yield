@@ -54,6 +54,7 @@ pub use db::{
     SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
     WavEntry,
 };
+pub use db::{SourceAcquisitionMetricsSnapshot, source_acquisition_metrics_snapshot};
 pub use finalization::{
     StagedFileFinalizationCapabilities, StagedFinalizationAvailability,
     StagedFinalizationUnsupportedReason, staged_file_finalization_capabilities,
