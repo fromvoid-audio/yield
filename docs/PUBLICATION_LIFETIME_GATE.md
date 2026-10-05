@@ -464,3 +464,36 @@ shared mirror backing from its original journal input pool, bind exact claims an
 current native descriptor/reserve provenance, and compose cancellation/retirement
 and completion fences. The actual provider arithmetic/barrier tests exercise the
 original ledger and leases with accounting fixtures, not Native grants or effects.
+
+## Composed original publication backing budget (OPT-2276)
+
+The original journal input pool now tracks a private publication subset under its
+existing input mutex. Publication backing has an additional 2 MiB ceiling and
+also consumes ordinary credit from the same 4 MiB total. The 64 KiB control margin
+remains disjoint. Both counters are checked before either debit changes; ordinary
+exhaustion cannot leave a partial publication reservation. The checked invariant
+requires publication usage to be no greater than actual ordinary usage.
+
+The original runtime resource header, native reader capsule backing/capture
+scratch and weak reader registry use this private factory. Full slot and charge
+mirror issuance must use it too. The limit includes shared overhead, so 32 is a
+maximum registry/use count, not a guarantee that 32 maximum-sized backing objects
+fit. Budget exhaustion refuses before allocating or cloning the native capsule;
+its duplicate fresh-proof scratch remains funded by the same limit.
+
+The non-Clone original input permit records its private classification. Its last
+backing-holder Drop refunds publication and ordinary memory counters together,
+including after lost replies and worker teardown. It does not release physical
+capacity, settle an operation, authorize retry or confer native/effect permission.
+Poisoned or inconsistent accounting and unconfirmable refunds retain unknown
+credit and close the original owner; they cannot reset either allowance.
+
+Real OwnerShared/runtime/store tests cover exact saturation with remaining
+ordinary/control margin, refusal without partial debit, funded reader capture,
+shared header/registry overhead, concurrent original permits, corruption/poison,
+and a last backing alias retained after an actual committed lost reply and join.
+These tests do not fabricate a qualified native reader or publication grant.
+OPT-2215 remains open for actual slots, exact source/target/charge association,
+qualified namespace allocation, mutation/release/retirement fences, bounded
+completion and settlement. Native provider and physical qualification remain
+separate acceptance.
