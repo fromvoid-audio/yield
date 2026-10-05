@@ -118,7 +118,10 @@ fn recording_custody_scalar_facade_cannot_create_slot_and_drain_closes_original_
     assert_eq!(FACTORIES.load(Ordering::Acquire), factories);
     let full = client
         .shared
-        .reserve_input(InputClass::Ordinary, ORDINARY_INPUT_BYTES)
+        .reserve_input(
+            InputClass::Ordinary,
+            before.remaining[InputClass::Ordinary.index()],
+        )
         .unwrap();
     assert!(matches!(
         forged.revalidate(),
@@ -136,5 +139,8 @@ fn recording_custody_scalar_facade_cannot_create_slot_and_drain_closes_original_
         forged.revalidate(),
         Err(OperationJournalOwnerQueueError::Closed)
     ));
-    assert_eq!(*client.shared.input_bytes.lock().unwrap(), before);
+    assert_eq!(
+        *client.shared.input_bytes.lock().unwrap(),
+        InputBudget::new()
+    );
 }
