@@ -37,6 +37,8 @@ pub const WORK_PLAN_VERSION_V1: u16 = 1;
 pub const WORK_PLAN_VERSION_SOURCE_LAYOUT: u16 = 2;
 /// Exact original-reservation legacy adoption topology; no current lease is invented.
 pub const WORK_PLAN_VERSION_LEGACY_ADOPTION: u16 = 3;
+/// Exact frozen source lease/global registry retirement graph. No execution authority.
+pub const WORK_PLAN_VERSION_REGISTRY_RETIREMENT: u16 = 4;
 /// Alias for the current work-plan version.
 pub const WORK_PLAN_VERSION: u16 = WORK_PLAN_VERSION_V1;
 /// Maximum number of derived participant work units in one plan.
@@ -288,6 +290,7 @@ impl WorkPlan {
             WORK_PLAN_VERSION_V1
                 | WORK_PLAN_VERSION_SOURCE_LAYOUT
                 | WORK_PLAN_VERSION_LEGACY_ADOPTION
+                | WORK_PLAN_VERSION_REGISTRY_RETIREMENT
         ) {
             return Err(WorkPlanError::UnsupportedPlanVersion {
                 actual: self.plan_version,
@@ -329,6 +332,41 @@ impl WorkPlan {
                     .units
                     .iter()
                     .any(|u| u.key.role == WorkUnitRole::SourceDerivedLayout))
+        {
+            return Err(WorkPlanError::UnsupportedPlanVersion {
+                actual: self.plan_version,
+            });
+        }
+        if self.plan_version == WORK_PLAN_VERSION_REGISTRY_RETIREMENT {
+            if self.units.len() != 3 || self.prerequisites.len() != 2 {
+                return Err(WorkPlanError::PlanMismatch);
+            }
+            let keys = [self.units[0].key, self.units[1].key, self.units[2].key];
+            if keys.iter().any(|key| key.action_ordinal != 0)
+                || keys[0].step_ordinal != 0
+                || keys[0].role != WorkUnitRole::GlobalLibrary
+                || keys[1].step_ordinal != 1
+                || keys[1].role != WorkUnitRole::SourceLeaseMaintenance
+                || keys[2].step_ordinal != 2
+                || keys[2].role != WorkUnitRole::GlobalLibrary
+                || keys[0].participant_id != keys[2].participant_id
+                || keys[0].participant_id == keys[1].participant_id
+                || self.units.iter().any(|unit| {
+                    unit.requirement != ParticipantRequirement::Required
+                        || unit.applicability != WorkUnitApplicability::Required
+                })
+                || self.prerequisites
+                    != [
+                        WorkPrerequisite::new(keys[0], keys[1]),
+                        WorkPrerequisite::new(keys[1], keys[2]),
+                    ]
+            {
+                return Err(WorkPlanError::PlanMismatch);
+            }
+        } else if self
+            .units
+            .iter()
+            .any(|unit| unit.key.role == WorkUnitRole::SourceLeaseMaintenance)
         {
             return Err(WorkPlanError::UnsupportedPlanVersion {
                 actual: self.plan_version,
@@ -457,6 +495,34 @@ pub fn derive_work_plan(
     args: &UniversalCommandArgs,
     participants: &ParticipantSet,
 ) -> Result<WorkPlan, WorkPlanError> {
+    if let UniversalCommandArgs::SourceRegistryRetirement(command) = args {
+        participants.validate_for_new_intent()?;
+        command
+            .validate_against_participants(participants)
+            .map_err(|error| {
+                WorkPlanError::CommandArguments(
+                    UniversalCommandArgsValidationError::SourceRegistryRetirement(error),
+                )
+            })?;
+        let mut builder = PlanBuilder::default();
+        let keys = [
+            command.draining_work(),
+            command.source_work(),
+            command.retired_work(),
+        ];
+        for key in keys {
+            builder.add_unit(
+                key,
+                ParticipantRequirement::Required,
+                WorkUnitApplicability::Required,
+            )?;
+        }
+        builder.add_edge(keys[0], keys[1])?;
+        builder.add_edge(keys[1], keys[2])?;
+        let plan = builder.finish_with_version(WORK_PLAN_VERSION_REGISTRY_RETIREMENT)?;
+        plan.validate()?;
+        return Ok(plan);
+    }
     if let UniversalCommandArgs::SourceLegacyAdoption(command) = args {
         participants.validate_for_new_intent()?;
         command

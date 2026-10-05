@@ -13,7 +13,8 @@ impl LeaseNative {
     pub(super) fn cleanup_staging_bytes(&self) -> usize {
         match self {
             Self::Unprepared(..) => 0,
-            _ => 3 * MAX_SOURCE_LEASE_SCOPE_BYTES + 512,
+            Self::Held(held) => held.cleanup_scratch_bytes().unwrap_or(usize::MAX),
+            Self::Failed(failed) => failed.cleanup_scratch_bytes().unwrap_or(usize::MAX),
         }
     }
     pub(super) fn close_without_reuse(self) {

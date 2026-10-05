@@ -695,3 +695,29 @@ pre-intent abort/deadline rules. OPT-2136 must supply the actual atomic transiti
 that protects their native transactions while journal settlement may commit,
 then definite outcome/readback reconciliation and atomic authoritative nonce
 persistence. Validation custody cannot issue permits or complete those steps.
+
+## Exact retirement preparation graph (OPT-2317)
+
+Frozen work-plan version 4 derives only the required global Draining reference,
+source `SourceLeaseMaintenance` release, and global Retired reference, in that
+order with both prerequisite edges. Older versions retain their algorithms and
+cannot accept this lease role. Re-derivation checks the original typed retirement
+arguments and exactly two required participants; no audited revision is invented
+for a source that has never completed an audit.
+
+The generic original-owner collector now prepares this complete family through
+its global-first acquisition, exact claim/device/subject checks, shared 64-database
+and 64 KiB context, original two-second deadline, current owner validation and
+reverse cleanup. Lease capture reserves checked scratch from the retained original
+allocation and subject, including JSON escaping, bounded native/CONTROL work and
+sequential encoding Vec growth. Cleanup reserves its actual recapture bound;
+insufficient context still refuses before capture and closes without reuse when
+cleanup cannot obtain its original credit. The shared ceiling is unchanged.
+
+The genuine SQLite regression collects both original owners for a pre-audit
+source and confirms cleanup. Its proposal row hashes are historical expectations:
+no global lifecycle transition or authenticated receipt is produced. Full and
+prepared retirement admission explicitly remain Unsupported before identity,
+capacity or intent effects. This graph and preparation do not supply the joint
+post-start settlement latch, qualified physical policy, lifecycle permit consumers,
+atomic nonce reconciliation or genuine settlement required by OPT-2136/2194/2196.

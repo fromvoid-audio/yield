@@ -318,6 +318,7 @@ mod integration {
                     crate::sample_sources::db::SourceLeaseMaintenanceAllocation,
                     crate::operation_journal::source_lease_binding::StoredSourceLeaseFence,
                     Instant,
+                    crate::sample_sources::db::SourceRegistryReferenceObservation,
                 )>,
             >,
         ) -> Self {
@@ -331,6 +332,7 @@ mod integration {
                     crate::sample_sources::db::SourceLeaseMaintenanceAllocation,
                     crate::operation_journal::source_lease_binding::StoredSourceLeaseFence,
                     Instant,
+                    crate::sample_sources::db::SourceRegistryReferenceObservation,
                 )>,
             >,
             register: bool,
@@ -391,6 +393,9 @@ mod integration {
                     assert_eq!(writers.len(), 1);
                     let id = writers.keys().next().unwrap().clone();
                     let writer = writers.remove(&id).unwrap();
+                    let reference = writer
+                        .capture_registry_reference_observation(Some(&authorities[&id]))
+                        .unwrap();
                     let deadline = Instant::now() + Duration::from_secs(2);
                     let allocation = writer
                         .capture_lease_maintenance_allocation(deadline)
@@ -403,7 +408,9 @@ mod integration {
                     let writer = prepared.abort().unwrap();
                     drop(binding);
                     writers.insert(id, writer);
-                    sender.send((allocation, fence, deadline)).unwrap();
+                    sender
+                        .send((allocation, fence, deadline, reference))
+                        .unwrap();
                 }
                 let mut held: HashMap<String, SourceWalProducerOwner> = HashMap::new();
                 let mut validated = std::collections::HashSet::new();
@@ -1290,7 +1297,8 @@ mod integration {
         let (requester, inbox) = SourceWalTransport::channel();
         let (send, receive) = mpsc::sync_channel(1);
         let actor = SourceActor::start_with_lease_observation(vec![writer], inbox, Some(send));
-        let (allocation, fence, deadline) = receive.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (allocation, fence, deadline, _) =
+            receive.recv_timeout(Duration::from_secs(3)).unwrap();
         let participant = ParticipantId::new();
         let participants = ParticipantSet::new(
             vec![ParticipantDescriptor::source_lease_maintenance(participant, fence).unwrap()],
@@ -1345,6 +1353,273 @@ mod integration {
         assert!(journal.shutdown());
     }
 
+    #[test]
+    fn all_owner_real_registry_retirement_collects_global_and_pre_audit_lease_with_exact_graph() {
+        use crate::operation_journal::source_registry_retirement::SourceRegistryRetirementIntentArgs;
+        use crate::operation_journal::work_plan::{
+            WORK_PLAN_VERSION_REGISTRY_RETIREMENT, WorkPlan, WorkPrerequisite, WorkUnitKey,
+            WorkUnitRole, derive_work_plan_v1,
+        };
+        use crate::sample_sources::db::{
+            SourceRegistryReferenceExpected, SourceRegistryReferenceProposal,
+            SourceRegistryReferenceTransition as Transition,
+        };
+        let (fixture, mut journal) = open_owner("all-owner-registry-retirement");
+        let mut global = GlobalLibraryWriter::start(&fixture.owner).unwrap();
+        let startup = Instant::now() + Duration::from_secs(5);
+        while global.status() != GlobalLibraryWriterStatus::Available {
+            assert!(Instant::now() < startup);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let media = fixture._base.path().join("retiring-pre-audit");
+        fs::create_dir(&media).unwrap();
+        let writer = SourceWriter::new_for_scan(
+            SourceDatabase::open_for_catalog_with_profile_guard(
+                &media,
+                &fixture.owner,
+                "retiring-pre-audit",
+            )
+            .unwrap(),
+            SourceId::from_string("retiring-pre-audit"),
+            1,
+        )
+        .unwrap();
+        assert!(writer.current_revision().is_err());
+        let (requester, inbox) = SourceWalTransport::channel();
+        let (send, receive) = mpsc::sync_channel(1);
+        let actor = SourceActor::start_with_lease_observation(vec![writer], inbox, Some(send));
+        let (allocation, fence, deadline, reference) =
+            receive.recv_timeout(Duration::from_secs(3)).unwrap();
+        let source = ParticipantId::new();
+        let global_id = ParticipantId::new();
+        let operation = OperationId::new();
+        // Historical expected-row hashes only. No global transition, authenticated receipt,
+        // qualified provider or release permission is installed by this preparation fixture.
+        let draining = SourceRegistryReferenceProposal::new(
+            &reference,
+            operation,
+            WorkUnitKey::new(0, 0, global_id, WorkUnitRole::GlobalLibrary),
+            Transition::Draining,
+            SourceRegistryReferenceExpected::Present {
+                state: Transition::Enrolled,
+                row_identity: [1; 32],
+            },
+        )
+        .unwrap();
+        let retired = SourceRegistryReferenceProposal::new(
+            &reference,
+            operation,
+            WorkUnitKey::new(0, 2, global_id, WorkUnitRole::GlobalLibrary),
+            Transition::Retired,
+            SourceRegistryReferenceExpected::Present {
+                state: Transition::Draining,
+                row_identity: [2; 32],
+            },
+        )
+        .unwrap();
+        let retirement =
+            SourceRegistryRetirementIntentArgs::new(source, global_id, fence, &draining, &retired)
+                .unwrap();
+        let descriptors = vec![
+            retirement.source_descriptor().unwrap(),
+            ParticipantDescriptor::new(
+                global_id,
+                ParticipantKind::GlobalLibrary,
+                ParticipantRequirement::Required,
+                None,
+                None,
+            )
+            .unwrap(),
+        ];
+        let checkpoints = descriptors
+            .iter()
+            .map(|descriptor| {
+                ParticipantCheckpoint::new(
+                    descriptor.id(),
+                    ParticipantCheckpointState::Pending,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let participants = ParticipantSet::new(descriptors, checkpoints).unwrap();
+        let args = UniversalCommandArgs::SourceRegistryRetirement(retirement.clone());
+        let work = derive_work_plan(&args, &participants).unwrap();
+        assert_eq!(work.plan_version(), WORK_PLAN_VERSION_REGISTRY_RETIREMENT);
+        assert_eq!(
+            work.units()
+                .iter()
+                .map(|unit| unit.key())
+                .collect::<Vec<_>>(),
+            vec![
+                retirement.draining_work(),
+                retirement.source_work(),
+                retirement.retired_work()
+            ]
+        );
+        assert_eq!(
+            work.prerequisites(),
+            &[
+                WorkPrerequisite::new(retirement.draining_work(), retirement.source_work()),
+                WorkPrerequisite::new(retirement.source_work(), retirement.retired_work())
+            ]
+        );
+        work.validate_against(&args, &participants).unwrap();
+        assert!(derive_work_plan_v1(&args, &participants).is_err());
+        let mut image = serde_json::to_value(&work).unwrap();
+        image["prerequisites"] = serde_json::json!([]);
+        assert!(
+            serde_json::from_value::<WorkPlan>(image)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        let mut image = serde_json::to_value(&work).unwrap();
+        image["plan_version"] = serde_json::json!(1);
+        assert!(
+            serde_json::from_value::<WorkPlan>(image)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        let (plan, claims, main, side) = plan(&fixture);
+        let source_input = || {
+            WalPreparationSource::new(
+                requester.clone(),
+                source,
+                main,
+                side,
+                SourceWalPreparationInput::Lease(allocation.clone()),
+            )
+        };
+        assert!(matches!(
+            WalPreparationInput::from_universal(
+                &args,
+                &participants,
+                &plan,
+                &claims,
+                vec![source_input()],
+                None,
+                deadline
+            ),
+            Err(WalPreparationError::InvalidInput)
+        ));
+        assert!(matches!(
+            WalPreparationInput::from_universal(
+                &args,
+                &participants,
+                &plan,
+                &claims,
+                Vec::new(),
+                Some(global.wal_preparation_client()),
+                deadline
+            ),
+            Err(WalPreparationError::InvalidInput)
+        ));
+        for sources in [
+            vec![source_input(), source_input()],
+            vec![WalPreparationSource::new(
+                requester.clone(),
+                ParticipantId::new(),
+                main,
+                side,
+                SourceWalPreparationInput::Lease(allocation.clone()),
+            )],
+            vec![WalPreparationSource::new(
+                requester.clone(),
+                source,
+                AdmissionClaimId::new(),
+                side,
+                SourceWalPreparationInput::Lease(allocation.clone()),
+            )],
+        ] {
+            assert!(matches!(
+                WalPreparationInput::from_universal(
+                    &args,
+                    &participants,
+                    &plan,
+                    &claims,
+                    sources,
+                    Some(global.wal_preparation_client()),
+                    deadline,
+                ),
+                Err(WalPreparationError::InvalidInput)
+            ));
+        }
+        let input = WalPreparationInput::from_universal(
+            &args,
+            &participants,
+            &plan,
+            &claims,
+            vec![source_input()],
+            Some(global.wal_preparation_client()),
+            deadline,
+        )
+        .unwrap();
+        let budget = input.budget_for_test();
+        let handle = journal
+            .client()
+            .prepare_wal_owners(input)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let WalPreparationStatus::Ready(view) = wait(&handle, |status| {
+            matches!(status, WalPreparationStatus::Ready(_)) || terminal(status)
+        }) else {
+            panic!("{:?}", handle.status());
+        };
+        assert_eq!(view.databases().len(), 2);
+        assert!(matches!(
+            view.databases()[0],
+            WalPreparedDatabase::Global(_)
+        ));
+        assert!(matches!(view.databases()[1], WalPreparedDatabase::Lease(_)));
+        let result = journal
+            .client()
+            .admit_full(args, participants)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(OperationJournalOwnerError::PreparedAdmission(
+                PreparedAdmissionError::Unsupported { .. }
+            ))
+        ));
+        assert_eq!(
+            journal
+                .prepared_admission_id_allocations
+                .load(Ordering::Relaxed),
+            0
+        );
+        let outside =
+            rusqlite::Connection::open(fixture.owner.profile_root().join(LIBRARY_DB_FILE_NAME))
+                .unwrap();
+        assert_eq!(
+            outside
+                .query_row(
+                    "SELECT count(*) FROM source_lifecycle_references",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        handle.abort();
+        let aborted = wait(&handle, terminal);
+        assert!(
+            matches!(aborted, WalPreparationStatus::Aborted),
+            "{aborted:?}"
+        );
+        drop(view);
+        drop(handle);
+        assert_eq!(budget.used(), 0);
+        drop(actor);
+        assert!(global.shutdown());
+        assert!(journal.shutdown());
+    }
     #[test]
     fn all_owner_real_tag_and_layout_factories_keep_actual_original_family_policy() {
         use crate::sample_sources::db::write::{

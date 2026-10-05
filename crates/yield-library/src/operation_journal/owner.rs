@@ -759,6 +759,14 @@ impl PreparedAdmissionInput {
                 ),
             });
         }
+        if matches!(
+            &self.args,
+            UniversalCommandArgs::SourceRegistryRetirement(_)
+        ) {
+            return Err(PreparedAdmissionError::Unsupported {
+                reason: "registry retirement requires the original all-owner settlement latch and qualified lifecycle admission".into(),
+            });
+        }
         if matches!(&self.args, UniversalCommandArgs::SourceLegacyAdoption(_)) {
             return Err(PreparedAdmissionError::Unsupported {
                 reason: "legacy adoption requires the original-owner capacity and durable admission bridge".into(),
@@ -6136,6 +6144,11 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
         } => {
             let _input = input;
             execute_store_result(result, move || {
+                if matches!(&args, UniversalCommandArgs::SourceRegistryRetirement(_)) {
+                    return Err(PreparedAdmissionError::Unsupported {
+                        reason: "registry retirement requires the original all-owner settlement latch and qualified lifecycle admission".into(),
+                    }.into());
+                }
                 if matches!(&args, UniversalCommandArgs::SourceLegacyAdoption(_)) {
                     return Err(PreparedAdmissionError::Unsupported {
                         reason: "legacy adoption requires the original-owner capacity and durable admission bridge".into(),

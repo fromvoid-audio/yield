@@ -369,6 +369,14 @@ fn prepare(custody: &mut Custody) -> Result<u64, SourceLeaseMaintenancePreparati
     Ok(wal.observed_bytes())
 }
 impl SourceLeaseMaintenancePreparation {
+    pub(crate) fn cleanup_scratch_bytes(&self) -> Option<usize> {
+        self.observation().preparation_scratch_bytes()
+    }
+
+    pub(crate) fn binding_scratch_bytes(&self) -> Option<usize> {
+        self.observation().binding_scratch_bytes()
+    }
+
     pub(crate) fn close_without_reuse(mut self) {
         self.custody.close_without_reuse();
     }
@@ -457,6 +465,10 @@ impl SourceLeaseMaintenancePreparation {
     }
 }
 impl SourceLeaseMaintenancePreparationFailure {
+    pub(crate) fn cleanup_scratch_bytes(&self) -> Option<usize> {
+        self.custody.observation.preparation_scratch_bytes()
+    }
+
     pub(crate) fn close_without_reuse(mut self) {
         self.custody.close_without_reuse();
     }

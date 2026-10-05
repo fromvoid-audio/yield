@@ -289,9 +289,9 @@ pub use store::{
 pub use validation::{RecordConsistency, classify_record};
 pub use work_plan::{
     MAX_WORK_PLAN_EDGES, MAX_WORK_PLAN_UNITS, WORK_PLAN_VERSION, WORK_PLAN_VERSION_LEGACY_ADOPTION,
-    WORK_PLAN_VERSION_SOURCE_LAYOUT, WORK_PLAN_VERSION_V1, WorkPlan, WorkPlanError,
-    WorkPrerequisite, WorkUnit, WorkUnitApplicability, WorkUnitKey, WorkUnitRole, derive_work_plan,
-    derive_work_plan_v1, validate_work_plan,
+    WORK_PLAN_VERSION_REGISTRY_RETIREMENT, WORK_PLAN_VERSION_SOURCE_LAYOUT, WORK_PLAN_VERSION_V1,
+    WorkPlan, WorkPlanError, WorkPrerequisite, WorkUnit, WorkUnitApplicability, WorkUnitKey,
+    WorkUnitRole, derive_work_plan, derive_work_plan_v1, validate_work_plan,
 };
 pub use work_progress::{
     AfterEffectReconciliationObservation, AuditTarget, AuditTargetValidationError,
