@@ -32,6 +32,16 @@ impl OwnerRuntime {
                 .wal_preparation
                 .as_mut()
                 .ok_or(WalPreparationError::InvalidInput)?;
+            let UniversalCommandArgs::SourceRegistryRetirement(args) = &prepared.args else {
+                return Err(WalPreparationError::InvalidInput.into());
+            };
+            collector.validate_retirement_policy(
+                args,
+                &prepared.participants,
+                &prepared.plan,
+                &prepared.claims,
+                digest,
+            )?;
             collector.begin_decision(digest)?;
             Ok::<_, OperationJournalOwnerError>(
                 collector.decision_nonce().expect("original decision nonce"),

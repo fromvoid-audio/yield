@@ -1497,6 +1497,12 @@ mod integration {
         original_retirement_custody(3);
     }
 
+    #[test]
+    fn retirement_original_consumer_refuses_invented_aggregate_component_budgets() {
+        original_retirement_custody(4);
+        original_retirement_custody(5);
+    }
+
     fn original_retirement_custody(outcome: u8) {
         use crate::operation_journal::source_registry_retirement::SourceRegistryRetirementIntentArgs;
         use crate::operation_journal::work_plan::{
@@ -1655,7 +1661,92 @@ mod integration {
                 .validate()
                 .is_err()
         );
-        let (base_plan, base_claims, main, side) = plan(&fixture);
+        let (mut base_plan, mut base_claims, main, side) = plan(&fixture);
+        if outcome == 0 || outcome == 5 {
+            // An actual original worker supplies planning ceilings before freezing the
+            // envelope. Its later retirement scope must independently match all of them.
+            // This observation does not qualify physical capacity or issue an ACK.
+            let request = crate::sample_sources::library::GlobalPreparationRequest::new(
+                global.preparation_owner(),
+                [9; 32],
+                deadline,
+                1,
+                16 * 1024,
+            )
+            .unwrap()
+            .with_lifecycle_policy();
+            let mut pending = global.submit_preparation(request).unwrap();
+            let original_scope = pending
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            let global_allocation = original_scope.observation().lifecycle_allocation().unwrap();
+            let source_caps = fence.write_ceilings();
+            let global_caps = [
+                global_allocation.main(),
+                global_allocation.wal(),
+                global_allocation.shm(),
+            ]
+            .map(|object| object.write_ceiling());
+            let mut exact = Vec::new();
+            for allocation in base_plan.allocations() {
+                let bytes = match allocation.class() {
+                    Class::SourceDatabaseCommit => source_caps[0],
+                    Class::SourceWalShm => source_caps[1].checked_add(source_caps[2]).unwrap(),
+                    Class::GlobalDatabaseCommit => global_caps[0].checked_mul(2).unwrap(),
+                    Class::GlobalWalShm => global_caps[1]
+                        .checked_add(global_caps[2])
+                        .unwrap()
+                        .checked_mul(2)
+                        .unwrap(),
+                    _ => unreachable!(),
+                };
+                let bytes = if outcome == 5 && allocation.class() == Class::SourceDatabaseCommit {
+                    bytes.checked_add(allocation.allocation_unit()).unwrap()
+                } else {
+                    bytes
+                };
+                exact.push(
+                    FullCapacityAllocation::new(
+                        allocation.volume().clone(),
+                        allocation.allocation_unit(),
+                        allocation.class(),
+                        bytes,
+                        bytes,
+                        PROTECTED_FREE_SPACE_FLOOR,
+                    )
+                    .unwrap(),
+                );
+            }
+            base_plan = FullCapacityPlan::new(exact).unwrap();
+            base_claims = AdmissionClaimInventory::new(
+                base_claims
+                    .claims()
+                    .iter()
+                    .map(|claim| {
+                        let allocation = base_plan
+                            .allocations()
+                            .iter()
+                            .find(|a| a.class() == claim.allocation_class())
+                            .unwrap();
+                        AdmissionClaim::new(
+                            claim.claim_id(),
+                            allocation.volume().clone(),
+                            allocation.class(),
+                            allocation.allocated_bytes(),
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            original_scope
+                .abort()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            drop(pending);
+        }
         let original = &base_plan.allocations()[0];
         let mut allocations = base_plan.allocations().to_vec();
         allocations.push(
@@ -1861,7 +1952,7 @@ mod integration {
         .unwrap();
         let budget = input.budget_for_test();
         let mut local_collector = None;
-        let handle = if outcome == 0 {
+        let handle = if outcome == 0 || outcome >= 4 {
             journal
                 .client()
                 .prepare_wal_owners(input)
@@ -2108,9 +2199,21 @@ mod integration {
             .unwrap()
             .recv_timeout(Duration::from_secs(3))
             .unwrap();
-        assert!(
-            matches!(result, Err(OperationJournalOwnerError::PreparedAdmission(PreparedAdmissionError::Unsupported { reason })) if reason.contains("original owners acknowledged"))
-        );
+        if outcome >= 4 {
+            assert!(
+                matches!(
+                    result,
+                    Err(OperationJournalOwnerError::WalPreparation(
+                        WalPreparationError::InvalidInput
+                    ))
+                ),
+                "invented aggregate budgets must fail original-policy comparison before acknowledgement: {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(OperationJournalOwnerError::PreparedAdmission(PreparedAdmissionError::Unsupported { reason })) if reason.contains("original owners acknowledged"))
+            );
+        }
         assert_eq!(
             journal
                 .prepared_admission_id_allocations
@@ -2133,7 +2236,14 @@ mod integration {
         handle.abort();
         let aborted = wait(&handle, terminal);
         assert!(
-            matches!(aborted, WalPreparationStatus::Aborted),
+            if outcome >= 4 {
+                matches!(
+                    aborted,
+                    WalPreparationStatus::Rejected(WalPreparationError::InvalidInput)
+                )
+            } else {
+                matches!(aborted, WalPreparationStatus::Aborted)
+            },
             "{aborted:?}"
         );
         drop(view);

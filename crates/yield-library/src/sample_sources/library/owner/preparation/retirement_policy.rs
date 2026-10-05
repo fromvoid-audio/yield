@@ -54,6 +54,34 @@ pub struct GlobalRetirementForwardPolicy {
     total: [u64; 3],
 }
 impl GlobalRetirementForwardPolicy {
+    /// Exact original planning correlation, not current authority or qualification.
+    pub(crate) fn matches_original(
+        &self,
+        args: &SourceRegistryRetirementIntentArgs,
+        owner: &GlobalPreparationOwner,
+        nonce: uuid::Uuid,
+        allocation: &crate::lifecycle_allocation::LifecycleDatabaseAllocation,
+    ) -> bool {
+        let Ok(input) = Input::new(args) else {
+            return false;
+        };
+        let objects = [allocation.main(), allocation.wal(), allocation.shm()];
+        let unit = objects[0].allocation_unit();
+        let per = objects.map(|object| object.write_ceiling());
+        self.version == 1
+            && self.input == input
+            && uuid::Uuid::parse_str(owner.acquisition().as_str()).ok() == Some(input.acquisition)
+            && self.registration == owner.registration()
+            && self.registration_generation == owner.generation()
+            && self.preparation_nonce == nonce
+            && allocation.role()
+                == crate::lifecycle_allocation::LifecycleAllocationRole::GlobalReferences
+            && objects.iter().all(|object| {
+                object.device() == objects[0].device() && object.allocation_unit() == unit
+            })
+            && self.per_transition == per
+            && totals(per, unit).is_ok_and(|total| self.total == total)
+    }
     /// Exact frozen operation correlation; not a newly allocated journal identity.
     pub fn operation_id(&self) -> OperationId {
         self.input.operation
