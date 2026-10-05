@@ -5,8 +5,8 @@ use super::resource_custody::{ResourceAdmission, ResourceUse, UseError};
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 const MAX_READERS: usize = 32;
-const BACKING: usize = 64 * 1024;
-const REGISTRY: usize = 32 * 1024;
+pub(super) const BACKING: usize = 64 * 1024;
+pub(super) const REGISTRY: usize = 32 * 1024;
 const SCRATCH: usize = 32 * 1024;
 const MAX_FACTS: usize = 32;
 #[derive(Default)]
