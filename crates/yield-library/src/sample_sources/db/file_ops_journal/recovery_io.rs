@@ -902,12 +902,18 @@ impl BoundDatabaseRoot {
         let capability = self._capability.try_clone()?;
         // A copied /proc alias must refer to THIS retained descriptor, not the original
         // temporary/actor descriptor. The readonly witness owns no lease or authority.
+        #[cfg(windows)]
+        let path =
+            windows_final_path(&capability).map_err(|e| io::Error::other(format!("{e:?}")))?;
+        #[cfg(not(windows))]
         let path = database_root_alias(
             &capability,
             self.named_path.as_deref().unwrap_or(&self.path),
             &self.identity,
         )
         .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        validate_database_root_alias(&capability, &path, &self.identity)
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
         let observer = ReadonlyDatabaseRoot {
             root: Self {
                 path,

@@ -807,3 +807,42 @@ pub(super) unsafe fn known_unix_descriptor(
         Some(native.descriptor)
     }
 }
+
+/// Borrow only the original pinned win32 file behind this exact private wrapper.
+#[cfg(windows)]
+pub(super) unsafe fn known_windows_file(
+    file: *mut ffi::sqlite3_file,
+    ctx: &Context,
+    expected_role: usize,
+) -> Option<*mut super::wal_objects::windows::WinFilePrefix> {
+    use super::wal_objects::windows::WinFilePrefix;
+    // SAFETY: sole SQLite owner keeps wrapper/native registration alive throughout
+    // this borrow. Validate our header before interpreting the bundled native prefix.
+    unsafe {
+        let wrapper = file.as_ref()?;
+        if ![&V1 as *const _, &V2 as *const _, &V3 as *const _].contains(&wrapper.pMethods) {
+            return None;
+        }
+        let h = header(file);
+        let native = ffi::sqlite3_vfs_find(c"win32".as_ptr());
+        if !ptr::eq(h.context, ctx)
+            || h.role != expected_role
+            || !matches!(expected_role, 0 | 1)
+            || rusqlite::version_number() != 3_050_002
+            || CStr::from_ptr(ffi::sqlite3_sourceid()).to_bytes()
+                != b"2025-06-28 14:00:48 2af157d77fb1304a74176eaee7fbc7c7e932d946bf25325e9c26c91db19e3079"
+            || native.is_null()
+            || ctx.native != native
+            || (*native).szOsFile < std::mem::size_of::<WinFilePrefix>() as c_int
+            || std::mem::size_of::<usize>() != 8
+        {
+            return None;
+        }
+        let file = inner(file).cast::<WinFilePrefix>();
+        let prefix = &*file;
+        if prefix.vfs != native || prefix.methods.is_null() || !prefix.valid_handle() {
+            return None;
+        }
+        Some(file)
+    }
+}

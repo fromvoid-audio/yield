@@ -1393,8 +1393,9 @@ mod tests {
     }
 
     use super::*;
+    use std::fs::{self, OpenOptions as StdOpenOptions};
+    #[cfg(unix)]
     use std::{
-        fs::{self, OpenOptions as StdOpenOptions},
         io::{self, BufRead, BufReader, Write},
         process::{Command, Stdio},
     };

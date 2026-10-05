@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use super::super::super::mutation_context::GlobalMutationRequest;
 
 fn finish(writer: &mut GlobalLibraryWriter) -> GlobalLibraryWriterDrainReport {

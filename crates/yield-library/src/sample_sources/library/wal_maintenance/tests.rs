@@ -75,6 +75,7 @@ fn available(writer: &GlobalLibraryWriter) {
     }
 }
 
+#[cfg(unix)]
 fn closed_after_profile_change(writer: &GlobalLibraryWriter) {
     // The command's error reply precedes terminal closure; shutdown's boolean only
     // identifies who initiated closure, so observe the actual terminal state first.
