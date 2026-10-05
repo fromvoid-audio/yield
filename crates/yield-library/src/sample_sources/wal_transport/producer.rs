@@ -351,6 +351,7 @@ pub(super) fn classify(error: &SourceWalPreparationError) -> SourceWalTransportR
             SourceWalTransportRejection::WalUnavailable
         }
         SourceWalPreparationError::TransactionActive
+        | SourceWalPreparationError::EmptyReservationChanged
         | SourceWalPreparationError::RollbackUnconfirmed => SourceWalTransportRejection::OwnerLost,
     }
 }

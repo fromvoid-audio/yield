@@ -455,7 +455,7 @@ fn classify(
     use SourceLeaseMaintenancePreparationError::*;
     match error.borrow() {
         Deadline => SourceWalTransportRejection::Deadline,
-        TransactionActive | RollbackUnconfirmed | PolicyUnconfirmed => {
+        TransactionActive | EmptyReservationChanged | RollbackUnconfirmed | PolicyUnconfirmed => {
             SourceWalTransportRejection::OwnerLost
         }
         Allocation(_) | Binding(_) | Owner(_) => SourceWalTransportRejection::Scope,

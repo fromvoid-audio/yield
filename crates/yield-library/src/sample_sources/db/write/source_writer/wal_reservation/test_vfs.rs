@@ -10,12 +10,7 @@ impl SourceWriter {
     ) -> Result<SourceWalPreparation, SourceWalPreparationFailure> {
         // HeldWriter is declared before Restore. During unwind the descriptor is restored
         // before HeldWriter closes the ordinary connection and releases its lease.
-        let mut held = HeldWriter {
-            writer: Some(self),
-            reservation: false,
-            restore_timeout: None,
-            registered: None,
-        };
+        let mut held = HeldWriter::new(self);
         unsafe extern "C" fn unknown(_: *mut ffi::sqlite3_file, _: *mut ffi::sqlite3_int64) -> i32 {
             ffi::SQLITE_IOERR_FSTAT
         }

@@ -668,7 +668,9 @@ fn genuine_binding_refuses_changed_lease_epoch_owner_or_state_in_retained_main()
         "UPDATE source_lease SET state='released',released_at=acquired_at",
         "UPDATE source_lease SET expires_at=acquired_at",
     ] {
-        let (_f, writer) = fixture();
+        let (f, writer) = fixture();
+        let other = external(&f);
+        let original_lease = lease(&other);
         let registration = writer.database.prepare_source_authority().unwrap();
         let held = prepare_owner(writer);
         let binding = held.capture_lease_binding(&registration).unwrap();
@@ -683,10 +685,22 @@ fn genuine_binding_refuses_changed_lease_epoch_owner_or_state_in_retained_main()
                 .is_err()
         );
         assert!(held.capture_lease_binding(&registration).is_err());
-        // Confirmed abort restores the real original rows, never authorizes the injected facts.
-        let writer = held.abort().unwrap();
+        // Confirmed rollback restores rows but cannot authorize reuse of changed custody.
+        let failure = held
+            .abort()
+            .err()
+            .expect("original mutated lease custody stays private");
+        assert!(matches!(
+            failure.error(),
+            SourceLeaseMaintenancePreparationError::EmptyReservationChanged
+        ));
+        assert_eq!(lease(&other), original_lease);
+        let failure = failure
+            .into_writer()
+            .err()
+            .expect("rollback cannot erase mismatch");
         drop(registration);
-        writer.close().unwrap();
+        failure.close_without_reuse();
     }
 }
 
@@ -899,7 +913,20 @@ fn parked_lease_rejects_uncommitted_write_and_original_deadline_without_reuse() 
         held.validate_lease_binding(&binding, &registration)
             .is_err()
     );
-    let returned = held.abort().unwrap();
+    let failure = held
+        .abort()
+        .err()
+        .expect("changed empty custody remains private");
+    assert!(matches!(
+        failure.error(),
+        SourceLeaseMaintenancePreparationError::EmptyReservationChanged
+    ));
+    let failure = failure
+        .into_writer()
+        .err()
+        .expect("rollback cannot clear original mismatch");
+    drop(registration);
+    failure.close_without_reuse();
     assert_eq!(
         external(&f)
             .query_row(
@@ -910,6 +937,9 @@ fn parked_lease_rejects_uncommitted_write_and_original_deadline_without_reuse() 
             .unwrap(),
         0
     );
+    drop(f);
+    let (_fresh, returned) = fixture();
+    let registration = returned.database.prepare_source_authority().unwrap();
     let deadline = Instant::now() + Duration::from_millis(250);
     let observation = returned
         .capture_lease_maintenance_allocation(deadline)
@@ -933,3 +963,32 @@ fn parked_lease_rejects_uncommitted_write_and_original_deadline_without_reuse() 
 }
 
 mod transport;
+
+#[test]
+fn original_lease_empty_writer_rejects_weakened_transaction_without_reuse() {
+    let (_fixture, writer) = fixture();
+    let held = prepare_owner(writer);
+    let connection = &held.custody.writer().database.connection;
+    connection.execute_batch("ROLLBACK; BEGIN").unwrap();
+    connection
+        .query_row("SELECT count(*) FROM metadata", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    assert!(matches!(
+        held.revalidate_owner(),
+        Err(SourceLeaseMaintenancePreparationError::EmptyReservationChanged)
+    ));
+    let failure = held
+        .abort()
+        .err()
+        .expect("weakened original writer transaction stays private");
+    assert!(matches!(
+        failure.error(),
+        SourceLeaseMaintenancePreparationError::EmptyReservationChanged
+    ));
+    assert!(failure.custody.writer().database.connection.is_autocommit());
+    let failure = failure
+        .into_writer()
+        .err()
+        .expect("original mismatch survives confirmed rollback");
+    failure.close_without_reuse();
+}

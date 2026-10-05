@@ -614,3 +614,30 @@ current-owner acknowledgement. It does not create a decision latch, authorize
 intent/claims, settle an operation, or qualify native allocation. The full
 OPT-2136 post-start cleanup fence, atomic nonce/intent/claims and readback/restart
 acceptance remains open.
+
+## Original source empty MAIN writer custody (OPT-2314)
+
+Audited source reservations now retain the original connection's total-change
+counter and require non-autocommit and SQLite MAIN transaction state `Write` at
+acquisition and parked owner/binding checks. The original pre-audit lease custody
+uses the same native state requirement alongside its existing counter. These
+checks perform no ordinary SQL and cannot renew a lease or extend the deadline.
+A separate flag distinguishes the acquired MAIN reservation from a failed initial
+read transaction, preserving confirmed rollback/retry of initial acquisition.
+
+Mismatch remains sticky through actual rollback and timeout/settings restoration.
+Changed custody cannot return a callable writer through `abort` or `into_writer`;
+its original Registered count and lease remain until ordinary SQLite closes.
+Release checks the counter/state even when no preceding parked validation ran.
+The actual source producer classifies this failure as owner loss. Tag and layout
+outer policy custody retains the failed inner owner and original counted use;
+rollback cannot bypass it. Negative VFS tests use the same private initializer.
+
+Actual source/SQLite regressions cover weakened/read transactions, uncommitted
+mutation with rollback/re-BEGIN, no-reuse after confirmed rollback, original
+Registered count through cleanup/retry and ordinary-close ordering. Existing
+SQL-denial, acquisition, rollback-retry, timeout and entered-policy tests remain
+required. This protects empty connection custody; it does not prove arbitrary
+DDL integrity or uninterrupted history from a scalar counter. It supplies no
+joint owner decision, capacity/database permit, retry/refund or genuine settlement.
+Full OPT-2136 and qualified allocation/recovery acceptance remain open.

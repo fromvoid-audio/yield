@@ -213,7 +213,7 @@ fn issuer() {
 }
 fn scope() {
     {
-        let (writer, _fixture, _) = writer();
+        let (writer, fixture, _) = writer();
         db(&writer)
             .execute(
                 "INSERT INTO metadata(key,value) VALUES ('source_starmap_generation_v1',?1)",
@@ -221,7 +221,6 @@ fn scope() {
             )
             .unwrap();
         let before = source_writer_state_snapshot(writer.database_for_tests());
-        let original = settings(&writer);
         let handle = unsafe { db(&writer).handle() };
         let obs = observe(&writer);
         let held = writer
@@ -237,17 +236,19 @@ fn scope() {
         authorizer(handle, Some(deny_begin));
         assert!(matches!(
             held.revalidate(),
-            Err(SourceWalPreparationError::Owner(
-                SourceWriterError::MetadataBoundNotDefined
-            ))
+            Err(SourceWalPreparationError::EmptyReservationChanged)
         ));
         authorizer(handle, None);
-        let writer = held.abort().unwrap();
-        assert_eq!(settings(&writer), original);
-        assert_eq!(
-            source_writer_state_snapshot(writer.database_for_tests()),
-            before
-        );
+        let failure = held
+            .abort()
+            .err()
+            .expect("changed layout custody stays private");
+        let failure = failure
+            .into_writer()
+            .err()
+            .expect("rollback cannot authorize changed layout reuse");
+        drop(failure);
+        assert_eq!(source_writer_state_snapshot(&fixture.database), before);
     }
 
     for sql in [
