@@ -17293,11 +17293,35 @@ mod tests {
         drop(settlement);
         assert_eq!(provider.outstanding(&volume, allocation_class), 2);
 
+        let ordinary = store.read_ordinary_claim_page(None, MAX_PAGE_ROWS).unwrap();
+        let first = ordinary
+            .records()
+            .iter()
+            .find(|row| row.claim_id() == first_id)
+            .unwrap();
+        let retained = AdmissionClaim::new(
+            first.claim_id(),
+            first.volume().clone(),
+            first.allocation_class(),
+            first.allocated_bytes(),
+        )
+        .unwrap();
+        let publication_charge = provider
+            .bind_publication_charge(first.operation_id(), &retained)
+            .unwrap();
+        assert!(publication_charge.is_current());
+
         let first_request = release_request(operation_id, first_id, Uuid::new_v4());
         store
             .release_ordinary_claim(first_request, &provider)
             .expect("release first claim");
         assert_eq!(provider.outstanding(&volume, allocation_class), 1);
+        assert!(!publication_charge.is_current());
+        assert!(
+            provider
+                .bind_publication_charge(operation_id, &retained)
+                .is_err()
+        );
         store
             .release_ordinary_claim(first_request, &provider)
             .expect("replay first release");
@@ -17530,6 +17554,18 @@ mod tests {
         store
             .persist_chunk_claim_with_lease(&request, &provider, lease)
             .expect("persist chunk claim");
+        let persisted = store.read_chunk_claim(request.chunk_id()).unwrap().unwrap();
+        let retained = AdmissionClaim::new(
+            persisted.claim_id(),
+            persisted.volume().clone(),
+            persisted.allocation_class(),
+            persisted.allocated_bytes(),
+        )
+        .unwrap();
+        let publication_charge = provider
+            .bind_publication_charge(persisted.operation_id(), &retained)
+            .unwrap();
+        assert!(publication_charge.is_current());
         let issue_id = Uuid::new_v4();
         store.set_insert_test_hook(|boundary| {
             if boundary == InsertTestBoundary::Commit {
@@ -17604,6 +17640,12 @@ mod tests {
         provider
             .release_claim(&replay)
             .expect("provider release after durable replay");
+        assert!(!publication_charge.is_current());
+        assert!(
+            provider
+                .bind_publication_charge(operation_id, &retained)
+                .is_err()
+        );
         assert_eq!(provider.claim_count(), 0);
     }
 

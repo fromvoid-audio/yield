@@ -527,3 +527,26 @@ actual supported Windows runtime verification remains OPT-2284.
 This bounded query supplies no private lifetime-slot issuer, native reserve
 qualification, effect entry, held-object publication, charge release or genuine
 settlement. Full OPT-2215/2216/2218/2219 and tracking acceptance remain open.
+## Exact retained-charge observations (OPT-2291)
+
+The original actor-owned capacity provider can bind immutable ordinary or chunk
+claim data to exactly one confirmed durable token. It checks operation and claim
+identity, volume, allocation class, allocated bytes, durable disposition and
+unreleased state. Provisional and audit-pending charges remain accounted but
+cannot mint this binding. The existing chunk issuance validation consumes this
+check before considering native capacity observations.
+
+The private binding is neither cloneable nor serializable. It retains only the
+immutable scalar claim and original charge observer, with a captured generation;
+it contains no actor `Rc<RefCell<_>>` or native resources. Any ledger generation
+change invalidates it, including unrelated admission and release. Pending or
+unknown mutations and original provider destruction refuse observation. An
+identical rebuilt ledger in another provider cannot validate the old binding.
+
+The binding header is at most 256 bytes. A future retaining slot producer must
+debit its actual backing, together with the original shared mirror and observer
+backing, on the existing publication input credit. These observations do not
+issue publication permission, qualify a filesystem, refund a reservation or
+complete settlement. OPT-2215 still requires the complete original issuer, target
+and source association, bounded slots, all lifetime fences and native namespace
+allocation policy.

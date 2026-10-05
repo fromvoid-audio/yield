@@ -25,7 +25,7 @@ use crate::operation_journal::model::OperationId;
 use uuid::Uuid;
 
 mod charge_observer;
-use charge_observer::{ChargeMirror, ChargeMutation, ChargeObserver};
+use charge_observer::{ChargeMirror, ChargeMutation, ChargeObserver, PublicationChargeBinding};
 use std::sync::Arc;
 const INITIAL_LEASE_TOKEN: u64 = 1;
 
@@ -204,6 +204,45 @@ impl CapacityProvider {
             .try_borrow()
             .map_err(|_| CapacityProviderError::LedgerBusy)?;
         ledger.mirror.bind(&ledger, volume)
+    }
+
+    /// Bind ordinary or chunk claim data to its exact confirmed durable original charge.
+    /// Decoded claim data alone is insufficient; this never admits bytes or issues a permit.
+    pub(crate) fn bind_publication_charge(
+        &self,
+        operation: OperationId,
+        claim: &AdmissionClaim,
+    ) -> Result<PublicationChargeBinding, CapacityProviderError> {
+        let ledger = self
+            .ledger
+            .try_borrow()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        validate_publication_claim(&ledger, operation, claim)?;
+        let observer = ledger.mirror.bind(&ledger, claim.volume())?;
+        let observation = observer
+            .observation()
+            .ok_or(CapacityProviderError::Unavailable)?;
+        Ok(PublicationChargeBinding::new(
+            operation,
+            claim.clone(),
+            observer,
+            observation,
+        ))
+    }
+
+    /// Actor-side revalidation additionally rejects a foreign provider incarnation.
+    pub(crate) fn validate_publication_charge(
+        &self,
+        binding: &PublicationChargeBinding,
+    ) -> Result<(), CapacityProviderError> {
+        if !binding.belongs_to(&self.mirror) || !binding.is_current() {
+            return Err(CapacityProviderError::Unavailable);
+        }
+        let ledger = self
+            .ledger
+            .try_borrow()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        validate_publication_claim(&ledger, binding.operation(), binding.claim())
     }
 
     /// Prove that this owner-thread ledger has no live charge that could be lost by a clean
@@ -407,6 +446,15 @@ impl CapacityProvider {
         witness: &super::owner::LiveAdmissionWitness<'_>,
     ) -> Result<(), CapacityProviderError> {
         self.validate_durable_chunk_claim(record)?;
+        let claim = AdmissionClaim::new(
+            record.claim_id(),
+            record.volume().clone(),
+            record.allocation_class(),
+            record.allocated_bytes(),
+        )
+        .map_err(|_| CapacityProviderError::InvalidClaims)?;
+        let binding = self.bind_publication_charge(record.operation_id(), &claim)?;
+        self.validate_publication_charge(&binding)?;
         if record.protected_free_bytes() != PROTECTED_FREE_SPACE_FLOOR {
             return Err(CapacityProviderError::UnsupportedFacts);
         }
@@ -945,6 +993,36 @@ impl Drop for CapacityProvider {
         // Observer custody cannot outlive the original actor/provider incarnation.
         self.mirror.close();
     }
+}
+
+fn validate_publication_claim(
+    ledger: &ProvisionalLedger,
+    operation: OperationId,
+    expected: &AdmissionClaim,
+) -> Result<(), CapacityProviderError> {
+    let mut matches = ledger
+        .charges_by_token
+        .values()
+        .filter(|entry| entry.claims.contains_key(&expected.claim_id()));
+    let entry = matches
+        .next()
+        .ok_or(CapacityProviderError::ClaimReleaseNotFound)?;
+    if matches.next().is_some() {
+        return Err(CapacityProviderError::ClaimReleaseAmbiguous);
+    }
+    let claim = &entry.claims[&expected.claim_id()];
+    if !matches!(&entry.disposition, ProvisionalLeaseDisposition::Durable {
+        operation_id, claim_ids
+    } if *operation_id == operation && claim_ids.contains(&expected.claim_id()))
+        || claim.volume != *expected.volume()
+        || claim.allocation_class != expected.allocation_class()
+        || claim.allocated_bytes != expected.allocated_bytes()
+        || claim.release_id.is_some()
+        || ledger.released_claims.contains_key(&expected.claim_id())
+    {
+        return Err(CapacityProviderError::ClaimReleaseConflict);
+    }
+    Ok(())
 }
 
 fn stage_rebuilt_ledger(
