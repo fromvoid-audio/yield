@@ -646,3 +646,25 @@ completion/settlement remain required by OPT-2215. Scalar race tests confer no
 source or native authority. Supported macOS compilation and genuine issuer
 execution remain in [OPT-2304](https://linear.app/boostnlvp/issue/OPT-2304).
 Unknown fences refuse new issuance and unresolved fences prevent clean runtime handoff.
+
+## Original chunk-release consumers (OPT-2305)
+
+Unused chunk release, release retry and chunk cancellation now consult the original
+operation fence before removing tickets, changing pending-release state, writing
+release rows or refunding provider charges. Entered, unsettled and unknown attempts
+return typed `PublicationChargeReleasePending`; pending publication entry closes
+before release proceeds. Existing identity/state checks still reject malformed
+or foreign requests. A failed or stale request can conservatively close entry.
+
+Receiving the original unique unused permit retains its exact release identity
+inline on the existing ticket before the permit drops. This is actor-retained
+unused proof, not permission reconstructed from IDs or decoded claims. Write entry
+and staging checkpoint reject that returned issuance. After a future legitimate
+publication resolution, exact release retry can transfer the retained proof to the
+existing pending-release path. No physical-quiescence Drop supplies that resolution.
+Restart loses live unused proof and must retain uncertainty instead of reissuing it.
+
+Other mutation/ordinary-release/source-retirement fences, exact capacity/native
+association, completion and settlement remain open in OPT-2215/2216/2217/2218.
+Supported macOS SDK compilation and genuine original-unused issuer execution
+remain [OPT-2306](https://linear.app/boostnlvp/issue/OPT-2306).

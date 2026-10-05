@@ -585,6 +585,12 @@ pub enum OperationJournalOwnerError {
         /// Original operation whose publication custody prevents cancellation.
         operation_id: OperationId,
     },
+    /// Original publication custody prevents releasing this operation's chunk charges.
+    #[error("operation {operation_id:?} chunk release awaits publication reconciliation")]
+    PublicationChargeReleasePending {
+        /// Operation whose entered, unsettled or unknown publication retains its charges.
+        operation_id: OperationId,
+    },
     /// An internally serialized control input could not be decoded on the owner thread.
     #[error("operation journal owner control input could not be decoded: {reason}")]
     InvalidInput {
@@ -975,6 +981,7 @@ struct SourceVolumeBinding {
 /// Owner-thread identity for one durable Issued chunk. The permit returned to a caller is not a
 /// write authority by itself; this live registry is required at every bounded entry/release.
 struct IssuedChunkTicket {
+    unused_release: Option<Uuid>,
     chunk_id: ChunkId,
     operation_id: OperationId,
     identity: ChunkWriteIdentity,
@@ -2085,6 +2092,7 @@ impl OwnerRuntime {
         self.issued_chunk_tickets.insert(
             permit.issue_id(),
             IssuedChunkTicket {
+                unused_release: None,
                 chunk_id: permit.chunk_id(),
                 operation_id: permit.operation_id(),
                 identity: permit.identity().clone(),
@@ -2456,7 +2464,8 @@ impl OwnerRuntime {
                 .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
                     reason: String::from("chunk validation has no physical staging proof"),
                 })?;
-        if ticket.chunk_id != chunk_id
+        if ticket.unused_release.is_some()
+            || ticket.chunk_id != chunk_id
             || ticket.operation_id != validation.operation_id()
             || ticket.identity.participant_id() != validation.participant_id()
             || ticket.live_output != Some(proof.output())
@@ -2523,7 +2532,8 @@ impl OwnerRuntime {
                 reason: String::from("chunk write ticket is not held by this owner"),
             }
         })?;
-        if ticket.chunk_id != permit.chunk_id()
+        if ticket.unused_release.is_some()
+            || ticket.chunk_id != permit.chunk_id()
             || ticket.operation_id != permit.operation_id()
             || ticket.identity != *permit.identity()
             || ticket.identity != identity
@@ -2641,7 +2651,7 @@ impl OwnerRuntime {
         let chunk_id = permit.chunk_id();
         let operation_id = permit.operation_id();
         let issue_id = permit.issue_id();
-        let Some(ticket) = self.issued_chunk_tickets.get(&issue_id) else {
+        let Some(ticket) = self.issued_chunk_tickets.get_mut(&issue_id) else {
             return Err(OperationJournalOwnerError::ChunkClaim {
                 reason: String::from("chunk release ticket is not held by this owner"),
             });
@@ -2659,6 +2669,19 @@ impl OwnerRuntime {
                 reason: String::from("chunk release identity is already pending"),
             });
         }
+        if ticket
+            .unused_release
+            .is_some_and(|retained| retained != release_id)
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("original unused release identity conflicts"),
+            });
+        }
+        // The moved original permit, never an ID-only request, proves this issuance unused.
+        // Retain its exact proof inline even if publication custody refuses charge release.
+        ticket.unused_release = Some(release_id);
+        self.publication_fences
+            .close_for_charge_release(operation_id)?;
         self.issued_chunk_tickets.remove(&issue_id);
         self.pending_chunk_releases.insert(
             release_id,
@@ -2704,6 +2727,8 @@ impl OwnerRuntime {
                 reason: String::from("chunk release identity is nil"),
             });
         }
+        self.publication_fences
+            .close_for_charge_release(operation_id)?;
         let pending_issue_id = match self.pending_chunk_releases.get(&release_id) {
             Some(pending)
                 if pending.chunk_id == chunk_id
@@ -2749,12 +2774,35 @@ impl OwnerRuntime {
                         .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
                             reason: String::from("Issued chunk has no issue identity"),
                         })?;
-                if pending_issue_id != Some(issue_id) {
+                let original_unused =
+                    self.issued_chunk_tickets
+                        .get(&issue_id)
+                        .is_some_and(|ticket| {
+                            ticket.chunk_id == chunk_id
+                                && ticket.operation_id == operation_id
+                                && ticket.identity == current.write_identity()
+                                && ticket.unused_release == Some(release_id)
+                        });
+                if pending_issue_id.is_some_and(|pending| pending != issue_id)
+                    || (pending_issue_id.is_none() && !original_unused)
+                {
                     return Err(OperationJournalOwnerError::ChunkClaim {
                         reason: String::from(
                             "Issued chunk has no retained unused release authority",
                         ),
                     });
+                }
+                if original_unused {
+                    self.issued_chunk_tickets.remove(&issue_id);
+                    self.pending_chunk_releases.insert(
+                        release_id,
+                        PendingChunkRelease {
+                            chunk_id,
+                            operation_id,
+                            issue_id,
+                            release_id,
+                        },
+                    );
                 }
                 Some(ChunkUnusedReleaseAuthorization::new(
                     chunk_id,
@@ -2802,6 +2850,8 @@ impl OwnerRuntime {
                 reason: String::from("chunk release identity is nil"),
             });
         }
+        self.publication_fences
+            .close_for_charge_release(operation_id)?;
         let current = self
             .store()
             .read_chunk_claim(chunk_id)
@@ -6386,6 +6436,7 @@ mod tests {
     mod control_input_tests;
     mod control_responsiveness_tests;
     mod native_read_capsule_tests;
+    mod publication_chunk_release_tests;
     mod publication_fence_tests;
     mod publication_input_tests;
     mod publication_uncertainty_tests;
@@ -9081,7 +9132,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn live_chunk_grant_crosses_to_file_owner_once_after_dropped_reply() {
-        native_live_chunk_and_staging_issuer(None, None, None, None);
+        native_live_chunk_and_staging_issuer(None, None, None, None, None);
     }
 
     #[cfg(target_os = "macos")]
@@ -9090,7 +9141,7 @@ mod tests {
         use super::super::store::InsertTestBoundary;
         for nth in [1, 2] {
             for boundary in [InsertTestBoundary::Commit, InsertTestBoundary::AfterCommit] {
-                native_live_chunk_and_staging_issuer(Some((nth, boundary)), None, None, None);
+                native_live_chunk_and_staging_issuer(Some((nth, boundary)), None, None, None, None);
             }
         }
     }
@@ -9099,7 +9150,7 @@ mod tests {
     #[test]
     fn native_preissued_publication_grant_refuses_original_drain_and_unavailable() {
         for unavailable in [false, true] {
-            native_live_chunk_and_staging_issuer(None, Some(unavailable), None, None);
+            native_live_chunk_and_staging_issuer(None, Some(unavailable), None, None, None);
         }
     }
 
@@ -9107,7 +9158,7 @@ mod tests {
     #[test]
     fn native_publication_issuer_refuses_stale_original_targets() {
         for kind in 0..3 {
-            native_live_chunk_and_staging_issuer(None, None, Some(kind), None);
+            native_live_chunk_and_staging_issuer(None, None, Some(kind), None, None);
         }
     }
 
@@ -9115,7 +9166,15 @@ mod tests {
     #[test]
     fn native_publication_issuer_cancellation_fences_original_pending_and_unsettled_grants() {
         for entered in [false, true] {
-            native_live_chunk_and_staging_issuer(None, None, None, Some(entered));
+            native_live_chunk_and_staging_issuer(None, None, None, Some(entered), None);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_publication_issuer_chunk_release_fences_original_unused_and_unsettled_grants() {
+        for entered in [false, true] {
+            native_live_chunk_and_staging_issuer(None, None, None, None, Some(entered));
         }
     }
 
@@ -9125,6 +9184,7 @@ mod tests {
         close_before_entry: Option<bool>,
         stale_target: Option<u8>,
         cancel_after_entry: Option<bool>,
+        release_after_entry: Option<bool>,
     ) {
         use super::super::store::{InsertTestBoundary, InsertTestDirective};
         let fixture = fixture("journal-owner-live-chunk-grant");
@@ -9976,6 +10036,21 @@ mod tests {
             );
             return;
         }
+        let unused_for_release = release_after_entry.map(|_| {
+            let request = ChunkClaimRequest::new(ChunkId::new(), operation_id,
+                AdmissionClaim::new(AdmissionClaimId::new(), claim.claim().volume().clone(),
+                    crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                    facts.allocation_unit).unwrap(), participant_id, "fenced-unused-release".into(),
+                0, 1, facts.allocation_unit, PROTECTED_FREE_SPACE_FLOOR).unwrap();
+            let mut claimed = client.claim_chunk(request.clone()).unwrap();
+            claimed.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+            let spec = LiveChunkEffectSpec::new(EffectId::new(), OutputIdentity::new(),
+                publication_root, vec![fence.clone()], 0, 1, b"x").unwrap();
+            let mut issued = client.issue_live_chunk_effect(request.chunk_id(), operation_id,
+                registration.clone(), guard.pin_for_effect().unwrap(), spec).unwrap();
+            let unused = issued.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+            (request, unused.into_unused_permit())
+        });
         if let Some((nth, _)) = fault {
             armed.store(nth, Ordering::Release);
         }
@@ -10028,6 +10103,51 @@ mod tests {
                 .publication_remaining,
             input_before - 64 * 1024 - publication_fence::HEADER_BYTES
         );
+        if let Some(entered) = release_after_entry {
+            let (request, unused) = unused_for_release.unwrap();
+            let release = Uuid::new_v4();
+            if entered {
+                let permit = publication.begin_publication().unwrap();
+                let mut returned = client.release_chunk(unused, release).unwrap();
+                // Queue admission is nonblocking; wait for actor replies only after source Drop.
+                drop(permit);
+                assert!(matches!(
+                    returned.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    Err(OperationJournalOwnerError::PublicationChargeReleasePending { .. })
+                ));
+                let mut retry = client
+                    .retry_chunk_release(request.chunk_id(), operation_id, release)
+                    .unwrap();
+                assert!(matches!(
+                    retry.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    Err(OperationJournalOwnerError::PublicationChargeReleasePending { .. })
+                ));
+                let mut claimed = client.claim_chunk(request.clone()).unwrap();
+                assert_eq!(
+                    claimed
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap()
+                        .unwrap()
+                        .state(),
+                    ChunkClaimState::Issued
+                );
+                assert_eq!(owner.shared.resource_admission.snapshot(), (false, 0, true));
+            } else {
+                let mut returned = client.release_chunk(unused, release).unwrap();
+                returned
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap();
+                assert!(publication.begin_publication().is_err());
+                assert_eq!(owner.shared.resource_admission.snapshot().1, 0);
+                drop(guard.pin_for_effect().unwrap().begin_effect().unwrap());
+            }
+            staged.acknowledge().unwrap();
+            let _ = file_owner.shutdown();
+            drop(database);
+            let _ = owner.shutdown();
+            return;
+        }
         if let Some(entered) = cancel_after_entry {
             let mut scan = client.scan_recovery_page(None).unwrap();
             let page = scan.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
