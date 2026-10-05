@@ -1417,9 +1417,14 @@ mod integration {
             },
         )
         .unwrap();
-        let retirement =
-            SourceRegistryRetirementIntentArgs::new(source, global_id, fence, &draining, &retired)
-                .unwrap();
+        let retirement = SourceRegistryRetirementIntentArgs::new(
+            source,
+            global_id,
+            fence.clone(),
+            &draining,
+            &retired,
+        )
+        .unwrap();
         let descriptors = vec![
             retirement.source_descriptor().unwrap(),
             ParticipantDescriptor::new(
@@ -1493,6 +1498,104 @@ mod integration {
                 SourceWalPreparationInput::Lease(allocation.clone()),
             )
         };
+        for fault in 0..5 {
+            let mut image = serde_json::to_value(&fence).unwrap();
+            match fault {
+                0 | 1 => {
+                    let object = &mut image["objects"][fault + 1];
+                    object["identity"] = serde_json::json!(format!(
+                        "{}-foreign",
+                        object["identity"].as_str().unwrap()
+                    ));
+                }
+                2 => {
+                    for object in image["objects"].as_array_mut().unwrap() {
+                        object["device"] =
+                            serde_json::json!(object["device"].as_u64().unwrap() + 1);
+                    }
+                }
+                3 => {
+                    image["maximum_pages"] =
+                        serde_json::json!(image["maximum_pages"].as_u64().unwrap() / 2)
+                }
+                _ => {
+                    image["objects"][0]["bytes"] =
+                        serde_json::json!(image["objects"][0]["bytes"].as_u64().unwrap() + 1)
+                }
+            }
+            let page = image["page_size"].as_u64().unwrap();
+            let pages = image["maximum_pages"].as_u64().unwrap();
+            let windows = [page * pages, (page + 24) * pages + 32, pages * 16 + 32768];
+            for (object, window) in image["objects"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .zip(windows)
+            {
+                object["ceiling"] = serde_json::json!(
+                    crate::lifecycle_allocation::logical_ceiling(
+                        object["bytes"].as_u64().unwrap(),
+                        window,
+                        object["unit"].as_u64().unwrap(),
+                    )
+                    .unwrap()
+                );
+            }
+            let foreign: crate::operation_journal::source_lease_binding::StoredSourceLeaseFence =
+                serde_json::from_value(image).unwrap();
+            foreign.validate().unwrap(); // Valid history, never a live allocation or grant.
+            let other = SourceRegistryRetirementIntentArgs::new(
+                source, global_id, foreign, &draining, &retired,
+            )
+            .unwrap();
+            let descriptors = vec![
+                other.source_descriptor().unwrap(),
+                participants.descriptors()[1].clone(),
+            ];
+            let other_participants =
+                ParticipantSet::new(descriptors, participants.checkpoints().to_vec()).unwrap();
+            assert!(
+                matches!(
+                    WalPreparationInput::from_universal(
+                        &UniversalCommandArgs::SourceRegistryRetirement(other),
+                        &other_participants,
+                        &plan,
+                        &claims,
+                        vec![source_input()],
+                        Some(global.wal_preparation_client()),
+                        deadline,
+                    ),
+                    Err(WalPreparationError::InvalidInput)
+                ),
+                "foreign frozen allocation fault={fault}"
+            );
+            let lease_participants = ParticipantSet::new(
+                vec![other_participants.descriptors()[0].clone()],
+                vec![
+                    ParticipantCheckpoint::new(
+                        source,
+                        ParticipantCheckpointState::Pending,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    WalPreparationInput::from_lease_scope(
+                        &lease_participants,
+                        &plan,
+                        &claims,
+                        source_input(),
+                        deadline,
+                    ),
+                    Err(WalPreparationError::InvalidInput)
+                ),
+                "isolated foreign allocation fault={fault}"
+            );
+        }
         assert!(matches!(
             WalPreparationInput::from_universal(
                 &args,

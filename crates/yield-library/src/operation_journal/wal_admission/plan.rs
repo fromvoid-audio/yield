@@ -318,7 +318,7 @@ impl WalPreparationInput {
                                 UniversalCommandArgs::SourceRegistryRetirement(_)
                             ) =>
                         {
-                            if !fence.matches_allocation_subject(input.subject()) {
+                            if !fence.matches_allocation(input.subject(), input.allocation()) {
                                 return Err(bad());
                             }
                         }
@@ -481,7 +481,7 @@ impl WalPreparationInput {
             || descriptor.id() != source.participant
             || descriptor
                 .lease_fence()
-                .is_none_or(|fence| !fence.matches_allocation_subject(input.subject()))
+                .is_none_or(|fence| !fence.matches_allocation(input.subject(), input.allocation()))
         {
             return Err(WalPreparationError::InvalidInput);
         }
