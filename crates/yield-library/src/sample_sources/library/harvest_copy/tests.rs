@@ -40,6 +40,7 @@ mod ownership;
 mod rejection;
 mod replay;
 mod setup;
+mod wal_maintenance;
 struct Fixture {
     global: Option<GlobalLibraryWriter>,
     journal: Option<OperationJournalOwner>,
