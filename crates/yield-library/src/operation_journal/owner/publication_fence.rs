@@ -1,6 +1,7 @@
-//! Original issuer versus cancellation only; no capacity or namespace authority.
+//! Original publication lifetime fences; no capacity or namespace authority.
 use super::resource_custody::UseError;
 use super::{InputPermit, OperationId, OperationJournalOwnerError, OwnerShared};
+use crate::sample_sources::db::SourceRegistrationId;
 use std::sync::{Arc, Mutex};
 
 const MAX_FENCES: usize = 32;
@@ -15,6 +16,7 @@ enum State {
 }
 struct Fence {
     operation: OperationId,
+    source: SourceRegistrationId,
     generation: u64,
     state: Mutex<State>,
 }
@@ -47,9 +49,22 @@ impl Registry {
             input: None,
         }
     }
+    #[cfg(test)]
     pub(super) fn issue(
         &mut self,
         operation: OperationId,
+        shared: &Arc<OwnerShared>,
+    ) -> Result<PendingFence, OperationJournalOwnerError> {
+        self.issue_for_source(
+            operation,
+            SourceRegistrationId::model_key_for_tests(0),
+            shared,
+        )
+    }
+    pub(super) fn issue_for_source(
+        &mut self,
+        operation: OperationId,
+        source: SourceRegistrationId,
         shared: &Arc<OwnerShared>,
     ) -> Result<PendingFence, OperationJournalOwnerError> {
         if self.exhausted {
@@ -121,6 +136,7 @@ impl Registry {
         self.next = generation;
         let fence = Arc::new(Fence {
             operation,
+            source,
             generation,
             state: Mutex::new(State::Pending),
         });
@@ -135,6 +151,26 @@ impl Registry {
             .iter()
             .flatten()
             .any(|fence| !matches!(fence.state.lock().map(|s| *s), Ok(State::Closed)))
+    }
+    pub(super) fn close_for_source(
+        &self,
+        source: SourceRegistrationId,
+    ) -> Result<(), OperationJournalOwnerError> {
+        for fence in self
+            .slots
+            .iter()
+            .flatten()
+            .filter(|fence| fence.source == source)
+        {
+            if !close_pending(fence) {
+                return Err(
+                    OperationJournalOwnerError::PublicationSourceRetirementPending {
+                        operation_id: fence.operation,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
     pub(super) fn close_for_mutation(
         &self,
@@ -166,21 +202,25 @@ impl Registry {
             .flatten()
             .filter(|fence| fence.operation == operation)
         {
-            let Ok(mut state) = fence.state.lock() else {
+            if !close_pending(fence) {
                 return Err(OperationJournalOwnerError::PublicationCancellationPending {
                     operation_id: operation,
                 });
-            };
-            match *state {
-                State::Pending | State::Closed => *state = State::Closed,
-                State::Entered | State::Unsettled | State::Unknown => {
-                    return Err(OperationJournalOwnerError::PublicationCancellationPending {
-                        operation_id: operation,
-                    });
-                }
             }
         }
         Ok(())
+    }
+}
+fn close_pending(fence: &Fence) -> bool {
+    let Ok(mut state) = fence.state.lock() else {
+        return false;
+    };
+    match *state {
+        State::Pending | State::Closed => {
+            *state = State::Closed;
+            true
+        }
+        State::Entered | State::Unsettled | State::Unknown => false,
     }
 }
 impl PendingFence {

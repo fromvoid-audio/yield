@@ -128,3 +128,54 @@ fn original_fence_unknown_entry_quarantines_original_admission_without_reverse_l
     assert!(!admission.close_and_wait());
     assert!(registry.issue(OperationId::new(), &shared).is_err());
 }
+
+#[test]
+fn publication_source_unknown_fence_refuses_only_its_original_registration() {
+    let shared = shared();
+    let mut registry = Registry::new();
+    let source = SourceRegistrationId::model_key_for_tests(41);
+    let operation = OperationId::new();
+    let pending = registry
+        .issue_for_source(operation, source, &shared)
+        .unwrap();
+    *pending.fence.state.lock().unwrap() = State::Unknown;
+    assert!(matches!(registry.close_for_source(source),
+        Err(OperationJournalOwnerError::PublicationSourceRetirementPending { operation_id }) if operation_id == operation));
+    assert!(
+        registry
+            .close_for_source(SourceRegistrationId::model_key_for_tests(42))
+            .is_ok()
+    );
+    assert_eq!(*pending.fence.state.lock().unwrap(), State::Unknown);
+}
+
+#[test]
+fn publication_source_retirement_and_original_admission_entry_have_one_winner() {
+    for _ in 0..64 {
+        let shared = shared();
+        let mut registry = Registry::new();
+        let operation = OperationId::new();
+        let source = SourceRegistrationId::model_key_for_tests(37);
+        let mut pending = registry
+            .issue_for_source(operation, source, &shared)
+            .unwrap();
+        let admission = ResourceAdmission::new();
+        assert!(admission.activate(|| true));
+        let mut runtime = admission.begin_read(|| true).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let entry = scope.spawn(|| {
+                barrier.wait();
+                runtime
+                    .enter_effect_checked(|| pending.enter_checked())
+                    .is_ok()
+            });
+            barrier.wait();
+            let cancelled = registry.close_for_source(source).is_ok();
+            assert_ne!(entry.join().unwrap(), cancelled);
+        });
+        drop(pending);
+        drop(runtime);
+        assert_eq!(admission.snapshot().1, 0);
+    }
+}
