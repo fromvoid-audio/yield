@@ -7,9 +7,10 @@ use crate::operation_journal::{
 use crate::sample_sources::db::{LegacySourceReadOwner, SourceCommandId};
 use std::sync::{Weak, atomic::AtomicBool};
 
-// Charge frozen <=32KiB input plus bounded observation/header metadata on the existing pool.
+// Preserve 64KiB for frozen <=32KiB input and bounded observation/header metadata;
+// additionally charge the derived sequential schema/row scratch peak, not audio input bytes.
 // The already-open source SQLite connection is transferred, never opened by this route.
-const INPUT_BYTES: usize = 64 * 1024;
+const INPUT_BYTES: usize = 64 * 1024 + crate::sample_sources::db::LEGACY_CAPTURE_SCRATCH_BYTES;
 
 /// Refusal of original readonly custody; none of these states authorizes a retry or mutation.
 #[derive(Debug, Error)]
