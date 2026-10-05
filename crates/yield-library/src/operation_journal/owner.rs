@@ -12,6 +12,8 @@ pub use super::wal_admission::{
     WalPreparationStatus, WalPreparedDatabase,
 };
 mod frozen_copy;
+mod legacy_adoption_custody;
+pub use legacy_adoption_custody::{LegacyAdoptionCustody, LegacyAdoptionCustodyError};
 mod native_read_capsule;
 mod resource_custody;
 pub use frozen_copy::{FrozenCopyObservation, FrozenCopyValidationError};
@@ -516,6 +518,9 @@ impl From<CapacityProviderError> for PreparedAdmissionError {
 /// Failure returned by an admitted journal command.
 #[derive(Debug, Error)]
 pub enum OperationJournalOwnerError {
+    /// Original pre-lease custody could not be installed or revalidated.
+    #[error(transparent)]
+    LegacyAdoptionCustody(#[from] LegacyAdoptionCustodyError),
     /// The underlying journal store rejected or could not complete the command.
     #[error(transparent)]
     Store(#[from] OperationJournalStoreError),
@@ -1573,6 +1578,7 @@ fn prepared_admission_fault_facts(
 }
 
 struct OwnerRuntime {
+    legacy_adoption: Option<legacy_adoption_custody::RetainedLegacyAdoption>,
     native_readers: BTreeMap<VolumeIdentity, std::sync::Weak<NativeCapsuleData>>,
     native_reader_registry_input: Option<InputPermit>,
     resource_admission: Arc<ResourceAdmission>,
@@ -1610,6 +1616,7 @@ impl OwnerRuntime {
             .try_clone_profile_guard_for_owner()
             .map_err(|error| error.to_string())?;
         Ok(Self {
+            legacy_adoption: None,
             native_readers: BTreeMap::new(),
             native_reader_registry_input: None,
             resource_admission: ResourceAdmission::new(),
@@ -3881,6 +3888,8 @@ impl Drop for OwnerRuntime {
         self.native_reader_registry_input.take();
         // Publish loss/cancel original owners before journal authority teardown.
         drop(self.wal_preparation.take());
+        // Original readonly SQLite closes before its pre-lease reservation/profile custody.
+        self.legacy_adoption.take();
         // Source registrations retain non-Send authority guards and external reserve/volume
         // bindings. Release these maps before the journal/profile core so a global shutdown is
         // visibly conservative and never mistaken for a successful per-source retirement.
@@ -5276,6 +5285,19 @@ struct CapacityLedgerTestSnapshot {
 
 #[allow(dead_code)]
 enum JournalCommand {
+    PrepareLegacyCustody {
+        source: crate::sample_sources::db::LegacySourceReadOwner,
+        participant: super::ParticipantId,
+        command: crate::sample_sources::db::SourceCommandId,
+        input: InputPermit,
+        result: SyncSender<Result<LegacyAdoptionCustody, OperationJournalOwnerError>>,
+    },
+    ValidateLegacyCustody {
+        command: crate::sample_sources::db::SourceCommandId,
+        digest: [u8; 32],
+        input: InputPermit,
+        result: SyncSender<Result<(), OperationJournalOwnerError>>,
+    },
     PrepareWalOwners {
         preparation: WalPreparationInput,
         input: InputPermit,
@@ -5696,6 +5718,24 @@ fn run_owner(
 // Returned outputs retain their independent result/producer custody. Input is not settlement.
 fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool {
     match command {
+        JournalCommand::PrepareLegacyCustody {
+            source,
+            participant,
+            command,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            runtime.prepare_legacy_custody(source, participant, command, input)
+        }),
+        JournalCommand::ValidateLegacyCustody {
+            command,
+            digest,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            let _input = input;
+            runtime.validate_legacy_custody(command, digest)
+        }),
         JournalCommand::PrepareWalOwners {
             preparation,
             input,
@@ -6140,6 +6180,12 @@ where
 
 fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
     match &command {
+        JournalCommand::PrepareLegacyCustody { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::ValidateLegacyCustody { result, .. } => {
+            let _ = result.send(Err(error));
+        }
         JournalCommand::PrepareWalOwners { result, .. } => {
             let _ = result.send(Err(error));
         }
