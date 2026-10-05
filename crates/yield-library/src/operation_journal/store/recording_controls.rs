@@ -96,9 +96,20 @@ impl OperationJournalStore {
             previous_sequence = Some(sequence);
             let bytes: Vec<u8> = self.connection.query_row("SELECT record FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=?2",
                 params![proposal.operation_id().to_string(), role.slot()], |r|r.get(0))?;
-            let observed = RecordingControlReservation::decode(&bytes, proposal).map_err(error)?;
-            if observed != expected {
-                return Err(error("conflicting reserved recording control"));
+            if self.recording_prestart_scope.get() {
+                // Complete preflight bounds this BLOB inside the same read snapshot. The
+                // narrow factory supports only genuine canonical empty reservations: never
+                // build an arbitrary JSON graph from even a small hostile control value.
+                if bytes != expected.encode(proposal).map_err(error)? {
+                    return Err(OperationJournalStoreError::RecordingPrestartResourceBound);
+                }
+            } else {
+                // General historical readers preserve their typed/noncanonical acceptance.
+                let observed =
+                    RecordingControlReservation::decode(&bytes, proposal).map_err(error)?;
+                if observed != expected {
+                    return Err(error("conflicting reserved recording control"));
+                }
             }
         }
         // Use the operation/slot index and a capped inventory, not an ordered global sequence

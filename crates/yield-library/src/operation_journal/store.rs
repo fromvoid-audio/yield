@@ -70,7 +70,9 @@ mod chunk_claims;
 mod chunk_staging;
 mod legacy_allocation_observation;
 mod recording_chunks;
+mod recording_prestart_budget;
 pub use legacy_allocation_observation::{LegacyJournalObservation, LegacyJournalObservationError};
+pub(crate) use recording_prestart_budget::COMMAND_INPUT_BYTES as RECORDING_PRESTART_INPUT_BYTES;
 mod recording_controls;
 pub(crate) use recording_chunks::{RecordingChunkPage, RecordingChunkReceipt};
 mod frozen_copy;
@@ -165,6 +167,9 @@ const CREATE_FULL_PROGRESS_TABLE: &str = "CREATE TABLE operation_journal_full_pr
 /// Errors returned by the profile-owned operation journal store.
 #[derive(Debug, Error)]
 pub enum OperationJournalStoreError {
+    /// Complete retained inventory cannot fit the narrow pre-start resource envelope.
+    #[error("recording pre-start resource envelope exceeded")]
+    RecordingPrestartResourceBound,
     /// Retained recording facts are invalid, conflicting, stale or over budget.
     #[error("recording retention rejected: {reason}")]
     RecordingRetention {
@@ -966,6 +971,8 @@ pub(crate) enum ReleaseTestDirective {
 /// is dropped. The store has no raw-connection escape hatch and exposes only bounded point reads.
 pub struct OperationJournalStore {
     connection: Connection,
+    recording_prestart_scope: std::cell::Cell<bool>,
+    recording_prestart_resource_refused: std::cell::Cell<bool>,
     database_path: PathBuf,
     database_identity: String,
     database_root: BoundDatabaseRoot,
@@ -2505,7 +2512,7 @@ impl OperationJournalStore {
         &self,
         volume: &VolumeIdentity,
     ) -> Result<u64, String> {
-        self.validate_namespace()
+        self.validate_recording_prestart_namespace()
             .map_err(|error| error.to_string())?;
         let active = recovery_reserve::active_charge_snapshot_for_volume(&self.connection, volume)
             .map_err(|error| error.to_string())?;
@@ -3332,6 +3339,8 @@ impl OperationJournalStore {
         let retained_profile_guard = profile_guard.try_clone()?;
         Ok(Self {
             connection,
+            recording_prestart_scope: std::cell::Cell::new(false),
+            recording_prestart_resource_refused: std::cell::Cell::new(false),
             database_path,
             database_identity,
             database_root,
@@ -6583,7 +6592,14 @@ impl OperationJournalStore {
                                   AND length(record) BETWEEN 0 AND ?2
                              THEN record ELSE NULL END
                  FROM operation_journal WHERE operation_id = ?1",
-                params![operation_id.to_string(), MAX_RECORD_BYTES as i64],
+                params![
+                    operation_id.to_string(),
+                    if self.recording_prestart_scope.get() {
+                        recording_prestart_budget::MAX_RECORD_BYTES
+                    } else {
+                        MAX_RECORD_BYTES as i64
+                    }
+                ],
                 |row| {
                     let operation_id_type: String = row.get(0)?;
                     let sequence_type: String = row.get(1)?;
@@ -6676,8 +6692,27 @@ impl OperationJournalStore {
                 String::from("stored record length changed or exceeded the bound"),
             ));
         }
-        let record =
-            decode(&encoded).map_err(|error| retained_decode_error(operation_id, error))?;
+        let record = if self.recording_prestart_scope.get() {
+            super::codec::decode_prestart_recording(
+                &encoded,
+                recording_prestart_budget::JSON_LIMITS,
+            )
+            .map_err(|error| match error {
+                super::codec::BoundedDecodeError::LimitExceeded { .. } => {
+                    self.recording_prestart_resource_refused.set(true);
+                    OperationJournalStoreError::RecordingPrestartResourceBound
+                }
+                super::codec::BoundedDecodeError::Decode(error) => {
+                    retained_decode_error(operation_id, error)
+                }
+            })?
+            .ok_or_else(|| {
+                self.recording_prestart_resource_refused.set(true);
+                OperationJournalStoreError::RecordingPrestartResourceBound
+            })?
+        } else {
+            decode(&encoded).map_err(|error| retained_decode_error(operation_id, error))?
+        };
         if record.operation_id != operation_id {
             return Err(retained_error(
                 Some(operation_id),
@@ -9302,6 +9337,7 @@ mod tests {
     include!("store/database_claims_tests.rs");
     include!("store/recording_retention_tests.rs");
     include!("store/record_materialization_tests.rs");
+    include!("store/recording_prestart_budget_tests.rs");
     include!("store/recording_control_tests.rs");
     include!("store/json_materialization_tests.rs");
     use std::collections::BTreeMap;

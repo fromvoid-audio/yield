@@ -16,7 +16,9 @@ mod queue_metrics;
 pub use queue_metrics::{JournalQueueClassMetrics, JournalQueueMetricsSnapshot};
 use queue_metrics::{QueueMetrics, QueueTicket};
 mod legacy_adoption_custody;
+mod recording_binding;
 pub use legacy_adoption_custody::{LegacyAdoptionCustody, LegacyAdoptionCustodyError};
+pub use recording_binding::{RecordingProducerCustody, RecordingProducerCustodyError};
 mod native_read_capsule;
 mod publication_charge;
 mod publication_custody;
@@ -584,6 +586,9 @@ impl From<CapacityProviderError> for PreparedAdmissionError {
 /// Failure returned by an admitted journal command.
 #[derive(Debug, Error)]
 pub enum OperationJournalOwnerError {
+    /// Original memory-only recording preparation could not be retained or revalidated.
+    #[error(transparent)]
+    RecordingProducerCustody(#[from] RecordingProducerCustodyError),
     /// Original pre-lease custody could not be installed or revalidated.
     #[error(transparent)]
     LegacyAdoptionCustody(#[from] LegacyAdoptionCustodyError),
@@ -1710,6 +1715,7 @@ fn prepared_admission_fault_facts(
 }
 
 struct OwnerRuntime {
+    recording_producer: Option<recording_binding::RetainedRecordingProducer>,
     publication_fences: publication_fence::Registry,
     legacy_adoption: Option<legacy_adoption_custody::RetainedLegacyAdoption>,
     native_readers: BTreeMap<VolumeIdentity, std::sync::Weak<NativeCapsuleData>>,
@@ -1749,6 +1755,7 @@ impl OwnerRuntime {
             .try_clone_profile_guard_for_owner()
             .map_err(|error| error.to_string())?;
         Ok(Self {
+            recording_producer: None,
             publication_fences: publication_fence::Registry::new(),
             legacy_adoption: None,
             native_readers: BTreeMap::new(),
@@ -4156,6 +4163,8 @@ impl Drop for OwnerRuntime {
         drop(self.wal_preparation.take());
         // Original readonly SQLite closes before its pre-lease reservation/profile custody.
         self.legacy_adoption.take();
+        // Original pre-start channels/source pin are released before source/profile teardown.
+        self.recording_producer.take();
         // Source registrations retain non-Send authority guards and external reserve/volume
         // bindings. Release these maps before the journal/profile core so a global shutdown is
         // visibly conservative and never mistaken for a successful per-source retirement.
@@ -5581,6 +5590,19 @@ struct CapacityLedgerTestSnapshot {
 
 #[allow(dead_code)]
 enum JournalCommand {
+    PrepareRecordingCustody {
+        operation: OperationId,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+        input: InputPermit,
+        result: SyncSender<Result<RecordingProducerCustody, OperationJournalOwnerError>>,
+    },
+    ValidateRecordingCustody {
+        operation: OperationId,
+        digest: [u8; 32],
+        input: InputPermit,
+        result: SyncSender<Result<(), OperationJournalOwnerError>>,
+    },
     PrepareLegacyCustody {
         source: crate::sample_sources::db::LegacySourceReadOwner,
         participant: super::ParticipantId,
@@ -6015,6 +6037,24 @@ fn run_owner(
 // Returned outputs retain their independent result/producer custody. Input is not settlement.
 fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool {
     match command {
+        JournalCommand::PrepareRecordingCustody {
+            operation,
+            registration,
+            source_pin,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            runtime.prepare_recording_custody(operation, registration, source_pin, input)
+        }),
+        JournalCommand::ValidateRecordingCustody {
+            operation,
+            digest,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            let _input = input;
+            runtime.validate_recording_custody(operation, digest)
+        }),
         JournalCommand::PrepareLegacyCustody {
             source,
             participant,
@@ -6492,6 +6532,12 @@ where
 
 fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
     match &command {
+        JournalCommand::PrepareRecordingCustody { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::ValidateRecordingCustody { result, .. } => {
+            let _ = result.send(Err(error));
+        }
         JournalCommand::PrepareLegacyCustody { result, .. } => {
             let _ = result.send(Err(error));
         }

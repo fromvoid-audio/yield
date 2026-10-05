@@ -87,3 +87,43 @@ Historical recordings without controls remain read-only observations and still
 block handoff/release. Valid byte/control inventory does not prove WAV grammar,
 producer closure, a live terminal capability, physical writes, publication or
 settlement. Those production requirements remain with OPT-2145 and OPT-2058.
+
+## Original pre-start producer custody (OPT-2326, partial)
+
+The journal client now accepts an existing original source registration object and
+its journal receipt to request memory-only pre-start custody. The original worker
+checks its retained Registered entry, current source/profile pin, actual stored
+V17 Recording intent with no disposition or captured bytes, exact four reserved
+controls, current physical capacity boundary, rebuilt claims and provider recovery.
+It then creates the actual inseparable Reson transport binding, receiver and
+settlements and retains all three privately in one fixed runtime slot. A checked
+temporary 3,604,480-byte debit from the existing ordinary input pool covers the
+complete supported read/decode/rebuild envelope, then shrinks to a separate
+448 KiB retained proposal/transport/context debit after temporary backing is gone.
+The narrow complete-snapshot resource refusals and pinned implementation evidence
+are in [RECORDING_PRESTART_MEMORY_BOUNDARY.md](RECORDING_PRESTART_MEMORY_BOUNDARY.md).
+No producer, serializer, capture ring or physical writer starts. The weak, non-Clone facade exposes only operation,
+proposal digest and original-worker revalidation. It cannot extract parts or
+construct a startup, terminal, SQL, publication or settlement capability.
+
+The slot is installed before its reply is sent, remains occupied after reply loss,
+and retains original parts/pin/credit after revalidation refusal until original
+worker teardown. Linux tests exercise genuine original journal/source refusal
+without installing an unissued receipt, private-facade forgery/drain refusal,
+original byte-budget exhaustion and shutdown accounting. Actual SQLite tests
+verify read-only empty-control inspection/reopen and preserve captured/cancelled,
+missing and unknown inventories on refusal. These tests do not exercise a positive
+qualified production slot or lost reply after such issuance.
+
+Two genuine positive harnesses use the production journal constructor, actual
+registered source and file-owner root, native reserve descriptor facts and common
+recording admission. Their complete helper is type-checked on Linux and Windows;
+execution is gated to macOS. OPT-2330 specifies the exact two-test native command,
+resources and retained-slot/lost-reply requirements. OPT-2326 remains open for
+that genuine original-source/provider/admission verification. Production reserve
+creation/reopen and revalidation reject Linux before namespace access; native
+macOS implementations exist, and fixtures do not qualify them. Required-WAL
+startup, current physical recording admission and the actual byte/terminal
+consumer remain separate implementation requirements under OPT-2145/OPT-2058.
+No startup, capture, Finalizing/Frozen/seal or physical qualification is completed
+by this pre-start entry point.

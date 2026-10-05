@@ -1641,6 +1641,32 @@ pub fn decode_with_limits(
     bytes: &[u8],
     limits: JsonMaterializationLimits,
 ) -> Result<StoredOperationRecord, BoundedDecodeError> {
+    decode_value(bounded_value(bytes, limits)?).map_err(Into::into)
+}
+
+/// Scoped pre-start envelope: inspect bounded data before allocating generic typed commands.
+/// None means the complete inventory is outside this factory's supported resource shape;
+/// neither result establishes a live source, admission or terminal capability.
+pub(crate) fn decode_prestart_recording(
+    bytes: &[u8],
+    limits: JsonMaterializationLimits,
+) -> Result<Option<StoredOperationRecord>, BoundedDecodeError> {
+    let value = bounded_value(bytes, limits)?;
+    if value.get("schema_version").and_then(Value::as_u64) != Some(u64::from(SCHEMA_V17))
+        || !value
+            .get("universal_command_args")
+            .and_then(Value::as_object)
+            .is_some_and(|args| args.len() == 1 && args.contains_key("Recording"))
+    {
+        return Ok(None);
+    }
+    decode_value(value).map(Some).map_err(Into::into)
+}
+
+fn bounded_value(
+    bytes: &[u8],
+    limits: JsonMaterializationLimits,
+) -> Result<Value, BoundedDecodeError> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(DecodeError::Oversize {
             actual: bytes.len(),
@@ -1657,7 +1683,7 @@ pub fn decode_with_limits(
             })
         }
     })?;
-    decode_value(value).map_err(Into::into)
+    Ok(value)
 }
 
 /// Decode one bounded persisted operation record.

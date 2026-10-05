@@ -321,6 +321,56 @@ impl OperationJournalStore {
         Ok(())
     }
 
+    /// Original immutable pre-start observation. This read issues no producer or write authority.
+    pub(crate) fn recording_prestart_proposal(
+        &self,
+        operation: OperationId,
+    ) -> Result<RecordingProposal, OperationJournalStoreError> {
+        if !self.recording_prestart_scope.get() {
+            self.begin_recording_prestart_read()?;
+            let result = self.recording_prestart_proposal_inside(operation);
+            self.finish_recording_prestart_read()?;
+            return result;
+        }
+        self.recording_prestart_proposal_inside(operation)
+    }
+
+    fn recording_prestart_proposal_inside(
+        &self,
+        operation: OperationId,
+    ) -> Result<RecordingProposal, OperationJournalStoreError> {
+        self.validate_recording_prestart_namespace()?;
+        let record = self
+            .read_row(operation)?
+            .ok_or_else(|| error("recording operation absent"))?
+            .record;
+        if record.schema_version != SCHEMA_V17
+            || record.phase != super::super::model::OperationPhase::IntentDurable
+            || record.disposition != OperationDisposition::None
+        {
+            return Err(error(
+                "recording operation is not an unchanged pre-start intent",
+            ));
+        }
+        let Some(UniversalCommandArgs::Recording(proposal)) = record.universal_command_args()
+        else {
+            return Err(error("operation has no recording proposal"));
+        };
+        self.verify_recording_reservation(proposal, true)?;
+        let captured: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operation_journal_recording_chunks WHERE operation_id=?1
+             AND slot NOT BETWEEN 20000 AND 20003)",
+            [operation.to_string()],
+            |r| r.get(0),
+        )?;
+        if captured {
+            return Err(error("recording already has captured bytes"));
+        }
+        let proposal = proposal.clone();
+        self.validate_recording_prestart_namespace()?;
+        Ok(proposal)
+    }
+
     pub(crate) fn retain_recording_chunk(
         &self,
         chunk: &RecordingCapturedChunk,
