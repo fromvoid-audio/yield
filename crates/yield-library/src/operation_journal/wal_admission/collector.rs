@@ -296,7 +296,8 @@ impl Collector {
                         return false;
                     }
                     SourceWalTransportStatus::Prepared(ref observation) => {
-                        if observation.correlation() != &expected
+                        if !observation.registered_custody_was_retained()
+                            || observation.correlation() != &expected
                             || observation.original_binding().is_none_or(|binding| {
                                 binding.main().device() != device
                                     || binding.subject().profile_acquisition()
@@ -318,7 +319,8 @@ impl Collector {
                         ));
                     }
                     SourceWalTransportStatus::PreparedLease(ref observation) => {
-                        if observation.correlation() != &expected
+                        if !observation.registered_custody_was_retained()
+                            || observation.correlation() != &expected
                             || observation
                                 .original_binding()
                                 .stored_fence()

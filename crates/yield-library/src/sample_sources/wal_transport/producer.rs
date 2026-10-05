@@ -128,6 +128,28 @@ impl SourceWalTransportOwner {
                 self.request.handshake.as_ref(),
             )?);
         }
+        // Only the private original journal collection route requires retained Registered use.
+        // Standalone diagnostic capture continues to observe genuine Prepared registrations.
+        if self.request.handshake.is_some() {
+            let binding = self
+                .scope
+                .as_ref()
+                .ok_or(SourceWalTransportRejection::Scope)?
+                .binding();
+            self.native
+                .as_mut()
+                .ok_or(SourceWalTransportRejection::OwnerLost)?
+                .retain_registered(
+                    binding,
+                    registration.ok_or(SourceWalTransportRejection::Scope)?,
+                )
+                .map_err(|e| classify(&e))?;
+        }
+        let native = self
+            .native
+            .as_ref()
+            .ok_or(SourceWalTransportRejection::OwnerLost)?;
+        let held = native.held().map_err(|e| classify(&e))?;
         // Charge complete immutable view before moving the original expected revision into it.
         let expected = self
             .request
@@ -147,6 +169,9 @@ impl SourceWalTransportOwner {
         .ok_or(SourceWalTransportRejection::InvalidContext)?;
         let mut credit = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
         credit.resize(heap)?;
+        if self.is_cancelled() {
+            return Err(SourceWalTransportRejection::Cancelled);
+        }
         if Instant::now() >= self.request.deadline {
             return Err(SourceWalTransportRejection::Deadline);
         }
@@ -158,6 +183,7 @@ impl SourceWalTransportOwner {
                 wal_bytes: held.wal_bytes(),
                 scope: self.scope.clone(),
                 policy_family: native.family(),
+                registered_custody_retained: self.request.handshake.is_some(),
                 _credit: credit,
             }),
         };
@@ -179,15 +205,19 @@ impl SourceWalTransportOwner {
             .ok_or(SourceWalTransportRejection::OwnerLost)?;
         let held = native.held().map_err(|e| classify(&e))?;
         match self.scope.as_ref() {
-            Some(scope) => held
-                .validate_wal_binding(
-                    scope.binding(),
-                    registration.ok_or(SourceWalTransportRejection::Scope)?,
-                )
-                .map_err(|e| classify(&e)),
+            Some(scope) => {
+                let registration = registration.ok_or(SourceWalTransportRejection::Scope)?;
+                if self.request.handshake.is_some() {
+                    held.validate_registered_wal_binding(scope.binding(), registration)
+                } else {
+                    held.validate_wal_binding(scope.binding(), registration)
+                }
+                .map_err(|e| classify(&e))
+            }
             None => held.revalidate_owner().map_err(|e| classify(&e)),
         }
     }
+
     /// Require the original parked scope and genuine current Registered authority.
     /// No historical reply, successful result or caller correlation can latch settlement.
     pub fn validate_registered(

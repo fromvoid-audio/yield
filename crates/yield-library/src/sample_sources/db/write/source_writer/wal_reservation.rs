@@ -62,6 +62,28 @@ impl fmt::Debug for SourceWalPreparationFailure {
 }
 
 impl SourceWalPreparationFailure {
+    pub(super) fn take_registered_database_custody(
+        &mut self,
+    ) -> Option<crate::sample_sources::db::source_authority::RegisteredDatabaseCustody> {
+        self.held.registered.take()
+    }
+    pub(super) fn close_for_retirement_with_custody(
+        mut self,
+        authority: &mut SourceAuthorityRegistration,
+        custody: Option<crate::sample_sources::db::source_authority::RegisteredDatabaseCustody>,
+    ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
+        if let Some(custody) = custody {
+            if self.held.registered.is_some() {
+                // Close original SQLite before either original count can be released.
+                drop(self);
+                drop(custody);
+                return Err(SourceAuthorityError::GuardMismatch);
+            }
+            self.held.registered = Some(custody);
+        }
+        self.close_for_retirement(authority)
+    }
+
     pub(super) fn writer(&self) -> &SourceWriter {
         self.held.writer()
     }
@@ -138,6 +160,28 @@ impl fmt::Debug for SourceWalPreparation {
 }
 
 impl SourceWalPreparation {
+    pub(super) fn take_registered_database_custody(
+        &mut self,
+    ) -> Option<crate::sample_sources::db::source_authority::RegisteredDatabaseCustody> {
+        self.held.registered.take()
+    }
+    pub(super) fn close_for_retirement_with_custody(
+        mut self,
+        authority: &mut SourceAuthorityRegistration,
+        custody: Option<crate::sample_sources::db::source_authority::RegisteredDatabaseCustody>,
+    ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
+        if let Some(custody) = custody {
+            if self.held.registered.is_some() {
+                // Close original SQLite before either original count can be released.
+                drop(self);
+                drop(custody);
+                return Err(SourceAuthorityError::GuardMismatch);
+            }
+            self.held.registered = Some(custody);
+        }
+        self.close_for_retirement(authority)
+    }
+
     pub(crate) fn close_for_retirement(
         mut self,
         authority: &mut SourceAuthorityRegistration,

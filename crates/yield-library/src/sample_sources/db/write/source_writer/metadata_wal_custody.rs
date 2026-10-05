@@ -6,6 +6,10 @@ use super::{
 // Owner drops before the extension guard: uncertain SQL closes before lease release.
 pub(super) struct Custody {
     pub(super) owner: Option<Owner>,
+    // Moves out of the inner reservation before cleanup, keeping the count through
+    // outer policy restoration. Field order closes owner before this counted use/lease.
+    pub(super) registered:
+        Option<crate::sample_sources::db::source_authority::RegisteredDatabaseCustody>,
     pub(super) policy: Option<EnteredMetadataPolicy>,
 }
 pub(super) enum Owner {
@@ -40,10 +44,27 @@ impl Custody {
             .map(|b| b.identity())
     }
     pub(super) fn source_authority_close_ready(&self) -> bool {
+        if let Some(custody) = self.registered.as_ref() {
+            return custody.close_ready(&self.writer().database);
+        }
         match self.owner.as_ref().expect("retained policy owner") {
             Owner::Held(held) => held.source_authority_close_ready(),
             Owner::Failed(failed) => failed.source_authority_close_ready(),
             Owner::Unprepared { writer, .. } => writer.database.source_authority_close_ready(),
+        }
+    }
+    pub(super) fn retain_registered(
+        &mut self,
+        binding: &super::SourceWalBinding,
+        registration: &crate::sample_sources::db::SourceAuthorityRegistration,
+    ) -> Result<(), SourceWalPreparationError> {
+        self.validate_parked()?;
+        if self.registered.is_some() {
+            return Err(SourceWalPreparationError::BindingUnavailable);
+        }
+        match self.owner.as_mut() {
+            Some(Owner::Held(held)) => held.retain_registered_wal_binding(binding, registration),
+            _ => Err(SourceWalPreparationError::RollbackUnconfirmed),
         }
     }
     pub(super) fn close_for_retirement(
@@ -66,10 +87,17 @@ impl Custody {
                     });
                     return Err(SourceAuthorityError::InvalidLifecycle);
                 }
-                authority.close_database(writer.into_catalog_database())
+                authority.close_database_with_registered_custody(
+                    writer.into_catalog_database(),
+                    self.registered.take(),
+                )
             }
-            Owner::Held(held) => held.close_for_retirement(authority),
-            Owner::Failed(failed) => failed.close_for_retirement(authority),
+            Owner::Held(held) => {
+                held.close_for_retirement_with_custody(authority, self.registered.take())
+            }
+            Owner::Failed(failed) => {
+                failed.close_for_retirement_with_custody(authority, self.registered.take())
+            }
         }
     }
 
@@ -90,7 +118,17 @@ impl Custody {
         }
     }
     pub(super) fn release(&mut self) -> Result<SourceWriter, SourceWalPreparationError> {
-        let owner = self.owner.take().expect("retained tag owner");
+        let mut owner = self.owner.take().expect("retained tag owner");
+        // Move, never clone or release, the original count before inner rollback/timeout.
+        let retained = match &mut owner {
+            Owner::Held(held) => held.take_registered_database_custody(),
+            Owner::Failed(failed) => failed.take_registered_database_custody(),
+            Owner::Unprepared { .. } => None,
+        };
+        if let Some(retained) = retained {
+            debug_assert!(self.registered.is_none(), "one original registered custody");
+            self.registered = Some(retained);
+        }
         let writer = match owner {
             Owner::Unprepared {
                 writer,
@@ -157,6 +195,8 @@ impl Custody {
             policy.restore(database).map_err(SourceWriterError::from)?;
         }
         self.policy = None;
+        // Original inner cleanup and all outer policy restoration are confirmed.
+        drop(self.registered.take());
         match self.owner.take().expect("retained tag owner") {
             Owner::Unprepared { writer, .. } => Ok(writer),
             _ => unreachable!(),

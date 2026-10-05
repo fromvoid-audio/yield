@@ -138,6 +138,43 @@ The harness is compiled for Linux, macOS and Windows; only Linux execution was
 available here. Native execution remains separate verification. These fixtures
 install no production capacity provider and qualify no physical allocation. This core primitive supplies no write permission, decision latch,
 retry, reservation refund or genuine journal settlement. Full OPT-2136 still needs
-audited/pre-audit transport retention and acknowledgements, aggregate budgets,
-all-owner decision and post-start cleanup fences, atomic nonce/intent/claims,
+all-owner acknowledgements and decision and post-start cleanup fences, atomic nonce/intent/claims,
 readback/restart handling and qualified directions with required permits.
+
+### Original journal source transport custody (OPT-2289)
+
+The original private combined-handshake source requester now requires genuine
+Registered custody before its producer publishes an audited, tag, layout or
+pre-audit lease preparation. Missing, Prepared, foreign or expired registration
+cannot publish that preparation. The producer rechecks cancellation and the
+original deadline after retention; late refusal keeps native custody until
+original cleanup. Standalone diagnostic requests retain their Prepared
+observation contract. The private historical observation marker lets the journal
+collector reject diagnostic preparations; it is never a current authority or a
+post-start decision latch. Parked sweeps validate the original retained binding.
+
+Tag/layout cleanup moves the non-cloneable count from the inner empty reservation
+to the original outer policy custody before rollback. It holds the same count and
+lease reference through rollback, timeout and every outer policy restoration.
+Confirmed cleanup releases the count before returning the original writer;
+sticky failures retain it until actual ordinary SQLite close. Draining close uses
+the exact original typed guard and existing snapshot exclusion. Concrete owner,
+preparation and observation headers remain charged to the original bounded pool
+and combined 64-slot/64-KiB handshake budget, with no additional pool or worker.
+
+Portable tests use real source/global/journal workers and the actual source
+confirmation lifecycle without installing a capacity provider. They check all
+source policy families, Prepared refusal, retained counts at publication and
+confirmed reuse, original budget conservation and cancellation, caller drop,
+lost reply, deadlines and shutdown. SQLite authorizer probes check the count
+during rollback and all four outer restorations; actual SQLite userdata
+destructors check it at sticky-failure and draining connection close. Clearing
+a restoration fault does not clear policy poisoning or authorize reuse.
+
+This supplies source transport custody only. Full OPT-2136 remains open for
+qualified allocation directions, the joint all-owner post-start decision and
+cleanup fences, atomic nonce/intent/claims, uncertain readback/restart, required
+permits and genuine settlement. No observation, lifecycle count, fixture or
+cross-compilation supplies physical qualification, retry, reservation refund or
+admitted lease release. Native registered/bootstrap execution stays tracked by
+OPT-2275/2262/2280.

@@ -377,24 +377,39 @@ fn actual_global_lifecycle_policy_native_sidecar_replacement_denies_reuse() {
         fs::metadata(&wal).unwrap().len(),
         fs::metadata(&original).unwrap().len()
     );
-    let queued = writer
-        .replace_ui_preferences_payload("must-not-dispatch".into())
-        .unwrap();
+    // The real periodic sweep may already have retired command admission after the
+    // substitution. Both rejection before queueing and rejection of queued work
+    // preserve the original boundary; neither may dispatch the preference write.
+    let queued = writer.replace_ui_preferences_payload("must-not-dispatch".into());
     assert_eq!(
         held.abort().recv_timeout(Duration::from_secs(3)).unwrap(),
         Err(GlobalPreparationError::DatabaseBinding)
     );
-    assert!(
-        queued
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap()
-            .is_err()
-    );
+    match queued {
+        Ok(receiver) => assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .is_err()
+        ),
+        Err(yield_library::sample_sources::library::GlobalLibraryWriterQueueError::Closed) => {}
+        Err(error) => panic!("unexpected queue refusal after original WAL replacement: {error:?}"),
+    }
     writer.shutdown_with_report();
     if wal.exists() {
         fs::remove_file(&wal).unwrap();
     }
     fs::rename(&original, &wal).unwrap();
+    assert_eq!(
+        read(&profile.profile_root().join(LIBRARY_DB_FILE_NAME))
+            .query_row(
+                "SELECT count(*) FROM metadata WHERE key=?1",
+                [yield_library::sample_sources::library::UI_PREFERENCES_KEY],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+        0
+    );
     assert_eq!(
         count(
             &read(&profile.profile_root().join(LIBRARY_DB_FILE_NAME)),
