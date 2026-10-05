@@ -30,6 +30,8 @@ impl LibraryDatabase {
         let receipt = ledger::insert(&tx, request, &outcome)?;
         request.validate_sources(true)?;
         tx.commit()?;
+        // The new immutable receipt committed even if live source validation below fails.
+        self.note_harvest_copy_commit();
         if request.validate_live(false).is_err() {
             return Err(LibraryError::HarvestCopyCommitUncertain);
         }

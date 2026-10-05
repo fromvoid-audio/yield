@@ -31,6 +31,16 @@ impl LibraryDatabase {
         self.ordinary_wal_maintenance.committed.set(true);
     }
 
+    /// A new copy receipt commits even when its disposition retains a rejected edit.
+    pub(super) fn note_harvest_copy_commit(&self) {
+        self.ordinary_wal_maintenance.committed.set(true);
+    }
+
+    #[cfg(test)]
+    pub(in crate::sample_sources::library) fn ordinary_commit_pending_for_test(&self) -> bool {
+        self.ordinary_wal_maintenance.committed.get()
+    }
+
     /// Consume the marker on the same worker after its post-command ownership check.
     /// Failure is best effort and cannot turn an already committed write into an SQL failure.
     pub(super) fn maintain_after_ordinary_commit(&self, guard: &WritableProfileGuard) {
