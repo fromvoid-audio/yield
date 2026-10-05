@@ -159,6 +159,36 @@ mod tests {
         assert!(bytes[buffer.size as usize..].iter().all(|b| *b == 0));
     }
     #[test]
+    fn original_rename_buffer_refuses_changed_second_pass_grammar_and_length() {
+        struct Changed(std::vec::IntoIter<u16>);
+        impl Clone for Changed {
+            fn clone(&self) -> Self {
+                Self(vec![97, 97].into_iter())
+            }
+        }
+        impl Iterator for Changed {
+            type Item = u16;
+            fn next(&mut self) -> Option<u16> {
+                self.0.next()
+            }
+        }
+        for units in [
+            vec![97],
+            vec![97, 97, 97],
+            vec![97, 0],
+            vec![97, 47],
+            vec![97, 92],
+            vec![97, 58],
+            vec![46, 46],
+        ] {
+            assert_eq!(
+                RenameInformation::new(Changed(units.into_iter()), NATIVE_NAME_OFFSET).unwrap_err(),
+                RenameInformationError::InvalidLeaf
+            );
+            assert!(MATERIALIZED_BACKING.with(|count| count.get()) <= MAX_BACKING);
+        }
+    }
+    #[test]
     fn original_rename_buffer_checked_layout_and_size_overflow() {
         for offset in [0, 1, NATIVE_NAME_OFFSET + 2, usize::MAX] {
             assert_eq!(
