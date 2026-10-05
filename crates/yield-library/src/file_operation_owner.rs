@@ -22,7 +22,10 @@ use std::time::{Duration, Instant};
 
 mod telemetry;
 use telemetry::FileOwnerTelemetry;
-pub use telemetry::{FileOwnerAdmissionOutcome, FileOwnerTelemetrySnapshot};
+pub use telemetry::{
+    FileOwnerAdmissionOutcome, FileOwnerRetainedOutcome, FileOwnerRetainedTelemetrySnapshot,
+    FileOwnerTelemetrySnapshot,
+};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -1932,6 +1935,12 @@ impl FileOperationOwner {
         self.shared.telemetry.snapshot()
     }
 
+    /// Sample fixed original retained-result observations; None means a short update is active.
+    /// This does not establish durable custody, publication qualification or settlement.
+    pub fn retained_telemetry_snapshot(&self) -> Option<FileOwnerRetainedTelemetrySnapshot> {
+        self.shared.telemetry.retained_snapshot()
+    }
+
     /// Queue one validated bounded effect command.
     pub fn submit(
         &self,
@@ -2837,6 +2846,9 @@ impl WorkerState {
                 input,
             } => {
                 self.acknowledge(key, fingerprint, input);
+                shared
+                    .telemetry
+                    .retained_inventory(self.receipts.len(), self.tombstones.len());
             }
             OwnerCommand::TakeUnusedLiveChunkGrant {
                 key,
@@ -3056,6 +3068,7 @@ impl WorkerState {
         let result = Arc::new(rejection_result(&command, fingerprint, outcome));
         shared.complete_admission(key);
         let aliases = usize::from(result_tx.send(Arc::clone(&result)).is_ok());
+        let retained_outcome = telemetry::FileOwnerRetainedOutcome::from_outcome(result.outcome());
         self.receipts.insert(
             key,
             ReceiptEntry {
@@ -3066,6 +3079,17 @@ impl WorkerState {
                 grant,
             },
         );
+        if primary {
+            shared.telemetry.retain_primary(
+                retained_outcome,
+                self.receipts.len(),
+                self.tombstones.len(),
+            );
+        } else {
+            shared
+                .telemetry
+                .retained_inventory(self.receipts.len(), self.tombstones.len());
+        }
     }
 
     fn execute_duplicate_or_conflict(
@@ -3942,6 +3966,7 @@ fn finish_worker(shared: Arc<OwnerShared>, mut state: WorkerState) {
         if shared.try_stop() {
             state.receipts.clear();
             state.tombstones.clear();
+            shared.telemetry.retained_inventory(0, 0);
             shared.clear_admissions();
             *shared
                 .shutdown_outcome

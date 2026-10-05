@@ -294,6 +294,16 @@
       "retirement": "Remove with cache maintenance owner; never broaden to source deletion."
     },
     {
+      "path": "crates/yield-library/src/file_operation_owner/tests/telemetry_tests.rs",
+      "function": "retained_metrics_actual_readonly_staging_applied_is_only_observation",
+      "operation": "fs::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2344",
+      "reason": "Cfg(test)-only original FileOperationOwner telemetry fixture writes three disposable staging bytes before genuine readonly validation; it issues no mutation grant or physical publication/cleanup qualification. Nested test module inheritance is reviewed explicitly; the lexical production guard remains unchanged.",
+      "retirement": "Remove this exact fixture inventory row when the corresponding readonly staging telemetry test is removed; never reuse its path write in a production owner."
+    },
+    {
       "path": "crates/yield-library/src/operation_journal/capacity_volume_owner.rs",
       "function": "open_existing_lock",
       "operation": "OpenOptions::write",
