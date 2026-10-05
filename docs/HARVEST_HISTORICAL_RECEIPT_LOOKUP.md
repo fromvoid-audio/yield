@@ -22,8 +22,10 @@ SQLite value/record limit also caps native comparison allocation for a corrupted
 unindexed foreign key; it preserves an existing lower limit and restores the
 original connection limit before commit, on refusal and during worker unwind. The
 original scoped HarvestFacts VM budget also bounds corrupted recursive-view work
-before any row is emitted: a two-second deadline and interruption after 1024
-callbacks of 1000 SQLite instructions. Its progress handler clears on return,
+before any row is emitted: it checks a two-second deadline at each callback and
+interrupts on callback 1025 at a 1000-instruction stride (about 1,025,000 VM
+instructions). These callback checks do not preempt native I/O. Its progress
+handler clears on return,
 refusal and unwind; actual exhaustion is classified as malformed history while
 unrelated SQLite errors retain their original classification. Malformed, ambiguous,
 oversized or foreign history rejects without changing it. Original effect/replay
