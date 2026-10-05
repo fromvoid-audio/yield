@@ -12,6 +12,9 @@ pub use super::wal_admission::{
     WalPreparationStatus, WalPreparedDatabase,
 };
 mod frozen_copy;
+mod queue_metrics;
+pub use queue_metrics::{JournalQueueClassMetrics, JournalQueueMetricsSnapshot};
+use queue_metrics::{QueueMetrics, QueueTicket};
 mod legacy_adoption_custody;
 pub use legacy_adoption_custody::{LegacyAdoptionCustody, LegacyAdoptionCustodyError};
 mod native_read_capsule;
@@ -188,11 +191,11 @@ impl ResultBudget {
 
 #[derive(Clone)]
 struct OwnerCommandSenders {
-    ordinary: SyncSender<JournalCommand>,
-    control: SyncSender<JournalCommand>,
+    ordinary: TrackedCommandSender,
+    control: TrackedCommandSender,
 }
 impl OwnerCommandSenders {
-    fn sender(&self, class: InputClass) -> &SyncSender<JournalCommand> {
+    fn sender(&self, class: InputClass) -> &TrackedCommandSender {
         match class {
             InputClass::Ordinary => &self.ordinary,
             InputClass::Control => &self.control,
@@ -200,20 +203,80 @@ impl OwnerCommandSenders {
     }
 }
 
+#[derive(Clone)]
+struct TrackedCommandSender {
+    sender: SyncSender<QueuedJournalCommand>,
+    metrics: Arc<QueueMetrics>,
+    class: InputClass,
+}
+impl TrackedCommandSender {
+    fn try_send(&self, command: JournalCommand) -> Result<(), TrySendError<JournalCommand>> {
+        self.metrics
+            .send(&self.sender, self.class, command)
+            .map_err(|error| match error {
+                TrySendError::Full(queued) => TrySendError::Full(queued.discard()),
+                TrySendError::Disconnected(queued) => TrySendError::Disconnected(queued.discard()),
+            })
+    }
+}
+struct TrackedCommandReceiver(Receiver<QueuedJournalCommand>);
+impl TrackedCommandReceiver {
+    fn try_recv(&self) -> Result<JournalCommand, TryRecvError> {
+        self.0.try_recv().map(QueuedJournalCommand::dispatch)
+    }
+    fn recv_timeout(&self, timeout: Duration) -> Result<JournalCommand, RecvTimeoutError> {
+        self.0
+            .recv_timeout(timeout)
+            .map(QueuedJournalCommand::dispatch)
+    }
+}
+
+struct QueuedJournalCommand {
+    command: JournalCommand,
+    ticket: QueueTicket,
+}
+impl QueuedJournalCommand {
+    fn dispatch(self) -> JournalCommand {
+        let Self {
+            command,
+            mut ticket,
+        } = self;
+        ticket.dequeued();
+        command
+    }
+    fn discard(self) -> JournalCommand {
+        let Self { command, ticket } = self;
+        drop(ticket);
+        command
+    }
+}
+
 struct OwnerCommandReceivers {
-    ordinary: Receiver<JournalCommand>,
-    control: Receiver<JournalCommand>,
+    ordinary: TrackedCommandReceiver,
+    control: TrackedCommandReceiver,
 }
 impl OwnerCommandReceivers {
     fn channel() -> (OwnerCommandSenders, Self) {
         let (ordinary_tx, ordinary) = mpsc::sync_channel(ORDINARY_COMMAND_CAPACITY);
         let (control_tx, control) = mpsc::sync_channel(CONTROL_COMMAND_CAPACITY);
+        let metrics = Arc::new(QueueMetrics::default());
         (
             OwnerCommandSenders {
-                ordinary: ordinary_tx,
-                control: control_tx,
+                ordinary: TrackedCommandSender {
+                    sender: ordinary_tx,
+                    metrics: Arc::clone(&metrics),
+                    class: InputClass::Ordinary,
+                },
+                control: TrackedCommandSender {
+                    sender: control_tx,
+                    metrics,
+                    class: InputClass::Control,
+                },
             },
-            Self { ordinary, control },
+            Self {
+                ordinary: TrackedCommandReceiver(ordinary),
+                control: TrackedCommandReceiver(control),
+            },
         )
     }
 
@@ -255,8 +318,8 @@ impl OwnerCommandReceivers {
 
     fn reject_pending(&self, error: impl Fn() -> OperationJournalOwnerError) {
         for receiver in [&self.control, &self.ordinary] {
-            while let Ok(command) = receiver.try_recv() {
-                reject_command(command, error());
+            while let Ok(command) = receiver.0.try_recv() {
+                reject_command(command.discard(), error());
             }
         }
     }
@@ -4391,6 +4454,12 @@ impl Drop for OperationJournalOwner {
 }
 
 impl OperationJournalClient {
+    /// Fixed per-owner queue observations. Returns None while accounting is contended.
+    /// Backlog ends at accounted dequeue; it is not instantaneous channel length or success.
+    pub fn queue_metrics_snapshot(&self) -> Option<JournalQueueMetricsSnapshot> {
+        self.shared.queue_metrics.snapshot()
+    }
+
     /// Return the current worker lifecycle without waiting for storage I/O.
     pub fn status(&self) -> OperationJournalOwnerStatus {
         self.shared.status()
@@ -5231,6 +5300,7 @@ fn bounded_json_input<T: serde::Serialize>(
 }
 
 struct OwnerShared {
+    queue_metrics: Arc<QueueMetrics>,
     resource_admission: Arc<ResourceAdmission>,
     commands: Mutex<Option<OwnerCommandSenders>>,
     admission_gate: Mutex<()>,
@@ -5245,6 +5315,7 @@ struct OwnerShared {
 impl OwnerShared {
     fn new(commands: OwnerCommandSenders) -> Self {
         Self {
+            queue_metrics: Arc::clone(&commands.ordinary.metrics),
             resource_admission: ResourceAdmission::new(),
             commands: Mutex::new(Some(commands)),
             admission_gate: Mutex::new(()),
@@ -6541,6 +6612,9 @@ mod tests {
     mod publication_input_tests;
     mod publication_mutation_tests;
     mod publication_uncertainty_tests;
+    mod queue_metrics_integration {
+        include!("owner/tests/queue_metrics_integration.rs");
+    }
     mod resource_custody_tests;
     mod source_registry_handoff_tests;
     #[test]
