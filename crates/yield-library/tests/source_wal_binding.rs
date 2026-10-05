@@ -105,6 +105,16 @@ fn two_real_audited_sources_issue_distinct_original_bindings_without_lease_mutat
         Err(SourceWalPreparationError::BindingUnavailable)
     ));
     a.validate_wal_binding(&ba, &ar).unwrap();
+    // Genuine local Prepared custody must never satisfy the Registered consuming boundary.
+    assert!(matches!(
+        a.validate_registered_wal_binding(&ba, &ar),
+        Err(SourceWalPreparationError::BindingUnavailable)
+    ));
+    assert!(matches!(
+        a.validate_registered_wal_binding(&ba, &br),
+        Err(SourceWalPreparationError::BindingUnavailable)
+    ));
+    a.validate_wal_binding(&ba, &ar).unwrap();
     b.validate_wal_binding(&bb, &br).unwrap();
     busy(&ca);
     busy(&cb);

@@ -100,4 +100,18 @@ impl SourceLeaseMaintenancePreparation {
         self.revalidate_owner()?;
         Ok(())
     }
+    /// Require genuine current Registered authority on the original pre-audit reservation.
+    /// This validates CONTROL/native custody and entered policy without ordinary SQL;
+    /// it neither renews the lease nor grants settlement, effect or capacity authority.
+    pub fn validate_registered_lease_binding(
+        &self,
+        binding: &SourceLeaseMaintenanceBinding,
+        registration: &SourceAuthorityRegistration,
+    ) -> Result<(), SourceLeaseMaintenancePreparationError> {
+        self.validate_lease_binding(binding, registration)?;
+        registration
+            .validate_registered_database_boundary(&self.custody.writer().database)
+            .map_err(|_| LifecycleAllocationError::Unknown)?;
+        self.validate_lease_binding(binding, registration)
+    }
 }

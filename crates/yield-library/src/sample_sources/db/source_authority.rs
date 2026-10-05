@@ -843,6 +843,27 @@ impl SourceAuthorityRegistration {
         })
     }
 
+    /// Check the actual registered lifecycle and read-only CONTROL for this exact database.
+    /// The observed registry phase alone cannot satisfy this consuming boundary. The transient
+    /// gate use excludes a simultaneous drain during validation; it confers no later authority.
+    pub(crate) fn validate_registered_database_boundary(
+        &self,
+        database: &SourceDatabase,
+    ) -> Result<(), SourceAuthorityError> {
+        self.registry_reference_observation(database)
+            .map_err(|_| SourceAuthorityError::RegistrationMismatch)?;
+        if !Arc::ptr_eq(&self.request.state, &self.guard.state) {
+            return Err(SourceAuthorityError::RegistrationMismatch);
+        }
+        let profile = database
+            .profile_guard
+            .as_ref()
+            .ok_or(SourceAuthorityError::RegistrationMismatch)?;
+        self.guard
+            .pin_for_effect()?
+            .validate_for_issuance(&self.request, profile)
+    }
+
     pub(crate) fn metadata_handoff_parts(
         &self,
         receipt: &SourceAuthorityRegistrationReceipt,

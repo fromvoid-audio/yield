@@ -224,6 +224,21 @@ impl SourceWalPreparation {
         self.revalidate_owner()
     }
 
+    /// Validate original parked scope against the genuine currently Registered source.
+    /// Prepared diagnostics cannot pass. No ordinary SQL, renewal, deadline extension,
+    /// release, decision latch or capacity/effect permission results from this check.
+    pub fn validate_registered_wal_binding(
+        &self,
+        binding: &SourceWalBinding,
+        registration: &SourceAuthorityRegistration,
+    ) -> Result<(), SourceWalPreparationError> {
+        self.validate_wal_binding(binding, registration)?;
+        registration
+            .validate_registered_database_boundary(&self.writer().database)
+            .map_err(|_| SourceWalPreparationError::BindingUnavailable)?;
+        self.validate_wal_binding(binding, registration)
+    }
+
     fn binding_objects(&self) -> Result<WalObjects, SourceWalPreparationError> {
         use SourceWalPreparationError::BindingUnavailable;
         let database = &self.writer().database;

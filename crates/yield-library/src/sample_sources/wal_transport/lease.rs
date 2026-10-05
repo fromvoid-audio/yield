@@ -279,6 +279,48 @@ impl SourceLeaseWalTransportOwner {
             None => held.revalidate_owner().map_err(classify),
         }
     }
+    /// Require the original parked scope and genuine current Registered authority.
+    /// No historical reply, successful result or caller correlation can latch settlement.
+    pub fn validate_registered(
+        &self,
+        registration: &SourceAuthorityRegistration,
+    ) -> Result<(), SourceWalTransportRejection> {
+        if self.rejection.is_some() || self.is_cancelled() {
+            return Err(self
+                .rejection
+                .unwrap_or(SourceWalTransportRejection::Cancelled));
+        }
+        if !matches!(
+            self.request.ticket.status(),
+            SourceWalTransportStatus::PreparedLease(_)
+        ) {
+            return Err(SourceWalTransportRejection::Scope);
+        }
+        let mut staging = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
+        staging.resize(scope::PARKED_BYTES)?;
+        let native = self
+            .native
+            .as_ref()
+            .ok_or(SourceWalTransportRejection::OwnerLost)?;
+        let held = native.held()?;
+        let scope = self
+            .scope
+            .as_ref()
+            .ok_or(SourceWalTransportRejection::Scope)?;
+        held.validate_registered_lease_binding(scope.original_binding(), registration)
+            .map_err(classify)?;
+        if self.is_cancelled() {
+            return Err(SourceWalTransportRejection::Cancelled);
+        }
+        if !matches!(
+            self.request.ticket.status(),
+            SourceWalTransportStatus::PreparedLease(_)
+        ) {
+            return Err(SourceWalTransportRejection::Scope);
+        }
+        Ok(())
+    }
+
     /// Request pre-intent abort while preserving original native custody.
     pub fn request_abort(&mut self, reason: Option<SourceWalTransportRejection>) {
         if self.rejection.is_none() {

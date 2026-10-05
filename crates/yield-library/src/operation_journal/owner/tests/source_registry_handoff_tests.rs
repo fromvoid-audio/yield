@@ -558,4 +558,104 @@ mod integration {
         drop(a);
         assert!(owner.shutdown());
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_registered_parked_source_boundaries_refuse_foreign_and_drained_authority() {
+        use crate::sample_sources::wal_transport::{
+            SourceWalTransport, SourceWalTransportCorrelation, SourceWalTransportRejection,
+        };
+        let f = fixture("native-registered-wal-boundary");
+        let mut journal = OperationJournalOwner::start_with_capacity_fixture_for_test(
+            OperationJournalStore::open(&f.owner).unwrap(),
+            fixture_volume_registry(&f),
+        )
+        .unwrap();
+        wait_until_available(&journal);
+        let client = journal.client();
+        let (_foreign_root, foreign_writer, foreign_authority) = writer(&f, "foreign-wal");
+        for (audited, abort_first) in [(false, false), (true, false), (false, true), (true, true)] {
+            let name = format!("registered-wal-{audited}-{abort_first}");
+            let (_root, w, mut authority) = writer(&f, &name);
+            if audited {
+                let generation = w.begin_scan_directory_truth_generation(0).unwrap();
+                let fence = w.current_scan_fence().unwrap();
+                let batch = w.catalog_database().write_batch().unwrap();
+                w.commit_scan_audit_completion(
+                    &fence,
+                    batch,
+                    generation,
+                    1,
+                    fence.root_identity().clone(),
+                    None,
+                )
+                .unwrap();
+            }
+            let receipt = client
+                .register_source_authority(authority.journal_request().unwrap())
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            let (transport, mut inbox) = SourceWalTransport::channel();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let correlation = SourceWalTransportCorrelation::new(
+                [74; 32],
+                ParticipantId::new(),
+                AdmissionClaimId::new(),
+                AdmissionClaimId::new(),
+            )
+            .unwrap();
+            let mut request = if audited {
+                transport.submit_with_binding(w.current_revision().unwrap(), correlation, deadline)
+            } else {
+                transport.submit_lease_with_binding(
+                    w.capture_lease_maintenance_allocation(deadline).unwrap(),
+                    correlation,
+                    deadline,
+                )
+            }
+            .unwrap();
+            let mut held = inbox.try_next_any().unwrap().acquire(w);
+            held.publish_prepared(Some(&authority)).unwrap();
+            let holder = request.try_prepared().unwrap();
+            assert_eq!(
+                held.validate_registered(&foreign_authority),
+                Err(SourceWalTransportRejection::Scope)
+            );
+            held.validate_registered(&authority).unwrap();
+            held.validate_registered(&authority).unwrap();
+            if abort_first {
+                held.request_abort(None);
+                assert_eq!(
+                    held.validate_registered(&authority),
+                    Err(SourceWalTransportRejection::Scope)
+                );
+            }
+            // Real journal drain must revoke the current check even with MAIN still held.
+            client
+                .begin_source_drain(receipt.clone())
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                held.validate_registered(&authority),
+                Err(SourceWalTransportRejection::Scope)
+            );
+            drop(holder);
+            let w = held
+                .into_writer()
+                .unwrap_or_else(|_| panic!("original empty rollback"));
+            let ack = authority.close_database(w.into_catalog_database()).unwrap();
+            client
+                .finalize_source_retirement(receipt, ack)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+        }
+        drop(foreign_authority);
+        foreign_writer.close().unwrap();
+        assert!(journal.shutdown());
+    }
 }

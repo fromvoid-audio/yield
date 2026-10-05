@@ -63,6 +63,9 @@ fn normal_build_original_never_audited_lease_owner_crosses_shared_fifo_and_prese
     assert!(owner.is_prepared());
     owner.publish_prepared(Some(&authority)).unwrap();
     owner.revalidate(Some(&authority)).unwrap();
+    assert_eq!(owner.validate_registered(&authority), Err(Rejection::Scope));
+    // A refusal cannot roll back, mutate the lease or turn the parked owner unavailable.
+    owner.revalidate(Some(&authority)).unwrap();
     let other = Connection::open(profile.profile_root().join("lease").join(DB_FILE_NAME)).unwrap();
     other.busy_timeout(Duration::ZERO).unwrap();
     assert_eq!(
