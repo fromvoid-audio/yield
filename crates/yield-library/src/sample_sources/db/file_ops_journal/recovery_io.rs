@@ -33,6 +33,8 @@ use super::super::{DatabaseRootBindingGuard, SourceDatabase};
 mod windows_final_namespace;
 #[cfg(any(windows, test))]
 mod windows_observation;
+#[cfg(any(windows, test))]
+mod windows_rename_information;
 
 /// Result of a descriptor-bound staged publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +214,7 @@ impl StagedFileFinalizer for TestStagedFileFinalizer {
 
 #[cfg(windows)]
 mod windows_finalization {
+    use super::windows_rename_information::{NATIVE_NAME_OFFSET, RenameInformation};
     use std::mem::offset_of;
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 
@@ -226,35 +229,27 @@ mod windows_finalization {
         target_parent: &std::fs::File,
         target_name: &std::ffi::OsStr,
     ) -> Result<(), String> {
-        let target_name: Vec<u16> = target_name.encode_wide().collect();
-        let name_bytes = target_name
-            .len()
-            .checked_mul(std::mem::size_of::<u16>())
-            .ok_or_else(|| "target name is too long".to_string())?;
-        let size = offset_of!(FILE_RENAME_INFO, FileName)
-            .checked_add(name_bytes)
-            .ok_or_else(|| "rename information is too large".to_string())?;
-        let word_size = std::mem::size_of::<usize>();
-        let word_count = size
-            .checked_add(word_size - 1)
-            .ok_or_else(|| "rename information alignment overflowed".to_string())?
-            / word_size;
-        let mut buffer = vec![0usize; word_count];
+        // Compile the portable layout contract against the actual Windows ABI.
+        const _: () = assert!(offset_of!(FILE_RENAME_INFO, FileName) == NATIVE_NAME_OFFSET);
+        const _: () =
+            assert!(offset_of!(FILE_RENAME_INFO, RootDirectory) == std::mem::size_of::<usize>());
+        const _: () = assert!(
+            offset_of!(FILE_RENAME_INFO, FileNameLength) == 2 * std::mem::size_of::<usize>()
+        );
+        const _: () =
+            assert!(std::mem::align_of::<FILE_RENAME_INFO>() <= std::mem::align_of::<usize>());
+        let mut buffer = RenameInformation::new(target_name.encode_wide(), NATIVE_NAME_OFFSET)
+            .map_err(|error| format!("bounded rename information refused: {error:?}"))?;
         let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         unsafe {
             (*info).Anonymous.ReplaceIfExists = false;
             (*info).RootDirectory = HANDLE(target_parent.as_raw_handle());
-            (*info).FileNameLength = name_bytes as u32;
-            std::ptr::copy_nonoverlapping(
-                target_name.as_ptr(),
-                (*info).FileName.as_mut_ptr(),
-                target_name.len(),
-            );
+            (*info).FileNameLength = buffer.name_bytes();
             SetFileInformationByHandle(
                 HANDLE(staged.as_raw_handle()),
                 FileRenameInfo,
                 info.cast(),
-                size as u32,
+                buffer.size(),
             )
             .map_err(|error| error.to_string())?;
         }
@@ -1836,6 +1831,35 @@ mod tests {
                 .expect("read replacement database"),
             None
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn original_rename_buffer_native_refusal_preserves_held_staged_and_parent() {
+        use std::os::windows::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("staged.tmp"), b"original-staged").unwrap();
+        let identity = capture_root_identity(temp.path()).unwrap();
+        let root = RecoveryRoot::open(temp.path(), Some(&identity)).unwrap();
+        let staged = root.open_file(Path::new("staged.tmp")).unwrap().unwrap();
+        let parent = root.open_directory(Path::new(".")).unwrap();
+        let name = std::ffi::OsString::from_wide(&vec![97; 64 * 1024]);
+        assert!(
+            windows_finalization::rename_no_replace(&staged.capability, &parent, &name).is_err()
+        );
+        assert_eq!(
+            fs::read(temp.path().join("staged.tmp")).unwrap(),
+            b"original-staged"
+        );
+        assert_eq!(
+            root.open_file(Path::new("staged.tmp"))
+                .unwrap()
+                .unwrap()
+                .identity,
+            staged.identity
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+        root.revalidate_named_root().unwrap();
     }
 
     #[cfg(windows)]

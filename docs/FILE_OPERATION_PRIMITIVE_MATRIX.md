@@ -104,6 +104,18 @@ through the same handle-bound API for source-local staged cleanup. These are
 implemented primitive candidates in `recovery_io.rs`, and the independent
 `Available` values in `finalization.rs` describe that low-level availability.
 
+The source-local Windows rename call now constructs its native information in
+one aligned buffer, capped at 64 KiB including header and word padding. A borrowed
+UTF-16 pass checks a nonempty single leaf (no NUL, separators, stream colon, `.`
+or `..`) and checked sizes before any native backing allocation. It writes UTF-16
+directly into the buffer and preserves Windows surrogate units; no intermediate
+owned name is constructed. The actual Windows ABI field offsets/alignment are
+compile-time assertions, and byte lengths use checked `u32` conversions. This
+resource boundary (OPT-2335) keeps original staged and parent handles and
+`ReplaceIfExists = false`; it creates no new FileOperationOwner authority or
+filesystem qualification. Allocation overhead outside the native buffer is not
+part of its 64 KiB backing ceiling. Native execution remains OPT-2219.
+
 The Microsoft [`FILE_RENAME_INFO` documentation](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info)
 states that `RootDirectory` is normally null, but can be a directory handle
 when `FileName` is relative. The current source's target-parent handle plus a
