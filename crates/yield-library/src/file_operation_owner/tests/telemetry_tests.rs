@@ -424,3 +424,42 @@ fn retained_metrics_actual_readonly_staging_applied_is_only_observation() {
         snapshot.primary_outcomes
     );
 }
+
+#[test]
+fn retained_metrics_implicit_owner_drop_retains_original_inventory() {
+    let owner = FileOperationOwner::start().unwrap();
+    let registration = owner
+        .register_root_for_test(profile_fence(owner.owner_identity()), "profile")
+        .unwrap();
+    owner.pause_before_execute_for_test();
+    let request = owner
+        .submit(unsupported_effect(&owner, registration, EffectId::new()))
+        .unwrap();
+    owner.wait_until_worker_paused_for_test();
+    drop(request);
+    owner.release_worker_for_test();
+    let before = wait_retained_metrics(&owner, 1, 0);
+    let shared = Arc::clone(&owner.shared);
+    drop(owner);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(outcome) = shared.shutdown_outcome.lock().unwrap().clone() {
+            assert!(matches!(
+                outcome,
+                FileOperationOwnerShutdown::RetirementUncertain { .. }
+            ));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "original implicit-drop worker completion"
+        );
+        thread::yield_now();
+    }
+    assert_eq!(shared.telemetry.retained_snapshot().unwrap(), before);
+    let retained = shared.retained_state.lock().unwrap();
+    let original = retained
+        .as_ref()
+        .expect("uncertain original owner state remains");
+    assert_eq!((original.receipts.len(), original.tombstones.len()), (1, 0));
+}
