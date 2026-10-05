@@ -752,3 +752,26 @@ Original workers still validate current native/CONTROL ownership. Wire versions,
 pre-audit domain, shared context ceiling and full retirement admission's explicit
 Unsupported boundary remain unchanged. Exact input matching supplies no physical
 qualification, permit, post-start custody, authenticated transition or settlement.
+
+## Original Linux shared-SHM directory alias (OPT-2320)
+
+Bundled Unix SQLite shares a SHM node by database inode and retains the first
+opener's filename until the node's final connection closes. Giving each original
+connection a different `/proc/self/fd/<directory fd>/<child>` alias allowed that
+first directory FD to close while another connection still used the SHM node.
+FD reuse could then direct eventual SHM unlink into another source root. Actual
+Linux binding stress reproduced missing SHM children; a deterministic original
+two-connection regression reproduced premature directory-alias close.
+
+BoundDatabaseRoot and its owned connections now share the original directory
+capability through Arc custody. Connections and owner-capability clones use the
+same alias and retain it through final SQLite close, including the existing
+unconfirmed-close quarantine. No global registry, second lease, namespace reopen,
+new authority or weaker native binding check is introduced. Independent readonly
+observation descriptors still use their own bounded read-only factory. The real
+regression drops the root binding and first connection, checks the exact alias
+remains open for the second connection, then confirms final close releases it.
+
+This fixes original descriptor lifetime; it does not qualify physical capacity,
+issue a WAL commit/publication permit, complete settlement, or replace native
+macOS/Windows SDK and runtime qualification.

@@ -488,7 +488,7 @@ impl RecoveryRoot {
                 .map_err(|error| error.to_string())?;
             return Ok(BoundDatabaseRoot {
                 path,
-                _capability: capability,
+                _capability: Arc::new(capability),
                 identity: self.identity.clone(),
                 profile_identity: self.identity.clone(),
                 named_path: None,
@@ -506,7 +506,7 @@ impl RecoveryRoot {
                 .map_err(|error| error.to_string())?;
             Ok(BoundDatabaseRoot {
                 path,
-                _capability: capability,
+                _capability: Arc::new(capability),
                 identity: self.identity.clone(),
                 profile_identity: self.identity.clone(),
                 named_path: None,
@@ -551,7 +551,7 @@ impl RecoveryRoot {
 
 pub(crate) struct BoundDatabaseRoot {
     path: PathBuf,
-    _capability: fs::File,
+    _capability: Arc<fs::File>,
     identity: String,
     profile_identity: String,
     named_path: Option<PathBuf>,
@@ -848,9 +848,10 @@ impl BoundDatabaseRoot {
         if components.len() != 1 {
             return Err(rusqlite::Error::InvalidPath(name.to_path_buf()));
         }
-        let descriptor = self
-            .try_clone_descriptor()
-            .map_err(|_| rusqlite::Error::InvalidPath(name.to_path_buf()))?;
+        // Unix SHM nodes are shared by inode and retain the first opener's filename.
+        // All connections from this original root must keep that same directory alias
+        // alive until their final close, even after the first connection is dropped.
+        let descriptor = Arc::clone(&self._capability);
         #[cfg(target_os = "linux")]
         let path = {
             use std::os::fd::AsRawFd;
@@ -870,15 +871,15 @@ impl BoundDatabaseRoot {
         &self.path
     }
 
-    /// Duplicate the retained directory descriptor for an owner-owned capability.
+    /// Share the retained directory alias for an owner-owned capability.
     ///
-    /// The original profile-child lease remains held by the store and is shared by the duplicate
-    /// through the retained lease handle. The duplicate acquires no second in-process lease and
+    /// The original profile-child lease remains held by the store and is shared by the clone
+    /// through the retained lease handle. The clone acquires no second in-process lease and
     /// keeps an owner-owned reserve capsule separate from the store while that shared lease lives.
     pub(crate) fn try_clone_for_owned_capability(&self) -> io::Result<Self> {
         Ok(Self {
             path: self.path.clone(),
-            _capability: self._capability.try_clone()?,
+            _capability: Arc::clone(&self._capability),
             identity: self.identity.clone(),
             profile_identity: self.profile_identity.clone(),
             named_path: self.named_path.clone(),
@@ -922,7 +923,7 @@ impl BoundDatabaseRoot {
         let observer = ReadonlyDatabaseRoot {
             root: Self {
                 path,
-                _capability: capability,
+                _capability: Arc::new(capability),
                 identity: self.identity.to_string(),
                 profile_identity: self.profile_identity.to_string(),
                 named_path: self.named_path.as_ref().map(|p| p.to_path_buf()),
@@ -1092,7 +1093,7 @@ impl BoundDatabaseRoot {
             .map_err(|error| profile_binding_error(profile_guard, error.to_string()))?;
         Ok(Self {
             path,
-            _capability: capability,
+            _capability: Arc::new(capability),
             identity: expected_identity.to_owned(),
             profile_identity: expected_identity.to_owned(),
             named_path: Some(profile_guard.profile_root().to_path_buf()),
@@ -1166,7 +1167,7 @@ impl BoundDatabaseRoot {
             .map_err(|error| map_profile_child_binding_error(&child_path, error))?;
         Ok(Self {
             path,
-            _capability: capability,
+            _capability: Arc::new(capability),
             identity,
             profile_identity: profile_guard.profile_root_identity().to_owned(),
             named_path: Some(profile_guard.profile_root().join(child)),
@@ -1220,7 +1221,7 @@ impl BoundDatabaseRoot {
             .map_err(|error| map_external_source_binding_error(source_root, error))?;
         Ok(Self {
             path,
-            _capability: capability,
+            _capability: Arc::new(capability),
             identity,
             profile_identity: profile_guard.profile_root_identity().to_owned(),
             named_path: Some(source_root.to_path_buf()),
@@ -1913,7 +1914,7 @@ mod index_inspection_primitive_tests {
         // Filesystem primitive test only: the production catalog tests separately exercise real profile/lease admission.
         let binding = BoundDatabaseRoot {
             path: root.path().into(),
-            _capability: open_root_nofollow(root.path()).unwrap(),
+            _capability: Arc::new(open_root_nofollow(root.path()).unwrap()),
             identity: String::new(),
             profile_identity: String::new(),
             named_path: None,
