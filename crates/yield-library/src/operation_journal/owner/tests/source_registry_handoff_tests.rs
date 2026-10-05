@@ -83,6 +83,176 @@ mod integration {
         }
     }
 
+    // Original roots/leases/SQLite and real actor queues; logical registration and scalar
+    // fences below cannot qualify capacity or create executable native grants.
+    fn publication_actor(
+        runtime: &mut OwnerRuntime,
+    ) -> (OperationJournalClient, OwnerCommandReceivers) {
+        let (commands, receivers) = OwnerCommandReceivers::channel();
+        let shared = Arc::new(OwnerShared::new(commands));
+        shared
+            .lifecycle
+            .store(OwnerLifecycle::Available as u8, Ordering::Release);
+        runtime.attach_resource_custody(&shared).unwrap();
+        (OperationJournalClient { shared }, receivers)
+    }
+    fn publication_drain(
+        runtime: &mut OwnerRuntime,
+        client: &OperationJournalClient,
+        receivers: &OwnerCommandReceivers,
+        receipt: SourceAuthorityRegistrationReceipt,
+    ) -> Result<(), OperationJournalOwnerError> {
+        let mut request = client.begin_source_drain(receipt).unwrap();
+        assert!(!execute_command(
+            receivers.control.try_recv().unwrap(),
+            runtime
+        ));
+        request.recv_timeout(Duration::from_secs(2)).unwrap()
+    }
+    #[test]
+    fn publication_source_drain_fences_all_matching_operations_without_revoking_unrelated_sources()
+    {
+        for entered in [false, true] {
+            let f = fixture("publication-source-drain");
+            let (_root, w, a) = writer(&f, "drain-bound");
+            let (request, receipt, marker) = registration_model(&a);
+            let (_other_root, other_w, other_a) = writer(&f, "drain-unrelated");
+            let (other_request, other_receipt, other_marker) = registration_model(&other_a);
+            let mut runtime =
+                OwnerRuntime::new(OperationJournalStore::open(&f.owner).unwrap()).unwrap();
+            insert_model(&mut runtime, request, receipt.clone(), marker);
+            insert_model(
+                &mut runtime,
+                other_request,
+                other_receipt.clone(),
+                other_marker,
+            );
+            let (client, receivers) = publication_actor(&mut runtime);
+            let mut first = runtime
+                .publication_fences
+                .issue_for_source(OperationId::new(), receipt.registration_id, &client.shared)
+                .unwrap();
+            let blocking = OperationId::new();
+            let mut second = runtime
+                .publication_fences
+                .issue_for_source(blocking, receipt.registration_id, &client.shared)
+                .unwrap();
+            let mut other = runtime
+                .publication_fences
+                .issue_for_source(
+                    OperationId::new(),
+                    other_receipt.registration_id,
+                    &client.shared,
+                )
+                .unwrap();
+            assert!(other.enter());
+            if entered {
+                let mut foreign = receipt.clone();
+                foreign.volume_identities = vec![VolumeIdentity { device: 2 }];
+                assert!(matches!(
+                    publication_drain(&mut runtime, &client, &receivers, foreign),
+                    Err(OperationJournalOwnerError::SourceAuthorityConflict { .. })
+                ));
+                // Invalid original-registration evidence cannot close the pending grant.
+                assert!(second.enter());
+            }
+            let result = publication_drain(&mut runtime, &client, &receivers, receipt.clone());
+            assert!(!first.enter());
+            if entered {
+                assert!(
+                    matches!(result, Err(OperationJournalOwnerError::PublicationSourceRetirementPending { operation_id }) if operation_id == blocking)
+                );
+                let retained = &runtime.source_registrations[&receipt.registration_id];
+                assert!(matches!(
+                    retained.readiness,
+                    SourceRegistrationReadiness::Registered
+                ));
+                assert!(retained.drain_marker.is_some());
+                assert_eq!(retained.receipt, receipt);
+                // Original metadata authority remains usable after refused drain.
+                drop(
+                    runtime
+                        .authenticate_source_registry_metadata(candidate(&w, &a, &receipt))
+                        .unwrap(),
+                );
+                drop(second);
+                assert!(
+                    matches!(publication_drain(&mut runtime, &client, &receivers, receipt.clone()),
+                    Err(OperationJournalOwnerError::PublicationSourceRetirementPending { operation_id }) if operation_id == blocking)
+                );
+                assert!(
+                    runtime.source_registrations[&receipt.registration_id]
+                        .drain_marker
+                        .is_some()
+                );
+            } else {
+                result.unwrap();
+                assert!(!second.enter());
+                let retained = &runtime.source_registrations[&receipt.registration_id];
+                assert!(matches!(
+                    retained.readiness,
+                    SourceRegistrationReadiness::Draining
+                ));
+                assert!(retained.drain_marker.is_none());
+            }
+            assert_eq!(runtime.source_registrations.len(), 2);
+            assert!(runtime.retired_source_registrations.is_empty());
+            assert!(matches!(
+                runtime.source_registrations[&other_receipt.registration_id].readiness,
+                SourceRegistrationReadiness::Registered
+            ));
+            drop(
+                runtime
+                    .authenticate_source_registry_metadata(candidate(
+                        &other_w,
+                        &other_a,
+                        &other_receipt,
+                    ))
+                    .unwrap(),
+            );
+        }
+    }
+    #[test]
+    fn publication_source_final_retirement_retains_real_closed_lease_ack_when_scalar_attempt_is_unsettled()
+     {
+        let f = fixture("publication-source-final-retirement");
+        let (_root, w, mut a) = writer(&f, "final-bound");
+        let (request, receipt, marker) = registration_model(&a);
+        let mut runtime =
+            OwnerRuntime::new(OperationJournalStore::open(&f.owner).unwrap()).unwrap();
+        insert_model(&mut runtime, request, receipt.clone(), marker);
+        let (client, receivers) = publication_actor(&mut runtime);
+        publication_drain(&mut runtime, &client, &receivers, receipt.clone()).unwrap();
+        let ack = a.close_database(w.into_catalog_database()).unwrap();
+        // Negative retained-state fixture only: production issuance cannot issue after drain.
+        // A genuine physical lease acknowledgement must never settle scalar uncertain evidence.
+        let operation = OperationId::new();
+        let mut fence = runtime
+            .publication_fences
+            .issue_for_source(operation, receipt.registration_id, &client.shared)
+            .unwrap();
+        assert!(fence.enter());
+        drop(fence);
+        let mut finalize = client
+            .finalize_source_retirement(receipt.clone(), ack)
+            .unwrap();
+        assert!(!execute_command(
+            receivers.control.try_recv().unwrap(),
+            &mut runtime
+        ));
+        assert!(
+            matches!(finalize.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(OperationJournalOwnerError::PublicationSourceRetirementPending { operation_id }) if operation_id == operation)
+        );
+        let retained = &runtime.source_registrations[&receipt.registration_id];
+        assert_eq!(retained.receipt, receipt);
+        assert!(matches!(
+            retained.readiness,
+            SourceRegistrationReadiness::Draining
+        ));
+        assert!(runtime.retired_source_registrations.is_empty());
+    }
+
     #[test]
     fn actual_prepared_owner_and_matching_scalar_receipt_cannot_issue_candidate() {
         let f = fixture("metadata-real-prepared-refusal");

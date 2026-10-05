@@ -685,3 +685,20 @@ checking exact retained records and sequences. Their scalar fences confer no
 source or native grant. Source/volume retirement, exact charge and qualified
 namespace association, completion and genuine settlement remain open under
 OPT-2215; this fence supplies none of those authorities.
+
+## Original source drain and retirement fences (OPT-2308)
+
+The actual issuer binds each fence to the opaque registration identity from its
+already authenticated source receipt. Actor source drain and final retirement
+close all matching pending fences before source request, metadata, registry or
+volume membership mutations. Entered, unsettled and unknown custody returns
+`PublicationSourceRetirementPending` identifying the blocking operation. Refusal
+retains original source evidence; closing earlier pending fences is conservative
+and never reopens an issuance. Unrelated registrations remain isolated.
+
+The bounded registry still uses its original 8KiB input debit. Portable actor
+queue tests use genuine roots, leases and SQLite with explicit logical source
+registration and scalar fences; they supply no native capacity or publication
+grant. Physical lease closure alone cannot settle uncertain publication custody.
+Exact current charges, qualified namespace entry, provider/volume retirement,
+completion and genuine settlement remain open under OPT-2215.

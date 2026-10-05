@@ -597,6 +597,12 @@ pub enum OperationJournalOwnerError {
         /// Original operation whose publication attempt remains entered or unresolved.
         operation_id: OperationId,
     },
+    /// Source retirement cannot invalidate an entered or unresolved publication binding.
+    #[error("source retirement awaits publication reconciliation for {operation_id:?}")]
+    PublicationSourceRetirementPending {
+        /// Original operation retaining this source registration.
+        operation_id: OperationId,
+    },
     /// An internally serialized control input could not be decoded on the owner thread.
     #[error("operation journal owner control input could not be decoded: {reason}")]
     InvalidInput {
@@ -2396,9 +2402,11 @@ impl OwnerRuntime {
                 reason: String::from("staging source fence differs from live registration"),
             });
         }
-        let fence = self
-            .publication_fences
-            .issue(validation.operation_id(), &input.shared)?;
+        let fence = self.publication_fences.issue_for_source(
+            validation.operation_id(),
+            registration.registration_id,
+            &input.shared,
+        )?;
         let checkpoint_result = self.store().checkpoint_staging_result(validation);
         let checkpoint: StagingCheckpointAck = self
             .publication_write_result(checkpoint_result)?
@@ -3415,6 +3423,8 @@ impl OwnerRuntime {
                 },
             );
         };
+        self.publication_fences
+            .close_for_source(receipt.registration_id)?;
         if let Err(error) = record.request.begin_drain(marker.clone()) {
             return Err(OperationJournalOwnerError::from(error));
         }
@@ -3452,6 +3462,8 @@ impl OwnerRuntime {
                 ),
             });
         }
+        self.publication_fences
+            .close_for_source(receipt.registration_id)?;
         record
             .request
             .finalize_retirement(acknowledgement)
