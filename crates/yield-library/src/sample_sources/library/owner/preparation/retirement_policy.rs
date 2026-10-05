@@ -4,7 +4,6 @@ use crate::operation_journal::{
     OperationId, WorkUnitKey, source_registry_retirement::SourceRegistryRetirementIntentArgs,
 };
 use serde::Serialize;
-use std::io::{self, Write};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct Input {
@@ -13,34 +12,20 @@ pub(crate) struct Input {
     family_digest: [u8; 32],
     acquisition: uuid::Uuid,
 }
-struct Digest(blake3::Hasher, usize);
-impl Write for Digest {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.1 = self.1.checked_add(bytes.len()).filter(|n| *n <= crate::operation_journal::source_registry_retirement::MAX_SOURCE_REGISTRY_RETIREMENT_BYTES).ok_or_else(|| io::Error::other("retirement policy bound"))?;
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 impl Input {
     pub(super) fn new(
         args: &SourceRegistryRetirementIntentArgs,
     ) -> Result<Self, GlobalPreparationError> {
         args.validate()
             .map_err(|_| GlobalPreparationError::InputBound)?;
-        let mut digest = Digest(
-            blake3::Hasher::new_derive_key("yield.global-retirement-initial-forward.v1"),
-            0,
-        );
-        serde_json::to_writer(&mut digest, args).map_err(|_| GlobalPreparationError::InputBound)?;
         Ok(Self {
             operation: args
                 .operation_id()
                 .map_err(|_| GlobalPreparationError::InputBound)?,
             work: [args.draining_work(), args.retired_work()],
-            family_digest: *digest.0.finalize().as_bytes(),
+            family_digest: args
+                .initial_forward_policy_digest()
+                .map_err(|_| GlobalPreparationError::InputBound)?,
             acquisition: args.lease_fence().subject().profile_acquisition(),
         })
     }

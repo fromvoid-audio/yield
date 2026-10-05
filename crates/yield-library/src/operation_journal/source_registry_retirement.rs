@@ -24,7 +24,36 @@ pub struct SourceRegistryRetirementIntentArgs {
     draining: String,
     retired: String,
 }
+// Fixed streaming scratch; complete family encoding cannot grow beyond its existing bound.
+struct ForwardPolicyDigest(blake3::Hasher, usize);
+impl std::io::Write for ForwardPolicyDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.1 = self
+            .1
+            .checked_add(bytes.len())
+            .filter(|n| *n <= MAX_SOURCE_REGISTRY_RETIREMENT_BYTES)
+            .ok_or_else(|| std::io::Error::other("retirement policy bound"))?;
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 impl SourceRegistryRetirementIntentArgs {
+    /// Shared exact frozen-family correlation only. Callers validate the complete DTO first;
+    /// this bounded streaming digest grants no current registration, policy or write authority.
+    pub(crate) fn initial_forward_policy_digest(
+        &self,
+    ) -> Result<[u8; 32], SourceLeaseBindingError> {
+        let mut digest = ForwardPolicyDigest(
+            blake3::Hasher::new_derive_key("yield.global-retirement-initial-forward.v1"),
+            0,
+        );
+        serde_json::to_writer(&mut digest, self).map_err(|_| SourceLeaseBindingError)?;
+        Ok(*digest.0.finalize().as_bytes())
+    }
+
     /// Form finite historical arguments. Actual admission must authenticate all live owners.
     pub fn new(
         source_participant: ParticipantId,
