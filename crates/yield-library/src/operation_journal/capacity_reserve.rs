@@ -907,6 +907,9 @@ fn capture_observation(file: &File) -> Result<ReserveObservation, ReserveFailure
     })
 }
 
+#[cfg(any(target_os = "windows", test))]
+mod windows_observation;
+
 struct RawFileObservation {
     device: u64,
     length: u64,
@@ -950,7 +953,12 @@ fn raw_file_observation(file: &File) -> Result<RawFileObservation, ReserveFailur
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn raw_file_observation(file: &File) -> Result<RawFileObservation, ReserveFailureReason> {
+    windows_observation::observe(file)
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 fn raw_file_observation(_file: &File) -> Result<RawFileObservation, ReserveFailureReason> {
     Err(ReserveFailureReason::Unsupported)
 }

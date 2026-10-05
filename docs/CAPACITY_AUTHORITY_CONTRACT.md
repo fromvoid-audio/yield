@@ -593,3 +593,28 @@ has run them:
 No Rust test or production behavior is claimed by this document. The current
 ordinary admission path remains fail-closed until the later provider, claim,
 and gate issues satisfy these boundaries.
+
+## Windows original reserve-file metadata observations (OPT-2299)
+
+The private reserve observation path can now query the original Windows disk HANDLE for
+identity, regular-file attributes, exact EOF, reported allocation extent and hard-link count.
+It uses synchronous fixed-record `GetFileInformationByHandle`/`FileStandardInfo` queries and
+rechecks identity, size, attributes, links and extent before returning. Directory, reparse,
+sparse, compressed, deleting, invalid/negative and non-disk shapes refuse. A nonempty file
+with unknown zero allocation extent also refuses. No locator is reopened and no seek,
+allocation, write or permission change occurs in this observation producer.
+
+The query does not establish physical peak allocation, a protected reserve floor, capacity
+permission or namespace qualification. Windows protected reserve creation, revalidation,
+spend/reconstitution and production provider qualification retain their existing unsupported
+or unqualified behavior. Reported AllocationSize and an ordinary successful write cannot
+activate those gates. Hard-link counts remain observations for the original reserve's
+independent single-link validator; they never grant shared-file mutation authority.
+
+Portable extent-input checks and actual Windows production/native harness compiler checks
+cover the implementation. Three genuine Windows harnesses verify original readonly identity
+and extent after rename/substitution, unchanged cursor/read rights, real hardlinks and
+sparse/reparse/directory/device refusal. Execution requires a disposable supported Windows
+filesystem and actual symlink privilege/Developer Mode; failures are not passing skips.
+The supported SDK/native execution requirements are scoped in OPT-2300. Linux compilation
+or scalar fixtures do not qualify this adapter or close OPT-2194/1561/2174 physical acceptance.
