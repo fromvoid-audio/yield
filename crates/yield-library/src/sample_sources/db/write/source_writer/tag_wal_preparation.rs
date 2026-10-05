@@ -45,6 +45,7 @@ impl SourceWriter {
     ) -> Result<SourceTagWalPreparation, SourceTagWalPreparationFailure> {
         let deadline = requested_deadline.min(observation.deadline());
         let mut custody = Custody {
+            registered: None,
             owner: Some(Owner::Unprepared {
                 writer: self,
                 created_transaction: false,
@@ -121,6 +122,14 @@ impl SourceWriter {
     }
 }
 impl SourceTagWalPreparation {
+    pub(crate) fn retain_registered_wal_binding(
+        &mut self,
+        binding: &super::SourceWalBinding,
+        registration: &crate::sample_sources::db::SourceAuthorityRegistration,
+    ) -> Result<(), SourceWalPreparationError> {
+        self.custody.retain_registered(binding, registration)
+    }
+
     pub(crate) fn original_wal_preparation(
         &self,
     ) -> Result<&super::SourceWalPreparation, SourceWalPreparationError> {

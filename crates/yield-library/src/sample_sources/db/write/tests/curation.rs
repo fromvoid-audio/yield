@@ -4424,3 +4424,6 @@ mod policy_transport;
 
 #[path = "curation/tag_streaming_validation.rs"]
 mod tag_streaming_validation;
+
+#[path = "curation/registered_metadata_custody.rs"]
+mod registered_metadata_custody;

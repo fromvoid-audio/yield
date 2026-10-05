@@ -1,4 +1,4 @@
-//! Real original SQLite workers; Prepared source registrations and logical plans give no grant.
+//! Real original SQLite workers; registered lifecycle custody and logical plans give no grant.
 #[cfg(test)]
 mod integration {
     use super::super::*;
@@ -310,6 +310,19 @@ mod integration {
         }
         fn start_with_lease_observation(
             writers: Vec<SourceWriter>,
+            inbox: crate::sample_sources::wal_transport::SourceWalTransportInbox,
+            observation: Option<
+                mpsc::SyncSender<(
+                    crate::sample_sources::db::SourceLeaseMaintenanceAllocation,
+                    crate::operation_journal::source_lease_binding::StoredSourceLeaseFence,
+                    Instant,
+                )>,
+            >,
+        ) -> Self {
+            Self::start_with_registration(writers, inbox, observation, true)
+        }
+        fn start_with_registration(
+            writers: Vec<SourceWriter>,
             mut inbox: crate::sample_sources::wal_transport::SourceWalTransportInbox,
             observation: Option<
                 mpsc::SyncSender<(
@@ -318,6 +331,7 @@ mod integration {
                     Instant,
                 )>,
             >,
+            register: bool,
         ) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
             let stopped = Arc::clone(&stop);
@@ -346,6 +360,25 @@ mod integration {
                             id.clone(),
                             w.catalog_database().prepare_source_authority().unwrap(),
                         )
+                    })
+                    .collect::<HashMap<_, _>>();
+                // Drive the genuine confirmation lifecycle without installing a capacity provider.
+                // These fixtures prove transport custody, never physical qualification or admission.
+                let registrations = authorities
+                    .iter()
+                    .map(|(id, authority)| {
+                        let envelope = authority.journal_request().unwrap();
+                        let proof = if register {
+                            Some(
+                                envelope
+                                    .request
+                                    .accept_confirmation(envelope.confirmation)
+                                    .unwrap(),
+                            )
+                        } else {
+                            None
+                        };
+                        (id.clone(), (envelope.request, proof))
                     })
                     .collect::<HashMap<_, _>>();
                 if let Some(sender) = observation {
@@ -381,7 +414,19 @@ mod integration {
                         };
                         recorded.lock().unwrap().push(format!("acquire:{id}"));
                         let mut owner = command.acquire(writer);
-                        let _ = owner.publish_prepared(authorities.get(&id));
+                        let result = owner.publish_prepared(authorities.get(&id));
+                        if let Err(reason) = result {
+                            // Match the actual catalog producer: carry publication refusal
+                            // through original cleanup, rather than reporting a caller abort.
+                            owner.request_abort(Some(reason));
+                        }
+                        if result.is_ok() {
+                            assert_eq!(
+                                registrations[&id].0.registered_uses_for_tests(),
+                                1,
+                                "successful publication retains original use {id}"
+                            );
+                        }
                         held.insert(id, owner);
                     }
                     let mut remaining = HashMap::new();
@@ -396,12 +441,18 @@ mod integration {
                         if stopped.load(Ordering::Acquire)
                             || owner.is_cancelled()
                             || !owner.is_prepared()
+                            || owner.rejection().is_some()
                             || Instant::now() >= owner.deadline()
                             || owner.revalidate(authorities.get(&id)).is_err()
                         {
                             owner.request_abort(None);
                             match owner.into_writer() {
                                 Ok(writer) => {
+                                    assert_eq!(
+                                        registrations[&id].0.registered_uses_for_tests(),
+                                        0,
+                                        "count released only after original cleanup"
+                                    );
                                     recorded.lock().unwrap().push(format!("reuse:{id}"));
                                     writers.insert(id, writer);
                                 }
@@ -422,6 +473,7 @@ mod integration {
                 // Real ordinary owners close before their genuine prepared-registration guards.
                 drop(writers);
                 drop(authorities);
+                drop(registrations);
             });
             Self {
                 stop,
@@ -633,6 +685,9 @@ mod integration {
     }
     impl Rig {
         fn new(name: &str) -> Self {
+            Self::with_registration(name, true)
+        }
+        fn with_registration(name: &str, register: bool) -> Self {
             let (fixture, journal) = open_owner(name);
             let global = GlobalLibraryWriter::start(&fixture.owner).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -646,7 +701,7 @@ mod integration {
                 .map(|w| w.current_revision().unwrap())
                 .collect();
             let (requester, inbox) = SourceWalTransport::channel();
-            let actor = SourceActor::start(writers, inbox);
+            let actor = SourceActor::start_with_registration(writers, inbox, None, register);
             Self {
                 fixture,
                 journal,
@@ -717,6 +772,55 @@ mod integration {
                 | WalPreparationStatus::Rejected(_)
                 | WalPreparationStatus::Unavailable(_)
         )
+    }
+    #[test]
+    fn all_owner_prepared_registration_cannot_publish_original_journal_custody() {
+        let mut rig = Rig::with_registration("all-owner-prepared-refusal", false);
+        let input = rig.input(Instant::now() + Duration::from_secs(2));
+        let budget = input.budget_for_test();
+        let handle = rig.submit(input);
+        let status = wait(&handle, terminal);
+        assert!(
+            matches!(status, WalPreparationStatus::Rejected(_)),
+            "{status:?}"
+        );
+        for index in 0..2 {
+            rig.outside_source(index)
+                .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+                .unwrap();
+        }
+        assert!(
+            rig.actor
+                .as_ref()
+                .unwrap()
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.starts_with("reuse:"))
+        );
+        assert_eq!(
+            rig.journal
+                .prepared_admission_id_allocations
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(rig.journal.shutdown());
+        let rows = rusqlite::Connection::open(
+            rig.fixture
+                .owner
+                .profile_root()
+                .join(crate::operation_journal::store::JOURNAL_DATABASE_ROOT_NAME)
+                .join(crate::operation_journal::store::JOURNAL_DATABASE_FILE_NAME),
+        )
+        .unwrap()
+        .query_row("SELECT count(*) FROM operation_journal", [], |r| {
+            r.get::<_, u64>(0)
+        })
+        .unwrap();
+        assert_eq!(rows, 0);
+        drop(handle);
+        assert_eq!(budget.used(), 0);
     }
     #[test]
     fn all_owner_busy_last_real_database_unwinds_acquired_prefix_without_identity() {

@@ -85,6 +85,18 @@ impl Native {
             _ => Err(SourceWalPreparationError::RollbackUnconfirmed),
         }
     }
+    pub(super) fn retain_registered(
+        &mut self,
+        binding: &crate::sample_sources::db::write::SourceWalBinding,
+        registration: &SourceAuthorityRegistration,
+    ) -> Result<(), SourceWalPreparationError> {
+        match self {
+            Self::Held(held) => held.retain_registered_wal_binding(binding, registration),
+            Self::HeldTag(held) => held.retain_registered_wal_binding(binding, registration),
+            Self::HeldLayout(held) => held.retain_registered_wal_binding(binding, registration),
+            _ => Err(SourceWalPreparationError::RollbackUnconfirmed),
+        }
+    }
     pub(super) fn family(&self) -> Option<SourceWalPolicyFamily> {
         match self {
             Self::HeldTag(_) => Some(SourceWalPolicyFamily::Tag),

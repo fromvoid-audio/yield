@@ -138,11 +138,13 @@ struct ObservationData {
     wal_bytes: u64,
     scope: Option<ScopeView>,
     policy_family: Option<SourceWalPolicyFamily>,
+    registered_custody_retained: bool,
     _credit: ByteCredit,
 }
 impl PartialEq for SourceWalTransportObservation {
     fn eq(&self, other: &Self) -> bool {
-        self.data.revision == other.data.revision
+        self.data.registered_custody_retained == other.data.registered_custody_retained
+            && self.data.revision == other.data.revision
             && self.data.correlation == other.data.correlation
             && self.data.nonce == other.data.nonce
             && self.data.wal_bytes == other.data.wal_bytes
@@ -152,6 +154,11 @@ impl PartialEq for SourceWalTransportObservation {
 }
 impl Eq for SourceWalTransportObservation {}
 impl SourceWalTransportObservation {
+    // Historical original-producer marker only; never current authority or a decision latch.
+    pub(crate) fn registered_custody_was_retained(&self) -> bool {
+        self.data.registered_custody_retained
+    }
+
     /// Historical family marker issued only after the actual owned policy entered successfully.
     /// This never proves current journal registration, physical allocation or settlement.
     pub fn policy_family(&self) -> Option<SourceWalPolicyFamily> {

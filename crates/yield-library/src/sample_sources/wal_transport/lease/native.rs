@@ -61,6 +61,14 @@ impl LeaseNative {
                 .unwrap_or(SourceWalTransportRejection::OwnerLost)),
         }
     }
+    pub(super) fn held_mut(
+        &mut self,
+    ) -> Result<&mut SourceLeaseMaintenancePreparation, SourceWalTransportRejection> {
+        match self {
+            Self::Held(held) => Ok(held),
+            _ => Err(SourceWalTransportRejection::OwnerLost),
+        }
+    }
     pub(super) fn database_identity(&self) -> Option<&str> {
         match self {
             Self::Held(h) => Some(h.observation().subject().database_identity()),

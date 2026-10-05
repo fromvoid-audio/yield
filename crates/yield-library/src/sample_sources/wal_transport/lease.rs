@@ -138,17 +138,24 @@ struct LeaseReport {
     bytes: Vec<u8>,
     correlation: SourceWalTransportCorrelation,
     wal_bytes: u64,
+    registered_custody_retained: bool,
     _credit: ByteCredit,
 }
 impl PartialEq for SourceLeaseWalTransportObservation {
     fn eq(&self, other: &Self) -> bool {
-        self.0.bytes == other.0.bytes
+        self.0.registered_custody_retained == other.0.registered_custody_retained
+            && self.0.bytes == other.0.bytes
             && self.0.correlation == other.0.correlation
             && self.0.wal_bytes == other.0.wal_bytes
     }
 }
 impl Eq for SourceLeaseWalTransportObservation {}
 impl SourceLeaseWalTransportObservation {
+    // Historical original-producer marker only; no current claim or decision authority.
+    pub(crate) fn registered_custody_was_retained(&self) -> bool {
+        self.0.registered_custody_retained
+    }
+
     /// Genuine original binding, retaining only historical issuer observations.
     pub fn original_binding(&self) -> &SourceLeaseMaintenanceBinding {
         &self.0.binding
@@ -244,11 +251,32 @@ impl SourceLeaseWalTransportOwner {
         if Instant::now() >= self.deadline() {
             return Err(SourceWalTransportRejection::Deadline);
         }
+        let wal_bytes = held.wal_bytes();
+        if self.request.handshake.is_some() {
+            self.native
+                .as_mut()
+                .ok_or(SourceWalTransportRejection::OwnerLost)?
+                .held_mut()?
+                .retain_registered_lease_binding(
+                    &binding,
+                    registration.ok_or(SourceWalTransportRejection::Scope)?,
+                )
+                .map_err(classify)?;
+        }
+        // Retention and original scope checks can consume time or race caller cancellation.
+        // Failed publication leaves the native count held for original-owner cleanup.
+        if self.is_cancelled() {
+            return Err(SourceWalTransportRejection::Cancelled);
+        }
+        if Instant::now() >= self.deadline() {
+            return Err(SourceWalTransportRejection::Deadline);
+        }
         let scope = SourceLeaseWalTransportObservation(Arc::new(LeaseReport {
             binding,
             bytes,
             correlation: self.request.correlation.clone(),
-            wal_bytes: held.wal_bytes(),
+            wal_bytes,
+            registered_custody_retained: self.request.handshake.is_some(),
             _credit: credit,
         }));
         self.scope = Some(scope.clone());
@@ -270,15 +298,19 @@ impl SourceLeaseWalTransportOwner {
             .ok_or(SourceWalTransportRejection::OwnerLost)?
             .held()?;
         match self.scope.as_ref() {
-            Some(scope) => held
-                .validate_lease_binding(
-                    scope.original_binding(),
-                    registration.ok_or(SourceWalTransportRejection::Scope)?,
-                )
-                .map_err(classify),
+            Some(scope) => {
+                let registration = registration.ok_or(SourceWalTransportRejection::Scope)?;
+                if self.request.handshake.is_some() {
+                    held.validate_registered_lease_binding(scope.original_binding(), registration)
+                } else {
+                    held.validate_lease_binding(scope.original_binding(), registration)
+                }
+                .map_err(classify)
+            }
             None => held.revalidate_owner().map_err(classify),
         }
     }
+
     /// Require the original parked scope and genuine current Registered authority.
     /// No historical reply, successful result or caller correlation can latch settlement.
     pub fn validate_registered(
