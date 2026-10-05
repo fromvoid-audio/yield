@@ -15,6 +15,7 @@ mod frozen_copy;
 mod legacy_adoption_custody;
 pub use legacy_adoption_custody::{LegacyAdoptionCustody, LegacyAdoptionCustodyError};
 mod native_read_capsule;
+mod publication_charge;
 mod publication_custody;
 mod publication_fence;
 mod resource_custody;
@@ -1125,6 +1126,7 @@ pub(crate) struct LiveChunkEffectGrant {
 pub(crate) struct StagingPublicationGrant {
     target: PreparedPublicationTarget,
     fence: publication_fence::PendingFence,
+    charge: super::capacity_provider::PublicationChargeBinding,
     source_pin: SourceEffectPin,
     resource_admission: Arc<ResourceAdmission>,
     input: InputPermit,
@@ -1151,6 +1153,7 @@ impl StagingPublicationGrant {
             self.target,
             self.input,
             self.fence,
+            self.charge,
         )
     }
 }
@@ -1183,6 +1186,11 @@ impl std::fmt::Debug for LiveChunkEffectGrant {
 impl LiveChunkEffectGrant {
     pub(crate) fn chunk_id(&self) -> Uuid {
         self.permit.chunk_id().as_uuid()
+    }
+
+    /// Scalar selection only; the original actor must resolve and bind its actual durable charge.
+    pub(crate) fn publication_charge_selector(&self) -> publication_charge::Selector {
+        publication_charge::Selector::Chunk(self.permit.chunk_id())
     }
 
     pub(crate) fn issue_id(&self) -> Uuid {
@@ -2354,6 +2362,7 @@ impl OwnerRuntime {
     fn checkpoint_and_grant_staging(
         &mut self,
         target: PreparedPublicationTarget,
+        charge_selector: publication_charge::Selector,
         registration: SourceAuthorityRegistrationReceipt,
         source_pin: SourceEffectPin,
         input: InputPermit,
@@ -2402,10 +2411,32 @@ impl OwnerRuntime {
                 reason: String::from("staging source fence differs from live registration"),
             });
         }
+        let provider = self.capacity_provider.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::StagingGrant {
+                reason: "original publication capacity provider is unavailable".into(),
+            }
+        })?;
+        let bytes = match validation.outcome() {
+            crate::file_operation_owner::EffectOutcome::Applied { evidence } => {
+                evidence.validated_staging().map(|proof| proof.bytes())
+            }
+            _ => None,
+        }
+        .ok_or_else(|| OperationJournalOwnerError::StagingGrant {
+            reason: "original publication target lacks validated staging bytes".into(),
+        })?;
         let fence = self.publication_fences.issue_for_source(
             validation.operation_id(),
             registration.registration_id,
             &input.shared,
+        )?;
+        let charge = publication_charge::bind(
+            self.store(),
+            provider,
+            charge_selector,
+            validation.operation_id(),
+            target.volume(),
+            bytes,
         )?;
         let checkpoint_result = self.store().checkpoint_staging_result(validation);
         let checkpoint: StagingCheckpointAck = self
@@ -2418,9 +2449,15 @@ impl OwnerRuntime {
         let grant_result = self.store().reserve_staging_grant(checkpoint, validation);
         self.publication_write_result(grant_result)?;
         validate_publication_target(&target)?;
+        provider
+            .validate_publication_charge(&charge)
+            .map_err(|error| OperationJournalOwnerError::StagingGrant {
+                reason: format!("original publication charge changed before reply: {error}"),
+            })?;
         Ok(StagingPublicationGrant {
             target,
             fence,
+            charge,
             input,
             source_pin,
             resource_admission: Arc::clone(&self.resource_admission),
@@ -4653,6 +4690,7 @@ impl OperationJournalClient {
     pub(crate) fn checkpoint_and_grant_staging(
         &self,
         target: PreparedPublicationTarget,
+        charge_selector: publication_charge::Selector,
         registration: SourceAuthorityRegistrationReceipt,
         source_pin: SourceEffectPin,
     ) -> Result<OperationJournalRequest<StagingPublicationGrant>, OperationJournalOwnerQueueError>
@@ -4663,6 +4701,7 @@ impl OperationJournalClient {
             true,
             move |input, result| JournalCommand::CheckpointStaging {
                 target,
+                charge_selector,
                 registration,
                 source_pin,
                 input,
@@ -5576,6 +5615,7 @@ enum JournalCommand {
     },
     CheckpointStaging {
         target: PreparedPublicationTarget,
+        charge_selector: publication_charge::Selector,
         registration: SourceAuthorityRegistrationReceipt,
         source_pin: SourceEffectPin,
         input: InputPermit,
@@ -6156,12 +6196,19 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
         }
         JournalCommand::CheckpointStaging {
             target,
+            charge_selector,
             registration,
             source_pin,
             input,
             result,
         } => execute_store_result(result, move || {
-            runtime.checkpoint_and_grant_staging(target, registration, source_pin, input)
+            runtime.checkpoint_and_grant_staging(
+                target,
+                charge_selector,
+                registration,
+                source_pin,
+                input,
+            )
         }),
         JournalCommand::CheckpointLiveChunkStaging {
             chunk_id,
@@ -6463,6 +6510,7 @@ mod tests {
     mod control_input_tests;
     mod control_responsiveness_tests;
     mod native_read_capsule_tests;
+    mod publication_charge_tests;
     mod publication_chunk_release_tests;
     mod publication_fence_tests;
     mod publication_input_tests;
@@ -9937,6 +9985,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("checkpoint issue result")
             .expect("checkpoint issue worker");
+        let publication_charge_selector = checkpoint_grant.publication_charge_selector();
         let mut wrong_chunk_checkpoint = client
             .checkpoint_live_chunk_staging(
                 checkpoint_claim.chunk_id(),
@@ -10029,6 +10078,7 @@ mod tests {
             let mut refused = client
                 .checkpoint_and_grant_staging(
                     target,
+                    publication_charge_selector,
                     registration.clone(),
                     guard.pin_for_effect().unwrap(),
                 )
@@ -10085,6 +10135,7 @@ mod tests {
         let mut checkpoint = client
             .checkpoint_and_grant_staging(
                 prepare_target(),
+                publication_charge_selector,
                 registration.clone(),
                 guard.pin_for_effect().expect("checkpoint source pin"),
             )
@@ -10107,6 +10158,7 @@ mod tests {
             let mut refused = client
                 .checkpoint_and_grant_staging(
                     prepare_target(),
+                    publication_charge_selector,
                     registration.clone(),
                     guard.pin_for_effect().unwrap(),
                 )
@@ -10288,6 +10340,7 @@ mod tests {
         let mut replay_checkpoint = client
             .checkpoint_and_grant_staging(
                 prepare_target(),
+                publication_charge_selector,
                 registration.clone(),
                 guard.pin_for_effect().expect("replay source pin"),
             )

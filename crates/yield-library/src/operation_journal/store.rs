@@ -1497,6 +1497,20 @@ impl OperationJournalStore {
         Ok(page)
     }
 
+    /// Point-read original claim evidence, rejecting a recorded release. This grants no authority.
+    pub(crate) fn read_active_ordinary_claim(
+        &self,
+        claim_id: AdmissionClaimId,
+    ) -> Result<Option<ordinary_claims::OrdinaryClaimRecord>, OrdinaryClaimReadError> {
+        self.validate_namespace()
+            .map_err(|error| OrdinaryClaimReadError::Namespace(error.to_string()))?;
+        let claim = ordinary_claims::read_claim(&self.connection, claim_id)?;
+        let released = ordinary_claims::read_release(&self.connection, claim_id)?.is_some();
+        self.validate_namespace()
+            .map_err(|error| OrdinaryClaimReadError::Namespace(error.to_string()))?;
+        Ok(if released { None } else { claim })
+    }
+
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn insert_ordinary_claim_for_test(
         &self,

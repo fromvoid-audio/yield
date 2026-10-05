@@ -87,7 +87,7 @@ impl PublicationChargeBinding {
 const _: () = assert!(
     std::mem::size_of::<ChargeMirror>()
         + MAX_VOLUMES * (std::mem::size_of::<ChargeObserver>() + 2 * std::mem::size_of::<usize>())
-        <= 4096
+        <= super::PUBLICATION_MIRROR_BYTES
 );
 impl Default for ChargeMirror {
     fn default() -> Self {

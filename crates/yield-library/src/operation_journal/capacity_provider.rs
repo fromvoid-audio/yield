@@ -25,7 +25,9 @@ use crate::operation_journal::model::OperationId;
 use uuid::Uuid;
 
 mod charge_observer;
-use charge_observer::{ChargeMirror, ChargeMutation, ChargeObserver, PublicationChargeBinding};
+pub(crate) use charge_observer::PublicationChargeBinding;
+pub(crate) const PUBLICATION_MIRROR_BYTES: usize = 4096;
+use charge_observer::{ChargeMirror, ChargeMutation, ChargeObserver};
 use std::sync::Arc;
 const INITIAL_LEASE_TOKEN: u64 = 1;
 

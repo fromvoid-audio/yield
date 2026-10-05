@@ -17,6 +17,7 @@ pub(crate) struct PublicationCustody {
     target: PreparedPublicationTarget,
     _input: InputPermit,
     fence: super::publication_fence::PendingFence,
+    charge: super::super::capacity_provider::PublicationChargeBinding,
 }
 pub(crate) type PublicationSourceUse = CountedSourceEntry<PublicationCustody>;
 #[cfg(all(test, target_os = "macos"))]
@@ -38,8 +39,14 @@ pub(super) fn begin_source_entry(
     target: PreparedPublicationTarget,
     input: InputPermit,
     fence: super::publication_fence::PendingFence,
+    charge: super::super::capacity_provider::PublicationChargeBinding,
 ) -> Result<PublicationSourceUse, OperationJournalOwnerError> {
     super::validate_publication_target(&target)?;
+    if !charge.is_current() {
+        return Err(OperationJournalOwnerError::StagingGrant {
+            reason: "original publication charge is no longer current".into(),
+        });
+    }
     counted_entry_checked(
         admission,
         || {
@@ -49,15 +56,26 @@ pub(super) fn begin_source_entry(
                 target,
                 _input: input,
                 fence,
+                charge,
             })
         },
         |custody| {
             if !custody.target.is_current() {
                 return Err(super::resource_custody::UseError::Closed);
             }
-            custody.fence.enter_checked()
+            // admission→original mirror→fence; only scalar transitions under these locks.
+            enter_charge_fence(&custody.charge, &mut custody.fence)
         },
     )
+}
+
+fn enter_charge_fence(
+    charge: &super::super::capacity_provider::PublicationChargeBinding,
+    fence: &mut super::publication_fence::PendingFence,
+) -> Result<(), super::resource_custody::UseError> {
+    charge
+        .with_current(|_| fence.enter_checked())
+        .ok_or(super::resource_custody::UseError::Closed)?
 }
 
 #[cfg(test)]
@@ -77,7 +95,7 @@ fn counted_entry_checked<T>(
     // closing between acquisition and upgrade refuses and drops source before runtime use.
     let mut runtime = admission.begin_read(|| true).map_err(closed)?;
     let mut source = acquire_source()?;
-    // Original admission and the issuer cancellation fence only. Exact capacity,
+    // Original admission, exact charge generation and issuer fence. Fresh qualified capacity,
     // qualified namespace entry and other mutation fences still belong to the adapter.
     runtime
         .enter_effect_checked(|| is_current(&mut source))

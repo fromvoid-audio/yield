@@ -183,3 +183,109 @@ fn counted_entry_retains_original_publication_credit_until_source_and_target_dro
     );
     assert_eq!(admission.snapshot(), (false, 0, true));
 }
+
+#[test]
+fn publication_charge_generation_change_during_counted_source_acquisition_refuses_final_entry() {
+    use crate::durable_capacity::{PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity};
+    use crate::operation_journal::admission_claims::{
+        AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory,
+    };
+    use crate::operation_journal::capacity_provider::CapacityProvider;
+    use crate::operation_journal::full_capacity::{
+        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
+    };
+    use crate::operation_journal::owner::{OperationId, OwnerCommandReceivers, OwnerShared};
+    for changed in [false, true] {
+        let volume = VolumeIdentity { device: 1 };
+        let plan = FullCapacityPlan::new(vec![
+            FullCapacityAllocation::new(
+                volume.clone(),
+                1,
+                FullCapacityAllocationClass::DestinationStaging,
+                1,
+                1,
+                PROTECTED_FREE_SPACE_FLOOR,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let claims = AdmissionClaimInventory::new(vec![
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                volume.clone(),
+                FullCapacityAllocationClass::DestinationStaging,
+                1,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let provider = CapacityProvider::qualified_fixture(
+            [(
+                volume.clone(),
+                VolumeFacts {
+                    identity: volume.clone(),
+                    allocation_unit: 1,
+                    free_bytes: PROTECTED_FREE_SPACE_FLOOR + 1024,
+                },
+            )]
+            .into(),
+        );
+        let operation = OperationId::new();
+        let mut lease = provider.admit(&plan, &claims).unwrap();
+        lease.mark_durable(operation).unwrap();
+        let (commands, _) = OwnerCommandReceivers::channel();
+        let shared = Arc::new(OwnerShared::new(commands));
+        let mut registry = super::super::publication_fence::Registry::new();
+        let mut fence = registry.issue(operation, &shared).unwrap();
+        let binding = provider
+            .bind_publication_charge(operation, &claims.claims()[0])
+            .unwrap();
+        let admission = ResourceAdmission::new();
+        assert!(admission.activate(|| true));
+        struct SourceSentinel(Arc<ResourceAdmission>, Arc<AtomicBool>);
+        impl Drop for SourceSentinel {
+            fn drop(&mut self) {
+                assert_eq!(self.0.snapshot().1, 1);
+                self.1.store(true, Ordering::Release);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result = counted_entry_checked(
+            &admission,
+            || {
+                assert_eq!(admission.snapshot().1, 1);
+                if changed {
+                    let extra = AdmissionClaimInventory::new(vec![
+                        AdmissionClaim::new(
+                            AdmissionClaimId::new(),
+                            volume.clone(),
+                            FullCapacityAllocationClass::DestinationStaging,
+                            1,
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap();
+                    // The actual provider mutation changes generation; dropping the provisional
+                    // lease returns only its own bytes and cannot revive the old observation.
+                    drop(provider.admit(&plan, &extra).unwrap());
+                }
+                Ok(SourceSentinel(admission.clone(), dropped.clone()))
+            },
+            |_| enter_charge_fence(&binding, &mut fence),
+        );
+        if changed {
+            assert!(result.is_err());
+            assert!(!binding.is_current());
+        } else {
+            assert!(result.is_ok());
+            assert!(binding.is_current());
+        }
+        drop(result);
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(admission.snapshot().1, 0);
+        if changed {
+            registry.close_for_cancellation(operation).unwrap();
+            assert!(!fence.enter());
+        }
+    }
+}

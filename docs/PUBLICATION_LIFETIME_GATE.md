@@ -702,3 +702,30 @@ registration and scalar fences; they supply no native capacity or publication
 grant. Physical lease closure alone cannot settle uncertain publication custody.
 Exact current charges, qualified namespace entry, provider/volume retirement,
 completion and genuine settlement remain open under OPT-2215.
+
+## Original exact charge consumption (OPT-2309)
+
+The real staging issuer now receives a bounded scalar ordinary/chunk selection.
+Selection grants no authority. The actor point-reads its original SQLite rows,
+rejects released evidence, and requires exact operation, target volume,
+DestinationStaging class and sufficient validated bytes. A chunk must be Issued
+and match its original ordinary row. The original provider then binds the exact
+retained durable charge; provisional, audit-pending, foreign or released ledger
+state cannot substitute. Binding precedes checkpoint/reservation and the actor
+revalidates it before returning the private grant.
+
+The original 8KiB registry debit is reserved before observer allocation and now
+statically covers its fence registry plus the bounded 4KiB mirror/32 observers.
+The binding stays with the original 64KiB grant/input through counted source
+custody. Final scalar entry uses admission→original mirror→fence order, requiring
+the captured generation atomically. Source acquisition and native/SQLite work
+remain outside those locks. Changed accounting, provider loss or uncertainty
+refuses entry; physical quiescence does not settle or refund retained charges.
+
+These checks supply charge association and lifetime only. Fresh qualified native
+facts and namespace allocation/provenance, remaining provider/volume fences,
+completion and genuine settlement remain open under OPT-2215 and its parents.
+The genuine macOS issuer harness selects its actual durable issued chunk through
+the original live grant; supported SDK/native execution remains OPT-2310.
+Linux/Windows do not compile macOS-only harness bodies. Portable owned-store and
+provider fixtures confer no native effect or physical qualification authority.
