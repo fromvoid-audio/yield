@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use super::output::{AudioDeviceSummary, AudioHostSummary};
 
@@ -14,51 +13,8 @@ pub use enumerate::{
 pub use resolve::resolve_input_stream_config;
 pub(crate) use stream::{StreamChannelSelection, build_input_stream};
 
-/// Errors that can occur while enumerating or opening audio inputs.
-#[derive(Debug, Error)]
-pub enum AudioInputError {
-    /// No audio input devices are available on the host.
-    #[error("No audio input devices found")]
-    NoInputDevices,
-    /// Failed to enumerate input devices on the host.
-    #[error("Could not list input devices: {source}")]
-    ListInputDevices {
-        /// Underlying cpal error.
-        source: cpal::DevicesError,
-    },
-    /// Failed to query supported input configs for a host.
-    #[error("Failed to read supported configs for {host_id}: {source}")]
-    SupportedInputConfigs {
-        /// Host identifier used for the query.
-        host_id: String,
-        /// Underlying cpal error.
-        source: cpal::SupportedStreamConfigsError,
-    },
-    /// Failed to create an input stream.
-    #[error("Failed to open input stream: {source}")]
-    OpenStream {
-        /// Underlying cpal error.
-        source: cpal::BuildStreamError,
-    },
-    /// Failed to read the default input config.
-    #[error("Failed to read default input config: {source}")]
-    DefaultInputConfig {
-        /// Underlying cpal error.
-        source: cpal::DefaultStreamConfigError,
-    },
-    /// Failed to start playback on an input stream.
-    #[error("Failed to start input stream: {source}")]
-    StartStream {
-        /// Underlying cpal error.
-        source: cpal::PlayStreamError,
-    },
-    /// Recording failed due to a runtime error.
-    #[error("Recording failed: {detail}")]
-    RecordingFailed {
-        /// Human-readable failure detail.
-        detail: String,
-    },
-}
+mod error;
+pub use error::AudioInputError;
 
 /// Persisted audio input preferences chosen by the user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

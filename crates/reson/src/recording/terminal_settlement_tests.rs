@@ -388,6 +388,7 @@ fn terminal_settlement_actual_failed_pcm_batch_arms_drop_without_barrier_or_comp
     assert!(observed.writer_accounting_complete);
 }
 
+#[cfg(feature = "native-audio")]
 #[test]
 fn terminal_settlement_actual_audio_recorder_stop_cancel_repeat_and_drop_routes() {
     use crate::input::ResolvedInput;

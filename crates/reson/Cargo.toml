@@ -3,8 +3,12 @@ name = "reson"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["native-audio"]
+native-audio = ["dep:cpal"]
+
 [dependencies]
-cpal = "0.17.1"
+cpal = { version = "0.17.1", optional = true }
 hound = "=3.5.1"
 ringbuf = "0.4"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -13,7 +17,7 @@ thiserror = "2.0.17"
 tracing = "0.1.41"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-cpal = { version = "0.17.1", features = ["asio"] }
+cpal = { version = "0.17.1", features = ["asio"], optional = true }
 
 [dev-dependencies]
 serde_json = "1.0.145"
