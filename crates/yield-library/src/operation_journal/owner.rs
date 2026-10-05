@@ -2307,6 +2307,11 @@ impl OwnerRuntime {
         registration: SourceAuthorityRegistrationReceipt,
         source_pin: SourceEffectPin,
     ) -> Result<StagingPublicationGrant, OperationJournalOwnerError> {
+        self.resource_admission.validate_open().map_err(|error| {
+            OperationJournalOwnerError::StagingGrant {
+                reason: format!("original publication admission is closed: {error:?}"),
+            }
+        })?;
         let source = self
             .source_registrations
             .get(&registration.registration_id)
@@ -2344,19 +2349,32 @@ impl OwnerRuntime {
                 reason: String::from("staging source fence differs from live registration"),
             });
         }
+        let checkpoint_result = self.store().checkpoint_staging_result(&validation);
         let checkpoint: StagingCheckpointAck = self
-            .store()
-            .checkpoint_staging_result(&validation)?
+            .publication_write_result(checkpoint_result)?
             .ok_or_else(|| OperationJournalOwnerError::StagingGrant {
                 reason: String::from("replayed staging checkpoint cannot issue a grant"),
             })?;
         source_pin.validate_for_issuance(&source.request, profile_guard)?;
-        self.store()
-            .reserve_staging_grant(checkpoint, &validation)?;
+        let grant_result = self.store().reserve_staging_grant(checkpoint, &validation);
+        self.publication_write_result(grant_result)?;
         Ok(StagingPublicationGrant {
             validation,
             source_pin,
         })
+    }
+
+    fn publication_write_result<T>(
+        &self,
+        result: Result<T, OperationJournalStoreError>,
+    ) -> Result<T, OperationJournalOwnerError> {
+        if matches!(
+            &result,
+            Err(OperationJournalStoreError::StagingOutcomeUncertain { .. })
+        ) {
+            self.resource_admission.invalidate();
+        }
+        result.map_err(Into::into)
     }
 
     fn checkpoint_live_chunk_staging(
@@ -6295,6 +6313,7 @@ mod tests {
     mod control_responsiveness_tests;
     mod native_read_capsule_tests;
     mod publication_input_tests;
+    mod publication_uncertainty_tests;
     mod resource_custody_tests;
     mod source_registry_handoff_tests;
     #[test]
@@ -8987,9 +9006,48 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn live_chunk_grant_crosses_to_file_owner_once_after_dropped_reply() {
+        native_live_chunk_and_staging_issuer(None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_publication_issuer_checkpoint_and_grant_uncertainty_close_original_gate() {
+        use super::super::store::InsertTestBoundary;
+        for nth in [1, 2] {
+            for boundary in [InsertTestBoundary::Commit, InsertTestBoundary::AfterCommit] {
+                native_live_chunk_and_staging_issuer(Some((nth, boundary)));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_live_chunk_and_staging_issuer(
+        fault: Option<(usize, super::super::store::InsertTestBoundary)>,
+    ) {
+        use super::super::store::{InsertTestBoundary, InsertTestDirective};
         let fixture = fixture("journal-owner-live-chunk-grant");
         let registry_path = fixture_volume_registry(&fixture);
         let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let armed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        if let Some((_, selected)) = fault {
+            let armed = armed.clone();
+            store.set_insert_test_hook(move |boundary| {
+                if boundary != selected || armed.load(Ordering::Acquire) == 0 {
+                    return InsertTestDirective::Continue;
+                }
+                if armed.fetch_sub(1, Ordering::AcqRel) != 1 {
+                    return InsertTestDirective::Continue;
+                }
+                let error = OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: "native original issuer durable-outcome fault".into(),
+                };
+                if boundary == InsertTestBoundary::Commit {
+                    InsertTestDirective::ExecuteThenFail(error)
+                } else {
+                    InsertTestDirective::Fail(error)
+                }
+            });
+        }
         let mut owner =
             OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
                 .expect("journal owner");
@@ -9728,6 +9786,9 @@ mod tests {
                 .expect("checkpoint release result")
                 .is_err()
         );
+        if let Some((nth, _)) = fault {
+            armed.store(nth, Ordering::Release);
+        }
         let mut checkpoint = client
             .checkpoint_and_grant_staging(
                 staged_result.clone(),
@@ -9735,10 +9796,39 @@ mod tests {
                 guard.pin_for_effect().expect("checkpoint source pin"),
             )
             .expect("staging checkpoint queues");
-        let publication = checkpoint
+        let publication_result = checkpoint
             .recv_timeout(Duration::from_secs(2))
-            .expect("staging checkpoint result")
-            .expect("acknowledged publication grant");
+            .expect("staging checkpoint result");
+        if fault.is_some() {
+            assert!(matches!(
+                publication_result,
+                Err(OperationJournalOwnerError::Store(
+                    OperationJournalStoreError::StagingOutcomeUncertain { .. }
+                ))
+            ));
+            assert_eq!(armed.load(Ordering::Acquire), 0);
+            assert!(matches!(
+                owner.shared.resource_admission.validate_open(),
+                Err(resource_custody::UseError::Unknown)
+            ));
+            let mut refused = client
+                .checkpoint_and_grant_staging(
+                    staged_result.clone(),
+                    registration.clone(),
+                    guard.pin_for_effect().unwrap(),
+                )
+                .unwrap();
+            assert!(matches!(
+                refused.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Err(OperationJournalOwnerError::StagingGrant { .. })
+            ));
+            staged.acknowledge().unwrap();
+            let _ = file_owner.shutdown();
+            drop(database);
+            assert!(!owner.shutdown());
+            return;
+        }
+        let publication = publication_result.expect("acknowledged publication grant");
         let (validated, permit) = publication
             .begin_publication()
             .expect("live publication entry");

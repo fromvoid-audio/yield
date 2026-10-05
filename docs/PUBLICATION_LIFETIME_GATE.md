@@ -550,3 +550,32 @@ issue publication permission, qualify a filesystem, refund a reservation or
 complete settlement. OPT-2215 still requires the complete original issuer, target
 and source association, bounded slots, all lifetime fences and native namespace
 allocation policy.
+
+## Durable staging uncertainty closes original issuance (OPT-2292)
+
+Checkpoint and one-shot grant reservation writes now distinguish a known
+precommit rejection from an unconfirmed durable outcome. Commit errors,
+unconfirmed rollback, lost postcommit acknowledgement, failed postcommit
+namespace validation and missing or conflicting readback return the typed
+`StagingOutcomeUncertain` error. Confirmed precommit rollback retains its ordinary
+checkpoint error. Commit errors remain conservatively uncertain even if a later
+rollback succeeds.
+
+The actual `OwnerRuntime::checkpoint_and_grant_staging` checks its original
+resource admission gate before issuance. A typed uncertain write invalidates that
+same original gate permanently; a later successful write or activation attempt
+cannot reopen it. Original counted reads refuse admission and shutdown remains
+unclean. Retained durable checkpoint/reservation bytes remain evidence; replay
+cannot construct a fresh private acknowledgement or grant.
+
+Portable tests exercise the original runtime gate, actual SQLite transaction
+faults, real authorization denial of COMMIT and actual postcommit row readback,
+retained rows and replay. The genuine macOS source/file-owner issuer harness adds
+four checkpoint/grant executed-commit and lost-acknowledgement cases. Supported
+macOS SDK compile and native execution are tracked in OPT-2293; Linux and Windows
+compilation do not validate macOS-only bodies.
+
+This does not fence previously issued source-only grants or other mutation and
+release routes. Those require the complete OPT-2215 slot implementation. Unknown
+quarantine does not qualify native publication, issue permission, refund a
+reservation or complete settlement.

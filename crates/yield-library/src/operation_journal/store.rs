@@ -265,6 +265,13 @@ pub enum OperationJournalStoreError {
         /// Bounded checkpoint diagnostic.
         reason: String,
     },
+    /// A staging checkpoint or grant write has no confirmed durable outcome.
+    /// The original publication issuer must permanently close admission.
+    #[error("operation journal staging durable outcome is uncertain: {reason}")]
+    StagingOutcomeUncertain {
+        /// Diagnostic for the unconfirmed commit, rollback or readback.
+        reason: String,
+    },
     /// A capability-bound incomplete chunk checkpoint failed closed.
     #[error("operation journal chunk staging error: {reason}")]
     ChunkStaging {
@@ -12835,7 +12842,10 @@ mod tests {
                 InsertTestDirective::Continue
             }
         });
-        assert!(store.checkpoint_staging(&checkpoint).is_err());
+        assert!(matches!(
+            store.checkpoint_staging(&checkpoint),
+            Err(OperationJournalStoreError::StagingCheckpoint { .. })
+        ));
         assert!(
             store
                 .read_staging_checkpoint_row(output_id)
@@ -12904,11 +12914,10 @@ mod tests {
                 InsertTestDirective::Continue
             }
         });
-        assert!(
-            reopened
-                .reserve_staging_grant_record(&checkpoint, checkpoint_sequence)
-                .is_err()
-        );
+        assert!(matches!(
+            reopened.reserve_staging_grant_record(&checkpoint, checkpoint_sequence),
+            Err(OperationJournalStoreError::StagingOutcomeUncertain { .. })
+        ));
 
         let uncertain_output = Uuid::new_v4();
         let mut uncertain_value = serde_json::to_value(&checkpoint).expect("checkpoint value");
@@ -12927,7 +12936,10 @@ mod tests {
                 InsertTestDirective::Continue
             }
         });
-        assert!(reopened.checkpoint_staging(&uncertain).is_err());
+        assert!(matches!(
+            reopened.checkpoint_staging(&uncertain),
+            Err(OperationJournalStoreError::StagingOutcomeUncertain { .. })
+        ));
         assert!(matches!(
             reopened
                 .checkpoint_staging(&uncertain)
@@ -12935,6 +12947,172 @@ mod tests {
             staging_checkpoints::StagingCheckpointReceipt::Replay { .. }
         ));
         let cancellation = CancellationRequestObservation::new(51).expect("cancel observation");
+        // Real SQLite COMMIT refusal leaves no row, but its unconfirmed durable outcome
+        // is conservatively distinct from a known precommit rejection.
+        let mut commit_value = uncertain_value.clone();
+        let commit_output = Uuid::new_v4();
+        commit_value["output_id"] = serde_json::json!(commit_output);
+        commit_value["effect_id"] = serde_json::json!(Uuid::new_v4());
+        let commit_record = staging_checkpoints::StagingCheckpointRecord::decode(
+            &serde_json::to_vec(&commit_value).unwrap(),
+        )
+        .unwrap();
+        reopened
+            .connection
+            .authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    rusqlite::hooks::AuthAction::Transaction {
+                        // rusqlite 0.37 maps SQLite's COMMIT authorization event to Unknown.
+                        operation: rusqlite::hooks::TransactionOperation::Unknown
+                    }
+                ) {
+                    rusqlite::hooks::Authorization::Deny
+                } else {
+                    rusqlite::hooks::Authorization::Allow
+                }
+            }));
+        assert!(matches!(
+            reopened.checkpoint_staging(&commit_record),
+            Err(OperationJournalStoreError::StagingOutcomeUncertain { .. })
+        ));
+        reopened.connection.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
+        assert!(
+            reopened
+                .read_staging_checkpoint_row(commit_output)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut rollback_value = uncertain_value.clone();
+        let rollback_output = Uuid::new_v4();
+        rollback_value["output_id"] = serde_json::json!(rollback_output);
+        rollback_value["effect_id"] = serde_json::json!(Uuid::new_v4());
+        let rollback_record = staging_checkpoints::StagingCheckpointRecord::decode(
+            &serde_json::to_vec(&rollback_value).unwrap(),
+        )
+        .unwrap();
+        reopened.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: "force precommit rejection before denied rollback".into(),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        reopened
+            .connection
+            .authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    rusqlite::hooks::AuthAction::Transaction {
+                        operation: rusqlite::hooks::TransactionOperation::Rollback
+                    }
+                ) {
+                    rusqlite::hooks::Authorization::Deny
+                } else {
+                    rusqlite::hooks::Authorization::Allow
+                }
+            }));
+        assert!(matches!(
+            reopened.checkpoint_staging(&rollback_record),
+            Err(OperationJournalStoreError::StagingOutcomeUncertain { .. })
+        ));
+        reopened.connection.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
+        assert!(!reopened.connection.is_autocommit());
+        reopened.connection.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            reopened
+                .read_staging_checkpoint_row(rollback_output)
+                .unwrap()
+                .is_none()
+        );
+
+        // Deny the actual postcommit staging-row read, rather than simulating a marker.
+        for grant_readback in [false, true] {
+            let mut value = uncertain_value.clone();
+            let output = Uuid::new_v4();
+            value["output_id"] = serde_json::json!(output);
+            value["effect_id"] = serde_json::json!(Uuid::new_v4());
+            let record = staging_checkpoints::StagingCheckpointRecord::decode(
+                &serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+            let sequence = if grant_readback {
+                match reopened.checkpoint_staging(&record).unwrap() {
+                    staging_checkpoints::StagingCheckpointReceipt::Committed { sequence } => {
+                        sequence
+                    }
+                    _ => panic!("fresh checkpoint must commit"),
+                }
+            } else {
+                0
+            };
+            let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook_flag = committed.clone();
+            reopened.set_insert_test_hook(move |boundary| {
+                if boundary == InsertTestBoundary::AfterCommit {
+                    hook_flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+                InsertTestDirective::Continue
+            });
+            let read_flag = committed.clone();
+            reopened.connection.authorizer(Some(
+                move |context: rusqlite::hooks::AuthContext<'_>| {
+                    if read_flag.load(std::sync::atomic::Ordering::Acquire)
+                        && matches!(
+                            context.action,
+                            rusqlite::hooks::AuthAction::Read {
+                                table_name: "operation_journal_staging_checkpoints",
+                                ..
+                            }
+                        )
+                    {
+                        rusqlite::hooks::Authorization::Deny
+                    } else {
+                        rusqlite::hooks::Authorization::Allow
+                    }
+                },
+            ));
+            let failed = if grant_readback {
+                reopened
+                    .reserve_staging_grant_record(&record, sequence)
+                    .map(|_| ())
+            } else {
+                reopened.checkpoint_staging(&record).map(|_| ())
+            };
+            assert!(matches!(
+                failed,
+                Err(OperationJournalStoreError::StagingOutcomeUncertain { .. })
+            ));
+            reopened.connection.authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            );
+            reopened.set_insert_test_hook(|_| InsertTestDirective::Continue);
+            let row = reopened
+                .read_staging_checkpoint_row(output)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.1, record);
+            assert_eq!(row.2, grant_readback);
+            if grant_readback {
+                assert!(
+                    reopened
+                        .reserve_staging_grant_record(&record, sequence)
+                        .is_err()
+                );
+            } else {
+                assert!(matches!(
+                    reopened.checkpoint_staging(&record).unwrap(),
+                    staging_checkpoints::StagingCheckpointReceipt::Replay { .. }
+                ));
+            }
+        }
         reopened
             .request_cancel_before_publish(operation_id, inserted.sequence(), cancellation)
             .expect("durable cancellation");

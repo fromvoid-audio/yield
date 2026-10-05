@@ -280,7 +280,33 @@ fn checkpoint_error(reason: impl Into<String>) -> OperationJournalStoreError {
     }
 }
 
+fn uncertain_outcome(reason: impl Into<String>) -> OperationJournalStoreError {
+    OperationJournalStoreError::StagingOutcomeUncertain {
+        reason: reason.into(),
+    }
+}
+
 impl OperationJournalStore {
+    fn rollback_staging_error(
+        &self,
+        error: OperationJournalStoreError,
+    ) -> OperationJournalStoreError {
+        match self.connection.execute_batch("ROLLBACK") {
+            Ok(()) => error,
+            Err(rollback) => {
+                uncertain_outcome(format!("{error}; rollback unconfirmed: {rollback}"))
+            }
+        }
+    }
+
+    fn commit_staging_transaction(&self) -> Result<(), OperationJournalStoreError> {
+        self.connection.execute_batch("COMMIT").map_err(|error| {
+            let rollback = self.connection.execute_batch("ROLLBACK");
+            uncertain_outcome(format!(
+                "commit outcome unconfirmed: {error}; rollback: {rollback:?}"
+            ))
+        })
+    }
     pub(crate) fn checkpoint_staging_result(
         &self,
         result: &FileOperationResult,
@@ -388,12 +414,13 @@ impl OperationJournalStore {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK");
-                return Err(error);
+                return Err(self.rollback_staging_error(error));
             }
         };
         if matches!(outcome, StagingCheckpointReceipt::Replay { .. }) {
-            self.connection.execute_batch("ROLLBACK")?;
+            self.connection.execute_batch("ROLLBACK").map_err(|error| {
+                uncertain_outcome(format!("replay rollback unconfirmed: {error}"))
+            })?;
             self.validate_namespace()?;
             return Ok(outcome);
         }
@@ -401,37 +428,39 @@ impl OperationJournalStore {
         let commit_directive = self.insert_test_directive(InsertTestBoundary::Commit);
         #[cfg(test)]
         if let Some(InsertTestDirective::Fail(error)) = commit_directive {
-            let _ = self.connection.execute_batch("ROLLBACK");
-            return Err(checkpoint_error(format!(
+            return Err(self.rollback_staging_error(checkpoint_error(format!(
                 "checkpoint commit was rejected: {error}"
-            )));
+            ))));
         }
         #[cfg(test)]
         if let Some(InsertTestDirective::ExecuteThenFail(error)) = commit_directive {
             let commit = self.connection.execute_batch("COMMIT");
             let _ = self.connection.execute_batch("ROLLBACK");
-            return Err(checkpoint_error(format!(
+            return Err(uncertain_outcome(format!(
                 "checkpoint commit outcome is uncertain: {error}; {commit:?}"
             )));
         }
-        self.connection.execute_batch("COMMIT")?;
+        self.commit_staging_transaction()?;
         #[cfg(test)]
         if let Some(InsertTestDirective::Fail(error)) =
             self.insert_test_directive(InsertTestBoundary::AfterCommit)
         {
-            return Err(checkpoint_error(format!(
+            return Err(uncertain_outcome(format!(
                 "checkpoint committed without acknowledgement: {error}"
             )));
         }
-        self.validate_namespace()?;
+        self.validate_namespace().map_err(|error| {
+            uncertain_outcome(format!("checkpoint postcommit namespace: {error}"))
+        })?;
         let (sequence, readback, reserved) = self
-            .read_staging_checkpoint_row(record.output_id())?
-            .ok_or_else(|| checkpoint_error("staging checkpoint disappeared during readback"))?;
+            .read_staging_checkpoint_row(record.output_id())
+            .map_err(|error| uncertain_outcome(format!("checkpoint readback failed: {error}")))?
+            .ok_or_else(|| uncertain_outcome("staging checkpoint disappeared during readback"))?;
         if readback != *record
             || reserved
             || outcome != (StagingCheckpointReceipt::Committed { sequence })
         {
-            return Err(checkpoint_error(
+            return Err(uncertain_outcome(
                 "staging checkpoint readback differs from committed record",
             ));
         }
@@ -501,41 +530,41 @@ impl OperationJournalStore {
             Ok(())
         })();
         if let Err(error) = transition {
-            let _ = self.connection.execute_batch("ROLLBACK");
-            return Err(error);
+            return Err(self.rollback_staging_error(error));
         }
         #[cfg(test)]
         let commit_directive = self.insert_test_directive(InsertTestBoundary::Commit);
         #[cfg(test)]
         if let Some(InsertTestDirective::Fail(error)) = commit_directive {
-            let _ = self.connection.execute_batch("ROLLBACK");
-            return Err(checkpoint_error(format!(
+            return Err(self.rollback_staging_error(checkpoint_error(format!(
                 "grant commit was rejected: {error}"
-            )));
+            ))));
         }
         #[cfg(test)]
         if let Some(InsertTestDirective::ExecuteThenFail(error)) = commit_directive {
             let commit = self.connection.execute_batch("COMMIT");
             let _ = self.connection.execute_batch("ROLLBACK");
-            return Err(checkpoint_error(format!(
+            return Err(uncertain_outcome(format!(
                 "grant commit outcome is uncertain: {error}; {commit:?}"
             )));
         }
-        self.connection.execute_batch("COMMIT")?;
+        self.commit_staging_transaction()?;
         #[cfg(test)]
         if let Some(InsertTestDirective::Fail(error)) =
             self.insert_test_directive(InsertTestBoundary::AfterCommit)
         {
-            return Err(checkpoint_error(format!(
+            return Err(uncertain_outcome(format!(
                 "grant committed without acknowledgement: {error}"
             )));
         }
-        self.validate_namespace()?;
+        self.validate_namespace()
+            .map_err(|error| uncertain_outcome(format!("grant postcommit namespace: {error}")))?;
         let (_, retained, reserved) = self
-            .read_staging_checkpoint_row(record.output_id())?
-            .ok_or_else(|| checkpoint_error("reserved checkpoint disappeared during readback"))?;
+            .read_staging_checkpoint_row(record.output_id())
+            .map_err(|error| uncertain_outcome(format!("grant readback failed: {error}")))?
+            .ok_or_else(|| uncertain_outcome("reserved checkpoint disappeared during readback"))?;
         if retained != *record || !reserved {
-            return Err(checkpoint_error(
+            return Err(uncertain_outcome(
                 "grant reservation readback differs from exact checkpoint",
             ));
         }
