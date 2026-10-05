@@ -92,5 +92,6 @@ pub use source::{SamplesBuffer, Source};
 #[cfg(feature = "native-audio")]
 pub(crate) const DEFAULT_ANTI_CLIP_FADE: Duration = Duration::from_millis(3);
 
-#[cfg(all(test, feature = "native-audio"))]
+#[cfg(feature = "native-audio")]
+#[cfg(test)]
 mod tests;

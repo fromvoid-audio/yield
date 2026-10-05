@@ -10,7 +10,8 @@ mod settlement;
 mod writer;
 pub use producer::{RecordingProducer, RecordingProducerOutcome};
 
-#[cfg(all(test, feature = "native-audio"))]
+#[cfg(feature = "native-audio")]
+#[cfg(test)]
 mod sink_contract_tests;
 
 #[cfg(feature = "native-audio")]
@@ -214,7 +215,8 @@ impl AudioRecorder {
 #[cfg(feature = "native-audio")]
 pub use monitor::InputMonitor;
 
-#[cfg(all(test, feature = "native-audio"))]
+#[cfg(feature = "native-audio")]
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
