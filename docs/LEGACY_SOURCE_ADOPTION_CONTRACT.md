@@ -527,3 +527,39 @@ refuse before migration or lease bootstrap. Genuine readonly-owner tests prove
 both alternate-affinity refusal and harmless formatting acceptance with preserved
 source bytes. This supplies no capacity, adoption receipt or physical qualification;
 full OPT-2117/2098/1745 remain open.
+
+## Original no-effect RW preparation (OPT-2341)
+
+The original journal custody worker now prepares an existing RW MAIN connection
+with an immutable connection-owned VFS fence installed before `sqlite3_open`.
+Installing `query_only` after an unrestricted RW open would be too late to stop
+SQLite's automatic hot-journal recovery. This preparer allows only the existing
+MAIN without creation or delete-on-close. It refuses auxiliary opens, writes,
+truncation, sync, deletion and SHM mutation before native callbacks, disables
+mapped database access and rejects unreviewed native file-control operations.
+The pinned SQLite core handles PRAGMA requests; a scalar setting cannot remove
+the VFS fence. Extension loading and native system-call replacement are refused.
+No API in this leaf disables the fence or issues a mutable admission grant.
+
+The genuine source owner validates its original reservation, profile, roots,
+native MAIN identity and exact frozen schema/row image before and after candidate
+preparation. It preserves a smaller original page cap downward with exact readback. It retains the original readonly connection until the candidate
+passes every check, then retains exactly one connection in the same source owner
+on the existing journal worker. Ordinary read-owner construction remains readonly.
+The entire journal preparation shares one cooperative two-second deadline.
+The private candidate preserves the live original connection until its caller
+returns or drops it. An initial handler refusal closes the source normally while
+preserving source/control evidence; it installs no slot. Successful and lost-reply
+custody retain the original slot, lock and metadata credit until normal shutdown. The 64KiB input debit covers retained metadata; native SQLite allocator
+memory is not certified by that debit. Candidate construction temporarily holds
+two SQLite connections, then retains one. This is no whole-process heap/RSS bound.
+
+Actual SQLite tests turn off SQL `query_only` and still observe zero forwarded
+native mutation callbacks and unchanged bytes/sidecars. A real process-death
+fixture first proves dirty spilled MAIN and a genuine hot DELETE journal, then
+proves fenced opening/reading does not replay or delete it. Independent ordinary
+SQLite recovery establishes that the fixture's journal is genuinely recoverable.
+These tests restrict effects; they do not qualify native physical allocation or
+power-loss durability. The permanent fence prepares custody only. Actual claims,
+durable intent, admitted mutable promotion, migration/receipt transaction,
+recovery and separately admitted lease bootstrap remain open under OPT-2117.

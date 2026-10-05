@@ -838,6 +838,22 @@ impl BoundDatabaseRoot {
         name: &Path,
         flags: rusqlite::OpenFlags,
     ) -> rusqlite::Result<crate::sqlite_budget::OwnedConnection> {
+        self.open_owned_sqlite_mode(name, flags, false)
+    }
+
+    pub(crate) fn open_existing_sqlite_no_effect(
+        &self,
+        name: &Path,
+    ) -> rusqlite::Result<crate::sqlite_budget::OwnedConnection> {
+        self.open_owned_sqlite_mode(name, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE, true)
+    }
+
+    fn open_owned_sqlite_mode(
+        &self,
+        name: &Path,
+        flags: rusqlite::OpenFlags,
+        no_effect: bool,
+    ) -> rusqlite::Result<crate::sqlite_budget::OwnedConnection> {
         let components = relative_components(name)
             .map_err(|_| rusqlite::Error::InvalidPath(name.to_path_buf()))?;
         if components.len() != 1 {
@@ -854,11 +870,15 @@ impl BoundDatabaseRoot {
         };
         #[cfg(not(target_os = "linux"))]
         let path = self.path.join(name);
-        let connection = crate::sqlite_budget::open_owned(
-            path,
-            flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            Some(descriptor),
-        )?;
+        let connection = if no_effect {
+            crate::sqlite_budget::no_effect::open_existing_no_effect(path, Some(descriptor))?
+        } else {
+            crate::sqlite_budget::open_owned(
+                path,
+                flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                Some(descriptor),
+            )?
+        };
         Ok(connection)
     }
 

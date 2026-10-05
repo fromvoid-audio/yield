@@ -43,6 +43,13 @@ unsafe extern "C" fn open(
         if name.is_null() && role != 4 {
             return ffi::SQLITE_CANTOPEN;
         }
+        if ctx.no_effect
+            && (role != 0
+                || flags & (ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_DELETEONCLOSE) != 0
+                || flags & ffi::SQLITE_OPEN_READWRITE == 0)
+        {
+            return ffi::SQLITE_READONLY;
+        }
         if role == 0 {
             if ctx
                 .main
@@ -82,6 +89,10 @@ unsafe extern "C" fn open(
         let Some(native_open) = (*native).xOpen else {
             return ffi::SQLITE_CANTOPEN;
         };
+        #[cfg(test)]
+        if role != 0 || flags & (ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_DELETEONCLOSE) != 0 {
+            ctx.native_effect_calls.fetch_add(1, Ordering::SeqCst);
+        }
         let rc = native_open(native, name, inner(f), flags, out);
         if rc != ffi::SQLITE_OK {
             if role == 0 {
@@ -150,6 +161,9 @@ unsafe extern "C" fn write(
     unsafe {
         let h = header(f);
         let ctx = &*h.context;
+        if ctx.no_effect {
+            return ffi::SQLITE_READONLY;
+        }
         if amount < 0 || offset < 0 || offset.checked_add(i64::from(amount)).is_none() {
             return ffi::SQLITE_IOERR_WRITE;
         }
@@ -184,6 +198,8 @@ unsafe extern "C" fn write(
             .take()
         {
             // Actual native prefix I/O then an uncertain failure, with no method-table patch.
+            #[cfg(test)]
+            ctx.native_effect_calls.fetch_add(1, Ordering::SeqCst);
             let rc = methods(f).xWrite.map_or(ffi::SQLITE_IOERR_WRITE, |call| {
                 call(inner(f), data, prefix.min(amount), offset)
             });
@@ -193,6 +209,8 @@ unsafe extern "C" fn write(
                 rc
             });
         }
+        #[cfg(test)]
+        ctx.native_effect_calls.fetch_add(1, Ordering::SeqCst);
         let rc = methods(f).xWrite.map_or(ffi::SQLITE_IOERR_WRITE, |call| {
             call(inner(f), data, amount, offset)
         });
@@ -206,6 +224,9 @@ unsafe extern "C" fn truncate(f: *mut ffi::sqlite3_file, size: i64) -> c_int {
         }
         let h = header(f);
         let ctx = &*h.context;
+        if ctx.no_effect {
+            return ffi::SQLITE_READONLY;
+        }
         let mut old = -1;
         if methods(f)
             .xFileSize
@@ -222,6 +243,8 @@ unsafe extern "C" fn truncate(f: *mut ffi::sqlite3_file, size: i64) -> c_int {
             }
         }
         // Non-growing rollback truncation remains possible after failure; it never refunds charge.
+        #[cfg(test)]
+        ctx.native_effect_calls.fetch_add(1, Ordering::SeqCst);
         let rc = methods(f)
             .xTruncate
             .map_or(ffi::SQLITE_IOERR_TRUNCATE, |call| call(inner(f), size));
@@ -232,6 +255,11 @@ unsafe extern "C" fn control(f: *mut ffi::sqlite3_file, op: c_int, arg: *mut c_v
     unsafe {
         let h = header(f);
         let ctx = &*h.context;
+        if ctx.no_effect {
+            if let Some(rc) = no_effect::control_result(op) {
+                return rc;
+            }
+        }
         if ctx.restricted() {
             match op {
                 ffi::SQLITE_FCNTL_SIZE_HINT => {
@@ -308,6 +336,9 @@ unsafe extern "C" fn shm_map(
             return ffi::SQLITE_IOERR_SHMMAP;
         }
         *output = ptr::null_mut();
+        if ctx.no_effect {
+            return ffi::SQLITE_READONLY;
+        }
         if ctx.restricted() && (page >= 4096 || size != 32768) {
             return ctx.charge(4, 1);
         }
@@ -323,6 +354,8 @@ unsafe extern "C" fn shm_map(
             *output = ptr::null_mut();
             return rc;
         }
+        #[cfg(test)]
+        ctx.native_effect_calls.fetch_add(1, Ordering::SeqCst);
         let rc = methods(f).xShmMap.map_or(ffi::SQLITE_IOERR_SHMMAP, |call| {
             call(inner(f), page, size, extend, output)
         });
@@ -340,6 +373,11 @@ unsafe extern "C" fn shm_map(
 unsafe extern "C" fn shm_unmap(f: *mut ffi::sqlite3_file, delete: c_int) -> c_int {
     unsafe {
         let ctx = &*header(f).context;
+        if ctx.no_effect {
+            return ffi::SQLITE_READONLY;
+        }
+        #[cfg(test)]
+        ctx.native_effect_calls.fetch_add(1, Ordering::SeqCst);
         let rc = methods(f)
             .xShmUnmap
             .map_or(ffi::SQLITE_IOERR_SHMOPEN, |call| call(inner(f), delete));
@@ -364,7 +402,7 @@ unsafe extern "C" fn fetch(
         }
         *output = ptr::null_mut();
         let ctx = &*header(f).context;
-        if ctx.restricted() {
+        if ctx.no_effect || ctx.restricted() {
             *output = ptr::null_mut();
             return ffi::SQLITE_OK;
         }
@@ -400,9 +438,14 @@ unsafe extern "C" fn unfetch(f: *mut ffi::sqlite3_file, offset: i64, data: *mut 
 unsafe extern "C" fn delete(v: *mut ffi::sqlite3_vfs, name: *const c_char, sync: c_int) -> c_int {
     unsafe {
         let ctx = context(v);
+        if ctx.no_effect {
+            return ffi::SQLITE_READONLY;
+        }
         if ctx.restricted() {
             return ctx.charge(4, 1);
         }
+        #[cfg(test)]
+        ctx.native_effect_calls.fetch_add(1, Ordering::SeqCst);
         (*ctx.native)
             .xDelete
             .map_or(ffi::SQLITE_IOERR_DELETE, |call| {
@@ -426,6 +469,9 @@ unsafe extern "C" fn sync(f: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
     unsafe {
         let h = header(f);
         let ctx = &*h.context;
+        if ctx.no_effect {
+            return ffi::SQLITE_READONLY;
+        }
         // Sync can allocate filesystem metadata even without growing the file.
         let rc = ctx.charge(h.role, 1);
         if rc != ffi::SQLITE_OK {
@@ -435,6 +481,8 @@ unsafe extern "C" fn sync(f: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
         if ctx.fail_sync.swap(false, Ordering::SeqCst) {
             return ctx.native_result(ffi::SQLITE_IOERR_FSYNC);
         }
+        #[cfg(test)]
+        ctx.native_effect_calls.fetch_add(1, Ordering::SeqCst);
         let rc = methods(f)
             .xSync
             .map_or(ffi::SQLITE_IOERR_FSYNC, |call| call(inner(f), flags));
@@ -488,6 +536,9 @@ unsafe extern "C" fn shm_lock(
     flags: c_int,
 ) -> c_int {
     unsafe {
+        if (&*header(f).context).no_effect {
+            return ffi::SQLITE_READONLY;
+        }
         methods(f)
             .xShmLock
             .map_or(ffi::SQLITE_IOERR_SHMLOCK, |call| {
@@ -532,6 +583,9 @@ unsafe extern "C" fn full_path(
 }
 unsafe extern "C" fn dl_open(v: *mut ffi::sqlite3_vfs, name: *const c_char) -> *mut c_void {
     unsafe {
+        if context(v).no_effect {
+            return ptr::null_mut();
+        }
         let native = context(v).native;
         (*native)
             .xDlOpen
@@ -604,6 +658,9 @@ unsafe extern "C" fn set_syscall(
     value: ffi::sqlite3_syscall_ptr,
 ) -> c_int {
     unsafe {
+        if context(v).no_effect {
+            return ffi::SQLITE_READONLY;
+        }
         let native = context(v).native;
         (*native)
             .xSetSystemCall

@@ -106,7 +106,7 @@ impl OperationJournalClient {
 impl OwnerRuntime {
     pub(super) fn prepare_legacy_custody(
         &mut self,
-        source: LegacySourceReadOwner,
+        mut source: LegacySourceReadOwner,
         participant: ParticipantId,
         command: SourceCommandId,
         input: InputPermit,
@@ -121,14 +121,16 @@ impl OwnerRuntime {
         self.store()
             .validate_for_admission()
             .map_err(|_| E::Changed)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let profile = self.final_profile_guard.as_ref().ok_or(E::Closed)?;
         let args = source
-            .prepare_legacy_adoption_input(
+            .prepare_legacy_adoption_input_until(
                 profile,
                 self.store(),
                 participant,
                 command,
                 &AtomicBool::new(false),
+                deadline,
             )
             .map_err(E::Preparation)?;
         let encoded = args.canonical_bytes().map_err(E::Preparation)?;
@@ -136,7 +138,32 @@ impl OwnerRuntime {
             return Err(E::Changed.into());
         }
         let digest = *blake3::hash(&encoded).as_bytes();
+        drop(encoded);
         source.validate(profile).map_err(|_| E::Changed)?;
+        self.store()
+            .validate_for_admission()
+            .map_err(|_| E::Changed)?;
+        if input.shared.status() != OperationJournalOwnerStatus::Available {
+            return Err(E::Closed.into());
+        }
+        source
+            .prepare_no_effect_writable_until(profile, deadline)
+            .map_err(|_| E::Changed)?;
+        // The preparation fence confers no admission. Freeze and compare the complete original
+        // input again through the retained no-effect connection before publishing custody.
+        let prepared = source
+            .prepare_legacy_adoption_input_until(
+                profile,
+                self.store(),
+                participant,
+                command,
+                &AtomicBool::new(false),
+                deadline,
+            )
+            .map_err(|_| E::Changed)?;
+        if prepared != args {
+            return Err(E::Changed.into());
+        }
         self.store()
             .validate_for_admission()
             .map_err(|_| E::Changed)?;
