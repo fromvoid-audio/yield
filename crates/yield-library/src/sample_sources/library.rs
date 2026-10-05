@@ -59,7 +59,7 @@ pub use harvest_authored::{
 };
 pub use harvest_copy::{
     HARVEST_COPY_MAX_BYTES, HARVEST_COPY_MAX_RECEIPTS, HarvestCopyDisposition, HarvestCopyReceipt,
-    HarvestCopyRequest, HarvestCopyResult,
+    HarvestCopyReceiptKey, HarvestCopyReceiptObservation, HarvestCopyRequest, HarvestCopyResult,
 };
 pub use harvest_facts::{
     HARVEST_FACTS_MAX_BYTES, HARVEST_FACTS_MAX_INCIDENT_EDGES, HARVEST_FACTS_MAX_PATH_BYTES,

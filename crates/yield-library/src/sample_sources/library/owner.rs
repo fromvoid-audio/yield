@@ -13,7 +13,9 @@ use super::harvest_authored::{
     HarvestAuthoredRequest, HarvestAuthoredResult, HarvestAuthoredSnapshot,
     HarvestAuthoredSnapshotRequest,
 };
-use super::harvest_copy::{HarvestCopyRequest, HarvestCopyResult};
+use super::harvest_copy::{
+    HarvestCopyReceiptKey, HarvestCopyReceiptObservation, HarvestCopyRequest, HarvestCopyResult,
+};
 use super::harvest_facts::{self, HarvestFactsBatch, HarvestFactsRequest};
 use super::mutation_context::{
     GlobalMutationCompletion, GlobalMutationKind, GlobalMutationRequest, ProfileAcquisitionId,
@@ -325,6 +327,10 @@ enum WriterCommand {
         request: HarvestCopyRequest,
         result: SyncSender<Result<HarvestCopyResult, LibraryError>>,
     },
+    ObserveHarvestCopyReceipt {
+        key: HarvestCopyReceiptKey,
+        result: SyncSender<Result<Option<HarvestCopyReceiptObservation>, LibraryError>>,
+    },
     #[cfg(any(test, feature = "test-support"))]
     PanicForTest {
         result: SyncSender<Result<(), LibraryError>>,
@@ -412,6 +418,10 @@ enum WriterReply {
         request: HarvestCopyRequest,
         value: Result<HarvestCopyResult, LibraryError>,
         result: SyncSender<Result<HarvestCopyResult, LibraryError>>,
+    },
+    ObserveHarvestCopyReceipt {
+        value: Result<Option<HarvestCopyReceiptObservation>, LibraryError>,
+        result: SyncSender<Result<Option<HarvestCopyReceiptObservation>, LibraryError>>,
     },
     ReferenceSnapshot {
         request: ReferenceSnapshotRequest,
@@ -524,6 +534,9 @@ impl WriterReply {
                 };
                 let _ = result.send(value);
             }
+            Self::ObserveHarvestCopyReceipt { result, value } => {
+                let _ = result.send(value);
+            }
             Self::CapturedMutation { result, value } => {
                 let _ = result.send(value);
             }
@@ -599,6 +612,9 @@ impl WriterReply {
                 let _ = result.send(Err(error));
             }
             Self::HarvestCopy { result, .. } => {
+                let _ = result.send(Err(error));
+            }
+            Self::ObserveHarvestCopyReceipt { result, .. } => {
                 let _ = result.send(Err(error));
             }
             Self::CapturedMutation { result, value } => {
@@ -1048,6 +1064,21 @@ impl GlobalLibraryWriter {
         self.send(WriterCommand::HarvestCopy { request, result })?;
         Ok(receiver)
     }
+    /// Read one immutable historical copy outcome through this original retained worker.
+    /// The scalar observation grants no replay, source, journal or physical authority.
+    pub fn observe_harvest_copy_receipt(
+        &self,
+        key: HarvestCopyReceiptKey,
+    ) -> Result<
+        Receiver<Result<Option<HarvestCopyReceiptObservation>, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        self.ensure_available()?;
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::ObserveHarvestCopyReceipt { key, result })?;
+        Ok(receiver)
+    }
+
     /// Read one complete bounded Harvest reference snapshot through the actual global owner.
     pub fn reference_snapshot(
         &self,
@@ -1661,6 +1692,7 @@ fn run_owner(
             command,
             &mut database,
             profile_guard.owner_identity(),
+            profile_guard.profile_root_identity(),
             &mut snapshot_fences,
             &harvest_generation,
         );
@@ -1700,6 +1732,7 @@ fn execute_command(
     command: WriterCommand,
     database: &mut LibraryDatabase,
     owner_identity: &str,
+    profile_identity: &str,
     snapshot_fences: &mut SnapshotFences,
     harvest_generation: &Arc<harvest_facts::Generation>,
 ) -> WriterReply {
@@ -1730,6 +1763,12 @@ fn execute_command(
             request,
             result,
         },
+        WriterCommand::ObserveHarvestCopyReceipt { key, result } => {
+            WriterReply::ObserveHarvestCopyReceipt {
+                value: database.observe_harvest_copy_receipt(profile_identity, key),
+                result,
+            }
+        }
         #[cfg(any(test, feature = "test-support"))]
         WriterCommand::PanicForTest { .. } => panic!("isolated global owner teardown fixture"),
         WriterCommand::CapturedMutation { request, result } => WriterReply::CapturedMutation {
@@ -1866,6 +1905,9 @@ fn send_command_error(command: WriterCommand, error: LibraryError) {
             let _ = result.send(Err(error));
         }
         WriterCommand::HarvestCopy { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        WriterCommand::ObserveHarvestCopyReceipt { result, .. } => {
             let _ = result.send(Err(error));
         }
         #[cfg(any(test, feature = "test-support"))]

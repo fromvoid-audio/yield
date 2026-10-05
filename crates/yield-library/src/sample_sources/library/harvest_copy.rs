@@ -7,6 +7,8 @@ use crate::sample_sources::db::{ManifestEnrollmentReceipt, SourceContentIdentity
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod historical;
+pub use historical::{HarvestCopyReceiptKey, HarvestCopyReceiptObservation};
 mod ledger;
 mod mutation;
 mod payload;
