@@ -1,4 +1,4 @@
-#![cfg(any(target_os = "linux", target_os = "macos"))]
+#![cfg(any(target_os = "linux", target_os = "macos", windows))]
 use super::*;
 use crate::app_dirs::{AppRootGuard, WritableProfileGuard};
 use std::{fs, time::Duration};
@@ -57,6 +57,7 @@ fn actual_native_main_wal_and_kernel_mapped_shm_are_distinct_read_only_facts() {
 }
 
 #[test]
+#[cfg(unix)]
 fn exact_size_replacement_of_main_or_wal_cannot_substitute_native_binding() {
     for name in ["test.db", "test.db-wal"] {
         let f = fixture();
@@ -74,6 +75,7 @@ fn exact_size_replacement_of_main_or_wal_cannot_substitute_native_binding() {
 }
 
 #[test]
+#[cfg(unix)]
 fn mapped_original_shm_refuses_identical_bytes_replacement_and_missing_path() {
     let f = fixture();
     let facts = capture(&f).unwrap();
@@ -93,6 +95,44 @@ fn mapped_original_shm_refuses_identical_bytes_replacement_and_missing_path() {
     fs::remove_file(&path).unwrap();
     fs::rename(&parked, &path).unwrap();
     assert_eq!(capture(&f).unwrap(), facts);
+    f.connection.execute_batch("ROLLBACK").unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_original_native_handles_refuse_rename_and_wrong_region_without_sql_or_close() {
+    let f = fixture();
+    let facts = capture(&f).unwrap();
+    let observation = f.root.readonly_observation().unwrap();
+    observation.validate().unwrap();
+    for name in ["test.db", "test.db-wal", "test.db-shm"] {
+        // Bundled win32 opens these native handles without FILE_SHARE_DELETE.
+        // Verify the OS refusal rather than pretend a Unix rename can succeed.
+        let path = f.temp.path().join(name);
+        assert!(fs::rename(&path, path.with_extension("parked")).is_err());
+        assert_eq!(capture(&f).unwrap(), facts);
+    }
+    let context = &f.connection.registration.as_ref().unwrap().context;
+    let original = context
+        .state
+        .lock()
+        .unwrap()
+        .mapped_shm_region_zero
+        .unwrap();
+    context.state.lock().unwrap().mapped_shm_region_zero = Some(original + 32768);
+    assert!(capture(&f).is_none());
+    context.state.lock().unwrap().mapped_shm_region_zero = Some(original);
+    let main = context.main.load(Ordering::SeqCst);
+    // SAFETY: real live private wrapper; ask for the wrong role and require refusal.
+    assert!(unsafe { io::known_windows_file(main, context, 1) }.is_none());
+    f.connection
+        .authorizer(Some(|_: rusqlite::hooks::AuthContext<'_>| {
+            rusqlite::hooks::Authorization::Deny
+        }));
+    assert_eq!(capture(&f).unwrap(), facts);
+    assert!(!f.connection.is_autocommit());
+    f.connection
+        .authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>);
     f.connection.execute_batch("ROLLBACK").unwrap();
 }
 

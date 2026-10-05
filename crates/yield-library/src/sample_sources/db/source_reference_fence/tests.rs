@@ -8,7 +8,7 @@ struct Fixture {
     // Close the source before removing its roots; restore global configuration before
     // releasing process-local test isolation.
     writer: SourceWriter,
-    root: tempfile::TempDir,
+    _root: tempfile::TempDir,
     _guard: WritableProfileGuard,
     _profile: PersistenceProfileGuard,
     _base_guard: ConfigBaseGuard,
@@ -46,7 +46,7 @@ impl Fixture {
             _base_guard: base_guard,
             _profile: profile,
             _guard: guard,
-            root,
+            _root: root,
             writer,
         }
     }
@@ -149,9 +149,9 @@ fn reference_read_fence_bounds_and_validates_audit_evidence_without_renewal() {
 fn reference_read_fence_rejects_replaced_media_root() {
     let fixture = Fixture::new();
     let fence = fixture.writer.reference_read_fence().unwrap();
-    let displaced = fixture.root.path().with_extension("displaced");
-    std::fs::rename(fixture.root.path(), &displaced).unwrap();
-    std::fs::create_dir(fixture.root.path()).unwrap();
+    let displaced = fixture._root.path().with_extension("displaced");
+    std::fs::rename(fixture._root.path(), &displaced).unwrap();
+    std::fs::create_dir(fixture._root.path()).unwrap();
     assert!(fence.validate().is_err());
     std::fs::remove_dir_all(displaced).unwrap();
 }

@@ -574,7 +574,7 @@ impl WalPreparationInput {
             header_bytes,
         })
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(in crate::operation_journal) fn budget_for_test(&self) -> Arc<HandshakeBudget> {
         Arc::clone(&self.budget)
     }

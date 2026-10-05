@@ -44,7 +44,7 @@ struct CurationFixture {
     _config_base: ConfigBaseGuard,
     _profile: PersistenceProfileGuard,
     _source: TempDir,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     profile_child: Option<PathBuf>,
     database: SourceDatabase,
     profile_guard: WritableProfileGuard,
@@ -1869,7 +1869,7 @@ impl CurationFixture {
             _config_base: config_base,
             _profile: profile,
             _source: source,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             profile_child,
             database,
             profile_guard,

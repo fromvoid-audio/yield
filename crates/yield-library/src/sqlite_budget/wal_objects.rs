@@ -5,6 +5,8 @@ use std::{path::Path, time::Instant};
 
 #[cfg(any(target_os = "macos", test))]
 mod darwin;
+#[cfg(any(windows, test))]
+pub(super) mod windows;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WalObjectFacts {
@@ -30,7 +32,11 @@ impl OwnedConnection {
         name: &Path,
         deadline: Instant,
     ) -> Option<WalObjects> {
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            windows::retained_wal_objects(self, root, name, deadline)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = (root, name, deadline);
             None
@@ -121,7 +127,7 @@ impl OwnedConnection {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn facts(file: &std::fs::File) -> Option<WalObjectFacts> {
     let metadata = file.metadata().ok()?;
     if !metadata.is_file() {

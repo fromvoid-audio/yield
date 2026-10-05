@@ -75,3 +75,38 @@ record tests and an isolated Windows Rust compile check cannot replace executing
 the native retained-file/directory/renamed-handle and device-refusal tests on a
 supported Windows filesystem.
 Native Windows execution and quota verification are tracked in OPT-2278.
+
+### Original Windows WAL object observations (OPT-2279)
+
+The private owned VFS now checks Windows MAIN/WAL file pointers against its
+original wrapper, context, role, `win32` VFS and exact bundled SQLite source ID.
+It borrows the native handles without closing or duplicating them. For SHM it
+locks SQLite's actual shared-node mutex, compares the original forwarder's
+region-zero address with the native region array, validates the committed shared
+read/write mapping, and compares both original mapping-file and locking-file
+handles with the retained no-follow SHM child. Current retained-root children,
+identities, sizes and deadline are checked again before returning observations.
+Unknown bindings refuse without SQL or filesystem mutation. Only the reviewed
+64-bit Windows layout is supported.
+
+The readonly root clone uses the existing Windows handle-derived final path and
+identity validator without acquiring a lease. Native Windows tests retain the
+actual profile-child fixture and test the bundled VFS's genuine no-delete-share
+rename refusal, changed mapping/foreign-role refusal and observation with all
+ordinary SQL denied. They do not pretend Unix replacement semantics apply.
+
+Reproduce the compile-only GNU Windows ABI check with the locked
+`libsqlite3-sys` registry source and an installed MinGW compiler:
+
+```sh
+x86_64-w64-mingw32-gcc-posix -fsyntax-only -DSQLITE_THREADSAFE=1 \
+  '-DYIELD_SQLITE_SOURCE="/absolute/locked/libsqlite3-sys/sqlite3/sqlite3.c"' \
+  crates/yield-library/tests/windows_wal_layout.c
+cargo check --locked -p yield-library --target x86_64-pc-windows-gnu --tests
+```
+
+These compile checks and portable layout/mapping refusal tests do not execute
+Windows APIs. Native execution and supported SDK/toolchain validation are tracked
+in OPT-2280; native capacity/quota execution remains OPT-2278. No physical
+allocation qualification, database claim slice, permit, retry, reservation refund,
+lifecycle release or genuine settlement is supplied. Full OPT-2194 remains open.

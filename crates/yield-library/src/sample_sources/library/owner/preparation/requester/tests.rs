@@ -1,5 +1,7 @@
 //! Genuine worker/SQLite tests. Empty reservations and historical scope issue no physical grant.
-use super::super::tests::{empty, external, fixture, release, request};
+#[cfg(target_os = "linux")]
+use super::super::tests::{empty, external};
+use super::super::tests::{fixture, release, request};
 use super::*;
 
 fn prepare(client: &GlobalWalPreparationClient, strict: bool) -> GlobalPreparationReservation {
