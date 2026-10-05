@@ -621,16 +621,39 @@ fn original_wal_binding_refuses_unknown_runtime_and_missing_completed_audit() {
                 )
                 .unwrap();
         }
-        assert!(matches!(
-            preparation.capture_wal_binding(&registration),
-            Err(SourceWalPreparationError::BindingUnavailable)
-        ));
+        let binding = preparation.capture_wal_binding(&registration);
+        assert!(if runtime_fault {
+            matches!(binding, Err(SourceWalPreparationError::BindingUnavailable))
+        } else {
+            matches!(
+                binding,
+                Err(SourceWalPreparationError::EmptyReservationChanged)
+            )
+        });
         busy(&other);
         assert_eq!(
             metadata(&other),
             before,
             "fault did not publish an audit change"
         );
+        if !runtime_fault {
+            let failure = preparation
+                .abort()
+                .err()
+                .expect("changed rows cannot return original writer");
+            assert!(matches!(
+                failure.error(),
+                SourceWalPreparationError::EmptyReservationChanged
+            ));
+            let failure = failure
+                .into_writer()
+                .err()
+                .expect("empty mismatch stays sticky");
+            assert_eq!(metadata(&other), before);
+            drop(registration);
+            drop(failure);
+            continue;
+        }
         let writer = preparation.abort().unwrap();
         if runtime_fault {
             // SAFETY: same returned connection, no outstanding statements or callback state.
@@ -721,4 +744,66 @@ fn registered_boundary_refuses_prepared_without_ordinary_sql_or_owner_release() 
     other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
     drop(registration);
     writer.close().unwrap();
+}
+
+#[test]
+fn original_source_empty_writer_rejects_mutation_and_weakened_transaction_without_reuse() {
+    for mutation in [false, true] {
+        let (_fixture, writer) = fixture();
+        let revision = writer.current_revision().unwrap();
+        let other = external(&writer);
+        let preparation = writer
+            .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        let connection = &preparation.held.writer().database.connection;
+        if mutation {
+            connection
+                .execute(
+                    "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+                    ["original-empty-fault", "uncommitted"],
+                )
+                .unwrap();
+            connection
+                .execute_batch("ROLLBACK; BEGIN IMMEDIATE")
+                .unwrap();
+        } else {
+            connection.execute_batch("ROLLBACK; BEGIN").unwrap();
+            connection
+                .query_row("SELECT count(*) FROM metadata", [], |r| r.get::<_, i64>(0))
+                .unwrap();
+        }
+        assert!(matches!(
+            preparation.revalidate_owner(),
+            Err(SourceWalPreparationError::EmptyReservationChanged)
+        ));
+        let failure = preparation
+            .abort()
+            .err()
+            .expect("changed original custody never returns a callable writer");
+        assert!(matches!(
+            failure.error(),
+            SourceWalPreparationError::EmptyReservationChanged
+        ));
+        assert!(failure.held.writer().database.connection.is_autocommit());
+        let failure = failure
+            .into_writer()
+            .err()
+            .expect("rollback does not clear sticky mismatch");
+        assert!(matches!(
+            failure.error(),
+            SourceWalPreparationError::EmptyReservationChanged
+        ));
+        assert_eq!(
+            other
+                .query_row(
+                    "SELECT count(*) FROM metadata WHERE key=?1",
+                    ["original-empty-fault"],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        drop(failure);
+        other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    }
 }

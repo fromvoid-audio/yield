@@ -504,3 +504,60 @@ fn retained_reservation_wrong_guard_closes_original_without_retirement() {
     assert_eq!(lease_state(&other), "released");
     wrong.close_database(different).unwrap();
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[test]
+fn original_source_empty_mismatch_keeps_registered_count_until_actual_connection_close() {
+    let (_fixture, writer) = fixture();
+    let revision = writer.current_revision().unwrap();
+    let other = external(&writer);
+    let (registration, _proof, request) = registered(&writer.database);
+    let mut preparation = writer
+        .prepare_wal_reservation(&revision, Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    let binding = preparation.capture_wal_binding(&registration).unwrap();
+    preparation
+        .retain_registered_wal_binding(&binding, &registration)
+        .unwrap();
+    assert_eq!(count(&request), 1);
+    preparation
+        .held
+        .writer()
+        .database
+        .connection
+        .execute(
+            "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+            ["registered-empty-fault", "uncommitted"],
+        )
+        .unwrap();
+    // Release itself must detect mismatch even without a preceding validation call.
+    let failure = preparation
+        .abort()
+        .err()
+        .expect("original changed custody stays private");
+    assert!(matches!(
+        failure.error(),
+        SourceWalPreparationError::EmptyReservationChanged
+    ));
+    assert_eq!(count(&request), 1);
+    assert!(failure.held.writer().database.connection.is_autocommit());
+    let failure = failure
+        .into_writer()
+        .err()
+        .expect("confirmed rollback cannot release original counted custody");
+    assert_eq!(count(&request), 1);
+    assert_eq!(
+        other
+            .query_row(
+                "SELECT count(*) FROM metadata WHERE key=?1",
+                ["registered-empty-fault"],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    drop(failure);
+    assert_eq!(count(&request), 0);
+    drop(registration);
+    assert_eq!(lease_state(&other), "released");
+}

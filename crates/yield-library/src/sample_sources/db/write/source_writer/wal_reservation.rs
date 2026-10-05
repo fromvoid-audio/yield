@@ -5,8 +5,8 @@ use crate::sample_sources::db::{
     SourceAuthorityError, SourceAuthorityRegistration, SourceAuthorityRetirementAck, SourceDbError,
 };
 use crate::sqlite_wal::enforce_wal_admission;
-use std::fmt;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{cell::Cell, fmt};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -39,6 +39,9 @@ pub enum SourceWalPreparationError {
     /// An existing caller-owned transaction cannot become preparation.
     #[error("source connection already has a transaction")]
     TransactionActive,
+    /// Original empty MAIN writer custody changed; rollback cannot authorize reuse.
+    #[error("original source empty writer reservation changed")]
+    EmptyReservationChanged,
     /// The empty preparation could not be rolled back; the writer stays private.
     #[error("source WAL preparation rollback remains unconfirmed")]
     RollbackUnconfirmed,
@@ -224,6 +227,7 @@ impl SourceWalPreparation {
         if self.is_expired() {
             return Err(SourceWalPreparationError::Deadline);
         }
+        self.held.validate_empty()?;
         let lease = self
             .held
             .writer()
@@ -258,6 +262,9 @@ impl SourceWalPreparation {
 struct HeldWriter {
     writer: Option<SourceWriter>,
     reservation: bool,
+    main_reserved: bool,
+    original_changes: u64,
+    empty_changed: Cell<bool>,
     restore_timeout: Option<Duration>,
     // Native writer/ordinary SQLite drops first. This lease reference then keeps final lease
     // cleanup from waiting on our own count until the counted use has released.
@@ -265,6 +272,32 @@ struct HeldWriter {
 }
 
 impl HeldWriter {
+    fn new(writer: SourceWriter) -> Self {
+        let original_changes = writer.database.connection.total_changes();
+        Self {
+            writer: Some(writer),
+            reservation: false,
+            main_reserved: false,
+            original_changes,
+            empty_changed: Cell::new(false),
+            restore_timeout: None,
+            registered: None,
+        }
+    }
+    fn validate_empty(&self) -> Result<(), SourceWalPreparationError> {
+        let connection = &self.writer().database.connection;
+        if self.empty_changed.get()
+            || !self.main_reserved
+            || !self.reservation
+            || connection.is_autocommit()
+            || connection.total_changes() != self.original_changes
+            || connection.transaction_state(Some("main")) != Ok(rusqlite::TransactionState::Write)
+        {
+            self.empty_changed.set(true);
+            return Err(SourceWalPreparationError::EmptyReservationChanged);
+        }
+        Ok(())
+    }
     fn close_ready(&self) -> bool {
         self.registered.as_ref().map_or_else(
             || self.writer().database.source_authority_close_ready(),
@@ -303,16 +336,26 @@ impl HeldWriter {
         self.writer().database.connection.busy_timeout(timeout)
     }
     fn release(&mut self) -> Result<SourceWriter, SourceWalPreparationError> {
+        if self.main_reserved {
+            let _ = self.validate_empty();
+        }
         let connection = &self.writer().database.connection;
+        if connection.total_changes() != self.original_changes {
+            self.empty_changed.set(true);
+        }
         if self.reservation {
             if connection.execute_batch("ROLLBACK").is_err() || !connection.is_autocommit() {
                 return Err(SourceWalPreparationError::RollbackUnconfirmed);
             }
             self.reservation = false;
+            self.main_reserved = false;
         }
         if let Some(timeout) = self.restore_timeout {
             self.restore_busy_timeout(timeout)?;
             self.restore_timeout = None;
+        }
+        if self.empty_changed.get() {
+            return Err(SourceWalPreparationError::EmptyReservationChanged);
         }
         // The original transaction is rolled back and timeout restoration confirmed.
         drop(self.registered.take());
@@ -387,12 +430,7 @@ impl SourceWriter {
         expected: &SourceRevision,
         deadline: Instant,
     ) -> Result<SourceWalPreparation, SourceWalPreparationFailure> {
-        let mut held = HeldWriter {
-            writer: Some(self),
-            reservation: false,
-            restore_timeout: None,
-            registered: None,
-        };
+        let mut held = HeldWriter::new(self);
         let prepared = prepare(&mut held, expected, deadline, true);
         finish_preparation(held, prepared, deadline, false)
     }
@@ -401,12 +439,7 @@ impl SourceWriter {
         expected: &SourceRevision,
         deadline: Instant,
     ) -> Result<SourceWalPreparation, SourceWalPreparationFailure> {
-        let mut held = HeldWriter {
-            writer: Some(self),
-            reservation: false,
-            restore_timeout: None,
-            registered: None,
-        };
+        let mut held = HeldWriter::new(self);
         let prepared = prepare(&mut held, expected, deadline, false);
         finish_preparation(held, prepared, deadline, true)
     }
@@ -436,10 +469,14 @@ fn finish_preparation(
             // Rollback/restore now when possible. If not confirmed, Failure keeps the
             // writer inaccessible; into_writer must retry release before it can be reused.
             let mut failure = SourceWalPreparationFailure { held, error };
+            if failure.held.main_reserved {
+                let _ = failure.held.validate_empty();
+            }
             if failure.held.reservation {
                 let connection = &failure.held.writer().database.connection;
                 if connection.execute_batch("ROLLBACK").is_ok() && connection.is_autocommit() {
                     failure.held.reservation = false;
+                    failure.held.main_reserved = false;
                 } else {
                     failure.error = SourceWalPreparationError::RollbackUnconfirmed;
                 }
@@ -580,9 +617,12 @@ fn prepare(
         held.restore_timeout = None;
     }
     acquired?;
+    held.main_reserved = true;
+    held.validate_empty()?;
     let revision = validate(held.writer(), expected, deadline)?;
     let state = enforce_wal_admission(&held.writer().database.connection)?;
     let wal_bytes = state.observed_bytes();
+    held.validate_empty()?;
     if Instant::now() >= deadline {
         return Err(SourceWalPreparationError::Deadline);
     }

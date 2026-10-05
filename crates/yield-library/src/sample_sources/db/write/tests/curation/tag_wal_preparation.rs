@@ -529,7 +529,7 @@ case!(
 
 fn bounds() {
     for count in [64, 128] {
-        let (writer, _fixture, old) = writer();
+        let (writer, fixture, old) = writer();
         db(&writer)
             .execute("DELETE FROM wav_file_tags WHERE tag_id=?1", [old])
             .unwrap();
@@ -563,7 +563,6 @@ fn bounds() {
                 .all(|p| p[0].as_path() < p[1].as_path())
         );
         let before = source_writer_state_snapshot(writer.database_for_tests());
-        let original = settings(&writer);
         let handle = unsafe { db(&writer).handle() };
         let held = writer.prepare_tag_wal_reservation(obs, request()).unwrap();
         held.revalidate().unwrap();
@@ -589,17 +588,19 @@ fn bounds() {
         authorizer(handle, Some(deny_begin));
         assert!(matches!(
             held.revalidate(),
-            Err(SourceWalPreparationError::Owner(
-                SourceWriterError::StaleFence
-            ))
+            Err(SourceWalPreparationError::EmptyReservationChanged)
         ));
         authorizer(handle, None);
-        let writer = held.abort().unwrap();
-        assert_eq!(settings(&writer), original);
-        assert_eq!(
-            source_writer_state_snapshot(writer.database_for_tests()),
-            before
-        );
+        let failure = held
+            .abort()
+            .err()
+            .expect("changed tag custody stays private");
+        let failure = failure
+            .into_writer()
+            .err()
+            .expect("rollback cannot authorize changed tag reuse");
+        drop(failure);
+        assert_eq!(source_writer_state_snapshot(&fixture.database), before);
     }
 }
 fn wal() {
