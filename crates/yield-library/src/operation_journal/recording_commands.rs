@@ -477,10 +477,18 @@ fn encode_value(value: &impl Serialize) -> Result<Vec<u8>, RecordingValueError> 
     serde_json::to_writer(&mut writer, value).map_err(invalid)?;
     Ok(writer.finish())
 }
+// Test-only observation at the actual generic Value parser, never admission authority.
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static RECORDING_VALUE_PARSE_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn decode_value<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, RecordingValueError> {
     if bytes.len() > MAX_RECORDING_VALUE_BYTES {
         return Err(invalid("encoded value exceeds bound"));
     }
+    #[cfg(test)]
+    RECORDING_VALUE_PARSE_ENTRIES.with(|entries| entries.set(entries.get().saturating_add(1)));
     let value = parse_unique_value(bytes).map_err(invalid)?;
     validate_json_depth(&value, 24).map_err(invalid)?;
     serde_json::from_value(value).map_err(invalid)

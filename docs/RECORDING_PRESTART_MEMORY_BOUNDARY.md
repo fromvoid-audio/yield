@@ -12,7 +12,16 @@ owned rows. Scalar queries refuse the complete inventory when it contains more
 than 32 operation/ordinary-claim/release/recovery rows per relation, more than 16
 recording rows, any database binding/slice/attempt/outcome, full-progress or chunk
 claim row, any captured recording payload, or oversized/wrongly typed row text.
-Recording rows must fit the 1 KiB empty-control envelope. Operation BLOBs must be
+Recording rows must fit the 1 KiB empty-control envelope. Within the same original
+read snapshot, the control reader compares each BLOB directly with the expected
+canonical empty reservation encoded from the validated proposal. It does not
+send retained control bytes to the generic JSON Value parser. Even a small BLOB
+can otherwise own a large graph of singleton maps before a post-parse depth or
+shape check. Trusted control encoding streams through the existing capped writer
+(initial 4 KiB backing) and uses the already-budgeted proposal encoding scratch.
+A different encoding returns the narrow resource refusal; it is not labeled a
+corrupt historical inventory. General control reads and full rebuild retain their
+existing typed acceptance, including valid noncanonical whitespace. Operation BLOBs must be
 at most 64 KiB each and 128 KiB in aggregate. UTF-8 text bounds count bytes rather
 than SQLite's TEXT code points.
 

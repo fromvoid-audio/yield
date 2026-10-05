@@ -234,3 +234,118 @@ fn recording_prestart_budget_refuses_complete_count_before_decoding_any_record()
         Some(records[0].clone())
     );
 }
+
+#[test]
+fn recording_prestart_budget_refuses_hostile_control_before_generic_value_parser() {
+    use crate::operation_journal::recording_commands::RECORDING_VALUE_PARSE_ENTRIES;
+    let f = fixture();
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    let proposal =
+        crate::operation_journal::recording_commands::recording_proposal_for_test(2, 100);
+    store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    // Under the complete raw envelope, but each singleton object owns a map node
+    // in the generic parser before that parser's post-construction depth refusal.
+    let hostile = format!("{}0{}", "{\"x\":".repeat(100), "}".repeat(100)).into_bytes();
+    assert!(hostile.len() < 1024);
+    store.connection.execute(
+        "UPDATE operation_journal_recording_chunks SET record=?1 WHERE operation_id=?2 AND slot=20000",
+        rusqlite::params![hostile, proposal.operation_id().to_string()],
+    ).unwrap();
+    let retained = || {
+        store.connection.query_row(
+        "SELECT chunk_id,sequence,record FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=20000",
+        [proposal.operation_id().to_string()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+    ).unwrap()
+    };
+    let before = retained();
+    assert_eq!(before.2, hostile);
+    RECORDING_VALUE_PARSE_ENTRIES.with(|entries| entries.set(0));
+    let result = store.recording_prestart_proposal(proposal.operation_id());
+    RECORDING_VALUE_PARSE_ENTRIES.with(|entries| {
+        assert_eq!(
+            entries.get(),
+            0,
+            "scoped control refusal must precede generic Value parsing"
+        )
+    });
+    assert!(matches!(
+        result,
+        Err(OperationJournalStoreError::RecordingPrestartResourceBound)
+    ));
+    assert!(store.connection.is_autocommit());
+    assert!(!store.recording_prestart_scope.get());
+    assert_eq!(retained(), before);
+    drop(store);
+    let reopened = OperationJournalStore::open(&f.owner).unwrap();
+    let after: (String, i64, Vec<u8>) = reopened.connection.query_row(
+        "SELECT chunk_id,sequence,record FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=20000",
+        [proposal.operation_id().to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(after, before);
+    assert!(reopened.connection.is_autocommit());
+}
+
+#[test]
+fn recording_prestart_budget_noncanonical_control_keeps_generic_historical_acceptance() {
+    use crate::operation_journal::recording_commands::RECORDING_VALUE_PARSE_ENTRIES;
+    let f = fixture();
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    let proposal =
+        crate::operation_journal::recording_commands::recording_proposal_for_test(2, 100);
+    store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    let baseline = store.rebuild_admission_snapshot().unwrap();
+    let before: (String, i64, Vec<u8>) = store.connection.query_row(
+        "SELECT chunk_id,sequence,record FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=20000",
+        [proposal.operation_id().to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    let mut noncanonical = vec![b' '];
+    noncanonical.extend_from_slice(&before.2);
+    noncanonical.push(b'\n');
+    assert!(noncanonical.len() <= 1024);
+    store.connection.execute(
+        "UPDATE operation_journal_recording_chunks SET record=?1 WHERE operation_id=?2 AND slot=20000",
+        rusqlite::params![noncanonical, proposal.operation_id().to_string()],
+    ).unwrap();
+    assert!(
+        store
+            .verify_recording_reservation(&proposal, false)
+            .unwrap()
+    );
+    assert_eq!(store.rebuild_admission_snapshot().unwrap(), baseline);
+    RECORDING_VALUE_PARSE_ENTRIES.with(|entries| entries.set(0));
+    assert!(matches!(
+        store.recording_prestart_proposal(proposal.operation_id()),
+        Err(OperationJournalStoreError::RecordingPrestartResourceBound)
+    ));
+    RECORDING_VALUE_PARSE_ENTRIES.with(|entries| assert_eq!(entries.get(), 0));
+    assert!(store.connection.is_autocommit());
+    assert!(!store.recording_prestart_scope.get());
+    let after: (String, i64, Vec<u8>) = store.connection.query_row(
+        "SELECT chunk_id,sequence,record FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=20000",
+        [proposal.operation_id().to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!((after.0, after.1), (before.0, before.1));
+    assert_eq!(after.2, noncanonical);
+    assert!(
+        store
+            .verify_recording_reservation(&proposal, false)
+            .unwrap()
+    );
+    assert_eq!(store.rebuild_admission_snapshot().unwrap(), baseline);
+    drop(store);
+    let reopened = OperationJournalStore::open(&f.owner).unwrap();
+    assert!(
+        reopened
+            .verify_recording_reservation(&proposal, false)
+            .unwrap()
+    );
+    assert_eq!(reopened.rebuild_admission_snapshot().unwrap(), baseline);
+}
