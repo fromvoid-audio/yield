@@ -1431,6 +1431,12 @@ mod tests {
 
     #[test]
     fn native_reader_last_original_volume_owner_alias_fences_before_lock_release() {
+        #[cfg(target_os = "linux")]
+        if process_isolation::run_in_child(
+            "native_reader_last_original_volume_owner_alias_fences_before_lock_release",
+        ) {
+            return;
+        }
         let fixture = fixture();
         let owner = acquire_fixture_for_test(
             &fixture.descriptor,
@@ -1468,6 +1474,12 @@ mod tests {
     }
     #[test]
     fn old_v1_unseen_device_ignores_uuid_dirty_owner_and_active_policy_keeps_shared_key() {
+        #[cfg(target_os = "linux")]
+        if process_isolation::run_in_child(
+            "old_v1_unseen_device_ignores_uuid_dirty_owner_and_active_policy_keeps_shared_key",
+        ) {
+            return;
+        }
         let fixture = fixture();
         let modern = acquire_fixture_for_test(
             &fixture.descriptor,
@@ -1521,15 +1533,19 @@ mod tests {
         assert_eq!(fs::read(&uuid_primary).unwrap(), uuid_dirty);
         drop(old);
         let old_dirty = fs::read(&unseen_path).unwrap();
-        assert!(matches!(
-            acquire_fixture_for_test(
-                &fixture.descriptor,
-                &fixture.registry,
-                volume(42),
-                "new-profile"
+        let reacquired = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(42),
+            "new-profile",
+        );
+        assert!(
+            matches!(
+                reacquired,
+                Err(VolumeOwnershipError::ReconciliationRequired { .. })
             ),
-            Err(VolumeOwnershipError::ReconciliationRequired { .. })
-        ));
+            "expected retained dirty marker after final old owner close: {reacquired:?}"
+        );
         assert_eq!(fs::read(&unseen_path).unwrap(), old_dirty);
     }
 

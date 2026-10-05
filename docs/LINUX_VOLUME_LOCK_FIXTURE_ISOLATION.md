@@ -18,7 +18,7 @@ unlock a remaining cloned context. This establishes a concrete inheritance
 mechanism; the original failed run did not record which concurrent child held
 the descriptor.
 
-Six existing close/reacquire fixtures execute their original bodies in separate
+Eight existing close/reacquire fixtures execute their original bodies in separate
 Linux test processes, filtered to exactly one case with one test thread. The
 parent checks the child exit status with a 30-second deadline; timeout kills and
 reaps the child, including parent panic paths. A private entry marker proves the
@@ -26,6 +26,16 @@ exact original test body ran; a negative case rejects a successful zero-test
 selection. No case is ignored and acquisition is not retried. The fork
 regression has its own bounded child synchronization and cleanup. Other libtest
 cases can launch subprocesses without inheriting these child-owned lock files.
+
+OPT-2338 extends the same scheduling rule to the original native-reader alias
+fence and old-v1 dirty-owner compatibility cases. The latter failed in a fresh
+main default-parallel run: after the final old parent descriptor closed,
+reacquisition returned `OwnedByAnotherProcess` on its unique temporary lock
+instead of observing the retained dirty marker. The assertion now reports the
+actual error. The synchronized fork regression establishes the descriptor
+inheritance mechanism; the failed parallel run does not identify its concurrent
+child. Both original bodies, including marker preservation and final alias
+fencing, execute once in the exact marked child; no production policy changes.
 
 Production ownership, clone lifetime, fencing, clean markers and lock release
 remain unchanged. In particular, explicitly unlocking on each capability drop
