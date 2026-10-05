@@ -60,11 +60,12 @@ normal-build case proves missing history remains absent after process death.
 The ignored child helper is explicitly invoked by each non-ignored parent;
 its ignore is not a skipped acceptance case.
 
-Initial Linux focused evidence: 31 authored-related cases passed before the
-shared guard's duplicate test was removed; both normal-build process parents
-passed with zero failures. Final current-tree results are recorded in the PR and
-Linear after repository verification. Windows GNU compilation proves target
-compatibility only; native platform runtime evidence remains separate.
+Linux focused evidence: 30 authored-related cases, 30 Copy cases, 19 Facts
+cases, and both normal-build process parents passed with zero failures. Final
+current-tree repository results are recorded in the PR and Linear after
+verification. Native runtime verification is tracked by OPT-2360 with both
+positive and missing-history parent commands on actual macOS and Windows.
+Windows GNU compilation proves target compatibility only.
 
 ## Limits
 
