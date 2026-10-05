@@ -98,6 +98,18 @@ enum RecordingCollision {
     RequireAbsentNoReplace,
 }
 impl RecordingFormat {
+    /// Frozen serializer sample rate, without capture authority.
+    pub(crate) fn sample_rate(self) -> u32 {
+        self.sample_rate
+    }
+    /// Frozen interleaved channel count, without capture authority.
+    pub(crate) fn channels(self) -> u16 {
+        self.channels
+    }
+    /// Frozen finite frame ceiling, without capture authority.
+    pub(crate) fn max_frames(self) -> u64 {
+        self.max_frames
+    }
     /// Validate before allocating rings, durable storage or a staging object.
     pub fn new(
         sample_rate: u32,

@@ -1052,3 +1052,127 @@ fn recording_rebuild_refuses_orphan_binding_order_and_sequence_corruption_withou
         assert!(store.connection.is_autocommit());
     }
 }
+
+#[test]
+fn recording_prestart_reads_exact_empty_reservation_and_refuses_capture_without_mutation() {
+    use crate::operation_journal::recording_commands::recording_proposal_for_test;
+    let f = fixture();
+    let proposal = recording_proposal_for_test(2, 100);
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    let before = store.recording_retained_totals().unwrap();
+    assert_eq!(
+        store
+            .recording_prestart_proposal(proposal.operation_id())
+            .unwrap(),
+        proposal
+    );
+    assert_eq!(store.recording_retained_totals().unwrap(), before);
+    drop(store);
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    assert_eq!(
+        store
+            .recording_prestart_proposal(proposal.operation_id())
+            .unwrap(),
+        proposal
+    );
+    store
+        .retain_recording_chunk(&initial_recording_header(&proposal))
+        .unwrap();
+    let captured = store.recording_retained_totals().unwrap();
+    assert!(
+        store
+            .recording_prestart_proposal(proposal.operation_id())
+            .is_err()
+    );
+    assert_eq!(store.recording_retained_totals().unwrap(), captured);
+}
+
+#[test]
+fn recording_prestart_refuses_missing_or_unknown_controls_without_retrofit() {
+    use crate::operation_journal::recording_commands::{
+        controls::{ControlRole, RecordingControlReservation},
+        recording_proposal_for_test,
+    };
+    for missing in [true, false] {
+        let f = fixture();
+        let proposal = recording_proposal_for_test(2, 100);
+        let store = OperationJournalStore::open(&f.owner).unwrap();
+        store
+            .insert_intent(&finite_recording_record(&proposal))
+            .unwrap();
+        let control = RecordingControlReservation::new(&proposal, ControlRole::Frozen).unwrap();
+        if missing {
+            store
+                .connection
+                .execute(
+                    "DELETE FROM operation_journal_recording_chunks WHERE chunk_id=?1",
+                    [control.id().to_string()],
+                )
+                .unwrap();
+        } else {
+            store
+                .connection
+                .execute(
+                    "UPDATE operation_journal_recording_chunks SET record=?1 WHERE chunk_id=?2",
+                    params![b"unknown control".as_slice(), control.id().to_string()],
+                )
+                .unwrap();
+        }
+        let before = store.recording_retained_totals().unwrap();
+        let rows: Vec<(String, Vec<u8>)> = store
+            .connection
+            .prepare(
+                "SELECT chunk_id,record FROM operation_journal_recording_chunks ORDER BY chunk_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            store
+                .recording_prestart_proposal(proposal.operation_id())
+                .is_err()
+        );
+        assert_eq!(store.recording_retained_totals().unwrap(), before);
+        let after: Vec<(String, Vec<u8>)> = store
+            .connection
+            .prepare(
+                "SELECT chunk_id,record FROM operation_journal_recording_chunks ORDER BY chunk_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(after, rows);
+    }
+}
+
+#[test]
+fn recording_prestart_refuses_actual_cancel_disposition_and_preserves_reservation() {
+    use crate::operation_journal::recording_commands::recording_proposal_for_test;
+    let f = fixture();
+    let proposal = recording_proposal_for_test(2, 100);
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    let inserted = store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    store
+        .request_cancel_before_publish(
+            proposal.operation_id(),
+            inserted.sequence(),
+            CancellationRequestObservation::new(2).unwrap(),
+        )
+        .unwrap();
+    let before = store.recording_retained_totals().unwrap();
+    assert!(
+        store
+            .recording_prestart_proposal(proposal.operation_id())
+            .is_err()
+    );
+    assert_eq!(store.recording_retained_totals().unwrap(), before);
+}

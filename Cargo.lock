@@ -8859,6 +8859,7 @@ dependencies = [
  "filetime",
  "hound",
  "libc",
+ "reson",
  "rusqlite",
  "serde",
  "serde_json",
