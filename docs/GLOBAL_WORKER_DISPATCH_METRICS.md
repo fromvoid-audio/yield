@@ -23,12 +23,22 @@ only in each bounded queued envelope and is discarded at dequeue/drop; snapshots
 contain neither raw timestamps/durations nor source/profile/operation/path/SQL
 or error identifiers. There is no dimension registry or extra command buffer.
 
-The collector uses six saturating relaxed atomic counters. Concurrent snapshots
-read fields independently and can differ across moments; do not require count
+The collector uses six saturating relaxed atomic counters and three fixed queue
+counters under a short mutex. Successful nonblocking send and backlog increment
+are serialized with dequeue/drop accounting. Each accepted envelope owns one
+private ticket: normal dequeue removes it from backlog, while explicit discard
+or receiver destruction/unwind removes it and increments abandoned once. Failed
+full/disconnected sends contribute nothing. Current backlog excludes executing
+commands; its boundary is completion of dequeue accounting, so an envelope just
+removed from the channel can briefly remain counted while awaiting that lock.
+Peak counts that successful envelope backlog, including this short boundary;
+it is not a claim about the channel's instantaneous physical length. The queue
+fields are internally consistent. Dispatch atomics in concurrent snapshots
+are read independently and can differ across moments; do not require count
 and bucket totals to agree while work runs. Counts are cumulative for this owner
 acquisition, remain observable after shutdown, and start fresh with a new owner.
 Saturation loses later samples. Observations never control queue admission,
-lifecycle, retries, SQL or capacity, and cannot establish queue depth or an SLO.
+lifecycle, retries, SQL or capacity, and cannot establish an SLO.
 Dequeue is not a committed mutation or physical qualification.
 
 Verification uses actual bounded channels for full/disconnected/discard and
@@ -47,6 +57,7 @@ cargo test -p yield-library --lib global_wal --locked
 scripts/agent.sh preflight
 ```
 
-This is OPT-2161's dispatch boundary only. OPT-1673 retains queue-depth, other
-owners and full lifecycle acceptance; OPT-2135/2136/2137 retain their WAL
+OPT-2161 supplies validated dispatch counts and residence buckets; OPT-2328
+adds successful envelope backlog, peak and abandonment. OPT-1673 retains other
+owners, reserve/retry/retained outcomes and full lifecycle acceptance; OPT-2135/2136/2137 retain their WAL
 reservation/admission/required-commit contracts and production authority work.
