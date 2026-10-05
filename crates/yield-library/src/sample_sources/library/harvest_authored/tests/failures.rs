@@ -37,6 +37,22 @@ fn harvest_authored_owner_changed_cas_and_identity_conflict_are_retained() {
         f.apply(r).unwrap(),
         HarvestAuthoredResult::Replayed(_)
     ));
+    let historical = f
+        .global()
+        .observe_harvest_authored_receipt(
+            HarvestAuthoredReceiptKey::new(changed.receipt().operation()).unwrap(),
+        )
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        historical.disposition(),
+        HarvestAuthoredDisposition::GraphChanged
+    );
+    assert_eq!(historical.requested_state(), HarvestState::Done);
+    assert_eq!(historical.sequence(), changed.receipt().sequence());
     assert_eq!(f.state(), "ignored");
     f.db()
         .execute("UPDATE harvest_files SET content_hash=?1", ["b".repeat(64)])
@@ -46,6 +62,22 @@ fn harvest_authored_owner_changed_cas_and_identity_conflict_are_retained() {
         conflict.receipt().disposition(),
         HarvestAuthoredDisposition::IdentityConflict
     );
+    let historical = f
+        .global()
+        .observe_harvest_authored_receipt(
+            HarvestAuthoredReceiptKey::new(conflict.receipt().operation()).unwrap(),
+        )
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        historical.disposition(),
+        HarvestAuthoredDisposition::IdentityConflict
+    );
+    assert_eq!(historical.requested_state(), HarvestState::Done);
+    assert_eq!(historical.sequence(), conflict.receipt().sequence());
     assert_eq!(f.state(), "ignored");
 }
 #[test]

@@ -1,37 +1,10 @@
 //! Original-owner readback of immutable metadata history, never execution or completion authority.
 use super::*;
 use crate::operation_journal::work_plan::WorkUnitRole;
-use rusqlite::{Connection, limits::Limit};
+use rusqlite::Connection;
 use std::sync::{Arc, atomic::AtomicBool};
 
-// SQLite can compare an unindexed foreign key before any matching-row shape predicate.
-// This caps that native value/record allocation, not only Rust row materialization.
-const SQLITE_HISTORY_VALUE_LIMIT: i32 = 256 * 1024;
-pub(super) struct HistoricalValueLimit<'a> {
-    connection: &'a Connection,
-    previous: i32,
-}
-impl<'a> HistoricalValueLimit<'a> {
-    pub(super) fn new(connection: &'a Connection) -> Result<Self, LibraryError> {
-        let previous = connection.limit(Limit::SQLITE_LIMIT_LENGTH)?;
-        connection.set_limit(
-            Limit::SQLITE_LIMIT_LENGTH,
-            previous.min(SQLITE_HISTORY_VALUE_LIMIT),
-        )?;
-        Ok(Self {
-            connection,
-            previous,
-        })
-    }
-}
-impl Drop for HistoricalValueLimit<'_> {
-    fn drop(&mut self) {
-        // Borrowed connection stays live through normal return, refusal and worker unwind.
-        let _ = self
-            .connection
-            .set_limit(Limit::SQLITE_LIMIT_LENGTH, self.previous);
-    }
-}
+pub(super) use super::super::harvest_facts::budget::HistoricalValueLimit;
 fn map_history_error(error: LibraryError) -> LibraryError {
     if matches!(&error, LibraryError::HarvestFactsQueryBudget)
         || matches!(&error, LibraryError::Sql(rusqlite::Error::SqliteFailure(code, _))

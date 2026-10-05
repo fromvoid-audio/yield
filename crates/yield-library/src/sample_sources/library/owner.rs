@@ -10,8 +10,8 @@ use thiserror::Error;
 use super::connection::LibraryDatabase;
 use super::error::LibraryError;
 use super::harvest_authored::{
-    HarvestAuthoredRequest, HarvestAuthoredResult, HarvestAuthoredSnapshot,
-    HarvestAuthoredSnapshotRequest,
+    HarvestAuthoredReceiptKey, HarvestAuthoredReceiptObservation, HarvestAuthoredRequest,
+    HarvestAuthoredResult, HarvestAuthoredSnapshot, HarvestAuthoredSnapshotRequest,
 };
 use super::harvest_copy::{
     HarvestCopyReceiptKey, HarvestCopyReceiptObservation, HarvestCopyRequest, HarvestCopyResult,
@@ -331,6 +331,10 @@ enum WriterCommand {
         key: HarvestCopyReceiptKey,
         result: SyncSender<Result<Option<HarvestCopyReceiptObservation>, LibraryError>>,
     },
+    ObserveHarvestAuthoredReceipt {
+        key: HarvestAuthoredReceiptKey,
+        result: SyncSender<Result<Option<HarvestAuthoredReceiptObservation>, LibraryError>>,
+    },
     #[cfg(any(test, feature = "test-support"))]
     PanicForTest {
         result: SyncSender<Result<(), LibraryError>>,
@@ -422,6 +426,10 @@ enum WriterReply {
     ObserveHarvestCopyReceipt {
         value: Result<Option<HarvestCopyReceiptObservation>, LibraryError>,
         result: SyncSender<Result<Option<HarvestCopyReceiptObservation>, LibraryError>>,
+    },
+    ObserveHarvestAuthoredReceipt {
+        value: Result<Option<HarvestAuthoredReceiptObservation>, LibraryError>,
+        result: SyncSender<Result<Option<HarvestAuthoredReceiptObservation>, LibraryError>>,
     },
     ReferenceSnapshot {
         request: ReferenceSnapshotRequest,
@@ -537,6 +545,9 @@ impl WriterReply {
             Self::ObserveHarvestCopyReceipt { result, value } => {
                 let _ = result.send(value);
             }
+            Self::ObserveHarvestAuthoredReceipt { result, value } => {
+                let _ = result.send(value);
+            }
             Self::CapturedMutation { result, value } => {
                 let _ = result.send(value);
             }
@@ -615,6 +626,9 @@ impl WriterReply {
                 let _ = result.send(Err(error));
             }
             Self::ObserveHarvestCopyReceipt { result, .. } => {
+                let _ = result.send(Err(error));
+            }
+            Self::ObserveHarvestAuthoredReceipt { result, .. } => {
                 let _ = result.send(Err(error));
             }
             Self::CapturedMutation { result, value } => {
@@ -1076,6 +1090,21 @@ impl GlobalLibraryWriter {
         self.ensure_available()?;
         let (result, receiver) = mpsc::sync_channel(1);
         self.send(WriterCommand::ObserveHarvestCopyReceipt { key, result })?;
+        Ok(receiver)
+    }
+
+    /// Read one immutable historical authored outcome through this original retained worker.
+    /// The scalar observation grants no replay, source, journal or physical authority.
+    pub fn observe_harvest_authored_receipt(
+        &self,
+        key: HarvestAuthoredReceiptKey,
+    ) -> Result<
+        Receiver<Result<Option<HarvestAuthoredReceiptObservation>, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        self.ensure_available()?;
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.send(WriterCommand::ObserveHarvestAuthoredReceipt { key, result })?;
         Ok(receiver)
     }
 
@@ -1769,6 +1798,12 @@ fn execute_command(
                 result,
             }
         }
+        WriterCommand::ObserveHarvestAuthoredReceipt { key, result } => {
+            WriterReply::ObserveHarvestAuthoredReceipt {
+                value: database.observe_harvest_authored_receipt(profile_identity, key),
+                result,
+            }
+        }
         #[cfg(any(test, feature = "test-support"))]
         WriterCommand::PanicForTest { .. } => panic!("isolated global owner teardown fixture"),
         WriterCommand::CapturedMutation { request, result } => WriterReply::CapturedMutation {
@@ -1908,6 +1943,9 @@ fn send_command_error(command: WriterCommand, error: LibraryError) {
             let _ = result.send(Err(error));
         }
         WriterCommand::ObserveHarvestCopyReceipt { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        WriterCommand::ObserveHarvestAuthoredReceipt { result, .. } => {
             let _ = result.send(Err(error));
         }
         #[cfg(any(test, feature = "test-support"))]

@@ -54,7 +54,8 @@ pub use harvest::{
 };
 pub use harvest_authored::{
     HARVEST_AUTHORED_MAX_BYTES, HARVEST_AUTHORED_MAX_RECEIPTS, HarvestAuthoredDisposition,
-    HarvestAuthoredReceipt, HarvestAuthoredRequest, HarvestAuthoredResult, HarvestAuthoredSnapshot,
+    HarvestAuthoredReceipt, HarvestAuthoredReceiptKey, HarvestAuthoredReceiptObservation,
+    HarvestAuthoredRequest, HarvestAuthoredResult, HarvestAuthoredSnapshot,
     HarvestAuthoredSnapshotRequest,
 };
 pub use harvest_copy::{

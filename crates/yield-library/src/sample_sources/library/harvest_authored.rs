@@ -5,7 +5,9 @@ use crate::operation_journal::{OperationId, StoredRelativePath};
 use crate::sample_sources::db::SourceContentIdentityObservation;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+mod historical;
 mod ledger;
+pub use historical::{HarvestAuthoredReceiptKey, HarvestAuthoredReceiptObservation};
 mod payload;
 #[cfg(test)]
 mod tests;
