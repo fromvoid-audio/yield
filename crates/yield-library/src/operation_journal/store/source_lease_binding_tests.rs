@@ -304,6 +304,11 @@ mod source_lease_binding_storage {
         let (record, claims, inventory) = input(&store, &f.owner);
         let image = crate::operation_journal::encode(&record).unwrap();
         let decoded = crate::operation_journal::decode(&image).unwrap();
+        assert_eq!(
+            crate::operation_journal::codec::decode_with_limits(&image, stored_json_limits())
+                .unwrap(),
+            decoded
+        );
         assert_eq!(crate::operation_journal::encode(&decoded).unwrap(), image);
         assert_eq!(
             crate::operation_journal::classify_record(&decoded),

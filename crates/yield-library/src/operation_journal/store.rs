@@ -9303,6 +9303,7 @@ mod tests {
     include!("store/recording_retention_tests.rs");
     include!("store/record_materialization_tests.rs");
     include!("store/recording_control_tests.rs");
+    include!("store/json_materialization_tests.rs");
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]

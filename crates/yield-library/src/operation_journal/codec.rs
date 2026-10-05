@@ -6,8 +6,10 @@
 
 use std::io::{self, Write};
 
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
+
+mod materialization;
+pub use materialization::{BoundedDecodeError, JsonMaterializationLimits, JsonResourceKind};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
@@ -1632,6 +1634,32 @@ fn persisted_v15_from_record(
     Ok(persisted_tagged_ref_from_record(record))
 }
 
+/// Decode with explicit quotas for the initial untrusted JSON value tree.
+/// This does not account for parser scratch, later typed decoding/clones, allocator
+/// overhead or caller backing; it grants no admission or effect authority.
+pub fn decode_with_limits(
+    bytes: &[u8],
+    limits: JsonMaterializationLimits,
+) -> Result<StoredOperationRecord, BoundedDecodeError> {
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err(DecodeError::Oversize {
+            actual: bytes.len(),
+            maximum: MAX_RECORD_BYTES,
+        }
+        .into());
+    }
+    let value = materialization::parse(bytes, Some(limits)).map_err(|failure| {
+        if let Some((resource, maximum)) = failure.limit {
+            BoundedDecodeError::LimitExceeded { resource, maximum }
+        } else {
+            BoundedDecodeError::Decode(DecodeError::Malformed {
+                reason: format!("invalid JSON: {}", failure.error),
+            })
+        }
+    })?;
+    decode_value(value).map_err(Into::into)
+}
+
 /// Decode one bounded persisted operation record.
 ///
 /// The input is checked against [`MAX_RECORD_BYTES`] before JSON parsing. Unknown schema versions
@@ -1647,6 +1675,10 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
     let value = parse_unique_value(bytes).map_err(|error| DecodeError::Malformed {
         reason: format!("invalid JSON: {error}"),
     })?;
+    decode_value(value)
+}
+
+fn decode_value(value: Value) -> Result<StoredOperationRecord, DecodeError> {
     let version = value
         .get("schema_version")
         .and_then(Value::as_u64)
@@ -1859,112 +1891,7 @@ fn malformed(reason: impl Into<String>) -> DecodeError {
 }
 
 pub(super) fn parse_unique_value(bytes: &[u8]) -> Result<Value, serde_json::Error> {
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let value = UniqueValueSeed.deserialize(&mut deserializer)?;
-    deserializer.end()?;
-    Ok(value)
-}
-
-struct UniqueValueSeed;
-
-impl<'de> DeserializeSeed<'de> for UniqueValueSeed {
-    type Value = Value;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(UniqueValueVisitor)
-    }
-}
-
-struct UniqueValueVisitor;
-
-impl<'de> Visitor<'de> for UniqueValueVisitor {
-    type Value = Value;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON value without duplicate object keys")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(Value::Bool(value))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        serde_json::Number::from_f64(value)
-            .map(Value::Number)
-            .ok_or_else(|| E::custom("JSON number is not finite"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(Value::String(value.to_owned()))
-    }
-
-    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
-        Ok(Value::String(value.to_owned()))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(Value::String(value))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        UniqueValueSeed.deserialize(deserializer)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::new();
-        while let Some(value) = sequence.next_element_seed(UniqueValueSeed)? {
-            values.push(value);
-        }
-        Ok(Value::Array(values))
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut object = Map::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if object.contains_key(&key) {
-                return Err(de::Error::custom(format!(
-                    "duplicate JSON object field `{key}`"
-                )));
-            }
-            let value = map.next_value_seed(UniqueValueSeed)?;
-            object.insert(key, value);
-        }
-        Ok(Value::Object(object))
-    }
+    materialization::parse(bytes, None).map_err(|failure| failure.error)
 }
 
 /// Encode one stored record using its persisted schema and a capped writer.
@@ -4416,6 +4343,7 @@ pub(super) fn validate_json_depth(value: &Value, maximum: usize) -> Result<(), &
 
 #[cfg(test)]
 mod tests {
+    include!("codec/materialization_tests.rs");
     use super::*;
     use crate::operation_journal::{
         DecodedEditIntentArgs, DecodedExportBatchIntentArgs, DecodedExportIntentArgs,
