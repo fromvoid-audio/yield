@@ -44,7 +44,7 @@ impl OriginalDecision {
                 && Instant::now() < self.round.deadline
         })
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(in crate::operation_journal) fn start_sqlite(&mut self) -> bool {
         let Ok(state) = self.round.acknowledged.lock() else {
             return false;

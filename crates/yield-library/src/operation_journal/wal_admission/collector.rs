@@ -248,14 +248,14 @@ impl Collector {
     pub(in crate::operation_journal) fn decision_nonce(&self) -> Option<uuid::Uuid> {
         self.decision.as_ref().map(|decision| decision.nonce())
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(in crate::operation_journal) fn start_settlement(&mut self) -> bool {
         self.decision
             .as_mut()
             .is_some_and(|decision| decision.start_sqlite())
     }
     /// Call only after definite original SQLite outcome or exact durable readback.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(in crate::operation_journal) fn resolve_settlement(&mut self) {
         if let Some(decision) = self.decision.take() {
             decision.resolve();
