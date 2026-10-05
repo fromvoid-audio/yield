@@ -11,6 +11,97 @@ use crate::operation_journal::participants::{
 use crate::sample_sources::SourceId;
 use serde_json::Value;
 
+#[test]
+fn recording_typed_decode_dense_pcm_does_not_enter_generic_value_parser() {
+    let proposal = proposal(2, 2048);
+    let bytes: Vec<u8> = (0..MAX_RECORDING_CHUNK_BYTES).map(|i| i as u8).collect();
+    let chunk = RecordingCapturedChunk::new(
+        &proposal,
+        Uuid::new_v4(),
+        RecordingChunkRole::Pcm { ordinal: 0 },
+        u64::from(proposal.format.header_bytes),
+        bytes,
+    )
+    .unwrap();
+    let wire = chunk.encode(&proposal).unwrap();
+    RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.set(0));
+    assert_eq!(
+        RecordingCapturedChunk::decode(&wire, &proposal).unwrap(),
+        chunk
+    );
+    assert_eq!(RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.get()), 0);
+}
+
+#[test]
+fn recording_typed_decode_preserves_noncanonical_and_strict_chunk_acceptance() {
+    let proposal = proposal(2, 2048);
+    let chunk = RecordingCapturedChunk::new(
+        &proposal,
+        Uuid::new_v4(),
+        RecordingChunkRole::Pcm { ordinal: 0 },
+        68,
+        (0..MAX_RECORDING_CHUNK_BYTES).map(|i| i as u8).collect(),
+    )
+    .unwrap();
+    let canonical = String::from_utf8(chunk.encode(&proposal).unwrap()).unwrap();
+    let noncanonical = format!(" \n{}\t", canonical.replace("\"bytes\"", "\"\\u0062ytes\""));
+    let enum_object = canonical.replace("\"role\":\"Stage\"", "\"role\":{\"Stage\":null}");
+    for wire in [
+        canonical.as_bytes(),
+        noncanonical.as_bytes(),
+        enum_object.as_bytes(),
+    ] {
+        let old: RecordingCapturedChunk = decode_tree_value(wire).unwrap();
+        assert_eq!(old, chunk);
+        assert_eq!(
+            RecordingCapturedChunk::decode(wire, &proposal).unwrap(),
+            old
+        );
+    }
+    for wire in [
+        canonical.replacen("{", "{\"version\":1,", 1),
+        canonical.replace("\"ordinal\":0", "\"ordinal\":0,\"ordinal\":0"),
+        canonical.replace(
+            "\"role\":\"Stage\"",
+            "\"role\":{\"Stage\":null,\"Stage\":null}",
+        ),
+        canonical.replace(
+            "\"role\":\"Stage\"",
+            "\"role\":{\"Stage\":null,\"Unknown\":null}",
+        ),
+        canonical.replace("\"offset\":68", "\"offset\":68,\"\\u006fffset\":68"),
+        canonical.replacen("{", "{\"unknown\":null,", 1),
+        format!("{canonical} null"),
+        canonical.replace("\"version\":1", "\"version\":1.0"),
+        canonical.replace("\"bytes\":[", "\"bytes\":[256,"),
+        format!("{{\"unknown\":{}null{}}}", "[".repeat(100), "]".repeat(100)),
+    ] {
+        assert!(decode_tree_value::<RecordingCapturedChunk>(wire.as_bytes()).is_err());
+        RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.set(0));
+        assert!(RecordingCapturedChunk::decode(wire.as_bytes(), &proposal).is_err());
+        assert_eq!(RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.get()), 0);
+    }
+    // Preserve serde's historical array-shaped struct representation as well.
+    let json: Value = serde_json::from_str(&canonical).unwrap();
+    let array = serde_json::to_vec(&serde_json::json!([
+        json["version"],
+        json["proposal_hash"],
+        json["operation_id"],
+        json["output_id"],
+        json["work_key"],
+        json["chunk_id"],
+        json["role"],
+        json["offset"],
+        json["bytes"]
+    ]))
+    .unwrap();
+    let old: RecordingCapturedChunk = decode_tree_value(&array).unwrap();
+    assert_eq!(
+        RecordingCapturedChunk::decode(&array, &proposal).unwrap(),
+        old
+    );
+}
+
 pub(super) fn proposal(channels: u16, frames: u64) -> RecordingProposal {
     proposal_with_root(channels, frames).0
 }

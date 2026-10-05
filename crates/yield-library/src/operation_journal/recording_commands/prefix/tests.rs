@@ -157,6 +157,85 @@ fn seal(f: &Fixture) -> RecordingPrefixSeal {
 }
 
 #[test]
+fn recording_typed_decode_prefix_inventory_and_seal_preserve_strict_json() {
+    let f = fixture(2, 100);
+    let sealed = seal(&f);
+    for wire in [
+        f.inventory.encode(&f.proposal).unwrap(),
+        sealed.encode(&f.proposal).unwrap(),
+    ] {
+        let text = String::from_utf8(wire).unwrap();
+        let noncanonical = format!(
+            " \n{}\t",
+            text.replace("\"version\"", "\"\\u0076ersion\"")
+                .replace("\"role\":\"Stage\"", "\"role\":{\"Stage\":null}")
+        );
+        if text.contains("\"inventory\"") {
+            assert_eq!(
+                decode_tree_value::<RecordingPrefixSeal>(noncanonical.as_bytes()).unwrap(),
+                sealed
+            );
+        } else {
+            assert_eq!(
+                decode_tree_value::<RecordingPrefixInventory>(noncanonical.as_bytes()).unwrap(),
+                f.inventory
+            );
+        }
+        RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.set(0));
+        if text.contains("\"inventory\"") {
+            assert_eq!(
+                RecordingPrefixSeal::decode(noncanonical.as_bytes(), &f.proposal).unwrap(),
+                sealed
+            );
+        } else {
+            assert_eq!(
+                RecordingPrefixInventory::decode(noncanonical.as_bytes(), &f.proposal).unwrap(),
+                f.inventory
+            );
+        }
+        assert_eq!(RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.get()), 0);
+        for malformed in [
+            text.replacen("{", "{\"version\":1,", 1),
+            text.replace("\"accepted\":200", "\"accepted\":200,\"accepted\":200"),
+            text.replace(
+                "\"role\":\"Stage\"",
+                "\"role\":{\"Stage\":null,\"Stage\":null}",
+            ),
+            text.replace(
+                "\"role\":\"Stage\"",
+                "\"role\":{\"Stage\":null,\"Unknown\":null}",
+            ),
+            text.replace(
+                "\"terminal\":\"Stop\"",
+                "\"terminal\":{\"Stop\":null,\"Stop\":null}",
+            ),
+            text.replace(
+                "\"terminal\":\"Stop\"",
+                "\"terminal\":{\"Stop\":null,\"Unknown\":null}",
+            ),
+            text.replacen("{", "{\"unknown\":null,", 1),
+            format!("{text} null"),
+            format!("{{\"unknown\":{}null{}}}", "[".repeat(100), "]".repeat(100)),
+        ] {
+            RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.set(0));
+            if text.contains("\"inventory\"") {
+                assert!(decode_tree_value::<RecordingPrefixSeal>(malformed.as_bytes()).is_err());
+                assert!(RecordingPrefixSeal::decode(malformed.as_bytes(), &f.proposal).is_err());
+            } else {
+                assert!(
+                    decode_tree_value::<RecordingPrefixInventory>(malformed.as_bytes()).is_err()
+                );
+                assert!(
+                    RecordingPrefixInventory::decode(malformed.as_bytes(), &f.proposal).is_err()
+                );
+            }
+            // The comparison decoder above is the only generic parser in this turn.
+            assert_eq!(RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.get()), 1);
+        }
+    }
+}
+
+#[test]
 fn actual_hound_matrix_matches_full_object_hash_and_exact_frames() {
     for channels in 1..=8 {
         let slot_frames = 16384 / (u64::from(channels) * 4);

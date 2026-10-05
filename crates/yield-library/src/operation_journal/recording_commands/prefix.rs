@@ -501,7 +501,7 @@ fn control_encode(value: &impl Serialize) -> Result<Vec<u8>, RecordingValueError
     }
     Ok(bytes)
 }
-fn control_decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, RecordingValueError> {
+fn control_decode<T: StreamingRecordingValue>(bytes: &[u8]) -> Result<T, RecordingValueError> {
     if bytes.len() > MAX_CONTROL_BYTES {
         return Err(invalid("prefix control exceeds bound"));
     }
