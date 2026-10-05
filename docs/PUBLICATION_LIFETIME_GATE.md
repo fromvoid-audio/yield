@@ -605,3 +605,23 @@ lifetime ordering only. The genuine registered-source issuer harness now exercis
 issued before original command drain/unavailable and checks original counted entry/drop.
 Supported macOS SDK compilation and native execution are scoped in OPT-2297; Linux and
 Windows do not compile or qualify those macOS-only bodies.
+
+## Original target issuer custody (OPT-2301)
+
+The staging issuer now consumes the file owner's private `PreparedPublicationTarget`.
+The checkpoint validation comes from that same retained original result, and its
+original deadline, root liveness and file-owner availability are checked before
+checkpointing, before durable reservation, before reply and at counted source entry.
+The fixed 64 KiB command debit comes from the original journal publication subset
+of its ordinary input pool. It remains with the queued command, delivered grant
+and entered guard; the file owner's existing target backing remains independently
+charged. Field drop order releases source, target and input before runtime custody.
+Lost replies never allow a reserved checkpoint to issue a replacement grant.
+
+This connects original target custody and admission only. It does not qualify a
+namespace backend, bind an exact retained capacity charge to a per-operation slot,
+install cancellation/release fences or acknowledge settlement. Those production
+requirements remain in OPT-2215/2216/2217/2218. The genuine macOS issuer harness now
+uses original staging replies and production profile root registrations to prepare
+targets; SDK compilation and native execution require the linked macOS verification
+[OPT-2302](https://linear.app/boostnlvp/issue/OPT-2302). Linux or Windows compilation cannot verify macOS-only bodies.

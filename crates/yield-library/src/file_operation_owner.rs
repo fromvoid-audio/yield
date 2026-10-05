@@ -35,6 +35,7 @@ use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 mod publication_binding;
 use crate::sample_sources::SourceId;
 use crate::sample_sources::db::{BoundDatabaseRoot, SourceAuthorityRequest};
+pub(crate) use publication_binding::PreparedPublicationTarget;
 use publication_binding::{BindingData, BindingError, BindingRequest};
 
 /// Maximum number of effect commands waiting for the file owner.

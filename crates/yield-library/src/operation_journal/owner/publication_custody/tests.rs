@@ -134,3 +134,52 @@ fn original_grant_custody_entry_preserves_count_and_teardown_waits_without_settl
     assert_eq!(original.snapshot(), (true, 0, true));
     assert!(!original.activate(|| true));
 }
+
+#[test]
+fn original_target_expiring_during_source_acquisition_refuses_count_upgrade() {
+    let original = ResourceAdmission::new();
+    assert!(original.activate(|| true));
+    struct Custody(Arc<ResourceAdmission>, Arc<AtomicBool>);
+    impl Drop for Custody {
+        fn drop(&mut self) {
+            assert_eq!(self.0.snapshot().1, 1);
+            self.1.store(true, Ordering::Release);
+        }
+    }
+    let released = Arc::new(AtomicBool::new(false));
+    assert!(
+        counted_entry_checked(
+            &original,
+            || Ok(Custody(original.clone(), released.clone())),
+            |_| false
+        )
+        .is_err()
+    );
+    assert!(released.load(Ordering::Acquire));
+    assert_eq!(original.snapshot(), (false, 0, false));
+    assert!(original.close_and_wait());
+}
+
+#[test]
+fn counted_entry_retains_original_publication_credit_until_source_and_target_drop() {
+    let (commands, _receivers) = super::super::OwnerCommandReceivers::channel();
+    let shared = Arc::new(super::super::OwnerShared::new(commands));
+    let admission = &shared.resource_admission;
+    assert!(admission.activate(|| true));
+    let input = shared.reserve_publication_input(64 * 1024).unwrap();
+    let initial = super::super::PUBLICATION_INPUT_BYTES;
+    struct Custody(super::super::InputPermit);
+    let entered = counted_entry_checked(admission, || Ok(Custody(input)), |_| true).unwrap();
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().publication_remaining,
+        initial - 64 * 1024
+    );
+    assert_eq!(entered._source.0.bytes, 64 * 1024);
+    assert_eq!(admission.snapshot().1, 1);
+    drop(entered);
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().publication_remaining,
+        initial
+    );
+    assert_eq!(admission.snapshot(), (false, 0, true));
+}
