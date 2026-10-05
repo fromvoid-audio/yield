@@ -721,3 +721,16 @@ prepared retirement admission explicitly remain Unsupported before identity,
 capacity or intent effects. This graph and preparation do not supply the joint
 post-start settlement latch, qualified physical policy, lifecycle permit consumers,
 atomic nonce reconciliation or genuine settlement required by OPT-2136/2194/2196.
+
+## Missing-root nonce readback (OPT-2318)
+
+Lost-acceptance readback queries the first retained binding for the exact original
+nonce, using the unique nonce/ordinal index and one-row limit. A later ordinal
+without ordinal zero refuses as partial durable evidence, including after reopen;
+it cannot be reported as absence. Present roots still require the exact nonce,
+digest, complete binding/slice image, operation and ordinary claims. The real
+profile-owned SQLite regression covers deleted roots, displaced roots and a
+non-root nonce rewrite while checking ordinary claim retention. Logical capacity
+fixtures do not qualify physical admission. A None result observes no binding for
+that nonce; it does not confirm rollback, release original owners or refund claims.
+The joint settlement latch and definite-outcome reconciliation remain required.

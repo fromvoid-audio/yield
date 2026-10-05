@@ -399,6 +399,65 @@ mod exact_database_claim_persistence {
     }
 
     #[test]
+    fn nonce_readback_refuses_missing_root_with_retained_original_binding_evidence() {
+        for fault in 0..3 {
+            let f = fixture();
+            let store = OperationJournalStore::open(&f.owner).unwrap();
+            let (record, claims, inventory) = input(&f.owner, 2);
+            let provider = logical_provider(&record);
+            let settled = settle_fixture(&store, &record, &claims, &inventory, &provider);
+            assert!(settled.outcome().receipt().is_some());
+            let mut nonce = inventory.header().decision_nonce;
+            let digest = inventory.digest().unwrap();
+            let root = inventory.bindings()[0].id.to_string();
+            match fault {
+                0 => {
+                    store.connection.execute("DELETE FROM operation_journal_database_claim_slice WHERE binding_id=?1", [&root]).unwrap();
+                    store
+                        .connection
+                        .execute(
+                            "DELETE FROM operation_journal_database_binding WHERE binding_id=?1",
+                            [&root],
+                        )
+                        .unwrap();
+                }
+                1 => {
+                    store.connection.execute("UPDATE operation_journal_database_binding SET ordinal=63,inventory=NULL WHERE binding_id=?1", [&root]).unwrap();
+                }
+                _ => {
+                    nonce = Uuid::new_v4();
+                    store.connection.execute("UPDATE operation_journal_database_binding SET decision_nonce=?1 WHERE ordinal=1", [nonce.to_string()]).unwrap();
+                }
+            }
+            // Corrupt durable facts do not remove ordinary charges or complete settlement.
+            let retained: u64 = store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM operation_journal_ordinary_claim WHERE operation_id=?1",
+                    [record.operation_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained as usize, claims.claims().len());
+            assert!(
+                store
+                    .read_database_claim_inventory_for_nonce(nonce, digest)
+                    .is_err(),
+                "fault={fault}"
+            );
+            drop(settled);
+            drop(store);
+            let reopened = OperationJournalStore::open(&f.owner).unwrap();
+            assert!(
+                reopened
+                    .read_database_claim_inventory_for_nonce(nonce, digest)
+                    .is_err(),
+                "reopen fault={fault}"
+            );
+        }
+    }
+
+    #[test]
     fn unresolved_rollback_cannot_supply_durable_inventory_readback_or_refund() {
         let f = fixture();
         let store = OperationJournalStore::open(&f.owner).unwrap();

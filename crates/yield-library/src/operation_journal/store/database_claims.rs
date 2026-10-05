@@ -198,6 +198,7 @@ impl OperationJournalStore {
     /// Recover an operation whose acceptance reply was lost before the caller learned its ID.
     /// Unique nonce/ordinal zero names the original operation. Caller digest is correlation,
     /// never live authority; a conflicting expected image remains unsupported.
+    /// None observes no binding with this nonce; it does not prove rollback or authorize refund.
     pub(crate) fn read_database_claim_inventory_for_nonce(
         &self,
         nonce: Uuid,
@@ -209,13 +210,20 @@ impl OperationJournalStore {
             ));
         }
         self.validate_namespace()?;
-        let text:Option<Option<String>>=self.connection.query_row(
-            "SELECT CASE WHEN typeof(operation_id)='text' AND length(operation_id)=36 THEN operation_id END FROM operation_journal_database_binding WHERE decision_nonce=?1 AND ordinal=0",
-            [nonce.to_string()],|r|r.get(0)).optional()?;
-        let Some(text) = text else {
+        // Read the first retained row for the nonce, not only ordinal zero. A missing
+        // root with later rows is partial durable evidence, never confirmed absence.
+        // The unique nonce/ordinal index bounds this to one row in the original query.
+        let first: Option<(Option<String>, i64)> = self.connection.query_row(
+            "SELECT CASE WHEN typeof(operation_id)='text' AND length(operation_id)=36 THEN operation_id END,ordinal FROM operation_journal_database_binding WHERE decision_nonce=?1 ORDER BY ordinal LIMIT 1",
+            [nonce.to_string()], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let Some((text, ordinal)) = first else {
             self.validate_namespace()?;
             return Ok(None);
         };
+        if ordinal != 0 {
+            return Err(error("nonce retains binding evidence without its root"));
+        }
         let text = text.ok_or_else(|| error("nonce operation identity bound"))?;
         let id = Uuid::parse_str(&text).map_err(error)?;
         if id.is_nil() || id.to_string() != text {
