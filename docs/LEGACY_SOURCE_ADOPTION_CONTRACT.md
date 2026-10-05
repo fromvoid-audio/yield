@@ -496,3 +496,21 @@ open for actual per-volume capacity claims, writable promotion, entered strict
 policy, preserving migration/receipt transactions, recovery and separately
 admitted lease bootstrap. Custody and passive input alone confer none of those
 authorities; native durability/physical qualification remain separate.
+
+## Complete original custody revalidation (OPT-2322)
+
+The original journal worker revalidates the entire frozen legacy input through
+its retained source, journal and profile owners under the existing cooperative
+two-second preparation bound. The comparison includes both pager policies,
+all eight object identities, devices, allocation units, observed lengths and
+conditional allowances. A matching source row digest alone is insufficient.
+Changed reservation control contents or newly retained journal rollback evidence
+refuse without deleting or repairing them. Rejection retains the original source
+slot, locked reservation and metadata debit until actual shutdown. Revalidation
+remains readonly observation; it issues no capacity claim, migration authority,
+retry/refund or settlement. Full OPT-2117 remains open.
+
+Evidence preservation here covers refusal while the original journal owner is
+retained. The source reservation survives shutdown. Existing confirmed SQLite
+close can remove its own ordinary cold journal rollback file; this observation
+does not promise a durable migration receipt or change that teardown behavior.

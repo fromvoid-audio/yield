@@ -155,6 +155,22 @@ impl LegacyAdoptionIntentArgs {
     pub fn original_image_digest(&self) -> &[u8; 32] {
         &self.data.image_digest
     }
+    // Descriptor-only comparison before SQLite can inspect or recover a changed rollback file.
+    pub(crate) fn matches_journal_rollback(&self, bytes: u64, identity: Option<&str>) -> bool {
+        let original = &self.data.objects[6];
+        original.observed == bytes
+            && match identity {
+                Some(identity) => original.identity == identity,
+                None => {
+                    original.identity
+                        == format!(
+                            "directory:{}/{}-journal",
+                            self.data.journal_directory,
+                            super::store::JOURNAL_DATABASE_FILE_NAME
+                        )
+                }
+            }
+    }
     /// Original legacy semantic revision, never an audited current SourceRevision.
     pub fn original_revision(&self) -> u64 {
         self.data.revision

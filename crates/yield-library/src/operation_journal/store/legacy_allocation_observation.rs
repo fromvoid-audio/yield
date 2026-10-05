@@ -329,7 +329,7 @@ impl OperationJournalStore {
         }
         Ok(result)
     }
-    fn rollback_facts(&self) -> Result<(u64, Option<String>)> {
+    pub(crate) fn rollback_facts(&self) -> Result<(u64, Option<String>)> {
         let name = format!("{JOURNAL_DATABASE_FILE_NAME}-journal");
         match self
             .database_root

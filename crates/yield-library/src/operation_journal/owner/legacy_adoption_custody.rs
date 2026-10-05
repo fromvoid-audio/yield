@@ -170,11 +170,29 @@ impl OwnerRuntime {
             return Err(E::Changed.into());
         }
         let profile = self.final_profile_guard.as_ref().ok_or(E::Closed)?;
+        let (bytes, identity) = self.store().rollback_facts().map_err(|_| E::Changed)?;
+        if !retained
+            .args
+            .matches_journal_rollback(bytes, identity.as_deref())
+        {
+            return Err(E::Changed.into());
+        }
         self.store()
             .validate_for_admission()
             .map_err(|_| E::Changed)?;
-        let image = retained.source.capture(profile).map_err(|_| E::Changed)?;
-        if image.digest() != retained.args.original_image_digest() {
+        // The frozen input includes source and journal policy, all eight original objects,
+        // and both control descriptors. A source row digest alone does not revalidate it.
+        let current = retained
+            .source
+            .prepare_legacy_adoption_input(
+                profile,
+                self.store(),
+                retained.args.participant_id(),
+                command,
+                &AtomicBool::new(false),
+            )
+            .map_err(|_| E::Changed)?;
+        if current != retained.args {
             return Err(E::Changed.into());
         }
         retained.source.validate(profile).map_err(|_| E::Changed)?;
