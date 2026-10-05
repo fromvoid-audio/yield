@@ -16,7 +16,7 @@ It does not install it. [OPT-1632](https://linear.app/boostnlvp/issue/OPT-1632),
 | --- | --- | --- |
 | `operation_journal/owner.rs`: `checkpoint_and_grant_staging` | Fresh validation, current source registration, acknowledged `CopyValidated`, durable one-shot reservation | Bind a live slot to the exact current retained charge, operation and immutable publication target before returning authority |
 | `operation_journal/store/staging_checkpoints.rs`: `reserve_staging_grant_record` | Exact checkpoint/readback and persistent `grant_reserved` | Reservation is issuance evidence only; it cannot protect later cancellation, release or worker entry |
-| `StagingPublicationGrant::begin_publication` | Non-Clone grant and live `SourceEffectPin` | Replace source-only entry with slot-bound entry; no public grant deserializer |
+| `StagingPublicationGrant::begin_publication` | Non-Clone grant, live `SourceEffectPin`, original journal admission and counted source/runtime custody | Add exact per-operation slot, charge/target/native namespace qualification and all mutation fences; no public grant deserializer |
 | `CapacityProvider` | Actor-owned `Rc<RefCell<ProvisionalLedger>>`, genuine volume/reserve resources | Retain and fence exact charges through settlement; never move this ledger to the file worker |
 | `SourceEffectGate` | Entry versus source drain; retirement waits for physical effects | Preserve this independent gate, without holding its permit across queue waits |
 | `file_operation_owner.rs` | Production root registration, bounded admission, primary/duplicate receipts and tombstones | Private publication envelope, exact worker checks, slot entry and completion custody |
@@ -579,3 +579,29 @@ This does not fence previously issued source-only grants or other mutation and
 release routes. Those require the complete OPT-2215 slot implementation. Unknown
 quarantine does not qualify native publication, issue permission, refund a
 reservation or complete settlement.
+
+## Original issued-grant runtime custody (OPT-2296)
+
+The actual private `StagingPublicationGrant` now retains its original journal admission Arc.
+`begin_publication` acquires one of the original bounded resource uses before acquiring the
+live source permit, then upgrades that same counted use under the original admission mutex.
+Known closure, unavailable/unknown admission and exhaustion refuse before source acquisition.
+Closure during source acquisition refuses the upgrade and releases source custody while the
+original runtime remains counted. The returned private, non-Clone paired guard releases the
+source permit before its resource use. Entered Drop wakes teardown but leaves unsettled
+state, so physical quiescence cannot establish clean handoff or durable settlement.
+
+This closes the original-runtime bypass for previously issued grants when command drain,
+unavailable or checkpoint/grant uncertainty closes admission. It does not supply the missing
+per-operation lifetime slot, exact charge/target/native namespace qualification, cancellation
+or release fences, completion or settlement. The general file owner still executes no
+publication backend. Original source permits, aggregate use counts and staging validation
+observations confer no additional namespace permission. Full OPT-2215 and its consumers
+remain open.
+
+Portable tests exercise the actual custody composition and original admission with drop
+sentinels, including closure during acquisition and blocked teardown. Sentinels verify
+lifetime ordering only. The genuine registered-source issuer harness now exercises grants
+issued before original command drain/unavailable and checks original counted entry/drop.
+Supported macOS SDK compilation and native execution are scoped in OPT-2297; Linux and
+Windows do not compile or qualify those macOS-only bodies.

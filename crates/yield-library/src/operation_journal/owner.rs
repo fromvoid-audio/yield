@@ -15,6 +15,7 @@ mod frozen_copy;
 mod legacy_adoption_custody;
 pub use legacy_adoption_custody::{LegacyAdoptionCustody, LegacyAdoptionCustodyError};
 mod native_read_capsule;
+mod publication_custody;
 mod resource_custody;
 pub use frozen_copy::{FrozenCopyObservation, FrozenCopyValidationError};
 use native_read_capsule::NativeCapsuleData;
@@ -1098,6 +1099,7 @@ pub(crate) struct LiveChunkEffectGrant {
 pub(crate) struct StagingPublicationGrant {
     validation: FileOperationResult,
     source_pin: SourceEffectPin,
+    resource_admission: Arc<ResourceAdmission>,
 }
 
 impl std::fmt::Debug for StagingPublicationGrant {
@@ -1114,8 +1116,15 @@ impl std::fmt::Debug for StagingPublicationGrant {
 impl StagingPublicationGrant {
     pub(crate) fn begin_publication(
         self,
-    ) -> Result<(FileOperationResult, SourceEffectPermit), SourceAuthorityError> {
-        let permit = self.source_pin.begin_effect()?;
+    ) -> Result<
+        (
+            FileOperationResult,
+            publication_custody::PublicationSourceUse,
+        ),
+        OperationJournalOwnerError,
+    > {
+        let permit =
+            publication_custody::begin_source_entry(&self.resource_admission, self.source_pin)?;
         Ok((self.validation, permit))
     }
 }
@@ -2361,6 +2370,7 @@ impl OwnerRuntime {
         Ok(StagingPublicationGrant {
             validation,
             source_pin,
+            resource_admission: Arc::clone(&self.resource_admission),
         })
     }
 
@@ -9006,7 +9016,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn live_chunk_grant_crosses_to_file_owner_once_after_dropped_reply() {
-        native_live_chunk_and_staging_issuer(None);
+        native_live_chunk_and_staging_issuer(None, None);
     }
 
     #[cfg(target_os = "macos")]
@@ -9015,14 +9025,23 @@ mod tests {
         use super::super::store::InsertTestBoundary;
         for nth in [1, 2] {
             for boundary in [InsertTestBoundary::Commit, InsertTestBoundary::AfterCommit] {
-                native_live_chunk_and_staging_issuer(Some((nth, boundary)));
+                native_live_chunk_and_staging_issuer(Some((nth, boundary)), None);
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_preissued_publication_grant_refuses_original_drain_and_unavailable() {
+        for unavailable in [false, true] {
+            native_live_chunk_and_staging_issuer(None, Some(unavailable));
         }
     }
 
     #[cfg(target_os = "macos")]
     fn native_live_chunk_and_staging_issuer(
         fault: Option<(usize, super::super::store::InsertTestBoundary)>,
+        close_before_entry: Option<bool>,
     ) {
         use super::super::store::{InsertTestBoundary, InsertTestDirective};
         let fixture = fixture("journal-owner-live-chunk-grant");
@@ -9829,11 +9848,39 @@ mod tests {
             return;
         }
         let publication = publication_result.expect("acknowledged publication grant");
+        if let Some(unavailable) = close_before_entry {
+            assert_eq!(owner.shared.resource_admission.snapshot().1, 0);
+            if unavailable {
+                owner
+                    .shared
+                    .mark_unavailable("native test: original unavailable after issuance");
+            } else {
+                assert!(client.begin_command_drain());
+            }
+            assert!(matches!(
+                publication.begin_publication(),
+                Err(OperationJournalOwnerError::StagingGrant { .. })
+            ));
+            assert_eq!(owner.shared.resource_admission.snapshot().1, 0);
+            // This original source remains independently live: refusal came from the
+            // original journal gate, not a fake pin or a drained source fixture.
+            drop(guard.pin_for_effect().unwrap().begin_effect().unwrap());
+            staged.acknowledge().unwrap();
+            let _ = file_owner.shutdown();
+            drop(database);
+            let clean = owner.shutdown();
+            if unavailable {
+                assert!(!clean);
+            }
+            return;
+        }
         let (validated, permit) = publication
             .begin_publication()
             .expect("live publication entry");
         assert_eq!(validated.operation_id(), operation_id);
+        assert_eq!(owner.shared.resource_admission.snapshot().1, 1);
         drop(permit);
+        assert_eq!(owner.shared.resource_admission.snapshot(), (false, 0, true));
         let mut replay_checkpoint = client
             .checkpoint_and_grant_staging(
                 staged_result.clone(),
