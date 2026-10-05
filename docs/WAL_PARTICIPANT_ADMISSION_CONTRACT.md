@@ -594,3 +594,23 @@ Full OPT-2136 retained transport acknowledgements, all-owner/post-start cleanup
 fences, atomic nonce/intent/claims/readback/restart and qualified required-permit
 behavior remain open; OPT-2194/2202 still own physical policy and admitted release.
 No write, decision, retry, refund or genuine settlement authority follows.
+
+## Original global empty-transaction custody (OPT-2313)
+
+The actual global preparation worker captures the original retained connection's
+SQLite total-change counter before `BEGIN IMMEDIATE`. After acquisition, before
+scope publication, on parked polls and before cleanup it requires non-autocommit,
+SQLite MAIN transaction state `Write`, and that unchanged counter. These native
+SQLite API checks execute no ordinary SQL. A deferred/read-only replacement
+transaction, transaction exit or uncommitted row mutation refuses even if native
+paths, registration-local mutation revision and entered settings still match.
+
+`EmptyReservationChanged` prevents ordinary reuse. Cleanup still attempts actual
+rollback and policy restoration; successful rollback cannot erase the counter or
+turn the changed reservation into confirmed original custody. Existing binding,
+profile, deadline and mutation-fence checks remain required. This is a bounded
+connection-state check, not a database schema/DDL integrity proof or a joint
+current-owner acknowledgement. It does not create a decision latch, authorize
+intent/claims, settle an operation, or qualify native allocation. The full
+OPT-2136 post-start cleanup fence, atomic nonce/intent/claims and readback/restart
+acceptance remains open.

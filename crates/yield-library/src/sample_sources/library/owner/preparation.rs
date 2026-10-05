@@ -48,6 +48,9 @@ pub enum GlobalPreparationError {
     /// The retained root/main file/native SQLite binding cannot be proven.
     #[error("preparation database binding unavailable")]
     DatabaseBinding,
+    /// The original empty writer transaction exited, weakened, or changed rows.
+    #[error("original empty preparation transaction changed")]
+    EmptyReservationChanged,
     /// Exact lifecycle schema/runtime/retained allocation observations are unavailable.
     #[error(transparent)]
     LifecycleAllocation(#[from] crate::lifecycle_allocation::LifecycleAllocationError),
@@ -435,6 +438,21 @@ fn sql_error(error: rusqlite::Error) -> GlobalPreparationError {
     }
 }
 
+/// Native SQLite state only: no ordinary query, renewal or new transaction.
+/// The baseline is captured on this original connection before BEGIN, never caller facts.
+fn validate_empty_transaction(
+    connection: &rusqlite::Connection,
+    changes: u64,
+) -> Result<(), GlobalPreparationError> {
+    if connection.is_autocommit()
+        || connection.total_changes() != changes
+        || connection.transaction_state(Some("main")) != Ok(rusqlite::TransactionState::Write)
+    {
+        return Err(GlobalPreparationError::EmptyReservationChanged);
+    }
+    Ok(())
+}
+
 /// Returns false only when the connection must close before any further dispatch.
 pub(super) fn run(
     command: Command,
@@ -471,6 +489,7 @@ pub(super) fn run(
         if !database.connection.is_autocommit() {
             return Err(GlobalPreparationError::ConnectionRetired);
         }
+        let original_changes = database.connection.total_changes();
         if command.request.lifecycle_policy {
             policy = Some(
                 super::super::lifecycle_allocation::policy::EnteredLifecyclePolicy::new(
@@ -506,6 +525,7 @@ pub(super) fn run(
             .busy_timeout(Duration::from_millis(timeout))
             .map_err(|_| GlobalPreparationError::ConnectionRetired)?;
         begin?;
+        validate_empty_transaction(&database.connection, original_changes)?;
         validate(database, guard, &file)?;
         canceled(&command, lifecycle)?;
         let wal_bytes =
@@ -522,6 +542,7 @@ pub(super) fn run(
         };
         canceled(&command, lifecycle)?;
         validate(database, guard, &file)?;
+        validate_empty_transaction(&database.connection, original_changes)?;
         let nonce = uuid::Uuid::new_v4();
         let wal_scope = if command.request.wal_binding {
             Some(binding::capture(
@@ -536,6 +557,7 @@ pub(super) fn run(
             None
         };
         canceled(&command, lifecycle)?;
+        validate_empty_transaction(&database.connection, original_changes)?;
         let (control, controls) = mpsc::sync_channel(1);
         let (released, release_rx) = mpsc::sync_channel(1);
         let observation = GlobalPreparationObservation {
@@ -570,10 +592,15 @@ pub(super) fn run(
         if command.ready.try_send(Ok(reservation)).is_err() {
             command.canceled.store(true, Ordering::Release);
         }
+        #[cfg(test)]
+        tests::inject_empty_custody_fault(&database.connection);
         // No SQL/row query/checkpoint/renewal/ordinary dispatch while held. The main-file FD
         // remains alive, and actual owner/path/native binding is rechecked cooperatively.
         let outcome = loop {
             if let Err(error) = canceled(&command, lifecycle) {
+                break error;
+            }
+            if let Err(error) = validate_empty_transaction(&database.connection, original_changes) {
                 break error;
             }
             if let Err(error) = mutation_fence.validate(Some(mutation_revision)) {
@@ -608,13 +635,16 @@ pub(super) fn run(
         // Cancellation/deadline can win before the next parked native poll. Revalidate
         // original binding while still held before deciding reuse; this cleanup allowance
         // does not extend preparation or publish another acknowledgement.
-        let cleanup_binding = retained_observation.wal_scope().map_or(Ok(()), |scope| {
-            validate(database, guard, &file).and_then(|_| {
-                binding::validate(
-                    database,
-                    scope,
-                    Instant::now() + GLOBAL_PREPARATION_MAX_DURATION,
-                )
+        let cleanup_empty = validate_empty_transaction(&database.connection, original_changes);
+        let cleanup_binding = cleanup_empty.clone().and_then(|_| {
+            retained_observation.wal_scope().map_or(Ok(()), |scope| {
+                validate(database, guard, &file).and_then(|_| {
+                    binding::validate(
+                        database,
+                        scope,
+                        Instant::now() + GLOBAL_PREPARATION_MAX_DURATION,
+                    )
+                })
             })
         });
         let rollback = database.connection.execute_batch("ROLLBACK");
@@ -624,7 +654,8 @@ pub(super) fn run(
             && !began
             && policy_restored
             && cleanup_binding.is_ok()
-            && outcome != GlobalPreparationError::DatabaseBinding;
+            && outcome != GlobalPreparationError::DatabaseBinding
+            && outcome != GlobalPreparationError::EmptyReservationChanged;
         let result = if rollback.is_err() || began || !policy_restored {
             Err(GlobalPreparationError::ConnectionRetired)
         } else if let Err(error) = cleanup_binding {
@@ -647,7 +678,8 @@ pub(super) fn run(
             let reusable = rollback_ok
                 && policy_restored
                 && error != GlobalPreparationError::ConnectionRetired
-                && error != GlobalPreparationError::DatabaseBinding;
+                && error != GlobalPreparationError::DatabaseBinding
+                && error != GlobalPreparationError::EmptyReservationChanged;
             let _ = command
                 .ready
                 .try_send(Err(if rollback_ok && policy_restored {

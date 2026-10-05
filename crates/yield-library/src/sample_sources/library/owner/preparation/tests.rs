@@ -680,3 +680,165 @@ fn preparation_one_actual_begin_and_timeout_restore_with_no_row_or_checkpoint_sq
         assert!(database.connection.is_autocommit());
     });
 }
+
+#[test]
+fn original_global_empty_transaction_validation_uses_no_ordinary_sql_and_requires_writer_lock() {
+    fixture(|writer, guard, _| {
+        writer.shutdown_with_report();
+        let database = LibraryDatabase::open_for_profile_guard(guard, None).unwrap();
+        let connection = &database.connection;
+        let changes = connection.total_changes();
+        assert_eq!(
+            validate_empty_transaction(connection, changes),
+            Err(GlobalPreparationError::EmptyReservationChanged)
+        );
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        connection.authorizer(Some(|_: rusqlite::hooks::AuthContext<'_>| {
+            rusqlite::hooks::Authorization::Deny
+        }));
+        assert_eq!(validate_empty_transaction(connection, changes), Ok(()));
+        assert!(
+            connection
+                .query_row("SELECT count(*) FROM metadata", [], |r| r.get::<_, i64>(0))
+                .is_err()
+        );
+        connection.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
+        connection.execute_batch("ROLLBACK; BEGIN").unwrap();
+        assert!(!connection.is_autocommit());
+        assert_eq!(
+            validate_empty_transaction(connection, changes),
+            Err(GlobalPreparationError::EmptyReservationChanged)
+        );
+        connection
+            .query_row("SELECT count(*) FROM metadata", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(
+            validate_empty_transaction(connection, changes),
+            Err(GlobalPreparationError::EmptyReservationChanged)
+        );
+        connection.execute_batch("ROLLBACK").unwrap();
+    });
+}
+
+#[test]
+fn original_global_empty_transaction_refuses_real_mutation_even_after_rollback_and_new_begin() {
+    fixture(|writer, guard, _| {
+        writer.shutdown_with_report();
+        let database = LibraryDatabase::open_for_profile_guard(guard, None).unwrap();
+        let connection = &database.connection;
+        let changes = connection.total_changes();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(validate_empty_transaction(connection, changes), Ok(()));
+        connection
+            .execute(
+                "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+                ["empty-reservation-mutation", "uncommitted"],
+            )
+            .unwrap();
+        assert_eq!(
+            validate_empty_transaction(connection, changes),
+            Err(GlobalPreparationError::EmptyReservationChanged)
+        );
+        connection
+            .execute_batch("ROLLBACK; BEGIN IMMEDIATE")
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM metadata WHERE key=?1",
+                    ["empty-reservation-mutation"],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            validate_empty_transaction(connection, changes),
+            Err(GlobalPreparationError::EmptyReservationChanged)
+        );
+        connection.execute_batch("ROLLBACK").unwrap();
+        assert!(connection.is_autocommit());
+    });
+}
+
+// Negative test only on the test's original run thread; no production callback/API.
+thread_local! {
+    static EMPTY_CUSTODY_FAULT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+pub(super) fn inject_empty_custody_fault(connection: &Connection) {
+    EMPTY_CUSTODY_FAULT.with(|fault| match fault.take() {
+        Some(true) => {
+            connection
+                .execute(
+                    "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+                    ["parked-original-mutation", "uncommitted"],
+                )
+                .unwrap();
+        }
+        Some(false) => {
+            connection.execute_batch("ROLLBACK; BEGIN").unwrap();
+        }
+        None => {}
+    });
+}
+
+#[test]
+fn original_global_empty_transaction_actual_worker_retires_changed_custody_after_confirmed_rollback()
+ {
+    fixture(|writer, guard, _| {
+        writer.shutdown_with_report();
+        for mutation in [false, true] {
+            let database = LibraryDatabase::open_for_profile_guard(guard, None).unwrap();
+            let (ready, receiver) = mpsc::sync_channel(1);
+            let command = Command {
+                request: request(writer, Duration::from_secs(1)),
+                canceled: Arc::new(AtomicBool::new(false)),
+                ready,
+                binding_credit: None,
+                handshake_credit: None,
+            };
+            let client = std::thread::spawn(move || {
+                receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap()
+                    .abort()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+            });
+            EMPTY_CUSTODY_FAULT.with(|fault| fault.set(Some(mutation)));
+            assert!(
+                !run(
+                    command,
+                    &database,
+                    guard,
+                    &std::sync::atomic::AtomicU8::new(WriterLifecycle::Available as u8),
+                    writer.preparation_owner().registration(),
+                    &mutation_fence::MutationFence::new()
+                ),
+                "changed custody cannot return the original writer for reuse"
+            );
+            assert_eq!(
+                client.join().unwrap(),
+                Err(GlobalPreparationError::EmptyReservationChanged)
+            );
+            assert!(
+                database.connection.is_autocommit(),
+                "actual empty rollback completed"
+            );
+            assert_eq!(
+                database
+                    .connection
+                    .query_row(
+                        "SELECT count(*) FROM metadata WHERE key=?1",
+                        ["parked-original-mutation"],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    });
+}
