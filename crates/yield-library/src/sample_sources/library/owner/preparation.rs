@@ -1,6 +1,6 @@
 //! Empty, pre-intent reservations on the existing global worker. No journal authority.
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -74,13 +74,36 @@ pub enum GlobalPreparationError {
 pub struct GlobalPreparationOwner {
     acquisition: ProfileAcquisitionId,
     registration: uuid::Uuid,
+    generation: u64,
+}
+static NEXT_REGISTRATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+fn issue_registration_generation(
+    counter: &AtomicU64,
+) -> Result<u64, GlobalLibraryWriterStartError> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            if value == 0 || value > i64::MAX as u64 {
+                None
+            } else {
+                value.checked_add(1)
+            }
+        })
+        .map_err(|_| GlobalLibraryWriterStartError::RegistrationGenerationExhausted)
 }
 impl GlobalPreparationOwner {
-    pub(super) fn new(acquisition: ProfileAcquisitionId) -> Self {
-        Self {
+    pub(super) fn new(
+        acquisition: ProfileAcquisitionId,
+    ) -> Result<Self, GlobalLibraryWriterStartError> {
+        let generation = issue_registration_generation(&NEXT_REGISTRATION_GENERATION)?;
+        Ok(Self {
             acquisition,
             registration: uuid::Uuid::new_v4(),
-        }
+            generation,
+        })
+    }
+    /// Checked issuing-worker generation, meaningful only with the original acquisition/UUID.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
     /// Profile acquisition observed by this worker.
     pub fn acquisition(&self) -> &ProfileAcquisitionId {
@@ -472,6 +495,7 @@ pub(super) fn run(
     guard: &WritableProfileGuard,
     lifecycle: &std::sync::atomic::AtomicU8,
     registration: uuid::Uuid,
+    registration_generation: u64,
     mutation_fence: &mutation_fence::MutationFence,
 ) -> bool {
     let mut began = false;
@@ -480,6 +504,7 @@ pub(super) fn run(
         canceled(&command, lifecycle)?;
         if command.request.owner.acquisition.as_str() != guard.owner_identity()
             || command.request.owner.registration != registration
+            || command.request.owner.generation != registration_generation
         {
             return Err(GlobalPreparationError::StaleOwner);
         }

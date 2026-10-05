@@ -794,3 +794,24 @@ audited tag/layout fixtures cover the same refusal and preserve normal preparati
 The private correlation has no public positive factory and supplies no physical
 qualification, allocation guarantee, decision latch, permit or settlement. Claim
 and wire formats, original deadlines, alias checks and shared ceilings are unchanged.
+
+
+## Original global registration generation and retained root (OPT-2332)
+
+The real global worker now issues a positive checked registration serial at startup,
+within SQLite's signed integer range. Its original worker hook validates that serial
+alongside the acquisition and registration UUID before acquiring MAIN. Failed starts
+can consume a serial; they never reuse one. The process-local serial is meaningful
+only with those original UUIDs, and cannot resume an owner across process restart.
+Exhaustion refuses startup instead of wrapping or deriving a generation from a UUID
+or the unrelated mutation counter.
+
+The same genuine worker seals its retained descriptor-bound database root identity
+and registration generation in the original bounded scope. Native parked validation
+requires the current retained root identity to match; cloned historical scope retains
+its complete original root backing within the existing local/shared handshake debit.
+A root identity is not a path, physical qualification, grant or settlement receipt.
+These producer fields define inventory context only. Full OPT-2136 still requires
+its genuine all-owner Start, post-start cleanup fence, exact component/participant
+write ceilings and atomic nonce/intent/claims/readback consumer. No permit, retry,
+refund or genuine settlement follows from a descriptor or generation observation.

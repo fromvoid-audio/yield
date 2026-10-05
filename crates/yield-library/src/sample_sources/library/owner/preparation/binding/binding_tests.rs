@@ -20,6 +20,76 @@ mod integration {
     }
 
     #[test]
+    fn original_global_descriptor_seals_retained_database_root() {
+        fixture(|writer, guard, _| {
+            let held = reserve_strict(writer, Duration::from_secs(2));
+            let view = held.observation().clone();
+            let encoded: serde_json::Value =
+                serde_json::from_slice(view.wal_scope().unwrap().descriptor_bytes()).unwrap();
+            assert_eq!(encoded["root_identity"], guard.profile_root_identity());
+            assert_eq!(
+                view.wal_scope().unwrap().root_identity(),
+                guard.profile_root_identity()
+            );
+            let outside = external(guard);
+            assert_eq!(
+                outside
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .unwrap_err()
+                    .sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            release(held);
+            assert_eq!(charged(writer), HANDOFF_BYTES);
+            drop(view);
+            assert_eq!(charged(writer), 0);
+            outside.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        });
+    }
+
+    #[test]
+    fn original_global_descriptor_generation_changes_on_same_acquisition_worker_restart() {
+        fixture(|writer, guard, _| {
+            let held = reserve_strict(writer, Duration::from_secs(2));
+            let first = held.observation().clone();
+            let encoded: serde_json::Value =
+                serde_json::from_slice(first.wal_scope().unwrap().descriptor_bytes()).unwrap();
+            let generation = encoded["registration_generation"]
+                .as_u64()
+                .expect("actual issued generation");
+            assert!(generation > 0 && generation <= i64::MAX as u64);
+            assert_eq!(generation, first.owner().generation());
+            release(held);
+            assert!(writer.shutdown());
+            *writer = GlobalLibraryWriter::start(guard).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while writer.status() != GlobalLibraryWriterStatus::Available {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let second = reserve_strict(writer, Duration::from_secs(2));
+            let encoded: serde_json::Value = serde_json::from_slice(
+                second.observation().wal_scope().unwrap().descriptor_bytes(),
+            )
+            .unwrap();
+            assert!(encoded["registration_generation"].as_u64().unwrap() > generation);
+            assert_eq!(
+                encoded["registration_generation"],
+                second.observation().owner().generation()
+            );
+            assert_eq!(first.acquisition(), second.observation().acquisition());
+            assert_ne!(
+                first.owner().registration(),
+                second.observation().owner().registration()
+            );
+            release(second);
+            drop(first);
+            empty(writer);
+            assert_eq!(charged(writer), 0);
+        });
+    }
+
+    #[test]
     fn dropped_queued_strict_requests_keep_credit_until_real_owner_disposal() {
         fixture(|writer, _, _| {
             let held = writer
