@@ -463,3 +463,36 @@ execute Windows APIs. Existing Unix FIFO and staged-target producer tests remain
 required. This producer supplies observations, not migration/publication admission,
 qualified physical allocation, lifecycle slots, receipts, retries/refunds or
 settlement. Full OPT-2117/2194/2215/2218 remain open.
+
+## Original pre-lease journal custody (OPT-2286)
+
+`OperationJournalClient::prepare_legacy_adoption_custody` transfers the genuine
+`LegacySourceReadOwner` into one slot on the existing journal worker. It captures
+the passive input against that worker's original store and profile acquisition;
+no decoded request, root path or caller observation reconstructs the slot. The
+original readonly SQLite connection, bound roots and locked fresh reservation
+move together. This route opens no new SQLite connection and creates no intent,
+current source registration, lease row or adoption receipt.
+
+The worker retains 64 KiB of ordinary input credit on its existing aggregate
+pool for frozen input and custody metadata. It transfers the already-owned
+source connection; this metadata credit does not qualify native SQLite memory
+or physical capacity. One occupied slot rejects further sources/commands. A
+privately issued non-Clone, non-serializable observation queues revalidation
+against the same worker, original profile/source/image and journal namespace.
+It cannot authorize migration, bootstrap, release or source retirement.
+
+Lost replies and dropped clients preserve the original slot, reservation lock
+and metadata debit. Only actual journal shutdown drops this readonly custody,
+before journal/profile teardown, and refunds transient metadata credit. The
+sidecar remains evidence; dropping readonly custody does not delete it or reset
+admission for another attempt. Source row changes, substituted roots, foreign
+profile acquisition and closed/unavailable owners reject without repair.
+
+Real owner/SQLite tests use the existing explicit no-capacity startup fixture:
+they exercise the actual queue, original descriptors, bytes and lock lifetime,
+without qualifying production journal reserve bootstrap. Full OPT-2117 remains
+open for actual per-volume capacity claims, writable promotion, entered strict
+policy, preserving migration/receipt transactions, recovery and separately
+admitted lease bootstrap. Custody and passive input alone confer none of those
+authorities; native durability/physical qualification remain separate.
