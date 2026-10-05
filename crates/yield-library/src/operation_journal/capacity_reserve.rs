@@ -54,7 +54,64 @@ pub(super) enum TestReserveMutationFault {
     Sync,
 }
 
+/// Immutable native observation only; cannot mutate the original protected reserve.
+#[allow(dead_code)]
+pub(super) struct ReadonlyReserve {
+    file: File,
+    expected: ReserveObservation,
+}
+#[allow(dead_code)]
+impl ReadonlyReserve {
+    pub(super) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.expected.identity.capacity()
+    }
+    pub(super) fn full_facts(
+        &self,
+    ) -> Result<crate::durable_capacity::VolumeFacts, ReserveFailureReason> {
+        let before = capture_observation(&self.file)?;
+        validate_verified_observation(&before, &self.expected)?;
+        let facts = descriptor_capacity_facts(&self.file)
+            .map_err(|e| ReserveFailureReason::CapacityFactsUnavailable(e.to_string()))?;
+        let after = capture_observation(&self.file)?;
+        validate_verified_observation(&after, &self.expected)?;
+        if facts.identity != self.expected.volume {
+            return Err(ReserveFailureReason::VerifiedVolumeMismatch);
+        }
+        if facts.allocation_unit != self.expected.allocation_unit {
+            return Err(ReserveFailureReason::VerifiedAllocationUnitMismatch);
+        }
+        Ok(facts)
+    }
+}
+
 impl ProtectedReserve {
+    /// Bind an independently opened readonly descriptor to this actual original held object.
+    #[allow(dead_code)]
+    pub(super) fn bind_readonly(
+        &self,
+        file: File,
+    ) -> Result<ReadonlyReserve, ReserveFailureReason> {
+        self.revalidate()?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 || flags & libc::O_ACCMODE != libc::O_RDONLY {
+                return Err(ReserveFailureReason::Unsupported);
+            }
+        }
+        if self.observation.identity.len() > 256 {
+            return Err(ReserveFailureReason::IdentityUnavailable);
+        }
+        let reader = ReadonlyReserve {
+            file,
+            expected: self.observation.clone(),
+        };
+        reader.full_facts()?;
+        self.revalidate()?;
+        Ok(reader)
+    }
+
     /// Revalidate the retained descriptor and its protected allocation without reopening a path.
     pub(super) fn revalidate(&self) -> Result<(), ReserveFailureReason> {
         #[cfg(target_os = "macos")]

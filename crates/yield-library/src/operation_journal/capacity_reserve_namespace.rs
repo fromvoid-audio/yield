@@ -564,7 +564,112 @@ impl BoundReserve<'_> {
     }
 }
 
+/// Parent root and named original lock observations, without guard/lock/child ownership.
+#[allow(dead_code)]
+pub(super) struct ReadonlyProfileScope {
+    root: crate::sample_sources::db::file_ops_journal::ReadonlyDatabaseRoot,
+    lock: String,
+}
+#[allow(dead_code)]
+impl ReadonlyProfileScope {
+    pub(super) fn capture(
+        profile: &WritableProfileGuard,
+    ) -> Result<Self, ReserveNamespaceFailureReason> {
+        let error = |e: String| ReserveNamespaceFailureReason::RootValidation(e);
+        profile
+            .validate_current()
+            .map_err(|e| error(e.to_string()))?;
+        if profile.profile_lock_identity().len() > 256 {
+            return Err(error("profile lock identity limit".into()));
+        }
+        let root = BoundDatabaseRoot::for_profile_guard(profile)
+            .map_err(|e| error(e.to_string()))?
+            .readonly_observation()
+            .map_err(|e| error(e.to_string()))?;
+        let scope = Self {
+            root,
+            lock: profile.profile_lock_identity().to_owned(),
+        };
+        scope.validate()?;
+        profile
+            .validate_current()
+            .map_err(|e| error(e.to_string()))?;
+        Ok(scope)
+    }
+    pub(super) fn validate(&self) -> Result<(), ReserveNamespaceFailureReason> {
+        self.root
+            .verify_direct_child(
+                Path::new(crate::app_dirs::PROFILE_OWNER_LOCK_FILE_NAME),
+                &self.lock,
+            )
+            .map_err(|e| ReserveNamespaceFailureReason::RootValidation(e.to_string()))
+    }
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.root.retained_bytes() + self.lock.capacity()
+    }
+}
+
+#[allow(dead_code)]
+pub(super) struct ReadonlyReserveNamespace {
+    profile: ReadonlyProfileScope,
+    root: crate::sample_sources::db::file_ops_journal::ReadonlyDatabaseRoot,
+    reserve: super::capacity_reserve::ReadonlyReserve,
+    identity: String,
+}
+#[allow(dead_code)]
+impl ReadonlyReserveNamespace {
+    pub(super) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.profile.retained_bytes()
+            + self.root.retained_bytes()
+            + self.reserve.retained_bytes()
+            + self.identity.capacity()
+    }
+    pub(super) fn full_facts(&self) -> Result<VolumeFacts, ReserveNamespaceFailureReason> {
+        self.profile.validate()?;
+        self.root
+            .verify_direct_child(Path::new(RESERVE_FILE_NAME), &self.identity)
+            .map_err(|e| ReserveNamespaceFailureReason::RootValidation(e.to_string()))?;
+        let facts = self
+            .reserve
+            .full_facts()
+            .map_err(ReserveNamespaceFailureReason::Observation)?;
+        self.root
+            .verify_direct_child(Path::new(RESERVE_FILE_NAME), &self.identity)
+            .map_err(|e| ReserveNamespaceFailureReason::RootValidation(e.to_string()))?;
+        self.profile.validate()?;
+        Ok(facts)
+    }
+}
+
 impl OwnedReserveAllocation {
+    #[allow(dead_code)]
+    pub(super) fn readonly_observation(
+        &mut self,
+        profile: &WritableProfileGuard,
+    ) -> Result<ReadonlyReserveNamespace, ReserveNamespaceFailureReason> {
+        self.view(profile).revalidate_and_prove()?;
+        let file = self
+            .root
+            .open_observation_file_nofollow(Path::new(RESERVE_FILE_NAME))
+            .map_err(|e| ReserveNamespaceFailureReason::RootValidation(e.to_string()))?;
+        let reader = ReadonlyReserveNamespace {
+            profile: ReadonlyProfileScope::capture(profile)?,
+            root: self
+                .root
+                .readonly_observation()
+                .map_err(|e| ReserveNamespaceFailureReason::RootValidation(e.to_string()))?,
+            reserve: self
+                .reserve
+                .bind_readonly(file)
+                .map_err(ReserveNamespaceFailureReason::Observation)?,
+            identity: self.observation.file_identity().to_owned(),
+        };
+        reader.full_facts()?;
+        self.view(profile).revalidate_and_prove()?;
+        Ok(reader)
+    }
+
     pub(super) fn observation(&self) -> &ReserveNamespaceObservation {
         &self.observation
     }

@@ -43,6 +43,7 @@ pub(super) struct ResourceUse {
     admission: Arc<ResourceAdmission>,
     index: usize,
     generation: u64,
+    observed: bool,
 }
 const _: () = assert!(
     2 * std::mem::size_of::<ResourceAdmission>()
@@ -98,6 +99,17 @@ impl ResourceAdmission {
     pub(super) fn snapshot(&self) -> (bool, usize, bool) {
         let state = self.lock();
         (state.closed, state.count, state.unsettled)
+    }
+    pub(super) fn validate_open(&self) -> Result<(), UseError> {
+        let mut state = self.lock();
+        if state.unknown || !state.valid() {
+            state.close_unknown();
+            return Err(UseError::Unknown);
+        }
+        if state.closed || !state.open {
+            return Err(UseError::Closed);
+        }
+        Ok(())
     }
     pub(super) fn invalidate(&self) {
         self.lock().close_unknown();
@@ -155,6 +167,7 @@ impl ResourceAdmission {
             admission: Arc::clone(self),
             index,
             generation,
+            observed: false,
         })
     }
     /// Retain original actor resources while this condition wait releases the admission lock.
@@ -181,6 +194,39 @@ impl ResourceAdmission {
 }
 #[allow(dead_code)] // Read-to-effect upgrade is called only by full original slot entry.
 impl ResourceUse {
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub(super) fn verify_read_for(
+        &self,
+        original: &Arc<ResourceAdmission>,
+    ) -> Result<(), UseError> {
+        if !Arc::ptr_eq(&self.admission, original) {
+            return Err(UseError::Unknown);
+        }
+        let state = self.admission.lock();
+        if state.unknown || !state.valid() {
+            return Err(UseError::Unknown);
+        }
+        if state.closed || !state.open {
+            return Err(UseError::Closed);
+        }
+        match state.uses.get(self.index).and_then(|use_| *use_) {
+            Some(use_) if use_.generation == self.generation && !use_.entered => Ok(()),
+            _ => Err(UseError::Unknown),
+        }
+    }
+    pub(super) fn begin_observation(
+        &mut self,
+        original: &Arc<ResourceAdmission>,
+    ) -> Result<u64, UseError> {
+        self.verify_read_for(original)?;
+        if self.observed {
+            return Err(UseError::Closed);
+        }
+        self.observed = true;
+        Ok(self.generation)
+    }
     pub(super) fn enter_effect(
         &mut self,
         validate_slot: impl FnOnce() -> bool,
