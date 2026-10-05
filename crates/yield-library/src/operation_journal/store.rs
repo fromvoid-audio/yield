@@ -18071,6 +18071,9 @@ mod tests {
 
     #[test]
     fn ordinary_claim_release_retains_charge_when_provider_reconciliation_fails() {
+        use crate::operation_journal::capacity_retention_telemetry::{
+            CapacityLedgerCall as K, CapacityLedgerReturn as R, tests::Capture,
+        };
         let fixture = fixture();
         let store = OperationJournalStore::open(&fixture.owner).expect("open store");
         let operation_id = OperationId::new();
@@ -18082,12 +18085,25 @@ mod tests {
             .settle_initial_claims(&record, &provider, &claims)
             .expect("settle claim");
         drop(settlement);
+        let capture = Capture::new();
         let request = release_request(operation_id, claim_id, Uuid::new_v4());
         provider.fail_release_for_test();
         assert!(matches!(
             store.release_ordinary_claim(request, &provider),
             Err(OrdinaryClaimReleaseError::ProviderRetained { .. })
         ));
+        assert_eq!(
+            capture
+                .snapshot()
+                .count(K::OrdinaryClaimRelease, R::Refused),
+            1
+        );
+        assert_eq!(
+            capture
+                .snapshot()
+                .count(K::OrdinaryClaimRelease, R::Confirmed),
+            0
+        );
         let row = &record
             .capacity_plan
             .as_ref()
@@ -18105,6 +18121,10 @@ mod tests {
             provider.outstanding(&row.identity, row.allocation_class.into()),
             0
         );
+        let snapshot = capture.snapshot();
+        assert_eq!(snapshot.count(K::OrdinaryClaimRelease, R::Refused), 1);
+        assert_eq!(snapshot.count(K::OrdinaryClaimRelease, R::Confirmed), 1);
+        assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 2);
     }
 
     #[test]

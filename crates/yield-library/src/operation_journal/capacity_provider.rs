@@ -707,6 +707,16 @@ impl CapacityProvider {
         &self,
         receipt: &OrdinaryClaimReleaseReceipt,
     ) -> Result<(), CapacityProviderError> {
+        use super::capacity_retention_telemetry::{CapacityLedgerCall as K, observe};
+        observe(K::OrdinaryClaimRelease, || {
+            self.release_claim_original(receipt)
+        })
+    }
+
+    fn release_claim_original(
+        &self,
+        receipt: &OrdinaryClaimReleaseReceipt,
+    ) -> Result<(), CapacityProviderError> {
         let mut ledger = self
             .ledger
             .try_borrow_mut()
@@ -1380,6 +1390,11 @@ impl ProvisionalCapacityLease {
     }
 
     pub(crate) fn release(&mut self) -> Result<(), CapacityProviderError> {
+        use super::capacity_retention_telemetry::{CapacityLedgerCall as K, observe};
+        observe(K::ProvisionalRelease, || self.release_original())
+    }
+
+    fn release_original(&mut self) -> Result<(), CapacityProviderError> {
         match &self.disposition {
             ProvisionalLeaseDisposition::Released => return Ok(()),
             ProvisionalLeaseDisposition::Provisional => {}
@@ -1464,6 +1479,16 @@ impl ProvisionalCapacityLease {
         &mut self,
         operation_id: OperationId,
     ) -> Result<(), CapacityProviderError> {
+        use super::capacity_retention_telemetry::{CapacityLedgerCall as K, observe};
+        observe(K::ConfirmedRollbackRelease, || {
+            self.release_after_confirmed_rollback_original(operation_id)
+        })
+    }
+
+    fn release_after_confirmed_rollback_original(
+        &mut self,
+        operation_id: OperationId,
+    ) -> Result<(), CapacityProviderError> {
         if operation_id.as_uuid().is_nil() {
             return Err(CapacityProviderError::LeaseDispositionConflict);
         }
@@ -1484,6 +1509,22 @@ impl ProvisionalCapacityLease {
     }
 
     fn bind_disposition(
+        &mut self,
+        operation_id: OperationId,
+        audit_pending: bool,
+    ) -> Result<(), CapacityProviderError> {
+        use super::capacity_retention_telemetry::{CapacityLedgerCall as K, observe};
+        observe(
+            if audit_pending {
+                K::AuditPendingBinding
+            } else {
+                K::DurableBinding
+            },
+            || self.bind_disposition_original(operation_id, audit_pending),
+        )
+    }
+
+    fn bind_disposition_original(
         &mut self,
         operation_id: OperationId,
         audit_pending: bool,
@@ -1687,6 +1728,9 @@ fn disposition_operation(disposition: &ProvisionalLeaseDisposition) -> Option<Op
 
 #[cfg(test)]
 mod admission_metrics_tests;
+
+#[cfg(test)]
+mod retention_metrics_tests;
 
 #[cfg(test)]
 mod tests {
