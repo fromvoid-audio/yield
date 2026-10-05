@@ -6872,6 +6872,7 @@ impl OperationJournalStore {
     }
 
     fn validate_chunk_claims_inside_transaction(&self) -> Result<(), OperationJournalStoreError> {
+        self.validate_recording_inventory_inside_transaction()?;
         self.validate_database_claims_inside_transaction()?;
         self.validate_database_attempts_inside_transaction()?;
         if chunk_claims::exceeds_row_limit(&self.connection, ordinary_claims::MAX_PAGE_ROWS)

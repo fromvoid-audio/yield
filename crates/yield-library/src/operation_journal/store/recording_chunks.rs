@@ -193,6 +193,134 @@ impl OperationJournalStore {
         }
         Ok(Some((sequence, chunk)))
     }
+    /// Audit the actual retained relation in the existing consistent rebuild transaction.
+    /// Decode one bounded chunk at a time; observations never authorize capture or release.
+    pub(super) fn validate_recording_inventory_inside_transaction(
+        &self,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.recording_retained_totals()?;
+        let mut after_operation = String::new();
+        loop {
+            let mut statement = self.connection.prepare(
+                "SELECT DISTINCT operation_id FROM operation_journal_recording_chunks
+                 WHERE operation_id>?1 ORDER BY operation_id LIMIT 8",
+            )?;
+            let operations = statement
+                .query_map([&after_operation], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            if operations.is_empty() {
+                break;
+            }
+            for text in operations {
+                let id = Uuid::parse_str(&text).map_err(error)?;
+                if id.is_nil() || id.to_string() != text {
+                    return Err(error(
+                        "restart recording operation identity is not canonical",
+                    ));
+                }
+                let proposal = self.recording_proposal(OperationId::from_uuid(id))?;
+                self.verify_recording_reservation(&proposal, false)?;
+                self.validate_recording_operation_inventory(&proposal)?;
+                after_operation = text;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_recording_operation_inventory(
+        &self,
+        proposal: &RecordingProposal,
+    ) -> Result<(), OperationJournalStoreError> {
+        let mut after_slot = -1i64;
+        let mut next_pcm = 0u32;
+        let mut next_header = 0u32;
+        let mut previous_pcm = None;
+        let mut previous_header = None;
+        let mut first_pcm_sequence = None;
+        let mut final_header_sequence = None;
+        let mut initial_header_sequence = None;
+        let mut previous_pcm_full = true;
+        loop {
+            // The private (operation_id,slot) index bounds both ordering and each key page.
+            let mut statement = self.connection.prepare(
+                "SELECT chunk_id,slot,sequence FROM operation_journal_recording_chunks
+                 WHERE operation_id=?1 AND slot>?2 ORDER BY slot LIMIT 8",
+            )?;
+            let keys = statement
+                .query_map(
+                    params![proposal.operation_id().to_string(), after_slot],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            if keys.is_empty() {
+                break;
+            }
+            for (text, stored_slot, sequence) in keys {
+                let id = Uuid::parse_str(&text).map_err(error)?;
+                if id.is_nil() || id.to_string() != text {
+                    return Err(error("restart recording chunk identity is not canonical"));
+                }
+                self.ensure_sequence_unique(sequence)?;
+                after_slot = stored_slot;
+                if (20_000..=20_003).contains(&stored_slot) {
+                    continue;
+                }
+                let (read_sequence, chunk) = self
+                    .read_recording_chunk_inside(id, proposal)?
+                    .ok_or_else(|| error("restart recording chunk disappeared"))?;
+                if read_sequence != sequence {
+                    return Err(error("restart recording chunk sequence changed"));
+                }
+                match chunk.role() {
+                    RecordingChunkRole::Pcm { ordinal } => {
+                        if ordinal != next_pcm
+                            || !previous_pcm_full
+                            || previous_pcm.is_some_and(|n| sequence <= n)
+                        {
+                            return Err(error("restart recording PCM prefix has an ordering gap"));
+                        }
+                        first_pcm_sequence.get_or_insert(sequence);
+                        previous_pcm = Some(sequence);
+                        previous_pcm_full =
+                            chunk.bytes().len() as u64 == proposal.format().pcm_chunk_bytes();
+                        next_pcm += 1;
+                    }
+                    RecordingChunkRole::Header { revision } => {
+                        if revision != next_header || previous_header.is_some_and(|n| sequence <= n)
+                        {
+                            return Err(error(
+                                "restart recording header prefix has an ordering gap",
+                            ));
+                        }
+                        if revision == 0 {
+                            initial_header_sequence = Some(sequence);
+                        } else {
+                            final_header_sequence.get_or_insert(sequence);
+                        }
+                        previous_header = Some(sequence);
+                        next_header += 1;
+                    }
+                }
+            }
+        }
+        if first_pcm_sequence
+            .is_some_and(|pcm| initial_header_sequence.is_none_or(|header| pcm <= header))
+            || previous_pcm
+                .is_some_and(|pcm| final_header_sequence.is_some_and(|header| pcm >= header))
+        {
+            return Err(error(
+                "restart recording capture crosses its header boundary",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn retain_recording_chunk(
         &self,
         chunk: &RecordingCapturedChunk,
