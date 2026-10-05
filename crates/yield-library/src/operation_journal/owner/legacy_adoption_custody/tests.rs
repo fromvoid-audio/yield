@@ -244,6 +244,75 @@ fn legacy_custody_original_directory_replacement_refuses_without_touching_substi
     );
 }
 
+fn changed_evidence(journal_rollback: bool) {
+    let mut f = Fixture::new();
+    let custody = f.prepare().unwrap();
+    let source = fs::read(f.path()).unwrap();
+    let journal = journal_bytes(&f);
+    let evidence = if journal_rollback {
+        f.profile
+            .path()
+            .join(super::super::super::store::JOURNAL_DATABASE_ROOT_NAME)
+            .join(format!(
+                "{}-journal",
+                super::super::super::store::JOURNAL_DATABASE_FILE_NAME
+            ))
+    } else {
+        f.profile
+            .path()
+            .join("legacy")
+            .join(".yield-source-lease.lock")
+    };
+    // The journal may already retain its normal 512-byte cold rollback header.
+    // A distinct length changes the frozen object observation even in that case.
+    let bytes = vec![0u8; 1024];
+    fs::write(&evidence, &bytes).unwrap();
+    assert!(
+        matches!(
+            validate(&custody),
+            Err(OperationJournalOwnerError::LegacyAdoptionCustody(
+                LegacyAdoptionCustodyError::Changed
+            ))
+        ),
+        "changed evidence accepted: journal_rollback={journal_rollback}"
+    );
+    assert_eq!(fs::read(&evidence).unwrap(), bytes);
+    assert_eq!(fs::read(f.path()).unwrap(), source);
+    assert_eq!(journal_bytes(&f), journal);
+    assert_eq!(
+        budget(&f.client()).remaining[0],
+        f.baseline.remaining[0] - INPUT_BYTES
+    );
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            f.profile
+                .path()
+                .join("legacy")
+                .join(".yield-source-lease.lock"),
+        )
+        .unwrap();
+    assert!(lock.try_lock().is_err());
+    f.close();
+    lock.try_lock().unwrap();
+    // Original source reservation evidence survives shutdown. SQLite's confirmed close may
+    // remove its own ordinary cold rollback file; it is not a durable adoption receipt.
+    if !journal_rollback {
+        assert_eq!(fs::read(&evidence).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn legacy_custody_changed_control_evidence_refuses() {
+    changed_evidence(false);
+}
+
+#[test]
+fn legacy_custody_changed_journal_evidence_refuses() {
+    changed_evidence(true);
+}
+
 #[test]
 fn legacy_custody_foreign_profile_rejection_refunds_and_preserves_both_originals() {
     let mut f = Fixture::new();
