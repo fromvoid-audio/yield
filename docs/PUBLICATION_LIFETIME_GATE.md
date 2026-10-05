@@ -25,9 +25,10 @@ Today only staging validation executes in the general file owner. Publication
 effects are `Unsupported`. Its validation result contains identity/content
 observations, not a retained native staged-file handle. Journal
 `Cancel` now closes pending original issuer fences and refuses entered/unsettled
-cancellation before calling the store. Chunk release still removes tickets and
-releases charges without a publication-slot association. All remaining mutation
-and release paths must be fenced before the new grant can enable an effect. Current cancellation accepts eligible
+cancellation before calling the store. Chunk release/retry/cancel and progress/retry
+commands also consult the original operation fence before mutating tickets or
+stored evidence. All remaining mutation and release paths must be fenced before
+the new grant can enable an effect. Current cancellation accepts eligible
 `IntentDurable` operations; a staging checkpoint does not itself advance that
 operation phase. Do not infer that its stored cancellation receipt excludes a
 newly begun namespace effect.
@@ -668,3 +669,19 @@ Other mutation/ordinary-release/source-retirement fences, exact capacity/native
 association, completion and settlement remain open in OPT-2215/2216/2217/2218.
 Supported macOS SDK compilation and genuine original-unused issuer execution
 remain [OPT-2306](https://linear.app/boostnlvp/issue/OPT-2306).
+
+## Original progress and retry mutation fences (OPT-2307)
+
+The actual `PersistFull`, `Retry` and `ChunkExhaustion` actor commands now consult
+the original operation fence after bounded decoding and before any store write.
+Pending entry closes conservatively, including when the subsequent CAS fails.
+Entered, unsettled or unknown custody returns typed `PublicationMutationPending`
+without changing the stored progress or retry observation. A different operation
+continues through its own store validation. Dropping counted physical custody does
+not permit mutation of an unsettled publication attempt.
+
+Portable tests drive the actual ordinary/control queues and owned SQLite actor,
+checking exact retained records and sequences. Their scalar fences confer no
+source or native grant. Source/volume retirement, exact charge and qualified
+namespace association, completion and genuine settlement remain open under
+OPT-2215; this fence supplies none of those authorities.

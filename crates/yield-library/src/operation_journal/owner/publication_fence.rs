@@ -136,6 +136,16 @@ impl Registry {
             .flatten()
             .any(|fence| !matches!(fence.state.lock().map(|s| *s), Ok(State::Closed)))
     }
+    pub(super) fn close_for_mutation(
+        &self,
+        operation: OperationId,
+    ) -> Result<(), OperationJournalOwnerError> {
+        self.close_for_cancellation(operation).map_err(|_| {
+            OperationJournalOwnerError::PublicationMutationPending {
+                operation_id: operation,
+            }
+        })
+    }
     pub(super) fn close_for_charge_release(
         &self,
         operation: OperationId,

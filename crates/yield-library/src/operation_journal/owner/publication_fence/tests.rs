@@ -92,6 +92,9 @@ fn original_fence_exhaustion_and_poison_never_remint_or_cancel_uncertain_entry()
     );
     assert!(!pending.enter());
     assert!(registry.close_for_cancellation(operation).is_err());
+    assert!(matches!(registry.close_for_mutation(operation),
+        Err(OperationJournalOwnerError::PublicationMutationPending { operation_id }) if operation_id == operation));
+
     drop(pending);
     assert!(registry.issue(operation, &shared).is_err());
 }

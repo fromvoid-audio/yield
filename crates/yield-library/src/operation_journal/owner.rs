@@ -591,6 +591,12 @@ pub enum OperationJournalOwnerError {
         /// Operation whose entered, unsettled or unknown publication retains its charges.
         operation_id: OperationId,
     },
+    /// Publication custody prevents changing this operation's progress or retry state.
+    #[error("operation {operation_id:?} mutation awaits publication reconciliation")]
+    PublicationMutationPending {
+        /// Original operation whose publication attempt remains entered or unresolved.
+        operation_id: OperationId,
+    },
     /// An internally serialized control input could not be decoded on the owner thread.
     #[error("operation journal owner control input could not be decoded: {reason}")]
     InvalidInput {
@@ -5999,6 +6005,9 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                     }
                 })?;
                 runtime
+                    .publication_fences
+                    .close_for_mutation(record.snapshot().intent().operation_id())?;
+                runtime
                     .store()
                     .persist_full(&record, expected_sequence)
                     .map_err(OperationJournalOwnerError::from)
@@ -6028,6 +6037,9 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             execute_store_result(result, move || {
                 let observation = decode_control_input(&encoded)?;
                 runtime
+                    .publication_fences
+                    .close_for_mutation(operation_id)?;
+                runtime
                     .store()
                     .record_retry_pending(operation_id, expected_sequence, observation)
                     .map_err(OperationJournalOwnerError::from)
@@ -6043,6 +6055,9 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             let _input = input;
             execute_store_result(result, move || {
                 let observation = decode_control_input(&encoded)?;
+                runtime
+                    .publication_fences
+                    .close_for_mutation(operation_id)?;
                 runtime
                     .store()
                     .record_post_intent_chunk_exhaustion(
@@ -6439,6 +6454,7 @@ mod tests {
     mod publication_chunk_release_tests;
     mod publication_fence_tests;
     mod publication_input_tests;
+    mod publication_mutation_tests;
     mod publication_uncertainty_tests;
     mod resource_custody_tests;
     mod source_registry_handoff_tests;
