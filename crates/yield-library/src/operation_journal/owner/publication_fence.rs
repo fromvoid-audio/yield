@@ -33,6 +33,7 @@ pub(super) struct Registry {
 const _: () = assert!(
     std::mem::size_of::<Registry>()
         + MAX_FENCES * (std::mem::size_of::<Fence>() + 2 * std::mem::size_of::<usize>())
+        + super::super::capacity_provider::PUBLICATION_MIRROR_BYTES
         <= HEADER_BYTES
 );
 fn refused(reason: &str) -> OperationJournalOwnerError {
