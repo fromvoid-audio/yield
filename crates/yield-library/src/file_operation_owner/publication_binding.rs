@@ -167,8 +167,140 @@ impl PreparedPublicationTarget {
     pub(crate) fn fingerprint(&self) -> RequestFingerprint {
         self.data.fingerprint
     }
+    fn revalidate_held_staging(&self) -> Result<(), BindingError> {
+        self.data.revalidate_held_staging()
+    }
     pub(crate) fn volume(&self) -> &crate::durable_capacity::VolumeIdentity {
         &self.data.volume
+    }
+}
+impl BindingData {
+    /// Fresh descriptor observations only; this never establishes creation provenance.
+    fn revalidate_held_staging(&self) -> Result<(), BindingError> {
+        let check = || {
+            if Instant::now() < self.deadline
+                && self.shared.upgrade().is_some_and(|shared| {
+                    OwnerLifecycle::from_u8(shared.lifecycle.load(Ordering::Acquire))
+                        == OwnerLifecycle::Running
+                })
+                && self.lives.iter().all(|life| life.load(Ordering::Acquire))
+            {
+                Ok(())
+            } else {
+                Err(BindingError::Closed)
+            }
+        };
+        check()?;
+        let EffectOutcome::Applied { evidence } = self.validation.outcome() else {
+            return Err(BindingError::Invalid);
+        };
+        let proof = evidence.validated_staging().ok_or(BindingError::Invalid)?;
+        let file = &self.staged_file;
+        let metadata_matches = || {
+            let metadata = file.metadata().map_err(|_| BindingError::Unknown)?;
+            if !metadata.is_file()
+                || metadata.len() != proof.bytes
+                || stable_filesystem_identity_from_open_file(file).as_deref()
+                    != Some(proof.stable_identity.as_str())
+            {
+                return Err(BindingError::Conflict);
+            }
+            #[cfg(unix)]
+            if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 {
+                return Err(BindingError::Conflict);
+            }
+            Ok(())
+        };
+        metadata_matches()?;
+        // Windows seek_read may move its supplied handle's cursor. ReOpenFile derives
+        // one independent read handle from this exact held object, never a pathname.
+        #[cfg(windows)]
+        let reader = reopen_held_staging_reader(file).map_err(|_| BindingError::Unknown)?;
+        #[cfg(windows)]
+        let reader = &reader;
+        #[cfg(not(windows))]
+        let reader = file;
+        let mut hasher = blake3::Hasher::new();
+        let mut scratch = [0u8; 8192];
+        let mut offset = 0u64;
+        loop {
+            check()?;
+            let count = read_held_staging_at(reader, &mut scratch, offset)
+                .map_err(|_| BindingError::Unknown)?;
+            if count == 0 {
+                break;
+            }
+            offset = offset
+                .checked_add(count as u64)
+                .filter(|bytes| *bytes <= proof.bytes)
+                .ok_or(BindingError::Conflict)?;
+            hasher.update(&scratch[..count]);
+        }
+        if offset != proof.bytes || *hasher.finalize().as_bytes() != proof.content_hash {
+            return Err(BindingError::Conflict);
+        }
+        metadata_matches()?;
+        if crate::durable_capacity::descriptor_capacity_facts(file)
+            .map_err(|_| BindingError::Unknown)?
+            .identity
+            != self.volume
+        {
+            return Err(BindingError::Conflict);
+        }
+        check()
+    }
+}
+#[cfg(windows)]
+fn reopen_held_staging_reader(original: &std::fs::File) -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, ReOpenFile,
+        },
+    };
+    let expected = stable_filesystem_identity_from_open_file(original)
+        .ok_or_else(|| std::io::Error::other("unknown original staged identity"))?;
+    // SAFETY: caller verified the held regular file; this requests only readonly
+    // access to that same object. No path, create, write or namespace right is used.
+    let handle = unsafe {
+        ReOpenFile(
+            HANDLE(original.as_raw_handle()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    }
+    .map_err(std::io::Error::other)?;
+    // SAFETY: the returned valid owned handle is closed on every subsequent path.
+    let reader = unsafe { std::fs::File::from_raw_handle(handle.0) };
+    if stable_filesystem_identity_from_open_file(&reader).as_deref() != Some(expected.as_str())
+        || stable_filesystem_identity_from_open_file(original).as_deref() != Some(expected.as_str())
+    {
+        return Err(std::io::Error::other(
+            "original staged reader identity changed",
+        ));
+    }
+    Ok(reader)
+}
+fn read_held_staging_at(
+    file: &std::fs::File,
+    bytes: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, bytes, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, bytes, offset)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, bytes, offset);
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 }
 impl FileOperationRequest {
@@ -344,6 +476,18 @@ impl WorkerState {
             .get(&target.target().registration)
             .and_then(|root| root.capability.as_ref())
             .ok_or(BindingError::Missing)?;
+        target.revalidate_held_staging()?;
+        let target_directory = root
+            .root
+            .try_clone_descriptor()
+            .map_err(|_| BindingError::Unknown)?;
+        if crate::durable_capacity::descriptor_capacity_facts(&target_directory)
+            .map_err(|_| BindingError::Unknown)?
+            .identity
+            != target.data.volume
+        {
+            return Err(BindingError::Conflict);
+        }
         match root
             .root
             .symlink_metadata(Path::new(target.target().locator.as_str()))
@@ -472,6 +616,9 @@ impl WorkerState {
                         .map_err(|_| BindingError::Full)?,
                 );
             }
+        }
+        if let Some(data) = existing.as_ref() {
+            data.revalidate_held_staging()?;
         }
         let deadline = existing
             .as_ref()

@@ -102,6 +102,104 @@ mod integration {
         }
     }
     #[test]
+    fn held_staging_revalidation_refuses_changed_original_without_moving_cursor() {
+        use std::io::Seek;
+        let f = Fixture::new();
+        let (mut validation, result) = f.validation();
+        let mut pending = f.prepare(result, EffectId::new(), "final.wav");
+        let target = wait(&mut pending).unwrap();
+        let mut original = &target.data.staged_file;
+        let cursor = original.stream_position().unwrap();
+        assert_eq!(cursor, b"actual original retained bytes".len() as u64);
+        assert_eq!(target.revalidate_held_staging(), Ok(()));
+        assert_eq!(target.revalidate_held_staging(), Ok(()));
+        assert_eq!(original.stream_position().unwrap(), cursor);
+        let credit = f.owner.input_bytes_remaining_for_test();
+        std::fs::write(
+            f.guard.profile_root().join("stage.bin"),
+            b"actual altered retained bytes",
+        )
+        .unwrap();
+        assert_eq!(
+            target.revalidate_held_staging(),
+            Err(BindingError::Conflict)
+        );
+        assert_eq!(original.stream_position().unwrap(), cursor);
+        assert_eq!(credit, f.owner.input_bytes_remaining_for_test());
+        assert!(!f.guard.profile_root().join("final.wav").exists());
+        validation.acknowledge().unwrap();
+        drop((target, pending, validation));
+        f.owner.acknowledge_custody_for_test();
+        let _ = f.owner.shutdown();
+    }
+
+    #[test]
+    fn held_staging_revalidation_preserves_renamed_original_and_foreign_replacement() {
+        let f = Fixture::new();
+        let (mut validation, result) = f.validation();
+        let effect = EffectId::new();
+        let mut pending = f.prepare(result.clone(), effect, "final.wav");
+        let target = wait(&mut pending).unwrap();
+        let credit = f.owner.input_bytes_remaining_for_test();
+        let stage = f.guard.profile_root().join("stage.bin");
+        let renamed = f.guard.profile_root().join("held-original.bin");
+        std::fs::rename(&stage, &renamed).unwrap();
+        std::fs::write(&stage, b"foreign replacement content").unwrap();
+        assert_eq!(target.revalidate_held_staging(), Ok(()));
+        std::fs::write(&renamed, b"actual altered retained bytes").unwrap();
+        assert_eq!(
+            target.revalidate_held_staging(),
+            Err(BindingError::Conflict)
+        );
+        let mut duplicate = f.prepare(result, effect, "final.wav");
+        assert!(matches!(wait(&mut duplicate), Err(BindingError::Conflict)));
+        assert_eq!(credit, f.owner.input_bytes_remaining_for_test());
+        assert_eq!(
+            std::fs::read(&stage).unwrap(),
+            b"foreign replacement content"
+        );
+        assert_eq!(
+            std::fs::read(&renamed).unwrap(),
+            b"actual altered retained bytes"
+        );
+        assert!(!f.guard.profile_root().join("final.wav").exists());
+        validation.acknowledge().unwrap();
+        drop((target, pending, duplicate, validation));
+        f.owner.acknowledge_custody_for_test();
+        let _ = f.owner.shutdown();
+    }
+
+    #[test]
+    fn held_staging_revalidation_refuses_links_length_and_closed_original_root() {
+        let f = Fixture::new();
+        let (mut validation, result) = f.validation();
+        let mut pending = f.prepare(result, EffectId::new(), "final.wav");
+        let target = wait(&mut pending).unwrap();
+        let stage = f.guard.profile_root().join("stage.bin");
+        let alias = f.guard.profile_root().join("alias.bin");
+        std::fs::hard_link(&stage, &alias).unwrap();
+        assert_eq!(
+            target.revalidate_held_staging(),
+            Err(BindingError::Conflict)
+        );
+        std::fs::remove_file(&alias).unwrap();
+        assert_eq!(target.revalidate_held_staging(), Ok(()));
+        std::fs::write(&stage, b"short").unwrap();
+        assert_eq!(
+            target.revalidate_held_staging(),
+            Err(BindingError::Conflict)
+        );
+        std::fs::write(&stage, b"actual original retained bytes").unwrap();
+        assert_eq!(target.revalidate_held_staging(), Ok(()));
+        f.owner.retire_root(f.stage).unwrap();
+        assert_eq!(target.revalidate_held_staging(), Err(BindingError::Closed));
+        validation.acknowledge().unwrap();
+        drop((target, pending, validation));
+        f.owner.acknowledge_custody_for_test();
+        let _ = f.owner.shutdown();
+    }
+
+    #[test]
     fn original_publication_command_bytes_cannot_mint_primary_grant() {
         let f = Fixture::new();
         let (mut validation, result) = f.validation();
