@@ -82,6 +82,7 @@ use super::work_plan::derive_work_plan;
 const CONTROL_INPUT_BYTES: usize = 1;
 // Disjoint credit classes on the original four-MiB pool; no ordinary caller can borrow control.
 const CONTROL_INPUT_RESERVED_BYTES: usize = 64 * 1024;
+const PUBLICATION_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const ORDINARY_INPUT_BYTES: usize =
     OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES - CONTROL_INPUT_RESERVED_BYTES;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,12 +107,14 @@ impl InputClass {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InputBudget {
     remaining: [usize; 2],
+    publication_remaining: usize,
     unavailable: bool,
 }
 impl InputBudget {
     fn new() -> Self {
         Self {
             remaining: [ORDINARY_INPUT_BYTES, CONTROL_INPUT_RESERVED_BYTES],
+            publication_remaining: PUBLICATION_INPUT_BYTES,
             unavailable: false,
         }
     }
@@ -119,6 +122,9 @@ impl InputBudget {
         !self.unavailable
             && self.remaining[0] <= ORDINARY_INPUT_BYTES
             && self.remaining[1] <= CONTROL_INPUT_RESERVED_BYTES
+            && self.publication_remaining <= PUBLICATION_INPUT_BYTES
+            && PUBLICATION_INPUT_BYTES - self.publication_remaining
+                <= ORDINARY_INPUT_BYTES - self.remaining[0]
     }
 }
 
@@ -5069,7 +5075,25 @@ impl OwnerShared {
         class: InputClass,
         requested: usize,
     ) -> Result<InputPermit, OperationJournalOwnerQueueError> {
-        if requested == 0 {
+        self.reserve_input_kind(class, requested, false)
+    }
+
+    /// Original pool debit with an additional publication ceiling, not another allowance.
+    /// Only fixed private producer callsites select this class; callers cannot borrow control.
+    fn reserve_publication_input(
+        self: &Arc<Self>,
+        requested: usize,
+    ) -> Result<InputPermit, OperationJournalOwnerQueueError> {
+        self.reserve_input_kind(InputClass::Ordinary, requested, true)
+    }
+
+    fn reserve_input_kind(
+        self: &Arc<Self>,
+        class: InputClass,
+        requested: usize,
+        publication: bool,
+    ) -> Result<InputPermit, OperationJournalOwnerQueueError> {
+        if requested == 0 || (publication && class != InputClass::Ordinary) {
             return Err(OperationJournalOwnerQueueError::InvalidInput {
                 reason: String::from("journal input credit must be nonzero"),
             });
@@ -5088,18 +5112,32 @@ impl OwnerShared {
                 reason: "journal input credit accounting is unavailable".into(),
             });
         }
-        let remaining = &mut budget.remaining[class.index()];
-        let after = remaining.checked_sub(requested).ok_or(
-            OperationJournalOwnerQueueError::InputBytesFull {
+        let publication_after = if publication {
+            Some(budget.publication_remaining.checked_sub(requested).ok_or(
+                OperationJournalOwnerQueueError::InputBytesFull {
+                    limit: PUBLICATION_INPUT_BYTES,
+                    requested,
+                },
+            )?)
+        } else {
+            None
+        };
+        let after = budget.remaining[class.index()]
+            .checked_sub(requested)
+            .ok_or(OperationJournalOwnerQueueError::InputBytesFull {
                 limit: class.limit(),
                 requested,
-            },
-        )?;
-        *remaining = after;
+            })?;
+        // Both checked debits succeed before either original counter changes.
+        budget.remaining[class.index()] = after;
+        if let Some(after) = publication_after {
+            budget.publication_remaining = after;
+        }
         Ok(InputPermit {
             shared: Arc::clone(self),
             bytes: requested,
             class,
+            publication,
         })
     }
 
@@ -5131,23 +5169,41 @@ impl OwnerShared {
         })
     }
 
-    fn release_input(&self, class: InputClass, bytes: usize) {
+    fn release_input(&self, class: InputClass, bytes: usize, publication: bool) {
         let Ok(mut budget) = self.input_bytes.lock() else {
-            // Unknown accounting is retained and closes admission. Do not panic in Drop or
-            // recover/reset a poisoned pool while another owner's backing may still exist.
             self.mark_unavailable("journal input credit mutex is poisoned");
             return;
         };
-        let after = budget.remaining[class.index()]
+        let mut restored = *budget;
+        let ordinary_after = budget.remaining[class.index()]
             .checked_add(bytes)
             .filter(|n| *n <= class.limit());
-        if !budget.valid() || bytes == 0 || after.is_none() {
+        let publication_after = if publication {
+            budget
+                .publication_remaining
+                .checked_add(bytes)
+                .filter(|n| *n <= PUBLICATION_INPUT_BYTES)
+        } else {
+            Some(budget.publication_remaining)
+        };
+        if let (Some(ordinary), Some(publication_bytes)) = (ordinary_after, publication_after) {
+            restored.remaining[class.index()] = ordinary;
+            restored.publication_remaining = publication_bytes;
+        }
+        if !budget.valid()
+            || bytes == 0
+            || ordinary_after.is_none()
+            || publication_after.is_none()
+            || (publication && class != InputClass::Ordinary)
+            || !restored.valid()
+        {
             budget.unavailable = true;
             drop(budget);
             self.mark_unavailable("journal input credit refund cannot be confirmed");
             return;
         }
-        budget.remaining[class.index()] = after.expect("checked finite refund");
+        // Last backing-holder Drop returns memory credits together; no physical claim changes.
+        *budget = restored;
     }
 
     fn release_result(&self, class: InputClass) {
@@ -5182,11 +5238,13 @@ pub(super) struct InputPermit {
     shared: Arc<OwnerShared>,
     bytes: usize,
     class: InputClass,
+    publication: bool,
 }
 
 impl Drop for InputPermit {
     fn drop(&mut self) {
-        self.shared.release_input(self.class, self.bytes);
+        self.shared
+            .release_input(self.class, self.bytes, self.publication);
     }
 }
 
@@ -6190,6 +6248,7 @@ mod tests {
     mod control_input_tests;
     mod control_responsiveness_tests;
     mod native_read_capsule_tests;
+    mod publication_input_tests;
     mod resource_custody_tests;
     mod source_registry_handoff_tests;
     #[test]

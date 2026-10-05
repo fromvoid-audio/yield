@@ -204,7 +204,7 @@ impl OwnerRuntime {
             return Err("resource custody already attached".into());
         }
         let input = shared
-            .reserve_input(InputClass::Ordinary, resource_custody::HEADER_BYTES)
+            .reserve_publication_input(resource_custody::HEADER_BYTES)
             .map_err(|error| error.to_string())?;
         self.resource_admission = Arc::clone(&shared.resource_admission);
         self.resource_input = Some(input);
@@ -236,7 +236,7 @@ impl OwnerRuntime {
             return Err(NativeReadError::Full);
         }
         let input = shared
-            .reserve_input(InputClass::Ordinary, BACKING)
+            .reserve_publication_input(BACKING)
             .map_err(|_| NativeReadError::Full)?;
         let profile = self
             .final_profile_guard
@@ -320,7 +320,7 @@ impl OwnerRuntime {
         if self.native_reader_registry_input.is_none() {
             self.native_reader_registry_input = Some(
                 shared
-                    .reserve_input(InputClass::Ordinary, REGISTRY)
+                    .reserve_publication_input(REGISTRY)
                     .map_err(|_| NativeReadError::Full)?,
             );
         }
