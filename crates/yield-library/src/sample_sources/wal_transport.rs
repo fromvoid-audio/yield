@@ -219,6 +219,7 @@ struct Ticket {
     cancelled: AtomicBool,
     status: Mutex<SourceWalTransportStatus>,
     credit: Mutex<Option<Credit>>,
+    current: Mutex<Option<crate::operation_journal::wal_admission::CurrentRequest>>,
 }
 impl Ticket {
     fn status(&self) -> SourceWalTransportStatus {
@@ -285,6 +286,24 @@ impl SourceWalTransportReservation {
     /// Observe prepared/aborting/terminal custody; only the original worker changes outcomes.
     pub fn status(&self) -> SourceWalTransportStatus {
         self.ticket.status()
+    }
+    pub(crate) fn request_current(
+        &self,
+        request: crate::operation_journal::wal_admission::CurrentRequest,
+    ) -> Result<(), SourceWalTransportRejection> {
+        if self.ticket.cancelled.load(Ordering::Acquire) {
+            return Err(SourceWalTransportRejection::Cancelled);
+        }
+        let mut pending = self
+            .ticket
+            .current
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if pending.is_some() {
+            return Err(SourceWalTransportRejection::Full);
+        }
+        *pending = Some(request);
+        Ok(())
     }
     /// Ask the original owner to abort; this does not synchronously unlock or return a writer.
     pub fn abort(&self) {
@@ -588,6 +607,7 @@ impl SourceWalTransport {
         q.bytes += size;
         let ticket = Arc::new(Ticket {
             cancelled: AtomicBool::new(false),
+            current: Mutex::new(None),
             status: Mutex::new(SourceWalTransportStatus::Pending),
             credit: Mutex::new(Some(Credit {
                 shared: Arc::downgrade(&self.shared),

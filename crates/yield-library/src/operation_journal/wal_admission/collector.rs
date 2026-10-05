@@ -163,6 +163,7 @@ pub(in crate::operation_journal) struct Collector {
     reason: Option<WalPreparationError>,
     global_started: bool,
     snapshot: Option<WalPreparationObservation>,
+    current: Option<Arc<super::CurrentRound>>,
     done: bool,
     _journal_input: Arc<super::super::owner::InputPermit>,
 }
@@ -189,6 +190,7 @@ impl Collector {
                 reason: None,
                 global_started: false,
                 snapshot: None,
+                current: None,
                 done: false,
                 _journal_input: Arc::new(journal_input),
             },
@@ -451,6 +453,48 @@ impl Collector {
                     self.fail(WalPreparationError::Source(error));
                     return self.poll_abort();
                 }
+            }
+        }
+        if self.snapshot.is_none() && !self.held.is_empty() {
+            if self.current.is_none() {
+                let mut credit = self.input.budget.credit();
+                if credit
+                    .resize(std::mem::size_of::<super::CurrentRound>() + 64)
+                    .is_err()
+                {
+                    self.fail(WalPreparationError::Full);
+                    return self.poll_abort();
+                }
+                let Some(round) =
+                    super::CurrentRound::new(self.held.len(), self.input.deadline, credit)
+                else {
+                    self.fail(WalPreparationError::InvalidInput);
+                    return self.poll_abort();
+                };
+                for (index, owner) in self.held.iter().enumerate() {
+                    let result = match owner {
+                        HeldOwner::Global(holder) => holder
+                            .request_current(round.request(index))
+                            .map_err(WalPreparationError::Global),
+                        HeldOwner::Source(holder) => holder
+                            .request_current(round.request(index))
+                            .map_err(WalPreparationError::Source),
+                    };
+                    if let Err(error) = result {
+                        self.fail(error);
+                        return self.poll_abort();
+                    }
+                }
+                self.current = Some(round);
+                return false;
+            }
+            if !self
+                .current
+                .as_ref()
+                .expect("original validation round")
+                .complete()
+            {
+                return false;
             }
         }
         if self.snapshot.is_none() {

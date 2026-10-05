@@ -16,6 +16,7 @@ const _: () = assert!(
         + std::mem::size_of::<GlobalPreparationRequest>()
         + std::mem::size_of::<GlobalPreparationPending>()
         + std::mem::size_of::<GlobalPreparationReservation>()
+        + std::mem::size_of::<Control>()
         + std::mem::size_of::<ObservationData>()
         + std::mem::size_of::<GlobalWalScope>()
         + 8 * std::mem::size_of::<usize>()
