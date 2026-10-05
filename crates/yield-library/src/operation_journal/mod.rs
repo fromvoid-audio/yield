@@ -11,6 +11,7 @@ pub mod cancellation_dispatch;
 pub mod cancellation_effects;
 pub mod cancellation_reconciliation;
 pub mod cancellation_recovery;
+pub mod capacity_admission_telemetry;
 pub mod capacity_estimator;
 #[allow(dead_code)]
 mod capacity_provider;

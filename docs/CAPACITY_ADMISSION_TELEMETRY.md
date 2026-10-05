@@ -1,0 +1,5 @@
+# Original capacity admission observations
+
+`capacity_admission_telemetry_snapshot` exposes fixed process-lifetime decision counts and five elapsed buckets from the original provider admission return. The live-witness path, original fallback and test-only fresh-facts seam each record once. Internal validation and ledger mutation remain unchanged. There is no telemetry lock, registry, callback, reset, trace payload or authority; atomic fields are sampled independently and saturate.
+
+Elapsed starts at the provider call and ends after selecting its original result, excluding earlier owner/witness acquisition and subsequent settlement or result destruction. Early caller rejection before the provider is not counted. A returned provisional lease is logical accounting, not durability, physical reservation or permission to execute. Logical qualified fixtures exercise real ledger code without qualifying production effects. Retained/retry settlement and full OPT-1673/1670 acceptance remain open.
