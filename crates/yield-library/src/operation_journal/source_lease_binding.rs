@@ -255,6 +255,15 @@ impl StoredSourceLeaseFence {
     pub(crate) fn write_ceilings(&self) -> [u64; 3] {
         self.objects.each_ref().map(|o| o.ceiling)
     }
+    // Compare a genuine new preparation with the complete frozen policy. The local
+    // capture nonce changes at preparation; it is not the journal decision nonce.
+    pub(crate) fn matches_initial_policy(&self, frozen: &Self) -> bool {
+        self.version == frozen.version
+            && self.subject == frozen.subject
+            && self.page_size == frozen.page_size
+            && self.maximum_pages == frozen.maximum_pages
+            && self.objects == frozen.objects
+    }
     pub(crate) fn device(&self) -> u64 {
         self.objects[0].device
     }
