@@ -22,6 +22,8 @@ use super::file_ops_journal::BoundDatabaseRoot;
 use super::source_lease::{SourceLease, SourceLeaseError};
 use super::sqlite_identity::DatabaseFileBinding;
 use super::{SourceDatabase, SourceDbError};
+mod registered_custody;
+pub(crate) use registered_custody::RegisteredDatabaseCustody;
 
 const PREPARED: u8 = 0;
 const REGISTERED: u8 = 1;
@@ -1101,15 +1103,35 @@ impl SourceDatabase {
         self,
         guard: &mut SourceAuthorityGuard,
     ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
-        let source_lease = self
-            .source_lease
-            .as_ref()
-            .ok_or(SourceDbError::SourceLease(SourceLeaseError::Required))?;
-        if !guard.belongs_to(source_lease) {
-            return Err(SourceAuthorityError::GuardMismatch);
-        }
-        if guard.state.phase() != DRAINING {
-            return Err(SourceAuthorityError::InvalidLifecycle);
+        self.close_with_registered_custody(guard, None)
+    }
+
+    pub(crate) fn close_with_registered_custody(
+        self,
+        guard: &mut SourceAuthorityGuard,
+        custody: Option<RegisteredDatabaseCustody>,
+    ) -> Result<SourceAuthorityRetirementAck, SourceAuthorityError> {
+        // On every validation failure close ordinary SQLite before dropping counted custody.
+        let validation = (|| {
+            let source_lease = self
+                .source_lease
+                .as_ref()
+                .ok_or(SourceDbError::SourceLease(SourceLeaseError::Required))?;
+            if !guard.belongs_to(source_lease) {
+                return Err(SourceAuthorityError::GuardMismatch);
+            }
+            if guard.state.phase() != DRAINING {
+                return Err(SourceAuthorityError::InvalidLifecycle);
+            }
+            if let Some(custody) = custody.as_ref() {
+                custody.validate_close(&self, guard)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            drop(self);
+            drop(custody);
+            return Err(error);
         }
 
         let SourceDatabase {
@@ -1119,10 +1141,14 @@ impl SourceDatabase {
         } = self;
         let snapshots_active = source_lease.as_ref().is_some_and(|lease| {
             // One strong reference belongs to this SourceDatabase and one to the source-owner
-            // guard. Any additional owner is a live snapshot/write fence.
-            Arc::strong_count(lease) > 2
+            // guard, plus the optional identity-checked custody reference. Any other
+            // owner is a live snapshot/write fence.
+            Arc::strong_count(lease) > 2 + usize::from(custody.is_some())
         });
         drop(connection);
+        // Own ordinary connection is now quiescent. Release precisely this counted use and
+        // its own lease reference before the existing final lease-release wait/ack boundary.
+        drop(custody);
         if snapshots_active {
             drop(source_lease);
             return Err(SourceAuthorityError::Lease(
@@ -1154,5 +1180,12 @@ mod tests {
     #[test]
     fn private_effect_pin_can_cross_to_the_owner_thread() {
         assert_send_sync::<SourceEffectPin>();
+    }
+}
+
+#[cfg(test)]
+impl SourceAuthorityRequest {
+    pub(crate) fn registered_uses_for_tests(&self) -> usize {
+        self.state.effect_gate.state.lock().unwrap().in_flight
     }
 }
