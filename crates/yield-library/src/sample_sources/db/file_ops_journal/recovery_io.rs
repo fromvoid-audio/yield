@@ -29,6 +29,9 @@ use crate::timestamps::system_time_to_unix_nanos;
 
 use super::super::{DatabaseRootBindingGuard, SourceDatabase};
 
+#[cfg(any(windows, test))]
+mod windows_observation;
+
 /// Result of a descriptor-bound staged publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum StagedFinalization {
@@ -977,7 +980,11 @@ impl BoundDatabaseRoot {
 
     /// Read one observation child without following links or waiting for a substituted FIFO.
     pub(crate) fn open_observation_file_nofollow(&self, name: &Path) -> io::Result<fs::File> {
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            windows_observation::open(self, name)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = name;
             Err(io::Error::new(
