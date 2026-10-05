@@ -12,4 +12,4 @@ pub(super) use collector::Collector;
 pub use collector::{
     WalPreparationHandle, WalPreparationObservation, WalPreparationStatus, WalPreparedDatabase,
 };
-pub(crate) use current::{CurrentRequest, CurrentRound};
+pub(crate) use current::{CurrentCustody, CurrentRequest, CurrentRound};

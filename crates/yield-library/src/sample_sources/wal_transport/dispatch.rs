@@ -59,6 +59,16 @@ pub enum SourceWalProducerOwner {
     Lease(SourceLeaseWalTransportOwner),
 }
 impl SourceWalProducerOwner {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn current_round_for_tests(
+        &self,
+    ) -> Option<Arc<crate::operation_journal::wal_admission::CurrentRound>> {
+        match self {
+            Self::Audited(owner) => owner.current_round_for_tests(),
+            Self::Lease(owner) => owner.current_round_for_tests(),
+        }
+    }
+
     /// Inspect original owner deadline.
     pub fn deadline(&self) -> Instant {
         match self {

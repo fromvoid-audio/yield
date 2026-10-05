@@ -7,8 +7,33 @@ use std::{
 pub(crate) struct CurrentRound {
     deadline: Instant,
     expected: u64,
-    acknowledged: Mutex<u64>,
+    acknowledged: Mutex<RoundState>,
     _credit: super::HandshakeCredit,
+}
+struct RoundState {
+    slots: u64,
+    invalidated: bool,
+}
+/// Only an actual parked worker retains this non-Clone acknowledgement custody.
+pub(crate) struct CurrentCustody(Arc<CurrentRound>);
+#[cfg(all(test, target_os = "linux"))]
+impl CurrentCustody {
+    pub(crate) fn original_round_for_tests(&self) -> Arc<CurrentRound> {
+        Arc::clone(&self.0)
+    }
+}
+#[cfg(all(test, target_os = "linux"))]
+impl CurrentRound {
+    pub(crate) fn invalidated_for_tests(&self) -> bool {
+        self.invalidated()
+    }
+}
+impl Drop for CurrentCustody {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.acknowledged.lock() {
+            state.invalidated = true;
+        }
+    }
 }
 pub(crate) struct CurrentRequest {
     round: Arc<CurrentRound>,
@@ -26,7 +51,10 @@ impl CurrentRound {
         Some(Arc::new(Self {
             deadline,
             expected: u64::MAX >> (64 - count),
-            acknowledged: Mutex::new(0),
+            acknowledged: Mutex::new(RoundState {
+                slots: 0,
+                invalidated: false,
+            }),
             _credit: credit,
         }))
     }
@@ -40,22 +68,34 @@ impl CurrentRound {
             bit,
         }
     }
+    pub(super) fn invalidated(&self) -> bool {
+        self.acknowledged
+            .lock()
+            .map_or(true, |state| state.invalidated)
+    }
     pub(super) fn complete(&self) -> bool {
-        Instant::now() < self.deadline
-            && self
-                .acknowledged
-                .lock()
-                .is_ok_and(|mask| *mask == self.expected)
+        self.with_complete(|| ()).is_some()
+    }
+    /// Scalar publication competes with original worker cleanup under this same mutex.
+    /// Never run native I/O, SQLite or owner waits inside this closure.
+    pub(super) fn with_complete<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
+        let state = self.acknowledged.lock().ok()?;
+        if Instant::now() >= self.deadline || state.invalidated || state.slots != self.expected {
+            return None;
+        }
+        Some(publish())
     }
 }
 impl CurrentRequest {
-    /// Called only after the actual original worker validates its retained native custody.
-    pub(crate) fn acknowledge(self) {
+    /// Original worker installs returned custody before it can clean up its native writer.
+    pub(crate) fn acknowledge(self) -> CurrentCustody {
         if Instant::now() < self.round.deadline
-            && let Ok(mut mask) = self.round.acknowledged.lock()
+            && let Ok(mut state) = self.round.acknowledged.lock()
+            && !state.invalidated
         {
-            *mask |= self.bit;
+            state.slots |= self.bit;
         }
+        CurrentCustody(self.round)
     }
 }
 
@@ -65,15 +105,82 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn current_round_original_global_worker_holds_and_invalidates_before_release_delivery() {
+        use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
+        use crate::sample_sources::library::{
+            GlobalLibraryWriter, GlobalLibraryWriterStatus, GlobalPreparationRequest,
+            LIBRARY_DB_FILE_NAME,
+        };
+        let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(std::fs::canonicalize(temp.path()).unwrap());
+        let _profile = PersistenceProfileGuard::named("current-global-custody");
+        let profile = WritableProfileGuard::acquire_current().unwrap();
+        let mut writer = GlobalLibraryWriter::start(&profile).unwrap();
+        let startup = Instant::now() + Duration::from_secs(5);
+        while writer.status() != GlobalLibraryWriterStatus::Available {
+            assert!(Instant::now() < startup);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let request =
+            GlobalPreparationRequest::new(writer.preparation_owner(), [9; 32], deadline, 1, 128)
+                .unwrap();
+        let holder = writer
+            .submit_preparation(request)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let budget = super::super::HandshakeBudget::new();
+        let mut credit = budget.credit();
+        credit.resize(128).unwrap();
+        let round = CurrentRound::new(1, deadline, credit).unwrap();
+        holder.request_current(round.request(0)).unwrap();
+        while !round.complete() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let outside =
+            rusqlite::Connection::open(profile.profile_root().join(LIBRARY_DB_FILE_NAME)).unwrap();
+        outside.busy_timeout(Duration::ZERO).unwrap();
+        assert_eq!(
+            outside
+                .execute_batch("BEGIN IMMEDIATE")
+                .unwrap_err()
+                .sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        let release = holder.abort();
+        release
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(round.invalidated());
+        assert!(!round.complete());
+        let late = round.request(0).acknowledge();
+        assert!(
+            !round.complete(),
+            "late reply cannot revive original cleanup"
+        );
+        outside.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        drop(late);
+        drop(round);
+        assert_eq!(budget.used(), 0);
+        assert!(writer.shutdown());
+    }
+
+    #[test]
     fn current_round_requires_every_original_slot_and_keeps_credit_with_worker_request() {
         let budget = super::super::HandshakeBudget::new();
         let mut credit = budget.credit();
         credit.resize(128).unwrap();
         let round = CurrentRound::new(64, Instant::now() + Duration::from_secs(2), credit).unwrap();
+        let mut workers = Vec::new();
         for index in 0..63 {
-            round.request(index).acknowledge();
+            workers.push(round.request(index).acknowledge());
         }
-        round.request(0).acknowledge();
+        workers.push(round.request(0).acknowledge());
         assert!(
             !round.complete(),
             "duplicate cannot replace missing last owner"
@@ -81,7 +188,15 @@ mod tests {
         let last = round.request(63);
         drop(round);
         assert_eq!(budget.used(), 128, "worker retains original round debit");
-        last.acknowledge();
+        let custody = last.acknowledge();
+        assert!(custody.0.complete());
+        drop(workers);
+        assert!(
+            !custody.0.complete(),
+            "original worker departure invalidates the full round"
+        );
+        assert_eq!(budget.used(), 128);
+        drop(custody);
         assert_eq!(budget.used(), 0);
     }
 
