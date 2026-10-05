@@ -205,6 +205,8 @@ impl BindingData {
             {
                 return Err(BindingError::Conflict);
             }
+            #[cfg(windows)]
+            validate_windows_held_staging(file)?;
             #[cfg(unix)]
             if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 {
                 return Err(BindingError::Conflict);
@@ -249,6 +251,48 @@ impl BindingData {
         }
         check()
     }
+}
+#[cfg(any(windows, test))]
+fn validate_windows_staging_shape(
+    kind: u32,
+    attributes: u32,
+    serial: u32,
+    index: u64,
+    links: u32,
+) -> Result<(), BindingError> {
+    // FILE_TYPE_DISK, no directory/device/reparse, exact singleton namespace link.
+    if kind != 1
+        || attributes & (0x10 | 0x40 | 0x400) != 0
+        || serial == 0
+        || index == 0
+        || links != 1
+    {
+        return Err(BindingError::Conflict);
+    }
+    Ok(())
+}
+#[cfg(windows)]
+fn validate_windows_held_staging(file: &std::fs::File) -> Result<(), BindingError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, GetFileType,
+        },
+    };
+    let handle = HANDLE(file.as_raw_handle());
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: live borrowed file handle and initialized output with its exact native ABI.
+    unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(|_| BindingError::Unknown)?;
+    // SAFETY: the same live borrowed handle remains owned throughout inspection.
+    let kind = unsafe { GetFileType(handle) }.0;
+    validate_windows_staging_shape(
+        kind,
+        info.dwFileAttributes,
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        info.nNumberOfLinks,
+    )
 }
 #[cfg(windows)]
 fn reopen_held_staging_reader(original: &std::fs::File) -> std::io::Result<std::fs::File> {

@@ -699,3 +699,56 @@ mod integration {
         let _ = f.owner.shutdown();
     }
 }
+
+#[test]
+fn windows_held_staging_shape_refuses_links_reparse_and_unknown_identity() {
+    use super::*;
+    assert_eq!(validate_windows_staging_shape(1, 0x20, 7, 9, 1), Ok(()));
+    for (kind, attributes, serial, index, links) in [
+        (0, 0x20, 7, 9, 1),
+        (2, 0x20, 7, 9, 1),
+        (1, 0x10, 7, 9, 1),
+        (1, 0x40, 7, 9, 1),
+        (1, 0x400, 7, 9, 1),
+        (1, 0x20, 0, 9, 1),
+        (1, 0x20, 7, 0, 1),
+        (1, 0x20, 7, 9, 0),
+        (1, 0x20, 7, 9, 2),
+        (1, 0x20, 7, 9, u32::MAX),
+    ] {
+        assert_eq!(
+            validate_windows_staging_shape(kind, attributes, serial, index, links),
+            Err(BindingError::Conflict)
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_original_staging_reader_preserves_cursor_and_refuses_actual_hardlink() {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+    let temp = tempfile::tempdir().unwrap();
+    let stage = temp.path().join("original.bin");
+    let renamed = temp.path().join("renamed.bin");
+    let alias = temp.path().join("alias.bin");
+    std::fs::write(&stage, b"original held content").unwrap();
+    let mut file = std::fs::File::open(&stage).unwrap();
+    file.seek(SeekFrom::End(0)).unwrap();
+    let cursor = file.stream_position().unwrap();
+    assert_eq!(validate_windows_held_staging(&file), Ok(()));
+    let mut reader = reopen_held_staging_reader(&file).unwrap();
+    std::fs::rename(&stage, &renamed).unwrap();
+    std::fs::write(&stage, b"foreign replacement").unwrap();
+    let mut observed = Vec::new();
+    reader.read_to_end(&mut observed).unwrap();
+    assert_eq!(observed, b"original held content");
+    assert_eq!(file.stream_position().unwrap(), cursor);
+    std::fs::hard_link(&renamed, &alias).unwrap();
+    assert_eq!(
+        validate_windows_held_staging(&file),
+        Err(BindingError::Conflict)
+    );
+    assert_eq!(std::fs::read(&stage).unwrap(), b"foreign replacement");
+    assert_eq!(std::fs::read(&alias).unwrap(), b"original held content");
+}

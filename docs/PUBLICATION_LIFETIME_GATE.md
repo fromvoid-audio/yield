@@ -32,12 +32,14 @@ harness remain OPT-2325; Linux and Windows GNU checks do not execute that body.
 
 The original file worker rechecks its retained staged descriptor before the
 publication result and before duplicate target preparation. Identity, regular
-shape, singleton Unix link count, exact length and full hash must still match
+shape, singleton link count, exact length and full hash must still match
 its original validation. The original deadline and root liveness bound the
 8 KiB scratch-buffer scan. Original staged and target descriptor volume identities
 must still match. Unix positional reads preserve the staged cursor; Windows
 uses one independent readonly `ReOpenFile` handle derived from the exact original
-object and verifies its identity before reading. No staging pathname supplies
+object and verifies its identity before reading. Windows also refuses non-disk, reparse,
+directory/device, zero native identity and non-singleton link observations before
+and after hashing. No staging pathname supplies
 a replacement descriptor, and no mutex remains held while hashing.
 
 These are fresh read-only observations. They do not exclude concurrent writable
