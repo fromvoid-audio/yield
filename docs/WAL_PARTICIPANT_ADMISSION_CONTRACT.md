@@ -734,3 +734,21 @@ non-root nonce rewrite while checking ordinary claim retention. Logical capacity
 fixtures do not qualify physical admission. A None result observes no binding for
 that nonce; it does not confirm rollback, release original owners or refund claims.
 The joint settlement latch and definite-outcome reconciliation remain required.
+
+## Exact original lease allocation matching (OPT-2319)
+
+Both generic retirement and isolated lease preparation compare the complete frozen
+lease allocation with the original source factory's observation: role, page size,
+selected pager maximum, and MAIN/WAL/SHM identity, device, allocation unit, observed
+length and logical ceiling, as well as the original source/lease/root/audit subject.
+A valid historical encoding with foreign storage facts refuses before collection.
+The genuine source fixture covers foreign WAL/SHM identities and device, changed
+pager limit and changed observed MAIN length in both factories, then collects and
+aborts the unchanged complete retirement with its original global owner.
+
+The local preparation nonce and registration phase remain historical observations;
+this equality check cannot turn them into a current Registered acknowledgement.
+Original workers still validate current native/CONTROL ownership. Wire versions,
+pre-audit domain, shared context ceiling and full retirement admission's explicit
+Unsupported boundary remain unchanged. Exact input matching supplies no physical
+qualification, permit, post-start custody, authenticated transition or settlement.

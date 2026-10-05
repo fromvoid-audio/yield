@@ -199,6 +199,29 @@ impl StoredSourceLeaseFence {
             && s.scan_revision() == current.scan_revision()
             && s.audit() == current.audit()
     }
+    // Compare the complete original storage plan, not merely the source subject. The
+    // local preparation nonce and sampled registration phase remain historical only.
+    pub(crate) fn matches_allocation(
+        &self,
+        subject: &SourceRegistryReferenceSubject,
+        allocation: &LifecycleDatabaseAllocation,
+    ) -> bool {
+        self.matches_allocation_subject(subject)
+            && allocation.role() == LifecycleAllocationRole::SourceLeaseMaintenance
+            && self.page_size == allocation.page_size()
+            && self.maximum_pages == allocation.selected_maximum_pages()
+            && self
+                .objects
+                .iter()
+                .zip([allocation.main(), allocation.wal(), allocation.shm()])
+                .all(|(stored, original)| {
+                    stored.identity == original.identity()
+                        && stored.device == original.device()
+                        && stored.unit == original.allocation_unit()
+                        && stored.bytes == original.observed_bytes()
+                        && stored.ceiling == original.write_ceiling()
+                })
+    }
     pub(crate) fn database_device(&self) -> u64 {
         self.objects[0].device
     }
