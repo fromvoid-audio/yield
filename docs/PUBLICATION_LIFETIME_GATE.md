@@ -28,6 +28,28 @@ read-only targets to prove command bytes cannot mint a grant. Supported macOS
 SDK compilation and execution of the genuine journal-issued positive handoff
 harness remain OPT-2325; Linux and Windows GNU checks do not execute that body.
 
+## Original held staging observations (OPT-2340)
+
+The original file worker rechecks its retained staged descriptor before the
+publication result and before duplicate target preparation. Identity, regular
+shape, singleton link count, exact length and full hash must still match
+its original validation. The original deadline and root liveness bound the
+8 KiB scratch-buffer scan. Original staged and target descriptor volume identities
+must still match. Unix positional reads preserve the staged cursor; Windows
+uses one independent readonly `ReOpenFile` handle derived from the exact original
+object and verifies its identity before reading. Windows also refuses non-disk, reparse,
+directory/device, zero native identity and non-singleton link observations before
+and after hashing. No staging pathname supplies
+a replacement descriptor, and no mutex remains held while hashing.
+
+These are fresh read-only observations. They do not exclude concurrent writable
+aliases or establish created-stage provenance, qualified namespace allocation,
+synchronization, publication permission or settlement. Linux tests exercise genuine
+original prepared descriptors and duplicate preparation queues. Execution through
+the original journal-issued publication queue still needs the supported macOS
+SDK and native harness in OPT-2325. Windows GNU checks type-check the independent
+handle path; native execution and physical qualification remain OPT-2219.
+
 Decision, 2 October 2026, reviewed at `3cd9d75b2`. Install a private,
 journal-issued, bounded shared slot whose entry transition competes with
 cancellation and retirement. Keep capacity accounting on the journal actor.
