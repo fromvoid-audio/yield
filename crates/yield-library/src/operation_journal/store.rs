@@ -137,6 +137,12 @@ const DATABASE_CLAIMS_SCHEMA_VERSION: u32 = 11;
 const MAX_SCHEMA_OBJECTS: i64 = 15;
 const MAX_SCHEMA_COLUMNS: usize = 16;
 const MAX_SCHEMA_INDEXES: usize = 8;
+#[cfg(test)]
+thread_local! {
+    // Private diagnostic only: actual bytes copied by the point-row callback.
+    static POINT_ROW_MATERIALIZED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 const MAX_REBUILD_DIAGNOSTICS: usize = 32;
 const MAX_REBUILD_DIAGNOSTIC_CHARS: usize = 256;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -6555,6 +6561,8 @@ impl OperationJournalStore {
         &self,
         operation_id: OperationId,
     ) -> Result<Option<JournalRow>, OperationJournalStoreError> {
+        #[cfg(test)]
+        POINT_ROW_MATERIALIZED_BYTES.with(|bytes| bytes.set(0));
         let (legacy_present, full_progress_present) =
             self.operation_family_presence(operation_id)?;
         if legacy_present && full_progress_present {
@@ -6570,9 +6578,12 @@ impl OperationJournalStore {
             .connection
             .query_row(
                 "SELECT typeof(operation_id), typeof(sequence), sequence,
-                        typeof(record), length(record), record
+                        typeof(record), length(record),
+                        CASE WHEN typeof(record) = 'blob'
+                                  AND length(record) BETWEEN 0 AND ?2
+                             THEN record ELSE NULL END
                  FROM operation_journal WHERE operation_id = ?1",
-                params![operation_id.to_string()],
+                params![operation_id.to_string(), MAX_RECORD_BYTES as i64],
                 |row| {
                     let operation_id_type: String = row.get(0)?;
                     let sequence_type: String = row.get(1)?;
@@ -6587,7 +6598,11 @@ impl OperationJournalStore {
                         _ => None,
                     };
                     let encoded = match row.get_ref(5)? {
-                        ValueRef::Blob(value) => Some(value.to_vec()),
+                        ValueRef::Blob(value) => {
+                            #[cfg(test)]
+                            POINT_ROW_MATERIALIZED_BYTES.with(|bytes| bytes.set(value.len()));
+                            Some(value.to_vec())
+                        }
                         _ => None,
                     };
                     Ok((
@@ -9286,6 +9301,7 @@ impl From<EncodeError> for OperationJournalStoreError {
 mod tests {
     include!("store/database_claims_tests.rs");
     include!("store/recording_retention_tests.rs");
+    include!("store/record_materialization_tests.rs");
     include!("store/recording_control_tests.rs");
     use std::collections::BTreeMap;
     use std::fs;
