@@ -2,7 +2,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use super::FileOperationOwnerQueueError;
+use super::{EffectOutcome, FileOperationOwnerQueueError};
 
 /// Fixed admission categories; successful submission does not imply an effect succeeded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,10 +51,85 @@ pub struct FileOwnerTelemetrySnapshot {
     pub dispatch_wait_buckets: [u64; 6],
 }
 
+/// Fixed original retained primary-result categories. No category grants effect authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum FileOwnerRetainedOutcome {
+    /// Applied observation or effect; readonly validation is not publication.
+    Applied,
+    /// Original live fence refused before effect.
+    SupersededBeforeEffect,
+    /// Original identity or absence predicate collided.
+    Collision,
+    /// No qualified producer/backend exists.
+    Unsupported,
+    /// Original typed before-effect retry outcome, not retry authorization.
+    RetryableBeforeEffect,
+    /// Original outcome retains uncertainty.
+    RetainedUncertain,
+    /// Original result reports its existing safe barrier.
+    StoppedAtSafeBoundary,
+    /// Original changed-request conflict observation.
+    Conflict,
+}
+impl FileOwnerRetainedOutcome {
+    pub(super) fn from_outcome(outcome: &EffectOutcome) -> Self {
+        match outcome {
+            EffectOutcome::Applied { .. } => Self::Applied,
+            EffectOutcome::SupersededBeforeEffect { .. } => Self::SupersededBeforeEffect,
+            EffectOutcome::Collision { .. } => Self::Collision,
+            EffectOutcome::Unsupported { .. } => Self::Unsupported,
+            EffectOutcome::RetryableBeforeEffect { .. } => Self::RetryableBeforeEffect,
+            EffectOutcome::RetainedUncertain { .. } => Self::RetainedUncertain,
+            EffectOutcome::StoppedAtSafeBoundary { .. } => Self::StoppedAtSafeBoundary,
+            EffectOutcome::Conflict { .. } => Self::Conflict,
+        }
+    }
+}
+/// Fixed observations of original worker-held result inventories.
+/// This is not durable custody, physical qualification or a settlement acknowledgement.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FileOwnerRetainedTelemetrySnapshot {
+    /// Current worker receipt entries, including replies lost before acknowledgement.
+    pub receipts: u64,
+    /// Current acknowledgement tombstones; acknowledgement does not settle an effect.
+    pub tombstones: u64,
+    /// Saturating counts indexed by FileOwnerRetainedOutcome, once per newly retained primary.
+    pub primary_outcomes: [u64; 8],
+}
+
 #[derive(Default)]
-pub(super) struct FileOwnerTelemetry(Mutex<FileOwnerTelemetrySnapshot>);
+pub(super) struct FileOwnerTelemetry(
+    Mutex<FileOwnerTelemetrySnapshot>,
+    Mutex<FileOwnerRetainedTelemetrySnapshot>,
+);
 
 impl FileOwnerTelemetry {
+    pub(super) fn retained_snapshot(&self) -> Option<FileOwnerRetainedTelemetrySnapshot> {
+        match self.1.try_lock() {
+            Ok(state) => Some(*state),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(poison)) => Some(*poison.into_inner()),
+        }
+    }
+    pub(super) fn retain_primary(
+        &self,
+        category: FileOwnerRetainedOutcome,
+        receipts: usize,
+        tombstones: usize,
+    ) {
+        let mut state = self.1.lock().unwrap_or_else(|poison| poison.into_inner());
+        let count = &mut state.primary_outcomes[category as usize];
+        *count = count.saturating_add(1);
+        state.receipts = receipts as u64;
+        state.tombstones = tombstones as u64;
+    }
+    pub(super) fn retained_inventory(&self, receipts: usize, tombstones: usize) {
+        let mut state = self.1.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.receipts = receipts as u64;
+        state.tombstones = tombstones as u64;
+    }
+
     pub(super) fn snapshot(&self) -> FileOwnerTelemetrySnapshot {
         self.0
             .lock()
@@ -121,6 +196,33 @@ impl FileOwnerTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_numeric_snapshot_is_fixed_saturating_and_nonblocking() {
+        let metrics = FileOwnerTelemetry::default();
+        assert_eq!(
+            std::mem::size_of::<FileOwnerRetainedTelemetrySnapshot>(),
+            80
+        );
+        assert!(std::mem::size_of::<FileOwnerTelemetry>() <= 256);
+        {
+            let mut state = metrics.1.lock().unwrap();
+            state.primary_outcomes[FileOwnerRetainedOutcome::Unsupported as usize] = u64::MAX;
+            assert_eq!(metrics.retained_snapshot(), None);
+        }
+        metrics.retain_primary(FileOwnerRetainedOutcome::Unsupported, 3, 4);
+        let snapshot = metrics.retained_snapshot().unwrap();
+        assert_eq!((snapshot.receipts, snapshot.tombstones), (3, 4));
+        assert_eq!(
+            snapshot.primary_outcomes[FileOwnerRetainedOutcome::Unsupported as usize],
+            u64::MAX
+        );
+        metrics.retained_inventory(0, 0);
+        assert_eq!(
+            metrics.retained_snapshot().unwrap().primary_outcomes,
+            snapshot.primary_outcomes
+        );
+    }
 
     #[test]
     fn fixed_dispatch_boundaries_and_saturating_counts() {
