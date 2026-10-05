@@ -19,7 +19,7 @@ pub const PROTECTED_FREE_SPACE_FLOOR: u64 = 256 * 1024 * 1024;
 /// Stable identity obtained from the destination file descriptor.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct VolumeIdentity {
-    /// Unix `st_dev`; other platforms may use their native volume serial in a future slice.
+    /// Unix `st_dev` or Windows handle-derived volume serial; not a qualified native UUID.
     pub device: u64,
 }
 
@@ -257,12 +257,12 @@ fn statvfs_capacity_values(
     Ok((free_bytes, fragment_size))
 }
 
+#[cfg(any(windows, test))]
+mod windows;
+
 #[cfg(windows)]
-fn descriptor_volume_facts(_file: &File) -> Result<VolumeFacts, io::Error> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "descriptor-derived volume facts are not implemented on Windows",
-    ))
+fn descriptor_volume_facts(file: &File) -> Result<VolumeFacts, io::Error> {
+    windows::descriptor_volume_facts(file)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -446,7 +446,7 @@ mod tests {
         assert!(facts.allocation_unit > 0);
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     #[test]
     fn unqualified_descriptor_discovery_is_unsupported() {
         let file = tempfile::tempfile().unwrap();
