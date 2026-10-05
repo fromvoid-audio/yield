@@ -308,7 +308,24 @@ impl SourceLeaseWalTransportOwner {
                 .map_err(classify)
             }
             None => held.revalidate_owner().map_err(classify),
+        }?;
+        // The next genuine Registered validation uses the same parked scratch bound.
+        drop(staging);
+        let request = self
+            .request
+            .ticket
+            .current
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(request) = request {
+            self.validate_registered(registration.ok_or(SourceWalTransportRejection::Scope)?)?;
+            if Instant::now() >= self.request.deadline {
+                return Err(SourceWalTransportRejection::Deadline);
+            }
+            request.acknowledge();
         }
+        Ok(())
     }
 
     /// Require the original parked scope and genuine current Registered authority.

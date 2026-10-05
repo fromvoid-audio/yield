@@ -641,3 +641,32 @@ required. This protects empty connection custody; it does not prove arbitrary
 DDL integrity or uninterrupted history from a scalar counter. It supplies no
 joint owner decision, capacity/database permit, retry/refund or genuine settlement.
 Full OPT-2136 and qualified allocation/recovery acceptance remain open.
+
+## Current original worker validation round (OPT-2315)
+
+After the original journal collector acquires its complete prefix, it requests one
+fresh validation round on those same parked workers. Each source ticket retains
+at most one private request; the existing global control channel has one slot.
+Requests share one private original round with at most 64 distinct owner slots,
+the original deadline and a credit from the combined 64 KiB handshake budget.
+The round retains that credit until the last collector or worker reference drops.
+No copied observation, decoded identity or external callback can answer a slot.
+
+The actual audited/tag/layout and pre-audit source producers answer only after
+fresh native/CONTROL validation of their original retained Registered custody.
+Their existing catalog parked polls service the request; scratch credits are
+released before the second Registered check. The actual global worker answers
+only on the next full parked validation pass after receiving its request, checking
+original empty MAIN Write state, profile/native scope, mutation fence, settings,
+cancellation and the original deadline. Neither worker performs ordinary row SQL
+or lease renewal. The journal polls asynchronously and publishes historical
+`Ready` only after every original slot answers before that deadline. Duplicate,
+missing, expired or poisoned-round replies cannot complete the round.
+
+These replies still describe checks performed at different times. They do not
+fence subsequent owner loss, abort, deadline or cleanup and are not a joint
+settlement latch. Existing pre-intent reverse cleanup remains unchanged.
+OPT-2136 still requires the real atomic commit-decision/cleanup protocol, exact
+qualified directions, sealed nonce persisted with intent/claims, and uncertain
+outcome readback/restart custody. No permit, retry/refund authority, genuine
+settlement or physical qualification follows from this validation round.

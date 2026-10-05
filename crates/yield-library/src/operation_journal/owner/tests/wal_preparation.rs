@@ -300,6 +300,7 @@ mod integration {
         worker: Option<JoinHandle<()>>,
         events: Arc<Mutex<Vec<String>>>,
         pause_abort: Arc<AtomicBool>,
+        pause_validation: Arc<AtomicBool>,
     }
     impl SourceActor {
         fn start(
@@ -339,6 +340,8 @@ mod integration {
             let recorded = Arc::clone(&events);
             let pause_abort = Arc::new(AtomicBool::new(false));
             let paused = Arc::clone(&pause_abort);
+            let pause_validation = Arc::new(AtomicBool::new(false));
+            let validation_paused = Arc::clone(&pause_validation);
             let worker = thread::spawn(move || {
                 let mut writers = writers
                     .into_iter()
@@ -443,7 +446,8 @@ mod integration {
                             || !owner.is_prepared()
                             || owner.rejection().is_some()
                             || Instant::now() >= owner.deadline()
-                            || owner.revalidate(authorities.get(&id)).is_err()
+                            || (!validation_paused.load(Ordering::Acquire)
+                                && owner.revalidate(authorities.get(&id)).is_err())
                         {
                             owner.request_abort(None);
                             match owner.into_writer() {
@@ -480,6 +484,7 @@ mod integration {
                 worker: Some(worker),
                 events,
                 pause_abort,
+                pause_validation,
             }
         }
     }
@@ -510,6 +515,13 @@ mod integration {
     }
     #[test]
     fn all_owner_real_journal_collects_two_sources_global_in_order_and_confirms_abort() {
+        real_current_round(false);
+    }
+    #[test]
+    fn all_owner_cancel_missing_current_reply_unwinds_original_prefix_without_identity() {
+        real_current_round(true);
+    }
+    fn real_current_round(cancel: bool) {
         let (fixture, mut journal) = open_owner("all-owner-real-ordered");
         let mut global = GlobalLibraryWriter::start(&fixture.owner).unwrap();
         while global.status() != GlobalLibraryWriterStatus::Available {
@@ -524,6 +536,7 @@ mod integration {
         let (plan, claims, main, side) = plan(&fixture);
         let (requester, inbox) = SourceWalTransport::channel();
         let actor = SourceActor::start(writers, inbox);
+        actor.pause_validation.store(true, Ordering::Release);
         // Reverse caller order must not change actual physical acquisition order.
         let sources = (0..2)
             .rev()
@@ -556,6 +569,37 @@ mod integration {
             .recv_timeout(Duration::from_secs(3))
             .unwrap()
             .unwrap();
+        let acquired_deadline = Instant::now() + Duration::from_secs(1);
+        while actor.events.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < acquired_deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Both genuine source workers published Prepared and retain actual SQLite writers.
+        // Those historical replies cannot complete the collector's fresh validation round.
+        for _ in 0..10 {
+            assert!(matches!(handle.status(), WalPreparationStatus::Preparing));
+            thread::sleep(Duration::from_millis(5));
+        }
+        if cancel {
+            handle.abort();
+            assert!(matches!(
+                wait(&handle, terminal),
+                WalPreparationStatus::Aborted
+            ));
+            assert_eq!(
+                journal
+                    .prepared_admission_id_allocations
+                    .load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(budget.used(), 0);
+            drop(handle);
+            drop(actor);
+            assert!(global.shutdown());
+            assert!(journal.shutdown());
+            return;
+        }
+        actor.pause_validation.store(false, Ordering::Release);
         let ready = wait(&handle, |status| {
             !matches!(
                 status,

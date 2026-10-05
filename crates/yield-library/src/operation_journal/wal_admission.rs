@@ -7,7 +7,9 @@ pub use input::{SourceInput, SourcePreparation};
 mod plan;
 pub use plan::{WalPreparationError, WalPreparationInput};
 mod collector;
+mod current;
 pub(super) use collector::Collector;
 pub use collector::{
     WalPreparationHandle, WalPreparationObservation, WalPreparationStatus, WalPreparedDatabase,
 };
+pub(crate) use current::{CurrentRequest, CurrentRound};

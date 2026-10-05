@@ -313,6 +313,7 @@ impl Drop for GlobalPreparationPending {
 
 enum Control {
     Abort,
+    Current(crate::operation_journal::wal_admission::CurrentRequest),
 }
 /// Live, non-cloneable cancellation handle. It cannot authorize intent or SQL effects.
 /// Dropping it requests rollback; ordinary reuse occurs only after confirmed rollback.
@@ -324,6 +325,17 @@ pub struct GlobalPreparationReservation {
     observed_release: Option<Result<(), GlobalPreparationError>>,
 }
 impl GlobalPreparationReservation {
+    pub(crate) fn request_current(
+        &self,
+        request: crate::operation_journal::wal_admission::CurrentRequest,
+    ) -> Result<(), GlobalPreparationError> {
+        if self.canceled.load(Ordering::Acquire) {
+            return Err(GlobalPreparationError::Canceled);
+        }
+        self.control
+            .try_send(Control::Current(request))
+            .map_err(|_| GlobalPreparationError::InputBound)
+    }
     pub(crate) fn try_release_outcome(
         &mut self,
     ) -> Result<Option<Result<(), GlobalPreparationError>>, mpsc::TryRecvError> {
@@ -596,6 +608,7 @@ pub(super) fn run(
         tests::inject_empty_custody_fault(&database.connection);
         // No SQL/row query/checkpoint/renewal/ordinary dispatch while held. The main-file FD
         // remains alive, and actual owner/path/native binding is rechecked cooperatively.
+        let mut current: Option<crate::operation_journal::wal_admission::CurrentRequest> = None;
         let outcome = loop {
             if let Err(error) = canceled(&command, lifecycle) {
                 break error;
@@ -619,6 +632,12 @@ pub(super) fn run(
             {
                 break GlobalPreparationError::LifecycleAllocation(error);
             }
+            if let Some(request) = current.take() {
+                if let Err(error) = canceled(&command, lifecycle) {
+                    break error;
+                }
+                request.acknowledge();
+            }
             let wait = OWNER_POLL_INTERVAL.min(
                 command
                     .request
@@ -628,6 +647,9 @@ pub(super) fn run(
             match controls.recv_timeout(wait) {
                 Ok(Control::Abort) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     break GlobalPreparationError::Canceled;
+                }
+                Ok(Control::Current(request)) => {
+                    current = Some(request);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
