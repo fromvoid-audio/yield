@@ -1,6 +1,5 @@
 //! Genuine pre-audit input and original native custody on the shared source FIFO.
 use super::*;
-use crate::operation_journal::source_lease_binding::MAX_SOURCE_LEASE_SCOPE_BYTES;
 use crate::sample_sources::db::write::{
     SourceLeaseMaintenanceAllocation, SourceLeaseMaintenanceBinding,
     SourceLeaseMaintenancePreparation, SourceLeaseMaintenancePreparationError,
@@ -59,7 +58,10 @@ impl SourceLeaseWalTransportCommand {
         let input = request.lease.take().expect("original lease input");
         // Bound initial scope/native capture temporaries before native preparation allocates.
         let mut staging = ByteCredit::in_handshake(&self.0.shared, request.handshake.as_ref());
-        let native = match staging.resize(3 * MAX_SOURCE_LEASE_SCOPE_BYTES + 512) {
+        let scratch = input
+            .preparation_scratch_bytes()
+            .ok_or(SourceWalTransportRejection::Full);
+        let native = match scratch.and_then(|bytes| staging.resize(bytes)) {
             Ok(()) => LeaseNative::acquire(
                 writer,
                 input,
@@ -254,8 +256,11 @@ impl SourceLeaseWalTransportOwner {
         held.revalidate_owner().map_err(classify)?;
         drop(staging);
         let mut credit = ByteCredit::in_handshake(&self.shared, self.request.handshake.as_ref());
-        credit
-            .resize(3 * MAX_SOURCE_LEASE_SCOPE_BYTES + std::mem::size_of::<LeaseReport>() + 512)?;
+        let scratch = held
+            .binding_scratch_bytes()
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<LeaseReport>() + 512))
+            .ok_or(SourceWalTransportRejection::Full)?;
+        credit.resize(scratch)?;
         let binding = held
             .capture_lease_binding(registration.ok_or(SourceWalTransportRejection::Scope)?)
             .map_err(classify)?;

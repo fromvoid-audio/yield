@@ -35,6 +35,45 @@ pub struct StoredSourceLeaseFence {
     objects: [Object; 3],
 }
 impl StoredSourceLeaseFence {
+    // Exact native input strings; JSON escapes quotes/backslashes at most twofold because
+    // validated identity strings contain no control characters. Byte-array elements take
+    // at most four bytes each. 4 KiB covers fixed names, UUIDs, enum tags and u64 scalars.
+    // This bounds encoding memory only, never physical allocation or live permission.
+    pub(crate) fn capture_encoding_bound(
+        subject: &SourceRegistryReferenceSubject,
+        allocation: &LifecycleDatabaseAllocation,
+    ) -> Option<usize> {
+        Self::encoding_bound(
+            subject,
+            [
+                allocation.main().identity(),
+                allocation.wal().identity(),
+                allocation.shm().identity(),
+            ],
+        )
+    }
+
+    fn encoding_bound(
+        subject: &SourceRegistryReferenceSubject,
+        objects: [&str; 3],
+    ) -> Option<usize> {
+        let strings = [
+            subject.source_id(),
+            subject.database_root_identity(),
+            subject.database_identity(),
+            subject.root_binding_identity(),
+            objects[0],
+            objects[1],
+            objects[2],
+        ]
+        .into_iter()
+        .try_fold(0usize, |n, value| n.checked_add(value.len()))?;
+        let bound = 4096usize
+            .checked_add(strings.checked_mul(2)?)?
+            .checked_add(subject.media_root_identity().len().checked_mul(4)?)?;
+        (bound <= MAX_SOURCE_LEASE_SCOPE_BYTES).then_some(bound)
+    }
+
     pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
         self.objects
             .iter()
@@ -207,5 +246,55 @@ impl StoredSourceLeaseFence {
                     | SourceRegistryRegistrationPhase::Draining,
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lease_encoding_bound_covers_maximum_escaped_identity_and_scalar_payload() {
+        // Codec-only historical data: no owner, registration receipt or allocation grant.
+        let identity = "\\\"".repeat(128);
+        let subject: SourceRegistryReferenceSubject = serde_json::from_value(serde_json::json!({
+            "source_id": identity, "lifecycle_generation": i64::MAX,
+            "profile_acquisition": Uuid::from_u128(1), "lease_owner": Uuid::from_u128(2),
+            "lease_epoch": i64::MAX, "media_root_identity": vec![255u8; 176],
+            "database_root_identity": identity, "database_identity": identity,
+            "root_binding_identity": identity, "scan_revision": i64::MAX,
+            "audit": {"status": "captured", "revision": i64::MAX, "directory_generation": i64::MAX},
+            "registration": {"registration_id": Uuid::from_u128(3), "phase": "registered_phase_observed"}
+        })).unwrap();
+        let objects = std::array::from_fn(|_| Object {
+            identity: identity.clone(),
+            device: u64::MAX,
+            unit: u64::MAX,
+            bytes: u64::MAX,
+            ceiling: u64::MAX,
+        });
+        let bound = StoredSourceLeaseFence::encoding_bound(&subject, [&identity; 3]).unwrap();
+        let stored = StoredSourceLeaseFence {
+            version: u8::MAX,
+            subject,
+            preparation_nonce: Uuid::from_u128(4),
+            page_size: u64::MAX,
+            maximum_pages: u64::MAX,
+            objects,
+        };
+        // Invalid physical scalars deliberately maximize encoding width; they cannot validate.
+        assert!(stored.validate().is_err());
+        let encoded = serde_json::to_vec(&stored).unwrap();
+        assert!(encoded.len() <= bound);
+        assert!(encoded.capacity() <= 2 * bound);
+        assert!(stored.retained_heap_bytes().unwrap() <= bound);
+        assert!(bound < MAX_SOURCE_LEASE_SCOPE_BYTES);
+        assert!(
+            StoredSourceLeaseFence::encoding_bound(
+                &stored.subject,
+                [&"x".repeat(MAX_SOURCE_LEASE_SCOPE_BYTES); 3]
+            )
+            .is_none()
+        );
     }
 }

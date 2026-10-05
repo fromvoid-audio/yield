@@ -18,6 +18,20 @@ pub struct SourceLeaseMaintenanceAllocation {
     deadline: Instant,
 }
 impl SourceLeaseMaintenanceAllocation {
+    pub(crate) fn preparation_scratch_bytes(&self) -> Option<usize> {
+        // Actual recaptured allocation/subjects and checked CONTROL/native scratch; no
+        // StoredSourceLeaseFence encoding is created during the preparation phase.
+        self.retained_input_bytes()?
+            .checked_mul(3)?
+            .checked_add(12 * 1024)
+    }
+    pub(crate) fn binding_scratch_bytes(&self) -> Option<usize> {
+        // A returned subject/descriptor and Vec growth during sequential validation and
+        // canonical serialization. The CONTROL/native scratch is independently included.
+        crate::operation_journal::source_lease_binding::StoredSourceLeaseFence::capture_encoding_bound(&self.subject, &self.allocation)?
+            .checked_mul(3)?.checked_add(12 * 1024)
+    }
+
     pub(crate) fn retained_input_bytes(&self) -> Option<usize> {
         std::mem::size_of::<Self>()
             .checked_add(self.subject.retained_heap_bytes()?)?
