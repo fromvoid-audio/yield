@@ -1,6 +1,123 @@
 // Scalar codec fixtures only. They create no registration/capacity or source authority.
 use super::*;
 use crate::operation_journal::ParticipantId;
+
+#[test]
+fn source_audit_typed_decode_preserves_historical_tagged_representations() {
+    // Exact original derive is a compatibility reference, never an owner capture.
+    #[derive(Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+    enum Original {
+        Unavailable {},
+        Captured {
+            revision: u64,
+            directory_generation: u64,
+        },
+    }
+    let cases = [
+        r#"{"status":"unavailable"}"#,
+        r#"{"status":"captured","revision":0,"directory_generation":1}"#,
+        r#"{"directory_generation":1,"revision":0,"status":"captured"}"#,
+        r#"{"\u0073tatus":"captured","\u0072evision":0,"directory_generation":1}"#,
+        r#"["unavailable"]"#,
+        r#"["captured",0,1]"#,
+        r#"{"status":0}"#,
+        r#"[1,0,1]"#,
+        r#"{"status":"captured","revision":18446744073709551615,"directory_generation":1}"#,
+        r#"{"status":"unavailable","revision":0}"#,
+        r#"{"status":"captured","revision":0}"#,
+        r#"{"status":"unavailable","status":"captured"}"#,
+        r#"{"status":"captured","revision":0,"\u0072evision":1,"directory_generation":1}"#,
+        r#"{"status":"captured","revision":0,"directory_generation":1,"directory_generation":2}"#,
+        r#"{"status":"unavailable","unknown":[[[0]]]}"#,
+        r#"{"status":"captured","revision":[],"directory_generation":1}"#,
+        r#"{"status":"captured","revision":-1,"directory_generation":1}"#,
+        r#"{"status":"captured","revision":0.5,"directory_generation":1}"#,
+        r#"{"status":{"captured":null},"revision":0,"directory_generation":1}"#,
+        r#"["captured",0,1,[[[0]]]]"#,
+        r#"["unavailable",{}]"#,
+        r#"[]"#,
+        r#"null"#,
+        r#"{"status":"unavailable"} false"#,
+    ];
+    for wire in cases {
+        let original = serde_json::from_str::<Original>(wire).map(|value| match value {
+            Original::Unavailable {} => SourceRegistryAuditObservation::Unavailable {},
+            Original::Captured {
+                revision,
+                directory_generation,
+            } => SourceRegistryAuditObservation::Captured {
+                revision,
+                directory_generation,
+            },
+        });
+        let actual = serde_json::from_str::<SourceRegistryAuditObservation>(wire);
+        assert_eq!(actual.is_ok(), original.is_ok(), "{wire}");
+        if let Ok(original) = original {
+            assert_eq!(actual.unwrap(), original, "{wire}");
+        }
+    }
+    for wire in [
+        format!(
+            r#"{{"{}":0,"status":"unavailable"}}"#,
+            "\\u2028".repeat(2600)
+        ),
+        format!(r#"{{"status":"{}"}}"#, "\\u2028".repeat(2600)),
+    ] {
+        assert!(serde_json::from_str::<Original>(&wire).is_err());
+        assert!(serde_json::from_str::<SourceRegistryAuditObservation>(&wire).is_err());
+    }
+}
+
+#[test]
+fn source_audit_typed_decode_actual_public_proposal_keeps_identity_and_refusals() {
+    let base = proposal();
+    let mut value = serde_json::to_value(&base.stored).unwrap();
+    for audit in [
+        serde_json::json!({"status":"unavailable"}),
+        serde_json::json!(["unavailable"]),
+    ] {
+        value["subject"]["audit"] = audit;
+        assert_eq!(
+            SourceRegistryReferenceProposal::decode(&serde_json::to_vec(&value).unwrap()).unwrap(),
+            base
+        );
+    }
+    let mut captured = base.stored.clone();
+    captured.subject.audit = SourceRegistryAuditObservation::Captured {
+        revision: 0,
+        directory_generation: 1,
+    };
+    let expected = SourceRegistryReferenceProposal::from_stored(captured).unwrap();
+    for audit in [
+        serde_json::json!({"status":"captured","revision":0,"directory_generation":1}),
+        serde_json::json!(["captured", 0, 1]),
+    ] {
+        value["subject"]["audit"] = audit;
+        assert_eq!(
+            SourceRegistryReferenceProposal::decode(&serde_json::to_vec(&value).unwrap()).unwrap(),
+            expected
+        );
+    }
+    for audit in [
+        serde_json::json!({"status":0}),
+        serde_json::json!([0]),
+        serde_json::json!([1, 0, 1]),
+        serde_json::json!({"status":"captured","revision":vec![0u8;6000],"directory_generation":1}),
+        serde_json::json!({"status":"unavailable","unknown":vec![0u8;6000]}),
+        serde_json::json!(["unavailable", vec![0u8; 6000]]),
+        serde_json::json!(["captured", 0, 1, vec![0u8; 6000]]),
+    ] {
+        value["subject"]["audit"] = audit;
+        let wire = serde_json::to_vec(&value).unwrap();
+        assert!(wire.len() <= SOURCE_REGISTRY_REFERENCE_MAX_BYTES);
+        assert!(SourceRegistryReferenceProposal::decode(&wire).is_err());
+    }
+    assert_eq!(
+        SourceRegistryReferenceProposal::decode(base.canonical_bytes()).unwrap(),
+        base
+    );
+}
 fn observation() -> SourceRegistryReferenceObservation {
     SourceRegistryReferenceObservation {
         subject: SourceRegistryReferenceSubject {

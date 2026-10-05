@@ -53,7 +53,7 @@ impl SourceRegistryRegistrationObservation {
 }
 
 /// Optional completed-audit metadata at the captured revision; no fabricated pre-audit values.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceRegistryAuditObservation {
     /// Completed audit metadata was unavailable or not current.
@@ -66,6 +66,8 @@ pub enum SourceRegistryAuditObservation {
         directory_generation: u64,
     },
 }
+
+mod audit_decoder;
 
 /// Historical scalar subject. Deserialization confers no source custody or freshness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
