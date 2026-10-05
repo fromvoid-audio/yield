@@ -24,7 +24,7 @@ pub(crate) struct OwnedConnection {
     connection: Option<Connection>,
     registration: Option<Box<Registration>>,
     // Exact procfs alias descriptor stays open through every native close callback.
-    directory_descriptor: Option<std::fs::File>,
+    directory_descriptor: Option<std::sync::Arc<std::fs::File>>,
 }
 impl From<Connection> for OwnedConnection {
     fn from(connection: Connection) -> Self {
@@ -421,7 +421,7 @@ impl Context {
 pub(crate) fn open_owned(
     path: impl AsRef<std::path::Path>,
     flags: rusqlite::OpenFlags,
-    directory_descriptor: Option<std::fs::File>,
+    directory_descriptor: Option<std::sync::Arc<std::fs::File>>,
 ) -> rusqlite::Result<OwnedConnection> {
     #[cfg(target_os = "linux")]
     let native_name = CString::new(crate::sqlite_linux::vfs_name()?).expect("fixed VFS name");

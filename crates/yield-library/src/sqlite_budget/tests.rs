@@ -418,7 +418,7 @@ fn retained_owned_open_survives_original_root_descriptor_drop_through_close() {
             .starts_with(&format!("/proc/self/fd/{descriptor}/"))
     );
     drop(root);
-    // Make the original FD number reusable; every sidecar callback must keep using our own FD.
+    // Attempt FD reuse after dropping the binding; the connection must retain its exact alias.
     let replacements: Vec<_> = (0..32)
         .map(|_| std::fs::File::open("/dev/null").unwrap())
         .collect();
@@ -486,4 +486,41 @@ fn implicit_busy_close_retains_registration_and_blocks_remaining_native_writes()
     assert_eq!(unsafe { ffi::sqlite3_close(handle) }, ffi::SQLITE_OK);
     // Its unconfirmed owner was intentionally retained; this test cannot claim a normal
     // owner-mediated reconciliation or free the forgotten Rust connection's bookkeeping.
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_shared_shm_namespace_alias_survives_first_connection_close() {
+    use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
+    use crate::sample_sources::db::BoundDatabaseRoot;
+    let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
+    let config = tempfile::tempdir().unwrap();
+    let _base = ConfigBaseGuard::set(config.path().to_path_buf());
+    let _profile = PersistenceProfileGuard::named("shared-shm-alias");
+    let guard = WritableProfileGuard::acquire_current().unwrap();
+    let root = BoundDatabaseRoot::for_profile_guard(&guard).unwrap();
+    let name = std::path::Path::new("shared-alias.db");
+    let first = root.open_owned_sqlite(name, OpenFlags::default()).unwrap();
+    first.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE held(value INTEGER); INSERT INTO held VALUES(42);").unwrap();
+    let first_alias = first.directory_descriptor.as_ref().unwrap().as_raw_fd();
+    let second = root.open_owned_sqlite(name, OpenFlags::default()).unwrap();
+    assert_eq!(
+        second
+            .query_row("SELECT value FROM held", [], |row| row.get::<_, u64>(0))
+            .unwrap(),
+        42
+    );
+    drop(root);
+    first.close().map_err(|(_, error)| error).unwrap();
+    // Bundled Unix's shared SHM node retains the first opener's procfs pathname until
+    // its final connection closes. That exact directory FD must still name its root.
+    // SAFETY: read-only inspection of a descriptor number, no ownership transfer.
+    assert!(
+        unsafe { libc::fcntl(first_alias, libc::F_GETFD) } >= 0,
+        "original shared SHM pathname directory alias closed before final connection"
+    );
+    second.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+    second.close().map_err(|(_, error)| error).unwrap();
+    // All original holders are gone only after confirmed final SQLite close.
+    assert_eq!(unsafe { libc::fcntl(first_alias, libc::F_GETFD) }, -1);
 }
