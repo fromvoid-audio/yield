@@ -83,11 +83,17 @@ impl GlobalWalObjectObservation<'_> {
 #[derive(Debug, Eq, PartialEq)]
 pub struct GlobalWalScope {
     objects: WalObjects,
+    retirement_forward_policy: Option<GlobalRetirementForwardPolicy>,
     root_identity: String,
     bytes: Box<[u8; DESCRIPTOR_MAX_BYTES]>,
     encoded_len: usize,
 }
 impl GlobalWalScope {
+    /// Exact original initial-forward retirement policy, never a capacity/Start/effect grant.
+    pub fn retirement_forward_policy(&self) -> Option<&GlobalRetirementForwardPolicy> {
+        self.retirement_forward_policy.as_ref()
+    }
+
     /// Original descriptor-bound database root, never a caller pathname or ownership grant.
     pub fn root_identity(&self) -> &str {
         &self.root_identity
@@ -130,6 +136,8 @@ impl<'a> From<&'a WalObjectFacts> for Object<'a> {
 #[derive(Serialize)]
 struct Descriptor<'a> {
     version: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retirement_forward_policy: Option<&'a GlobalRetirementForwardPolicy>,
     acquisition: &'a str,
     registration: uuid::Uuid,
     registration_generation: u64,
@@ -222,6 +230,7 @@ pub(super) fn capture(
     if root_identity.len() > 256 {
         return Err(GlobalPreparationError::InputBound);
     }
+    let retirement_forward_policy = retirement_policy::capture(request, nonce, lifecycle)?;
     // One fixed encoding buffer, with no grow/shrink copy and no separate cloned descriptor.
     let mut output = Output {
         bytes: Box::new([0; DESCRIPTOR_MAX_BYTES]),
@@ -231,6 +240,7 @@ pub(super) fn capture(
         &mut output,
         &Descriptor {
             version: 1,
+            retirement_forward_policy: retirement_forward_policy.as_ref(),
             acquisition,
             registration: request.owner.registration,
             registration_generation: request.owner.generation,
@@ -246,6 +256,7 @@ pub(super) fn capture(
     .map_err(|_| GlobalPreparationError::InputBound)?;
     let scope = GlobalWalScope {
         objects: observed,
+        retirement_forward_policy,
         root_identity: root_identity.into(),
         bytes: output.bytes,
         encoded_len: output.len,

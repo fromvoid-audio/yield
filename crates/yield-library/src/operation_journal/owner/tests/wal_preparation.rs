@@ -1787,6 +1787,55 @@ mod integration {
             WalPreparedDatabase::Global(_)
         ));
         assert!(matches!(view.databases()[1], WalPreparedDatabase::Lease(_)));
+        let WalPreparedDatabase::Global(original) = &view.databases()[0] else {
+            unreachable!();
+        };
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(original.wal_scope().unwrap().descriptor_bytes()).unwrap();
+        assert!(
+            descriptor["retirement_forward_policy"].is_object(),
+            "the actual retirement producer must seal its typed initial-forward policy"
+        );
+        let policy = original
+            .wal_scope()
+            .unwrap()
+            .retirement_forward_policy()
+            .unwrap();
+        assert_eq!(policy.operation_id(), operation);
+        assert_eq!(
+            policy.work_keys(),
+            &[retirement.draining_work(), retirement.retired_work()]
+        );
+        let allocation = original.lifecycle_allocation().unwrap();
+        let expected = [
+            allocation.main().write_ceiling(),
+            allocation.wal().write_ceiling(),
+            allocation.shm().write_ceiling(),
+        ];
+        assert_eq!(policy.per_transition_ceilings(), expected);
+        assert_eq!(
+            policy.total_forward_ceilings(),
+            expected.map(|n| n.checked_mul(2).unwrap())
+        );
+        let sealed = &descriptor["retirement_forward_policy"];
+        assert_eq!(
+            sealed["registration"],
+            serde_json::to_value(original.owner().registration()).unwrap()
+        );
+        assert_eq!(
+            sealed["registration_generation"],
+            original.owner().generation()
+        );
+        assert_eq!(
+            sealed["preparation_nonce"],
+            serde_json::to_value(original.nonce()).unwrap()
+        );
+        let expected_digest = blake3::derive_key(
+            "yield.global-retirement-initial-forward.v1",
+            &serde_json::to_vec(&retirement).unwrap(),
+        );
+        assert_eq!(policy.family_digest(), &expected_digest);
+
         let result = journal
             .client()
             .admit_full(args, participants)

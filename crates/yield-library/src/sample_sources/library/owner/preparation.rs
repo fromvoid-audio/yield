@@ -11,6 +11,8 @@ use crate::sample_sources::db::sqlite_identity::{
     validate_database_file_identity,
 };
 pub use binding::{GlobalWalObjectObservation, GlobalWalScope};
+mod retirement_policy;
+pub use retirement_policy::GlobalRetirementForwardPolicy;
 mod requester;
 pub use requester::GlobalWalPreparationClient;
 
@@ -125,10 +127,21 @@ pub struct GlobalPreparationRequest {
     expected_mutation_revision: Option<u64>,
     lifecycle_allocation: bool,
     lifecycle_policy: bool,
+    retirement: Option<retirement_policy::Input>,
     wal_binding: bool,
     handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
 }
 impl GlobalPreparationRequest {
+    pub(crate) fn retirement_policy_input(
+        args: &crate::operation_journal::source_registry_retirement::SourceRegistryRetirementIntentArgs,
+    ) -> Result<retirement_policy::Input, GlobalPreparationError> {
+        retirement_policy::Input::new(args)
+    }
+    pub(crate) fn with_retirement_policy(mut self, input: retirement_policy::Input) -> Self {
+        self.retirement = Some(input);
+        self.with_lifecycle_policy()
+    }
+
     pub(crate) fn in_handshake(
         mut self,
         budget: Arc<crate::operation_journal::wal_admission::HandshakeBudget>,
@@ -207,6 +220,7 @@ impl GlobalPreparationRequest {
             expected_mutation_revision: None,
             lifecycle_allocation: false,
             lifecycle_policy: false,
+            retirement: None,
             wal_binding: false,
             handshake: None,
         })

@@ -815,3 +815,27 @@ These producer fields define inventory context only. Full OPT-2136 still require
 its genuine all-owner Start, post-start cleanup fence, exact component/participant
 write ceilings and atomic nonce/intent/claims/readback consumer. No permit, retry,
 refund or genuine settlement follows from a descriptor or generation observation.
+
+## Typed retirement initial-forward planning (OPT-2334)
+
+The actual universal retirement preparation route requests a typed global policy for
+its complete frozen V18 family. The original entered global worker seals the exact
+operation, Draining and Retired work keys, versioned family digest, acquisition,
+registration/generation and preparation nonce into its retained native scope. The
+scope still binds original MAIN/WAL/SHM identities and allocation units. A foreign
+acquisition, absent entered policy, component/unit mismatch or checked overflow
+refuses preparation and follows the original empty rollback path.
+
+Each of the two sequential frozen global transitions receives the complete genuine
+entered lifecycle MAIN/WAL/SHM restriction. Their checked sums form a conservative
+initial-forward planning partition; no aggregate claim is divided or historical
+object length treated as a future budget. Combined WAL/SHM totals must also fit the
+signed SQLite range. This fixed-size policy shares original scope backing and its
+existing local/shared debit. Generic lifecycle preparation keeps its old semantics.
+
+This capture grants no Start, capacity, physical-family qualification, required
+permit, global transition, source release, compensation or settlement. The later
+consumer must match the exact frozen family and enforce these separate work budgets
+on actual transition code; it cannot reuse one reservation for concurrent or
+compensation effects. Physical-family qualification, compensation/finalization
+requirements and OPT-2136/2194/2196 remain open.

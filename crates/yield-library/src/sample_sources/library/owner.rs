@@ -54,8 +54,8 @@ pub use preparation::{
     GLOBAL_PREPARATION_MAX_BYTES, GLOBAL_PREPARATION_MAX_DATABASES,
     GLOBAL_PREPARATION_MAX_DURATION, GlobalPreparationError, GlobalPreparationObservation,
     GlobalPreparationOwner, GlobalPreparationPending, GlobalPreparationRequest,
-    GlobalPreparationReservation, GlobalWalObjectObservation, GlobalWalPreparationClient,
-    GlobalWalScope,
+    GlobalPreparationReservation, GlobalRetirementForwardPolicy, GlobalWalObjectObservation,
+    GlobalWalPreparationClient, GlobalWalScope,
 };
 
 mod shutdown;
