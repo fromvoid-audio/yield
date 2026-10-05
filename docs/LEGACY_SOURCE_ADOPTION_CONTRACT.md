@@ -444,3 +444,22 @@ in OPT-2282; Windows production and all-test-target cross-compilation is separat
 from execution. These observations do not implement admission, writable promotion,
 migration/receipt/version stamping, lease bootstrap, retries/refunds or settlement.
 Full OPT-2117/2098/1745 and physical qualification remain open.
+
+## Windows retained-root observation opens (OPT-2283)
+
+The bounded observation opener now supports Windows direct regular children.
+It first requests only attributes through the original retained directory with
+no-follow semantics. Disk type, regular/non-reparse attributes and nonzero native
+identity are checked before `ReOpenFile` enables readonly data access through the
+original handle. Original and new identities are compared while both handles are
+live. Unknown shapes and alternate data streams refuse; no creation, write,
+delete, path-based data reopen or ownership grant is requested.
+
+The genuine Windows harness checks original-handle reads after rename/replacement,
+write refusal, directories/nested/parent/stream refusal, symlink preservation and
+character-device refusal. Native execution with genuine symlink privilege or
+Developer Mode is OPT-2284; compile checks and portable record fixtures do not
+execute Windows APIs. Existing Unix FIFO and staged-target producer tests remain
+required. This producer supplies observations, not migration/publication admission,
+qualified physical allocation, lifecycle slots, receipts, retries/refunds or
+settlement. Full OPT-2117/2194/2215/2218 remain open.
