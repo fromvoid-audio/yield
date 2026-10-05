@@ -342,14 +342,16 @@ impl CapacityProvider {
         plan: &FullCapacityPlan,
         claims: &AdmissionClaimInventory,
     ) -> Result<ProvisionalCapacityLease, CapacityProviderError> {
-        if self.qualification == ProviderQualification::Unavailable {
-            return Err(CapacityProviderError::Unavailable);
-        }
-        let facts = self
-            .facts
-            .as_ref()
-            .ok_or(CapacityProviderError::UnsupportedFacts)?;
-        self.admit_with_facts(plan, claims, &facts.by_volume)
+        super::capacity_admission_telemetry::observe(|| {
+            if self.qualification == ProviderQualification::Unavailable {
+                return Err(CapacityProviderError::Unavailable);
+            }
+            let facts = self
+                .facts
+                .as_ref()
+                .ok_or(CapacityProviderError::UnsupportedFacts)?;
+            self.admit_with_facts(plan, claims, &facts.by_volume)
+        })
     }
 
     /// Admit once against a fresh owner-created descriptor witness. The witness borrows the
@@ -361,7 +363,9 @@ impl CapacityProvider {
         claims: &AdmissionClaimInventory,
         witness: super::owner::LiveAdmissionWitness<'_>,
     ) -> Result<ProvisionalCapacityLease, CapacityProviderError> {
-        self.admit_with_facts(plan, claims, witness.facts())
+        super::capacity_admission_telemetry::observe(|| {
+            self.admit_with_facts(plan, claims, witness.facts())
+        })
     }
 
     /// Test-only arithmetic seam. Production callers must provide an owner-created witness.
@@ -372,7 +376,7 @@ impl CapacityProvider {
         claims: &AdmissionClaimInventory,
         facts: &BTreeMap<VolumeIdentity, VolumeFacts>,
     ) -> Result<ProvisionalCapacityLease, CapacityProviderError> {
-        self.admit_with_facts(plan, claims, facts)
+        super::capacity_admission_telemetry::observe(|| self.admit_with_facts(plan, claims, facts))
     }
 
     /// Check stable claim identities before any lease token or ledger mutation is created.
@@ -1680,6 +1684,9 @@ fn disposition_operation(disposition: &ProvisionalLeaseDisposition) -> Option<Op
         ProvisionalLeaseDisposition::Provisional | ProvisionalLeaseDisposition::Released => None,
     }
 }
+
+#[cfg(test)]
+mod admission_metrics_tests;
 
 #[cfg(test)]
 mod tests {
