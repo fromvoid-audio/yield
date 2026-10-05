@@ -1,0 +1,9 @@
+# Journal JSON materialization limits
+
+`operation_journal::codec::decode_with_limits` applies caller-selected cumulative quotas before constructing the initial owned JSON tree: value nodes, array entries, object entries, decoded UTF-8 key/value bytes, and nesting depth (root zero). It returns `BoundedDecodeError::LimitExceeded` separately from existing malformed, oversized and unsupported-schema errors. The existing `decode` API keeps its acceptance limits and strict duplicate-key, trailing-input and schema validation behavior.
+
+Entry and node charges precede construction; string charges precede owned copies from borrowed decoded strings. Object entry accounting includes a rejected duplicate key. Empty containers need a node but no entries. Limits do not reserve or authorize storage, retries, refunds, source effects or settlement.
+
+These are structural materialization quotas, not a complete heap bound. Serde JSON escape scratch, vector/map backing capacity, allocator overhead, later typed decoding and clones, raw wire buffers, and complete inventory audits require separate bounds and original owner credits. In particular, this decoder alone does not establish the Recording factory's 4 MiB budget or complete OPT-2326. The unchanged 1 MiB wire limit alone cannot establish a heap bound either.
+
+Tests count actual constructed values, appended array entries, inserted object entries and owned decoded string bytes at the production visitor's construction sites. Wide arrays/objects, escaped strings/keys and nested values refuse before exceeding their corresponding quotas. Supported V1–V18 fixtures use the same production decoder. An actual profile-owned SQLite test retains an opaque wide-array record, verifies distinct bounded refusal without changing its bytes/key/sequence, and confirms default readback and reopen. Storage fixtures provide no live registration or physical qualification.
