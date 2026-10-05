@@ -92,3 +92,28 @@ Neither configuration qualifies an arbitrary transport as an admitted physical
 sink or activates recording in GPUI. OPT-2145 still requires the actual private
 sink/source/profile/claim/capacity association and Finalizing/Frozen/seal owner
 integration; OPT-2058 retains physical transport/publication/retirement scope.
+
+## Original bounded serializer channel (OPT-2295)
+
+`RecordingTransport::bind(limits)` constructs the original private sink and returns its
+single byte-request receiver together with the original sink binding and settlement receiver.
+The receiving owner must be running before `RecordingProducer::start`: startup writes the
+initial WAV header synchronously. The receiver also continues running while another thread
+performs Stop/Cancel and joins the serializer. No capture callback waits on this channel.
+
+Each request retains exact immutable bytes and its serializer offset. At most one write
+(up to 16384 bytes) or flush awaits acknowledgement. A write advances the sink cursor only
+after acknowledgement; seeking updates a checked local cursor and cannot exceed the finite
+allocation or use end-relative seeks. Refusal, request/receiver loss, queue failure or the
+fixed two-second acknowledgement deadline permanently fails the sink. The timed-out request
+can remain retained for audit; late acknowledgement cannot resume encoding. A lost response
+is unconfirmed even if the receiving owner already performed an effect. There is no automatic
+retry, fallback file I/O, publication, refund or genuine settlement.
+
+This is production byte plumbing, not an admitted file-operation adapter. Consumers must
+bind actual current source/profile/output/chunk/capacity authority before retaining or
+executing requests. Neither `acknowledge` nor the original producer proof constructs that
+authority. OPT-2145 still owns immutable Finalizing/Frozen/seal storage and authentic owner
+binding; OPT-2058 still owns retained physical transport, verified physical results and
+publication/retirement. Cursor-backed transport tests verify original serialization and
+proof routing, not native qualification or journal acceptance.

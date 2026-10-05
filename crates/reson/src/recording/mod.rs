@@ -7,8 +7,13 @@ mod health;
 mod monitor;
 mod producer;
 mod settlement;
+mod transport;
 mod writer;
 pub use producer::{RecordingProducer, RecordingProducerOutcome};
+pub use transport::{
+    RECORDING_TRANSPORT_ACK_TIMEOUT, RECORDING_TRANSPORT_MAX_WRITE_BYTES, RecordingTransport,
+    RecordingTransportReceiver, RecordingTransportRequest, RecordingTransportRequestKind,
+};
 
 #[cfg(feature = "native-audio")]
 #[cfg(test)]
