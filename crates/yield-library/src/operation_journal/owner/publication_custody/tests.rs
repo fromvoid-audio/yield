@@ -289,3 +289,122 @@ fn publication_charge_generation_change_during_counted_source_acquisition_refuse
         }
     }
 }
+
+#[test]
+fn publication_native_floor_fit_rejects_pressure_overflow_foreign_and_unaligned_facts() {
+    use crate::durable_capacity::{
+        PROTECTED_FREE_SPACE_FLOOR as FLOOR, VolumeFacts, VolumeIdentity,
+    };
+    let volume = VolumeIdentity { device: 1 };
+    let mut facts = VolumeFacts {
+        identity: volume.clone(),
+        allocation_unit: 4096,
+        free_bytes: FLOOR + 8192,
+    };
+    assert!(capacity_fits(&volume, 4096, &facts, 8192));
+    assert!(!capacity_fits(&volume, 4096, &facts, 8193));
+    assert!(!capacity_fits(&volume, 4096, &facts, u64::MAX));
+    assert!(!capacity_fits(
+        &VolumeIdentity { device: 2 },
+        4096,
+        &facts,
+        0
+    ));
+    assert!(!capacity_fits(&volume, 0, &facts, 0));
+    assert!(!capacity_fits(&volume, 4095, &facts, 0));
+    facts.allocation_unit = 0;
+    assert!(!capacity_fits(&volume, 4096, &facts, 0));
+    facts.allocation_unit = 4096;
+    facts.free_bytes = FLOOR - 1;
+    assert!(!capacity_fits(&volume, 4096, &facts, 0));
+}
+
+#[test]
+fn counted_native_observation_rejects_read_failure_and_invalidation_before_source() {
+    for invalidate in [false, true] {
+        let admission = ResourceAdmission::new();
+        assert!(admission.activate(|| true));
+        let result = counted_entry_observed(
+            &admission,
+            |resource| {
+                assert_eq!(admission.snapshot().1, 1);
+                resource.verify_read_for(&admission).unwrap();
+                if invalidate {
+                    admission.invalidate();
+                    Ok(())
+                } else {
+                    Err(OperationJournalOwnerError::StagingGrant {
+                        reason: "readonly observation refused".into(),
+                    })
+                }
+            },
+            |_| -> Result<(), OperationJournalOwnerError> {
+                panic!("source acquisition after observation refusal")
+            },
+            |_, _| panic!("association check after observation refusal"),
+            |_| panic!("entry after observation refusal"),
+        );
+        assert!(result.is_err());
+        assert_eq!(admission.snapshot().1, 0);
+        assert_eq!(
+            admission.validate_open(),
+            if invalidate {
+                Err(UseError::Unknown)
+            } else {
+                Ok(())
+            }
+        );
+    }
+}
+
+#[test]
+fn counted_native_observation_retains_one_use_through_association_and_source_cleanup() {
+    struct Sentinel(Arc<ResourceAdmission>, Arc<AtomicBool>);
+    impl Drop for Sentinel {
+        fn drop(&mut self) {
+            assert_eq!(self.0.snapshot().1, 1);
+            self.1.store(true, Ordering::Release);
+        }
+    }
+    for refusal in [0, 1, 2] {
+        let admission = ResourceAdmission::new();
+        assert!(admission.activate(|| true));
+        let released = Arc::new(AtomicBool::new(false));
+        let result = counted_entry_observed(
+            &admission,
+            |resource| {
+                resource.verify_read_for(&admission).unwrap();
+                assert_eq!(admission.snapshot().1, 1);
+                Ok(resource.generation())
+            },
+            |generation| {
+                assert_eq!(admission.snapshot().1, 1);
+                if refusal == 2 {
+                    admission.close();
+                }
+                Ok((generation, Sentinel(admission.clone(), released.clone())))
+            },
+            |(generation, _), resource| {
+                resource.verify_read_for(&admission)?;
+                assert_eq!(*generation, resource.generation());
+                assert_eq!(admission.snapshot().1, 1);
+                if refusal == 1 {
+                    Err(UseError::Closed)
+                } else {
+                    Ok(())
+                }
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(result.is_ok(), refusal == 0);
+        if result.is_ok() {
+            assert_eq!(admission.snapshot().1, 1);
+        }
+        drop(result);
+        assert!(released.load(Ordering::Acquire));
+        assert_eq!(admission.snapshot().1, 0);
+        if refusal == 0 {
+            assert!(admission.snapshot().2, "drop retains unsettled state");
+        }
+    }
+}

@@ -46,11 +46,11 @@ they return and the use is released.
 
 Runtime closure prevents new original reads. Retained observation descriptors after
 runtime teardown retain their memory debit but cannot resurrect ownership or a read use.
-The full OPT-2215 issuer must account for these capsules, registry, custody header,
-mirrors, slots and bindings inside its shared 2 MiB publication ceiling. This leaf uses
-the existing 4 MiB input pool and does not claim that final composition is implemented.
-Source/target/claim/capacity associations, all mutation fences, effect slots, completion
-and verified settlement remain open in OPT-2215; backend and qualification remain open.
+OPT-2276 places these capsules, registry and resource custody inside the shared
+2 MiB publication subset of the existing 4 MiB input pool. The OPT-2311 consumer
+below composes original source, target, retained charge and reader custody. Qualified
+namespace associations, remaining lifetime fences, completion and verified settlement
+remain open in OPT-2215; backend and qualification remain open.
 
 Portable tests exercise actual journal/profile/root custody, refusal/refunds, original
 counted origin, replay/closure, real root/child/symlink/FIFO substitution, bounded deep
@@ -61,3 +61,27 @@ root, marker and physical-floor failure, sticky unknown, expired reuse, memory r
 and original teardown. This test registry does not qualify the production per-user root.
 OPT-2273 records exact SDK/runtime/production-root, pressure, UUID/unit change and
 multi-volume verification requirements. These native cases have not run on Linux.
+
+## Original staging-grant consumer (OPT-2311)
+
+The staging issuer now captures this original reader from the authenticated target
+volume before checkpoint or reservation. Missing, unsupported, closed or unknown
+capture refuses the command. The grant retains the capsule and its existing 64 KiB
+publication debit; the actor's 32 KiB registry debit remains until teardown. Both use
+the shared publication subset, alongside the original grant and fence/mirror backing.
+
+Entry acquires one original counted read use before native observation. That same
+use remains counted through source acquisition and effect upgrade. Native IO and
+source acquisition run outside admission, charge-mirror and fence locks. Original
+capsule/resource association is checked outside the final admission lock. The final
+admission→mirror→fence transition requires the captured charge generation to remain
+current, matching volume, nonzero original reader allocation unit, aligned nonzero
+claim bytes, and checked free-space fit for the full protected floor plus current
+incremental total. Native facts and source/target/input custody drop before the count.
+
+Linux exercises actual negative capture and scalar fit/custody behavior. The genuine
+macOS issuer harness accounts for capsule and registry debits, but still needs supported
+SDK/runtime execution. These observations do not qualify namespace allocation or
+provenance, issue database/native effect permits, authorize retry or refund, or settle
+an entered attempt. Qualified namespace policy, remaining issuer fences, completion
+and genuine settlement stay open in OPT-2194/2215/2216/2217/2218.

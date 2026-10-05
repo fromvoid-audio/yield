@@ -64,7 +64,7 @@ impl PublicationChargeBinding {
     pub(super) fn operation(&self) -> OperationId {
         self.operation
     }
-    pub(super) fn claim(&self) -> &AdmissionClaim {
+    pub(crate) fn claim(&self) -> &AdmissionClaim {
         &self.claim
     }
     /// Historical scalar validity only. The issuer still needs independent admission,

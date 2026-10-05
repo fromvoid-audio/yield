@@ -1127,6 +1127,7 @@ pub(crate) struct StagingPublicationGrant {
     target: PreparedPublicationTarget,
     fence: publication_fence::PendingFence,
     charge: super::capacity_provider::PublicationChargeBinding,
+    native: native_read_capsule::NativeReadCapsule,
     source_pin: SourceEffectPin,
     resource_admission: Arc<ResourceAdmission>,
     input: InputPermit,
@@ -1154,6 +1155,7 @@ impl StagingPublicationGrant {
             self.input,
             self.fence,
             self.charge,
+            self.native,
         )
     }
 }
@@ -2374,6 +2376,11 @@ impl OwnerRuntime {
                 reason: format!("original publication admission is closed: {error:?}"),
             }
         })?;
+        let native = self
+            .capture_native_read_capsule(target.volume())
+            .map_err(|error| OperationJournalOwnerError::StagingGrant {
+                reason: format!("original publication native reader unavailable: {error:?}"),
+            })?;
         let source = self
             .source_registrations
             .get(&registration.registration_id)
@@ -2458,6 +2465,7 @@ impl OwnerRuntime {
             target,
             fence,
             charge,
+            native,
             input,
             source_pin,
             resource_admission: Arc::clone(&self.resource_admission),
@@ -10181,7 +10189,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .publication_remaining,
-            input_before - 64 * 1024 - publication_fence::HEADER_BYTES
+            input_before
+                - 64 * 1024
+                - publication_fence::HEADER_BYTES
+                - native_read_capsule::BACKING
+                - native_read_capsule::REGISTRY
         );
         if let Some(entered) = release_after_entry {
             let (request, unused) = unused_for_release.unwrap();
@@ -10324,7 +10336,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .publication_remaining,
-            input_before - 64 * 1024 - publication_fence::HEADER_BYTES
+            input_before
+                - 64 * 1024
+                - publication_fence::HEADER_BYTES
+                - native_read_capsule::BACKING
+                - native_read_capsule::REGISTRY
         );
         drop(permit);
         assert_eq!(
@@ -10334,7 +10350,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .publication_remaining,
-            input_before - publication_fence::HEADER_BYTES
+            input_before - publication_fence::HEADER_BYTES - native_read_capsule::REGISTRY
         );
         assert_eq!(owner.shared.resource_admission.snapshot(), (false, 0, true));
         let mut replay_checkpoint = client
