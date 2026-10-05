@@ -109,9 +109,39 @@ impl SourceLeaseMaintenancePreparation {
         registration: &SourceAuthorityRegistration,
     ) -> Result<(), SourceLeaseMaintenancePreparationError> {
         self.validate_lease_binding(binding, registration)?;
+        if let Some(custody) = self.custody.registered.as_ref() {
+            custody
+                .validate(&self.custody.writer().database, registration)
+                .map_err(|_| LifecycleAllocationError::Unknown)?;
+        }
         registration
             .validate_registered_database_boundary(&self.custody.writer().database)
             .map_err(|_| LifecycleAllocationError::Unknown)?;
         self.validate_lease_binding(binding, registration)
+    }
+}
+
+impl SourceLeaseMaintenancePreparation {
+    /// Retain one genuine Registered use on this exact original pre-audit reservation.
+    /// Custody survives rollback, timeout and policy restoration failure until real close.
+    /// No audit/revision, decision, write, capacity, deadline extension or settlement is issued.
+    pub fn retain_registered_lease_binding(
+        &mut self,
+        binding: &SourceLeaseMaintenanceBinding,
+        registration: &SourceAuthorityRegistration,
+    ) -> Result<(), SourceLeaseMaintenancePreparationError> {
+        if self.custody.registered.is_some() {
+            return Err(LifecycleAllocationError::Unknown.into());
+        }
+        self.validate_registered_lease_binding(binding, registration)?;
+        let custody = registration
+            .retain_registered_database_boundary(&self.custody.writer().database)
+            .map_err(|_| LifecycleAllocationError::Unknown)?;
+        self.validate_lease_binding(binding, registration)?;
+        custody
+            .validate(&self.custody.writer().database, registration)
+            .map_err(|_| LifecycleAllocationError::Unknown)?;
+        self.custody.registered = Some(custody);
+        Ok(())
     }
 }

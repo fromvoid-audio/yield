@@ -69,9 +69,10 @@ impl fmt::Debug for SourceLeaseMaintenancePreparationFailure {
     }
 }
 
-// Field order keeps the original ordinary connection/lease ahead of the extension gate.
+// Field order closes ordinary SQLite before releasing counted use/lease, then extension exclusion.
 struct Custody {
     writer: Option<SourceWriter>,
+    registered: Option<crate::sample_sources::db::source_authority::RegisteredDatabaseCustody>,
     policy: Option<EnteredMetadataPolicy>,
     observation: SourceLeaseMaintenanceAllocation,
     deadline: Instant,
@@ -88,7 +89,15 @@ impl Custody {
         // No full capture or reuse/retirement acknowledgement. The actual connection
         // closes before its source lease and before the retained extension gate.
         drop(self.writer.take());
+        drop(self.registered.take());
         drop(self.policy.take());
+    }
+    fn close_ready(&self) -> bool {
+        !self.preexisting_transaction
+            && self.registered.as_ref().map_or_else(
+                || self.writer().database.source_authority_close_ready(),
+                |custody| custody.close_ready(&self.writer().database),
+            )
     }
     fn writer(&self) -> &SourceWriter {
         self.writer
@@ -180,6 +189,8 @@ impl Custody {
         }
         // Drop the policy guard only after all SQL/owner restoration checks finish.
         self.policy = None;
+        // Original rollback, timeout, policy restoration and final owner validation are complete.
+        drop(self.registered.take());
         Ok(self
             .writer
             .take()
@@ -224,6 +235,7 @@ fn new_custody(
     let ordinary_changes = writer.database.connection.total_changes();
     Custody {
         writer: Some(writer),
+        registered: None,
         policy: None,
         observation,
         deadline,
@@ -343,10 +355,7 @@ impl SourceLeaseMaintenancePreparation {
     }
     /// Check snapshot custody only; no source retirement/release acknowledgement is issued.
     pub fn source_authority_close_ready(&self) -> bool {
-        self.custody
-            .writer()
-            .database
-            .source_authority_close_ready()
+        self.custody.close_ready()
     }
     /// Validate original parked CONTROL/native custody and entered settings without ordinary SQL.
     /// Full schema/scan/allocation facts are checked at acquisition and initial binding capture.
@@ -437,7 +446,10 @@ impl SourceLeaseMaintenancePreparationFailure {
             .writer
             .take()
             .expect("original failed lease custody");
-        authority.close_database(writer.into_catalog_database())
+        authority.close_database_with_registered_custody(
+            writer.into_catalog_database(),
+            self.custody.registered.take(),
+        )
     }
     /// Inspect the rejection while the original owner remains inaccessible.
     pub fn error(&self) -> &SourceLeaseMaintenancePreparationError {
@@ -445,12 +457,7 @@ impl SourceLeaseMaintenancePreparationFailure {
     }
     /// Diagnostic snapshot readiness; never close/release authority.
     pub fn source_authority_close_ready(&self) -> bool {
-        !self.custody.preexisting_transaction
-            && self
-                .custody
-                .writer()
-                .database
-                .source_authority_close_ready()
+        self.custody.close_ready()
     }
     /// Cleanup may retry a confirmed-empty rollback/timeout; poisoned policy never revives.
     pub fn into_writer(mut self) -> Result<SourceWriter, Self> {
@@ -476,3 +483,6 @@ mod workload_tests;
 
 #[cfg(feature = "test-support")]
 mod test_vfs;
+
+#[cfg(test)]
+mod registered_custody_tests;
