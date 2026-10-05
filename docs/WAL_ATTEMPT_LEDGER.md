@@ -57,3 +57,21 @@ continues to bind the exact versioned start digest. Actual transaction and resta
 readback support both without changing SQLite schema 12. See
 [SOURCE_REGISTRY_LIFECYCLE_CONTRACT.md](SOURCE_REGISTRY_LIFECYCLE_CONTRACT.md) for
 finite bounds, original-owner capture and the still-open admitted execution gates.
+
+### Windows retained-handle capacity observations (OPT-2277)
+
+`descriptor_capacity_facts` queries `FileFsFullSizeInformation` through the
+original Windows disk handle. It brackets the query with handle-derived volume
+serial, file index and creation-time checks, refuses opened reparse points and
+non-disk handles, and validates the exact record size, counts, geometry and byte
+arithmetic. Free space uses the caller-available allocation count, preserving
+quota restrictions. No path lookup, reopen or filesystem mutation occurs.
+
+The Windows volume serial is an observation identifier, not a qualified native
+UUID. These facts do not qualify physical allocation policy, bind Windows WAL or
+SHM objects, issue permits, authorize retries, refund reservations or complete
+settlement. OPT-2194 remains open for the complete qualified policy. Portable
+record tests and an isolated Windows Rust compile check cannot replace executing
+the native retained-file/directory/renamed-handle and device-refusal tests on a
+supported Windows filesystem.
+Native Windows execution and quota verification are tracked in OPT-2278.
