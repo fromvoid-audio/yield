@@ -1,5 +1,8 @@
 //! Finite source writer acquisition. Never replay a transaction body or commit.
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod metrics;
+pub use metrics::{SourceAcquisitionMetricsSnapshot, source_acquisition_metrics_snapshot};
 
 use rusqlite::{Transaction, TransactionBehavior, ffi};
 
@@ -23,9 +26,19 @@ struct Observation {
 
 fn begin_with_backoff(
     database: &SourceDatabase,
-    mut backoff: impl FnMut(u8),
+    backoff: impl FnMut(u8),
 ) -> Result<Transaction<'_>, SourceDbError> {
+    begin_with_metrics(database, backoff, &metrics::PROCESS_METRICS)
+}
+
+fn begin_with_metrics<'a>(
+    database: &'a SourceDatabase,
+    mut backoff: impl FnMut(u8),
+    metrics: &metrics::AcquisitionMetrics,
+) -> Result<Transaction<'a>, SourceDbError> {
+    let started = Instant::now();
     let connection = &database.connection;
+    let nested = !connection.is_autocommit();
     let mut observation = Observation {
         outcome: "rejected",
         ..Observation::default()
@@ -52,6 +65,7 @@ fn begin_with_backoff(
                 observation.outcome = "ownership_rejected";
                 revalidate(database)?;
                 observation.attempts = attempt;
+                metrics.attempt();
                 match Transaction::new_unchecked(connection, TransactionBehavior::Immediate) {
                     Ok(transaction) => {
                         revalidate(database)?;
@@ -74,6 +88,7 @@ fn begin_with_backoff(
                             return Err(map_sql_error(error));
                         }
                         observation.retries += 1;
+                        metrics.retry();
                         backoff(attempt);
                     }
                 }
@@ -89,6 +104,7 @@ fn begin_with_backoff(
         }
         result
     })();
+    metrics.finish(&result, nested, &observation, started.elapsed());
     tracing::info!(target: "yield::source_writer_acquisition",
         attempts = observation.attempts, retries = observation.retries,
         sqlite_code = observation.sqlite_code, outcome = observation.outcome);

@@ -21,6 +21,9 @@ pub use command::{
 pub use curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
 };
+pub use reservation_retry::{
+    SourceAcquisitionMetricsSnapshot, source_acquisition_metrics_snapshot,
+};
 pub use source_writer::{
     FeatureMaintenanceMetrics, FeaturePruneCursor, FeaturePrunePage, FeatureRebuildMetrics,
     ManifestEnrollmentEntry, ManifestEnrollmentError, ManifestEnrollmentKind,

@@ -316,6 +316,7 @@ fn reservation_retry_near_expiry_success_does_not_renew_during_wait() {
 fn reservation_retry_namespace_replacement_during_wait_retains_data() {
     let fixture = owned();
     let database = &fixture.database;
+    let metrics = metrics::AcquisitionMetrics::new();
     database.upsert_file(Path::new("one.wav"), 10, 1).unwrap();
     let revision = database.get_revision().unwrap();
     let rival = rusqlite::Connection::open(&database.db_path).unwrap();
@@ -326,15 +327,25 @@ fn reservation_retry_namespace_replacement_during_wait_retains_data() {
         .profile_root()
         .join("displaced-source-retry");
     let (result, records) = capture(|| {
-        begin_with_backoff(database, |_| {
-            rival.execute_batch("ROLLBACK").unwrap();
-            std::fs::rename(&child, &displaced).unwrap();
-            std::fs::create_dir(&child).unwrap();
-            std::fs::write(child.join("private-sentinel"), b"untouched").unwrap();
-        })
+        begin_with_metrics(
+            database,
+            |_| {
+                rival.execute_batch("ROLLBACK").unwrap();
+                std::fs::rename(&child, &displaced).unwrap();
+                std::fs::create_dir(&child).unwrap();
+                std::fs::write(child.join("private-sentinel"), b"untouched").unwrap();
+            },
+            &metrics,
+        )
     });
     assert!(result.is_err());
     observed(&records, "ownership_rejected", 1, 1, ffi::SQLITE_BUSY);
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.attempts, 1);
+    assert_eq!(snapshot.retries, 1);
+    assert_eq!(snapshot.ownership_rejected, 1);
+    assert_eq!(snapshot.acquired, 0);
+    assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 1);
     assert_eq!(timeout(database), 777);
     assert!(database.connection.is_autocommit());
     assert_eq!(database.get_revision().unwrap(), revision);
@@ -450,4 +461,150 @@ fn reservation_retry_actual_source_writer_preserves_receipts_and_restart_replay(
         )
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[test]
+fn source_acquisition_metrics_actual_busy_release_nested_and_one_committed_body() {
+    let (_root, database) = plain();
+    database
+        .connection
+        .execute_batch("CREATE TABLE metric_effect(value UNIQUE)")
+        .unwrap();
+    let revision = database.get_revision().unwrap();
+    let rival = rusqlite::Connection::open(&database.db_path).unwrap();
+    let metrics = metrics::AcquisitionMetrics::new();
+    rival.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(matches!(
+        begin_with_metrics(
+            &database,
+            |_| std::thread::sleep(Duration::from_millis(20)),
+            &metrics
+        ),
+        Err(SourceDbError::Busy)
+    ));
+    assert_eq!(database.get_revision().unwrap(), revision);
+    assert_eq!(timeout(&database), 1234);
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.attempts, 3);
+    assert_eq!(snapshot.retries, 2);
+    assert_eq!(snapshot.busy_exhausted, 1);
+    assert_eq!(snapshot.acquired, 0);
+    assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 1);
+    assert_eq!(snapshot.elapsed_buckets[..2], [0, 0]);
+    let transaction = begin_with_metrics(
+        &database,
+        |attempt| {
+            assert_eq!(attempt, 1);
+            rival.execute_batch("ROLLBACK").unwrap();
+        },
+        &metrics,
+    )
+    .unwrap();
+    assert_eq!(timeout(&database), 1234);
+    assert!(matches!(
+        begin_with_metrics(&database, |_| panic!("nested retry"), &metrics),
+        Err(SourceDbError::Unexpected)
+    ));
+    transaction
+        .execute("INSERT INTO metric_effect VALUES (1)", [])
+        .unwrap();
+    transaction.commit().unwrap();
+    assert_eq!(
+        database
+            .connection
+            .query_row("SELECT count(*) FROM metric_effect", [], |row| row
+                .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.attempts, 5);
+    assert_eq!(snapshot.retries, 3);
+    assert_eq!(snapshot.acquired, 1);
+    assert_eq!(snapshot.nested_transaction, 1);
+    assert_eq!(snapshot.busy_exhausted, 1);
+    assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 3);
+    assert_eq!(snapshot.other_failure, 0);
+    assert_eq!(snapshot.ownership_rejected, 0);
+}
+
+#[test]
+fn source_acquisition_metrics_actual_locked_and_readonly_preserve_dispositions() {
+    let (_root, mut database) = plain();
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_SHARED_CACHE;
+    database.connection = rusqlite::Connection::open_with_flags(&database.db_path, flags)
+        .unwrap()
+        .into();
+    database
+        .connection
+        .busy_timeout(Duration::from_millis(800))
+        .unwrap();
+    let rival = rusqlite::Connection::open_with_flags(&database.db_path, flags).unwrap();
+    let metrics = metrics::AcquisitionMetrics::new();
+    rival.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(
+        matches!(begin_with_metrics(&database, |_| panic!("LOCKED retry"), &metrics), Err(SourceDbError::Sql(rusqlite::Error::SqliteFailure(error, _))) if error.extended_code == ffi::SQLITE_LOCKED_SHAREDCACHE)
+    );
+    assert_eq!(timeout(&database), 800);
+    rival.execute_batch("ROLLBACK").unwrap();
+    database
+        .connection
+        .execute_batch("PRAGMA query_only=ON")
+        .unwrap();
+    assert!(matches!(
+        begin_with_metrics(&database, |_| panic!("readonly retry"), &metrics),
+        Err(SourceDbError::Sql(_))
+    ));
+    assert_eq!(timeout(&database), 800);
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.attempts, 2);
+    assert_eq!(snapshot.retries, 0);
+    assert_eq!(snapshot.contention_not_retried, 1);
+    assert_eq!(snapshot.other_failure, 1);
+    assert_eq!(snapshot.acquired, 0);
+    assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 2);
+}
+
+#[test]
+fn source_acquisition_metrics_actual_lease_expiry_counts_refusal_without_renewal() {
+    let fixture = owned();
+    let database = &fixture.database;
+    let metrics = metrics::AcquisitionMetrics::new();
+    let rival = rusqlite::Connection::open(&database.db_path).unwrap();
+    rival.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(matches!(
+        begin_with_metrics(
+            database,
+            |attempt| {
+                assert_eq!(attempt, 1);
+                rival
+                    .execute_batch("UPDATE source_lease SET expires_at = acquired_at; COMMIT")
+                    .unwrap();
+            },
+            &metrics
+        ),
+        Err(SourceDbError::SourceLease(
+            crate::sample_sources::db::SourceLeaseError::Expired { .. }
+        ))
+    ));
+    assert_eq!(timeout(database), 777);
+    assert!(database.connection.is_autocommit());
+    assert!(
+        database
+            .connection
+            .query_row(
+                "SELECT expires_at = acquired_at FROM source_lease",
+                [],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.attempts, 1);
+    assert_eq!(snapshot.retries, 1);
+    assert_eq!(snapshot.ownership_rejected, 1);
+    assert_eq!(snapshot.acquired, 0);
+    assert_eq!(snapshot.other_failure, 0);
+    assert_eq!(snapshot.elapsed_buckets.iter().sum::<u64>(), 1);
 }

@@ -166,6 +166,7 @@ pub use write::{
     SourceTagWrite, SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity,
     SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
+pub use write::{SourceAcquisitionMetricsSnapshot, source_acquisition_metrics_snapshot};
 
 /// Hidden filename used for per-source databases.
 pub const DB_FILE_NAME: &str = ".yield.db";
