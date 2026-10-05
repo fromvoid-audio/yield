@@ -558,3 +558,39 @@ harness registers through the actual journal, checks audited and pre-audit origi
 producers, and drains/retires through actual journal commands. Its macOS execution
 requires native capacity/bootstrap resources; a logical registration model cannot
 replace that execution or qualify the production per-user reserve registry.
+
+## Original Registered pre-audit reservation custody (OPT-2288)
+
+`SourceLeaseMaintenancePreparation::retain_registered_lease_binding` retains the
+same private counted original registration/lease custody as the audited reservation
+primitive. Its once-only acquisition validates the exact original lease binding,
+request, database, current Registered CONTROL/profile and native objects before
+and after retention. Prepared, foreign, expired or drained scope cannot acquire it.
+No authoritative audit or `SourceRevision` is manufactured.
+
+The original count and lease reference survive empty rollback, timeout restoration,
+entered-policy restoration and final owner/settings validation failures. Successful
+cleanup releases them only after those checks and before returning the same writer.
+Sticky policy failures retain them until actual ordinary SQLite close. Drop and
+`close_without_reuse` close ordinary SQLite before releasing counted custody, and
+release the count before final lease cleanup. Draining close validates the exact
+original guard and distinguishes only its own identity-checked lease reference
+from external lease/snapshot fences. Wrong guards cannot seal retirement.
+
+Parked validation preserves OPT-2259: no ordinary row, schema, page, scan or audit
+queries, writes or nested transactions. The four existing read-only entered-setting
+PRAGMAs and the existing read-only `journal_mode` health check remain required.
+The new authorizer fixture permits exactly these five value-free setting/mode reads and denies every other ordinary action. Actual source/SQLite tests
+also cover denied rollback/retry, timeout restoration, all four sticky setting
+restoration failures, original close callback ordering, abandonment/no-reuse,
+exact drain, external lease references and foreign/expired binding refusal.
+
+The fixed private custody header is bounded by the existing 512-byte assertion;
+shared lease transport accounting already includes the concrete preparation size.
+No new pool, worker, schema, native qualification or transport acknowledgement is
+introduced. Fixtures exercise the actual confirmation lifecycle without installing
+a capacity provider. Native macOS/Windows execution remains separate verification.
+Full OPT-2136 retained transport acknowledgements, all-owner/post-start cleanup
+fences, atomic nonce/intent/claims/readback/restart and qualified required-permit
+behavior remain open; OPT-2194/2202 still own physical policy and admitted release.
+No write, decision, retry, refund or genuine settlement authority follows.
