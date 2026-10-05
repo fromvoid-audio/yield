@@ -379,7 +379,20 @@ fn native_original_recording_custody(lost_reply: bool) {
                 .unwrap(),
         )
     };
-    // The second serialized request is also a completion barrier for an abandoned first reply.
+    // A small original point-read command is the completion barrier for an abandoned reply.
+    // It fits while the first command still holds its transient debit; a second large
+    // preparation cannot truthfully be queued until the first has shrunk to retained credit.
+    assert_eq!(
+        client
+            .get(operation)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .operation_id,
+        operation,
+    );
     assert!(matches!(
         client
             .prepare_recording_producer_custody(operation, receipt.clone(), &authority)

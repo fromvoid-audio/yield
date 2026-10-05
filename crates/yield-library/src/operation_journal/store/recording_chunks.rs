@@ -326,7 +326,20 @@ impl OperationJournalStore {
         &self,
         operation: OperationId,
     ) -> Result<RecordingProposal, OperationJournalStoreError> {
-        self.validate_namespace()?;
+        if !self.recording_prestart_scope.get() {
+            self.begin_recording_prestart_read()?;
+            let result = self.recording_prestart_proposal_inside(operation);
+            self.finish_recording_prestart_read()?;
+            return result;
+        }
+        self.recording_prestart_proposal_inside(operation)
+    }
+
+    fn recording_prestart_proposal_inside(
+        &self,
+        operation: OperationId,
+    ) -> Result<RecordingProposal, OperationJournalStoreError> {
+        self.validate_recording_prestart_namespace()?;
         let record = self
             .read_row(operation)?
             .ok_or_else(|| error("recording operation absent"))?
@@ -354,7 +367,7 @@ impl OperationJournalStore {
             return Err(error("recording already has captured bytes"));
         }
         let proposal = proposal.clone();
-        self.validate_namespace()?;
+        self.validate_recording_prestart_namespace()?;
         Ok(proposal)
     }
 
