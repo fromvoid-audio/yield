@@ -769,6 +769,27 @@ impl ReadonlyDatabaseRoot {
 }
 
 impl BoundDatabaseRoot {
+    /// Original retained metadata only; native descriptor/allocator memory is separate.
+    pub(crate) fn legacy_metadata_bytes(&self) -> Option<usize> {
+        let bounded =
+            |p: &PathBuf| p.as_os_str().as_encoded_bytes().len() <= 4096 && p.capacity() <= 8192;
+        if !bounded(&self.path)
+            || self.named_path.as_ref().is_some_and(|p| !bounded(p))
+            || self.identity.capacity() > 256
+            || self.profile_identity.capacity() > 256
+        {
+            return None;
+        }
+        Some(
+            std::mem::size_of::<Self>()
+                + 2 * std::mem::size_of::<usize>()
+                + std::mem::size_of::<fs::File>()
+                + self.path.capacity()
+                + self.named_path.as_ref().map_or(0, PathBuf::capacity)
+                + self.identity.capacity()
+                + self.profile_identity.capacity(),
+        )
+    }
     /// Hold a bounded normal-component chain without data access or symlink traversal.
     pub(crate) fn inspect_index_file(
         &self,

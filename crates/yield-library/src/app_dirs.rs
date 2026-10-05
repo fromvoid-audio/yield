@@ -23,8 +23,8 @@ pub use paths::{
 };
 pub use profile::{PersistenceMode, PersistenceProfileGuard, ResolvedPersistence};
 pub(crate) use profile_ownership::{
-    PROFILE_OWNER_LOCK_FILE_NAME, ProfileChildLease, open_canonical_global_app_root,
-    open_no_follow_directory,
+    LegacyAppRootBacking, PROFILE_OWNER_LOCK_FILE_NAME, ProfileChildLease,
+    open_canonical_global_app_root, open_legacy_canonical_app_root, open_no_follow_directory,
 };
 pub use profile_ownership::{ProfileOwnershipError, WritableProfileGuard};
 pub use resolution::{

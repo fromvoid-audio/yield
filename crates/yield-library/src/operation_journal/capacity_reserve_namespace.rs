@@ -222,6 +222,16 @@ pub(super) struct ReserveNamespaceFailure {
 }
 
 impl ReserveNamespaceFailure {
+    /// Move the exact affected descriptor into recovery-only custody. Diagnostic strings and
+    /// cached protected-file qualification are dropped; this does not produce a reserve.
+    pub(super) fn into_legacy_backing(self) -> LegacyReserveFailureBacking {
+        LegacyReserveFailureBacking {
+            file: self.owned_file.map(OwnedFailureFile::into_file),
+            stage: self.stage,
+            observation: self.observation,
+            observed_allocation: self.observed_allocation,
+        }
+    }
     fn new(
         stage: ReserveNamespaceFailureStage,
         reason: ReserveNamespaceFailureReason,
@@ -260,6 +270,23 @@ impl ReserveNamespaceFailure {
     }
 }
 
+/// Closed failure evidence. Future physical use requires original-root/owner reobservation.
+pub(super) struct LegacyReserveFailureBacking {
+    pub(super) file: Option<File>,
+    pub(super) stage: ReserveNamespaceFailureStage,
+    pub(super) observation: Option<ReserveNamespaceObservation>,
+    pub(super) observed_allocation: Option<u64>,
+}
+impl LegacyReserveFailureBacking {
+    pub(super) fn metadata_bytes(&self) -> usize {
+        let _evidence = (&self.file, self.stage, self.observed_allocation);
+        std::mem::size_of::<Self>()
+            + self.observation.as_ref().map_or(0, |o| {
+                o.root_identity.capacity() + o.file_identity.capacity()
+            })
+    }
+}
+
 impl std::fmt::Display for ReserveNamespaceFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -271,6 +298,46 @@ impl std::fmt::Display for ReserveNamespaceFailure {
 }
 
 impl std::error::Error for ReserveNamespaceFailure {}
+
+#[cfg(test)]
+mod legacy_failure_backing_tests {
+    use super::*;
+    #[test]
+    fn recovery_only_failure_moves_exact_native_file_extent_and_discards_unbounded_diagnostic() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("affected-reserve");
+        std::fs::write(&path, vec![71; 4096]).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let identity =
+            crate::filesystem_identity::stable_filesystem_identity_from_open_file(&file).unwrap();
+        let failure = ReserveNamespaceFailure::new(
+            ReserveNamespaceFailureStage::Allocation,
+            ReserveNamespaceFailureReason::Sync("diagnostic".repeat(128 * 1024)),
+            Some(OwnedFailureFile::Raw(file)),
+            None,
+            Some(4096),
+        );
+        let backing = failure.into_legacy_backing();
+        assert_eq!(
+            backing.metadata_bytes(),
+            std::mem::size_of::<LegacyReserveFailureBacking>()
+        );
+        assert_eq!(backing.observed_allocation, Some(4096));
+        let file = backing.file.as_ref().unwrap();
+        assert_eq!(
+            crate::filesystem_identity::stable_filesystem_identity_from_open_file(file).unwrap(),
+            identity
+        );
+        assert_eq!(file.metadata().unwrap().len(), 4096);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![71; 4096]);
+        drop(backing);
+        assert_eq!(std::fs::read(path).unwrap(), vec![71; 4096]);
+    }
+}
 
 /// A live namespace-bound reserve whose lifetime cannot outlive its caller-owned root capability.
 pub(crate) struct BoundReserve<'a> {
@@ -643,6 +710,22 @@ impl ReadonlyReserveNamespace {
 }
 
 impl OwnedReserveAllocation {
+    pub(super) fn legacy_metadata_bytes(&self) -> Option<usize> {
+        let root = self.root.legacy_metadata_bytes()?;
+        let identity = self.reserve.observation().identity.capacity();
+        let observations = [
+            &self.observation.root_identity,
+            &self.observation.file_identity,
+        ];
+        if identity > 256 || observations.iter().any(|s| s.capacity() > 256) {
+            return None;
+        }
+        Some(
+            std::mem::size_of::<Self>() + root - std::mem::size_of::<BoundDatabaseRoot>()
+                + identity
+                + observations.iter().map(|s| s.capacity()).sum::<usize>(),
+        )
+    }
     #[allow(dead_code)]
     pub(super) fn readonly_observation(
         &mut self,

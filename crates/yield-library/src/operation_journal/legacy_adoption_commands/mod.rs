@@ -84,6 +84,29 @@ struct Object {
     conditional_logical_bytes: u64,
 }
 impl LegacyAdoptionIntentArgs {
+    pub(crate) fn legacy_metadata_bytes(&self) -> Option<usize> {
+        let d = &self.data;
+        let text = [
+            &d.profile_owner,
+            &d.profile_root,
+            &d.media_root,
+            &d.source_directory,
+            &d.journal_directory,
+        ];
+        if text.iter().any(|s| s.capacity() > 1024)
+            || d.objects.iter().any(|o| o.identity.capacity() > 1024)
+        {
+            return None;
+        }
+        Some(
+            std::mem::size_of::<Self>()
+                + text.iter().map(|s| s.capacity()).sum::<usize>()
+                + d.objects
+                    .iter()
+                    .map(|o| o.identity.capacity())
+                    .sum::<usize>(),
+        )
+    }
     pub(crate) fn from_original(
         observation: &LegacyCommonAllocationObservation,
         participant: ParticipantId,

@@ -1041,6 +1041,69 @@ pub(crate) enum RecoveryReserveContextError {
     Binding(#[from] recovery_reserve_binding::ReserveBindingError),
 }
 
+// Closed original bootstrap capabilities. Existing current-lease gates remain unchanged.
+#[derive(Default)]
+struct LegacyReserveFailureSink {
+    namespace:
+        std::cell::RefCell<Option<super::capacity_reserve_namespace::LegacyReserveFailureBacking>>,
+    reserve: std::cell::RefCell<Option<OwnedReserveAllocation>>,
+}
+pub(super) struct LegacyReserveBindingFailure {
+    pub(super) original: SourceReserveBindingFailure,
+    pub(super) namespace: Option<super::capacity_reserve_namespace::LegacyReserveFailureBacking>,
+    pub(super) reopened_reserve: Option<OwnedReserveAllocation>,
+}
+enum ReserveBootstrapProof<'a, 'b> {
+    Current(&'a SourceAuthorityUseProof),
+    Legacy {
+        source: &'a crate::sample_sources::db::LegacyReserveUseProof<'b>,
+        failure: &'a LegacyReserveFailureSink,
+    },
+}
+impl ReserveBootstrapProof<'_, '_> {
+    fn validate_for_physical_use(&self) -> Result<(), String> {
+        match self {
+            Self::Current(proof) => proof.validate_for_physical_use().map_err(|e| e.to_string()),
+            Self::Legacy { source, .. } => {
+                source.validate_for_bootstrap().map_err(|e| e.to_string())
+            }
+        }
+    }
+    fn namespace_error(
+        &self,
+        error: super::capacity_reserve_namespace::ReserveNamespaceFailure,
+    ) -> RecoveryReserveContextError {
+        let text = match self {
+            Self::Legacy { failure, .. } => {
+                let text = format!(
+                    "legacy reserve failure at {:?}; exact backing retained",
+                    error.stage()
+                );
+                *failure.namespace.borrow_mut() = Some(error.into_legacy_backing());
+                text
+            }
+            Self::Current(_) => error.to_string(),
+        };
+        RecoveryReserveContextError::Reserve(text)
+    }
+    fn retain_reopened(&self, reserve: OwnedReserveAllocation) {
+        if let Self::Legacy { failure, .. } = self {
+            *failure.reserve.borrow_mut() = Some(reserve);
+        }
+    }
+    fn retain_bound(&self, reserve: super::capacity_reserve_namespace::BoundReserve<'_>) {
+        if !matches!(self, Self::Legacy { .. }) {
+            return;
+        }
+        match reserve.into_owned() {
+            Ok(reserve) => self.retain_reopened(reserve),
+            Err(error) => {
+                self.namespace_error(error);
+            }
+        }
+    }
+}
+
 /// Failure while binding one source-volume reserve, retaining every owner-thread resource that
 /// may have been acquired before the error. The journal owner converts this into a recovery-only
 /// registration state instead of dropping a lock or reserve after an ambiguous write boundary.
@@ -1446,6 +1509,18 @@ impl std::fmt::Debug for OperationJournalStore {
 }
 
 impl OperationJournalStore {
+    #[cfg(test)]
+    pub(crate) fn legacy_binding_prefix_for_test(&self, prefix: u64) {
+        // Exact passive journal-prefix logic test only: force page growth using bounded valid
+        // binding rows. These rows are never physical qualification or live volume authority.
+        let identity = "i".repeat(256);
+        for n in 0..64u64 {
+            self.connection.execute(
+                "INSERT INTO operation_journal_recovery_reserve_binding VALUES (?1, ?2, ?2, ?2, 4096, 268435456, 1, 'recovery-reserve.bin', 1)",
+                rusqlite::params![(prefix * 64 + n + 1000).to_string(), identity],
+            ).unwrap();
+        }
+    }
     /// Open or create the journal under the retained operation_journal profile child.
     ///
     /// Existing files are accepted only when their SQLite header and private schema match this
@@ -2642,7 +2717,7 @@ impl OperationJournalStore {
             volume_owner,
             root,
             profile_guard,
-            proof,
+            &ReserveBootstrapProof::Current(proof),
             &mut no_hook,
         )
     }
@@ -2664,9 +2739,35 @@ impl OperationJournalStore {
             volume_owner,
             root,
             profile_guard,
-            proof,
+            &ReserveBootstrapProof::Current(proof),
             &mut callback,
         )
+    }
+
+    /// Bootstrap only from the original retained pre-lease worker custody, never decoded data.
+    pub(super) fn acquire_owned_legacy_reserve(
+        &self,
+        volume_owner: VolumeOwnershipCapability,
+        root: &BoundDatabaseRoot,
+        profile_guard: &WritableProfileGuard,
+        proof: &crate::sample_sources::db::LegacyReserveUseProof<'_>,
+    ) -> Result<OwnedReserveAllocation, LegacyReserveBindingFailure> {
+        let failure = LegacyReserveFailureSink::default();
+        let result = self.acquire_owned_source_reserve_inner(
+            volume_owner,
+            root,
+            profile_guard,
+            &ReserveBootstrapProof::Legacy {
+                source: proof,
+                failure: &failure,
+            },
+            &mut None,
+        );
+        result.map_err(|original| LegacyReserveBindingFailure {
+            original,
+            namespace: failure.namespace.into_inner(),
+            reopened_reserve: failure.reserve.into_inner(),
+        })
     }
 
     fn acquire_owned_source_reserve_inner(
@@ -2674,7 +2775,7 @@ impl OperationJournalStore {
         volume_owner: VolumeOwnershipCapability,
         root: &BoundDatabaseRoot,
         profile_guard: &WritableProfileGuard,
-        proof: &SourceAuthorityUseProof,
+        proof: &ReserveBootstrapProof<'_, '_>,
         after_reserve: &mut Option<&mut dyn FnMut()>,
     ) -> Result<OwnedReserveAllocation, SourceReserveBindingFailure> {
         let fail = |error, volume_owner, reserve| SourceReserveBindingFailure {
@@ -2746,11 +2847,20 @@ impl OperationJournalStore {
                 Ok(owner) => owner,
                 Err(error) => return Err(fail(error.into(), volume_owner, None)),
             };
-            let context = match self.reopen_recovery_reserve(context_owner, root, profile_guard) {
+            let context = match self.reopen_recovery_reserve_with_failure_proof(
+                context_owner,
+                root,
+                profile_guard,
+                Some(proof),
+            ) {
                 Ok(context) => context,
                 Err(error) => return Err(fail(error, volume_owner, None)),
             };
-            return match context.into_owned_reserve() {
+            let RecoveryReserveContext { reserve: bound, .. } = context;
+            return match bound
+                .into_owned()
+                .map_err(|error| proof.namespace_error(error))
+            {
                 Ok(reserve) => Ok(reserve),
                 Err(error) => Err(fail(error, volume_owner, None)),
             };
@@ -2769,21 +2879,13 @@ impl OperationJournalStore {
             match super::capacity_reserve_namespace::create_owned_reserve(root, profile_guard) {
                 Ok(reserve) => reserve,
                 Err(error) => {
-                    return Err(fail(
-                        RecoveryReserveContextError::Reserve(error.to_string()),
-                        volume_owner,
-                        None,
-                    ));
+                    return Err(fail(proof.namespace_error(error), volume_owner, None));
                 }
             };
         let mut reserve = match reserve.into_owned() {
             Ok(reserve) => reserve,
             Err(error) => {
-                return Err(fail(
-                    RecoveryReserveContextError::Reserve(error.to_string()),
-                    volume_owner,
-                    None,
-                ));
+                return Err(fail(proof.namespace_error(error), volume_owner, None));
             }
         };
         if let Some(hook) = after_reserve.as_mut() {
@@ -2839,7 +2941,7 @@ impl OperationJournalStore {
         root: &BoundDatabaseRoot,
         profile_guard: &WritableProfileGuard,
         binding: recovery_reserve_binding::ReserveBinding,
-        proof: &SourceAuthorityUseProof,
+        proof: &ReserveBootstrapProof<'_, '_>,
     ) -> Result<OwnedReserveAllocation, RecoveryReserveContextError> {
         if binding.profile_identity() != profile_guard.profile_root_identity()
             || binding.volume() != volume_owner.volume()
@@ -2859,7 +2961,7 @@ impl OperationJournalStore {
         }
         proof
             .validate_for_physical_use()
-            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+            .map_err(|error| RecoveryReserveContextError::Reserve(error))?;
         self.prove_clean_handoff_durable()
             .map_err(|error| RecoveryReserveContextError::Store(error))?;
         volume_owner.revalidate()?;
@@ -2873,32 +2975,39 @@ impl OperationJournalStore {
             .map_err(|reason| RecoveryReserveContextError::Reserve(reason.into()))?;
         let reserve =
             super::capacity_reserve_namespace::reopen_owned_reserve(root, profile_guard, &expected)
-                .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+                .map_err(|error| proof.namespace_error(error))?;
         let mut reserve = reserve
             .into_owned()
-            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
-        let physical = reserve
-            .view(profile_guard)
-            .revalidate_and_prove()
-            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
-        if physical.volume() != volume_owner.volume()
-            || !physical.non_sparse()
-            || physical.physical_bytes() < crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
-        {
-            return Err(RecoveryReserveContextError::Reserve(
-                "source clean-handoff reserve proof does not meet the protected floor".into(),
-            ));
+            .map_err(|error| proof.namespace_error(error))?;
+        let result = (|| -> Result<(), RecoveryReserveContextError> {
+            let physical = reserve
+                .view(profile_guard)
+                .revalidate_and_prove()
+                .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+            if physical.volume() != volume_owner.volume()
+                || !physical.non_sparse()
+                || physical.physical_bytes() < crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+            {
+                return Err(RecoveryReserveContextError::Reserve(
+                    "source clean-handoff reserve proof does not meet the protected floor".into(),
+                ));
+            }
+            proof
+                .validate_for_physical_use()
+                .map_err(|error| RecoveryReserveContextError::Reserve(error))?;
+            volume_owner.revalidate()?;
+            recovery_reserve_binding::rebind_owner_generation(
+                &self.connection,
+                &binding,
+                volume_owner.owner_generation(),
+            )?;
+            volume_owner.revalidate()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            proof.retain_reopened(reserve);
+            return Err(error);
         }
-        proof
-            .validate_for_physical_use()
-            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
-        volume_owner.revalidate()?;
-        recovery_reserve_binding::rebind_owner_generation(
-            &self.connection,
-            &binding,
-            volume_owner.owner_generation(),
-        )?;
-        volume_owner.revalidate()?;
         Ok(reserve)
     }
 
@@ -2914,6 +3023,16 @@ impl OperationJournalStore {
         volume_owner: VolumeOwnershipCapability,
         root: &'a BoundDatabaseRoot,
         profile_guard: &'a WritableProfileGuard,
+    ) -> Result<RecoveryReserveContext<'a>, RecoveryReserveContextError> {
+        self.reopen_recovery_reserve_with_failure_proof(volume_owner, root, profile_guard, None)
+    }
+
+    fn reopen_recovery_reserve_with_failure_proof<'a>(
+        &'a self,
+        volume_owner: VolumeOwnershipCapability,
+        root: &'a BoundDatabaseRoot,
+        profile_guard: &'a WritableProfileGuard,
+        failure_proof: Option<&ReserveBootstrapProof<'_, '_>>,
     ) -> Result<RecoveryReserveContext<'a>, RecoveryReserveContextError> {
         self.validate_namespace()?;
         root.validate_profile_guard(profile_guard)
@@ -2991,19 +3110,30 @@ impl OperationJournalStore {
             &expected,
             minimum_length,
         )
-        .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        .map_err(|error| match failure_proof {
+            Some(proof) => proof.namespace_error(error),
+            None => RecoveryReserveContextError::Reserve(error.to_string()),
+        })?;
         if reserve.profile_identity() != profile_identity
             || reserve.observation().volume() != volume_owner.volume()
             || reserve.observation().file_identity() != binding.file_identity()
             || reserve.observation().allocation_unit() != binding.allocation_unit()
         {
+            if let Some(proof) = failure_proof {
+                proof.retain_bound(reserve);
+            }
             return Err(RecoveryReserveContextError::Binding(
                 recovery_reserve_binding::ReserveBindingError::IdentityMismatch(
                     "reopened reserve descriptor differs from the durable binding".into(),
                 ),
             ));
         }
-        volume_owner.revalidate()?;
+        if let Err(error) = volume_owner.revalidate() {
+            if let Some(proof) = failure_proof {
+                proof.retain_bound(reserve);
+            }
+            return Err(error.into());
+        }
         Ok(RecoveryReserveContext {
             store: self,
             volume_owner,

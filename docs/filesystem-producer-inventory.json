@@ -225,6 +225,16 @@
     },
     {
       "path": "crates/yield-library/src/app_dirs/profile_ownership.rs",
+      "function": "open_legacy_canonical_app_root",
+      "operation": "method::create_dir",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-2349",
+      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/profile_ownership.rs",
       "function": "open_lock_file",
       "operation": "OpenOptions::create",
       "count": 1,
@@ -342,6 +352,36 @@
       "issue": "OPT-1340",
       "reason": "Existing profile/source owner internal persistence bootstrap; runtime profile/lease checks remain required.",
       "retirement": "Remove only when the named bootstrap API is retired; review new producers separately."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/capacity_volume_owner/legacy_bootstrap.rs",
+      "function": "acquire_legacy_inner",
+      "operation": "OpenOptions::create",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-2349",
+      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/capacity_volume_owner/legacy_bootstrap.rs",
+      "function": "acquire_legacy_inner",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-2349",
+      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/capacity_volume_owner/legacy_bootstrap.rs",
+      "function": "acquire_legacy_inner",
+      "operation": "method::create_dir",
+      "count": 1,
+      "classification": "owner",
+      "issue": "OPT-2349",
+      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
     },
     {
       "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/reconcile.rs",
