@@ -650,31 +650,83 @@ pub(super) fn run(
         let mut current: Option<crate::operation_journal::wal_admission::CurrentRequest> = None;
         let mut current_custody = None;
         let outcome = loop {
+            if current_custody.as_ref().is_some_and(
+                |custody: &crate::operation_journal::wal_admission::CurrentCustody| {
+                    custody.settlement_held()
+                },
+            ) {
+                // A sealed commit ACK excludes every ordinary native cleanup path.
+                // Keep polling without SQLite or a synchronous journal/owner wait.
+                std::thread::sleep(OWNER_POLL_INTERVAL);
+                continue;
+            }
             if let Err(error) = canceled(&command, lifecycle) {
-                break error;
+                if current_custody
+                    .as_ref()
+                    .is_none_or(|custody| custody.begin_cleanup())
+                {
+                    break error;
+                }
+                continue;
             }
             if let Err(error) = validate_empty_transaction(&database.connection, original_changes) {
-                break error;
+                if current_custody
+                    .as_ref()
+                    .is_none_or(|custody| custody.begin_cleanup())
+                {
+                    break error;
+                }
+                continue;
             }
             if let Err(error) = mutation_fence.validate(Some(mutation_revision)) {
-                break error;
+                if current_custody
+                    .as_ref()
+                    .is_none_or(|custody| custody.begin_cleanup())
+                {
+                    break error;
+                }
+                continue;
             }
             if let Err(error) = validate(database, guard, &file) {
-                break error;
+                if current_custody
+                    .as_ref()
+                    .is_none_or(|custody| custody.begin_cleanup())
+                {
+                    break error;
+                }
+                continue;
             }
             if let Some(scope) = retained_observation.wal_scope()
                 && let Err(error) = binding::validate(database, scope, command.request.deadline)
             {
-                break error;
+                if current_custody
+                    .as_ref()
+                    .is_none_or(|custody| custody.begin_cleanup())
+                {
+                    break error;
+                }
+                continue;
             }
             if let Some(policy) = &policy
                 && let Err(error) = policy.validate_settings()
             {
-                break GlobalPreparationError::LifecycleAllocation(error);
+                if current_custody
+                    .as_ref()
+                    .is_none_or(|custody| custody.begin_cleanup())
+                {
+                    break GlobalPreparationError::LifecycleAllocation(error);
+                }
+                continue;
             }
             if let Some(request) = current.take() {
                 if let Err(error) = canceled(&command, lifecycle) {
-                    break error;
+                    if current_custody
+                        .as_ref()
+                        .is_none_or(|custody| custody.begin_cleanup())
+                    {
+                        break error;
+                    }
+                    continue;
                 }
                 current_custody = Some(request.acknowledge());
             }
@@ -686,7 +738,12 @@ pub(super) fn run(
             );
             match controls.recv_timeout(wait) {
                 Ok(Control::Abort) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break GlobalPreparationError::Canceled;
+                    if current_custody
+                        .as_ref()
+                        .is_none_or(|custody| custody.begin_cleanup())
+                    {
+                        break GlobalPreparationError::Canceled;
+                    }
                 }
                 Ok(Control::Current(request)) => {
                     current = Some(request);

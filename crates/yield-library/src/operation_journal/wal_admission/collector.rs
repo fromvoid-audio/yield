@@ -158,6 +158,7 @@ pub(in crate::operation_journal) struct Collector {
     input: WalPreparationInput,
     profile_acquisition: uuid::Uuid,
     shared: Arc<Shared>,
+    decision: Option<super::OriginalDecision>,
     held: Vec<HeldOwner>,
     awaiting: Option<PendingOwner>,
     releasing: Option<Releasing>,
@@ -185,6 +186,7 @@ impl Collector {
                 input,
                 profile_acquisition,
                 shared: Arc::clone(&shared),
+                decision: None,
                 held,
                 awaiting: None,
                 releasing: None,
@@ -197,6 +199,80 @@ impl Collector {
             },
             WalPreparationHandle(shared),
         )
+    }
+    /// Request a new original commit-acknowledgement round; earlier Ready is insufficient.
+    pub(in crate::operation_journal) fn begin_decision(
+        &mut self,
+        expected_digest: [u8; 32],
+    ) -> Result<(), WalPreparationError> {
+        if expected_digest != self.input.digest
+            || self.snapshot.is_none()
+            || self.reason.is_some()
+            || self.decision.is_some()
+            || !self.current.as_ref().is_some_and(|round| round.complete())
+        {
+            return Err(WalPreparationError::InvalidInput);
+        }
+        let mut credit = self.input.budget.credit();
+        credit
+            .resize(std::mem::size_of::<super::CurrentRound>() + 64)
+            .map_err(|_| WalPreparationError::Full)?;
+        let (round, decision) =
+            super::CurrentRound::decision_round(self.held.len(), self.input.deadline, credit)
+                .ok_or(WalPreparationError::InvalidInput)?;
+        for (index, owner) in self.held.iter().enumerate() {
+            let result = match owner {
+                HeldOwner::Global(holder) => holder
+                    .request_current(round.request(index))
+                    .map_err(WalPreparationError::Global),
+                HeldOwner::Source(holder) => holder
+                    .request_current(round.request(index))
+                    .map_err(WalPreparationError::Source),
+            };
+            if let Err(error) = result {
+                // The sole guard resolves NoAttempt before reverse prefix cleanup begins.
+                drop(decision);
+                self.fail(error.clone());
+                return Err(error);
+            }
+        }
+        self.current = Some(round);
+        self.decision = Some(decision);
+        Ok(())
+    }
+    pub(in crate::operation_journal) fn decision_acknowledged(&self) -> bool {
+        self.decision
+            .as_ref()
+            .is_some_and(|decision| decision.acknowledged())
+    }
+    pub(in crate::operation_journal) fn decision_nonce(&self) -> Option<uuid::Uuid> {
+        self.decision.as_ref().map(|decision| decision.nonce())
+    }
+    #[cfg(test)]
+    pub(in crate::operation_journal) fn start_settlement(&mut self) -> bool {
+        self.decision
+            .as_mut()
+            .is_some_and(|decision| decision.start_sqlite())
+    }
+    /// Call only after definite original SQLite outcome or exact durable readback.
+    #[cfg(test)]
+    pub(in crate::operation_journal) fn resolve_settlement(&mut self) {
+        if let Some(decision) = self.decision.take() {
+            decision.resolve();
+        }
+        self.cancel();
+    }
+    pub(in crate::operation_journal) fn refuse_decision(&mut self, reason: WalPreparationError) {
+        // Drop before SQL is definitive NoAttempt. After SQL, refuse cannot release custody.
+        if self
+            .decision
+            .as_ref()
+            .is_some_and(|decision| decision.sqlite_started())
+        {
+            return;
+        }
+        drop(self.decision.take());
+        self.fail(reason);
     }
     pub(in crate::operation_journal) fn is_unavailable(&self) -> bool {
         matches!(
@@ -220,6 +296,20 @@ impl Collector {
     }
     /// Return true only after the collector no longer has outstanding owner cleanup.
     pub(in crate::operation_journal) fn poll(&mut self) -> bool {
+        if self
+            .decision
+            .as_ref()
+            .is_some_and(|decision| decision.sqlite_started())
+        {
+            // No timer, dropped handle or owner shutdown proves a journal transaction outcome.
+            return false;
+        }
+        if self.decision.is_some()
+            && (self.shared.canceled.load(Ordering::Acquire)
+                || Instant::now() >= self.input.deadline)
+        {
+            drop(self.decision.take());
+        }
         if self.shared.canceled.load(Ordering::Acquire) {
             if self.reason.is_none() {
                 self.reason = Some(WalPreparationError::Canceled);
@@ -258,6 +348,11 @@ impl Collector {
                     }
                 },
             }
+        }
+        if self.decision.is_some() {
+            // Fresh commit ACK custody has its own state. Do not republish cached
+            // Ready or ask the earlier Preparing round to complete this decision.
+            return false;
         }
         if let Some(pending) = self.awaiting.take() {
             match pending {

@@ -4114,6 +4114,12 @@ fn run_worker_with_sources(
         if closing {
             preparations.close(&mut sources);
         }
+        // Do not enter journal-facing commands or teardown while its original settlement
+        // still owns any native reservation. Keep accepted packets/credits in existing bounds.
+        if preparations.has_settling() {
+            std::thread::sleep(WORKER_IDLE_POLL);
+            continue;
+        }
         let ready = deferred.iter().position(|packet| {
             closing || !source_wal_preparation::deferred(&packet.command, &preparations)
         });
