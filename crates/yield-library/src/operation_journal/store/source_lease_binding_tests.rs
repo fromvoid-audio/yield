@@ -297,6 +297,7 @@ mod source_lease_binding_storage {
         }
         codec_and_domain_refusals();
         actual_atomic_storage_attempts_and_legacy_reopen();
+        retirement_forward_codec_and_storage();
     }
     fn codec_and_domain_refusals() {
         let f = fixture();
@@ -736,4 +737,5 @@ mod source_lease_binding_storage {
             assert!(reopened.read_database_attempt(start.attempt).is_err());
         }
     }
+    include!("retirement_forward_storage_tests.rs");
 }

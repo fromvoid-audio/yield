@@ -7,6 +7,8 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub(crate) mod retirement_forward_policy;
+
 use super::admission_claims::AdmissionClaimInventory;
 use super::full_capacity::{FullCapacityAllocationClass, FullCapacityPlan};
 use super::participants::{MAX_PARTICIPANTS, MAX_SOURCE_IDENTITY_BYTES};
@@ -120,8 +122,15 @@ pub(crate) struct DatabaseClaimSlice {
     pub shm_ceiling: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InventoryPolicy {
+    Historical,
+    RetirementInitialForward,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DatabaseClaimInventory {
+    policy: InventoryPolicy,
     header: InventoryHeader,
     bindings: Vec<DatabaseBinding>,
     slices: Vec<DatabaseClaimSlice>,
@@ -288,6 +297,9 @@ impl DatabaseClaimInventory {
                 )?;
             }
         }
+        if self.policy == InventoryPolicy::RetirementInitialForward {
+            retirement_forward_policy::validate_record(self, record)?;
+        }
         Ok(())
     }
     /// Normalize validated bounded inputs. Physical aliases must already be deduplicated by
@@ -319,10 +331,23 @@ impl DatabaseClaimInventory {
         }
         slices.sort_by_key(|s| (s.claim, s.binding, s.participant, s.direction, s.id));
         let value = Self {
+            policy: InventoryPolicy::Historical,
             header,
             bindings,
             slices,
         };
+        value.validate()?;
+        Ok(value)
+    }
+    /// Explicit initial-forward storage policy, never a live acknowledgement or grant.
+    /// Historical constructors/versions retain their existing observational semantics.
+    pub(crate) fn new_retirement_forward(
+        header: InventoryHeader,
+        bindings: Vec<DatabaseBinding>,
+        slices: Vec<DatabaseClaimSlice>,
+    ) -> Result<Self> {
+        let mut value = Self::new(header, bindings, slices)?;
+        value.policy = InventoryPolicy::RetirementInitialForward;
         value.validate()?;
         Ok(value)
     }
@@ -337,6 +362,9 @@ impl DatabaseClaimInventory {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.policy == InventoryPolicy::RetirementInitialForward {
+            retirement_forward_policy::validate_shape(self)?;
+        }
         require(
             !self.bindings.is_empty()
                 && self.bindings.len() <= MAX_DATABASES
@@ -685,11 +713,15 @@ impl DatabaseClaimInventory {
             .bindings
             .iter()
             .any(|b| b.source.as_ref().is_some_and(|s| s.lease_fence.is_some()));
-        out.extend_from_slice(if version2 {
-            b"YWCB\x02\x00"
-        } else {
-            b"YWCB\x01\x00"
-        });
+        out.extend_from_slice(
+            if self.policy == InventoryPolicy::RetirementInitialForward {
+                b"YWCB\x03\x00"
+            } else if version2 {
+                b"YWCB\x02\x00"
+            } else {
+                b"YWCB\x01\x00"
+            },
+        );
         put_string(&mut out, &self.header.profile);
         put_string(&mut out, &self.header.acquisition);
         put_u64(&mut out, self.header.ownership_generation);
@@ -749,7 +781,9 @@ impl DatabaseClaimInventory {
     }
     pub(crate) fn digest(&self) -> Result<[u8; 32]> {
         let bytes = self.encode()?;
-        let domain = if bytes.starts_with(b"YWCB\x02\x00") {
+        let domain = if bytes.starts_with(b"YWCB\x03\x00") {
+            "yield.database-claim-inventory.v3"
+        } else if bytes.starts_with(b"YWCB\x02\x00") {
             "yield.database-claim-inventory.v2"
         } else {
             "yield.database-claim-inventory.v1"
@@ -763,7 +797,8 @@ impl DatabaseClaimInventory {
         )?;
         let mut r = Reader(bytes);
         let magic = r.take(6)?;
-        let version2 = magic == b"YWCB\x02\x00";
+        let retirement_forward = magic == b"YWCB\x03\x00";
+        let version2 = retirement_forward || magic == b"YWCB\x02\x00";
         require(
             version2 || magic == b"YWCB\x01\x00",
             "inventory magic/version",
@@ -907,7 +942,11 @@ impl DatabaseClaimInventory {
             });
         }
         require(r.0.is_empty(), "trailing inventory bytes")?;
-        let value = Self::new(header, bindings, slices)?;
+        let value = if retirement_forward {
+            Self::new_retirement_forward(header, bindings, slices)?
+        } else {
+            Self::new(header, bindings, slices)?
+        };
         require(value.encode()? == bytes, "noncanonical inventory order")?;
         Ok(value)
     }

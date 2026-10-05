@@ -178,3 +178,34 @@ permits and genuine settlement. No observation, lifecycle count, fixture or
 cross-compilation supplies physical qualification, retry, reservation refund or
 admitted lease release. Native registered/bootstrap execution stays tracked by
 OPT-2275/2262/2280.
+
+## Explicit retirement initial-forward inventory (OPT-2337)
+
+Inventory marker `YWCB\x03\x00` uses the existing bounded binary fields and schema
+12 tables, with a separate digest domain. Tags 1 and 2 keep their historical
+validation and encoding; a historical retirement inventory does not acquire the
+new policy by being read. Tag 3 requires exactly one source lease participant and
+one required global participant, with six slices: a source MAIN/WAL-SHM pair and
+separate MAIN/WAL-SHM pairs for the frozen Draining and Retired work keys. The two
+global transitions each retain the same full component ceilings; conservation
+charges both pairs separately against the aggregate claims.
+
+Slice identities reconstruct the complete frozen retirement-family digest, work
+key, component, claim, decision nonce, original binding and registration/generation
+identities. The family digest is shared with the actual original global policy
+capture. Record validation rejects omissions, extras and mixed identities; durable
+readback repeats that validation, including after lost commit replies and restart.
+The existing 64-binding, 256-slice and 64 KiB image limits remain in force.
+
+This is a storage comparison policy. Matching images, hashes and nonce readback
+cannot issue Start, participant permits, retries, refunds or settlement. The future
+live consumer must compare all six slices with the genuine original source lease
+and global OPT-2334 policies and qualified physical requirements before joint
+Start and atomic insertion, and must enforce the sequential transitions.
+Compensation needs an explicit separate policy and reservation. OPT-2136,
+OPT-2194 and OPT-2196 remain open for their complete live contracts.
+
+Existing attempt Start V1/V2 deliberately refuse tag-3 inventories. Their existing
+work/phase correlation must not silently broaden to this new per-work policy;
+OPT-2168 still needs an exact issuer/attempt integration before any such attempt
+can be persisted. This inventory change does not enable retirement attempt effects.
