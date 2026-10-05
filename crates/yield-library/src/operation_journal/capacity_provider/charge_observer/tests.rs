@@ -3,7 +3,7 @@ use super::super::tests::{facts, plan_and_claims, rebuild_claim, rebuild_snapsho
 use super::*;
 use std::sync::{Barrier, mpsc};
 const CLASS: FullCapacityAllocationClass = FullCapacityAllocationClass::DestinationStaging;
-fn provider(devices: &[u64]) -> CapacityProvider {
+pub(super) fn provider(devices: &[u64]) -> CapacityProvider {
     CapacityProvider::qualified_fixture(
         devices
             .iter()
@@ -16,7 +16,7 @@ fn provider(devices: &[u64]) -> CapacityProvider {
             .collect(),
     )
 }
-fn admit(
+pub(super) fn admit(
     provider: &CapacityProvider,
     device: u64,
     class: FullCapacityAllocationClass,

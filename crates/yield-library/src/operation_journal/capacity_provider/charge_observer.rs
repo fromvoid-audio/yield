@@ -33,6 +33,55 @@ pub(crate) struct ChargeObservation {
     pub(crate) generation: u64,
     pub(crate) incremental_bytes: u64,
 }
+
+/// Exact durable charge observation, minted by the original actor-owned provider only.
+/// No actor ledger, native handle, effect permission or settlement authority is retained.
+pub(crate) struct PublicationChargeBinding {
+    operation: OperationId,
+    claim: AdmissionClaim,
+    observer: Arc<ChargeObserver>,
+    observation: ChargeObservation,
+}
+// The future slot/input producer must debit this retained header on its original credit.
+const _: () = assert!(std::mem::size_of::<PublicationChargeBinding>() <= 256);
+impl PublicationChargeBinding {
+    pub(super) fn new(
+        operation: OperationId,
+        claim: AdmissionClaim,
+        observer: Arc<ChargeObserver>,
+        observation: ChargeObservation,
+    ) -> Self {
+        Self {
+            operation,
+            claim,
+            observer,
+            observation,
+        }
+    }
+    pub(super) fn belongs_to(&self, mirror: &Arc<ChargeMirror>) -> bool {
+        Arc::ptr_eq(&self.observer.mirror, mirror)
+    }
+    pub(super) fn operation(&self) -> OperationId {
+        self.operation
+    }
+    pub(super) fn claim(&self) -> &AdmissionClaim {
+        &self.claim
+    }
+    /// Historical scalar validity only. The issuer still needs independent admission,
+    /// source, target, native facts, namespace allocation policy and lifetime fences.
+    pub(crate) fn is_current(&self) -> bool {
+        self.with_current(|_| ()).is_some()
+    }
+    /// Run a scalar-only transition while the exact captured generation stays current.
+    /// This provides neither an effect gate nor a replacement for actor revalidation.
+    pub(crate) fn with_current<T>(
+        &self,
+        transition: impl FnOnce(ChargeObservation) -> T,
+    ) -> Option<T> {
+        self.observer
+            .with_current(Some(self.observation), transition)
+    }
+}
 // Fixed registry and all thirty-two unique observer allocations fit a bounded header.
 // The full issuer must still debit this backing as part of its original slot/input credit.
 const _: () = assert!(
@@ -222,5 +271,7 @@ impl Drop for ChargeMutation {
         }
     }
 }
+#[cfg(test)]
+mod exact_binding_tests;
 #[cfg(test)]
 mod tests;
