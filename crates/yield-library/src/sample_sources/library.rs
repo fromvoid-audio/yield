@@ -83,8 +83,8 @@ pub use owner::{
     GlobalLibraryWriterStartError, GlobalLibraryWriterStatus, GlobalLibraryWriterUnavailable,
     GlobalPreparationError, GlobalPreparationObservation, GlobalPreparationOwner,
     GlobalPreparationPending, GlobalPreparationRequest, GlobalPreparationReservation,
-    GlobalWalObjectObservation, GlobalWalPreparationClient, GlobalWalScope,
-    ProfileTagVocabularyClient, SourceRegistrySnapshot,
+    GlobalRetirementForwardPolicy, GlobalWalObjectObservation, GlobalWalPreparationClient,
+    GlobalWalScope, ProfileTagVocabularyClient, SourceRegistrySnapshot,
 };
 pub use read_only::load_source_registry_snapshot_read_only;
 pub use reference_participant::{

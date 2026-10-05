@@ -398,6 +398,16 @@ impl WalPreparationInput {
         } else {
             None
         };
+        // Build the fixed typed policy while the complete original topology/DTO scratch
+        // is funded. finish releases that staging; afterward transfer no variable backing.
+        let retirement = if let UniversalCommandArgs::SourceRegistryRetirement(args) = args {
+            Some(
+                GlobalPreparationRequest::retirement_policy_input(args)
+                    .map_err(WalPreparationError::Global)?,
+            )
+        } else {
+            None
+        };
         drop(work);
         let mut input = Self::finish(
             sources,
@@ -407,6 +417,10 @@ impl WalPreparationInput {
             matches!(args, UniversalCommandArgs::SourceRegistryRetirement(_)),
             Some((budget, credit)),
         )?;
+        if let Some(retirement) = retirement {
+            let (client, request) = input.global.take().ok_or_else(bad)?;
+            input.global = Some((client, request.with_retirement_policy(retirement)));
+        }
         input.global_storage = global_storage;
         Ok(input)
     }
