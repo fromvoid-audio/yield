@@ -806,3 +806,249 @@ fn recording_retention_blocks_ordinary_charge_release_before_retirement_implemen
             .is_none()
     );
 }
+
+#[test]
+fn recording_rebuild_refuses_unknown_retained_control_after_reopen_without_releasing() {
+    use crate::operation_journal::recording_commands::{
+        controls::{ControlRole, RecordingControlReservation},
+        recording_proposal_for_test,
+    };
+    let f = fixture();
+    let proposal = recording_proposal_for_test(2, 100);
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    store
+        .retain_recording_chunk(&initial_recording_header(&proposal))
+        .unwrap();
+    assert!(store.rebuild_admission_snapshot().is_ok());
+    let control = RecordingControlReservation::new(&proposal, ControlRole::Frozen).unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE operation_journal_recording_chunks SET record=?1 WHERE chunk_id=?2",
+            params![
+                b"unknown retained terminal control".as_slice(),
+                control.id().to_string()
+            ],
+        )
+        .unwrap();
+    let before = store.recording_retained_totals().unwrap();
+    drop(store);
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    assert!(
+        store.rebuild_admission_snapshot().is_err(),
+        "unknown retained terminal control must refuse rebuilt admission"
+    );
+    assert!(store.rebuild_ordinary_claim_snapshot().is_err());
+    assert_eq!(store.recording_retained_totals().unwrap(), before);
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal_recording_chunks WHERE chunk_id=?1",
+                [control.id().to_string()],
+                |r| r.get::<_, Vec<u8>>(0)
+            )
+            .unwrap(),
+        b"unknown retained terminal control"
+    );
+}
+
+#[test]
+fn recording_rebuild_audits_paged_actual_prefix_and_readonly_historical_inventory() {
+    use crate::operation_journal::recording_commands::{
+        RecordingCapturedChunk, RecordingChunkRole, recording_proposal_for_test,
+    };
+    let f = fixture();
+    let proposal = recording_proposal_for_test(2, 100_000);
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    // A reservation alone is valid retained evidence, not an empty/released operation.
+    assert!(store.rebuild_admission_snapshot().is_ok());
+    store
+        .retain_recording_chunk(&initial_recording_header(&proposal))
+        .unwrap();
+    for ordinal in 0..9 {
+        let pcm = RecordingCapturedChunk::new(
+            &proposal,
+            Uuid::new_v4(),
+            RecordingChunkRole::Pcm { ordinal },
+            68 + u64::from(ordinal) * 16_384,
+            vec![0; 16_384],
+        )
+        .unwrap();
+        store.retain_recording_chunk(&pcm).unwrap();
+    }
+    let patch = RecordingCapturedChunk::new(
+        &proposal,
+        Uuid::new_v4(),
+        RecordingChunkRole::Header { revision: 1 },
+        4,
+        vec![0; 4],
+    )
+    .unwrap();
+    store.retain_recording_chunk(&patch).unwrap();
+    let totals = store.recording_retained_totals().unwrap();
+    drop(store);
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    assert!(store.rebuild_admission_snapshot().is_ok());
+    assert!(store.rebuild_ordinary_claim_snapshot().is_ok());
+    assert_eq!(store.recording_retained_totals().unwrap(), totals);
+    assert!(store.prove_clean_handoff_durable().is_err());
+    // Historical zero-control rows remain observable. Rebuild cannot retrofit capture authority.
+    store
+        .connection
+        .execute(
+            "DELETE FROM operation_journal_recording_chunks WHERE slot BETWEEN 20000 AND 20003",
+            [],
+        )
+        .unwrap();
+    assert!(store.rebuild_admission_snapshot().is_ok());
+    assert!(store.retain_recording_chunk(&patch).is_err());
+    assert!(store.prove_clean_handoff_durable().is_err());
+}
+
+#[test]
+fn recording_rebuild_refuses_orphan_binding_order_and_sequence_corruption_without_mutation() {
+    use crate::operation_journal::recording_commands::{
+        RecordingCapturedChunk, RecordingChunkRole, recording_proposal_for_test,
+    };
+    for case in 0..8 {
+        let f = fixture();
+        let proposal = recording_proposal_for_test(2, 100_000);
+        let store = OperationJournalStore::open(&f.owner).unwrap();
+        store
+            .insert_intent(&finite_recording_record(&proposal))
+            .unwrap();
+        let header = initial_recording_header(&proposal);
+        store.retain_recording_chunk(&header).unwrap();
+        let pcm: Vec<_> = (0..2)
+            .map(|ordinal| {
+                RecordingCapturedChunk::new(
+                    &proposal,
+                    Uuid::new_v4(),
+                    RecordingChunkRole::Pcm { ordinal },
+                    68 + u64::from(ordinal) * 16_384,
+                    vec![0; 16_384],
+                )
+                .unwrap()
+            })
+            .collect();
+        for chunk in &pcm {
+            store.retain_recording_chunk(chunk).unwrap();
+        }
+        let patch = RecordingCapturedChunk::new(
+            &proposal,
+            Uuid::new_v4(),
+            RecordingChunkRole::Header { revision: 1 },
+            4,
+            vec![0; 4],
+        )
+        .unwrap();
+        store.retain_recording_chunk(&patch).unwrap();
+        assert!(store.rebuild_admission_snapshot().is_ok());
+        match case {
+            0 => {
+                store.connection.execute("UPDATE operation_journal_recording_chunks SET operation_id=?1 WHERE chunk_id=?2",
+                params![OperationId::new().to_string(),header.chunk_id().to_string()]).unwrap();
+            }
+            1 => {
+                let other = recording_proposal_for_test(2, 100_000);
+                let foreign = RecordingCapturedChunk::new(
+                    &other,
+                    header.chunk_id(),
+                    RecordingChunkRole::Header { revision: 0 },
+                    0,
+                    vec![0; 68],
+                )
+                .unwrap();
+                store
+                    .connection
+                    .execute(
+                        "UPDATE operation_journal_recording_chunks SET record=?1 WHERE chunk_id=?2",
+                        params![
+                            foreign.encode(&other).unwrap(),
+                            header.chunk_id().to_string()
+                        ],
+                    )
+                    .unwrap();
+            }
+            2 => {
+                store.connection.execute("UPDATE operation_journal_recording_chunks SET chunk_id=?1 WHERE chunk_id=?2",
+                params![format!("{{{}}}", header.chunk_id()),header.chunk_id().to_string()]).unwrap();
+            }
+            3 => {
+                store.connection.execute("UPDATE operation_journal_recording_chunks SET sequence=1 WHERE chunk_id=?1",
+                [header.chunk_id().to_string()]).unwrap();
+            }
+            4 => {
+                store
+                    .connection
+                    .execute(
+                        "DELETE FROM operation_journal_recording_chunks WHERE chunk_id=?1",
+                        [pcm[0].chunk_id().to_string()],
+                    )
+                    .unwrap();
+            }
+            5 => {
+                store.connection.execute("UPDATE operation_journal_recording_chunks SET sequence=1999 WHERE chunk_id=?1",
+                [pcm[1].chunk_id().to_string()]).unwrap();
+            }
+            6 => {
+                let short = RecordingCapturedChunk::new(
+                    &proposal,
+                    pcm[0].chunk_id(),
+                    RecordingChunkRole::Pcm { ordinal: 0 },
+                    68,
+                    vec![0; 8],
+                )
+                .unwrap();
+                store
+                    .connection
+                    .execute(
+                        "UPDATE operation_journal_recording_chunks SET record=?1 WHERE chunk_id=?2",
+                        params![
+                            short.encode(&proposal).unwrap(),
+                            pcm[0].chunk_id().to_string()
+                        ],
+                    )
+                    .unwrap();
+            }
+            _ => {
+                let gap = RecordingCapturedChunk::new(
+                    &proposal,
+                    patch.chunk_id(),
+                    RecordingChunkRole::Header { revision: 2 },
+                    4,
+                    vec![0; 4],
+                )
+                .unwrap();
+                store.connection.execute("UPDATE operation_journal_recording_chunks SET slot=10002,record=?1 WHERE chunk_id=?2",
+                    params![gap.encode(&proposal).unwrap(),patch.chunk_id().to_string()]).unwrap();
+            }
+        }
+        let read_rows = |store: &OperationJournalStore| {
+            store.connection.prepare("SELECT chunk_id,operation_id,slot,sequence,record FROM operation_journal_recording_chunks ORDER BY slot").unwrap()
+                .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,Vec<u8>>(4)?))).unwrap()
+                .collect::<Result<Vec<_>,_>>().unwrap()
+        };
+        let before = read_rows(&store);
+        let totals = store.recording_retained_totals();
+        drop(store);
+        let store = OperationJournalStore::open(&f.owner).unwrap();
+        assert!(store.rebuild_admission_snapshot().is_err(), "case {case}");
+        assert!(
+            store.rebuild_ordinary_claim_snapshot().is_err(),
+            "case {case}"
+        );
+        assert_eq!(read_rows(&store), before, "case {case}");
+        if let Ok(totals) = totals {
+            assert_eq!(store.recording_retained_totals().unwrap(), totals);
+        }
+        assert!(store.connection.is_autocommit());
+    }
+}

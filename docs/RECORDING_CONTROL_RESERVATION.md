@@ -68,3 +68,22 @@ retained serializer transport, physical qualification, publication and retiremen
 This leaf understands reserved controls only; a future Frozen value is unsupported
 until the actual terminal owner explicitly validates and enforces it. Linux paths
 that lack a qualified platform owner remain unavailable without synthetic grants.
+
+## Original capacity rebuild audit (OPT-2323)
+
+The existing journal ordinary/admission rebuild read transaction now audits the
+actual recording relation before its capacity image can be installed. It first
+checks the capped 8193-row global inventory and 128 MiB retention ceiling,
+including the full 4096-byte charge for each reserved control. Private indexed
+operation and slot pages contain at most eight keys; only one bounded immutable
+chunk is decoded at a time. Exact canonical row identities, original recording
+proposal bindings, complete reserved controls, cross-relation sequence uniqueness,
+contiguous header/PCM order and the final short PCM boundary must agree.
+Orphan, unknown, conflicting and malformed retained observations refuse rebuild.
+The read transaction preserves all rows and charges and returns to autocommit
+on refusal, including after reopening the actual database.
+
+Historical recordings without controls remain read-only observations and still
+block handoff/release. Valid byte/control inventory does not prove WAV grammar,
+producer closure, a live terminal capability, physical writes, publication or
+settlement. Those production requirements remain with OPT-2145 and OPT-2058.
