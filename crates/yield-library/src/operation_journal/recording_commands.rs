@@ -293,7 +293,7 @@ impl RecordingProposal {
     }
     /// Strict recovered proposal decoding, never positive admission.
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordingValueError> {
-        let value: Self = decode_value(bytes)?;
+        let value: Self = decode_tree_value(bytes)?;
         value.validate()?;
         Ok(value)
     }
@@ -483,7 +483,30 @@ std::thread_local! {
     pub(crate) static RECORDING_VALUE_PARSE_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn decode_value<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, RecordingValueError> {
+// Only these closed, untagged-by-content field graphs may stream directly. All nested
+// structs reject unknown/duplicate fields; their enums are unit or externally tagged.
+// In particular, do not add proposal participants here: optional lease scopes reach
+// internally tagged serde Content and need their own materialization accounting.
+trait StreamingRecordingValue: serde::de::DeserializeOwned {}
+impl StreamingRecordingValue for RecordingCapturedChunk {}
+impl StreamingRecordingValue for controls::RecordingControlReservation {}
+impl StreamingRecordingValue for prefix::RecordingPrefixInventory {}
+impl StreamingRecordingValue for prefix::RecordingPrefixSeal {}
+
+fn decode_value<T: StreamingRecordingValue>(bytes: &[u8]) -> Result<T, RecordingValueError> {
+    if bytes.len() > MAX_RECORDING_VALUE_BYTES {
+        return Err(invalid("encoded value exceeds bound"));
+    }
+    // These complete schemas have maximum value depth four, including array-shaped
+    // struct input. Typed visitors reject wrong shapes before descending into them.
+    // from_slice also checks the whole input for trailing data. No Value/Content tree
+    // is constructed for PCM bytes or unknown nested control fields.
+    serde_json::from_slice(bytes).map_err(invalid)
+}
+
+fn decode_tree_value<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T, RecordingValueError> {
     if bytes.len() > MAX_RECORDING_VALUE_BYTES {
         return Err(invalid("encoded value exceeds bound"));
     }

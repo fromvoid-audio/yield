@@ -1,6 +1,90 @@
 // Actual journal/SQLite tests with authority-free synthetic proposal observations.
 // No fixture below reserves physical capacity or issues a live source/write grant.
 #[test]
+fn recording_typed_decode_actual_sqlite_dense_pcm_and_refusal_preserve_rows() {
+    use crate::operation_journal::recording_commands::{
+        RECORDING_VALUE_PARSE_ENTRIES, RecordingCapturedChunk, RecordingChunkRole,
+        recording_proposal_for_test,
+    };
+    let f = fixture();
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    let proposal = recording_proposal_for_test(2, 2048);
+    store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    store
+        .retain_recording_chunk(&initial_recording_header(&proposal))
+        .unwrap();
+    let pcm = RecordingCapturedChunk::new(
+        &proposal,
+        Uuid::new_v4(),
+        RecordingChunkRole::Pcm { ordinal: 0 },
+        68,
+        (0..16384).map(|i| i as u8).collect(),
+    )
+    .unwrap();
+    store.retain_recording_chunk(&pcm).unwrap();
+    let canonical = String::from_utf8(pcm.encode(&proposal).unwrap()).unwrap();
+    let noncanonical = format!(" \n{}\t", canonical.replace("\"bytes\"", "\"\\u0062ytes\""));
+    store
+        .connection
+        .execute(
+            "UPDATE operation_journal_recording_chunks SET record=?1 WHERE chunk_id=?2",
+            params![noncanonical.as_bytes(), pcm.chunk_id().to_string()],
+        )
+        .unwrap();
+    RECORDING_VALUE_PARSE_ENTRIES.with(|n| n.set(0));
+    assert_eq!(
+        store
+            .get_recording_chunk(proposal.operation_id(), pcm.chunk_id())
+            .unwrap(),
+        Some(pcm.clone())
+    );
+    let baseline = store.rebuild_admission_snapshot().unwrap();
+    assert_eq!(RECORDING_VALUE_PARSE_ENTRIES.with(|n| n.get()), 0);
+    drop(store);
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    assert_eq!(store.rebuild_admission_snapshot().unwrap(), baseline);
+    assert_eq!(
+        store
+            .get_recording_chunk(proposal.operation_id(), pcm.chunk_id())
+            .unwrap(),
+        Some(pcm.clone())
+    );
+    let invalid = canonical.replace("\"offset\":68", "\"offset\":68,\"offset\":68");
+    store
+        .connection
+        .execute(
+            "UPDATE operation_journal_recording_chunks SET record=?1 WHERE chunk_id=?2",
+            params![invalid.as_bytes(), pcm.chunk_id().to_string()],
+        )
+        .unwrap();
+    let retained = |s: &OperationJournalStore| -> Vec<(String, String, i64, i64, Vec<u8>)> {
+        s.connection.prepare("SELECT chunk_id,operation_id,slot,sequence,record FROM operation_journal_recording_chunks ORDER BY chunk_id").unwrap()
+            .query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap()
+            .collect::<Result<_,_>>().unwrap()
+    };
+    let before = retained(&store);
+    assert!(
+        store
+            .get_recording_chunk(proposal.operation_id(), pcm.chunk_id())
+            .is_err()
+    );
+    assert!(store.rebuild_admission_snapshot().is_err());
+    assert_eq!(retained(&store), before);
+    assert!(store.connection.is_autocommit());
+    drop(store);
+    let reopened = OperationJournalStore::open(&f.owner).unwrap();
+    assert!(
+        reopened
+            .get_recording_chunk(proposal.operation_id(), pcm.chunk_id())
+            .is_err()
+    );
+    assert_eq!(retained(&reopened), before);
+    assert!(reopened.connection.is_autocommit());
+}
+
+#[test]
 fn recording_metadata_policy_tightens_default_and_preserves_stricter_owner_cap() {
     let fixture = fixture();
     let store = OperationJournalStore::open(&fixture.owner).unwrap();

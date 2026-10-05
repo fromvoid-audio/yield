@@ -1,6 +1,61 @@
 use super::*;
 
 #[test]
+fn recording_typed_decode_controls_preserve_historical_json_without_tree() {
+    let proposal = recording_proposal_for_test(2, 100);
+    for role in ControlRole::ALL {
+        let control = RecordingControlReservation::new(&proposal, role).unwrap();
+        let wire = String::from_utf8(control.encode(&proposal).unwrap()).unwrap();
+        let noncanonical = format!(
+            " \n{}\t",
+            wire.replace("\"version\"", "\"\\u0076ersion\"")
+                .replace("\"role\":\"Stage\"", "\"role\":{\"Stage\":null}")
+                .replace(
+                    &format!("\"role\":\"{role:?}\""),
+                    &format!("\"role\":{{\"{role:?}\":null}}")
+                )
+        );
+        let old: RecordingControlReservation = decode_tree_value(noncanonical.as_bytes()).unwrap();
+        RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.set(0));
+        assert_eq!(
+            RecordingControlReservation::decode(noncanonical.as_bytes(), &proposal).unwrap(),
+            old
+        );
+        assert_eq!(old, control);
+        assert_eq!(RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.get()), 0);
+        for malformed in [
+            wire.replacen("{", "{\"version\":1,", 1),
+            wire.replace(
+                "\"action_ordinal\":0",
+                "\"action_ordinal\":0,\"action_ordinal\":0",
+            ),
+            wire.replace(
+                &format!("\"role\":\"{role:?}\""),
+                &format!("\"role\":{{\"{role:?}\":null,\"{role:?}\":null}}"),
+            ),
+            wire.replace(
+                &format!("\"role\":\"{role:?}\""),
+                &format!("\"role\":{{\"{role:?}\":null,\"Unknown\":null}}"),
+            ),
+            wire.replacen("{", "{\"unknown\":null,", 1),
+            format!("{wire} false"),
+            format!(
+                "{{\"unknown\":{}null{}}}",
+                "{\"a\":".repeat(100),
+                "}".repeat(100)
+            ),
+        ] {
+            assert!(
+                decode_tree_value::<RecordingControlReservation>(malformed.as_bytes()).is_err()
+            );
+            RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.set(0));
+            assert!(RecordingControlReservation::decode(malformed.as_bytes(), &proposal).is_err());
+            assert_eq!(RECORDING_VALUE_PARSE_ENTRIES.with(|count| count.get()), 0);
+        }
+    }
+}
+
+#[test]
 fn reserved_controls_bind_every_role_and_exact_proposal_without_authority() {
     let proposal = recording_proposal_for_test(2, 10_000);
     let mut identities = std::collections::HashSet::new();
