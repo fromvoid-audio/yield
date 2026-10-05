@@ -2,11 +2,35 @@
 use super::{LegacyObservationError, Result, refused};
 use rusqlite::Connection;
 
-fn normalized(sql: &str) -> String {
-    sql.chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect()
+// Only the finite unquoted compiled grammar is supported. Borrow tokens rather than
+// materializing an unbounded number of strings from the already bounded DDL image.
+struct Tokens<'a>(&'a [u8]);
+impl<'a> Iterator for Tokens<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0 = self.0.trim_ascii_start();
+        let first = *self.0.first()?;
+        let identifier = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
+        let length = if identifier(&first) {
+            self.0.iter().take_while(|byte| identifier(byte)).count()
+        } else {
+            1
+        };
+        let (token, remaining) = self.0.split_at(length);
+        self.0 = remaining;
+        Some(token)
+    }
+}
+fn matches_compiled_sql(actual: &str, expected: &str) -> bool {
+    if !actual.is_ascii() {
+        return false;
+    }
+    let mut actual = Tokens(actual.as_bytes());
+    Tokens(expected.as_bytes()).all(|expected| {
+        actual
+            .next()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+    }) && actual.next().is_none()
 }
 pub(super) fn capture(connection: &Connection) -> Result<[u8; 32]> {
     let version: u64 = connection
@@ -72,7 +96,11 @@ pub(super) fn capture(connection: &Connection) -> Result<[u8; 32]> {
             a.0 != e.0
                 || a.1 != e.1
                 || a.2 != e.2
-                || a.3.as_deref().map(normalized) != e.3.map(normalized)
+                || !match (a.3.as_deref(), e.3) {
+                    (Some(actual), Some(expected)) => matches_compiled_sql(actual, expected),
+                    (None, None) => true,
+                    _ => false,
+                }
         })
     {
         return Err(LegacyObservationError("unknown legacy schema image"));
