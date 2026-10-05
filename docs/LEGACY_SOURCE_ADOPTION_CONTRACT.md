@@ -426,3 +426,21 @@ retained writable promotion and entered policy, the preserving atomic migration/
 receipt transaction, exact replay/uncertainty/recovery and separately accounted
 lease bootstrap. OPT-2098/1745 and native allocation/durability acceptance remain
 open. Normal v11 opens still return `MigrationRequired`; journal schema stays 12.
+
+## Original Windows DELETE callback observation (OPT-2281)
+
+`known_delete_sector_size` now validates the original private MAIN wrapper,
+context, role and exact pinned native SQLite source before invoking its actual
+sector callback on Windows as well as Linux/macOS. Windows uses the existing
+reviewed `win32` native-prefix checker; Unix uses the retained descriptor checker.
+Unknown/unowned files or unsupported sector values refuse. The observed sector
+is a pager scalar, not the volume allocation unit or physical allocation policy.
+
+The actual readonly v11 owner test invokes the callback repeatedly with all
+ordinary SQL denied, preserving main bytes, live ownership and absent sidecars.
+Existing source pager smaller-cap, changed-policy, deadline, unknown-owner and
+extension-taint tests now compile on Windows too. Native execution is tracked
+in OPT-2282; Windows production and all-test-target cross-compilation is separate
+from execution. These observations do not implement admission, writable promotion,
+migration/receipt/version stamping, lease bootstrap, retries/refunds or settlement.
+Full OPT-2117/2098/1745 and physical qualification remain open.
