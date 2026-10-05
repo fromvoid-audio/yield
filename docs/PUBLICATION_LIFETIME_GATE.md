@@ -1,5 +1,33 @@
 # Publication lifetime gate (OPT-2183)
 
+## Original queue handoff (OPT-2324)
+
+The private file-owner publication submit route moves the original journal
+`StagingPublicationGrant` into the existing primary execution envelope. Its
+authority-free `PublishNoReplace` command comes from the original sealed target,
+staging receipt and effect identity. Those command bytes alone cannot admit a
+primary request. Confirmed queue rejection returns the original grant; accepted
+reply loss retains it in the same bounded receipt and tombstone custody used by
+chunk requests. Exact duplicates return the retained result. Chunk grant recovery
+cannot extract or discard a publication grant.
+
+The envelope uses the existing 32-command, 64-result, 64-receipt and 4 MiB file
+budgets. Its command and moved-value backing must fit 64 KiB; target and native
+payloads remain charged to their original retained input pools. No source or
+journal entry permit is acquired while queued. On the original worker, the
+binding must still be the original registry Arc, with live matching retained
+root capabilities and an absent target. Publication then remains `Unsupported`,
+without entering the source/slot gate or invoking a namespace backend. Receipt
+acknowledgement, dropping custody and unsupported results do not settle durable
+staging charges or permit issuance to be replayed.
+
+This installs queue custody only. Qualified staged-object provenance, namespace
+allocation, effect entry, completion and durable settlement remain required by
+OPT-2216/2217/2218 and the tracking parents. Linux tests use genuine original
+read-only targets to prove command bytes cannot mint a grant. Supported macOS
+SDK compilation and execution of the genuine journal-issued positive handoff
+harness remain OPT-2325; Linux and Windows GNU checks do not execute that body.
+
 Decision, 2 October 2026, reviewed at `3cd9d75b2`. Install a private,
 journal-issued, bounded shared slot whose entry transition competes with
 cancellation and retirement. Keep capacity accounting on the journal actor.

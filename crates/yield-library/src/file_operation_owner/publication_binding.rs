@@ -89,6 +89,59 @@ impl Drop for PublicationTargetPending {
 }
 #[allow(dead_code)] // Private producer interface consumed by complete OPT-2215.
 impl PreparedPublicationTarget {
+    /// Build only the authority-free bytes selected by this original binding.
+    pub(crate) fn publication_command(
+        &self,
+    ) -> Result<FileOperationCommand, FileOperationValidationError> {
+        let validation = self.validation();
+        let EffectOutcome::Applied { evidence } = validation.outcome() else {
+            return Err(FileOperationValidationError::new(
+                "original staging validation is absent",
+            ));
+        };
+        let proof = evidence
+            .validated_staging()
+            .ok_or_else(|| FileOperationValidationError::new("original staging proof is absent"))?;
+        let [staging] = validation.root_bindings() else {
+            return Err(FileOperationValidationError::new(
+                "original staging role is absent",
+            ));
+        };
+        let object = evidence
+            .observed_identity
+            .ok_or_else(|| FileOperationValidationError::new("original staged object is absent"))?;
+        let command = FileOperationCommand {
+            operation_id: validation.operation_id(),
+            participant_id: validation.participant_id(),
+            effect_id: self.publication_effect(),
+            source_fences: validation.source_fences().to_vec(),
+            target_registration: self.target().registration,
+            expected: ExpectedObject::Absent,
+            effect: EffectRequest::PublishNoReplace {
+                staging: StagingRoot {
+                    binding: RootRoleBinding {
+                        registration: staging.registration,
+                        authority: staging.authority.clone(),
+                        locator: staging.locator.clone(),
+                        expected: ExpectedObject::Exact(object),
+                    },
+                },
+                target: DestinationRoot {
+                    binding: self.target().clone(),
+                },
+                staged: CopyValidatedEvidence {
+                    object,
+                    bytes: proof.bytes(),
+                },
+                expected_absent: AbsenceProof { marker: 1 },
+            },
+            authorization: EffectAuthorization::JournalGrant(JournalGrantAuthorization {
+                _sealed: (),
+            }),
+        };
+        command.validate_shape()?;
+        Ok(command)
+    }
     /// Scalar liveness only; actual roots/native objects require worker revalidation at entry.
     pub(crate) fn is_current(&self) -> bool {
         Instant::now() < self.data.deadline
@@ -232,6 +285,74 @@ fn retained_validation_bytes(result: &FileOperationResult) -> Option<usize> {
     Some(bytes)
 }
 impl WorkerState {
+    /// Check the original weak registry and retained capabilities on their owning worker.
+    /// This is pre-effect validation; it never qualifies a staged object for mutation.
+    pub(super) fn validate_original_publication_target(
+        &self,
+        target: &PreparedPublicationTarget,
+        shared: &Arc<OwnerShared>,
+    ) -> Result<(), BindingError> {
+        if !target.is_current() || !Weak::ptr_eq(&target.data.shared, &Arc::downgrade(shared)) {
+            return Err(BindingError::Closed);
+        }
+        let key = EffectKey {
+            operation_id: target.validation().operation_id(),
+            participant_id: target.validation().participant_id(),
+            effect_id: target.validation().effect_id(),
+        };
+        let original = self
+            .publication_bindings
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .ok_or(BindingError::Missing)?;
+        if !Arc::ptr_eq(&original, &target.data) {
+            return Err(BindingError::Conflict);
+        }
+        let command = target
+            .publication_command()
+            .map_err(|_| BindingError::Invalid)?;
+        for (_, binding) in command.effect.role_bindings() {
+            let root = self
+                .registrations
+                .get(&binding.registration)
+                .ok_or(BindingError::Missing)?;
+            if root.authority != binding.authority || !root.alive.load(Ordering::Acquire) {
+                return Err(BindingError::Closed);
+            }
+            root.capability
+                .as_ref()
+                .ok_or(BindingError::Unknown)?
+                .validate()
+                .map_err(|_| BindingError::Closed)?;
+        }
+        let EffectOutcome::Applied { evidence } = target.validation().outcome() else {
+            return Err(BindingError::Invalid);
+        };
+        if let Some(source) = evidence
+            .validated_staging()
+            .and_then(|proof| proof.source_root())
+        {
+            self.registrations
+                .get(&source)
+                .and_then(|root| root.capability.as_ref())
+                .ok_or(BindingError::Missing)?
+                .validate()
+                .map_err(|_| BindingError::Closed)?;
+        }
+        let root = self
+            .registrations
+            .get(&target.target().registration)
+            .and_then(|root| root.capability.as_ref())
+            .ok_or(BindingError::Missing)?;
+        match root
+            .root
+            .symlink_metadata(Path::new(target.target().locator.as_str()))
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(BindingError::Occupied),
+            Err(_) => Err(BindingError::Unknown),
+        }
+    }
     pub(super) fn prepare_publication_target(
         &mut self,
         request: BindingRequest,
