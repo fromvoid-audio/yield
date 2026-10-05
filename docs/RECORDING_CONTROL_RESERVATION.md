@@ -112,8 +112,12 @@ verify read-only empty-control inspection/reopen and preserve captured/cancelled
 missing and unknown inventories on refusal. These tests do not exercise a positive
 qualified production slot or lost reply after such issuance.
 
-OPT-2326 remains open for genuine positive original-source/provider/admission
-verification and its retained-slot/lost-reply acceptance. Production reserve
+Two genuine positive harnesses use the production journal constructor, actual
+registered source and file-owner root, native reserve descriptor facts and common
+recording admission. Their complete helper is type-checked on Linux and Windows;
+execution is gated to macOS. OPT-2330 specifies the exact two-test native command,
+resources and retained-slot/lost-reply requirements. OPT-2326 remains open for
+that genuine original-source/provider/admission verification. Production reserve
 creation/reopen and revalidation reject Linux before namespace access; native
 macOS implementations exist, and fixtures do not qualify them. Required-WAL
 startup, current physical recording admission and the actual byte/terminal
