@@ -102,6 +102,42 @@ mod integration {
         }
     }
     #[test]
+    fn original_publication_command_bytes_cannot_mint_primary_grant() {
+        let f = Fixture::new();
+        let (mut validation, result) = f.validation();
+        let effect = EffectId::new();
+        let mut pending = f.prepare(result.clone(), effect, "final.wav");
+        let target = wait(&mut pending).unwrap();
+        let before = f.owner.input_bytes_remaining_for_test();
+        let executions = f.owner.shared.execution_count.load(Ordering::Acquire);
+        let command = target.publication_command().unwrap();
+        assert_eq!(command.operation_id(), result.operation_id());
+        assert_eq!(command.participant_id(), result.participant_id());
+        assert_eq!(command.effect_id(), effect);
+        assert!(matches!(
+            command.effect(),
+            EffectRequest::PublishNoReplace { .. }
+        ));
+        assert!(matches!(
+            f.owner.submit(command),
+            Err(FileOperationOwnerQueueError::InvalidInput(_))
+        ));
+        assert_eq!(before, f.owner.input_bytes_remaining_for_test());
+        assert_eq!(
+            executions,
+            f.owner.shared.execution_count.load(Ordering::Acquire)
+        );
+        assert!(!f.guard.profile_root().join("final.wav").exists());
+        validation.acknowledge().unwrap();
+        drop(target);
+        let FileOperationOwnerShutdown::RetirementDeferred { pending, .. } = f.owner.shutdown()
+        else {
+            panic!("original validation evidence requires confirmed coordinator custody");
+        };
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].effect_id, result.effect_id());
+    }
+    #[test]
     fn actual_original_worker_binds_exact_receipt_roots_descriptor_and_credit() {
         let f = Fixture::new();
         let (mut validation, result) = f.validation();

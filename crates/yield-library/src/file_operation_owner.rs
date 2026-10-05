@@ -30,8 +30,10 @@ use uuid::Uuid;
 
 use crate::app_dirs::WritableProfileGuard;
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
-use crate::operation_journal::owner::LiveChunkEffectGrant;
+use crate::operation_journal::owner::{LiveChunkEffectGrant, StagingPublicationGrant};
+mod publication_handoff;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
+use publication_handoff::QueuedGrant;
 mod publication_binding;
 use crate::sample_sources::SourceId;
 use crate::sample_sources::db::{BoundDatabaseRoot, SourceAuthorityRequest};
@@ -1092,9 +1094,13 @@ impl FileOperationCommand {
                 }
             }
             EffectAuthorization::JournalGrant(_) => {
-                if !matches!(self.effect, EffectRequest::WriteStagingChunk { .. }) {
+                if !matches!(
+                    self.effect,
+                    EffectRequest::WriteStagingChunk { .. }
+                        | EffectRequest::PublishNoReplace { .. }
+                ) {
                     return Err(FileOperationValidationError::new(
-                        "journal grant is valid only for staging chunk writes",
+                        "journal grant requires an exact staging chunk or publication envelope",
                     ));
                 }
             }
@@ -1940,8 +1946,16 @@ impl FileOperationOwner {
         command: FileOperationCommand,
         grant: LiveChunkEffectGrant,
     ) -> Result<FileOperationRequest, (FileOperationOwnerQueueError, LiveChunkEffectGrant)> {
-        self.submit_inner(command, Some(grant))
-            .map_err(|(error, grant)| (error, grant.expect("primary grant returned on rejection")))
+        self.submit_inner(command, Some(QueuedGrant::Chunk(grant)))
+            .map_err(|(error, grant)| {
+                (
+                    error,
+                    grant
+                        .expect("primary grant returned on rejection")
+                        .into_chunk()
+                        .expect("original chunk grant"),
+                )
+            })
     }
 
     #[allow(dead_code)] // No ordinary-family producer retries live chunks yet.
@@ -1955,9 +1969,8 @@ impl FileOperationOwner {
     fn submit_inner(
         &self,
         command: FileOperationCommand,
-        grant: Option<LiveChunkEffectGrant>,
-    ) -> Result<FileOperationRequest, (FileOperationOwnerQueueError, Option<LiveChunkEffectGrant>)>
-    {
+        grant: Option<QueuedGrant>,
+    ) -> Result<FileOperationRequest, (FileOperationOwnerQueueError, Option<QueuedGrant>)> {
         let result = self.submit_observed(command, grant);
         self.shared
             .telemetry
@@ -1968,9 +1981,8 @@ impl FileOperationOwner {
     fn submit_observed(
         &self,
         mut command: FileOperationCommand,
-        mut grant: Option<LiveChunkEffectGrant>,
-    ) -> Result<FileOperationRequest, (FileOperationOwnerQueueError, Option<LiveChunkEffectGrant>)>
-    {
+        mut grant: Option<QueuedGrant>,
+    ) -> Result<FileOperationRequest, (FileOperationOwnerQueueError, Option<QueuedGrant>)> {
         macro_rules! reject {
             ($error:expr) => {
                 return Err(($error, grant.take()))
@@ -2692,7 +2704,7 @@ struct ReceiptEntry {
     fingerprint: RequestFingerprint,
     result: Arc<FileOperationResult>,
     aliases: usize,
-    grant: Option<LiveChunkEffectGrant>,
+    grant: Option<QueuedGrant>,
 }
 
 struct ReceiptTombstone {
@@ -2700,7 +2712,7 @@ struct ReceiptTombstone {
     fingerprint: RequestFingerprint,
     result: Arc<FileOperationResult>,
     aliases: usize,
-    grant: Option<LiveChunkEffectGrant>,
+    grant: Option<QueuedGrant>,
 }
 
 enum AdmissionState {
@@ -2908,7 +2920,7 @@ impl WorkerState {
     fn execute(
         &mut self,
         command: FileOperationCommand,
-        grant: Option<LiveChunkEffectGrant>,
+        grant: Option<QueuedGrant>,
         canonical: Arc<[u8]>,
         fingerprint: RequestFingerprint,
         key: EffectKey,
@@ -2987,14 +2999,18 @@ impl WorkerState {
                         ) {
                             Ok(()) => match grant
                                 .as_ref()
-                                .map(LiveChunkEffectGrant::begin_source_effect)
-                                .transpose()
-                            {
-                                Err(_) => EffectOutcome::SupersededBeforeEffect {
-                                    reason: String::from(
-                                        "live source authority closed before effect",
-                                    ),
-                                },
+                                .map_or(Ok(()), |live| live.validate_original_worker(self, shared))
+                                .and_then(|()| {
+                                    grant
+                                        .as_ref()
+                                        .map(QueuedGrant::begin_chunk_source_effect)
+                                        .transpose()
+                                        .map_err(|_| EffectOutcome::SupersededBeforeEffect {
+                                            reason: "live source authority closed before effect"
+                                                .into(),
+                                        })
+                                }) {
+                                Err(outcome) => outcome,
                                 Ok(_source_permit) => {
                                     #[cfg(test)]
                                     shared.execution_count.fetch_add(1, Ordering::AcqRel);
@@ -3143,8 +3159,13 @@ impl WorkerState {
             let _ = result.send(None);
             return;
         }
-        if let Err(error) = result.send(grant.take()) {
-            *grant = error.0;
+        if !matches!(grant, Some(QueuedGrant::Chunk(_))) {
+            let _ = result.send(None);
+            return;
+        }
+        let original = grant.take().and_then(QueuedGrant::into_chunk);
+        if let Err(error) = result.send(original) {
+            *grant = error.0.map(QueuedGrant::Chunk);
         }
     }
 }
@@ -3157,7 +3178,7 @@ enum OwnerCommand {
     Execute {
         enqueued_at: Instant,
         command: FileOperationCommand,
-        grant: Option<LiveChunkEffectGrant>,
+        grant: Option<QueuedGrant>,
         canonical: Arc<[u8]>,
         fingerprint: RequestFingerprint,
         key: EffectKey,
@@ -4113,7 +4134,7 @@ fn validate_staging_effect(
 
 fn validate_for_owner(
     command: &FileOperationCommand,
-    grant: Option<&LiveChunkEffectGrant>,
+    grant: Option<&QueuedGrant>,
     shared: &Arc<OwnerShared>,
     registrations: &BTreeMap<RootRegistrationRef, RootRegistrationState>,
 ) -> Result<(), EffectOutcome> {

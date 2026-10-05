@@ -1153,6 +1153,10 @@ impl std::fmt::Debug for StagingPublicationGrant {
 
 #[allow(dead_code)] // Consumed by the publication adapter when that route is installed.
 impl StagingPublicationGrant {
+    pub(crate) fn original_target(&self) -> &PreparedPublicationTarget {
+        &self.target
+    }
+
     pub(crate) fn begin_publication(
         self,
     ) -> Result<publication_custody::PublicationSourceUse, OperationJournalOwnerError> {
@@ -9229,7 +9233,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn live_chunk_grant_crosses_to_file_owner_once_after_dropped_reply() {
-        native_live_chunk_and_staging_issuer(None, None, None, None, None);
+        native_live_chunk_and_staging_issuer(None, None, None, None, None, false);
     }
 
     #[cfg(target_os = "macos")]
@@ -9238,7 +9242,14 @@ mod tests {
         use super::super::store::InsertTestBoundary;
         for nth in [1, 2] {
             for boundary in [InsertTestBoundary::Commit, InsertTestBoundary::AfterCommit] {
-                native_live_chunk_and_staging_issuer(Some((nth, boundary)), None, None, None, None);
+                native_live_chunk_and_staging_issuer(
+                    Some((nth, boundary)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                );
             }
         }
     }
@@ -9247,7 +9258,7 @@ mod tests {
     #[test]
     fn native_preissued_publication_grant_refuses_original_drain_and_unavailable() {
         for unavailable in [false, true] {
-            native_live_chunk_and_staging_issuer(None, Some(unavailable), None, None, None);
+            native_live_chunk_and_staging_issuer(None, Some(unavailable), None, None, None, false);
         }
     }
 
@@ -9255,7 +9266,7 @@ mod tests {
     #[test]
     fn native_publication_issuer_refuses_stale_original_targets() {
         for kind in 0..3 {
-            native_live_chunk_and_staging_issuer(None, None, Some(kind), None, None);
+            native_live_chunk_and_staging_issuer(None, None, Some(kind), None, None, false);
         }
     }
 
@@ -9263,7 +9274,7 @@ mod tests {
     #[test]
     fn native_publication_issuer_cancellation_fences_original_pending_and_unsettled_grants() {
         for entered in [false, true] {
-            native_live_chunk_and_staging_issuer(None, None, None, Some(entered), None);
+            native_live_chunk_and_staging_issuer(None, None, None, Some(entered), None, false);
         }
     }
 
@@ -9271,8 +9282,14 @@ mod tests {
     #[test]
     fn native_publication_issuer_chunk_release_fences_original_unused_and_unsettled_grants() {
         for entered in [false, true] {
-            native_live_chunk_and_staging_issuer(None, None, None, None, Some(entered));
+            native_live_chunk_and_staging_issuer(None, None, None, None, Some(entered), false);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_publication_original_handoff_retains_lost_reply_and_tombstone_grant() {
+        native_live_chunk_and_staging_issuer(None, None, None, None, None, true);
     }
 
     #[cfg(target_os = "macos")]
@@ -9282,6 +9299,7 @@ mod tests {
         stale_target: Option<u8>,
         cancel_after_entry: Option<bool>,
         release_after_entry: Option<bool>,
+        publication_handoff: bool,
     ) {
         use super::super::store::{InsertTestBoundary, InsertTestDirective};
         let fixture = fixture("journal-owner-live-chunk-grant");
@@ -10335,6 +10353,63 @@ mod tests {
             if unavailable {
                 assert!(!clean);
             }
+            return;
+        }
+        if publication_handoff {
+            let original_fingerprint = publication.original_target().fingerprint();
+            let foreign = crate::file_operation_owner::FileOperationOwner::start().unwrap();
+            let publication = match foreign.submit_publication(publication) {
+                Err((
+                    crate::file_operation_owner::FileOperationOwnerQueueError::InvalidInput(_),
+                    original,
+                )) => original,
+                _ => panic!("foreign owner must return the exact original grant before admission"),
+            };
+            assert_eq!(
+                publication.original_target().fingerprint(),
+                original_fingerprint
+            );
+            assert_eq!(foreign.execution_count_for_test(), 0);
+            assert_eq!(
+                foreign.shutdown(),
+                crate::file_operation_owner::FileOperationOwnerShutdown::DrainedAck
+            );
+            let retry = publication.original_target().publication_command().unwrap();
+            let exact = publication.original_target().publication_command().unwrap();
+            let pending = file_owner.submit_publication(publication).unwrap();
+            drop(pending); // Accepted loss retains the original grant; no entry happened.
+            let mut duplicate = file_owner.submit(retry).unwrap();
+            let result = duplicate.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(matches!(
+                result.outcome(),
+                crate::file_operation_owner::EffectOutcome::Unsupported { .. }
+            ));
+            assert!(duplicate.take_unused_live_chunk_grant().unwrap().is_none());
+            duplicate.acknowledge().unwrap();
+            let mut exact_again = file_owner.submit(exact).unwrap();
+            assert_eq!(
+                exact_again.recv_timeout(Duration::from_secs(2)).unwrap(),
+                result
+            );
+            exact_again.acknowledge().unwrap();
+            assert_eq!(owner.shared.resource_admission.snapshot().1, 0);
+            assert_eq!(
+                owner
+                    .shared
+                    .input_bytes
+                    .lock()
+                    .unwrap()
+                    .publication_remaining,
+                input_before
+                    - 64 * 1024
+                    - publication_fence::HEADER_BYTES
+                    - native_read_capsule::BACKING
+                    - native_read_capsule::REGISTRY
+            );
+            staged.acknowledge().unwrap();
+            let _ = file_owner.shutdown();
+            drop(database);
+            let _ = owner.shutdown();
             return;
         }
         let permit = publication
