@@ -19,6 +19,7 @@ mod capacity_provider;
 mod capacity_reserve;
 #[allow(dead_code)]
 mod capacity_reserve_namespace;
+pub mod capacity_retention_telemetry;
 #[allow(dead_code)]
 mod capacity_volume_owner;
 pub mod codec;
