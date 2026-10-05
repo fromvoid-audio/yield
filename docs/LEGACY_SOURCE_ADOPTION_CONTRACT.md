@@ -514,3 +514,16 @@ Evidence preservation here covers refusal while the original journal owner is
 retained. The source reservation survives shutdown. Existing confirmed SQLite
 close can remove its own ordinary cold journal rollback file; this observation
 does not promise a durable migration receipt or change that teardown behavior.
+
+## Exact legacy DDL token boundaries (OPT-2327)
+
+Known-v11 schema inspection compares the finite unquoted compiled ASCII tokens,
+allowing case and whitespace variation while preserving declaration boundaries.
+For example, SQLite accepts `T E X T` as a distinct type with NUMERIC affinity;
+it cannot impersonate the required `TEXT` token. The bounded inspector borrows
+DDL token slices without allocating a token collection. Unknown tokens, quoted
+or commented alternatives, additional objects and unsupported versions still
+refuse before migration or lease bootstrap. Genuine readonly-owner tests prove
+both alternate-affinity refusal and harmless formatting acceptance with preserved
+source bytes. This supplies no capacity, adoption receipt or physical qualification;
+full OPT-2117/2098/1745 remain open.

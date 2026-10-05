@@ -141,6 +141,79 @@ fn every_unknown_schema_and_malformed_row_rejects_without_source_mutation() {
 }
 
 #[test]
+fn distinct_sqlite_type_tokens_cannot_impersonate_known_text_columns() {
+    for metadata in [true, false] {
+        let sql = if metadata {
+            "DROP TABLE metadata; CREATE TABLE metadata (key T E X T PRIMARY KEY, value TEXT NOT NULL); INSERT INTO metadata VALUES ('revision','7');"
+        } else {
+            "DROP TABLE wav_files; CREATE TABLE wav_files (path T E X T PRIMARY KEY, file_size INTEGER NOT NULL, modified_ns INTEGER NOT NULL); INSERT INTO wav_files VALUES ('legacy/one.wav',42,99);"
+        };
+        let f = Fixture::new(sql);
+        let connection = Connection::open(&f.path).unwrap();
+        // SQLite assigns NUMERIC affinity to this distinct type, unlike the compiled TEXT.
+        connection.execute_batch("BEGIN;").unwrap();
+        let (table, column) = if metadata {
+            ("metadata", "key")
+        } else {
+            ("wav_files", "path")
+        };
+        connection
+            .execute_batch(if metadata {
+                "INSERT INTO metadata VALUES ('001','probe');"
+            } else {
+                "INSERT INTO wav_files VALUES ('001',1,1);"
+            })
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    &format!("SELECT typeof({column}) FROM {table} WHERE {column}=1"),
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "integer"
+        );
+        connection.execute_batch("ROLLBACK;").unwrap();
+        drop(connection);
+        let bytes = std::fs::read(&f.path).unwrap();
+        assert!(
+            f.open().is_err(),
+            "accepted distinct SQLite type tokens: {sql}"
+        );
+        assert_eq!(std::fs::read(&f.path).unwrap(), bytes);
+        let connection = Connection::open(&f.path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name='source_lease'",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn exact_compiled_legacy_tokens_allow_benign_case_and_whitespace_without_writes() {
+    let f = Fixture::new(
+        "DROP TABLE metadata; cReAtE\tTaBlE metadata(key text primary\nkey,value text not null); INSERT INTO metadata VALUES ('revision','7'); DROP TABLE wav_files; CREATE TABLE wav_files ( path text PRIMARY KEY , file_size integer NOT NULL , modified_ns INTEGER NOT NULL ); INSERT INTO wav_files VALUES ('legacy/one.wav',42,99);",
+    );
+    let bytes = std::fs::read(&f.path).unwrap();
+    let owner = f.open().unwrap();
+    let image = owner.capture(&f.guard).unwrap();
+    assert_eq!(image.revision(), 7);
+    assert_eq!(image.metadata_rows(), 1);
+    assert_eq!(image.audio_rows(), 1);
+    assert_eq!(std::fs::read(&f.path).unwrap(), bytes);
+    drop(owner);
+    assert!(f.lock().exists());
+    assert_eq!(std::fs::read(&f.path).unwrap(), bytes);
+}
+
+#[test]
 fn original_image_is_frozen_even_if_an_external_sqlite_writer_ignores_yield_sidecar() {
     let f = Fixture::new("");
     let owner = f.open().unwrap();
