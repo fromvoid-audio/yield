@@ -9,7 +9,7 @@ impl Drop for Progress<'_> {
         self.0.progress_handler(0, None::<fn() -> bool>);
     }
 }
-pub(super) fn run<T>(
+pub(in crate::sample_sources::library) fn run<T>(
     connection: &Connection,
     canceled: &Arc<AtomicBool>,
     read: impl FnOnce() -> Result<T, LibraryError>,

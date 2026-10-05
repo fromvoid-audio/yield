@@ -56,6 +56,7 @@ pub(super) fn potentially_mutates(command: &WriterCommand) -> bool {
         WriterCommand::Prepare(_)
         | WriterCommand::HarvestFacts { .. }
         | WriterCommand::HarvestAuthoredSnapshot { .. }
+        | WriterCommand::ObserveHarvestCopyReceipt { .. }
         | WriterCommand::ReferenceSnapshot { .. }
         | WriterCommand::LoadSourceRegistry { .. }
         | WriterCommand::LookupRetainedSource { .. }

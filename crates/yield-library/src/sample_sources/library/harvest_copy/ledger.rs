@@ -19,7 +19,19 @@ pub(super) fn read(
     c: &Connection,
     request: &HarvestCopyRequest,
 ) -> Result<Option<HarvestCopyReceipt>, LibraryError> {
-    let key = request.payload.key()?;
+    let Some((receipt, payload)) = read_stored(c, &request.payload.key()?)? else {
+        return Ok(None);
+    };
+    if payload != request.bytes {
+        return Err(LibraryError::HarvestCopyReplayConflict);
+    }
+    Ok(Some(receipt))
+}
+
+pub(super) fn read_stored(
+    c: &Connection,
+    key: &str,
+) -> Result<Option<(HarvestCopyReceipt, Vec<u8>)>, LibraryError> {
     let count: i64 = c.query_row(
         "SELECT COUNT(*) FROM (SELECT 1 FROM harvest_copy_receipts WHERE command_key=?1 LIMIT 2)",
         [&key],
@@ -39,8 +51,11 @@ pub(super) fn read(
     if !valid {
         return Err(malformed());
     }
-    // The transaction holds the single writer; preflight and readback share one snapshot.
-    let (sequence,payload,result,identity,owner):(i64,Vec<u8>,Vec<u8>,Vec<u8>,String)=c.query_row("SELECT sequence,payload,result,identity,owner FROM harvest_copy_receipts WHERE command_key=?1",[&key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    // The caller retains a transaction; preflight and readback share one SQLite snapshot.
+    let (sequence,stored_key,payload,result,identity,owner):(i64,String,Vec<u8>,Vec<u8>,Vec<u8>,String)=c.query_row("SELECT sequence,command_key,payload,result,identity,owner FROM harvest_copy_receipts WHERE command_key=?1",[&key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+    if stored_key != key {
+        return Err(malformed());
+    }
     let unique: i64 = c.query_row(
         "SELECT COUNT(*) FROM (SELECT 1 FROM harvest_copy_receipts WHERE sequence=?1 LIMIT 2)",
         [sequence],
@@ -52,11 +67,9 @@ pub(super) fn read(
     if identity != digest(&payload, &result, &owner) {
         return Err(malformed());
     }
-    if Payload::decode(&payload).is_err() {
+    let decoded = Payload::decode(&payload).map_err(|_| malformed())?;
+    if decoded.key()? != key {
         return Err(malformed());
-    }
-    if payload != request.bytes {
-        return Err(LibraryError::HarvestCopyReplayConflict);
     }
     let owner = Uuid::parse_str(&owner)
         .ok()
@@ -75,12 +88,15 @@ pub(super) fn read(
     {
         return Err(malformed());
     }
-    Ok(Some(HarvestCopyReceipt {
-        payload: request.payload.clone(),
-        outcome,
-        sequence: sequence as u64,
-        owner,
-    }))
+    Ok(Some((
+        HarvestCopyReceipt {
+            payload: decoded,
+            outcome,
+            sequence: sequence as u64,
+            owner,
+        },
+        payload,
+    )))
 }
 pub(super) fn capacity(c: &Connection, request: &HarvestCopyRequest) -> Result<(), LibraryError> {
     let count: i64 = c.query_row(

@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use uuid::Uuid;
-mod budget;
+pub(super) mod budget;
 mod client;
 pub use client::HarvestFactsClient;
 mod read;

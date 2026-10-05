@@ -36,6 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod capacity;
+mod historical;
 mod ownership;
 mod rejection;
 mod replay;
