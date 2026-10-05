@@ -50,6 +50,12 @@ impl SourceInput {
         }
     }
 }
+// Validated plan correlation only; original native observations must match it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ClaimStorage {
+    pub(super) device: u64,
+    pub(super) unit: u64,
+}
 /// Original requester and nonauthoritative participant/claim correlations for one source.
 pub struct SourcePreparation {
     pub(super) requester: SourceWalTransport,
@@ -57,7 +63,7 @@ pub struct SourcePreparation {
     pub(super) database_claim: super::super::AdmissionClaimId,
     pub(super) sidecar_claim: super::super::AdmissionClaimId,
     pub(super) input: SourceInput,
-    pub(super) database_device: Option<u64>,
+    pub(super) database_storage: Option<ClaimStorage>,
     pub(super) profile_acquisition: Option<uuid::Uuid>,
 }
 impl SourcePreparation {
@@ -76,7 +82,7 @@ impl SourcePreparation {
             database_claim,
             sidecar_claim,
             input,
-            database_device: None,
+            database_storage: None,
             profile_acquisition: None,
         }
     }

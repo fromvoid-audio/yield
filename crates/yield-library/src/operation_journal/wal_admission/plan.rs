@@ -3,6 +3,7 @@ use super::super::{
     AdmissionClaimInventory, FullCapacityAllocationClass as Class, FullCapacityPlan,
     ParticipantKind, ParticipantSet, UniversalCommandArgs,
 };
+use super::input::ClaimStorage;
 use super::{HandshakeBudget, HandshakeCredit, SourceInput, SourcePreparation};
 use crate::sample_sources::library::{GlobalPreparationRequest, GlobalWalPreparationClient};
 use blake3::Hasher;
@@ -51,7 +52,7 @@ pub struct WalPreparationInput {
     pub(super) sources: Vec<SourcePreparation>,
     pub(super) global: Option<(GlobalWalPreparationClient, GlobalPreparationRequest)>,
     pub(super) digest: [u8; 32],
-    pub(super) global_device: Option<u64>,
+    pub(super) global_storage: Option<ClaimStorage>,
     pub(super) deadline: Instant,
     pub(super) budget: Arc<HandshakeBudget>,
     pub(super) credit: HandshakeCredit,
@@ -180,7 +181,8 @@ fn topology_staging(
 fn claims_for_source(
     source: &SourcePreparation,
     claims: &AdmissionClaimInventory,
-) -> Result<u64, WalPreparationError> {
+    plan: &FullCapacityPlan,
+) -> Result<ClaimStorage, WalPreparationError> {
     let main = claims
         .claims()
         .iter()
@@ -198,7 +200,20 @@ fn claims_for_source(
     {
         return Err(WalPreparationError::InvalidInput);
     }
-    Ok(main.volume().device)
+    let allocation = |claim: &super::super::AdmissionClaim| {
+        plan.allocations()
+            .iter()
+            .find(|a| a.volume() == claim.volume() && a.class() == claim.allocation_class())
+            .ok_or(WalPreparationError::InvalidInput)
+    };
+    let main_unit = allocation(main)?.allocation_unit();
+    if allocation(side)?.allocation_unit() != main_unit {
+        return Err(WalPreparationError::InvalidInput);
+    }
+    Ok(ClaimStorage {
+        device: main.volume().device,
+        unit: main_unit,
+    })
 }
 impl WalPreparationInput {
     pub(in crate::operation_journal) fn deadline(&self) -> Instant {
@@ -271,7 +286,7 @@ impl WalPreparationInput {
                         .iter_mut()
                         .find(|source| source.participant == descriptor.id())
                         .ok_or_else(bad)?;
-                    source.database_device = Some(claims_for_source(source, claims)?);
+                    source.database_storage = Some(claims_for_source(source, claims, plan)?);
                     match (
                         &source.input,
                         descriptor.source_fence(),
@@ -361,23 +376,25 @@ impl WalPreparationInput {
         {
             return Err(bad());
         }
-        let global_device = if needs_global {
+        let global_storage = if needs_global {
             let main = plan
                 .allocations()
                 .iter()
                 .find(|a| a.class() == Class::GlobalDatabaseCommit)
-                .ok_or_else(bad)?
-                .volume()
-                .device;
+                .ok_or_else(bad)?;
+            let storage = ClaimStorage {
+                device: main.volume().device,
+                unit: main.allocation_unit(),
+            };
             if plan
                 .allocations()
                 .iter()
                 .filter(|a| matches!(a.class(), Class::GlobalDatabaseCommit | Class::GlobalWalShm))
-                .any(|a| a.volume().device != main)
+                .any(|a| a.volume().device != storage.device || a.allocation_unit() != storage.unit)
             {
                 return Err(bad());
             }
-            Some(main)
+            Some(storage)
         } else {
             None
         };
@@ -390,7 +407,7 @@ impl WalPreparationInput {
             matches!(args, UniversalCommandArgs::SourceRegistryRetirement(_)),
             Some((budget, credit)),
         )?;
-        input.global_device = global_device;
+        input.global_storage = global_storage;
         Ok(input)
     }
     /// Prepare one source-only metadata assignment scope from its complete genuine original
@@ -410,7 +427,7 @@ impl WalPreparationInput {
         claims
             .validate_against(plan)
             .map_err(|_| WalPreparationError::InvalidInput)?;
-        source.database_device = Some(claims_for_source(&source, claims)?);
+        source.database_storage = Some(claims_for_source(&source, claims, plan)?);
         if source.participant != args.participant_id() {
             return Err(WalPreparationError::InvalidInput);
         }
@@ -469,7 +486,7 @@ impl WalPreparationInput {
         claims
             .validate_against(plan)
             .map_err(|_| WalPreparationError::InvalidInput)?;
-        source.database_device = Some(claims_for_source(&source, claims)?);
+        source.database_storage = Some(claims_for_source(&source, claims, plan)?);
         if participants.descriptors().len() != 1 {
             return Err(WalPreparationError::InvalidInput);
         }
@@ -567,7 +584,7 @@ impl WalPreparationInput {
             sources,
             global,
             digest,
-            global_device: None,
+            global_storage: None,
             deadline,
             budget,
             credit,
