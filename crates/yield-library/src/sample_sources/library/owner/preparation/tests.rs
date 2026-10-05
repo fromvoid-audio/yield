@@ -150,7 +150,7 @@ fn preparation_busy_stale_and_bounds_do_not_change_metadata_or_context() {
         assert!(started.elapsed() < Duration::from_secs(1));
         external.execute_batch("ROLLBACK").unwrap();
         let stale = GlobalPreparationRequest::new(
-            GlobalPreparationOwner::new(ProfileAcquisitionId::test_only()),
+            GlobalPreparationOwner::new(ProfileAcquisitionId::test_only()).unwrap(),
             [7; 32],
             Instant::now() + Duration::from_secs(1),
             1,
@@ -409,6 +409,7 @@ fn preparation_retained_unknown_mode_and_rollback_denial_require_no_fake_complet
             guard,
             &lifecycle,
             writer.preparation_owner().registration(),
+            writer.preparation_owner().generation(),
             &mutation_fence::MutationFence::new()
         ));
         assert!(matches!(
@@ -463,6 +464,7 @@ fn preparation_retained_unknown_mode_and_rollback_denial_require_no_fake_complet
             guard,
             &lifecycle,
             writer.preparation_owner().registration(),
+            writer.preparation_owner().generation(),
             &mutation_fence::MutationFence::new()
         ));
         assert_eq!(
@@ -621,6 +623,7 @@ fn preparation_one_actual_begin_and_timeout_restore_with_no_row_or_checkpoint_sq
             guard,
             &lifecycle,
             writer.preparation_owner().registration(),
+            writer.preparation_owner().generation(),
             &mutation_fence::MutationFence::new()
         ));
         assert_eq!(
@@ -666,6 +669,7 @@ fn preparation_one_actual_begin_and_timeout_restore_with_no_row_or_checkpoint_sq
             guard,
             &lifecycle,
             writer.preparation_owner().registration(),
+            writer.preparation_owner().generation(),
             &mutation_fence::MutationFence::new()
         ));
         client.join().unwrap().unwrap();
@@ -816,6 +820,7 @@ fn original_global_empty_transaction_actual_worker_retires_changed_custody_after
                     guard,
                     &std::sync::atomic::AtomicU8::new(WriterLifecycle::Available as u8),
                     writer.preparation_owner().registration(),
+                    writer.preparation_owner().generation(),
                     &mutation_fence::MutationFence::new()
                 ),
                 "changed custody cannot return the original writer for reuse"
@@ -840,5 +845,54 @@ fn original_global_empty_transaction_actual_worker_retires_changed_custody_after
                 0
             );
         }
+    });
+}
+
+#[test]
+fn global_registration_generation_refuses_zero_exhaustion_and_numeric_overflow() {
+    let zero = AtomicU64::new(0);
+    assert!(matches!(
+        issue_registration_generation(&zero),
+        Err(GlobalLibraryWriterStartError::RegistrationGenerationExhausted)
+    ));
+    assert_eq!(zero.load(Ordering::Relaxed), 0);
+    let last = AtomicU64::new(i64::MAX as u64);
+    assert_eq!(
+        issue_registration_generation(&last).unwrap(),
+        i64::MAX as u64
+    );
+    for _ in 0..2 {
+        assert!(matches!(
+            issue_registration_generation(&last),
+            Err(GlobalLibraryWriterStartError::RegistrationGenerationExhausted)
+        ));
+        assert_eq!(last.load(Ordering::Relaxed), i64::MAX as u64 + 1);
+    }
+    let overflow = AtomicU64::new(u64::MAX);
+    assert!(matches!(
+        issue_registration_generation(&overflow),
+        Err(GlobalLibraryWriterStartError::RegistrationGenerationExhausted)
+    ));
+    assert_eq!(overflow.load(Ordering::Relaxed), u64::MAX);
+}
+
+#[test]
+fn original_worker_rejects_foreign_generation_with_same_registration_before_acquisition() {
+    fixture(|writer, guard, _| {
+        let mut original = request(writer, Duration::from_secs(1));
+        original.owner.generation = original.owner.generation.checked_add(1).unwrap();
+        let outside = external(guard);
+        outside.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let refusal = writer
+            .submit_preparation(original)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .err()
+            .expect("foreign generation refused");
+        assert_eq!(refusal, GlobalPreparationError::StaleOwner);
+        outside.execute_batch("ROLLBACK").unwrap();
+        empty(writer);
+        release(reserve(writer, Duration::from_secs(1)));
     });
 }

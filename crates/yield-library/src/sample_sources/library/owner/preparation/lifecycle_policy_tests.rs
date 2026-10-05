@@ -181,6 +181,7 @@ mod integration {
                 guard,
                 &lifecycle,
                 writer.preparation_owner().registration(),
+                writer.preparation_owner().generation(),
                 &mutation_fence::MutationFence::new()
             ));
             assert!(matches!(
@@ -199,6 +200,7 @@ mod integration {
                 guard,
                 &lifecycle,
                 writer.preparation_owner().registration(),
+                writer.preparation_owner().generation(),
                 &mutation_fence::MutationFence::new()
             ));
             assert_eq!(
@@ -255,6 +257,7 @@ mod integration {
                     guard,
                     &lifecycle,
                     writer.preparation_owner().registration(),
+                    writer.preparation_owner().generation(),
                     &mutation_fence::MutationFence::new()
                 ));
                 assert_eq!(
@@ -327,6 +330,7 @@ mod integration {
                 guard,
                 &lifecycle,
                 writer.preparation_owner().registration(),
+                writer.preparation_owner().generation(),
                 &mutation_fence::MutationFence::new()
             ));
             assert_eq!(

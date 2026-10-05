@@ -83,10 +83,15 @@ impl GlobalWalObjectObservation<'_> {
 #[derive(Debug, Eq, PartialEq)]
 pub struct GlobalWalScope {
     objects: WalObjects,
+    root_identity: String,
     bytes: Box<[u8; DESCRIPTOR_MAX_BYTES]>,
     encoded_len: usize,
 }
 impl GlobalWalScope {
+    /// Original descriptor-bound database root, never a caller pathname or ownership grant.
+    pub fn root_identity(&self) -> &str {
+        &self.root_identity
+    }
     /// Original retained MAIN object.
     pub fn main(&self) -> GlobalWalObjectObservation<'_> {
         GlobalWalObjectObservation(&self.objects.main)
@@ -127,6 +132,8 @@ struct Descriptor<'a> {
     version: u8,
     acquisition: &'a str,
     registration: uuid::Uuid,
+    registration_generation: u64,
+    root_identity: &'a str,
     preparation_nonce: uuid::Uuid,
     command_digest: &'a [u8; 32],
     mutation_revision: u64,
@@ -208,6 +215,13 @@ pub(super) fn capture(
             }
         }
     }
+    let root_identity = database
+        .preparation_root()
+        .ok_or(GlobalPreparationError::DatabaseBinding)?
+        .identity();
+    if root_identity.len() > 256 {
+        return Err(GlobalPreparationError::InputBound);
+    }
     // One fixed encoding buffer, with no grow/shrink copy and no separate cloned descriptor.
     let mut output = Output {
         bytes: Box::new([0; DESCRIPTOR_MAX_BYTES]),
@@ -219,6 +233,8 @@ pub(super) fn capture(
             version: 1,
             acquisition,
             registration: request.owner.registration,
+            registration_generation: request.owner.generation,
+            root_identity,
             preparation_nonce: nonce,
             command_digest: &request.command_digest,
             mutation_revision,
@@ -230,6 +246,7 @@ pub(super) fn capture(
     .map_err(|_| GlobalPreparationError::InputBound)?;
     let scope = GlobalWalScope {
         objects: observed,
+        root_identity: root_identity.into(),
         bytes: output.bytes,
         encoded_len: output.len,
     };
@@ -244,7 +261,11 @@ pub(super) fn validate(
     if Instant::now() >= deadline {
         return Err(GlobalPreparationError::Deadline);
     }
-    if objects(database, deadline)? != scope.objects {
+    if database
+        .preparation_root()
+        .is_none_or(|root| root.identity() != scope.root_identity)
+        || objects(database, deadline)? != scope.objects
+    {
         return Err(GlobalPreparationError::DatabaseBinding);
     }
     if Instant::now() >= deadline {
@@ -306,6 +327,7 @@ impl SharedHandshakeCredit {
         let bytes = [
             DESCRIPTOR_MAX_BYTES,
             objects,
+            scope.root_identity.capacity(),
             lifecycle,
             data.database_identity.capacity(),
             data.owner.acquisition.as_str().len(),

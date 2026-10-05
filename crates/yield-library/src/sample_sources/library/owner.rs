@@ -295,6 +295,9 @@ impl GlobalLibraryWriterQueueError {
 /// Failure to start a profile-owned global-library worker.
 #[derive(Debug, Error)]
 pub enum GlobalLibraryWriterStartError {
+    /// The checked registration counter cannot issue another worker within its numeric domain.
+    #[error("global writer registration generation exhausted")]
+    RegistrationGenerationExhausted,
     /// The supplied profile capability was no longer valid before handoff.
     #[error(transparent)]
     ProfileOwnership(#[from] ProfileOwnershipError),
@@ -649,6 +652,7 @@ type DatabaseHook = Arc<dyn Fn(&rusqlite::Connection) + Send + Sync>;
 
 struct OwnerHooks {
     preparation_registration: uuid::Uuid,
+    preparation_generation: u64,
     initialization_gate: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
     binding_open_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
@@ -763,8 +767,9 @@ impl GlobalLibraryWriter {
         #[cfg(test)] mutation_revision_seed: Option<u64>,
     ) -> Result<Self, GlobalLibraryWriterStartError> {
         let preparation_owner =
-            GlobalPreparationOwner::new(ProfileAcquisitionId::from_guard(profile_guard));
+            GlobalPreparationOwner::new(ProfileAcquisitionId::from_guard(profile_guard))?;
         let preparation_registration = preparation_owner.registration();
+        let preparation_generation = preparation_owner.generation();
         let global_writer_lease = profile_guard.acquire_named_lease("library.db")?;
         let worker_profile_guard = profile_guard.try_clone()?;
         let (commands, command_rx) = mpsc::sync_channel(GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY);
@@ -794,6 +799,7 @@ impl GlobalLibraryWriter {
                     worker_unavailable,
                     OwnerHooks {
                         preparation_registration,
+                        preparation_generation,
                         initialization_gate,
                         #[cfg(test)]
                         binding_open_gate,
@@ -899,7 +905,8 @@ impl GlobalLibraryWriter {
         let (commands, blocked_receiver) =
             mpsc::sync_channel(GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY);
         Self {
-            preparation_owner: GlobalPreparationOwner::new(ProfileAcquisitionId::test_only()),
+            preparation_owner: GlobalPreparationOwner::new(ProfileAcquisitionId::test_only())
+                .unwrap(),
             preparation_binding_budget: Arc::default(),
             acquisition: ProfileAcquisitionId::test_only(),
             commands: Arc::new(Mutex::new(Some(commands))),
@@ -1608,6 +1615,7 @@ fn run_owner(
                     &profile_guard,
                     &lifecycle,
                     hooks.preparation_registration,
+                    hooks.preparation_generation,
                     &mutation_fence,
                 ) {
                     let _admission = admission_gate.lock().unwrap_or_else(|p| p.into_inner());
