@@ -84,7 +84,14 @@ impl OperationJournalStore {
         if !(512..=65536).contains(&page_size) || !(page_size as u64).is_power_of_two() {
             return Err(error("unknown SQLite page size"));
         }
-        let pages = MAX_RECORDING_JOURNAL_DATABASE_BYTES / page_size as u64;
+        let existing: i64 = self
+            .connection
+            .query_row("PRAGMA max_page_count", [], |r| r.get(0))?;
+        if existing <= 0 {
+            return Err(error("unknown existing SQLite growth limit"));
+        }
+        // Recording may tighten the original owner's policy, never enlarge it.
+        let pages = (MAX_RECORDING_JOURNAL_DATABASE_BYTES / page_size as u64).min(existing as u64);
         let enforced: i64 =
             self.connection
                 .query_row(&format!("PRAGMA max_page_count={pages}"), [], |r| r.get(0))?;
