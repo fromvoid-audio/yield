@@ -66,3 +66,29 @@ bash scripts/agent.sh preflight
 Actual macOS/Windows CPAL devices and native callback/Stop/Drop lifecycle are
 pending in OPT-2066/2067. These Linux transport tests qualify no device, physical
 capacity, journal inventory, publication or power-loss behavior.
+
+## Device-independent producer and owner-facing types (OPT-2294)
+
+Reson's default `native-audio` feature keeps existing input, monitoring and
+playback behavior enabled. With `default-features = false`, the actual bounded
+WAV serializer, sink binding, sample accounting, pending-tail/final-header
+inventory and private terminal proofs are available without CPAL, ALSA or Windows
+ASIO. This lets the journal owner retain the genuine nominal producer types;
+it does not replace them with a parallel model or data-only receipt.
+
+`recording::RecordingProducer` consumes the original `RecordingSinkBinding` and
+runs the same worker as native capture. CPU sample submission uses its bounded
+ring and accounting. Stop/Cancel close submission and join through the original
+pre-finalize owner acknowledgement; owner denial cannot emit successful joined
+evidence. The owner must handle the paired settlements separately from the
+blocking Stop/join caller. Drop uses the existing protected cancellation/join
+path and cannot manufacture a joined proof.
+
+Producer-only checks include `cargo test --locked -p reson --no-default-features
+--lib`, its proof privacy doctests, and a real Windows GNU all-test compile.
+The dependency tree in that configuration excludes native device SDKs. Default
+native-audio tests still cover the original recorder/monitor/playback routes.
+Neither configuration qualifies an arbitrary transport as an admitted physical
+sink or activates recording in GPUI. OPT-2145 still requires the actual private
+sink/source/profile/claim/capacity association and Finalizing/Frozen/seal owner
+integration; OPT-2058 retains physical transport/publication/retirement scope.

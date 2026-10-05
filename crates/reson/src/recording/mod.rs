@@ -1,24 +1,36 @@
 //! Audio recording pipeline and monitoring utilities.
 
+#[cfg(feature = "native-audio")]
 mod capture;
 mod health;
+#[cfg(feature = "native-audio")]
 mod monitor;
+mod producer;
 mod settlement;
 mod writer;
+pub use producer::{RecordingProducer, RecordingProducerOutcome};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-audio"))]
 mod sink_contract_tests;
 
+#[cfg(feature = "native-audio")]
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "native-audio")]
 use cpal::Stream;
+#[cfg(feature = "native-audio")]
 use cpal::traits::StreamTrait;
 
+#[cfg(feature = "native-audio")]
 use super::input::{AudioInputConfig, AudioInputError, ResolvedInput};
+#[cfg(feature = "native-audio")]
 use std::sync::Arc;
 
+#[cfg(feature = "native-audio")]
 use health::RecordingHealthState;
+#[cfg(feature = "native-audio")]
 use monitor::RecordingMonitor;
+#[cfg(feature = "native-audio")]
 use writer::RecorderWriter;
 
 pub use health::RecordingHealth;
@@ -30,6 +42,7 @@ pub use settlement::{
 pub use writer::{RecordingLimits, RecordingPrefixState, RecordingSink};
 
 /// Summary returned when a recording completes.
+#[cfg(feature = "native-audio")]
 pub struct RecordingOutcome {
     /// Diagnostic target locator; codec completion does not prove publication or reopen it.
     pub path: PathBuf,
@@ -46,6 +59,7 @@ pub struct RecordingOutcome {
 }
 
 /// Active audio recorder that streams samples to a WAV file.
+#[cfg(feature = "native-audio")]
 pub struct AudioRecorder {
     stream: Option<Stream>,
     writer: Option<RecorderWriter>,
@@ -56,6 +70,7 @@ pub struct AudioRecorder {
     active: bool,
 }
 
+#[cfg(feature = "native-audio")]
 impl AudioRecorder {
     /// Unadmitted pathname startup is unsupported and never opens/truncates an output.
     /// Use an already retained sink through the app's actual owner/admission adapter.
@@ -196,9 +211,10 @@ impl AudioRecorder {
     }
 }
 
+#[cfg(feature = "native-audio")]
 pub use monitor::InputMonitor;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-audio"))]
 mod tests {
     use super::*;
     use tempfile::tempdir;
