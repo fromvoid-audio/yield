@@ -1,4 +1,5 @@
 //! One original journal actor polls original owners; no SQLite connection crosses this route.
+use super::input::ClaimStorage;
 use super::{HandshakeCredit, WalPreparationError, WalPreparationInput};
 use crate::sample_sources::{
     library::{
@@ -140,7 +141,7 @@ enum PendingOwner {
     Source {
         request: SourceWalTransportRequest,
         expected: SourceWalTransportCorrelation,
-        device: u64,
+        storage: ClaimStorage,
     },
 }
 enum Releasing {
@@ -279,7 +280,10 @@ impl Collector {
                             != Some(self.profile_acquisition)
                             || observation.command_digest() != &self.input.digest
                             || observation.wal_scope().is_none_or(|scope| {
-                                Some(scope.main().device()) != self.input.global_device
+                                Some(ClaimStorage {
+                                    device: scope.main().device(),
+                                    unit: scope.main().allocation_unit(),
+                                }) != self.input.global_storage
                             })
                             || self.input.sources.iter().any(|source| {
                                 source.input.database_identity() == observation.database_identity()
@@ -295,13 +299,13 @@ impl Collector {
                 PendingOwner::Source {
                     mut request,
                     expected,
-                    device,
+                    storage,
                 } => match request.status() {
                     SourceWalTransportStatus::Pending | SourceWalTransportStatus::Aborting => {
                         self.awaiting = Some(PendingOwner::Source {
                             request,
                             expected,
-                            device,
+                            storage,
                         });
                         return false;
                     }
@@ -309,7 +313,8 @@ impl Collector {
                         if !observation.registered_custody_was_retained()
                             || observation.correlation() != &expected
                             || observation.original_binding().is_none_or(|binding| {
-                                binding.main().device() != device
+                                binding.main().device() != storage.device
+                                    || binding.main().allocation_unit() != storage.unit
                                     || binding.subject().profile_acquisition()
                                         != self.profile_acquisition
                             })
@@ -319,7 +324,7 @@ impl Collector {
                             self.awaiting = Some(PendingOwner::Source {
                                 request,
                                 expected,
-                                device,
+                                storage,
                             });
                             self.fail(WalPreparationError::InvalidInput);
                             return self.poll_abort();
@@ -335,7 +340,12 @@ impl Collector {
                                 .original_binding()
                                 .stored_fence()
                                 .database_device()
-                                != device
+                                != storage.device
+                            || observation
+                                .original_binding()
+                                .stored_fence()
+                                .allocation_unit()
+                                != storage.unit
                             || observation
                                 .original_binding()
                                 .stored_fence()
@@ -354,7 +364,7 @@ impl Collector {
                             self.awaiting = Some(PendingOwner::Source {
                                 request,
                                 expected,
-                                device,
+                                storage,
                             });
                             self.fail(WalPreparationError::InvalidInput);
                             return self.poll_abort();
@@ -369,7 +379,7 @@ impl Collector {
                         self.awaiting = Some(PendingOwner::Source {
                             request,
                             expected,
-                            device,
+                            storage,
                         });
                         self.fail(WalPreparationError::Source(error));
                         return self.poll_abort();
@@ -408,8 +418,8 @@ impl Collector {
                 self.fail(WalPreparationError::InvalidInput);
                 return self.poll_abort();
             }
-            let device = source
-                .database_device
+            let storage = source
+                .database_storage
                 .expect("original validated claim volume");
             let correlation = match SourceWalTransportCorrelation::new(
                 self.input.digest,
@@ -435,7 +445,7 @@ impl Collector {
                         self.awaiting = Some(PendingOwner::Source {
                             request,
                             expected: correlation,
-                            device,
+                            storage,
                         });
                         self.fail(WalPreparationError::Full);
                         return self.poll_abort();
@@ -445,7 +455,7 @@ impl Collector {
                         self.awaiting = Some(PendingOwner::Source {
                             request,
                             expected: correlation,
-                            device,
+                            storage,
                         });
                         self.fail(WalPreparationError::Full);
                         return self.poll_abort();
@@ -453,7 +463,7 @@ impl Collector {
                     self.awaiting = Some(PendingOwner::Source {
                         request,
                         expected: correlation,
-                        device,
+                        storage,
                     });
                     return false;
                 }

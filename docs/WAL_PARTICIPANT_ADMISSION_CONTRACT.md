@@ -775,3 +775,22 @@ remains open for the second connection, then confirms final close releases it.
 This fixes original descriptor lifetime; it does not qualify physical capacity,
 issue a WAL commit/publication permit, complete settlement, or replace native
 macOS/Windows SDK and runtime qualification.
+
+## Native allocation-unit correlation (OPT-2321)
+
+The original collector derives one private device/unit correlation from each
+validated source claim pair and its exact plan classes, and from the global
+allocation classes. Every genuine source/global reply must match both native
+facts before Ready. Audited/tag/layout replies compare their original native MAIN
+unit; pre-audit lease replies compare the original captured lease binding. Original
+scope validation already requires MAIN/WAL/SHM units and devices to agree. A
+well-formed logical plan with a different power-of-two unit cannot substitute for
+this native check.
+
+Real SQLite regressions reproduced prior wrong-unit Ready publication for the
+global-first and source-only pre-audit routes. They now require InvalidInput,
+confirmed original cleanup, zero identity allocation and released context; the
+audited tag/layout fixtures cover the same refusal and preserve normal preparation.
+The private correlation has no public positive factory and supplies no physical
+qualification, allocation guarantee, decision latch, permit or settlement. Claim
+and wire formats, original deadlines, alias checks and shared ceilings are unchanged.

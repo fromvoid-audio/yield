@@ -1277,8 +1277,87 @@ mod integration {
             );
         }
     }
+    fn mismatched_unit_plan(plan: &FullCapacityPlan) -> FullCapacityPlan {
+        FullCapacityPlan::new(
+            plan.allocations()
+                .iter()
+                .map(|allocation| {
+                    let unit = allocation.allocation_unit();
+                    let wrong = if unit > 1 { unit / 2 } else { 2 };
+                    FullCapacityAllocation::new(
+                        allocation.volume().clone(),
+                        wrong,
+                        allocation.class(),
+                        allocation.allocated_bytes(),
+                        allocation.allocated_bytes(),
+                        PROTECTED_FREE_SPACE_FLOOR,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn all_owner_native_global_unit_mismatch_refuses_original_prefix_without_identity() {
+        let rig = Rig::new("all-owner-global-unit");
+        let (args, participants, ids) = command(&rig.fixture, &rig.revisions);
+        let (plan, claims, main, side) = plan(&rig.fixture);
+        let plan = mismatched_unit_plan(&plan);
+        let sources = (0..2)
+            .map(|i| {
+                WalPreparationSource::new(
+                    rig.requester.clone(),
+                    ids[i],
+                    main,
+                    side,
+                    SourceWalPreparationInput::Audited(rig.revisions[i].clone()),
+                )
+            })
+            .collect();
+        let input = WalPreparationInput::from_universal(
+            &args,
+            &participants,
+            &plan,
+            &claims,
+            sources,
+            Some(rig.global.wal_preparation_client()),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        let budget = input.budget_for_test();
+        let handle = rig.submit(input);
+        let result = wait(&handle, |status| {
+            matches!(status, WalPreparationStatus::Ready(_)) || terminal(status)
+        });
+        assert!(
+            matches!(
+                result,
+                WalPreparationStatus::Rejected(WalPreparationError::InvalidInput)
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            rig.journal
+                .prepared_admission_id_allocations
+                .load(Ordering::Relaxed),
+            0
+        );
+        drop(handle);
+        drop(rig);
+        assert_eq!(budget.used(), 0);
+    }
+
     #[test]
     fn all_owner_real_pre_audit_lease_input_stays_distinct_and_aborts_original_writer() {
+        original_lease_unit_fixture(false);
+    }
+    #[test]
+    fn all_owner_native_lease_unit_mismatch_refuses_actual_original_source_without_identity() {
+        original_lease_unit_fixture(true);
+    }
+    fn original_lease_unit_fixture(wrong_unit: bool) {
         let (fixture, mut journal) = open_owner("all-owner-preaudit");
         let media = fixture._base.path().join("pre-audit");
         fs::create_dir(&media).unwrap();
@@ -1314,6 +1393,11 @@ mod integration {
         )
         .unwrap();
         let (plan, claims, main, side) = plan(&fixture);
+        let plan = if wrong_unit {
+            mismatched_unit_plan(&plan)
+        } else {
+            plan
+        };
 
         let input = WalPreparationInput::from_lease_scope(
             &participants,
@@ -1329,6 +1413,7 @@ mod integration {
             deadline,
         )
         .unwrap();
+        let budget = input.budget_for_test();
         let handle = journal
             .client()
             .prepare_wal_owners(input)
@@ -1336,6 +1421,29 @@ mod integration {
             .recv_timeout(Duration::from_secs(3))
             .unwrap()
             .unwrap();
+        if wrong_unit {
+            let result = wait(&handle, |status| {
+                matches!(status, WalPreparationStatus::Ready(_)) || terminal(status)
+            });
+            assert!(
+                matches!(
+                    result,
+                    WalPreparationStatus::Rejected(WalPreparationError::InvalidInput)
+                ),
+                "{result:?}"
+            );
+            assert_eq!(
+                journal
+                    .prepared_admission_id_allocations
+                    .load(Ordering::Relaxed),
+                0
+            );
+            drop(handle);
+            drop(actor);
+            assert!(journal.shutdown());
+            assert_eq!(budget.used(), 0);
+            return;
+        }
         let WalPreparationStatus::Ready(view) = wait(&handle, |s| {
             matches!(s, WalPreparationStatus::Ready(_)) || terminal(s)
         }) else {
@@ -1730,7 +1838,7 @@ mod integration {
         };
         use crate::sample_sources::wal_transport::SourceWalPolicyFamily;
         use crate::sample_sources::{SourceCommandId, SourceTagAssignmentMutation};
-        for layout in [false, true] {
+        for (layout, wrong_unit) in [(false, false), (true, false), (false, true), (true, true)] {
             let (fixture, mut journal) = open_owner(if layout {
                 "all-owner-layout"
             } else {
@@ -1744,6 +1852,11 @@ mod integration {
             let revision = writer.current_revision().unwrap();
             let participant = ParticipantId::new();
             let (plan, claims, main, side) = plan(&fixture);
+            let plan = if wrong_unit {
+                mismatched_unit_plan(&plan)
+            } else {
+                plan
+            };
             let (requester, inbox) = SourceWalTransport::channel();
             let input = if layout {
                 let cancel = AtomicBool::new(false);
@@ -1854,6 +1967,28 @@ mod integration {
                 .recv_timeout(Duration::from_secs(3))
                 .unwrap()
                 .unwrap();
+            if wrong_unit {
+                let result = wait(&handle, |status| {
+                    matches!(status, WalPreparationStatus::Ready(_)) || terminal(status)
+                });
+                assert!(
+                    matches!(
+                        result,
+                        WalPreparationStatus::Rejected(WalPreparationError::InvalidInput)
+                    ),
+                    "layout={layout} {result:?}"
+                );
+                assert_eq!(
+                    journal
+                        .prepared_admission_id_allocations
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                drop(handle);
+                drop(actor);
+                assert!(journal.shutdown());
+                continue;
+            }
             let WalPreparationStatus::Ready(view) = wait(&handle, |s| {
                 matches!(s, WalPreparationStatus::Ready(_)) || terminal(s)
             }) else {
