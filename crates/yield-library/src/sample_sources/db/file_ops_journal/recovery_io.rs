@@ -30,6 +30,8 @@ use crate::timestamps::system_time_to_unix_nanos;
 use super::super::{DatabaseRootBindingGuard, SourceDatabase};
 
 #[cfg(any(windows, test))]
+mod windows_final_namespace;
+#[cfg(any(windows, test))]
 mod windows_observation;
 
 /// Result of a descriptor-bound staged publication.
@@ -1579,36 +1581,31 @@ fn windows_database_root_binding(
 
 #[cfg(windows)]
 fn windows_final_path(capability: &fs::File) -> Result<PathBuf, BoundDatabaseRootError> {
-    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+    use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
 
-    let mut buffer = vec![0u16; 256];
-    loop {
+    let mut buffer = [0u16; windows_final_namespace::BUFFER_UNITS];
+    let wide = windows_final_namespace::capture(&mut buffer, |buffer| {
+        // The original borrowed handle stays live. One call; never retry or grow
+        // backing from a native required-length response or reopen a pathname.
         let length = unsafe {
-            GetFinalPathNameByHandleW(
-                HANDLE(capability.as_raw_handle()),
-                &mut buffer,
-                VOLUME_NAME_DOS,
-            )
+            GetFinalPathNameByHandleW(HANDLE(capability.as_raw_handle()), buffer, VOLUME_NAME_DOS)
         };
         if length == 0 {
-            return Err(BoundDatabaseRootError::Unavailable {
-                path: PathBuf::from("<descriptor>"),
-                reason: format!(
-                    "failed to derive final source-root namespace from its open descriptor: {}",
-                    std::io::Error::last_os_error()
-                ),
-            });
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(length)
         }
-        let length = length as usize;
-        if length < buffer.len() {
-            return Ok(PathBuf::from(std::ffi::OsString::from_wide(
-                &buffer[..length],
-            )));
-        }
-        buffer.resize(length + 1, 0);
-    }
+    })
+    .map_err(|error| BoundDatabaseRootError::Unavailable {
+        path: PathBuf::from("<descriptor>"),
+        reason: format!("bounded original source-root namespace query refused: {error}"),
+    })?;
+    windows_final_namespace::into_path(wide).map_err(|error| BoundDatabaseRootError::Unavailable {
+        path: PathBuf::from("<descriptor>"),
+        reason: format!("bounded original source-root namespace conversion refused: {error}"),
+    })
 }
 
 pub(super) fn capture_root_identity(path: &Path) -> io::Result<String> {

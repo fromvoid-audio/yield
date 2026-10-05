@@ -497,3 +497,33 @@ OPT-2215 remains open for actual slots, exact source/target/charge association,
 qualified namespace allocation, mutation/release/retirement fences, bounded
 completion and settlement. Native provider and physical qualification remain
 separate acceptance.
+
+## Bounded original Windows namespace queries (OPT-2290)
+
+The existing retained-root helper queries `GetFinalPathNameByHandleW` once on the
+original borrowed handle. It uses a fixed 4,097-unit UTF-16 buffer (8,194 bytes),
+including the terminator, and never retries or resizes from a native required
+length. Zero, oversized/required-capacity results and interior NULs refuse before
+path allocation. The complete returned namespace, including its prefix, must fit
+both 4,096 UTF-16 units and the existing 4,096 encoded-byte readonly-root limit.
+
+Lossless Windows `OsString` conversion preserves paired and unpaired native
+surrogates. The helper checks the exact encoded size first, shrinks conversion
+slack and then checks the actual retained capacity before producing a `PathBuf`;
+a result that cannot meet the capacity bound refuses. Fixed query backing and
+bounded conversion inputs replace unbounded native-controlled allocation/work.
+All original profile/source/recovery/readonly callers retain their existing
+object identity, alias validation and delete-sharing barriers. No pathname
+reopen, truncated namespace or fallback supplies an observation or permission.
+
+Portable tests exercise the production one-call and record validation algorithm,
+including extreme required lengths, exact ASCII/Unicode backing boundaries and
+unpaired native units. Genuine Windows harnesses verify the original directory
+query/alias identity, retained-clone consistency, delete-sharing barrier and
+native path conversion/capacity, and actual oversized original-directory
+namespace refusal without fallback. Compilation does not execute those harnesses;
+actual supported Windows runtime verification remains OPT-2284.
+
+This bounded query supplies no private lifetime-slot issuer, native reserve
+qualification, effect entry, held-object publication, charge release or genuine
+settlement. Full OPT-2215/2216/2218/2219 and tracking acceptance remain open.
