@@ -360,6 +360,8 @@ impl LibraryDatabase {
         let receipt = read_receipt(&tx, request)?.ok_or(LibraryError::ReferenceMalformedReceipt)?;
         request.validate_sources(true)?;
         tx.commit()?;
+        // The new immutable receipt committed even if postcommit source validation fails.
+        self.note_reference_participant_commit();
         if request.validate_sources(true).is_err() {
             return Err(LibraryError::ReferenceCommitUncertain);
         }

@@ -4,6 +4,10 @@ use crate::operation_journal::work_plan::{WorkUnitKey, WorkUnitRole};
 use crate::operation_journal::{OperationId, ParticipantId, StoredRelativePath};
 use crate::sample_sources::{SourceDatabase, SourceWriter};
 
+#[cfg(test)]
+#[path = "reference_owner_tests/wal_maintenance.rs"]
+mod wal_maintenance;
+
 struct ReferenceFixture {
     global: Option<GlobalLibraryWriter>,
     origin: Option<SourceWriter>,
@@ -184,7 +188,10 @@ fn reference_owner_lost_reply_self_endpoints_old_key_reuse_and_restart() {
     let dispatch_revision = f.global().observed_mutation_revision_for_test();
     drop(f.global().apply_reference_rekey(request.clone()).unwrap());
     let replay = f.apply(request.clone()).unwrap();
-    assert_eq!(f.global().observed_mutation_revision_for_test(), dispatch_revision + 2);
+    assert_eq!(
+        f.global().observed_mutation_revision_for_test(),
+        dispatch_revision + 2
+    );
     assert!(matches!(replay, ReferenceRekeyResult::Replayed(_)));
     assert_eq!(
         replay.receipt().disposition(),

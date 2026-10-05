@@ -36,6 +36,11 @@ impl LibraryDatabase {
         self.ordinary_wal_maintenance.committed.set(true);
     }
 
+    /// A new reference receipt commits even when its disposition retains the old references.
+    pub(super) fn note_reference_participant_commit(&self) {
+        self.ordinary_wal_maintenance.committed.set(true);
+    }
+
     #[cfg(test)]
     pub(in crate::sample_sources::library) fn ordinary_commit_pending_for_test(&self) -> bool {
         self.ordinary_wal_maintenance.committed.get()
