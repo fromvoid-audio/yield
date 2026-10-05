@@ -47,30 +47,8 @@ fn known_schema(database: &LibraryDatabase) -> Result<(), LifecycleAllocationErr
     validate_bounded_runtime(connection, &expected.1).map_err(|_| Unknown)?;
     Ok(())
 }
-fn counts(database: &LibraryDatabase) -> Result<(u64, u64, u64), LifecycleAllocationError> {
-    use LifecycleAllocationError::Unknown;
-    let read = |sql| {
-        database
-            .connection
-            .query_row(sql, [], |r| r.get::<_, u64>(0))
-            .map_err(|_| Unknown)
-    };
-    let references =
-        read("SELECT count(*) FROM (SELECT 1 FROM source_lifecycle_references LIMIT 8193)")?;
-    let receipts = read(
-        "SELECT count(*) FROM (SELECT 1 FROM source_lifecycle_reference_receipts LIMIT 8193)",
-    )?;
-    if references > 8192 || receipts > 8192 {
-        return Err(Unknown);
-    }
-    let active = read(
-        "SELECT count(*) FROM (SELECT 1 FROM source_lifecycle_references WHERE state IN ('Enrolled','Draining') LIMIT 4097)",
-    )?;
-    if active > 4096 {
-        return Err(Unknown);
-    }
-    Ok((references, receipts, active))
-}
+mod row_shapes;
+use row_shapes::counts;
 impl LibraryDatabase {
     pub(super) fn capture_lifecycle_allocation(
         &self,
