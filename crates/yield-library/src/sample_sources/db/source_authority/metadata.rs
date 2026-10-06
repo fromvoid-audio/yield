@@ -45,6 +45,15 @@ impl SourceAuthorityRegistrationRequest {
         ] {
             bytes = bytes.checked_add(identity.len())?;
         }
+        // Both possible original source ancestors are cloned into actor volume custody before
+        // acquisition effects. Their inline headers are already in SourceVolumeBinding; reserve
+        // their explicit retained backing here before consuming the confirmation.
+        for root in [&request.media_root, &request.database_root] {
+            bytes = bytes.checked_add(
+                root.current_metadata_bytes()?
+                    .checked_sub(std::mem::size_of::<BoundDatabaseRoot>())?,
+            )?;
+        }
         Some(bytes)
     }
 }

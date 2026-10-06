@@ -1081,6 +1081,8 @@ struct SourceVolumeBinding {
     reserve: Option<OwnedReserveAllocation>,
     #[allow(dead_code)]
     owner: Option<VolumeOwnershipCapability>,
+    // Original selected source ancestor closes after all native children and ownership backing.
+    _current_root: Option<crate::sample_sources::db::BoundDatabaseRoot>,
     allocation_unit: Option<u64>,
     readiness: SourceVolumeBindingReadiness,
     registrations: BTreeSet<crate::sample_sources::db::SourceRegistrationId>,
@@ -3363,6 +3365,7 @@ impl OwnerRuntime {
                 .or_insert_with(|| SourceVolumeBinding {
                     reserve: None,
                     owner: None,
+                    _current_root: None,
                     allocation_unit: None,
                     readiness: SourceVolumeBindingReadiness::Incomplete,
                     registrations: BTreeSet::new(),
@@ -3431,6 +3434,30 @@ impl OwnerRuntime {
                 return self.retain_source_recovery(
                     registration_id,
                     "before-volume-ownership",
+                    error.to_string(),
+                    proof.take(),
+                );
+            }
+            let original_root = match root.try_clone_for_owned_capability() {
+                Ok(root) => root,
+                Err(error) => {
+                    return self.retain_source_recovery(
+                        registration_id,
+                        "volume-ancestor-retention",
+                        error.to_string(),
+                        proof.take(),
+                    );
+                }
+            };
+            self.source_volumes
+                .get_mut(&volume)
+                .expect("source volume placeholder was inserted")
+                ._current_root = Some(original_root);
+            // The readonly clone must not extend the original confirmation deadline.
+            if let Err(error) = scope.validate_for_bootstrap() {
+                return self.retain_source_recovery(
+                    registration_id,
+                    "after-volume-ancestor-retention",
                     error.to_string(),
                     proof.take(),
                 );
@@ -7283,6 +7310,23 @@ mod tests {
             response,
             Err(OperationJournalOwnerError::SourceAuthorityConflict { .. })
         ));
+        // The result is sent before the registration closure is destroyed. A second real
+        // worker command runs only after that closure has dropped. This test-only control
+        // routing of a readonly point lookup leaves the measured ordinary credit unchanged.
+        let barrier = client
+            .submit_control(CONTROL_INPUT_BYTES, |input, result| JournalCommand::Get {
+                operation_id: OperationId::new(),
+                input,
+                result,
+            })
+            .expect("actual worker barrier");
+        assert!(
+            barrier
+                .recv_timeout(Duration::from_secs(2))
+                .expect("barrier reply")
+                .expect("readonly barrier")
+                .is_none()
+        );
         assert_eq!(
             client.shared.input_bytes.lock().expect("budget").remaining[0],
             ordinary_before
@@ -7506,6 +7550,7 @@ mod tests {
                         volume.clone(),
                         SourceVolumeBinding {
                             _current_input: None,
+                            _current_root: None,
                             owner: None,
                             reserve: None,
                             allocation_unit: Some(1),
@@ -8179,6 +8224,7 @@ mod tests {
             invalid_volume,
             SourceVolumeBinding {
                 _current_input: None,
+                _current_root: None,
                 owner: None,
                 reserve: None,
                 allocation_unit: Some(4096),
@@ -8552,6 +8598,7 @@ mod tests {
             profile_volume,
             SourceVolumeBinding {
                 _current_input: None,
+                _current_root: None,
                 owner: None,
                 reserve: None,
                 allocation_unit: Some(facts.allocation_unit),
