@@ -42,6 +42,14 @@ scratch drops before successful canonical encoding. Insert encoding drops before
 commit/readback, and original command bytes drop before checkpoint work. The
 original target and native capsule retain their separate existing backing.
 
+The 60 KiB calculation covers only the typed issuance/staging projections and
+their encoding, parsing and error-formatting phases described above. It does not
+cover the existing generic operation `read_row(operation)`, namespace validation,
+SQLite internal allocations or native machinery used by the reservation path.
+Their complete admission backing remains an unresolved implementation contract
+under OPT-2215 and the related admission work; this decoder leaf does not qualify
+the whole issuer's memory usage or defer that implementation gap to native testing.
+
 
 Guarded schema-12 migration creates an empty relation. Existing reserved checkpoints
 remain reserved without a fabricated association and cannot issue again. Clean
