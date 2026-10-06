@@ -45,14 +45,15 @@ impl OwnerRuntime {
             let UniversalCommandArgs::SourceRegistryRetirement(args) = &prepared.args else {
                 return Err(WalPreparationError::InvalidInput.into());
             };
+            let ready = collector.original_ready_round()?;
             collector.validate_retirement_policy(
                 args,
                 &prepared.participants,
                 &prepared.plan,
                 &prepared.claims,
                 digest,
+                &ready,
             )?;
-            let ready = collector.original_ready_round()?;
             let phase = match collector.begin_decision_from_ready(digest, &ready) {
                 Ok(()) => {
                     Phase::Decision(collector.decision_nonce().expect("original decision nonce"))
@@ -103,6 +104,7 @@ impl OwnerRuntime {
                     &pending.prepared.plan,
                     &pending.prepared.claims,
                     digest,
+                    original,
                 )?;
                 collector.begin_decision_from_ready(digest, original)?;
                 Ok(collector

@@ -33,22 +33,39 @@ impl OriginalReadyRound {
     pub(super) fn new(round: Arc<CurrentRound>, cohort: u64) -> Self {
         Self { round, cohort }
     }
+    fn matches_ready(&self, original: &CurrentRound, state: &RoundState) -> bool {
+        state.cohort == self.cohort
+            && !state.invalidated
+            && state.slots == original.expected
+            && original.sources_present(state)
+            && state.decision == Decision::Preparing
+            && Instant::now() < original.deadline
+    }
+    /// Provenance permits frozen-policy comparison, never current native admission.
+    pub(super) fn require_provenance(
+        &self,
+        original: &Arc<CurrentRound>,
+    ) -> Result<(), super::WalPreparationError> {
+        if !Arc::ptr_eq(&self.round, original) {
+            return Err(super::WalPreparationError::InvalidInput);
+        }
+        let state = original
+            .acknowledged
+            .lock()
+            .map_err(|_| super::WalPreparationError::InvalidInput)?;
+        if !self.matches_ready(original, &state) {
+            return Err(super::WalPreparationError::InvalidInput);
+        }
+        Ok(())
+    }
     pub(super) fn require_current(
         &self,
         original: &Arc<CurrentRound>,
     ) -> Result<(), super::WalPreparationError> {
         use super::WalPreparationError;
-        if !Arc::ptr_eq(&self.round, original) {
-            return Err(WalPreparationError::InvalidInput);
-        }
-        match original.with_boundaries(|state| {
-            state.cohort == self.cohort
-                && !state.invalidated
-                && state.slots == original.expected
-                && original.sources_present(state)
-                && state.decision == Decision::Preparing
-                && Instant::now() < original.deadline
-        }) {
+        // The scalar round lock is released before trying any original native gate.
+        self.require_provenance(original)?;
+        match original.with_boundaries(|state| self.matches_ready(original, state)) {
             Ok(true) => Ok(()),
             Err(BoundaryRefusal::Busy) => Err(WalPreparationError::Busy),
             _ => Err(WalPreparationError::InvalidInput),

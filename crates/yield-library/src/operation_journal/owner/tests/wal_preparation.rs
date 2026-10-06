@@ -2629,12 +2629,10 @@ mod integration {
         };
         let mut admitted = journal.client().admit_prepared(prepared).unwrap();
         if outcome >= 13 {
+            let early = admitted.recv_timeout(Duration::from_millis(50));
             assert!(
-                matches!(
-                    admitted.recv_timeout(Duration::from_millis(50)),
-                    Err(OperationJournalRequestError::Empty)
-                ),
-                "genuine Ready command must retain original input while its gate is busy"
+                matches!(early, Err(OperationJournalRequestError::Empty)),
+                "genuine Ready command must retain original input while its gate is busy: {early:?}"
             );
             if outcome == 14 {
                 handle.abort();
