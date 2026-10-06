@@ -636,11 +636,14 @@ mod integration {
                     .load(Ordering::Relaxed),
                 0
             );
-            assert_eq!(budget.used(), 0);
             drop(handle);
             drop(actor);
             assert!(global.shutdown());
             assert!(journal.shutdown());
+            // Terminal publication precedes destruction of the original collector's
+            // CurrentRound. Its shared debit remains funded until the last real
+            // holder drops; all original joins above establish that boundary.
+            assert_eq!(budget.used(), 0);
             return;
         }
         actor.pause_validation.store(false, Ordering::Release);
@@ -1503,7 +1506,24 @@ mod integration {
         original_retirement_custody(5);
     }
 
+    #[test]
+    fn retirement_original_consumer_refuses_missing_source_release_policy() {
+        original_retirement_custody_with_source_policy(0, Some(false));
+    }
+
+    #[test]
+    fn retirement_original_consumer_refuses_another_valid_source_release_family() {
+        original_retirement_custody_with_source_policy(0, Some(true));
+    }
+
     fn original_retirement_custody(outcome: u8) {
+        original_retirement_custody_with_source_policy(outcome, None);
+    }
+
+    fn original_retirement_custody_with_source_policy(
+        outcome: u8,
+        source_policy_fault: Option<bool>,
+    ) {
         use crate::operation_journal::source_registry_retirement::SourceRegistryRetirementIntentArgs;
         use crate::operation_journal::work_plan::{
             WORK_PLAN_VERSION_REGISTRY_RETIREMENT, WorkPlan, WorkPrerequisite, WorkUnitKey,
@@ -1933,7 +1953,7 @@ mod integration {
                 Err(WalPreparationError::InvalidInput)
             ));
         }
-        let input = WalPreparationInput::from_universal(
+        let mut input = WalPreparationInput::from_universal(
             &args,
             &participants,
             &plan,
@@ -1943,6 +1963,47 @@ mod integration {
             deadline,
         )
         .unwrap();
+        if let Some(foreign_family) = source_policy_fault {
+            if foreign_family {
+                // A different complete valid frozen family is transported by the actual
+                // Source producer; it supplies no authority for the original family.
+                let other_operation = OperationId::new();
+                let other_draining = SourceRegistryReferenceProposal::new(
+                    &reference,
+                    other_operation,
+                    retirement.draining_work(),
+                    Transition::Draining,
+                    SourceRegistryReferenceExpected::Present {
+                        state: Transition::Enrolled,
+                        row_identity: [1; 32],
+                    },
+                )
+                .unwrap();
+                let other_retired = SourceRegistryReferenceProposal::new(
+                    &reference,
+                    other_operation,
+                    retirement.retired_work(),
+                    Transition::Retired,
+                    SourceRegistryReferenceExpected::Present {
+                        state: Transition::Draining,
+                        row_identity: [2; 32],
+                    },
+                )
+                .unwrap();
+                let other = SourceRegistryRetirementIntentArgs::new(
+                    source,
+                    global_id,
+                    fence.clone(),
+                    &other_draining,
+                    &other_retired,
+                )
+                .unwrap();
+                other.validate().unwrap();
+                input.replace_source_retirement_policy_for_test(Some(&other));
+            } else {
+                input.replace_source_retirement_policy_for_test(None);
+            }
+        }
         let digest = crate::operation_journal::wal_admission::prepared_digest(
             &args,
             &participants,
@@ -2038,6 +2099,34 @@ mod integration {
             &serde_json::to_vec(&retirement).unwrap(),
         );
         assert_eq!(policy.family_digest(), &expected_digest);
+
+        let WalPreparedDatabase::Lease(original_source) = &view.databases()[1] else {
+            unreachable!();
+        };
+        let retained_credit = budget.used();
+        assert!(retained_credit > 0);
+        let historical_alias = original_source.clone();
+        assert_eq!(budget.used(), retained_credit);
+        drop(historical_alias);
+        assert_eq!(budget.used(), retained_credit);
+        let source_policy = original_source
+            .original_binding()
+            .retirement_forward_policy();
+        if source_policy_fault == Some(false) {
+            assert!(source_policy.is_none());
+        } else {
+            let source_policy = source_policy
+                .expect("the actual Source producer must retain the frozen lease RELEASE policy");
+            assert_eq!(
+                source_policy.matches_original(
+                    &retirement,
+                    policy.family_digest(),
+                    original_source.original_binding().stored_fence(),
+                    original_source.scope_descriptor_bytes(),
+                ),
+                source_policy_fault.is_none(),
+            );
+        }
 
         if let Some(collector) = local_collector.as_mut() {
             collector.begin_decision(digest).unwrap();
@@ -2199,7 +2288,7 @@ mod integration {
             .unwrap()
             .recv_timeout(Duration::from_secs(3))
             .unwrap();
-        if outcome >= 4 {
+        if outcome >= 4 || source_policy_fault.is_some() {
             assert!(
                 matches!(
                     result,
@@ -2207,13 +2296,23 @@ mod integration {
                         WalPreparationError::InvalidInput
                     ))
                 ),
-                "invented aggregate budgets must fail original-policy comparison before acknowledgement: {result:?}"
+                "foreign or missing original policy must fail before acknowledgement: {result:?}"
             );
         } else {
             assert!(
                 matches!(result, Err(OperationJournalOwnerError::PreparedAdmission(PreparedAdmissionError::Unsupported { reason })) if reason.contains("original owners acknowledged"))
             );
         }
+        assert!(
+            journal
+                .client()
+                .get(operation)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             journal
                 .prepared_admission_id_allocations
@@ -2236,7 +2335,7 @@ mod integration {
         handle.abort();
         let aborted = wait(&handle, terminal);
         assert!(
-            if outcome >= 4 {
+            if outcome >= 4 || source_policy_fault.is_some() {
                 matches!(
                     aborted,
                     WalPreparationStatus::Rejected(WalPreparationError::InvalidInput)

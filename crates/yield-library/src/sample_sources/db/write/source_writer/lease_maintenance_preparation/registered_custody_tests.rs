@@ -1,5 +1,7 @@
 //! Actual never-audited source/SQLite lifecycle tests; no capacity provider is installed.
 #![cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[path = "retirement_policy/registered_tests.rs"]
+mod retirement_policy_tests;
 use super::*;
 use crate::{
     app_dirs::{AppRootGuard, WritableProfileGuard},

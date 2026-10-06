@@ -147,6 +147,8 @@ struct LeaseReport {
 impl PartialEq for SourceLeaseWalTransportObservation {
     fn eq(&self, other: &Self) -> bool {
         self.0.registered_custody_retained == other.0.registered_custody_retained
+            && self.0.binding.retirement_forward_policy()
+                == other.0.binding.retirement_forward_policy()
             && self.0.bytes == other.0.bytes
             && self.0.correlation == other.0.correlation
             && self.0.wal_bytes == other.0.wal_bytes
@@ -280,7 +282,7 @@ impl SourceLeaseWalTransportOwner {
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<LeaseReport>() + 512))
             .ok_or(SourceWalTransportRejection::Full)?;
         credit.resize(scratch)?;
-        let binding = held
+        let mut binding = held
             .capture_lease_binding(registration.ok_or(SourceWalTransportRejection::Scope)?)
             .map_err(classify)?;
         let bytes = binding
@@ -292,7 +294,6 @@ impl SourceLeaseWalTransportOwner {
             .and_then(|n| n.checked_add(bytes.capacity()))
             .and_then(|n| n.checked_add(std::mem::size_of::<LeaseReport>() + 64))
             .ok_or(SourceWalTransportRejection::InvalidContext)?;
-        credit.resize(size)?;
         if Instant::now() >= self.deadline() {
             return Err(SourceWalTransportRejection::Deadline);
         }
@@ -308,6 +309,19 @@ impl SourceLeaseWalTransportOwner {
                 )
                 .map_err(classify)?;
         }
+        self.native
+            .as_ref()
+            .ok_or(SourceWalTransportRejection::OwnerLost)?
+            .held()?
+            .capture_retirement_forward_policy(
+                &mut binding,
+                registration.ok_or(SourceWalTransportRejection::Scope)?,
+                &bytes,
+            )
+            .map_err(classify)?;
+        // Keep the complete capture debit through Registered retention and policy sealing.
+        // The private policy is inline in binding and funded by its concrete header size.
+        credit.resize(size)?;
         // Retention and original scope checks can consume time or race caller cancellation.
         // Failed publication leaves the native count held for original-owner cleanup.
         if self.is_cancelled() {
