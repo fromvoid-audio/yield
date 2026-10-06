@@ -1330,6 +1330,8 @@ fn recording_payload_projection_changed_blob_refuses_before_copy() {
             connection.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
             connection.execute("UPDATE operation_journal_recording_chunks SET record=?1 WHERE chunk_id=?2", params![changed_for_hook,id_for_hook]).unwrap();
             connection.execute_batch("PRAGMA ignore_check_constraints=OFF").unwrap();
+            *baseline_for_hook.borrow_mut() = Some(recording_projection_raw_state(connection));
+            PAYLOAD_COPIED_BYTES.with(|n| n.set(0));
         }))));
         PAYLOAD_COPIED_BYTES.with(|n| n.set(0));
         let result = if kind == PayloadReader::Control {
