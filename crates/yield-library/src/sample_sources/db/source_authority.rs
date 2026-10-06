@@ -31,6 +31,7 @@ mod registration_generation;
 #[path = "source_authority/registration_generation/native_tests.rs"]
 mod registration_generation_native_tests;
 mod reserve_use;
+pub(crate) use reserve_use::CurrentReserveUseProof;
 
 const PREPARED: u8 = 0;
 const REGISTERED: u8 = 1;

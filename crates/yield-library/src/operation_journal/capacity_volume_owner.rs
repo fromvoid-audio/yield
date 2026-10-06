@@ -39,8 +39,10 @@ const MARKER_VERSION: &str = "1";
 const MAX_MARKER_BYTES: usize = 1024;
 const MAX_IDENTITY_BYTES: usize = 256;
 
+mod current_source;
 #[cfg(any(windows, test))]
 mod windows_lock;
+pub(super) use current_source::validate_current_source_scope;
 
 mod legacy_bootstrap;
 pub(super) use legacy_bootstrap::{LegacyVolumeFailureBacking, acquire_legacy_for_descriptor};

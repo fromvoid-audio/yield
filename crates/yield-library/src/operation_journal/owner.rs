@@ -3390,6 +3390,15 @@ impl OwnerRuntime {
                     );
                 }
             };
+            if let Err(error) = super::capacity_volume_owner::validate_current_source_scope(&scope)
+            {
+                return self.retain_source_recovery(
+                    registration_id,
+                    "volume-ownership-native-scope",
+                    error.to_string(),
+                    proof.take(),
+                );
+            }
             if volume == profile_volume_id
                 || self.source_volumes.get(&volume).is_some_and(|binding| {
                     binding.readiness == SourceVolumeBindingReadiness::Complete

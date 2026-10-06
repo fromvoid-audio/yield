@@ -6,6 +6,10 @@ use std::fs::File;
 pub(crate) struct CurrentReserveUseProof<'a> {
     main: File,
     descriptor: File,
+    #[cfg(target_os = "macos")]
+    database_descriptor: File,
+    #[cfg(target_os = "macos")]
+    media_descriptor: File,
     root: &'a BoundDatabaseRoot,
     request: &'a SourceAuthorityRequest,
     proof: &'a SourceAuthorityUseProof,
@@ -166,6 +170,15 @@ impl SourceAuthorityRequest {
         let scope = CurrentReserveUseProof {
             main,
             descriptor,
+            #[cfg(target_os = "macos")]
+            database_descriptor,
+            #[cfg(target_os = "macos")]
+            media_descriptor: self.media_root.try_clone_descriptor().map_err(|source| {
+                SourceAuthorityError::Lease(SourceLeaseError::Io {
+                    path: self.media_root.path().to_path_buf(),
+                    source,
+                })
+            })?,
             root,
             request: self,
             proof,
@@ -177,6 +190,16 @@ impl SourceAuthorityRequest {
 }
 
 impl CurrentReserveUseProof<'_> {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn native_volume_descriptors(&self) -> [&File; 4] {
+        [
+            &self.main,
+            &self.database_descriptor,
+            &self.media_descriptor,
+            &self.descriptor,
+        ]
+    }
+
     pub(crate) fn descriptor(&self) -> &File {
         &self.descriptor
     }
