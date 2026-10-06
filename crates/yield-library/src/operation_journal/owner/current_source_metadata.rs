@@ -39,7 +39,7 @@ pub(super) const MIN_RETAINED_CURRENT_BYTES: usize =
 pub(super) const MAX_CURRENT_CREDITS: usize = ORDINARY_INPUT_BYTES / MIN_RETAINED_CURRENT_BYTES;
 const _: () = assert!(MIN_RETAINED_CURRENT_BYTES > 0 && MAX_CURRENT_CREDITS > 0);
 const CREDIT_TEARDOWN_SCRATCH: usize =
-    std::mem::size_of::<[Option<Arc<InputPermit>>; MAX_CURRENT_CREDITS]>();
+    std::mem::size_of::<[Option<CurrentInput>; MAX_CURRENT_CREDITS]>();
 
 // Rust 1.93 std/hashbrown: power-of-two bucket storage, >=7/8 load, one control byte per
 // bucket plus a <=16-byte control group. Eight buckets per lifetime entry covers initial
@@ -74,8 +74,8 @@ const REGISTRY_NODE_BYTES: usize = hash_entry::<crate::sample_sources::db::Sourc
     // Temporary deduplicated volume set before installing the two entries.
     + tree_insert::<VolumeIdentity, ()>()
     // Vec initial/growing capacity is <=4 slots per lifetime credit; no permit is created.
-    + 4 * std::mem::size_of::<Arc<InputPermit>>();
-const FIXED_INPUT_HEADERS: usize = std::mem::size_of::<(usize, usize, InputPermit)>()
+    + 4 * std::mem::size_of::<CurrentInput>();
+const FIXED_INPUT_HEADERS: usize = std::mem::size_of::<(usize, usize, CurrentInputBacking)>()
     + std::mem::size_of::<SourceAuthorityRecord>()
     + std::mem::size_of::<RetiredSourceAuthorityRecord>()
     + 2 * std::mem::size_of::<SourceVolumeBinding>()
@@ -96,4 +96,48 @@ pub(super) fn input_bytes(
             ),
         })?;
     Ok(input_bytes)
+}
+
+// No raw Arc or Weak can escape: every alias consumes Arc::into_inner. Its exact last
+// winner frees the Arc allocation (including the implicit weak header) before refunding
+// the moved permit. This also covers rejection before registry retention and unwind.
+pub(super) struct CurrentInput(Option<Arc<CurrentInputBacking>>);
+struct CurrentInputBacking {
+    // Test probes observe a separate allocation, never pin the funded Arc header.
+    #[cfg(test)]
+    probe: Arc<()>,
+    input: InputPermit,
+}
+impl CurrentInput {
+    pub(super) fn new(input: InputPermit) -> Self {
+        Self(Some(Arc::new(CurrentInputBacking {
+            #[cfg(test)]
+            probe: Arc::new(()),
+            input,
+        })))
+    }
+    #[cfg(all(test, unix))]
+    pub(super) fn probe(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.0.as_ref().expect("live Current input").probe)
+    }
+}
+impl Clone for CurrentInput {
+    fn clone(&self) -> Self {
+        Self(Some(Arc::clone(
+            self.0.as_ref().expect("live Current input"),
+        )))
+    }
+}
+impl std::ops::Deref for CurrentInput {
+    type Target = InputPermit;
+    fn deref(&self) -> &Self::Target {
+        &self.0.as_ref().expect("live Current input").input
+    }
+}
+impl Drop for CurrentInput {
+    fn drop(&mut self) {
+        if let Some(input) = self.0.take().and_then(Arc::into_inner) {
+            drop(input);
+        }
+    }
 }

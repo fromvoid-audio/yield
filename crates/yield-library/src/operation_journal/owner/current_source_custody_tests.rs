@@ -10,7 +10,7 @@ pub(super) struct Snapshot {
     length: u64,
     root_device: u64,
     root_inode: u64,
-    credit: Weak<InputPermit>,
+    credit: Weak<()>,
     drops: Arc<Mutex<DropObservation>>,
 }
 
@@ -25,7 +25,7 @@ pub(super) struct BeforeRootDrop {
     native_device: u64,
     native_inode: u64,
     root: Weak<std::fs::File>,
-    credit: Weak<InputPermit>,
+    credit: Weak<()>,
     observations: Arc<Mutex<DropObservation>>,
 }
 impl Drop for BeforeRootDrop {
@@ -43,7 +43,7 @@ impl Drop for BeforeRootDrop {
 }
 pub(super) struct AfterRootDrop {
     root: Weak<std::fs::File>,
-    credit: Weak<InputPermit>,
+    credit: Weak<()>,
     observations: Arc<Mutex<DropObservation>>,
 }
 impl Drop for AfterRootDrop {
@@ -57,7 +57,7 @@ impl Drop for AfterRootDrop {
 impl OwnerRuntime {
     pub(super) fn current_refused_prefix_for_test(
         &mut self,
-        credit: Arc<InputPermit>,
+        credit: current_source_metadata::CurrentInput,
         envelope: SourceAuthorityRegistrationRequest,
         app: &Path,
         panic_after_retention: bool,
@@ -73,7 +73,7 @@ impl OwnerRuntime {
         request.validate_consuming_boundary(&profile)?;
         self.validate_current_registry_credit(Some(&credit))?;
         let proof = request.accept_confirmation(envelope.confirmation)?;
-        self.source_registry_credits.push(Arc::clone(&credit));
+        self.source_registry_credits.push(credit.clone());
         let root = request.media_root();
         let scope = request.reserve_use(root, &proof, &profile)?;
         let volume = descriptor_capacity_facts(scope.descriptor())
@@ -99,7 +99,7 @@ impl OwnerRuntime {
                 allocation_unit: None,
                 readiness: SourceVolumeBindingReadiness::Incomplete,
                 registrations: BTreeSet::from([id]),
-                _current_input: Some(Arc::clone(&credit)),
+                _current_input: Some(credit.clone()),
             },
         );
         self.source_registrations.insert(id, SourceAuthorityRecord {
@@ -131,7 +131,7 @@ impl OwnerRuntime {
             .as_ref()
             .unwrap()
             .current_drop_root_for_test();
-        let credit = Arc::downgrade(binding._current_input.as_ref().unwrap());
+        let credit = binding._current_input.as_ref().unwrap().probe();
         let observations = Arc::new(Mutex::new(DropObservation::default()));
         binding._current_before_root_drop = Some(BeforeRootDrop {
             native_fd: file.as_raw_fd(),
@@ -189,7 +189,7 @@ impl OwnerRuntime {
             length: metadata.len(),
             root_device: root.dev(),
             root_inode: root.ino(),
-            credit: Arc::downgrade(binding._current_input.as_ref().unwrap()),
+            credit: binding._current_input.as_ref().unwrap().probe(),
             drops: Arc::clone(
                 &binding
                     ._current_before_root_drop
@@ -425,7 +425,9 @@ fn current_original_registry_carrier_bound_refuses_before_confirmation_and_relea
     let minimum = current_source_metadata::MIN_RETAINED_CURRENT_BYTES;
     let bound = current_source_metadata::MAX_CURRENT_CREDITS;
     for _ in 0..bound {
-        let credit = Arc::new(shared.reserve_input(InputClass::Ordinary, minimum).unwrap());
+        let credit = current_source_metadata::CurrentInput::new(
+            shared.reserve_input(InputClass::Ordinary, minimum).unwrap(),
+        );
         runtime
             .validate_current_registry_credit(Some(&credit))
             .unwrap();
@@ -439,8 +441,8 @@ fn current_original_registry_carrier_bound_refuses_before_confirmation_and_relea
         matches!(shared.reserve_input(InputClass::Ordinary, minimum),
         Err(OperationJournalOwnerQueueError::InputBytesFull { requested, .. }) if requested == minimum)
     );
-    let retained = Arc::downgrade(&runtime.source_registry_credits[0]);
-    let existing_credit = Arc::clone(&runtime.source_registry_credits[0]);
+    let retained = runtime.source_registry_credits[0].probe();
+    let existing_credit = runtime.source_registry_credits[0].clone();
     let media = tempfile::tempdir().unwrap();
     let database_root = tempfile::tempdir().unwrap();
     let source = crate::sample_sources::SourceDatabase::open_for_source_write_with_profile_guard(
@@ -485,7 +487,7 @@ pub(super) fn install_native_reserve_drop_probe(
         .unwrap()
         .current_drop_root_for_test();
     let native_root = root.upgrade().unwrap().metadata().unwrap();
-    let credit = Arc::downgrade(binding._current_input.as_ref().unwrap());
+    let credit = binding._current_input.as_ref().unwrap().probe();
     let observations = Arc::new(Mutex::new(DropObservation::default()));
     binding._current_before_root_drop = Some(BeforeRootDrop {
         native_fd: fd,
@@ -520,4 +522,42 @@ pub(super) fn assert_native_reserve_closed_in_order(snapshot: &Snapshot) {
     assert!(snapshot.credit.upgrade().is_none());
     let drops = snapshot.drops.lock().unwrap();
     assert!(drops.native_before_root && drops.root_before_credit);
+}
+
+#[test]
+fn current_original_credit_concurrent_final_aliases_release_exact_original_pool() {
+    let (commands, _receiver) = OwnerCommandReceivers::channel();
+    let shared = Arc::new(OwnerShared::new(commands));
+    for _ in 0..32 {
+        let bytes = current_source_metadata::MIN_RETAINED_CURRENT_BYTES;
+        let credit = current_source_metadata::CurrentInput::new(
+            shared.reserve_input(InputClass::Ordinary, bytes).unwrap(),
+        );
+        let probe = credit.probe();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let aliases: Vec<_> = (0..4).map(|_| credit.clone()).collect();
+        drop(credit);
+        assert_eq!(
+            shared.input_bytes.lock().unwrap().remaining[0],
+            ORDINARY_INPUT_BYTES - bytes
+        );
+        let workers: Vec<_> = aliases
+            .into_iter()
+            .map(|alias| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    drop(alias);
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(probe.upgrade().is_none());
+        assert_eq!(
+            shared.input_bytes.lock().unwrap().remaining[0],
+            ORDINARY_INPUT_BYTES
+        );
+    }
 }

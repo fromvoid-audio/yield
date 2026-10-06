@@ -1097,7 +1097,7 @@ struct SourceVolumeBinding {
     allocation_unit: Option<u64>,
     readiness: SourceVolumeBindingReadiness,
     registrations: BTreeSet<crate::sample_sources::db::SourceRegistrationId>,
-    _current_input: Option<Arc<InputPermit>>,
+    _current_input: Option<current_source_metadata::CurrentInput>,
 }
 
 /// Owner-thread identity for one durable Issued chunk. The permit returned to a caller is not a
@@ -1593,7 +1593,7 @@ struct SourceAuthorityRecord {
     receipt: SourceAuthorityRegistrationReceipt,
     drain_marker: Option<SourceAuthorityDrainMarker>,
     readiness: SourceRegistrationReadiness,
-    _current_input: Option<Arc<InputPermit>>,
+    _current_input: Option<current_source_metadata::CurrentInput>,
 }
 
 struct RetiredSourceAuthorityRecord {
@@ -1602,7 +1602,7 @@ struct RetiredSourceAuthorityRecord {
     database_file_identity: String,
     lease_identity: crate::sample_sources::db::SourceLeaseIdentity,
     receipt: SourceAuthorityRegistrationReceipt,
-    _current_input: Option<Arc<InputPermit>>,
+    _current_input: Option<current_source_metadata::CurrentInput>,
 }
 
 impl RetiredSourceAuthorityRecord {
@@ -1766,7 +1766,7 @@ struct OwnerRuntime {
     reserve: Option<OwnedReserveAllocation>,
     volume_owner: Option<VolumeOwnershipCapability>,
     final_profile_guard: Option<WritableProfileGuard>,
-    source_registry_credits: Vec<Arc<InputPermit>>,
+    source_registry_credits: Vec<current_source_metadata::CurrentInput>,
     source_volumes: BTreeMap<VolumeIdentity, SourceVolumeBinding>,
     source_registrations:
         HashMap<crate::sample_sources::db::SourceRegistrationId, SourceAuthorityRecord>,
@@ -3178,7 +3178,7 @@ impl OwnerRuntime {
 
     fn validate_current_registry_credit(
         &self,
-        credit: Option<&Arc<InputPermit>>,
+        credit: Option<&current_source_metadata::CurrentInput>,
     ) -> Result<(), OperationJournalOwnerError> {
         let Some(credit) = credit else {
             return Ok(());
@@ -3198,7 +3198,7 @@ impl OwnerRuntime {
     fn register_source_authority_funded(
         &mut self,
         // Parameters drop in reverse order: the original request/confirmation must drop first.
-        current_input: Option<Arc<InputPermit>>,
+        current_input: Option<current_source_metadata::CurrentInput>,
         input: SourceAuthorityRegistrationRequest,
     ) -> Result<SourceAuthorityRegistrationReceipt, OperationJournalOwnerError> {
         let request = input.request;
@@ -3387,7 +3387,7 @@ impl OwnerRuntime {
         // proof and converts it to a drain marker on partial failure.
         let mut proof = Some(request.accept_confirmation(input.confirmation)?);
         if let Some(credit) = current_input.as_ref() {
-            self.source_registry_credits.push(Arc::clone(credit));
+            self.source_registry_credits.push(credit.clone());
         }
         let volume_identities = volume_ids.iter().cloned().collect::<Vec<_>>();
         let receipt = SourceAuthorityRegistrationReceipt::new(
@@ -4423,7 +4423,7 @@ impl Drop for OwnerRuntime {
         drop(std::mem::take(&mut self.source_registrations));
         drop(std::mem::take(&mut self.retired_source_registrations));
         let mut credit_heap = std::mem::take(&mut self.source_registry_credits).into_iter();
-        let current_registry_credits: [Option<Arc<InputPermit>>;
+        let current_registry_credits: [Option<current_source_metadata::CurrentInput>;
             current_source_metadata::MAX_CURRENT_CREDITS] =
             std::array::from_fn(|_| credit_heap.next());
         // The bound is checked before every actual retention; free the keeper heap first.
@@ -6589,7 +6589,7 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             result,
         } => execute_store_result(result, move || {
             runtime.current_refused_prefix_for_test(
-                Arc::new(input),
+                current_source_metadata::CurrentInput::new(input),
                 request,
                 &app,
                 panic_after_retention,
@@ -6623,7 +6623,7 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => {
-            let input = Arc::new(input);
+            let input = current_source_metadata::CurrentInput::new(input);
             execute_store_result(result, move || {
                 runtime.register_source_authority_funded(Some(input), request)
             })
