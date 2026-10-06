@@ -5,7 +5,7 @@ use yield_library::sample_sources::db::DB_FILE_NAME;
 fn start_source_idle(
     fixture: &tests::Fixture,
     configure: impl FnOnce(&CatalogSourceDatabase, &rusqlite::Connection) + Send + 'static,
-) -> (CatalogService, rusqlite::Connection, PathBuf, u64) {
+) -> (CatalogService, rusqlite::Connection, PathBuf, u64, Instant) {
     let source_id = SourceId::from_string("idle-original");
     let guard = fixture.guard.try_clone().unwrap();
     let root = fixture.root.path().to_path_buf();
@@ -71,7 +71,7 @@ fn start_source_idle(
                 source_authority_pending: None,
             },
         );
-        ready.send((external, before)).unwrap();
+        ready.send((external, before, Instant::now())).unwrap();
         run_worker_with_sources(
             guard,
             receiver,
@@ -90,15 +90,14 @@ fn start_source_idle(
         admission,
         worker: Mutex::new(WorkerJoinState::new(Some(worker))),
     };
-    let (external, before) = startup.recv_timeout(Duration::from_secs(5)).unwrap();
-    (service, external, main, before)
+    let (external, before, started) = startup.recv_timeout(Duration::from_secs(5)).unwrap();
+    (service, external, main, before, started)
 }
 
 #[test]
 fn original_source_idle_worker_checkpoints_real_wal_pressure() {
     let fixture = tests::Fixture::new("source-idle-wal");
-    let (service, external, main, before) = start_source_idle(&fixture, |_, _| {});
-    let started = Instant::now();
+    let (service, external, main, before, started) = start_source_idle(&fixture, |_, _| {});
     let deadline = started + Duration::from_secs(18);
     while fs::metadata(&main).unwrap().len() < 34603008 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(25));
@@ -124,24 +123,23 @@ fn original_source_idle_worker_checkpoints_real_wal_pressure() {
 fn original_source_idle_worker_preserves_reader_and_retries_only_on_next_idle_opportunity() {
     let fixture = tests::Fixture::new("source-idle-reader");
     let (send, receive) = mpsc::sync_channel(1);
-    let (service, external, main, before) = start_source_idle(&fixture, move |_, external| {
-        let reader = rusqlite::Connection::open(external.path().unwrap()).unwrap();
-        reader
-            .execute_batch("BEGIN; SELECT singleton FROM source_lease")
-            .unwrap();
-        send.send(reader).unwrap();
-    });
+    let (observed, results) = mpsc::sync_channel(1);
+    let (service, external, _, _, started) =
+        start_source_idle(&fixture, move |database, external| {
+            database
+                .writer
+                .observe_wal_checkpoint_results_for_tests(observed);
+            let reader = rusqlite::Connection::open(external.path().unwrap()).unwrap();
+            reader
+                .execute_batch("BEGIN; SELECT singleton FROM source_lease")
+                .unwrap();
+            send.send(reader).unwrap();
+        });
     let reader = receive.recv_timeout(Duration::from_secs(1)).unwrap();
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(16) {
-        thread::sleep(Duration::from_millis(25));
-    }
-    let partial = fs::metadata(&main).unwrap().len();
-    let frames: (i64, i64, i64) = external
-        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .unwrap();
+    let first = results.recv_timeout(Duration::from_secs(18)).unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(15));
+    assert!(!first.0);
+    assert!(first.1 > first.2 && first.2 >= 0);
     let payload_visible: i64 = reader
         .query_row(
             "SELECT count(*) FROM sqlite_schema WHERE name = 'idle_payload'",
@@ -149,26 +147,20 @@ fn original_source_idle_worker_preserves_reader_and_retries_only_on_next_idle_op
             |row| row.get(0),
         )
         .unwrap();
-    eprintln!(
-        "pinned diagnostic MAIN={partial} frames={frames:?} autocommit={} payload_visible={payload_visible}",
-        reader.is_autocommit()
-    );
-    assert!(
-        partial < 34603008,
-        "pinned original reader was bypassed: {before} -> {partial}"
-    );
+    assert!(!reader.is_autocommit());
+    assert_eq!(payload_visible, 0, "original reader snapshot was replaced");
     reader.execute_batch("ROLLBACK").unwrap();
-    let deadline = started + Duration::from_secs(34);
-    while fs::metadata(&main).unwrap().len() < 34603008 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(25));
-    }
-    let after = fs::metadata(&main).unwrap().len();
+    assert!(matches!(
+        results.recv_timeout(Duration::from_secs(1)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    let second = results.recv_timeout(Duration::from_secs(18)).unwrap();
+    let elapsed = started.elapsed();
     service.shutdown();
-    assert!(
-        after >= 34603008,
-        "next real idle opportunity did not checkpoint released reader"
-    );
-    assert!(started.elapsed() >= Duration::from_secs(30));
+    assert!(!second.0);
+    assert!(second.1 > 0);
+    assert_eq!(second.1, second.2);
+    assert!(elapsed >= Duration::from_secs(30));
     assert_eq!(
         external
             .query_row("SELECT length(value) FROM idle_payload", [], |row| row
@@ -183,7 +175,7 @@ fn original_source_idle_worker_closing_joins_an_admitted_native_checkpoint() {
     let fixture = tests::Fixture::new("source-idle-closing");
     let (entered, seen) = mpsc::sync_channel(1);
     let (release, resume) = mpsc::sync_channel(1);
-    let (service, external, main, _) = start_source_idle(&fixture, move |database, _| {
+    let (service, external, main, _, _) = start_source_idle(&fixture, move |database, _| {
         database
             .writer
             .block_idle_wal_checkpoint_for_tests(entered, resume);

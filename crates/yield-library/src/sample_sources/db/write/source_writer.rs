@@ -799,6 +799,18 @@ impl SourceWriter {
         self.database.maintain_idle_wal()
     }
 
+    /// Observe successful checkpoint results from this original writer's shared policy.
+    /// The fixture channel is bounded and nonblocking; it performs no additional checkpoint.
+    #[cfg(feature = "test-support")]
+    pub fn observe_wal_checkpoint_results_for_tests(
+        &self,
+        observer: mpsc::SyncSender<(bool, i64, i64)>,
+    ) {
+        self.database
+            .checkpoint_policy
+            .observe_results_for_tests(observer);
+    }
+
     /// Pause the first actual passive-checkpoint pragma on this original test writer.
     ///
     /// This feature-only native SQLite barrier tests admitted maintenance custody during closing.

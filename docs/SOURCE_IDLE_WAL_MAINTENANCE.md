@@ -43,6 +43,15 @@ closed original gate and root/MAIN replacement before or during Native work. Fix
 pacing geometry supplements these owner tests. External SQLite writes are fixture
 pressure setup, never production source authority or physical qualification.
 
+The pinned-reader test observes the original worker's actual successful PASSIVE
+result through a bounded, nonblocking test-support observer. It requires fewer
+checkpointed than logged frames and the unchanged old reader schema snapshot, then
+requires complete frame backfill only at the next paced opportunity after rollback.
+It issues no fixture checkpoint. MAIN file extent is not a completeness measure:
+backfilling frames already visible to a pinned reader can grow that extent while
+later WAL frames remain blocked. Timing uses the original worker's startup anchor,
+so delayed scheduling of the fixture's caller cannot shorten the measured interval.
+
 PASSIVE does not promise WAL truncation, hard-watermark size reduction, bounded Native
 I/O, a durable shutdown checkpoint or physical power-loss qualification. Missing
 broader admission, scheduler, hard-pressure, shutdown and qualification requirements
