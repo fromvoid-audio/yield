@@ -2752,11 +2752,21 @@ mod integration {
                     .any(|event| event == "reuse:retiring-pre-audit"),
                 "original Source writer was not restored"
             );
+            // The original resource header remains deliberately charged until shutdown.
+            // Every WAL preparation/command debit must be gone independently of it.
+            let mut live_header = InputBudget::new();
+            live_header.remaining[InputClass::Ordinary.index()] -= resource_custody::HEADER_BYTES;
+            live_header.publication_remaining -= resource_custody::HEADER_BYTES;
             let released = Instant::now() + Duration::from_secs(1);
-            while *journal.shared.input_bytes.lock().unwrap() != InputBudget::new() {
+            loop {
+                let observed = *journal.shared.input_bytes.lock().unwrap();
+                if observed == live_header {
+                    break;
+                }
                 assert!(
                     Instant::now() < released,
-                    "original journal input debit remains held"
+                    "original journal input debit remains held: observed={observed:?}, expected={:?}",
+                    live_header
                 );
                 thread::sleep(Duration::from_millis(1));
             }
@@ -2786,6 +2796,12 @@ mod integration {
         drop(actor);
         assert!(global.shutdown());
         assert!(journal.shutdown());
+        if outcome == 16 {
+            assert_eq!(
+                *journal.shared.input_bytes.lock().unwrap(),
+                InputBudget::new()
+            );
+        }
     }
     #[test]
     fn all_owner_real_tag_and_layout_factories_keep_actual_original_family_policy() {
