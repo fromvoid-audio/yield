@@ -177,6 +177,42 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     #[test]
+    fn original_file_vfs_observes_replacement_without_substituting_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("original.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE evidence (value TEXT); INSERT INTO evidence VALUES ('original')",
+            )
+            .unwrap();
+        assert!(observe(&connection, "unused on Unix").is_ok());
+        let retained = directory.path().join("retained.sqlite3");
+        std::fs::rename(&path, &retained).unwrap();
+        let bytes = std::fs::read(&retained).unwrap();
+        std::fs::write(&path, b"replacement evidence").unwrap();
+        let refusal = observe(&connection, "unused on Unix")
+            .err()
+            .expect("same original VFS detects replacement");
+        let mut debits = Vec::new();
+        let error = materialize(refusal, &path, |bytes| {
+            debits.push(bytes);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert!(
+            matches!(error, DatabaseIdentityError::Replaced { path: actual } if actual == path)
+        );
+        assert_eq!(debits, [path.as_os_str().as_encoded_bytes().len()]);
+        let original: String = connection
+            .query_row("SELECT value FROM evidence", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(original, "original");
+        assert_eq!(std::fs::read(&retained).unwrap(), bytes);
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement evidence");
+    }
+    #[cfg(unix)]
+    #[test]
     fn memory_vfs_control_refusal_copies_only_after_each_debit() {
         let connection = Connection::open_in_memory().unwrap();
         let refusal = observe(&connection, "unused")
