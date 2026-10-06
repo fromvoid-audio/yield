@@ -40,7 +40,101 @@ impl std::io::Write for ForwardPolicyDigest {
         Ok(())
     }
 }
+#[derive(Serialize)]
+struct CanonicalArgs<'a, F: Serialize> {
+    draining: &'a str,
+    global_participant: ParticipantId,
+    lease_fence: F,
+    retired: &'a str,
+    source_participant: ParticipantId,
+    version: u8,
+}
+#[derive(Serialize)]
+enum CanonicalCommand<'a, F: Serialize> {
+    SourceRegistryRetirement(CanonicalArgs<'a, F>),
+}
+#[derive(Serialize)]
+enum BorrowedCommand<'a> {
+    SourceRegistryRetirement(&'a SourceRegistryRetirementIntentArgs),
+}
+struct CommandDigest(blake3::Hasher, usize);
+impl std::io::Write for CommandDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.1 = self
+            .1
+            .checked_add(bytes.len())
+            .filter(|n| *n <= MAX_SOURCE_REGISTRY_RETIREMENT_BYTES + 64)
+            .ok_or(std::io::ErrorKind::InvalidInput)?;
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn lexical_codec_map() -> bool {
+    // This fixed probe is prepaid by the caller and destroyed before hashing.
+    const P: usize = std::mem::size_of::<usize>();
+    const PAIR: usize = std::mem::size_of::<String>() + std::mem::size_of::<serde_json::Value>();
+    const TREE: usize = 16 * P + 11 * PAIR;
+    const INDEX: usize = 4 * (P + PAIR) + 8 * (P + 1) + 32 * P;
+    const _: () = assert!(
+        std::mem::size_of::<serde_json::Map<String, serde_json::Value>>()
+            + if TREE > INDEX { TREE } else { INDEX }
+            + 2
+            <= 2048
+    );
+    let mut map = serde_json::Map::new();
+    map.insert("b".into(), serde_json::Value::Null);
+    map.insert("a".into(), serde_json::Value::Null);
+    map.keys().next().is_some_and(|key| key == "a")
+}
 impl SourceRegistryRetirementIntentArgs {
+    pub(crate) fn validation_scratch_bound(&self) -> Option<usize> {
+        self.draining
+            .len()
+            .checked_add(self.retired.len())?
+            .checked_mul(5)?
+            .checked_add(4096)
+    }
+    pub(crate) fn canonical_command_digest(&self) -> Result<[u8; 32], SourceLeaseBindingError> {
+        let lexical = lexical_codec_map();
+        let mut digest = CommandDigest(
+            blake3::Hasher::new_derive_key("yield.database-command-family.v1"),
+            0,
+        );
+        digest.0.update(&super::model::SCHEMA_V18.to_le_bytes());
+        digest.0.update(&[1]);
+        self.write_command_ordered(&mut digest, lexical)?;
+        Ok(*digest.0.finalize().as_bytes())
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn write_codec_normalized_command(
+        &self,
+        writer: impl std::io::Write,
+    ) -> Result<(), SourceLeaseBindingError> {
+        self.write_command_ordered(writer, lexical_codec_map())
+    }
+    fn write_command_ordered(
+        &self,
+        writer: impl std::io::Write,
+        lexical: bool,
+    ) -> Result<(), SourceLeaseBindingError> {
+        if !lexical {
+            return serde_json::to_writer(writer, &BorrowedCommand::SourceRegistryRetirement(self))
+                .map_err(|_| SourceLeaseBindingError);
+        }
+        let command = CanonicalCommand::SourceRegistryRetirement(CanonicalArgs {
+            draining: &self.draining,
+            global_participant: self.global_participant,
+            lease_fence: self.lease_fence.canonical_retirement_view(),
+            retired: &self.retired,
+            source_participant: self.source_participant,
+            version: self.version,
+        });
+        serde_json::to_writer(writer, &command).map_err(|_| SourceLeaseBindingError)
+    }
+
     /// Shared exact frozen-family correlation only. Callers validate the complete DTO first;
     /// this bounded streaming digest grants no current registration, policy or write authority.
     pub(crate) fn initial_forward_policy_digest(
