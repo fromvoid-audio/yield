@@ -59,3 +59,5 @@ retry or reservation refund, or complete genuine release/settlement. Full OPT-21
 OPT-2136 and native verification remain open. Terminal handle/header custody and
 complete factory prepayment require their own actual ownership analysis; this
 leaf supplies detached report backing custody.
+
+After permanent journal input-pool backing was integrated, post-join assertions derive their baseline from `InputBudget::shared_initial()`. Detached reports must retain exactly 65,536 bytes beyond that baseline, and the last report alias must restore it exactly. The earlier zero-versus-65,536 failure evidence predates that integration.

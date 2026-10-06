@@ -3092,7 +3092,7 @@ mod integration {
             assert!(global.shutdown());
             // The original resource header remains deliberately charged until shutdown.
             // Every WAL preparation/command debit must be gone independently of it.
-            let mut live_header = InputBudget::new();
+            let mut live_header = InputBudget::shared_initial();
             live_header.remaining[InputClass::Ordinary.index()] -= resource_custody::HEADER_BYTES;
             live_header.publication_remaining -= resource_custody::HEADER_BYTES;
             assert_eq!(budget.used(), 0);
@@ -3126,7 +3126,8 @@ mod integration {
             // A diagnostic budget alias must not be the holder that funds this proof.
             drop(budget);
             assert_eq!(
-                ORDINARY_INPUT_BYTES - journal.shared.input_bytes.lock().unwrap().remaining[0],
+                InputBudget::shared_initial().remaining[0]
+                    - journal.shared.input_bytes.lock().unwrap().remaining[0],
                 64 * 1024,
                 "detached genuine lease report must retain original journal input after joins"
             );
@@ -3134,7 +3135,7 @@ mod integration {
             concurrent_inventory_drop(detached_report, alias);
             assert_eq!(
                 *journal.shared.input_bytes.lock().unwrap(),
-                InputBudget::new()
+                InputBudget::shared_initial()
             );
             return;
         }
@@ -3419,7 +3420,8 @@ mod integration {
             );
             drop(budget);
             assert_eq!(
-                ORDINARY_INPUT_BYTES - client.shared.input_bytes.lock().unwrap().remaining[0],
+                InputBudget::shared_initial().remaining[0]
+                    - client.shared.input_bytes.lock().unwrap().remaining[0],
                 64 * 1024,
                 "detached original reports must retain the original journal backing debit"
             );
@@ -3427,7 +3429,7 @@ mod integration {
             concurrent_inventory_drop(detached, alias);
             assert_eq!(
                 client.shared.input_bytes.lock().unwrap().remaining[0],
-                ORDINARY_INPUT_BYTES
+                InputBudget::shared_initial().remaining[0]
             );
         }
     }
