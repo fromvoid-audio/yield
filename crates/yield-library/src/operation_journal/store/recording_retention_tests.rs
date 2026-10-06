@@ -1260,3 +1260,296 @@ fn recording_prestart_refuses_actual_cancel_disposition_and_preserves_reservatio
     );
     assert_eq!(store.recording_retained_totals().unwrap(), before);
 }
+
+fn recording_projection_raw_state(
+    connection: &rusqlite::Connection,
+) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    let tables = connection.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'operation_journal%' ORDER BY name").unwrap()
+        .query_map([], |r|r.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let sql = format!(
+                "SELECT * FROM \"{}\" ORDER BY 1",
+                table.replace('"', "\"\"")
+            );
+            let mut statement = connection.prepare(&sql).unwrap();
+            let columns = statement.column_count();
+            let values = statement
+                .query_map([], |r| {
+                    (0..columns)
+                        .map(|n| r.get::<_, rusqlite::types::Value>(n))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (table, values)
+        })
+        .collect()
+}
+
+#[test]
+fn recording_payload_projection_changed_blob_refuses_before_copy() {
+    use super::recording_chunks::{PAYLOAD_COPIED_BYTES, PAYLOAD_READ_HOOK, PayloadReader};
+    use crate::operation_journal::recording_commands::recording_proposal_for_test;
+    let mut observations = Vec::new();
+    for kind in [PayloadReader::Control, PayloadReader::Chunk] {
+        let f = fixture();
+        let store = OperationJournalStore::open(&f.owner).unwrap();
+        let proposal = recording_proposal_for_test(2, 100);
+        store
+            .insert_intent(&finite_recording_record(&proposal))
+            .unwrap();
+        let header = initial_recording_header(&proposal);
+        store.retain_recording_chunk(&header).unwrap();
+        let id: String = if kind == PayloadReader::Control {
+            store
+                .connection
+                .query_row(
+                    "SELECT chunk_id FROM operation_journal_recording_chunks WHERE slot=20000",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        } else {
+            header.chunk_id().to_string()
+        };
+        let bound = if kind == PayloadReader::Control {
+            4096
+        } else {
+            131072
+        };
+        let changed = vec![b'x'; bound + 1];
+        let changed_for_hook = changed.clone();
+        let id_for_hook = id.clone();
+        let baseline = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let baseline_for_hook = baseline.clone();
+        PAYLOAD_READ_HOOK.with(|h| *h.borrow_mut() = Some((kind, Box::new(move |connection| {
+            assert!(connection.is_autocommit());
+            connection.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
+            connection.execute("UPDATE operation_journal_recording_chunks SET record=?1 WHERE chunk_id=?2", params![changed_for_hook,id_for_hook]).unwrap();
+            connection.execute_batch("PRAGMA ignore_check_constraints=OFF").unwrap();
+            *baseline_for_hook.borrow_mut() = Some(recording_projection_raw_state(connection));
+            PAYLOAD_COPIED_BYTES.with(|n| n.set(0));
+        }))));
+        PAYLOAD_COPIED_BYTES.with(|n| n.set(0));
+        let result = if kind == PayloadReader::Control {
+            store
+                .verify_recording_reservation(&proposal, true)
+                .map(|_| ())
+        } else {
+            store
+                .get_recording_chunk(proposal.operation_id(), header.chunk_id())
+                .map(|_| ())
+        };
+        let decoder_error = if kind == PayloadReader::Control {
+            crate::operation_journal::recording_commands::controls::RecordingControlReservation::decode(&changed, &proposal).unwrap_err()
+        } else {
+            crate::operation_journal::recording_commands::RecordingCapturedChunk::decode(
+                &changed, &proposal,
+            )
+            .unwrap_err()
+        };
+        let expected = OperationJournalStoreError::RecordingRetention {
+            reason: decoder_error.to_string(),
+        };
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            expected.to_string(),
+            "{kind:?}"
+        );
+        let copied = PAYLOAD_COPIED_BYTES.with(|n| n.get());
+        eprintln!(
+            "actual recording payload {kind:?}: changed={} copied={copied}",
+            changed.len()
+        );
+        observations.push((kind, copied));
+        assert_eq!(
+            recording_projection_raw_state(&store.connection),
+            *baseline.borrow().as_ref().unwrap()
+        );
+        let retained: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal_recording_chunks WHERE chunk_id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, changed);
+        assert!(store.connection.is_autocommit());
+        drop(store);
+        let reopened = OperationJournalStore::open(&f.owner).unwrap();
+        let after: Vec<u8> = reopened
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal_recording_chunks WHERE chunk_id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, changed);
+        assert_eq!(
+            recording_projection_raw_state(&reopened.connection),
+            *baseline.borrow().as_ref().unwrap()
+        );
+        assert!(
+            reopened
+                .verify_recording_reservation(&proposal, true)
+                .is_err()
+                || reopened
+                    .get_recording_chunk(proposal.operation_id(), header.chunk_id())
+                    .is_err()
+        );
+    }
+    assert!(
+        observations.iter().all(|(_, copied)| *copied == 0),
+        "oversized retained payloads copied: {observations:?}"
+    );
+}
+
+#[test]
+fn recording_payload_projection_changed_types_empty_and_historical_bytes() {
+    use super::recording_chunks::{PAYLOAD_COPIED_BYTES, PAYLOAD_READ_HOOK, PayloadReader};
+    use crate::operation_journal::recording_commands::controls::RecordingControlReservation;
+    use crate::operation_journal::recording_commands::{
+        RecordingCapturedChunk, recording_proposal_for_test,
+    };
+    use rusqlite::types::Value;
+    for kind in [PayloadReader::Control, PayloadReader::Chunk] {
+        for case in 0..5 {
+            let f = fixture();
+            let store = OperationJournalStore::open(&f.owner).unwrap();
+            let proposal = recording_proposal_for_test(2, 100);
+            store
+                .insert_intent(&finite_recording_record(&proposal))
+                .unwrap();
+            let header = initial_recording_header(&proposal);
+            store.retain_recording_chunk(&header).unwrap();
+            let id: String = if kind == PayloadReader::Control {
+                store
+                    .connection
+                    .query_row(
+                        "SELECT chunk_id FROM operation_journal_recording_chunks WHERE slot=20000",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            } else {
+                header.chunk_id().to_string()
+            };
+            let original: Vec<u8> = store
+                .connection
+                .query_row(
+                    "SELECT record FROM operation_journal_recording_chunks WHERE chunk_id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let changed = match case {
+                0 => Value::Text("changed SQL type".into()),
+                1 => Value::Integer(42),
+                2 => Value::Real(42.5),
+                3 => Value::Blob(Vec::new()),
+                _ => Value::Blob(
+                    format!(" \n{}\t", String::from_utf8(original).unwrap()).into_bytes(),
+                ),
+            };
+            let expected_error = match &changed {
+                Value::Blob(bytes) if case == 3 => {
+                    let error = if kind == PayloadReader::Control {
+                        RecordingControlReservation::decode(bytes, &proposal)
+                            .unwrap_err()
+                            .to_string()
+                    } else {
+                        RecordingCapturedChunk::decode(bytes, &proposal)
+                            .unwrap_err()
+                            .to_string()
+                    };
+                    Some(
+                        OperationJournalStoreError::RecordingRetention { reason: error }
+                            .to_string(),
+                    )
+                }
+                Value::Blob(_) => None,
+                _ => Some(
+                    OperationJournalStoreError::from(rusqlite::Error::InvalidColumnType(
+                        0,
+                        "record".into(),
+                        changed.data_type(),
+                    ))
+                    .to_string(),
+                ),
+            };
+            let baseline = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let baseline_for_hook = baseline.clone();
+            let id_for_hook = id.clone();
+            PAYLOAD_READ_HOOK.with(|h| *h.borrow_mut()=Some((kind,Box::new(move |connection| {
+                assert!(connection.is_autocommit());
+                connection.execute("UPDATE operation_journal_recording_chunks SET record=?1 WHERE chunk_id=?2",params![changed,id_for_hook]).unwrap();
+                *baseline_for_hook.borrow_mut()=Some(recording_projection_raw_state(connection));
+                PAYLOAD_COPIED_BYTES.with(|n|n.set(0));
+            }))));
+            let result = if kind == PayloadReader::Control {
+                store
+                    .verify_recording_reservation(&proposal, true)
+                    .map(|_| ())
+            } else {
+                store
+                    .get_recording_chunk(proposal.operation_id(), header.chunk_id())
+                    .map(|chunk| assert_eq!(chunk, Some(header.clone())))
+            };
+            if let Some(expected) = expected_error {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    expected,
+                    "{kind:?} case{case}"
+                );
+                assert_eq!(
+                    PAYLOAD_COPIED_BYTES.with(|n| n.get()),
+                    0,
+                    "{kind:?} case{case}"
+                );
+            } else {
+                result.unwrap();
+            }
+            let snapshot = baseline.borrow();
+            let snapshot = snapshot.as_ref().unwrap();
+            assert_eq!(&recording_projection_raw_state(&store.connection), snapshot);
+            assert!(store.connection.is_autocommit());
+            drop(store);
+            let reopened = OperationJournalStore::open(&f.owner).unwrap();
+            assert_eq!(
+                &recording_projection_raw_state(&reopened.connection),
+                snapshot
+            );
+            assert!(reopened.connection.is_autocommit());
+            if case == 4 {
+                assert!(
+                    reopened
+                        .verify_recording_reservation(&proposal, true)
+                        .unwrap()
+                );
+                assert_eq!(
+                    reopened
+                        .get_recording_chunk(proposal.operation_id(), header.chunk_id())
+                        .unwrap(),
+                    Some(header)
+                );
+            } else if kind == PayloadReader::Control {
+                assert!(
+                    reopened
+                        .verify_recording_reservation(&proposal, true)
+                        .is_err()
+                );
+            } else {
+                assert!(
+                    reopened
+                        .get_recording_chunk(proposal.operation_id(), header.chunk_id())
+                        .is_err()
+                );
+            }
+        }
+    }
+}
