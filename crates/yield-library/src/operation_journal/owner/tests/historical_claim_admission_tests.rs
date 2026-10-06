@@ -193,19 +193,16 @@ fn historical_claim_late_send_disposes_payload_before_original_reply_credit() {
     let shared = Arc::new(OwnerShared::new(senders));
     let before = shared.input_bytes.lock().unwrap().remaining[0];
     let header = shared
-        .reserve_input(
-            InputClass::Ordinary,
-            std::mem::size_of::<HistoricalReplyBacking>() + 2 * std::mem::size_of::<usize>(),
-        )
+        .reserve_input(InputClass::Ordinary, HISTORICAL_REPLY_BYTES)
         .unwrap();
-    let backing = Arc::new(HistoricalReplyBacking {
+    let backing = HistoricalReply::new(HistoricalReplyBacking {
         _header: header,
         consumer: Mutex::new(None),
         observer: Mutex::new(None),
         consumer_refused: std::sync::atomic::AtomicBool::new(false),
     });
     let mut input = shared.reserve_input(InputClass::Ordinary, 1).unwrap();
-    input.historical_reply = Some(Arc::clone(&backing));
+    input.historical_reply = Some(backing.clone());
     let scratch = input.reserve_historical_scratch(4096).unwrap();
     input.retain_historical_error(scratch, None, None, None);
     let (sender, receiver) = mpsc::sync_channel::<Result<(), OperationJournalOwnerError>>(1);
@@ -213,17 +210,23 @@ fn historical_claim_late_send_disposes_payload_before_original_reply_credit() {
     let request = OperationJournalRequest {
         receiver: Some(receiver),
         result_permit: Some(result_permit),
-        historical_reply: Some(Arc::clone(&backing)),
+        historical_reply: Some(backing.clone()),
     };
     drop(request);
     drop(input);
-    assert!(before - shared.input_bytes.lock().unwrap().remaining[0] >= 4096);
+    assert_eq!(
+        before - shared.input_bytes.lock().unwrap().remaining[0],
+        4096 + HISTORICAL_REPLY_BYTES
+    );
     assert!(!execute_store_result(sender, || Err::<(), _>(
         OperationJournalStoreError::HistoricalClaimObservation {
             reason: "actual late reply".into()
         }
     )));
-    assert!(before - shared.input_bytes.lock().unwrap().remaining[0] >= 4096);
+    assert_eq!(
+        before - shared.input_bytes.lock().unwrap().remaining[0],
+        4096 + HISTORICAL_REPLY_BYTES
+    );
     drop(backing);
     assert_eq!(shared.input_bytes.lock().unwrap().remaining[0], before);
 }
@@ -282,4 +285,50 @@ fn historical_claim_earliest_consumer_refusal_keeps_precharged_reply_through_del
     );
     drop(retained);
     assert_eq!(owner.shared.input_bytes.lock().unwrap().remaining[0], limit);
+}
+
+#[test]
+fn historical_claim_concurrent_last_reply_aliases_refund_exact_original_pool() {
+    // Exercise actual concurrent final aliases, not a single-owner try_unwrap path.
+    for _ in 0..32 {
+        let (senders, _receivers) = OwnerCommandReceivers::channel();
+        let shared = Arc::new(OwnerShared::new(senders));
+        let before = shared.input_bytes.lock().unwrap().remaining[0];
+        let backing = HistoricalReply::new(HistoricalReplyBacking {
+            consumer: Mutex::new(Some(
+                shared.reserve_input(InputClass::Ordinary, 1024).unwrap(),
+            )),
+            observer: Mutex::new(Some(HistoricalObserverCredits {
+                _sql: shared.reserve_input(InputClass::Ordinary, 2048).unwrap(),
+                _parser: None,
+                _envelope: None,
+                _sqlite_error: None,
+            })),
+            consumer_refused: std::sync::atomic::AtomicBool::new(false),
+            _header: shared
+                .reserve_input(InputClass::Ordinary, HISTORICAL_REPLY_BYTES)
+                .unwrap(),
+        });
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let alias = backing.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    drop(alias);
+                })
+            })
+            .collect();
+        drop(backing);
+        assert_eq!(
+            before - shared.input_bytes.lock().unwrap().remaining[0],
+            3072 + HISTORICAL_REPLY_BYTES
+        );
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(shared.input_bytes.lock().unwrap().remaining[0], before);
+    }
 }

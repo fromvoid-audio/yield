@@ -73,7 +73,15 @@ held through an unconsumed reply. Receiver Drop destroys channel contents before
 releasing count/backing; the actor keeps backing through send and disposal of a
 failed-send payload. Explicit consumption transfers the result to its caller;
 this account does not bound caller-owned output thereafter. Terminal permits do
-not reference the reply Arc, so this backing cannot form a retention cycle.
+not reference the reply Arc, so this backing cannot form a retention cycle. A
+private alias wrapper exposes neither an Arc nor a Weak. Every alias Drop uses
+`Arc::into_inner`, whose pinned Rust 1.93 implementation moves the backing and
+drops the implicit Weak before returning it. With no external Weak, the Arc
+allocation is freed before the moved backing drops its consumer/observer fields
+and finally its LAST header permit. This also guarantees one winner when final
+aliases drop concurrently; `try_unwrap(...).ok()` cannot supply that guarantee.
+See [the pinned implementation](https://github.com/rust-lang/rust/blob/1.93.0/library/alloc/src/sync.rs#L1221)
+and the original-pool simultaneous-final-alias refund fixture.
 
 The actor corruption fixtures insert through the same original Store connection
 and a test-only queued fixture command after genuine startup; they do not relax

@@ -12,6 +12,8 @@ pub use super::wal_admission::{
     WalPreparationStatus, WalPreparedDatabase,
 };
 mod frozen_copy;
+mod historical_reply;
+use historical_reply::HistoricalReply;
 mod queue_metrics;
 pub use queue_metrics::{JournalQueueClassMetrics, JournalQueueMetricsSnapshot};
 use queue_metrics::{QueueMetrics, QueueTicket};
@@ -713,7 +715,7 @@ pub enum OperationJournalRequestError {
 /// that has no receiver.
 pub struct OperationJournalRequest<T> {
     receiver: Option<Receiver<Result<T, OperationJournalOwnerError>>>,
-    historical_reply: Option<Arc<HistoricalReplyBacking>>,
+    historical_reply: Option<HistoricalReply>,
     result_permit: Option<ResultPermit>,
 }
 
@@ -5307,14 +5309,14 @@ impl OperationJournalClient {
         let historical_reply = if historical {
             // Fund the Arc allocation (including both reference counters) before allocating.
             let header = self.shared.reserve_input(class, HISTORICAL_REPLY_BYTES)?;
-            let backing = Arc::new(HistoricalReplyBacking {
+            let backing = HistoricalReply::new(HistoricalReplyBacking {
                 _header: header,
                 consumer: Mutex::new(None),
                 observer: Mutex::new(None),
                 #[cfg(test)]
                 consumer_refused: std::sync::atomic::AtomicBool::new(false),
             });
-            input.historical_reply = Some(Arc::clone(&backing));
+            input.historical_reply = Some(backing.clone());
             Some(backing)
         } else {
             None
@@ -5709,15 +5711,16 @@ pub(super) struct InputPermit {
     bytes: usize,
     class: InputClass,
     publication: bool,
-    historical_reply: Option<Arc<HistoricalReplyBacking>>,
+    historical_reply: Option<HistoricalReply>,
 }
 
 struct HistoricalReplyBacking {
-    _header: InputPermit,
     consumer: Mutex<Option<InputPermit>>,
     observer: Mutex<Option<HistoricalObserverCredits>>,
     #[cfg(test)]
     consumer_refused: std::sync::atomic::AtomicBool,
+    // Release working/consumer storage first; the private wrapper already freed the Arc.
+    _header: InputPermit,
 }
 // This first-stage refusal can occur before any observer/consumer debit succeeds.
 // Fund its owned reason (including String growth) BEFORE queueing/Arc allocation.

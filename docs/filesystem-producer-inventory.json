@@ -384,6 +384,66 @@
       "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
     },
     {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pressure_before_effects",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2375",
+      "reason": "cfg(test) isolated genuine profile Store/owner fixture for original queued historical BOOL observation, pool pressure and reply retention; same original SQLite connection, no physical capacity/provider or filesystem mutation authority.",
+      "retirement": "Keep only as the explicit historical observer/owner funding fixture; never enable start_without_capacity_for_test as production bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pressure_before_effects",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2375",
+      "reason": "cfg(test) isolated genuine profile Store/owner fixture for original queued historical BOOL observation, pool pressure and reply retention; same original SQLite connection, no physical capacity/provider or filesystem mutation authority.",
+      "retirement": "Keep only as the explicit historical observer/owner funding fixture; never enable start_without_capacity_for_test as production bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "historical_claim_earliest_consumer_refusal_keeps_precharged_reply_through_delivery",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2375",
+      "reason": "cfg(test) isolated genuine profile Store/owner fixture for original queued historical BOOL observation, pool pressure and reply retention; same original SQLite connection, no physical capacity/provider or filesystem mutation authority.",
+      "retirement": "Keep only as the explicit historical observer/owner funding fixture; never enable start_without_capacity_for_test as production bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "historical_claim_earliest_consumer_refusal_keeps_precharged_reply_through_delivery",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2375",
+      "reason": "cfg(test) isolated genuine profile Store/owner fixture for original queued historical BOOL observation, pool pressure and reply retention; same original SQLite connection, no physical capacity/provider or filesystem mutation authority.",
+      "retirement": "Keep only as the explicit historical observer/owner funding fixture; never enable start_without_capacity_for_test as production bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "historical_claim_unconsumed_actor_error_hands_off_to_funded_diagnostics_until_receiver_drop",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2375",
+      "reason": "cfg(test) isolated genuine profile Store/owner fixture for original queued historical BOOL observation, pool pressure and reply retention; same original SQLite connection, no physical capacity/provider or filesystem mutation authority.",
+      "retirement": "Keep only as the explicit historical observer/owner funding fixture; never enable start_without_capacity_for_test as production bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "historical_claim_unconsumed_actor_error_hands_off_to_funded_diagnostics_until_receiver_drop",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2375",
+      "reason": "cfg(test) isolated genuine profile Store/owner fixture for original queued historical BOOL observation, pool pressure and reply retention; same original SQLite connection, no physical capacity/provider or filesystem mutation authority.",
+      "retirement": "Keep only as the explicit historical observer/owner funding fixture; never enable start_without_capacity_for_test as production bootstrap."
+    },
+    {
       "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/reconcile.rs",
       "function": "reconcile_source_entry",
       "operation": "method::remove_file",
