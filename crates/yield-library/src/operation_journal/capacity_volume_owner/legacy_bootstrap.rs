@@ -255,7 +255,7 @@ fn write_sealed_marker(
 mod tests {
     #[cfg(unix)]
     mod native {
-        use super::*;
+        use super::super::*;
         use crate::{
             app_dirs::AppRootGuard,
             sample_sources::{DB_FILE_NAME, SourceDatabase},
