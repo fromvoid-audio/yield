@@ -1,6 +1,6 @@
 //! Resource-required production bootstrap and genuine journal registration.
 //! This body is typechecked on all test targets; no test-capacity startup or forged receipt.
-use super::super::*;
+use super::*;
 use crate::operation_journal::source_registry_retirement::SourceRegistryRetirementIntentArgs;
 use crate::operation_journal::work_plan::{WorkUnitKey, WorkUnitRole};
 use crate::operation_journal::{
