@@ -30,12 +30,18 @@ fn database_attempt_initial_borrow_preserves_first_stored_start() {
         "initial validation duplicated original owned label backing"
     );
     assert!(HISTORICAL_LABEL_CAPACITY.with(|n| n.get()) >= stored.intent.label.len());
-    assert_eq!(
-        store.read_database_attempt(a.attempt).unwrap().unwrap(),
-        (a.clone(), None)
-    );
-    assert_eq!(a.encode().unwrap(), image);
-    assert_eq!(a.digest().unwrap(), digest);
+    let retained: Vec<u8> = store
+        .connection
+        .query_row(
+            "SELECT image FROM operation_journal_database_attempt WHERE attempt_id=?1",
+            [a.attempt.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, image);
+    let readback = store.read_database_attempt(a.attempt).unwrap().unwrap();
+    assert_eq!(readback, (a.clone(), None));
+    assert_eq!(readback.0.digest().unwrap(), digest);
     assert_eq!(
         store.read_row(record.operation_id).unwrap().unwrap().record,
         stored
