@@ -7248,6 +7248,8 @@ mod tests {
         drop(authority);
         drop(database);
         assert!(owner.shutdown());
+        drop(owner);
+        drop(fixture);
 
         let (fixture, mut owner) = open_owner("current-source-refusal-debit");
         let source_root = tempfile::tempdir().expect("source root");
