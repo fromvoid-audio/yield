@@ -21,6 +21,9 @@ The active fixed header gate counts the whole Collector, Shared with conservativ
 inside the unchanged 2048-byte allowance. Shared's additional input keeper is
 included in its actual target layout. Snapshot and CurrentRound have separate
 simultaneous credits within the unchanged combined 64 KiB budget.
+The Linux test layout measured Collector 784 + Shared with Arc slack 168 +
+InputPermit with Arc slack 104 + budget backing 104 = 1160 bytes. Native target
+compilation checks the same unchanged allowance against each target's layout.
 
 The actual producer test covers both explicit abort and original journal shutdown.
 It requires confirmed cleanup, original Source writer reuse, all actual joins,
