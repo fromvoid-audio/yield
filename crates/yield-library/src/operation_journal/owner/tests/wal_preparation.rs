@@ -1078,11 +1078,10 @@ mod integration {
                 .unwrap();
         }
         let handle = rig.submit(rig.input(Instant::now() + Duration::from_millis(400)));
-        assert!(matches!(
-            wait(&handle, |s| matches!(s, WalPreparationStatus::Ready(_))
-                || terminal(s)),
-            WalPreparationStatus::Ready(_)
-        ));
+        let ready = wait(&handle, |s| {
+            matches!(s, WalPreparationStatus::Ready(_)) || terminal(s)
+        });
+        assert!(matches!(ready, WalPreparationStatus::Ready(_)), "{ready:?}");
         let result = wait(&handle, terminal);
         assert!(
             matches!(
