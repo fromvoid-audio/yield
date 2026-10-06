@@ -54,11 +54,13 @@ fn legacy_reserve_original_child_create_and_directory_sync_refuse_lost_proof_wit
             // Logical ProtectedReserve fixture only; refusal cannot issue a qualified reserve.
             let reserve = super::super::super::capacity_reserve::test_fixture_reserve(file);
             std::fs::write(&sidecar, b"retained source evidence").unwrap();
-            let failure =
-                finish_legacy_created_reserve(root, &profile, reserve, &proof).unwrap_err();
+            let failure = match finish_legacy_created_reserve(root, &profile, reserve, &proof) {
+                Err(failure) => failure,
+                Ok(_) => panic!("lost source proof cannot complete reserve qualification"),
+            };
             assert_eq!(failure.stage(), ReserveNamespaceFailureStage::Sync);
             assert!(matches!(
-                failure.owned_file,
+                failure.owned_file.as_ref(),
                 Some(OwnedFailureFile::Protected(_))
             ));
             let backing = failure.into_legacy_backing();

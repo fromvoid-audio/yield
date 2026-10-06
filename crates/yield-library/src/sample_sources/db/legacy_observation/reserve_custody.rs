@@ -13,6 +13,10 @@ pub(crate) struct LegacyReserveUseProof<'a> {
     profile: &'a WritableProfileGuard,
     deadline: Instant,
     frozen: LegacySourcePagerObservation,
+    #[cfg(test)]
+    before_final_targets: Option<fn(Instant)>,
+    #[cfg(test)]
+    before_final_root: Option<fn(Instant)>,
 }
 impl LegacyReserveUseProof<'_> {
     #[cfg(any(target_os = "macos", test))]
@@ -26,15 +30,18 @@ impl LegacyReserveUseProof<'_> {
                 "legacy bootstrap root is not original custody",
             ));
         }
-        root.validate_profile_guard(self.profile).map_err(refused)
+        root.validate_profile_guard(self.profile).map_err(refused)?;
+        #[cfg(test)]
+        if let Some(hold) = self.before_final_root {
+            hold(self.deadline);
+        }
+        self.validate_live_boundary()
     }
     pub(crate) fn validate_for_bootstrap(&self) -> Result<()> {
         self.validated_targets().map(|_| ())
     }
     fn validated_targets(&self) -> Result<Vec<LegacyReserveTarget>> {
-        if Instant::now() >= self.deadline || !self.source.connection.has_no_effect_fence() {
-            return Err(LegacyObservationError("legacy bootstrap custody closed"));
-        }
+        self.validate_live_boundary()?;
         if self
             .source
             .capture_pager_until(self.profile, self.deadline)?
@@ -44,7 +51,20 @@ impl LegacyReserveUseProof<'_> {
                 "legacy bootstrap original source changed",
             ));
         }
-        self.source.reserve_targets(self.profile, self.deadline)
+        let targets = self.source.reserve_targets(self.profile, self.deadline)?;
+        #[cfg(test)]
+        if let Some(hold) = self.before_final_targets {
+            hold(self.deadline);
+        }
+        // Native observation may consume the remaining budget; refuse cooperatively after it.
+        self.validate_live_boundary()?;
+        Ok(targets)
+    }
+    fn validate_live_boundary(&self) -> Result<()> {
+        if Instant::now() >= self.deadline || !self.source.connection.has_no_effect_fence() {
+            return Err(LegacyObservationError("legacy bootstrap custody closed"));
+        }
+        Ok(())
     }
 }
 impl LegacySourceReadOwner {
@@ -89,6 +109,10 @@ impl LegacySourceReadOwner {
             source: self,
             profile,
             deadline,
+            #[cfg(test)]
+            before_final_targets: None,
+            #[cfg(test)]
+            before_final_root: None,
         };
         proof.validate_for_bootstrap()?;
         Ok(proof)

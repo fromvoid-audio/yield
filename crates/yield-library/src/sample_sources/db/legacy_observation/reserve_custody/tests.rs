@@ -84,3 +84,57 @@ fn explicitly_retained_main_reserve_root_refuses_replacement_without_mutating_so
     assert!(std::fs::read_dir(&root).unwrap().next().is_none());
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
+
+#[test]
+fn original_prelease_proof_refuses_expiry_after_actual_targets_and_root_validation_return() {
+    // Test-only holds delay return from genuine Native observation; no fake authority or floor.
+    fn hold(deadline: Instant) {
+        while Instant::now() < deadline {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+    for after_root in [false, true] {
+        let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let media = tempfile::tempdir().unwrap();
+        let _app = crate::app_dirs::AppRootGuard::set(temp.path().to_owned()).unwrap();
+        let child = temp.path().join("legacy");
+        std::fs::create_dir(&child).unwrap();
+        let path = child.join(crate::sample_sources::DB_FILE_NAME);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/profile-v11/source.sql"
+            )))
+            .unwrap();
+        let profile = WritableProfileGuard::acquire_current().unwrap();
+        let mut source =
+            SourceDatabase::open_legacy_read_owner(media.path(), &profile, "legacy").unwrap();
+        let original = std::fs::read(&path).unwrap();
+        source
+            .prepare_no_effect_writable_until(&profile, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        let targets = source
+            .reserve_targets(&profile, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut proof = source.reserve_use_proof(&profile, deadline).unwrap();
+        if after_root {
+            proof.before_final_root = Some(hold);
+            assert!(
+                proof
+                    .validate_root_for_bootstrap(targets[0].root.as_ref())
+                    .is_err()
+            );
+        } else {
+            proof.before_final_targets = Some(hold);
+            assert!(proof.validate_for_bootstrap().is_err());
+        }
+        assert!(Instant::now() >= deadline);
+        assert!(proof.validate_for_bootstrap().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!child.join("recovery-reserve.bin").exists());
+        assert!(source.connection.has_no_effect_fence());
+    }
+}
