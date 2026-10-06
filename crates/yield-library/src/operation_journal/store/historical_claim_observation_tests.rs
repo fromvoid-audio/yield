@@ -95,3 +95,187 @@ fn historical_claim_sqlite_errors_and_pressure_preserve_original_rows_and_credit
         huge.as_bytes()
     );
 }
+
+#[test]
+fn historical_claim_sqlite_projection_gates_match_original_type_identity_and_sequence_refusals() {
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let operation = OperationId::new();
+    let encoded = encode(&intent_record(operation)).unwrap();
+    let original = String::from_utf8(encoded.clone()).unwrap();
+    let mismatch = original
+        .replace(&operation.to_string(), &OperationId::new().to_string())
+        .into_bytes();
+    let unknown = original
+        .replace("\"schema_version\": 1", "\"schema_version\": 999")
+        .into_bytes();
+    assert_ne!(mismatch, encoded);
+    assert_ne!(unknown, encoded);
+    use rusqlite::types::Value as SqlValue;
+    let cases = [
+        (
+            "valid",
+            SqlValue::Integer(1),
+            SqlValue::Blob(encoded.clone()),
+            true,
+        ),
+        (
+            "zero_sequence",
+            SqlValue::Integer(0),
+            SqlValue::Blob(encoded.clone()),
+            false,
+        ),
+        (
+            "negative_sequence",
+            SqlValue::Integer(-1),
+            SqlValue::Blob(encoded.clone()),
+            false,
+        ),
+        (
+            "text_sequence",
+            SqlValue::Text("not-an-integer".into()),
+            SqlValue::Blob(encoded.clone()),
+            false,
+        ),
+        (
+            "real_sequence",
+            SqlValue::Real(1.5),
+            SqlValue::Blob(encoded.clone()),
+            false,
+        ),
+        (
+            "text_record",
+            SqlValue::Integer(1),
+            SqlValue::Text(original.clone()),
+            false,
+        ),
+        (
+            "empty_blob",
+            SqlValue::Integer(1),
+            SqlValue::Blob(Vec::new()),
+            false,
+        ),
+        (
+            "wrong_identity",
+            SqlValue::Integer(1),
+            SqlValue::Blob(mismatch),
+            false,
+        ),
+        (
+            "unknown_schema",
+            SqlValue::Integer(1),
+            SqlValue::Blob(unknown),
+            false,
+        ),
+        (
+            "oversize_blob",
+            SqlValue::Integer(1),
+            SqlValue::Blob(vec![b' '; MAX_RECORD_BYTES + 1]),
+            false,
+        ),
+    ];
+    // Deliberately create retained corrupt rows without changing the schema or
+    // admission code. The original and borrowed readers must both refuse them.
+    store
+        .connection
+        .execute_batch("PRAGMA ignore_check_constraints=ON")
+        .unwrap();
+    let input = super::super::owner::InputPermit::historical_test_input(1);
+    let available = input.historical_test_remaining();
+    for (label, sequence, record, valid) in cases {
+        store
+            .connection
+            .execute("DELETE FROM operation_journal", [])
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal VALUES (?1,?2,?3)",
+                params![operation.to_string(), sequence, record],
+            )
+            .unwrap();
+        let before: (String, String, SqlValue) = store
+            .connection
+            .query_row(
+                "SELECT typeof(sequence), typeof(record), record FROM operation_journal",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let old = store.get(operation);
+        let new = store.observe_claim_operation(operation, &input);
+        assert_eq!(
+            old.as_ref().is_ok_and(Option::is_some),
+            valid,
+            "original {label}"
+        );
+        assert_eq!(
+            new.as_ref().is_ok_and(|present| *present),
+            valid,
+            "borrowed {label}"
+        );
+        assert_eq!(old.is_err(), new.is_err(), "typed refusal {label}");
+        assert_eq!(
+            input.historical_test_remaining(),
+            available,
+            "credit {label}"
+        );
+        let after = store
+            .connection
+            .query_row(
+                "SELECT typeof(sequence), typeof(record), record FROM operation_journal",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, SqlValue>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(before, after, "immutable retained row {label}");
+    }
+    store
+        .connection
+        .execute("DELETE FROM operation_journal", [])
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO operation_journal VALUES (?1,1,?2)",
+            params![operation.to_string(), encoded],
+        )
+        .unwrap();
+    // The original uniqueness check spans all existing observation families.
+    store
+        .connection
+        .execute(
+            "INSERT INTO operation_journal_full_progress VALUES (?1,1,?2)",
+            params![OperationId::new().to_string(), b"{}".as_slice()],
+        )
+        .unwrap();
+    assert!(store.get(operation).is_err());
+    assert!(matches!(
+        store.observe_claim_operation(operation, &input),
+        Err(OperationJournalStoreError::RequiresAudit { .. })
+    ));
+    assert_eq!(input.historical_test_remaining(), available);
+    store
+        .connection
+        .execute("DELETE FROM operation_journal_full_progress", [])
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO operation_journal_full_progress VALUES (?1,2,?2)",
+            params![operation.to_string(), b"{}".as_slice()],
+        )
+        .unwrap();
+    assert!(store.get(operation).is_err());
+    assert!(matches!(
+        store.observe_claim_operation(operation, &input),
+        Err(OperationJournalStoreError::RequiresAudit { .. })
+    ));
+    assert_eq!(input.historical_test_remaining(), available);
+}

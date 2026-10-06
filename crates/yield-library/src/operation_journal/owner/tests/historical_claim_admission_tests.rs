@@ -21,7 +21,7 @@ fn historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pres
         .unwrap();
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
     wait_until_available(&owner);
-    let pool_before = owner.shared.input_bytes.lock().unwrap().remaining[0];
+    let pool_before = InputClass::Ordinary.limit();
     let retained = owner
         .shared
         .reserve_input(InputClass::Ordinary, 3 * MAX_RECORD_BYTES)
@@ -105,7 +105,7 @@ fn historical_claim_unconsumed_actor_error_hands_off_to_funded_diagnostics_until
         .join("operation_journal/journal.sqlite3");
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
     wait_until_available(&owner);
-    let pool_before = owner.shared.input_bytes.lock().unwrap().remaining[0];
+    let pool_before = InputClass::Ordinary.limit();
     let old_id = OperationId::new();
     // Introduce a malformed historical row after genuine startup. The actor must
     // retain its original typed error rather than allocating an operation identity.
