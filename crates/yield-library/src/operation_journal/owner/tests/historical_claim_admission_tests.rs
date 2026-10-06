@@ -162,11 +162,10 @@ fn historical_claim_unconsumed_actor_error_hands_off_to_funded_diagnostics_until
             .historical_reply
             .as_ref()
             .unwrap()
-            .terminal
+            .consumer
             .lock()
             .unwrap()
-            .iter()
-            .any(Option::is_some);
+            .is_some();
         if retained {
             break;
         }
@@ -213,12 +212,13 @@ fn historical_claim_late_send_disposes_payload_before_original_reply_credit() {
         .unwrap();
     let backing = Arc::new(HistoricalReplyBacking {
         _header: header,
-        terminal: Mutex::new([None, None, None, None]),
+        consumer: Mutex::new(None),
+        observer: Mutex::new(None),
     });
     let mut input = shared.reserve_input(InputClass::Ordinary, 1).unwrap();
     input.historical_reply = Some(Arc::clone(&backing));
     let scratch = input.reserve_historical_scratch(4096).unwrap();
-    input.retain_historical_error([Some(scratch), None, None]);
+    input.retain_historical_error(scratch, None, None, None);
     let (sender, receiver) = mpsc::sync_channel::<Result<(), OperationJournalOwnerError>>(1);
     let result_permit = shared.reserve_result(InputClass::Ordinary).unwrap();
     let request = OperationJournalRequest {

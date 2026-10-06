@@ -2,6 +2,9 @@
 use super::super::codec::historical_observation;
 use super::super::owner::InputPermit;
 use super::*;
+use std::cell::RefCell;
+mod borrowed_sql;
+use borrowed_sql::Statement;
 
 impl OperationJournalStore {
     #[cfg(any(test, feature = "test-support"))]
@@ -39,13 +42,49 @@ impl OperationJournalStore {
         };
         #[cfg(not(windows))]
         let path_bytes = self.database_path.as_os_str().as_encoded_bytes().len();
+        // Display may replace each invalid native byte with three UTF-8 bytes.
+        // Both original owned reason and the consumer's formatted diagnostic overlap.
+        let prefix =
+            "ordinary claim  operation  requires audit: operation journal at  requires audit: "
+                .len()
+                + 2 * 36;
+        let display_bytes = path_bytes
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(historical_observation::FIXED_BYTES))
+            .and_then(|n| n.checked_add(prefix))
+            .and_then(|n| n.checked_mul(2))
+            .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
         let sql_bytes = historical_observation::FIXED_BYTES
             .checked_add(path_bytes)
+            .and_then(|n| n.checked_add(display_bytes))
+            .and_then(|n| {
+                n.checked_add(
+                    3 * std::mem::size_of::<Statement<'_>>()
+                        + std::mem::size_of::<RefCell<Option<InputPermit>>>(),
+                )
+            })
             .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
         let sql = input.reserve_historical_scratch(sql_bytes)?;
         let mut scratch = None;
+        let native_error = RefCell::new(None);
         let result = (|| {
-            let (legacy, full) = self.operation_family_presence(operation_id)?;
+            let mut key_buffer = [0; 36];
+            let key = operation_id
+                .as_uuid()
+                .hyphenated()
+                .encode_lower(&mut key_buffer);
+            let mut family_present = [false; 2];
+            for (index, query) in [
+                c"SELECT EXISTS(SELECT 1 FROM operation_journal WHERE operation_id = ?1)",
+                c"SELECT EXISTS(SELECT 1 FROM operation_journal_full_progress WHERE operation_id = ?1)",
+            ].into_iter().enumerate() {
+                let mut family = Statement::new(&self.connection, input, &native_error, query)?;
+                family.bind_text(1, key)?;
+                if !family.next()? { return Err(rusqlite::Error::QueryReturnedNoRows.into()); }
+                let ValueRef::Integer(present) = family.get_ref(0)? else { unreachable!("SQLite EXISTS is an integer") };
+                family_present[index] = present != 0;
+            }
+            let [legacy, full] = family_present;
             if legacy && full {
                 return Err(audit_error(
                     &self.database_path,
@@ -57,27 +96,25 @@ impl OperationJournalStore {
             }
             // Declaration order also covers panic/early-return: rows, statement, then
             // the original scratch debit. No borrowed Native row outlives its credit.
-            let mut statement = self.connection.prepare(
-            "SELECT typeof(operation_id), typeof(sequence), sequence, typeof(record), length(record),
-             CASE WHEN typeof(record) = 'blob' AND length(record) BETWEEN 0 AND ?2
-                  THEN record ELSE NULL END
-             FROM operation_journal WHERE operation_id = ?1"
-        )?;
-            let mut rows =
-                statement.query(params![operation_id.to_string(), MAX_RECORD_BYTES as i64])?;
-            let Some(row) = rows.next()? else {
+            let mut statement = Statement::new(&self.connection, input, &native_error,
+                c"SELECT typeof(operation_id), typeof(sequence), sequence, typeof(record), length(record),
+                 CASE WHEN typeof(record) = 'blob' AND length(record) BETWEEN 0 AND ?2 THEN record ELSE NULL END
+                 FROM operation_journal WHERE operation_id = ?1")?;
+            statement.bind_text(1, key)?;
+            statement.bind_integer(2, MAX_RECORD_BYTES as i64)?;
+            if !statement.next()? {
                 return Ok(false);
-            };
-            if row.get_ref(0)? != ValueRef::Text(b"text")
-                || row.get_ref(1)? != ValueRef::Text(b"integer")
-                || row.get_ref(3)? != ValueRef::Text(b"blob")
+            }
+            if statement.get_ref(0)? != ValueRef::Text(b"text")
+                || statement.get_ref(1)? != ValueRef::Text(b"integer")
+                || statement.get_ref(3)? != ValueRef::Text(b"blob")
             {
                 return Err(retained_error(
                     Some(operation_id),
                     "stored operation key, sequence or record has the wrong SQLite type",
                 ));
             }
-            let ValueRef::Integer(sequence) = row.get_ref(2)? else {
+            let ValueRef::Integer(sequence) = statement.get_ref(2)? else {
                 return Err(retained_error(
                     Some(operation_id),
                     "stored sequence is not an integer",
@@ -89,14 +126,35 @@ impl OperationJournalStore {
                     "stored sequence is not positive",
                 ));
             }
-            self.ensure_sequence_unique(sequence)?;
-            let ValueRef::Integer(length) = row.get_ref(4)? else {
+            {
+                let mut unique = Statement::new(&self.connection, input, &native_error,
+                    c"SELECT COUNT(*) FROM (
+                       SELECT sequence FROM operation_journal WHERE typeof(sequence) = 'integer' AND sequence = ?1
+                       UNION ALL SELECT sequence FROM operation_journal_full_progress WHERE typeof(sequence) = 'integer' AND sequence = ?1
+                       UNION ALL SELECT sequence FROM operation_journal_staging_checkpoints WHERE typeof(sequence) = 'integer' AND sequence = ?1
+                       UNION ALL SELECT sequence FROM operation_journal_chunk_staging WHERE typeof(sequence) = 'integer' AND sequence = ?1
+                       UNION ALL SELECT sequence FROM operation_journal_recording_chunks WHERE typeof(sequence) = 'integer' AND sequence = ?1)")?;
+                unique.bind_integer(1, sequence)?;
+                if !unique.next()? {
+                    return Err(rusqlite::Error::QueryReturnedNoRows.into());
+                }
+                let ValueRef::Integer(count) = unique.get_ref(0)? else {
+                    unreachable!("SQLite COUNT is an integer")
+                };
+                if count > 1 {
+                    return Err(audit_error(
+                        &self.database_path,
+                        format!("duplicate journal-observation sequence {sequence}"),
+                    ));
+                }
+            }
+            let ValueRef::Integer(length) = statement.get_ref(4)? else {
                 return Err(retained_error(
                     Some(operation_id),
                     "stored record length is unavailable",
                 ));
             };
-            let ValueRef::Blob(bytes) = row.get_ref(5)? else {
+            let ValueRef::Blob(bytes) = statement.get_ref(5)? else {
                 return Err(retained_error(
                     Some(operation_id),
                     "stored record is not a bounded SQLite BLOB",
@@ -113,7 +171,6 @@ impl OperationJournalStore {
                 historical_observation::observe(bytes, scratch.as_mut().expect("funded scratch"));
             // End the SQLite borrow before releasing its per-row scratch or falling through
             // to the unchanged other-family reader. No historical payload is copied here.
-            drop(rows);
             drop(statement);
             let observation = observed?;
             let Some(record) = observation.as_ref() else {
@@ -143,7 +200,7 @@ impl OperationJournalStore {
                 .take()
                 .map(|scratch| scratch.into_permits())
                 .unwrap_or([None, None]);
-            input.retain_historical_error([Some(sql), parser, extra]);
+            input.retain_historical_error(sql, parser, extra, native_error.into_inner());
         }
         result
     }

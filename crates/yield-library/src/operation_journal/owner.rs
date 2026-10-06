@@ -5312,7 +5312,8 @@ impl OperationJournalClient {
             )?;
             let backing = Arc::new(HistoricalReplyBacking {
                 _header: header,
-                terminal: Mutex::new([None, None, None, None]),
+                consumer: Mutex::new(None),
+                observer: Mutex::new(None),
             });
             input.historical_reply = Some(Arc::clone(&backing));
             Some(backing)
@@ -5714,7 +5715,15 @@ pub(super) struct InputPermit {
 
 struct HistoricalReplyBacking {
     _header: InputPermit,
-    terminal: Mutex<[Option<InputPermit>; 4]>,
+    consumer: Mutex<Option<InputPermit>>,
+    observer: Mutex<Option<HistoricalObserverCredits>>,
+}
+
+struct HistoricalObserverCredits {
+    _sql: InputPermit,
+    _parser: Option<InputPermit>,
+    _envelope: Option<InputPermit>,
+    _sqlite_error: Option<InputPermit>,
 }
 
 impl InputPermit {
@@ -5731,26 +5740,35 @@ impl InputPermit {
         self.shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()]
     }
 
-    pub(super) fn retain_historical_error(&self, permits: [Option<InputPermit>; 3]) {
+    pub(super) fn retain_historical_error(
+        &self,
+        sql: InputPermit,
+        parser: Option<InputPermit>,
+        envelope: Option<InputPermit>,
+        sqlite_error: Option<InputPermit>,
+    ) {
         if let Some(backing) = &self.historical_reply {
-            // Terminal permits have no reply Arc: the retained backing cannot form a cycle.
-            let mut terminal = backing.terminal.lock().unwrap_or_else(|p| p.into_inner());
-            assert!(
-                terminal[1..].iter().all(Option::is_none),
-                "previous observer error must be consumed before the next lookup"
-            );
-            for (slot, permit) in terminal[1..].iter_mut().zip(permits) {
-                *slot = permit;
-            }
+            // Each named allocation is funded on the original pool. Terminal permits
+            // contain no reply Arc; the retained backing cannot form a cycle.
+            *backing.observer.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(HistoricalObserverCredits {
+                    _sql: sql,
+                    _parser: parser,
+                    _envelope: envelope,
+                    _sqlite_error: sqlite_error,
+                });
         }
     }
 
     pub(super) fn historical_error_consumed(&self) {
         if let Some(backing) = &self.historical_reply {
-            let mut terminal = backing.terminal.lock().unwrap_or_else(|p| p.into_inner());
-            for permit in &mut terminal[1..] {
-                drop(permit.take());
-            }
+            drop(
+                backing
+                    .observer
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take(),
+            );
         }
     }
 
@@ -5758,7 +5776,7 @@ impl InputPermit {
         if let Some(backing) = &self.historical_reply {
             let permit =
                 self.reserve_historical_scratch(super::store::HISTORICAL_DIAGNOSTIC_BYTES)?;
-            backing.terminal.lock().unwrap_or_else(|p| p.into_inner())[0] = Some(permit);
+            *backing.consumer.lock().unwrap_or_else(|p| p.into_inner()) = Some(permit);
         }
         Ok(())
     }
