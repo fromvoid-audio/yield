@@ -107,7 +107,12 @@ fn database_claim_scalar_projection_original_large_nul_rows_do_not_copy_or_mutat
         );
         store
             .connection
-            .execute(&format!("UPDATE {table} SET {column}=?1"), [&value])
+            .execute(
+                &format!(
+                    "UPDATE {table} SET {column}=?1 WHERE rowid=(SELECT rowid FROM {table} LIMIT 1)"
+                ),
+                [&value],
+            )
             .unwrap();
         let before = scalar_database_image(&store);
         database_claims::SCALAR_COPIED_BYTES.with(|n| n.set(0));
