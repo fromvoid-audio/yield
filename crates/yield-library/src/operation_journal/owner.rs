@@ -7216,7 +7216,7 @@ mod tests {
     fn current_source_registration_busy_preserves_confirmation_and_refusal_releases_debit() {
         let (fixture, mut owner) = open_owner("current-source-input-custody");
         let source_root = tempfile::tempdir().expect("source root");
-        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        let database = crate::sample_sources::SourceDatabase::open_for_catalog_with_profile_guard(
             source_root.path(),
             &fixture.owner,
             "current-input-source",
@@ -7253,7 +7253,7 @@ mod tests {
 
         let (fixture, mut owner) = open_owner("current-source-refusal-debit");
         let source_root = tempfile::tempdir().expect("source root");
-        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        let database = crate::sample_sources::SourceDatabase::open_for_catalog_with_profile_guard(
             source_root.path(),
             &fixture.owner,
             "current-refusal-source",
