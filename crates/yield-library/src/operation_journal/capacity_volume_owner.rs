@@ -47,6 +47,8 @@ pub(super) use current_source::validate_current_source_scope;
 mod bootstrap_use;
 pub(crate) use bootstrap_use::ReserveBootstrapUseProof;
 mod legacy_bootstrap;
+#[cfg(all(test, unix))]
+pub(super) use legacy_bootstrap::acquire_current_refused_prefix_for_test;
 pub(super) use legacy_bootstrap::{
     LegacyVolumeFailureBacking, acquire_current_for_scope, acquire_legacy_for_descriptor,
 };

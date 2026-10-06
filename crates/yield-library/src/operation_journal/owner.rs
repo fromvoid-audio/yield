@@ -17,6 +17,8 @@ use historical_reply::HistoricalReply;
 mod queue_metrics;
 pub use queue_metrics::{JournalQueueClassMetrics, JournalQueueMetricsSnapshot};
 use queue_metrics::{QueueMetrics, QueueTicket};
+#[cfg(all(test, unix))]
+mod current_source_custody_tests;
 mod current_source_metadata;
 mod legacy_adoption_custody;
 mod legacy_adoption_volumes;
@@ -4686,27 +4688,7 @@ impl OperationJournalClient {
         OperationJournalRequest<SourceAuthorityRegistrationReceipt>,
         OperationJournalOwnerQueueError,
     > {
-        let input_bytes = request
-            .current_metadata_bytes()
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<(usize, usize, InputPermit)>()))
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<SourceAuthorityRecord>()))
-            .and_then(|bytes| {
-                bytes.checked_add(std::mem::size_of::<RetiredSourceAuthorityRecord>())
-            })
-            .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<SourceVolumeBinding>()))
-            .and_then(|bytes| bytes.checked_add(6 * std::mem::size_of::<VolumeIdentity>()))
-            .and_then(|bytes| bytes.checked_add(512))
-            .and_then(|bytes| bytes.checked_add(current_source_metadata::NATIVE_BACKING_BYTES))
-            .and_then(|bytes| {
-                bytes.checked_add(std::mem::size_of::<
-                    crate::sample_sources::db::CurrentReserveUseProof<'static>,
-                >())
-            })
-            .ok_or_else(|| OperationJournalOwnerQueueError::InvalidRecord {
-                reason: String::from(
-                    "Current source registration metadata exceeds its bounded field inventory",
-                ),
-            })?;
+        let input_bytes = current_source_metadata::input_bytes(&request)?;
         self.submit(input_bytes, move |input, result| {
             JournalCommand::RegisterSource {
                 request,
@@ -5983,6 +5965,22 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<(), OperationJournalOwnerError>>,
     },
+    #[cfg(all(test, unix))]
+    CurrentRefusedPrefix {
+        request: SourceAuthorityRegistrationRequest,
+        app: std::path::PathBuf,
+        panic_after_retention: bool,
+        probe: Option<Arc<Mutex<Option<current_source_custody_tests::Snapshot>>>>,
+        input: InputPermit,
+        result: SyncSender<Result<SourceAuthorityRegistrationReceipt, OperationJournalOwnerError>>,
+    },
+    #[cfg(all(test, unix))]
+    InspectCurrentRefusedPrefix {
+        volume: VolumeIdentity,
+        input: InputPermit,
+        result:
+            SyncSender<Result<current_source_custody_tests::Snapshot, OperationJournalOwnerError>>,
+    },
 
     PrepareRecordingCustody {
         operation: OperationId,
@@ -6515,6 +6513,34 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                 runtime.authenticate_source_registry_metadata(candidate)
             })
         }
+        #[cfg(all(test, unix))]
+        JournalCommand::CurrentRefusedPrefix {
+            request,
+            app,
+            panic_after_retention,
+            probe,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            runtime.current_refused_prefix_for_test(
+                Arc::new(input),
+                request,
+                &app,
+                panic_after_retention,
+                probe,
+            )
+        }),
+        #[cfg(all(test, unix))]
+        JournalCommand::InspectCurrentRefusedPrefix {
+            volume,
+            input,
+            result,
+        } => {
+            let _input = input;
+            execute_store_result(result, move || {
+                runtime.inspect_current_refused_prefix(&volume)
+            })
+        }
         JournalCommand::RegisterSource {
             request,
             input,
@@ -7005,6 +7031,14 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
         }
 
         JournalCommand::AuthenticateSourceMetadata { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        #[cfg(all(test, unix))]
+        JournalCommand::CurrentRefusedPrefix { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        #[cfg(all(test, unix))]
+        JournalCommand::InspectCurrentRefusedPrefix { result, .. } => {
             let _ = result.send(Err(error));
         }
         JournalCommand::RegisterSource { result, .. } => {

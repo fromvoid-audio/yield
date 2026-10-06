@@ -29,3 +29,30 @@ const PRODUCER_SCRATCH: usize = OWNER_DYNAMIC
     + PATH;
 
 pub(super) const NATIVE_BACKING_BYTES: usize = 2 * VOLUME_DYNAMIC + PRODUCER_SCRATCH;
+
+use super::*;
+
+pub(super) fn input_bytes(
+    request: &SourceAuthorityRegistrationRequest,
+) -> Result<usize, OperationJournalOwnerQueueError> {
+    let input_bytes = request
+        .current_metadata_bytes()
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<(usize, usize, InputPermit)>()))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<SourceAuthorityRecord>()))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<RetiredSourceAuthorityRecord>()))
+        .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<SourceVolumeBinding>()))
+        .and_then(|bytes| bytes.checked_add(6 * std::mem::size_of::<VolumeIdentity>()))
+        .and_then(|bytes| bytes.checked_add(512))
+        .and_then(|bytes| bytes.checked_add(NATIVE_BACKING_BYTES))
+        .and_then(|bytes| {
+            bytes.checked_add(std::mem::size_of::<
+                crate::sample_sources::db::CurrentReserveUseProof<'static>,
+            >())
+        })
+        .ok_or_else(|| OperationJournalOwnerQueueError::InvalidRecord {
+            reason: String::from(
+                "Current source registration metadata exceeds its bounded field inventory",
+            ),
+        })?;
+    Ok(input_bytes)
+}

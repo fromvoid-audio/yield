@@ -107,6 +107,33 @@ pub(in super::super) fn acquire_current_for_scope(
     )
 }
 
+#[cfg(all(test, unix))]
+pub(in super::super) fn acquire_current_refused_prefix_for_test(
+    scope: &CurrentReserveUseProof<'_>,
+    backing: &mut LegacyVolumeFailureBacking,
+    app_path: &Path,
+) -> Result<VolumeOwnershipCapability, ()> {
+    let _custody = ReserveBootstrapUseProof::Current(scope).begin_effect()?;
+    let app = open_no_follow_directory(app_path).map_err(|_| ())?;
+    acquire_bootstrap_inner(
+        scope.descriptor(),
+        scope.profile(),
+        &ReserveBootstrapUseProof::Current(scope),
+        backing,
+        Some((app_path.to_owned(), app)),
+        Some(TestFault::AfterMarker),
+    )
+}
+
+#[cfg(all(test, unix))]
+impl LegacyVolumeFailureBacking {
+    pub(in super::super) fn held_lock_for_tests(&self) -> Option<&File> {
+        self.lock
+            .as_ref()
+            .or_else(|| self.failed_owner.as_ref().map(|owner| &owner.lock_file))
+    }
+}
+
 fn acquire_bootstrap_inner(
     descriptor: &File,
     profile: &WritableProfileGuard,
