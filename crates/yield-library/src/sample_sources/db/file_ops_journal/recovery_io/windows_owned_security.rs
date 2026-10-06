@@ -167,6 +167,7 @@ mod native {
     };
 
     const _: () = {
+        assert!(std::mem::align_of::<SnapshotBuffers>() >= std::mem::align_of::<TOKEN_USER>());
         assert!(
             KNOWN_RIGHTS
                 == FILE_ALL_ACCESS.0
@@ -482,6 +483,17 @@ mod tests {
             snapshot(&descriptor(&user, &[(0, 0, 0x200, user.clone())]), &user),
             Err(SnapshotError::Malformed)
         );
+        let bounded = vec![(0, 0, 1, user.clone()); MAX_ACES];
+        assert_eq!(snapshot(&descriptor(&user, &bounded), &user), Ok(()));
+        for (kind, flags) in [(1, 0), (0, INHERIT_ONLY), (1, INHERIT_ONLY)] {
+            assert_eq!(
+                snapshot(
+                    &descriptor(&user, &[(kind, flags, 0x200, user.clone())]),
+                    &user
+                ),
+                Err(SnapshotError::Malformed)
+            );
+        }
         let entries = vec![(0, 0, 1, user.clone()); MAX_ACES + 1];
         assert_eq!(
             snapshot(&descriptor(&user, &entries), &user),
@@ -565,6 +577,39 @@ mod native_tests {
         );
         drop(foreign);
         drop(held);
+    }
+
+    #[test]
+    fn windows_owned_security_metadata_first_refuses_actual_device_and_reparse_directory() {
+        let private_base =
+            std::env::var_os("YIELD_WINDOWS_PRIVATE_DIRECTORY_FIXTURE").expect("private fixture");
+        let temp = tempfile::tempdir_in(private_base).unwrap();
+        let original = temp.path().join("directory");
+        let alias = temp.path().join("reparse");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("bytes"), b"unchanged reparse target").unwrap();
+        std::os::windows::fs::symlink_dir(&original, &alias)
+            .expect("native verification requires symlink privilege or Developer Mode");
+        let linked = OpenOptions::new()
+            .read(true)
+            .access_mode(0x80)
+            .custom_flags(0x02000000 | 0x00200000)
+            .share_mode(7)
+            .open(&alias)
+            .unwrap();
+        assert_eq!(validate(&linked), Err(SnapshotError::NotDirectory));
+        assert_eq!(
+            std::fs::read(original.join("bytes")).unwrap(),
+            b"unchanged reparse target"
+        );
+        drop(linked);
+        std::fs::remove_dir(alias).unwrap();
+        let device = OpenOptions::new()
+            .read(true)
+            .access_mode(0x80)
+            .open("NUL")
+            .unwrap();
+        assert_eq!(validate(&device), Err(SnapshotError::NotDirectory));
     }
 
     #[test]
