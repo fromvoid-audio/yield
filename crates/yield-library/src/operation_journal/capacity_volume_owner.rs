@@ -39,6 +39,9 @@ const MARKER_VERSION: &str = "1";
 const MAX_MARKER_BYTES: usize = 1024;
 const MAX_IDENTITY_BYTES: usize = 256;
 
+#[cfg(any(windows, test))]
+mod windows_lock;
+
 /// This capability can only be used for recovery coordination in this milestone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum VolumeOwnershipReadiness {
@@ -1155,14 +1158,8 @@ fn validate_lock_file(file: &File, path: &Path) -> Result<(), VolumeOwnershipErr
         })?;
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-            return Err(VolumeOwnershipError::LockNotRegular {
-                path: path.to_path_buf(),
-            });
-        }
+        let _ = metadata;
+        windows_lock::validate(file, path)?;
     }
     #[cfg(not(windows))]
     {
