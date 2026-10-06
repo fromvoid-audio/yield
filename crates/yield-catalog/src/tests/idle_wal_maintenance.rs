@@ -137,6 +137,22 @@ fn original_source_idle_worker_preserves_reader_and_retries_only_on_next_idle_op
         thread::sleep(Duration::from_millis(25));
     }
     let partial = fs::metadata(&main).unwrap().len();
+    let frames: (i64, i64, i64) = external
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    let payload_visible: i64 = reader
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'idle_payload'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    eprintln!(
+        "pinned diagnostic MAIN={partial} frames={frames:?} autocommit={} payload_visible={payload_visible}",
+        reader.is_autocommit()
+    );
     assert!(
         partial < 34603008,
         "pinned original reader was bypassed: {before} -> {partial}"
