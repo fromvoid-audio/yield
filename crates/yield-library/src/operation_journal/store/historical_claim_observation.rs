@@ -31,7 +31,7 @@ impl OperationJournalStore {
         if legacy && full {
             return Err(audit_error(
                 &self.database_path,
-                "operation appears in both journal families".into(),
+                "operation appears in both journal families",
             ));
         }
         if !legacy {
