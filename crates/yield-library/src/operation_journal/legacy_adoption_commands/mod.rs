@@ -246,7 +246,7 @@ impl LegacyAdoptionIntentArgs {
             .iter()
             .any(|s| !text(s))
             || d.target_version != 13
-            || d.journal_schema != 12
+            || d.journal_schema != u64::from(super::store::JOURNAL_SCHEMA_VERSION)
             || d.sqlite_version != 3_050_002
             || d.legacy_version != 11
             || d.revision > i64::MAX as u64

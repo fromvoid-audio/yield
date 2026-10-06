@@ -99,6 +99,7 @@ mod recovery_reserve_binding;
 use current_reserve_custody::{BoundCustody, OwnedCustody};
 #[cfg(test)]
 use current_reserve_custody::{CurrentReserveBoundary, CurrentReserveHook};
+mod publication_bindings;
 mod staging_checkpoints;
 pub(crate) use chunk_claims::{
     ChunkClaimRecord, ChunkClaimRequest, ChunkClaimState, ChunkId, ChunkIssueReceipt,
@@ -109,6 +110,7 @@ pub(crate) use full_progress::FullProgressWriteOutcome;
 #[cfg(test)]
 pub(crate) use ordinary_claims::MAX_PAGE_ROWS;
 pub(crate) use ordinary_claims::{OrdinaryClaimCursor, OrdinaryClaimPage, OrdinaryClaimReadError};
+pub(crate) use publication_bindings::{PublicationBindingCapture, PublicationBindingDraft};
 pub(crate) use staging_checkpoints::StagingCheckpointAck;
 /// Read-only, bounded recovery paging for the profile-owned operation journal.
 pub mod recovery;
@@ -123,7 +125,7 @@ pub const JOURNAL_DATABASE_ROOT_NAME: &str = "operation_journal";
 /// The SQLite application id reserved for the operation journal.
 pub const JOURNAL_APPLICATION_ID: u32 = u32::from_be_bytes(*b"WCJ1");
 /// The SQLite user-version written by this journal schema.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 12;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 13;
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -146,7 +148,8 @@ const STAGING_CHECKPOINT_SCHEMA_VERSION: u32 = 8;
 const CHUNK_STAGING_SCHEMA_VERSION: u32 = 9;
 const RECORDING_CHUNKS_SCHEMA_VERSION: u32 = 10;
 const DATABASE_CLAIMS_SCHEMA_VERSION: u32 = 11;
-const MAX_SCHEMA_OBJECTS: i64 = 15;
+const DATABASE_ATTEMPTS_SCHEMA_VERSION: u32 = 12;
+const MAX_SCHEMA_OBJECTS: i64 = 16;
 const MAX_SCHEMA_COLUMNS: usize = 16;
 const MAX_SCHEMA_INDEXES: usize = 8;
 #[cfg(test)]
@@ -2471,7 +2474,8 @@ impl OperationJournalStore {
                       + (SELECT COUNT(*) FROM operation_journal_chunk_staging)
                       + (SELECT COUNT(*) FROM operation_journal_recording_chunks)
                       + (SELECT COUNT(*) FROM operation_journal_database_attempt)
-                      + (SELECT COUNT(*) FROM operation_journal_database_attempt_outcome)",
+                      + (SELECT COUNT(*) FROM operation_journal_database_attempt_outcome)
+                      + (SELECT COUNT(*) FROM operation_journal_publication_issuance)",
                 [],
                 |row| row.get(0),
             )?;
@@ -3757,6 +3761,16 @@ impl OperationJournalStore {
             } else if header_version == DATABASE_CLAIMS_SCHEMA_VERSION {
                 configure_connection(&connection)?;
                 migrate_database_attempt_schema(
+                    &connection,
+                    &database_root,
+                    &database_path,
+                    &database_identity,
+                    profile_guard,
+                    rollback_journal.as_ref(),
+                )?;
+            } else if header_version == DATABASE_ATTEMPTS_SCHEMA_VERSION {
+                configure_connection(&connection)?;
+                migrate_publication_binding_schema(
                     &connection,
                     &database_root,
                     &database_path,
@@ -8104,6 +8118,7 @@ fn validate_sqlite_header(file: &mut File, path: &Path) -> Result<u32, Operation
             | CHUNK_STAGING_SCHEMA_VERSION
             | RECORDING_CHUNKS_SCHEMA_VERSION
             | DATABASE_CLAIMS_SCHEMA_VERSION
+            | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -8141,6 +8156,7 @@ fn read_sqlite_user_version(
             | CHUNK_STAGING_SCHEMA_VERSION
             | RECORDING_CHUNKS_SCHEMA_VERSION
             | DATABASE_CLAIMS_SCHEMA_VERSION
+            | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -8276,6 +8292,7 @@ fn validate_existing_schema(
         | CHUNK_STAGING_SCHEMA_VERSION
         | RECORDING_CHUNKS_SCHEMA_VERSION
         | DATABASE_CLAIMS_SCHEMA_VERSION
+        | DATABASE_ATTEMPTS_SCHEMA_VERSION
         | JOURNAL_SCHEMA_VERSION => {
             let mut expected = vec![
                 (String::from(JOURNAL_TABLE_NAME), String::from("table")),
@@ -8342,13 +8359,19 @@ fn validate_existing_schema(
                     String::from("table"),
                 ));
             }
-            if schema_version == JOURNAL_SCHEMA_VERSION {
+            if schema_version >= DATABASE_ATTEMPTS_SCHEMA_VERSION {
                 expected.push((
                     String::from(database_attempts::START_TABLE),
                     String::from("table"),
                 ));
                 expected.push((
                     String::from(database_attempts::OUTCOME_TABLE),
+                    String::from("table"),
+                ));
+            }
+            if schema_version == JOURNAL_SCHEMA_VERSION {
+                expected.push((
+                    String::from(publication_bindings::TABLE_NAME),
                     String::from("table"),
                 ));
             }
@@ -8382,6 +8405,7 @@ fn validate_existing_schema(
             | CHUNK_STAGING_SCHEMA_VERSION
             | RECORDING_CHUNKS_SCHEMA_VERSION
             | DATABASE_CLAIMS_SCHEMA_VERSION
+            | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -8402,6 +8426,7 @@ fn validate_existing_schema(
             | CHUNK_STAGING_SCHEMA_VERSION
             | RECORDING_CHUNKS_SCHEMA_VERSION
             | DATABASE_CLAIMS_SCHEMA_VERSION
+            | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -8427,6 +8452,7 @@ fn validate_existing_schema(
             | CHUNK_STAGING_SCHEMA_VERSION
             | RECORDING_CHUNKS_SCHEMA_VERSION
             | DATABASE_CLAIMS_SCHEMA_VERSION
+            | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -8445,6 +8471,7 @@ fn validate_existing_schema(
             | CHUNK_STAGING_SCHEMA_VERSION
             | RECORDING_CHUNKS_SCHEMA_VERSION
             | DATABASE_CLAIMS_SCHEMA_VERSION
+            | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -8462,6 +8489,7 @@ fn validate_existing_schema(
             | CHUNK_STAGING_SCHEMA_VERSION
             | RECORDING_CHUNKS_SCHEMA_VERSION
             | DATABASE_CLAIMS_SCHEMA_VERSION
+            | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -8478,6 +8506,7 @@ fn validate_existing_schema(
             | CHUNK_STAGING_SCHEMA_VERSION
             | RECORDING_CHUNKS_SCHEMA_VERSION
             | DATABASE_CLAIMS_SCHEMA_VERSION
+            | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -8493,6 +8522,7 @@ fn validate_existing_schema(
             | CHUNK_STAGING_SCHEMA_VERSION
             | RECORDING_CHUNKS_SCHEMA_VERSION
             | DATABASE_CLAIMS_SCHEMA_VERSION
+            | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -8532,7 +8562,7 @@ fn validate_existing_schema(
             database_claims::CREATE_SLICE,
         )?;
     }
-    if schema_version == JOURNAL_SCHEMA_VERSION {
+    if schema_version >= DATABASE_ATTEMPTS_SCHEMA_VERSION {
         validate_table_schema(
             connection,
             path,
@@ -8544,6 +8574,14 @@ fn validate_existing_schema(
             path,
             database_attempts::OUTCOME_TABLE,
             database_attempts::CREATE_OUTCOME,
+        )?;
+    }
+    if schema_version == JOURNAL_SCHEMA_VERSION {
+        validate_table_schema(
+            connection,
+            path,
+            publication_bindings::TABLE_NAME,
+            publication_bindings::CREATE_TABLE,
         )?;
     }
     Ok(())
@@ -8783,6 +8821,16 @@ fn validate_table_schema(
             (String::from("issue_id"), String::from("TEXT"), 0, 0),
             (String::from("release_id"), String::from("TEXT"), 0, 0),
         ],
+        publication_bindings::TABLE_NAME => vec![
+            (String::from("output_id"), String::from("TEXT"), 1, 1),
+            (
+                String::from("publication_effect_id"),
+                String::from("TEXT"),
+                1,
+                0,
+            ),
+            (String::from("record"), String::from("BLOB"), 1, 0),
+        ],
         staging_checkpoints::TABLE_NAME => vec![
             (String::from("output_id"), String::from("TEXT"), 1, 1),
             (String::from("sequence"), String::from("INTEGER"), 1, 0),
@@ -8877,7 +8925,9 @@ fn validate_table_schema(
     }
     if matches!(
         table_name,
-        database_attempts::START_TABLE | database_attempts::OUTCOME_TABLE
+        database_attempts::START_TABLE
+            | database_attempts::OUTCOME_TABLE
+            | publication_bindings::TABLE_NAME
     ) {
         let mut actual = Vec::new();
         for (_, name, _, _, _) in &indexes {
@@ -8895,8 +8945,10 @@ fn validate_table_schema(
                 vec!["start_nonce"],
                 vec!["operation_id", "attempt_id"],
             ]
-        } else {
+        } else if table_name == database_attempts::OUTCOME_TABLE {
             vec![vec!["attempt_id"], vec!["observation_id"]]
+        } else {
+            vec![vec!["output_id"], vec!["publication_effect_id"]]
         };
         let mut wanted: Vec<Vec<String>> = wanted
             .into_iter()
@@ -8965,6 +9017,7 @@ fn migrate_legacy_schema(
         connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         database_claims::create(connection)?;
         database_attempts::create(connection)?;
+        publication_bindings::create(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         if let Some(error) =
             migration_failure.and_then(|hook| hook(MigrationTestBoundary::BeforeCommit, connection))
@@ -9039,6 +9092,7 @@ fn migrate_previous_schema(
         connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         database_claims::create(connection)?;
         database_attempts::create(connection)?;
+        publication_bindings::create(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -9106,6 +9160,7 @@ fn migrate_recovery_reserve_schema(
         connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         database_claims::create(connection)?;
         database_attempts::create(connection)?;
+        publication_bindings::create(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -9176,6 +9231,7 @@ fn migrate_ordinary_claim_schema(
         connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         database_claims::create(connection)?;
         database_attempts::create(connection)?;
+        publication_bindings::create(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -9241,6 +9297,7 @@ fn migrate_ordinary_claim_release_schema(
         connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         database_claims::create(connection)?;
         database_attempts::create(connection)?;
+        publication_bindings::create(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -9309,6 +9366,7 @@ fn migrate_chunk_claim_schema(
         connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         database_claims::create(connection)?;
         database_attempts::create(connection)?;
+        publication_bindings::create(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -9372,6 +9430,7 @@ fn migrate_staging_checkpoint_schema(
         connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         database_claims::create(connection)?;
         database_attempts::create(connection)?;
+        publication_bindings::create(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -9434,6 +9493,7 @@ fn migrate_chunk_staging_schema(
         connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         database_claims::create(connection)?;
         database_attempts::create(connection)?;
+        publication_bindings::create(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -9495,6 +9555,7 @@ fn migrate_recording_chunks_schema(
         connection.execute_batch(recording_chunks::CREATE_TABLE)?;
         database_claims::create(connection)?;
         database_attempts::create(connection)?;
+        publication_bindings::create(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -9555,6 +9616,7 @@ fn migrate_database_claim_schema(
         validate_existing_schema(connection, database_path, RECORDING_CHUNKS_SCHEMA_VERSION)?;
         database_claims::create(connection)?;
         database_attempts::create(connection)?;
+        publication_bindings::create(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -9614,6 +9676,66 @@ fn migrate_database_attempt_schema(
         )?;
         validate_existing_schema(connection, database_path, DATABASE_CLAIMS_SCHEMA_VERSION)?;
         database_attempts::create(connection)?;
+        publication_bindings::create(connection)?;
+        connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
+        validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            JOURNAL_SCHEMA_VERSION,
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn migrate_publication_binding_schema(
+    connection: &Connection,
+    database_root: &BoundDatabaseRoot,
+    database_path: &Path,
+    database_identity: &str,
+    profile_guard: &WritableProfileGuard,
+    rollback_journal: Option<&PreexistingRollbackJournal>,
+) -> Result<(), OperationJournalStoreError> {
+    validate_migration_guards(
+        connection,
+        database_root,
+        database_path,
+        database_identity,
+        profile_guard,
+        rollback_journal,
+        DATABASE_ATTEMPTS_SCHEMA_VERSION,
+    )?;
+    connection.execute_batch("BEGIN EXCLUSIVE")?;
+    let result = (|| {
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            DATABASE_ATTEMPTS_SCHEMA_VERSION,
+        )?;
+        validate_existing_schema(connection, database_path, DATABASE_ATTEMPTS_SCHEMA_VERSION)?;
+        publication_bindings::create(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -9703,7 +9825,8 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
              {database_binding_table};
              {database_slice_table};
              {database_attempt_table};
-             {database_attempt_outcome_table};",
+             {database_attempt_outcome_table};
+             {publication_issuance_table};",
             charge_table = recovery_reserve::CREATE_CHARGE_TABLE,
             transition_table = recovery_reserve::CREATE_TRANSITION_TABLE,
             binding_table = recovery_reserve_binding::CREATE_TABLE,
@@ -9717,6 +9840,7 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
             database_slice_table = database_claims::CREATE_SLICE,
             database_attempt_table = database_attempts::CREATE_START,
             database_attempt_outcome_table = database_attempts::CREATE_OUTCOME,
+            publication_issuance_table = publication_bindings::CREATE_TABLE,
         ))
         .map(|_| ());
     match result {
@@ -9853,6 +9977,7 @@ mod tests {
     include!("store/historical_claim_observation_tests.rs");
     include!("store/current_reserve_binding_bounds_tests.rs");
     include!("store/ordinary_rebuild_backing_tests.rs");
+    include!("store/publication_binding_tests.rs");
     include!("store/database_claims_tests.rs");
     include!("store/recording_retention_tests.rs");
     include!("store/record_materialization_tests.rs");
@@ -15393,6 +15518,10 @@ mod tests {
                     String::from("table")
                 ),
                 (
+                    String::from(publication_bindings::TABLE_NAME),
+                    String::from("table")
+                ),
+                (
                     String::from(recording_chunks::TABLE_NAME),
                     String::from("table")
                 ),
@@ -15441,7 +15570,7 @@ mod tests {
         let connection = Connection::open(&path).expect("open old schema fixture");
         connection
             .execute_batch(&format!(
-                "DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; DROP TABLE {}; DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
+                "DROP TABLE operation_journal_publication_issuance; DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; DROP TABLE {}; DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
                 recording_chunks::TABLE_NAME,
                 staging_checkpoints::TABLE_NAME,
                 chunk_staging::TABLE_NAME,
@@ -15483,7 +15612,7 @@ mod tests {
         let connection = Connection::open(database_path(&fixture.owner)).expect("open v8 fixture");
         connection
             .execute_batch(&format!(
-                "DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
+                "DROP TABLE operation_journal_publication_issuance; DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
                 recording_chunks::TABLE_NAME,
                 chunk_staging::TABLE_NAME,
                 STAGING_CHECKPOINT_SCHEMA_VERSION

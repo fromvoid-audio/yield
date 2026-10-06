@@ -4,6 +4,8 @@ Journal schema 12 adds private immutable start and outcome relations. A guarded
 schema-11 migration creates empty relations without changing existing intents,
 bindings or claims. Older migrations likewise create empty relations. Exact table,
 column and index validation rejects unexpected schema objects.
+The current schema is 13; its additional publication-issuance relation preserves
+these attempt relations and limits. See [durable issuance](PUBLICATION_ISSUANCE_BINDING.md).
 
 Starts bind the actual stored, codec-normalized command family and revision domain
 to its complete validated database inventory, participant, direction, physical

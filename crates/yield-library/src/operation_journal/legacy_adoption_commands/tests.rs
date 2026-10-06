@@ -63,6 +63,24 @@ impl Fixture {
     }
 }
 #[test]
+fn original_preparation_requires_exact_current_journal_schema() {
+    let fixture = Fixture::new();
+    let original = fixture.prepare();
+    let current = u64::from(crate::operation_journal::store::JOURNAL_SCHEMA_VERSION);
+    assert_eq!(original.data.journal_schema, current);
+    original.validate().unwrap();
+    for version in [0, current - 1, current + 1] {
+        let mut foreign = original.clone();
+        foreign.data.journal_schema = version;
+        assert!(foreign.validate().is_err());
+        let mut wire = MAGIC.to_vec();
+        wire.extend_from_slice(&1u64.to_le_bytes());
+        wire.extend(serde_json::to_vec(&foreign.data).unwrap());
+        assert!(decode_legacy_adoption_input(&wire).is_err());
+    }
+}
+
+#[test]
 fn supported_wire_semantic_corruptions_refuse_even_with_canonical_field_order() {
     let f = Fixture::new();
     let original = f.prepare();
