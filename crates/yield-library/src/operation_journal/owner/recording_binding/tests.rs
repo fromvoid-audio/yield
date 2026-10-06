@@ -145,7 +145,7 @@ fn recording_custody_scalar_facade_cannot_create_slot_and_drain_closes_original_
     ));
     assert_eq!(
         *client.shared.input_bytes.lock().unwrap(),
-        InputBudget::new()
+        InputBudget::shared_initial()
     );
 }
 
@@ -473,7 +473,7 @@ fn native_original_recording_custody(lost_reply: bool) {
     assert!(owner.shutdown());
     assert_eq!(
         *client.shared.input_bytes.lock().unwrap(),
-        InputBudget::new()
+        InputBudget::shared_initial()
     );
     assert_eq!(FACTORIES.load(Ordering::Acquire), factories + 1);
     assert!(matches!(

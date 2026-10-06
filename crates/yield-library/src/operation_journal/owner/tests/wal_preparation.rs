@@ -807,7 +807,8 @@ mod integration {
         assert_eq!(rows, 0);
         assert!(budget.used() > 0);
         assert_eq!(
-            ORDINARY_INPUT_BYTES - client.shared.input_bytes.lock().unwrap().remaining[0],
+            InputBudget::shared_initial().remaining[0]
+                - client.shared.input_bytes.lock().unwrap().remaining[0],
             64 * 1024
         );
         let held_bytes = budget.used();
@@ -821,7 +822,7 @@ mod integration {
         assert_eq!(budget.used(), 0);
         assert_eq!(
             client.shared.input_bytes.lock().unwrap().remaining[0],
-            ORDINARY_INPUT_BYTES
+            InputBudget::shared_initial().remaining[0]
         );
         drop(actor);
         assert!(global.shutdown());
@@ -2414,7 +2415,7 @@ mod integration {
             assert!(journal.shutdown());
             assert_eq!(
                 *journal.shared.input_bytes.lock().unwrap(),
-                InputBudget::new()
+                InputBudget::shared_initial()
             );
             return;
         }
@@ -2479,7 +2480,7 @@ mod integration {
             assert!(journal.shutdown());
             assert_eq!(
                 *journal.shared.input_bytes.lock().unwrap(),
-                InputBudget::new()
+                InputBudget::shared_initial()
             );
             return;
         }
@@ -3063,7 +3064,7 @@ mod integration {
             );
             // The original resource header remains deliberately charged until shutdown.
             // Every WAL preparation/command debit must be gone independently of it.
-            let mut live_header = InputBudget::new();
+            let mut live_header = InputBudget::shared_initial();
             live_header.remaining[InputClass::Ordinary.index()] -= resource_custody::HEADER_BYTES;
             live_header.publication_remaining -= resource_custody::HEADER_BYTES;
             let released = Instant::now() + Duration::from_secs(1);
@@ -3110,7 +3111,7 @@ mod integration {
             assert!(!journal.shutdown());
             assert_eq!(
                 *journal.shared.input_bytes.lock().unwrap(),
-                InputBudget::new()
+                InputBudget::shared_initial()
             );
         } else {
             assert!(journal.shutdown());
@@ -3378,14 +3379,15 @@ mod integration {
                 .unwrap();
         }
         assert_eq!(
-            ORDINARY_INPUT_BYTES - client.shared.input_bytes.lock().unwrap().remaining[0],
+            InputBudget::shared_initial().remaining[0]
+                - client.shared.input_bytes.lock().unwrap().remaining[0],
             64 * 1024
         );
         drop(view);
         drop(handle);
         assert_eq!(
             client.shared.input_bytes.lock().unwrap().remaining[0],
-            ORDINARY_INPUT_BYTES
+            InputBudget::shared_initial().remaining[0]
         );
     }
     #[test]
