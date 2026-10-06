@@ -12,6 +12,12 @@ pub(in crate::operation_journal) struct FundedSnapshot {
     _collection: Option<InputPermit>,
 }
 impl FundedSnapshot {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(in crate::operation_journal) fn collection_debit_for_test(&self) -> usize {
+        self._collection
+            .as_ref()
+            .map_or(0, InputPermit::historical_test_funded_bytes)
+    }
     pub(super) fn new(snapshot: OrdinaryClaimRebuildSnapshot, credit: Option<InputPermit>) -> Self {
         Self {
             snapshot,

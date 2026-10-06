@@ -4287,15 +4287,24 @@ impl OwnerRuntime {
     fn rebuild_capacity_with_funding(&mut self, input: Option<&InputPermit>) -> Result<(), String> {
         let _proof = self.revalidate_capacity_boundary()?;
         let _descriptor_observation = self.refresh_live_descriptor_capacity()?;
-        let provider = self
-            .capacity_provider
-            .take()
-            .map(Ok)
-            .unwrap_or_else(|| match input {
-                Some(input) => CapacityProvider::unavailable_for_input(input),
-                None => Ok(CapacityProvider::unavailable()),
-            })
-            .map_err(|_| String::from(startup_credit::REFUSAL))?;
+        self.rebuild_capacity_image_with_funding(input)
+    }
+
+    fn rebuild_capacity_image_with_funding(
+        &mut self,
+        input: Option<&InputPermit>,
+    ) -> Result<(), String> {
+        if self.capacity_provider.is_none() {
+            self.capacity_provider = Some(
+                match input {
+                    Some(input) => CapacityProvider::unavailable_for_input(input),
+                    None => Ok(CapacityProvider::unavailable()),
+                }
+                .map_err(|_| String::from(startup_credit::REFUSAL))?,
+            );
+        }
+        // Keep the exact original provider installed through every new refusal path.
+        let provider = self.capacity_provider.as_ref().unwrap();
         let snapshot = match match input {
             Some(input) => self
                 .store()
@@ -4307,7 +4316,6 @@ impl OwnerRuntime {
         } {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.capacity_provider = Some(provider);
                 if let Some(input) = input {
                     let bytes = startup_credit::display_bytes(&error)
                         .ok_or_else(|| String::from(startup_credit::REFUSAL))?;
@@ -4348,8 +4356,8 @@ impl OwnerRuntime {
         let mut readiness = snapshot.readiness().clone();
         if readiness.can_install() {
             if let Err(error) = match input {
-                Some(input) => snapshot.install_provider_for_input(&provider, input),
-                None => snapshot.install_provider_component_compatibility(&provider),
+                Some(input) => snapshot.install_provider_for_input(provider, input),
+                None => snapshot.install_provider_component_compatibility(provider),
             } {
                 let replacement_credit = if let Some(input) = input {
                     let message =
@@ -4382,7 +4390,6 @@ impl OwnerRuntime {
                 "ordinary claim capacity rebuild retained recovery-only evidence"
             );
         }
-        self.capacity_provider = Some(provider);
         self.capacity_rebuild_readiness = readiness;
         self.capacity_readiness_credit = readiness_credit;
         Ok(())
@@ -5787,6 +5794,10 @@ struct OwnerShared {
     recovery_audit_entered: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     provider_reconciliation_component: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    startup_component: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    startup_component_claims: AtomicUsize,
     results: Mutex<ResultBudget>,
     #[cfg(test)]
     shutdown_cas_gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
@@ -5816,6 +5827,10 @@ impl OwnerShared {
             recovery_audit_entered: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             provider_reconciliation_component: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            startup_component: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            startup_component_claims: AtomicUsize::new(usize::MAX),
             results: Mutex::new(ResultBudget::new()),
             #[cfg(test)]
             shutdown_cas_gate: Mutex::new(None),
@@ -6551,6 +6566,36 @@ fn run_owner(
 
     if let Err(error) = runtime.attach_resource_custody(&shared) {
         shared.mark_unavailable(&format!("publication resource header unavailable: {error}"));
+        return;
+    }
+
+    #[cfg(test)]
+    if shared.startup_component.load(Ordering::Acquire) {
+        let input = match shared.startup_input() {
+            Ok(input) => input,
+            Err(_) => {
+                shared.mark_unavailable(startup_credit::REFUSAL);
+                return;
+            }
+        };
+        match runtime.rebuild_capacity_image_with_funding(Some(&input)) {
+            Ok(()) => {
+                shared.startup_component_claims.store(
+                    runtime
+                        .capacity_provider
+                        .as_ref()
+                        .unwrap()
+                        .outstanding_claim_count_for_test(),
+                    Ordering::Release,
+                );
+                shared.mark_startup_unavailable(
+                    &"funded startup component verified; physical admission unsupported",
+                    &input,
+                );
+            }
+            Err(error) => shared.mark_startup_unavailable(&error, &input),
+        }
+        // Test-only actual worker component. It cannot activate the owner or issue IDs.
         return;
     }
 
@@ -7503,6 +7548,7 @@ mod tests {
     mod queue_metrics_integration {
         include!("owner/tests/queue_metrics_integration.rs");
     }
+    mod capacity_startup_tests;
     mod historical_claim_admission_tests;
     mod provider_reconciliation_tests;
     mod resource_custody_tests;
