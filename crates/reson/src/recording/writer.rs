@@ -23,6 +23,11 @@ const RUNNING: u8 = 0;
 pub(super) const STOPPED: u8 = 1;
 pub(super) const CANCELLED: u8 = 2;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static PREPARED_RING_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Already retained byte transport. This interface grants no filesystem authority.
 /// Yield must supply its admitted owner channel; arbitrary transports are useful for codecs/tests.
 pub trait RecordingSink: Write + Seek + Send {}
@@ -157,6 +162,8 @@ impl RecorderWriter {
         health: Arc<RecordingHealthState>,
     ) -> (RecorderCapture, ringbuf::HeapCons<f32>) {
         let (producer, consumer) = HeapRb::<f32>::new(limits.ring_samples).split();
+        #[cfg(test)]
+        PREPARED_RING_BYTES.with(|bytes| bytes.set(limits.ring_samples * size_of::<f32>()));
         (
             RecorderCapture {
                 producer,

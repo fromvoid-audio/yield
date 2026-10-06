@@ -83,6 +83,58 @@ fn actual_producer_serializes_wav_through_original_transport_and_terminal_route(
 }
 
 #[test]
+fn original_transport_limits_refuse_changed_producer_before_ring_and_header() {
+    let original = RecordingLimits::new(48_000, 1, 8192).unwrap();
+    let mut all_refused_before_resources = true;
+    for (rate, channels, frames) in [
+        (192_000, 1, 8192),
+        (48_000, 2, 4096), // Identical encoded byte ceiling, different channel/frame meaning.
+        (48_000, 1, 4096),
+        (192_000, 8, 1024),
+    ] {
+        let supplied = RecordingLimits::new(rate, channels, frames).unwrap();
+        let (binding, receiver, mut settlements) = RecordingTransport::bind(original);
+        super::super::writer::PREPARED_RING_BYTES.with(|bytes| bytes.set(0));
+        let (started, header_bytes) = thread::scope(|scope| {
+            let owner = scope.spawn(move || {
+                let mut header_bytes = 0;
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(1)) {
+                        Ok(request) => {
+                            header_bytes += request.bytes().len();
+                            request.acknowledge().unwrap();
+                        }
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => return header_bytes,
+                    }
+                    if let Ok(barrier) = settlements.recv_barrier(Duration::ZERO) {
+                        barrier.deny();
+                    }
+                }
+            });
+            let started = match RecordingProducer::start(binding, supplied) {
+                Ok(producer) => {
+                    // Cleanly settle the real original worker without inventing completion.
+                    assert!(producer.cancel().is_err());
+                    true
+                }
+                Err(_) => false,
+            };
+            (started, owner.join().unwrap())
+        });
+        let ring_bytes = super::super::writer::PREPARED_RING_BYTES.with(|bytes| bytes.get());
+        eprintln!(
+            "original transport mismatch {rate}/{channels}/{frames}: started={started}, ring_bytes={ring_bytes}, header_bytes={header_bytes}"
+        );
+        all_refused_before_resources &= !started && ring_bytes == 0 && header_bytes == 0;
+    }
+    assert!(
+        all_refused_before_resources,
+        "changed original format reached producer resources/header"
+    );
+}
+
+#[test]
 fn serializer_waits_for_exact_request_and_limits_each_batch() {
     let (mut sink, receiver) = sink(Duration::from_secs(2), 65536);
     thread::scope(|scope| {
