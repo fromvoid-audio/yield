@@ -26,6 +26,9 @@ mod decision_boundary;
 pub(crate) use decision_boundary::{DecisionBoundaryRefusal, RegisteredDecisionBoundary};
 mod registered_custody;
 pub(crate) use registered_custody::RegisteredDatabaseCustody;
+#[cfg(test)]
+#[path = "source_authority/registration_generation/native_tests.rs"]
+mod registration_generation_native_tests;
 
 const PREPARED: u8 = 0;
 const REGISTERED: u8 = 1;
@@ -282,6 +285,12 @@ impl fmt::Debug for SourceAuthorityRequest {
 }
 
 impl SourceAuthorityRequest {
+    // Regression observation adapter: the baseline original request has no generation field.
+    #[cfg(test)]
+    pub(crate) const fn registration_generation(&self) -> u64 {
+        0
+    }
+
     fn new(
         registration_id: SourceRegistrationId,
         lease_identity: SourceLeaseIdentity,
