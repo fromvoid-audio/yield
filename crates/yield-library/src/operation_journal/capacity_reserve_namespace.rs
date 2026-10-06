@@ -26,6 +26,9 @@ use super::capacity_reserve::{
 };
 use super::reserve_telemetry::{ReserveAttempt, observe};
 
+mod legacy;
+pub(super) use legacy::create_owned_legacy_reserve;
+
 /// Reserved direct child name for the owner-created recovery-reserve namespace.
 pub(super) const RESERVE_FILE_NAME: &str = "recovery-reserve.bin";
 

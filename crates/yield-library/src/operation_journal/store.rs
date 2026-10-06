@@ -1102,6 +1102,25 @@ impl ReserveBootstrapProof<'_, '_> {
             }
         }
     }
+    fn create_reserve<'a>(
+        &self,
+        root: &'a BoundDatabaseRoot,
+        profile: &'a WritableProfileGuard,
+    ) -> Result<
+        super::capacity_reserve_namespace::BoundReserve<'a>,
+        super::capacity_reserve_namespace::ReserveNamespaceFailure,
+    > {
+        match self {
+            Self::Current(_) => {
+                super::capacity_reserve_namespace::create_owned_reserve(root, profile)
+            }
+            Self::Legacy { source, .. } => {
+                super::capacity_reserve_namespace::create_owned_legacy_reserve(
+                    root, profile, source,
+                )
+            }
+        }
+    }
 }
 
 /// Failure while binding one source-volume reserve, retaining every owner-thread resource that
@@ -2875,13 +2894,12 @@ impl OperationJournalStore {
                 None,
             ));
         }
-        let reserve =
-            match super::capacity_reserve_namespace::create_owned_reserve(root, profile_guard) {
-                Ok(reserve) => reserve,
-                Err(error) => {
-                    return Err(fail(proof.namespace_error(error), volume_owner, None));
-                }
-            };
+        let reserve = match proof.create_reserve(root, profile_guard) {
+            Ok(reserve) => reserve,
+            Err(error) => {
+                return Err(fail(proof.namespace_error(error), volume_owner, None));
+            }
+        };
         let mut reserve = match reserve.into_owned() {
             Ok(reserve) => reserve,
             Err(error) => {

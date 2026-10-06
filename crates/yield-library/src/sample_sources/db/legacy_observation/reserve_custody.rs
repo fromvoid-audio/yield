@@ -15,7 +15,23 @@ pub(crate) struct LegacyReserveUseProof<'a> {
     frozen: LegacySourcePagerObservation,
 }
 impl LegacyReserveUseProof<'_> {
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn validate_root_for_bootstrap(&self, root: &BoundDatabaseRoot) -> Result<()> {
+        if !self
+            .validated_targets()?
+            .iter()
+            .any(|target| std::ptr::eq(target.root.as_ref(), root))
+        {
+            return Err(LegacyObservationError(
+                "legacy bootstrap root is not original custody",
+            ));
+        }
+        root.validate_profile_guard(self.profile).map_err(refused)
+    }
     pub(crate) fn validate_for_bootstrap(&self) -> Result<()> {
+        self.validated_targets().map(|_| ())
+    }
+    fn validated_targets(&self) -> Result<Vec<LegacyReserveTarget>> {
         if Instant::now() >= self.deadline || !self.source.connection.has_no_effect_fence() {
             return Err(LegacyObservationError("legacy bootstrap custody closed"));
         }
@@ -28,8 +44,7 @@ impl LegacyReserveUseProof<'_> {
                 "legacy bootstrap original source changed",
             ));
         }
-        self.source.reserve_targets(self.profile, self.deadline)?;
-        Ok(())
+        self.source.reserve_targets(self.profile, self.deadline)
     }
 }
 impl LegacySourceReadOwner {

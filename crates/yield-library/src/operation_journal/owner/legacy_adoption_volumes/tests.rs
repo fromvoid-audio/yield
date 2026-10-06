@@ -7,18 +7,18 @@ use crate::{
 };
 use std::fs;
 
-struct Fixture {
-    runtime: OwnerRuntime,
-    shared: Arc<OwnerShared>,
+pub(super) struct Fixture {
+    pub(super) runtime: OwnerRuntime,
+    pub(super) shared: Arc<OwnerShared>,
     _receivers: OwnerCommandReceivers,
-    guard: WritableProfileGuard,
+    pub(super) guard: WritableProfileGuard,
     _root: AppRootGuard,
-    profile: tempfile::TempDir,
+    pub(super) profile: tempfile::TempDir,
     _media: tempfile::TempDir,
     _test: TestRuntimeGuard,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let test = TestRuntimeGuard::acquire();
         let profile = tempfile::tempdir().unwrap();
         let media = tempfile::tempdir().unwrap();
@@ -72,10 +72,10 @@ impl Fixture {
             .reserve_input(InputClass::Ordinary, REPLY_BYTES)
             .unwrap()
     }
-    fn source_bytes(&self) -> Vec<u8> {
+    pub(super) fn source_bytes(&self) -> Vec<u8> {
         fs::read(self.profile.path().join("legacy").join(DB_FILE_NAME)).unwrap()
     }
-    fn remaining(&self) -> usize {
+    pub(super) fn remaining(&self) -> usize {
         self.shared.input_bytes.lock().unwrap().remaining[0]
     }
 }

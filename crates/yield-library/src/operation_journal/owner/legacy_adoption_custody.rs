@@ -99,11 +99,12 @@ impl LegacyAdoptionCustody {
 }
 
 pub(super) struct RetainedLegacyAdoption {
-    // Drop original SQLite/root/reservation ownership before refunding metadata credit.
+    // Added reserve/failure/volume backing closes before the original source reservation.
+    pub(super) volumes: Option<super::legacy_adoption_volumes::RetainedLegacyVolumes>,
+    // Original SQLite closes before its own root/reservation, and all backing before credit.
     pub(super) source: LegacySourceReadOwner,
     pub(super) args: LegacyAdoptionIntentArgs,
     pub(super) digest: [u8; 32],
-    pub(super) volumes: Option<super::legacy_adoption_volumes::RetainedLegacyVolumes>,
     pub(super) input: InputPermit,
 }
 impl OperationJournalClient {

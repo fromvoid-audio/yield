@@ -61,6 +61,14 @@ pub(super) struct RetainedLegacyVolumes {
     pub(super) ready: bool,
     _input: InputPermit,
 }
+impl Drop for RetainedLegacyVolumes {
+    fn drop(&mut self) {
+        // Close all added native backing before checkpoint strings and its charged credit.
+        self.entries.clear();
+        #[cfg(test)]
+        drop_order_tests::observe_after_entries(self);
+    }
+}
 pub(super) enum LegacyVolumeEntry {
     Existing {
         volume: VolumeIdentity,
@@ -346,5 +354,7 @@ fn validate_existing_provenance(
         .map_err(|_| LegacyAdoptionCustodyError::Changed.into())
 }
 
+#[cfg(test)]
+mod drop_order_tests;
 #[cfg(test)]
 mod tests;

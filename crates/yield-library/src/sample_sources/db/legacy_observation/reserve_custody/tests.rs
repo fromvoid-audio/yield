@@ -30,6 +30,11 @@ fn original_prelease_bootstrap_proof_requires_fence_live_source_and_same_deadlin
     let targets = owner.reserve_targets(&profile, deadline).unwrap();
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].root.identity(), owner.binding.root().identity());
+    proof
+        .validate_root_for_bootstrap(targets[0].root.as_ref())
+        .unwrap();
+    let unrelated = BoundDatabaseRoot::for_external_source_root(&profile, media.path()).unwrap();
+    assert!(proof.validate_root_for_bootstrap(&unrelated).is_err());
     assert!(owner.reserve_use_proof(&profile, Instant::now()).is_err());
     let sidecar = child.join(format!("{}-journal", crate::sample_sources::DB_FILE_NAME));
     std::fs::write(&sidecar, b"changed evidence").unwrap();
