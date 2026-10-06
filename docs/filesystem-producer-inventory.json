@@ -1096,9 +1096,9 @@
     {
       "path": "crates/yield-library/src/operation_journal/store/database_claim_scalar_projection_tests.rs",
       "function": "database_claim_scalar_projection_original_large_nul_rows_do_not_copy_or_mutate",
-      "operation": "OperationJournalStore::open",
+      "operation": "journal::open",
       "count": 1,
-      "classification": "test-only",
+      "classification": "fixture",
       "issue": "OPT-2403",
       "reason": "Automated real SQLite test opens only its isolated writable-profile fixture. Scalar corruption and raw retained evidence comparisons issue no live permit or physical qualification.",
       "retirement": "Keep as isolated original database-claim scalar projection regression coverage."
@@ -1106,9 +1106,9 @@
     {
       "path": "crates/yield-library/src/operation_journal/store/database_claim_scalar_projection_tests.rs",
       "function": "database_claim_scalar_projection_original_restart_utf8_error_precedes_uuid_error",
-      "operation": "OperationJournalStore::open",
+      "operation": "journal::open",
       "count": 1,
-      "classification": "test-only",
+      "classification": "fixture",
       "issue": "OPT-2403",
       "reason": "Automated real SQLite test opens only its isolated writable-profile fixture. Scalar corruption and raw retained evidence comparisons issue no live permit or physical qualification.",
       "retirement": "Keep as isolated original database-claim scalar projection regression coverage."
@@ -1116,9 +1116,9 @@
     {
       "path": "crates/yield-library/src/operation_journal/store/database_claim_scalar_projection_tests.rs",
       "function": "database_claim_scalar_projection_complete_original_inventory_and_nonce_still_read",
-      "operation": "OperationJournalStore::open",
+      "operation": "journal::open",
       "count": 1,
-      "classification": "test-only",
+      "classification": "fixture",
       "issue": "OPT-2403",
       "reason": "Automated real SQLite test opens only its isolated writable-profile fixture. Scalar corruption and raw retained evidence comparisons issue no live permit or physical qualification.",
       "retirement": "Keep as isolated original database-claim scalar projection regression coverage."
