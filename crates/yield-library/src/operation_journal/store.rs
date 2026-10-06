@@ -2595,7 +2595,7 @@ impl OperationJournalStore {
             &self.profile_guard,
         )
         .map_err(|error| ProfileJournalReserveBootstrapError::Namespace(error.to_string()))?;
-        let reserve = reserve
+        let mut reserve = reserve
             .into_owned()
             .map_err(|error| ProfileJournalReserveBootstrapError::Namespace(error.to_string()))?;
         {
@@ -3214,7 +3214,7 @@ impl OperationJournalStore {
         let reserve =
             super::capacity_reserve_namespace::reopen_owned_reserve(root, profile_guard, &expected)
                 .map_err(|error| proof.namespace_error(error))?;
-        let mut reserve = reserve
+        let reserve = reserve
             .into_owned()
             .map_err(|error| proof.namespace_error(error))?;
         let mut reserve = OwnedCustody::new(reserve, proof);
