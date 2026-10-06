@@ -12,6 +12,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+mod scalar_projection;
+use scalar_projection::UuidProjection;
+#[cfg(test)]
+thread_local! {
+    pub(super) static SCALAR_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) const START_TABLE: &str = "operation_journal_database_attempt";
 pub(super) const OUTCOME_TABLE: &str = "operation_journal_database_attempt_outcome";
 pub(super) const CREATE_START:&str="CREATE TABLE operation_journal_database_attempt (
@@ -106,11 +113,11 @@ fn count(c: &Connection, table: &str, operation: Option<Uuid>) -> Result<usize> 
 }
 fn read_start(c: &Connection, id: Uuid) -> Result<Option<DatabaseAttemptStart>> {
     type Row = (
-        String,
-        String,
-        String,
-        String,
-        String,
+        UuidProjection,
+        UuidProjection,
+        UuidProjection,
+        UuidProjection,
+        UuidProjection,
         u64,
         u64,
         u64,
@@ -123,7 +130,7 @@ fn read_start(c: &Connection, id: Uuid) -> Result<Option<DatabaseAttemptStart>> 
          database_bytes,wal_bytes,shm_bytes,
          CASE WHEN typeof(image)='blob' AND length(image) BETWEEN 1 AND ?2 THEN image END
          FROM operation_journal_database_attempt WHERE attempt_id=?1",
-        params![id.to_string(),MAX_START_BYTES as i64],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional()?;
+        params![id.to_string(),MAX_START_BYTES as i64],|r|Ok((scalar_projection::required_uuid(r,0)?,scalar_projection::required_uuid(r,1)?,scalar_projection::required_uuid(r,2)?,scalar_projection::required_uuid(r,3)?,scalar_projection::required_uuid(r,4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional()?;
     let Some((op, binding, nonce, db, sidecar, db_bytes, wal, shm, image)) = row else {
         return Ok(None);
     };
@@ -131,11 +138,11 @@ fn read_start(c: &Connection, id: Uuid) -> Result<Option<DatabaseAttemptStart>> 
         DatabaseAttemptStart::decode(&image.ok_or_else(|| error("start image type/length"))?)
             .map_err(error)?;
     if start.attempt != id
-        || start.operation.to_string() != op
-        || start.binding.to_string() != binding
-        || start.nonce.to_string() != nonce
-        || start.database_slice.to_string() != db
-        || start.sidecar_slice.to_string() != sidecar
+        || !op.matches(start.operation)
+        || !binding.matches(start.binding)
+        || !nonce.matches(start.nonce)
+        || !db.matches(start.database_slice)
+        || !sidecar.matches(start.sidecar_slice)
         || start.database_bytes != db_bytes
         || start.wal_bytes != wal
         || start.shm_bytes != shm
@@ -148,7 +155,12 @@ fn read_outcome(
     c: &Connection,
     start: &DatabaseAttemptStart,
 ) -> Result<Option<DatabaseAttemptOutcome>> {
-    let row: Option<(String, String, Option<Vec<u8>>, Option<Vec<u8>>)> = c
+    let row: Option<(
+        UuidProjection,
+        UuidProjection,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    )> = c
         .query_row(
             "SELECT CASE WHEN length(operation_id)=36 THEN operation_id END,
          CASE WHEN length(observation_id)=36 THEN observation_id END,
@@ -156,7 +168,14 @@ fn read_outcome(
          CASE WHEN typeof(image)='blob' AND length(image) BETWEEN 1 AND ?2 THEN image END
          FROM operation_journal_database_attempt_outcome WHERE attempt_id=?1",
             params![start.attempt.to_string(), MAX_OUTCOME_BYTES as i64],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| {
+                Ok((
+                    scalar_projection::required_uuid(r, 0)?,
+                    scalar_projection::required_uuid(r, 1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                ))
+            },
         )
         .optional()?;
     let Some((op, observation, digest, image)) = row else {
@@ -166,8 +185,8 @@ fn read_outcome(
         DatabaseAttemptOutcome::decode(&image.ok_or_else(|| error("outcome image type/length"))?)
             .map_err(error)?;
     outcome.validate(start).map_err(error)?;
-    if op != start.operation.to_string()
-        || outcome.observation.to_string() != observation
+    if !op.matches(start.operation)
+        || !observation.matches(outcome.observation)
         || digest.as_deref() != Some(outcome.start_digest.as_slice())
     {
         return Err(error("outcome columns differ from image"));
@@ -215,7 +234,7 @@ impl OperationJournalStore {
                 let mut statement=self.connection.prepare(&format!("SELECT CASE WHEN typeof(attempt_id)='text' AND length(attempt_id)=36 THEN attempt_id END FROM {table} WHERE attempt_id>?1 ORDER BY attempt_id LIMIT ?2"))?;
                 let page = statement
                     .query_map(params![after, AUDIT_PAGE_ROWS as i64], |r| {
-                        r.get::<_, Option<String>>(0)
+                        scalar_projection::nullable_uuid(r, 0)
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 if page.is_empty() {
@@ -223,8 +242,8 @@ impl OperationJournalStore {
                 }
                 for text in page {
                     let text = text.ok_or_else(|| error("audit key shape"))?;
-                    let id = Uuid::parse_str(&text).map_err(error)?;
-                    if id.is_nil() || id.to_string() != text {
+                    let id = text.id.map_err(error)?;
+                    if id.is_nil() || !text.canonical {
                         return Err(error("audit key identity"));
                     }
                     let start =
@@ -273,7 +292,7 @@ impl OperationJournalStore {
                             }
                         }
                     }
-                    after = text;
+                    after = id.to_string();
                 }
             }
         }
@@ -320,14 +339,16 @@ impl OperationJournalStore {
             return Err(error("invalid nonce/readback state"));
         }
         self.validate_namespace()?;
-        let text:Option<Option<String>>=self.connection.query_row("SELECT CASE WHEN typeof(attempt_id)='text' AND length(attempt_id)=36 THEN attempt_id END FROM operation_journal_database_attempt WHERE start_nonce=?1",[nonce.to_string()],|r|r.get(0)).optional()?;
+        let text:Option<Option<UuidProjection>>=self.connection.query_row("SELECT CASE WHEN typeof(attempt_id)='text' AND length(attempt_id)=36 THEN attempt_id END FROM operation_journal_database_attempt WHERE start_nonce=?1",[nonce.to_string()],|r|scalar_projection::nullable_uuid(r,0)).optional()?;
         let Some(text) = text else {
             self.audit_attempts()?;
             self.validate_namespace()?;
             return Ok(None);
         };
-        let id =
-            Uuid::parse_str(&text.ok_or_else(|| error("nonce attempt shape"))?).map_err(error)?;
+        let id = text
+            .ok_or_else(|| error("nonce attempt shape"))?
+            .id
+            .map_err(error)?;
         let value = self
             .read_database_attempt(id)?
             .ok_or_else(|| error("nonce start vanished"))?;
