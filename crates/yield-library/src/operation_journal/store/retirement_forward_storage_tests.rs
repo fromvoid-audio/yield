@@ -425,7 +425,7 @@ fn retirement_forward_codec_and_storage() {
         trailing.push(0);
         assert!(DatabaseClaimInventory::decode(&trailing).is_err());
         let mut unknown = image.clone();
-        unknown[4] = 4;
+        unknown[4] = 5;
         assert!(DatabaseClaimInventory::decode(&unknown).is_err());
         assert!(DatabaseClaimInventory::decode(&vec![0; 65537]).is_err());
         let mut missing = inventory.slices().to_vec();

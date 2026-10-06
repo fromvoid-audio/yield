@@ -181,6 +181,31 @@ OPT-2275/2262/2280.
 
 ## Explicit retirement initial-forward inventory (OPT-2337)
 
+### Separate registration serial policy (OPT-2385)
+
+Marker `YWCB\x04\x00` preserves all tag-3 fields and adds one positive Source
+registration serial (little-endian u64, at most i64::MAX) immediately after the
+header decision nonce, before the binding/slice counts. Source `owner_generation`
+continues to equal the exact stored lease epoch; Source lifecycle and registration
+UUID checks remain independent. Tags 1, 2 and 3 retain their exact meanings and
+encodings. No old image is upgraded when read.
+
+Tag 4 retains the exact two bindings/six initial-forward slices and uses the
+separate `yield.database-claim-inventory.v4` digest domain. Every work/component
+slice uses `yield.registered-retirement-forward-slice.v1`, hashing the independent
+serial followed by the existing complete tag-3 slice identity. The serial therefore
+binds both Source and Global work pairs to the same frozen observation. Changed
+serials or mixed tag-3/tag-4 slices fail record validation. Schema 12 retains the
+complete bounded canonical image and its digest; readback verifies those bytes
+and the frozen record without adding a normalized authority column.
+
+This policy stores historical comparison data only. Its scalar storage fixtures
+do not issue or validate a genuine original registration. Existing attempt Start
+versions refuse tag 4, as they refuse tag 3. OPT-2382 must still project the real
+Source/Global/profile/decision context on the original ACK consumer, prepay its
+allocations and recheck that context. Physical qualification, joint Start, permits,
+admission, retries/refunds and settlement remain separate open work.
+
 Inventory marker `YWCB\x03\x00` uses the existing bounded binary fields and schema
 12 tables, with a separate digest domain. Tags 1 and 2 keep their historical
 validation and encoding; a historical retirement inventory does not acquire the
