@@ -712,7 +712,8 @@ pub enum OperationJournalRequestError {
 /// does not cancel the admitted command; the worker still executes it and simply discards a result
 /// that has no receiver.
 pub struct OperationJournalRequest<T> {
-    receiver: Receiver<Result<T, OperationJournalOwnerError>>,
+    receiver: Option<Receiver<Result<T, OperationJournalOwnerError>>>,
+    historical_reply: Option<Arc<HistoricalReplyBacking>>,
     result_permit: Option<ResultPermit>,
 }
 
@@ -721,14 +722,21 @@ impl<T> OperationJournalRequest<T> {
     pub fn try_result(
         &mut self,
     ) -> Result<Result<T, OperationJournalOwnerError>, OperationJournalRequestError> {
-        match self.receiver.try_recv() {
+        match self
+            .receiver
+            .as_ref()
+            .ok_or(OperationJournalRequestError::Disconnected)?
+            .try_recv()
+        {
             Ok(result) => {
                 self.result_permit.take();
+                self.historical_reply.take();
                 Ok(result)
             }
             Err(TryRecvError::Empty) => Err(OperationJournalRequestError::Empty),
             Err(TryRecvError::Disconnected) => {
                 self.result_permit.take();
+                self.historical_reply.take();
                 Err(OperationJournalRequestError::Disconnected)
             }
         }
@@ -739,14 +747,21 @@ impl<T> OperationJournalRequest<T> {
         &mut self,
         timeout: Duration,
     ) -> Result<Result<T, OperationJournalOwnerError>, OperationJournalRequestError> {
-        match self.receiver.recv_timeout(timeout) {
+        match self
+            .receiver
+            .as_ref()
+            .ok_or(OperationJournalRequestError::Disconnected)?
+            .recv_timeout(timeout)
+        {
             Ok(result) => {
                 self.result_permit.take();
+                self.historical_reply.take();
                 Ok(result)
             }
             Err(RecvTimeoutError::Timeout) => Err(OperationJournalRequestError::Empty),
             Err(RecvTimeoutError::Disconnected) => {
                 self.result_permit.take();
+                self.historical_reply.take();
                 Err(OperationJournalRequestError::Disconnected)
             }
         }
@@ -755,7 +770,10 @@ impl<T> OperationJournalRequest<T> {
 
 impl<T> Drop for OperationJournalRequest<T> {
     fn drop(&mut self) {
+        // Destroy unconsumed channel contents before releasing their count/backing.
+        drop(self.receiver.take());
         self.result_permit.take();
+        self.historical_reply.take();
     }
 }
 
@@ -1865,14 +1883,6 @@ impl OwnerRuntime {
             self.wal_preparation_unconfirmed |= collector.is_unavailable();
             drop(collector);
         }
-    }
-
-    #[cfg(test)]
-    fn admit_prepared(
-        &mut self,
-        prepared: PreparedAdmissionInput,
-    ) -> Result<OperationId, OperationJournalOwnerError> {
-        self.admit_prepared_with_funding(prepared, None)
     }
 
     fn admit_prepared_with_funding(
@@ -4787,13 +4797,21 @@ impl OperationJournalClient {
             }
         })?;
         let input_bytes = bounded_prepared_admission_input(&prepared)?;
-        self.submit(input_bytes, move |input, result| {
-            JournalCommand::AdmitPrepared {
+        let historical = !matches!(
+            prepared.args,
+            UniversalCommandArgs::SourceRegistryRetirement(_)
+        );
+        self.submit_funded_with_reply(
+            InputClass::Ordinary,
+            input_bytes,
+            false,
+            historical,
+            move |input, result| JournalCommand::AdmitPrepared {
                 prepared,
                 input,
                 result,
-            }
-        })
+            },
+        )
     }
 
     /// Queue one bounded post-intent chunk claim. The owner allocates no chunk or operation
@@ -5246,6 +5264,20 @@ impl OperationJournalClient {
     where
         F: FnOnce(InputPermit, SyncSender<Result<T, OperationJournalOwnerError>>) -> JournalCommand,
     {
+        self.submit_funded_with_reply(class, input_bytes, publication, false, build)
+    }
+
+    fn submit_funded_with_reply<T, F>(
+        &self,
+        class: InputClass,
+        input_bytes: usize,
+        publication: bool,
+        historical: bool,
+        build: F,
+    ) -> Result<OperationJournalRequest<T>, OperationJournalOwnerQueueError>
+    where
+        F: FnOnce(InputPermit, SyncSender<Result<T, OperationJournalOwnerError>>) -> JournalCommand,
+    {
         let _admission = self
             .shared
             .admission_gate
@@ -5260,24 +5292,44 @@ impl OperationJournalClient {
             .as_ref()
             .cloned()
             .ok_or(OperationJournalOwnerQueueError::Closed)?;
-        let input = if publication {
+        let mut input = if publication {
             self.shared.reserve_publication_input(input_bytes)?
         } else {
             self.shared.reserve_input(class, input_bytes)?
+        };
+        let historical_reply = if historical {
+            // Fund the Arc allocation (including both reference counters) before allocating.
+            let header = self.shared.reserve_input(
+                class,
+                std::mem::size_of::<HistoricalReplyBacking>() + 2 * std::mem::size_of::<usize>(),
+            )?;
+            let backing = Arc::new(HistoricalReplyBacking {
+                _header: header,
+                terminal: Mutex::new([None, None, None]),
+            });
+            input.historical_reply = Some(Arc::clone(&backing));
+            Some(backing)
+        } else {
+            None
         };
         let result_permit = self.shared.reserve_result(class)?;
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let command = build(input, result_tx);
         match sender.sender(class).try_send(command) {
             Ok(()) => Ok(OperationJournalRequest {
-                receiver: result_rx,
+                receiver: Some(result_rx),
+                historical_reply,
                 result_permit: Some(result_permit),
             }),
-            Err(TrySendError::Full(_command)) => {
+            Err(TrySendError::Full(command)) => {
+                drop(command);
+                drop(result_rx);
                 drop(result_permit);
                 Err(OperationJournalOwnerQueueError::Full)
             }
-            Err(TrySendError::Disconnected(_command)) => {
+            Err(TrySendError::Disconnected(command)) => {
+                drop(command);
+                drop(result_rx);
                 drop(result_permit);
                 self.shared
                     .mark_unavailable("operation journal owner disconnected");
@@ -5548,6 +5600,7 @@ impl OwnerShared {
             bytes: requested,
             class,
             publication,
+            historical_reply: None,
         })
     }
 
@@ -5649,6 +5702,12 @@ pub(super) struct InputPermit {
     bytes: usize,
     class: InputClass,
     publication: bool,
+    historical_reply: Option<Arc<HistoricalReplyBacking>>,
+}
+
+struct HistoricalReplyBacking {
+    _header: InputPermit,
+    terminal: Mutex<[Option<InputPermit>; 3]>,
 }
 
 impl InputPermit {
@@ -5663,6 +5722,18 @@ impl InputPermit {
     #[cfg(test)]
     pub(super) fn historical_test_remaining(&self) -> usize {
         self.shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()]
+    }
+
+    pub(super) fn retain_historical_error(&self, permits: [Option<InputPermit>; 3]) {
+        if let Some(backing) = &self.historical_reply {
+            // Terminal permits have no reply Arc: the retained backing cannot form a cycle.
+            let mut terminal = backing.terminal.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                terminal.iter().all(Option::is_none),
+                "one terminal observer error per command"
+            );
+            *terminal = permits;
+        }
     }
 
     /// Private scratch debit from this exact queued command's original pool.
@@ -6449,9 +6520,13 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                     }
                 }
             } else {
-                execute_store_result(result, move || {
+                // Keep terminal backing through send, including disposal of a SendError payload.
+                let reply = input.historical_reply.clone();
+                let panicked = execute_store_result(result, move || {
                     runtime.admit_prepared_with_funding(prepared, Some(&input))
-                })
+                });
+                drop(reply);
+                panicked
             }
         }
         JournalCommand::ClaimChunk {

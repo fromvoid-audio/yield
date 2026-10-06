@@ -12,6 +12,19 @@ mod syntax;
 #[cfg(test)]
 mod tests;
 
+// Longest V1/V2 classifier reason: fixed schema-v2 evidence labels, the longest
+// phase/disposition names, and six `false` values. Other V1/V2 reasons contain
+// shorter fixed labels or a single decimal i64/u64. Two copies cover formatting
+// growth and the original owned error simultaneously; no opaque payload is echoed.
+const ERROR_BYTES: usize = 2 * concat!(
+    "schema-v2 phase/evidence combination is invalid: phase=FilesystemPublished, ",
+    "disposition=SucceededWithDeferredArtifacts, evidence=SchemaV2EvidencePresence { ",
+    "prepared: false, staged: false, absent_final_recovery_observation: false, ",
+    "absent_final_transaction_owned_proof: false, absent_final_adoption_evidence: false, ",
+    "published: false }"
+)
+.len();
+
 // Parser, scalar scanner recursion (at most the original serde 128 nesting limit),
 // owned vector headers, projected/typed record headers, and bounded SQL/error context.
 pub(in crate::operation_journal) const FIXED_BYTES: usize =
@@ -23,14 +36,14 @@ pub(in crate::operation_journal) const FIXED_BYTES: usize =
         + size_of::<rusqlite::Statement<'static>>()
         + size_of::<rusqlite::Rows<'static>>()
         + 36
-        + 256;
+        + ERROR_BYTES;
 
 pub(in crate::operation_journal) struct Scratch<'a> {
     input: &'a InputPermit,
     parser_bytes: usize,
     funded: usize,
     extra: Option<InputPermit>,
-    _parser: InputPermit,
+    parser: InputPermit,
 }
 impl<'a> Scratch<'a> {
     pub(in crate::operation_journal) fn new(
@@ -50,9 +63,13 @@ impl<'a> Scratch<'a> {
             parser_bytes,
             funded: parser_bytes,
             extra: None,
-            _parser: parser,
+            parser,
         })
     }
+    pub(in crate::operation_journal) fn into_permits(self) -> [Option<InputPermit>; 2] {
+        [Some(self.parser), self.extra]
+    }
+
     fn ensure(&mut self, bytes: usize) -> Result<(), OperationJournalStoreError> {
         if bytes > self.funded {
             drop(self.extra.take());
