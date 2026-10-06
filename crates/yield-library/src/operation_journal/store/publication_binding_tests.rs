@@ -643,11 +643,11 @@ mod publication_issuance {
     fn publication_issuance_staging_maximum_valid_text_fits_conservative_decode_bound() {
         let (_fixture, _store, staging, _binding, _sequence) = prepared();
         let mut value = serde_json::to_value(&staging).unwrap();
-        value["locator"] = serde_json::json!("\n".repeat(1024));
-        value["physical_object_id"] = serde_json::json!("\n".repeat(256));
+        value["locator"] = serde_json::json!("\u{1}".repeat(1024));
+        value["physical_object_id"] = serde_json::json!("\u{1}".repeat(256));
         value["source_root"] = value["staging_root"].clone();
-        value["source_fence"] = serde_json::json!({"source_id":"\n".repeat(256),"root_identity":"\n".repeat(256),
-            "database_identity":"\n".repeat(256),"lifecycle_generation":u64::MAX,"source_revision":u64::MAX,"lease_epoch":u64::MAX});
+        value["source_fence"] = serde_json::json!({"source_id":"\u{1}".repeat(256),"root_identity":"\u{1}".repeat(256),
+            "database_identity":"\u{1}".repeat(256),"lifecycle_generation":u64::MAX,"source_revision":u64::MAX,"lease_epoch":u64::MAX});
         let record = staging_checkpoints::StagingCheckpointRecord::decode(
             &serde_json::to_vec(&value).unwrap(),
         )
@@ -657,6 +657,33 @@ mod publication_issuance {
         assert_eq!(
             staging_checkpoints::StagingCheckpointRecord::decode(&encoded).unwrap(),
             record
+        );
+    }
+    #[test]
+    fn publication_issuance_staging_preserves_historical_whitespace_and_field_order() {
+        let (_fixture, store, staging, _binding, _sequence) = prepared();
+        let reordered = serde_json::to_vec(&serde_json::to_value(&staging).unwrap()).unwrap();
+        let mut historical = vec![b' '; 64 * 1024 - reordered.len()];
+        historical.extend_from_slice(&reordered);
+        assert_eq!(historical.len(), 64 * 1024);
+        assert_eq!(
+            staging_checkpoints::StagingCheckpointRecord::decode(&historical).unwrap(),
+            staging
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE operation_journal_staging_checkpoints SET record=?1 WHERE output_id=?2",
+                params![historical, staging.output_id().to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .read_staging_checkpoint_row(staging.output_id())
+                .unwrap()
+                .unwrap()
+                .1,
+            staging
         );
     }
 }

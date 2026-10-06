@@ -29,6 +29,7 @@ pub(super) enum ExpectedObservation {
 pub(super) struct RootObservation {
     pub(super) registration: StoredRootRef,
     pub(super) authority: AuthorityObservation,
+    #[serde(deserialize_with = "super::super::staging_checkpoints::text_1024")]
     pub(super) locator: String,
     pub(super) expected: ExpectedObservation,
 }

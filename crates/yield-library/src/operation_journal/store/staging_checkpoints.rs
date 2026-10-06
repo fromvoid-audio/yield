@@ -29,12 +29,9 @@ pub(super) const CREATE_TABLE: &str = "CREATE TABLE operation_journal_staging_ch
 
 const RECORD_SCHEMA_VERSION: u32 = 1;
 pub(super) const MAX_RECORD_BYTES: usize = 64 * 1024;
-// Valid shapes contain <=2048 text bytes (locator1024 + physical256 + source3*256).
-// Worst JSON escaping is six bytes per text byte; 4096 covers all fixed scalars/keys.
-// Keep the historical SQL constraint, but reject oversized observations before decoding.
-const MAX_OBSERVATION_BYTES: usize = 6 * (1024 + 256 + 3 * 256) + 4096;
-const _: () = assert!(MAX_OBSERVATION_BYTES <= MAX_RECORD_BYTES);
-pub(super) const MAX_ROWS: i64 = 8192;
+// Preserve the historical 64KiB wire allowance, including whitespace/key ordering.
+// Every accepted text is <=1024 bytes; maximum JSON escaping is six bytes per byte.
+const MAX_STRING_TOKEN_BYTES: usize = 6 * 1024;
 
 /// A serialized root observation, intentionally separate from the live registration type.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -69,8 +66,11 @@ impl StoredRootRef {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StoredStagingSourceFence {
+    #[serde(deserialize_with = "text_256")]
     source_id: String,
+    #[serde(deserialize_with = "text_256")]
     root_identity: String,
+    #[serde(deserialize_with = "text_256")]
     database_identity: String,
     lifecycle_generation: u64,
     source_revision: Option<u64>,
@@ -128,8 +128,10 @@ pub(super) struct StagingCheckpointRecord {
     staging_root: StoredRootRef,
     source_root: Option<StoredRootRef>,
     source_fence: Option<StoredStagingSourceFence>,
+    #[serde(deserialize_with = "text_1024")]
     locator: String,
     logical_object_id: Uuid,
+    #[serde(deserialize_with = "text_256")]
     physical_object_id: String,
     bytes: u64,
     content_hash: [u8; 32],
@@ -267,21 +269,72 @@ impl StagingCheckpointRecord {
     pub(super) fn encode(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
         let encoded = serde_json::to_vec(self).map_err(|error| error.to_string())?;
-        if encoded.len() > MAX_OBSERVATION_BYTES {
+        if encoded.len() > MAX_RECORD_BYTES {
             return Err(String::from("staging checkpoint exceeds its record bound"));
         }
         Ok(encoded)
     }
 
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() > MAX_OBSERVATION_BYTES {
+        if bytes.len() > MAX_RECORD_BYTES {
             return Err(String::from("staging checkpoint exceeds its record bound"));
         }
+        bounded_string_tokens(bytes)?;
         // Typed fields reject duplicates/unknown keys without an owned JSON Value graph.
         let record: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
         record.validate()?;
         Ok(record)
     }
+}
+
+// Validate a string token's raw wire size without allocating or interpreting authority.
+// Legal UTF-8 text/JSON escapes cannot exceed six times its decoded byte allowance.
+fn bounded_string_tokens(bytes: &[u8]) -> Result<(), String> {
+    let (mut quoted, mut escaped, mut length) = (false, false, 0usize);
+    for byte in bytes {
+        if !quoted {
+            if *byte == b'"' {
+                quoted = true;
+                length = 0;
+            }
+        } else if escaped {
+            escaped = false;
+            length += 1;
+        } else if *byte == b'"' {
+            quoted = false;
+        } else {
+            length += 1;
+            escaped = *byte == b'\\';
+        }
+        if quoted && length > MAX_STRING_TOKEN_BYTES {
+            return Err("staging checkpoint string token exceeds accepted text bound".into());
+        }
+    }
+    Ok(())
+}
+fn bounded_text<'de, D: serde::Deserializer<'de>, const N: usize>(
+    decoder: D,
+) -> Result<String, D::Error> {
+    struct Text<const N: usize>;
+    impl<'de, const N: usize> serde::de::Visitor<'de> for Text<N> {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "nonempty text of at most {N} bytes")
+        }
+        fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<String, E> {
+            if text.is_empty() || text.len() > N {
+                return Err(E::custom("staging text bounds"));
+            }
+            Ok(text.to_owned())
+        }
+    }
+    decoder.deserialize_str(Text::<N>)
+}
+pub(super) fn text_256<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<String, D::Error> {
+    bounded_text::<D, 256>(decoder)
+}
+pub(super) fn text_1024<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<String, D::Error> {
+    bounded_text::<D, 1024>(decoder)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -648,7 +701,7 @@ impl OperationJournalStore {
                     return Ok(Err(checkpoint_error("staging checkpoint has malformed SQLite cells")));
                 };
                 if key != output_id.to_string().as_bytes() || sequence <= 0
-                    || bytes.len() > MAX_OBSERVATION_BYTES || !matches!(reserved, 0 | 1) {
+                    || bytes.len() > MAX_RECORD_BYTES || !matches!(reserved, 0 | 1) {
                     return Ok(Err(checkpoint_error("staging checkpoint has malformed SQLite cells")));
                 }
                 let record = match StagingCheckpointRecord::decode(bytes) {

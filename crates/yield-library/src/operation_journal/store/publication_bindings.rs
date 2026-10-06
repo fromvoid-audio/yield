@@ -70,6 +70,11 @@ pub(crate) struct PublicationBindingDraft {
     charge_incremental_bytes: u64,
     chunk: Option<ChunkObservation>,
 }
+// Header + at most three source-fence string groups and two1024-byte locators
+// fit8KiB per typed projection, including the single source Vec element.
+const _: () = assert!(std::mem::size_of::<PublicationBindingDraft>() <= 2048);
+const _: () =
+    assert!(std::mem::size_of::<super::staging_checkpoints::StoredStagingSourceFence>() <= 256);
 impl PublicationBindingDraft {
     pub(super) fn capture(
         canonical_command: &[u8],

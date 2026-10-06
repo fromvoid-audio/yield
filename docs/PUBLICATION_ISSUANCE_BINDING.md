@@ -29,6 +29,17 @@ issuance without evicting historical rows. Direct typed decoding caps source fen
 at one and rejects unknown/duplicate fields. Streaming command hashing avoids a
 second owned projection; readback borrows the bounded SQLite blob before decoding.
 These caps add conservative backpressure within the existing input allowance.
+The existing staging reader now validates borrowed SQLite cells before decoding.
+It preserves the historical64KiB wire allowance, whitespace and key order, while
+an allocation-free token scan caps escaped string scratch at6KiB and bounded
+string visitors validate text before owned copying. It constructs no JSON Value
+graph. A typed issuance projection fits8KiB (header<=2KiB, at most4352 string
+bytes and one source element<=256 bytes); a typed staging projection fits4KiB.
+Two issuance projections, three staging projections, a16KiB canonical temporary
+and16KiB parser/error scratch stay within60KiB. Insert encoding drops before
+commit/readback, and original command bytes drop before checkpoint work. The
+original target and native capsule retain their separate existing backing.
+
 
 Guarded schema-12 migration creates an empty relation. Existing reserved checkpoints
 remain reserved without a fabricated association and cannot issue again. Clean
