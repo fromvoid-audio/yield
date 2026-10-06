@@ -62,7 +62,9 @@ fn maintenance_successor_reservation_survives_original_predecessor_join() {
     let second_gate = service.arm_completion_for_test(false);
     let second = admission.reserve(MaintenanceKind::StorageUsage).unwrap();
     let second_id = second.id;
-    let (second_tx, second_rx) = mpsc::sync_channel(1);
+    // Fixture-only rendezvous backpressure uses the original worker's result sender
+    // to retain the real successor before its own admission finish.
+    let (second_tx, second_rx) = mpsc::sync_channel(0);
     let owner = thread::spawn(move || {
         service.start_storage(Some(&profile), second, second_tx);
         drop(profile);
@@ -70,14 +72,29 @@ fn maintenance_successor_reservation_survives_original_predecessor_join() {
     });
     assert!(
         !second_gate.wait_entered(Duration::from_millis(150)),
-        "successor cannot execute before original predecessor join"
+        "successor cannot finish while its original predecessor remains paused"
     );
     assert!(admission.reserve(MaintenanceKind::CacheClear).is_none());
+    assert!(matches!(
+        second_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
     first_gate.release();
-    assert!(second_gate.wait_entered(Duration::from_secs(5)));
     let mut service = owner.join().unwrap();
-    let _second_result = second_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(service.active.as_ref().unwrap().id, second_id);
+    assert_eq!(
+        admission.state.lock().unwrap().active,
+        Some((second_id, MaintenanceKind::StorageUsage)),
+        "original predecessor join cannot release the accepted successor"
+    );
+    assert!(admission.reserve(MaintenanceKind::CacheClear).is_none());
+    assert!(WritableProfileGuard::acquire_current().is_err());
+    let _second_result = second_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(second_gate.wait_entered(Duration::from_secs(5)));
+    let next = admission
+        .reserve(MaintenanceKind::CacheClear)
+        .expect("successor releases only its own reservation when it finishes");
+    drop(next);
     // The second operation has released admission, but its original handle/custody remains.
     assert!(WritableProfileGuard::acquire_current().is_err());
     second_gate.release();

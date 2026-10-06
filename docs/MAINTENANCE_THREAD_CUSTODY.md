@@ -29,7 +29,9 @@ cache, rather than claiming a new public maintenance fault integration.
 
 Real original worker tests pause after operation admission release but before
 thread exit, reject detached-predecessor shutdown, preserve the successor's exact
-handle while joining its predecessor, cover an original cache predecessor,
+handle while joining its predecessor, observe its exact admission after that
+join and before its own finish using fixture-only original result-channel
+rendezvous backpressure, cover an original cache predecessor,
 retain an actual post-operation thread panic across refused successors, and
 preserve ordinary cancellation. Real Session tests release the worker only after
 original shutdown cancellation, prove all other original owners and child leases
