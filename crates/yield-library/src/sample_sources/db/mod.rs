@@ -23,9 +23,9 @@ pub(crate) use file_ops_journal::BoundDatabaseRoot;
 mod exact_scan;
 mod subtree_scan;
 pub use subtree_scan::{SUBTREE_SCAN_MAX_RETAINED, SubtreeScanDatabaseFacts};
+mod idle_maintenance;
 mod index_entries;
 mod index_inspection;
-mod idle_maintenance;
 mod legacy_observation;
 pub(crate) use legacy_observation::LEGACY_CAPTURE_SCRATCH_BYTES;
 pub use legacy_observation::{

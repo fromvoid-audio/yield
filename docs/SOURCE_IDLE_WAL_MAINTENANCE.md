@@ -56,5 +56,7 @@ PASSIVE does not promise WAL truncation, hard-watermark size reduction, bounded 
 I/O, a durable shutdown checkpoint or physical power-loss qualification. Missing
 broader admission, scheduler, hard-pressure, shutdown and qualification requirements
 remain open in OPT-1687/1686/1685/1348. Windows GNU compilation is not Native MSVC/NTFS
-execution. No idle observation issues permits, authorizes retries, refunds credit or
-confirms genuine settlement.
+execution. Exact implemented native macOS/Windows commands and requirements are
+tracked in [OPT-2379](https://linear.app/boostnlvp/issue/OPT-2379); the two pathname-
+substitution cases remain deliberately Unix-only. No idle observation issues permits,
+authorizes retries, refunds credit or confirms genuine settlement.
