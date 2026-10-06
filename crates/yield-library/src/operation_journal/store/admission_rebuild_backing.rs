@@ -77,7 +77,7 @@ impl Collection {
             Ok(counts) => counts,
             Err(error) => {
                 input.retain_historical_error(sql, None, None, native_error.into_inner());
-                return Err(error);
+                return Err(resource_error(error));
             }
         };
         // A full pinned internal BTree node per entry covers sparse occupancy,
@@ -147,11 +147,15 @@ fn collection_bytes(claims: usize, releases: usize) -> Option<usize> {
     let page_headers = size_of::<Statement<'_>>()
         + size_of::<RefCell<Option<InputPermit>>>()
         + 4 * size_of::<String>();
+    let diagnostics =
+        2 * MAX_REBUILD_DIAGNOSTICS * (size_of::<String>() + 4 * MAX_REBUILD_DIAGNOSTIC_CHARS)
+            + size_of::<Vec<String>>();
     rows.checked_add(release_maps)?
         .checked_add(page)?
         .checked_add(headers)?
         .checked_add(page_headers)?
-        .checked_add(text)
+        .checked_add(text)?
+        .checked_add(diagnostics)
 }
 
 fn resource_error(error: OperationJournalStoreError) -> OperationJournalStoreError {

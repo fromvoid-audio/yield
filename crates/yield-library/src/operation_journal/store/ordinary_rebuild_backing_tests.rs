@@ -56,6 +56,12 @@ fn ordinary_rebuild_backing_preserves_malformed_missing_and_orphan_audit() {
             store.connection.execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE operation_journal_ordinary_claim SET allocation_class='unknown'; PRAGMA ignore_check_constraints=OFF").unwrap();
         }
         if scenario == "orphan" || scenario == "mismatch" {
+            // Exact existing corruption-fixture mechanism: original table/reader,
+            // with a retained impossible relation rather than a schema substitute.
+            store
+                .connection
+                .execute_batch("PRAGMA foreign_keys=OFF")
+                .unwrap();
             store
                 .connection
                 .execute(
@@ -71,6 +77,10 @@ fn ordinary_rebuild_backing_preserves_malformed_missing_and_orphan_audit() {
                         Uuid::new_v4().to_string()
                     ],
                 )
+                .unwrap();
+            store
+                .connection
+                .execute_batch("PRAGMA foreign_keys=ON")
                 .unwrap();
         }
         let old = store.rebuild_admission_snapshot().unwrap();

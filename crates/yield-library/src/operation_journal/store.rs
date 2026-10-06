@@ -7262,7 +7262,11 @@ impl OperationJournalStore {
             }
         }
 
-        let claim_ids: BTreeSet<_> = claim_rows.iter().map(|claim| claim.claim_id()).collect();
+        // Incremental insertion avoids FromIterator's additional sorting Vec.
+        let mut claim_ids = BTreeSet::new();
+        for claim in &claim_rows {
+            claim_ids.insert(claim.claim_id());
+        }
         let mut rebuild_claims = Vec::with_capacity(claim_rows.len());
         for claim in claim_rows {
             let observed = match input {
