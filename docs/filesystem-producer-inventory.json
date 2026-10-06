@@ -1122,6 +1122,26 @@
       "issue": "OPT-2403",
       "reason": "Automated real SQLite test opens only its isolated writable-profile fixture. Scalar corruption and raw retained evidence comparisons issue no live permit or physical qualification.",
       "retirement": "Keep as isolated original database-claim scalar projection regression coverage."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_attempt_scalar_projection_tests.rs",
+      "function": "database_attempt_scalar_projection_retains_nul_corruption_without_copying",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2411",
+      "reason": "Isolated actual SQLite fixture tests retained original attempt scalar corruption and readback; synthetic observations issue no permit or physical qualification.",
+      "retirement": "Keep as isolated original attempt scalar projection regression coverage."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_attempt_scalar_projection_tests.rs",
+      "function": "database_attempt_scalar_projection_nonce_and_audit_keys_remain_bounded",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2411",
+      "reason": "Isolated actual SQLite fixture tests retained original attempt scalar corruption and readback; synthetic observations issue no permit or physical qualification.",
+      "retirement": "Keep as isolated original attempt scalar projection regression coverage."
     }
   ]
 }
