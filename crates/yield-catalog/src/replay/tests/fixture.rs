@@ -234,7 +234,7 @@ impl Fixture {
                 commands,
                 events,
                 admission,
-                worker: Mutex::new(Some(worker)),
+                worker: Mutex::new(crate::shutdown::WorkerJoinState::new(Some(worker))),
             },
             gate,
         )

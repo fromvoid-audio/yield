@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -66,7 +66,10 @@ pub use source_wal_preparation::{
     CatalogSourceWalRequest, CatalogSourceWalStatus,
 };
 mod command_metrics;
+mod shutdown;
 pub use command_metrics::{CatalogCommandMetrics, CatalogDurationMetrics};
+use shutdown::WorkerJoinState;
+pub use shutdown::{CatalogThreadJoinOutcome, CatalogThreadShutdownReport};
 
 mod curation;
 mod curation_tag_facts;
@@ -3654,7 +3657,7 @@ pub struct CatalogService {
     commands: SyncSender<QueuedCatalogCommand>,
     events: Arc<EventHub>,
     admission: Arc<Mutex<AdmissionState>>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<WorkerJoinState>,
 }
 
 impl CatalogService {
@@ -3762,7 +3765,7 @@ impl CatalogService {
             commands,
             events,
             admission,
-            worker: Mutex::new(Some(worker)),
+            worker: Mutex::new(WorkerJoinState::new(Some(worker))),
         })
     }
 
@@ -4041,25 +4044,6 @@ impl CatalogService {
         admission.tag_read_payload_bytes = admission
             .tag_read_payload_bytes
             .saturating_sub(tag_read_payload_bytes);
-    }
-
-    /// Request cancellation and synchronously join the worker.
-    pub fn shutdown(&self) {
-        {
-            let mut admission = self
-                .admission
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !admission.shutdown && !admission.closed {
-                admission.shutdown = true;
-                admission.invalidate_all();
-            }
-        }
-        if let Ok(mut worker) = self.worker.lock()
-            && let Some(worker) = worker.take()
-        {
-            let _ = worker.join();
-        }
     }
 }
 
@@ -10836,7 +10820,7 @@ mod tests {
             commands,
             events: Arc::clone(&hub),
             admission: Arc::clone(&admission),
-            worker: Mutex::new(None),
+            worker: Mutex::new(WorkerJoinState::new(None)),
         };
         let terminal_credits = (17, 3, 11);
         {
@@ -11031,7 +11015,7 @@ mod tests {
             commands,
             events: Arc::clone(&hub),
             admission: Arc::clone(&admission),
-            worker: Mutex::new(None),
+            worker: Mutex::new(WorkerJoinState::new(None)),
         };
         assert!(matches!(
             service.recv_event_timeout(Duration::ZERO),

@@ -150,7 +150,7 @@ fn disconnected_channel_rejects_without_timestamp_or_credit_leak() {
         commands,
         events: std::sync::Arc::new(crate::EventHub::new()),
         admission: std::sync::Arc::new(std::sync::Mutex::new(crate::AdmissionState::new())),
-        worker: std::sync::Mutex::new(None),
+        worker: std::sync::Mutex::new(crate::shutdown::WorkerJoinState::new(None)),
     };
     assert_eq!(
         service.submit(CatalogCommand::RequestAudit {

@@ -38,7 +38,10 @@ impl OriginalWorkerPanic {
     /// Wait a bounded time for the original worker to enter the gate.
     pub fn wait_entered(&self, timeout: std::time::Duration) -> bool {
         let flags = self.state.flags.lock().unwrap_or_else(|e| e.into_inner());
-        let (flags, _) = self.state.wake.wait_timeout_while(flags, timeout, |s| !s.entered)
+        let (flags, _) = self
+            .state
+            .wake
+            .wait_timeout_while(flags, timeout, |s| !s.entered)
             .unwrap_or_else(|e| e.into_inner());
         flags.entered
     }
@@ -51,13 +54,19 @@ impl OriginalWorkerPanic {
 
     /// Release the original worker to panic; this operation is idempotent.
     pub fn release(&self) {
-        self.state.flags.lock().unwrap_or_else(|e| e.into_inner()).released = true;
+        self.state
+            .flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .released = true;
         self.state.wake.notify_all();
     }
 }
 
 impl Drop for OriginalWorkerPanic {
-    fn drop(&mut self) { self.release(); }
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl CatalogService {
@@ -65,19 +74,30 @@ impl CatalogService {
     /// This fixture neither supplies ownership nor bypasses production admission.
     pub fn arm_original_worker_panic(&self) -> Result<OriginalWorkerPanic, WorkerPanicError> {
         let mut admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        if admission.shutdown || admission.closed { return Err(WorkerPanicError::Closed); }
-        if admission.worker_panic.is_some() { return Err(WorkerPanicError::Occupied); }
+        if admission.shutdown || admission.closed {
+            return Err(WorkerPanicError::Closed);
+        }
+        if admission.worker_panic.is_some() {
+            return Err(WorkerPanicError::Occupied);
+        }
         let state = Arc::new(WorkerPanicState {
             flags: Mutex::new(WorkerPanicFlags::default()),
             wake: std::sync::Condvar::new(),
         });
         admission.worker_panic = Some(Arc::clone(&state));
-        Ok(OriginalWorkerPanic { state, admission: Arc::clone(&self.admission) })
+        Ok(OriginalWorkerPanic {
+            state,
+            admission: Arc::clone(&self.admission),
+        })
     }
 }
 
 pub(crate) fn original_worker_failure(admission: &Arc<Mutex<AdmissionState>>) {
-    let fault = admission.lock().unwrap_or_else(|e| e.into_inner()).worker_panic.clone();
+    let fault = admission
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .worker_panic
+        .clone();
     if let Some(fault) = fault {
         let mut flags = fault.flags.lock().unwrap_or_else(|e| e.into_inner());
         flags.entered = true;

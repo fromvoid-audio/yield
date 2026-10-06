@@ -1404,9 +1404,18 @@ impl Persistence {
 
     fn shutdown(&mut self) -> Result<(), SessionError> {
         self.maintenance.shutdown();
-        if let Some(catalog) = self.catalog.take() {
-            catalog.shutdown();
-        }
+        let catalog_result = if let Some(catalog) = self.catalog.take() {
+            let report = catalog.shutdown_with_report();
+            if report.is_confirmed_join() {
+                Ok(())
+            } else {
+                Err(SessionError::Persistence(format!(
+                    "catalog shutdown was unconfirmed: {report:?}"
+                )))
+            }
+        } else {
+            Ok(())
+        };
         let global_result = if let Some(mut writer) = self.writer.take() {
             let report = writer.shutdown_with_report();
             match report.outcome() {
@@ -1442,7 +1451,7 @@ impl Persistence {
             Ok(())
         };
         self.writable.take();
-        global_result.and(journal_result)
+        global_result.and(journal_result).and(catalog_result)
     }
 }
 
@@ -2982,8 +2991,8 @@ fn drain_shutdown(
 
 #[cfg(test)]
 mod tests {
-    mod journal_shutdown;
     mod catalog_shutdown;
+    mod journal_shutdown;
 
     mod harvest_catalog_tests {
         use super::*;
