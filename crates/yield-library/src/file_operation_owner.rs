@@ -2257,6 +2257,9 @@ impl FileOperationOwner {
                     .and_then(|root| bytes.checked_add(root))
             })
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ProductionRootCapability>()))
+            .and_then(|bytes| {
+                bytes.checked_add(BoundDatabaseRoot::owned_directory_snapshot_bytes())
+            })
             .ok_or_else(|| String::from("profile root backing overflow"))?;
         let input = self
             .shared
@@ -2877,7 +2880,8 @@ impl ProductionRootCapability {
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
             .and_then(|bytes| {
                 bytes.checked_add(match self.source.as_ref() {
-                    None => BoundDatabaseRoot::LEGACY_ARC_FILE_BYTES,
+                    None => BoundDatabaseRoot::LEGACY_ARC_FILE_BYTES
+                        .checked_add(BoundDatabaseRoot::owned_directory_snapshot_bytes())?,
                     Some(source) => source.retained_graph_metadata_bytes()?,
                 })
             })
@@ -2902,6 +2906,13 @@ impl ProductionRootCapability {
             .map_err(|error| error.to_string())?;
         #[cfg(windows)]
         if self.source.is_none() {
+            if self._input.as_ref().is_none_or(|input| {
+                input.bytes < BoundDatabaseRoot::owned_directory_snapshot_bytes()
+            }) {
+                return Err(String::from(
+                    "owned directory snapshot has no original backing",
+                ));
+            }
             self.root
                 .validate_owned_directory_snapshot()
                 .map_err(|_| String::from("owned directory security snapshot refused"))?;
@@ -4766,9 +4777,14 @@ mod tests {
         let _profile = PersistenceProfileGuard::named("windows-private-root");
         let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
         let owner = FileOperationOwner::start().expect("original owner");
+        let before = owner.input_bytes_remaining_for_test();
         let registration = owner
             .register_profile_root(&guard)
             .expect("private root registers");
+        assert!(
+            before - owner.input_bytes_remaining_for_test()
+                >= BoundDatabaseRoot::owned_directory_snapshot_bytes()
+        );
         let path = guard.profile_root().join("unchanged.bin");
         std::fs::write(&path, b"unchanged original bytes").unwrap();
         let mut request = owner
@@ -4785,6 +4801,7 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"unchanged original bytes");
         drop(request);
         owner.retire_root(registration).unwrap();
+        assert_eq!(owner.input_bytes_remaining_for_test(), before);
         owner.acknowledge_custody_for_test();
         assert!(matches!(
             owner.shutdown(),

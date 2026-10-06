@@ -811,6 +811,18 @@ impl BoundDatabaseRoot {
             .checked_add(guard.profile_root().as_os_str().as_encoded_bytes().len())?
             .checked_add(guard.profile_root_identity().len().checked_mul(2)?)
     }
+    /// Exact profile-only heap scratch retained in original FileOwner backing.
+    pub(crate) const fn owned_directory_snapshot_bytes() -> usize {
+        #[cfg(windows)]
+        {
+            windows_owned_security::BUFFER_BYTES
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    }
+
     /// Read-only security snapshot of this exact already retained owned directory.
     #[cfg(windows)]
     pub(crate) fn validate_owned_directory_snapshot(&self) -> io::Result<()> {
