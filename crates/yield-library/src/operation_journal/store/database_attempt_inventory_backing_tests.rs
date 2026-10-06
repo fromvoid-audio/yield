@@ -30,7 +30,7 @@ fn database_attempt_inventory_backing_retains_oversized_original_image() {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("attempt image shape")
+                .contains("unsupported database claim inventory: attempt image shape")
         );
         assert!(
             OWNED_BYTES.with(|n| n.get())
@@ -61,7 +61,7 @@ fn database_attempt_inventory_backing_preserves_original_error_order() {
         DatabaseAttemptStart::decode(canonical.as_bytes())
             .unwrap_err()
             .to_string(),
-        "attempt image shape"
+        "unsupported database claim inventory: attempt image shape"
     );
     for json in [
         canonical.replacen("\"inventory\":[0", "\"inventory\":[ 0", 1),
@@ -72,7 +72,7 @@ fn database_attempt_inventory_backing_preserves_original_error_order() {
             DatabaseAttemptStart::decode(json.as_bytes())
                 .unwrap_err()
                 .to_string(),
-            "noncanonical attempt image"
+            "unsupported database claim inventory: noncanonical attempt image"
         );
     }
     for json in [
@@ -88,7 +88,7 @@ fn database_attempt_inventory_backing_preserves_original_error_order() {
             DatabaseAttemptStart::decode(json.as_bytes())
                 .unwrap_err()
                 .to_string(),
-            "unsupported attempt image"
+            "unsupported database claim inventory: unsupported attempt image"
         );
     }
 }
