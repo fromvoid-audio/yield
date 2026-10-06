@@ -49,7 +49,7 @@ mod integration {
         drop(runtime);
         assert_eq!(
             shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()],
-            InputClass::Ordinary.limit()
+            InputBudget::shared_initial().remaining[InputClass::Ordinary.index()]
         );
         assert!(OperationJournalStore::open(&fixture.owner).is_ok());
     }
@@ -411,7 +411,8 @@ mod integration {
                 drop(reopened);
                 assert_eq!(
                     shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()],
-                    InputClass::Ordinary.limit() - 64 * 1024
+                    InputBudget::shared_initial().remaining[InputClass::Ordinary.index()]
+                        - 64 * 1024
                 );
                 drop(retained);
             } else {
@@ -419,7 +420,7 @@ mod integration {
             }
             assert_eq!(
                 shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()],
-                InputClass::Ordinary.limit()
+                InputBudget::shared_initial().remaining[InputClass::Ordinary.index()]
             );
         }
     }
