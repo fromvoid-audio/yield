@@ -175,17 +175,7 @@ impl OwnerRuntime {
         let _source_effect = pin.begin_effect()?;
         let proposal = self.store().recording_prestart_proposal(operation)?;
         let epoch = u64::try_from(registration.lease_identity.epoch()).map_err(|_| E::Changed)?;
-        if !proposal
-            .participants()
-            .descriptors()
-            .iter()
-            .filter_map(|p| p.source_fence())
-            .any(|f| {
-                f.root_identity() == source.request.media_root().identity()
-                    && f.database_identity() == source.request.database_file_identity()
-                    && f.lease_epoch() == epoch
-            })
-        {
+        if !proposal.matches_original_destination(&source.request, epoch) {
             return Err(E::Changed.into());
         }
         let snapshot = self.store().rebuild_recording_prestart_snapshot()?;

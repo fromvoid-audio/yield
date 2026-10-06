@@ -496,3 +496,114 @@ fn recording_proposal_participant_preflight_counts_array_form_and_escaped_keys()
     assert!(RecordingProposal::decode(&serde_json::to_vec(&array).unwrap()).is_err());
     RECORDING_VALUE_PARSE_ENTRIES.with(|n| assert_eq!(n.get(), 0));
 }
+
+#[test]
+fn recording_original_destination_refuses_unrelated_matching_source() {
+    use crate::app_dirs::{AppRootGuard, WritableProfileGuard};
+    let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
+    let profile = tempfile::tempdir().unwrap();
+    let _root = AppRootGuard::set(profile.path().to_owned()).unwrap();
+    let guard = WritableProfileGuard::acquire_current().unwrap();
+    let media = tempfile::tempdir().unwrap();
+    let source = crate::sample_sources::SourceDatabase::open_for_catalog_with_profile_guard(
+        media.path(),
+        &guard,
+        "recording-held-original",
+    )
+    .unwrap();
+    let authority = source.prepare_source_authority().unwrap();
+    let envelope = authority.journal_request().unwrap();
+    let request = envelope.request;
+    let _confirmation = request.accept_confirmation(envelope.confirmation).unwrap();
+    let epoch = u64::try_from(request.lease_identity().epoch()).unwrap();
+
+    // These proposals are stored observations only. The held Source request is genuine;
+    // this test never installs a journal receipt, capacity provider or physical grant.
+    let mut wire = serde_json::to_value(proposal(2, 10)).unwrap();
+    for descriptor in wire["participants"]["descriptors"].as_array_mut().unwrap() {
+        if descriptor["source_fence"].is_object() {
+            descriptor["source_fence"]["root_identity"] = request.media_root().identity().into();
+            descriptor["source_fence"]["database_identity"] =
+                request.database_file_identity().into();
+            descriptor["source_fence"]["lease_epoch"] = epoch.into();
+        }
+    }
+    wire["destination"]["parent"]["expectation"]["filesystem_identity"] =
+        request.media_root().identity().into();
+    let valid = RecordingProposal::decode(&serde_json::to_vec(&wire).unwrap()).unwrap();
+    assert!(valid.matches_original_destination(&request, epoch));
+
+    for (field, value) in [
+        ("root_identity", Value::from("foreign-root")),
+        ("database_identity", Value::from("foreign-database")),
+        ("lease_epoch", Value::from(epoch.checked_add(1).unwrap())),
+    ] {
+        let mut changed = wire.clone();
+        // The destination Source differs; the unrelated Harvest/Projection/Readiness
+        // descriptors still match, reproducing the original any-participant predicate.
+        changed["participants"]["descriptors"][0]["source_fence"][field] = value.clone();
+        if field == "root_identity" {
+            changed["destination"]["parent"]["expectation"]["filesystem_identity"] = value;
+        }
+        let changed = RecordingProposal::decode(&serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(
+            changed
+                .participants()
+                .descriptors()
+                .iter()
+                .filter_map(|d| d.source_fence())
+                .any(|f| {
+                    f.root_identity() == request.media_root().identity()
+                        && f.database_identity() == request.database_file_identity()
+                        && f.lease_epoch() == epoch
+                })
+        );
+        assert!(
+            !changed.matches_original_destination(&request, epoch),
+            "{field}"
+        );
+        assert_eq!(
+            RecordingProposal::decode(&changed.encode().unwrap()).unwrap(),
+            changed
+        );
+    }
+    // A second required SourceDatabase A matches the genuine request. Destination B
+    // has a different valid source/root/database/epoch: A must not authorize B.
+    let mut two_sources = wire.clone();
+    let mut source_a = two_sources["participants"]["descriptors"][0].clone();
+    let source_a_id = ParticipantId::new();
+    source_a["id"] = serde_json::to_value(source_a_id).unwrap();
+    source_a["source_fence"]["source_id"] = Value::from("source-a");
+    two_sources["participants"]["descriptors"]
+        .as_array_mut()
+        .unwrap()
+        .push(source_a);
+    let checkpoint =
+        ParticipantCheckpoint::new(source_a_id, ParticipantCheckpointState::Pending, None, None)
+            .unwrap();
+    two_sources["participants"]["checkpoints"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::to_value(checkpoint).unwrap());
+    let destination_b = &mut two_sources["participants"]["descriptors"][0]["source_fence"];
+    destination_b["source_id"] = Value::from("source-b");
+    destination_b["root_identity"] = Value::from("source-b-root");
+    destination_b["database_identity"] = Value::from("source-b-database");
+    destination_b["lease_epoch"] = Value::from(epoch.checked_add(1).unwrap());
+    two_sources["destination"]["parent"]["source_id"] = Value::from("source-b");
+    two_sources["destination"]["parent"]["expectation"]["filesystem_identity"] =
+        Value::from("source-b-root");
+    let two_sources =
+        RecordingProposal::decode(&serde_json::to_vec(&two_sources).unwrap()).unwrap();
+    assert!(two_sources.participants().descriptors().iter().any(|d| {
+        d.kind() == ParticipantKind::SourceDatabase
+            && d.id() == source_a_id
+            && d.source_fence().is_some_and(|f| {
+                f.root_identity() == request.media_root().identity()
+                    && f.database_identity() == request.database_file_identity()
+                    && f.lease_epoch() == epoch
+            })
+    }));
+    assert!(!two_sources.matches_original_destination(&request, epoch));
+    assert!(!valid.matches_original_destination(&request, epoch.checked_add(1).unwrap()));
+}

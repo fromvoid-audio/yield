@@ -2313,18 +2313,7 @@ impl OwnerRuntime {
                 reason: "recording lease epoch invalid".into(),
             }
         })?;
-        let current = operation.universal_intent.as_ref().is_some_and(|intent| {
-            intent
-                .participants()
-                .descriptors()
-                .iter()
-                .filter_map(|p| p.source_fence())
-                .any(|f| {
-                    f.root_identity() == source.request.media_root().identity()
-                        && f.database_identity() == source.request.database_file_identity()
-                        && f.lease_epoch() == epoch
-                })
-        });
+        let current = proposal.matches_original_destination(&source.request, epoch);
         if !current {
             return Err(OperationJournalOwnerError::ChunkClaim {
                 reason: "recording source differs from frozen participant".into(),
