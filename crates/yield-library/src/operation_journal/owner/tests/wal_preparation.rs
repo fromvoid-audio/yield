@@ -2795,12 +2795,16 @@ mod integration {
         }
         drop(actor);
         assert!(global.shutdown());
-        assert!(journal.shutdown());
         if outcome == 16 {
+            // OwnerLost conservatively denies clean handoff, even when NoAttempt
+            // backing has been destroyed. Memory release does not waive that refusal.
+            assert!(!journal.shutdown());
             assert_eq!(
                 *journal.shared.input_bytes.lock().unwrap(),
                 InputBudget::new()
             );
+        } else {
+            assert!(journal.shutdown());
         }
     }
     #[test]
