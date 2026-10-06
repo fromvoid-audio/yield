@@ -202,7 +202,7 @@ fn historical_claim_late_send_disposes_payload_before_original_reply_credit() {
         _header: header,
         consumer: Mutex::new(None),
         observer: Mutex::new(None),
-        consumer_refused: AtomicBool::new(false),
+        consumer_refused: std::sync::atomic::AtomicBool::new(false),
     });
     let mut input = shared.reserve_input(InputClass::Ordinary, 1).unwrap();
     input.historical_reply = Some(Arc::clone(&backing));

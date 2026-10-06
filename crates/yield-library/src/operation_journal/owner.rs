@@ -5312,7 +5312,7 @@ impl OperationJournalClient {
                 consumer: Mutex::new(None),
                 observer: Mutex::new(None),
                 #[cfg(test)]
-                consumer_refused: AtomicBool::new(false),
+                consumer_refused: std::sync::atomic::AtomicBool::new(false),
             });
             input.historical_reply = Some(Arc::clone(&backing));
             Some(backing)
@@ -5717,7 +5717,7 @@ struct HistoricalReplyBacking {
     consumer: Mutex<Option<InputPermit>>,
     observer: Mutex<Option<HistoricalObserverCredits>>,
     #[cfg(test)]
-    consumer_refused: AtomicBool,
+    consumer_refused: std::sync::atomic::AtomicBool,
 }
 // This first-stage refusal can occur before any observer/consumer debit succeeds.
 // Fund its owned reason (including String growth) BEFORE queueing/Arc allocation.
