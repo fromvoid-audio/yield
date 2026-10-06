@@ -973,6 +973,11 @@ impl BoundDatabaseRoot {
         Ok(observer)
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn current_drop_root_for_test(&self) -> std::sync::Weak<fs::File> {
+        Arc::downgrade(&self._capability)
+    }
+
     pub(crate) fn try_clone_descriptor(&self) -> io::Result<fs::File> {
         self._capability.try_clone()
     }
@@ -1118,6 +1123,57 @@ impl BoundDatabaseRoot {
                 observe(2);
             }
             Ok(())
+        }
+    }
+
+    /// Each Current namespace flush retains the original source gate while native I/O runs.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn sync_current_namespace(
+        &self,
+        profile_guard: &WritableProfileGuard,
+        proof: &crate::sample_sources::db::CurrentReserveUseProof<'_>,
+        #[cfg(test)] after_sync: Option<fn(u8)>,
+    ) -> Result<(), String> {
+        // Current physical creation is gated to macOS; never pretend a Windows directory
+        // flush succeeded. The original parent descriptor derives from the scoped profile.
+        #[cfg(windows)]
+        {
+            let _ = (profile_guard, proof, after_sync);
+            Err("Current namespace flush unsupported".into())
+        }
+        #[cfg(not(windows))]
+        {
+            let profile_root = proof
+                .profile()
+                .profile_root_dir()
+                .map_err(|e| e.to_string())?;
+            self.validate_profile_guard(profile_guard)
+                .map_err(|e| e.to_string())?;
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())?;
+            let effect = proof.begin_bootstrap_effect().map_err(|e| e.to_string())?;
+            sync_retained_directory(&profile_root.into_std_file()).map_err(|e| e.to_string())?;
+            drop(effect);
+            #[cfg(test)]
+            if let Some(observe) = after_sync {
+                observe(1);
+            }
+            self.validate_profile_guard(profile_guard)
+                .map_err(|e| e.to_string())?;
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())?;
+            let effect = proof.begin_bootstrap_effect().map_err(|e| e.to_string())?;
+            sync_retained_directory(&self._capability).map_err(|e| e.to_string())?;
+            drop(effect);
+            #[cfg(test)]
+            if let Some(observe) = after_sync {
+                observe(2);
+            }
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())
         }
     }
 
@@ -1314,6 +1370,30 @@ impl BoundDatabaseRoot {
             namespace_kind: BoundDatabaseRootNamespace::ExternalSource,
             _lease: None,
         })
+    }
+
+    /// Retained Current request backing, including a catalog child lease when present.
+    /// This is explicit metadata accounting, not a bound on the OS descriptor or profile registry.
+    pub(crate) fn current_metadata_bytes(&self) -> Option<usize> {
+        let mut bytes =
+            std::mem::size_of::<Self>()
+                .checked_add(std::mem::size_of::<(usize, usize, fs::File)>())?;
+        for path in std::iter::once(&self.path).chain(self.named_path.iter()) {
+            if path.capacity() > 8192 || path.as_os_str().as_encoded_bytes().len() > 4096 {
+                return None;
+            }
+            bytes = bytes.checked_add(path.capacity())?;
+        }
+        for identity in [&self.identity, &self.profile_identity] {
+            if identity.capacity() > 256 {
+                return None;
+            }
+            bytes = bytes.checked_add(identity.capacity())?;
+        }
+        if let Some(lease) = &self._lease {
+            bytes = bytes.checked_add(lease.current_metadata_bytes()?)?;
+        }
+        Some(bytes)
     }
 
     pub(crate) fn identity(&self) -> &str {

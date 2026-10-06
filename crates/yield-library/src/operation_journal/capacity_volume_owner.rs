@@ -39,11 +39,19 @@ const MARKER_VERSION: &str = "1";
 const MAX_MARKER_BYTES: usize = 1024;
 const MAX_IDENTITY_BYTES: usize = 256;
 
+mod current_source;
 #[cfg(any(windows, test))]
 mod windows_lock;
+pub(super) use current_source::validate_current_source_scope;
 
+mod bootstrap_use;
+pub(crate) use bootstrap_use::ReserveBootstrapUseProof;
 mod legacy_bootstrap;
-pub(super) use legacy_bootstrap::{LegacyVolumeFailureBacking, acquire_legacy_for_descriptor};
+#[cfg(all(test, unix))]
+pub(super) use legacy_bootstrap::acquire_current_refused_prefix_for_test;
+pub(super) use legacy_bootstrap::{
+    LegacyVolumeFailureBacking, acquire_current_for_scope, acquire_legacy_for_descriptor,
+};
 
 /// This capability can only be used for recovery coordination in this milestone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -225,12 +225,12 @@
     },
     {
       "path": "crates/yield-library/src/app_dirs/profile_ownership.rs",
-      "function": "open_legacy_canonical_app_root",
+      "function": "open_source_canonical_app_root",
       "operation": "method::create_dir",
       "count": 1,
       "classification": "owner",
       "issue": "OPT-2349",
-      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "reason": "Closed original Current or Legacy source proof revalidates before this exact shared bootstrap effect. Current holds its original SourceEffectPermit across native work with descriptor validation outside the gate mutex; Legacy preserves its frozen pre-lease seal. Exact refused-prefix backing remains on the original charged worker. No ordinary grant, retry/refund or physical qualification is supplied.",
       "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
     },
     {
@@ -355,32 +355,32 @@
     },
     {
       "path": "crates/yield-library/src/operation_journal/capacity_volume_owner/legacy_bootstrap.rs",
-      "function": "acquire_legacy_inner",
+      "function": "acquire_bootstrap_inner",
       "operation": "OpenOptions::create",
       "count": 1,
       "classification": "owner",
       "issue": "OPT-2349",
-      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "reason": "Closed original Current or Legacy source proof revalidates before this exact shared bootstrap effect. Current holds its original SourceEffectPermit across native work with descriptor validation outside the gate mutex; Legacy preserves its frozen pre-lease seal. Exact refused-prefix backing remains on the original charged worker. No ordinary grant, retry/refund or physical qualification is supplied.",
       "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
     },
     {
       "path": "crates/yield-library/src/operation_journal/capacity_volume_owner/legacy_bootstrap.rs",
-      "function": "acquire_legacy_inner",
+      "function": "acquire_bootstrap_inner",
       "operation": "OpenOptions::write",
       "count": 1,
       "classification": "owner",
       "issue": "OPT-2349",
-      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "reason": "Closed original Current or Legacy source proof revalidates before this exact shared bootstrap effect. Current holds its original SourceEffectPermit across native work with descriptor validation outside the gate mutex; Legacy preserves its frozen pre-lease seal. Exact refused-prefix backing remains on the original charged worker. No ordinary grant, retry/refund or physical qualification is supplied.",
       "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
     },
     {
       "path": "crates/yield-library/src/operation_journal/capacity_volume_owner/legacy_bootstrap.rs",
-      "function": "acquire_legacy_inner",
+      "function": "acquire_bootstrap_inner",
       "operation": "method::create_dir",
       "count": 1,
       "classification": "owner",
       "issue": "OPT-2349",
-      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "reason": "Closed original Current or Legacy source proof revalidates before this exact shared bootstrap effect. Current holds its original SourceEffectPermit across native work with descriptor validation outside the gate mutex; Legacy preserves its frozen pre-lease seal. Exact refused-prefix backing remains on the original charged worker. No ordinary grant, retry/refund or physical qualification is supplied.",
       "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
     },
     {
@@ -812,6 +812,106 @@
       "issue": "OPT-1636",
       "reason": "Application diagnostic log creation/rotation/pruning, separate from source media and durable operation completion.",
       "retirement": "Remove with logging implementation; changing its namespace or caller requires explicit review."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_lost_reply_replay_and_shutdown_retain_dirty_backing_and_debit",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_lost_reply_replay_and_shutdown_retain_dirty_backing_and_debit",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_lost_reply_replay_and_shutdown_retain_dirty_backing_and_debit",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_panic_closes_native_capsule_before_releasing_metadata_credit",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_panic_closes_native_capsule_before_releasing_metadata_credit",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_panic_closes_native_capsule_before_releasing_metadata_credit",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_registry_carrier_bound_refuses_before_confirmation_and_releases_real_pool",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable genuine profile Store/Source fixture validates the actual Current actor entry-point refusal at the original pool-derived metadata carrier bound. Original pool permits remain funded through real runtime teardown; confirmation remains unspent and no source reserve or physical authority is created.",
+      "retirement": "Remove this exact row with its named metadata carrier test; never reuse fixture Store ownership or pool-only permits as physical qualification."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_native_fault_tests.rs",
+      "function": "native_case",
+      "operation": "fs::create_dir",
+      "count": 3,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only ignored native-resource harness creates dedicated Source subdirectories and starts the genuine original journal owner, including a prior clean retirement where required. Positive cases require an isolated ordinary macOS account and physically distinct APFS volume. Pause/inspection hooks supply no physical qualification, retry, permit, or settlement authority; dirty profile and Source paths are preserved.",
+      "retirement": "Remove this exact row when native_case or its named call is removed; never reuse its private fixture hooks in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_native_fault_tests.rs",
+      "function": "native_case",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only ignored native-resource harness creates dedicated Source subdirectories and starts the genuine original journal owner, including a prior clean retirement where required. Positive cases require an isolated ordinary macOS account and physically distinct APFS volume. Pause/inspection hooks supply no physical qualification, retry, permit, or settlement authority; dirty profile and Source paths are preserved.",
+      "retirement": "Remove this exact row when native_case or its named call is removed; never reuse its private fixture hooks in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_native_fault_tests.rs",
+      "function": "native_case",
+      "operation": "journal::start",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only ignored native-resource harness creates dedicated Source subdirectories and starts the genuine original journal owner, including a prior clean retirement where required. Positive cases require an isolated ordinary macOS account and physically distinct APFS volume. Pause/inspection hooks supply no physical qualification, retry, permit, or settlement authority; dirty profile and Source paths are preserved.",
+      "retirement": "Remove this exact row when native_case or its named call is removed; never reuse its private fixture hooks in production."
     }
   ]
 }

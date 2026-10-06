@@ -150,6 +150,21 @@ pub(crate) struct ProfileChildLease {
     identity: String,
 }
 
+impl ProfileChildLease {
+    /// Immutable identity backing retained by this lease and its original registry entry.
+    /// The shared, mutable registry allocation is owned by the profile and is not counted here.
+    pub(crate) fn current_metadata_bytes(&self) -> Option<usize> {
+        let registry = self.registry.lock().ok()?;
+        let entry = registry.get(&self.identity)?;
+        if self.identity.capacity() > 256 || entry.capacity() > 256 {
+            return None;
+        }
+        std::mem::size_of::<(usize, usize, Self)>()
+            .checked_add(self.identity.capacity())?
+            .checked_add(entry.capacity())
+    }
+}
+
 impl Drop for ProfileChildLease {
     fn drop(&mut self) {
         let mut registry = self
@@ -513,6 +528,14 @@ impl LegacyAppRootBacking {
 pub(crate) fn open_legacy_canonical_app_root(
     proof: &crate::sample_sources::db::LegacyReserveUseProof<'_>,
 ) -> Result<(PathBuf, Dir), LegacyAppRootBacking> {
+    open_source_canonical_app_root(&crate::operation_journal::ReserveBootstrapUseProof::Legacy(
+        proof,
+    ))
+}
+
+pub(crate) fn open_source_canonical_app_root(
+    proof: &crate::operation_journal::ReserveBootstrapUseProof<'_, '_>,
+) -> Result<(PathBuf, Dir), LegacyAppRootBacking> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = proof;
@@ -548,7 +571,7 @@ pub(crate) fn open_legacy_canonical_app_root(
             let app = match parent.open_dir_nofollow(super::APP_DIR_NAME) {
                 Ok(app) => app,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    proof.validate_for_bootstrap().map_err(|_| ())?;
+                    let effect = proof.begin_effect()?;
                     parent
                         .create_dir(super::APP_DIR_NAME)
                         .or_else(|e| {
@@ -564,8 +587,10 @@ pub(crate) fn open_legacy_canonical_app_root(
                         .open_dir_nofollow(super::APP_DIR_NAME)
                         .map_err(|_| ())?;
                     backing.child = Some(app);
-                    proof.validate_for_bootstrap().map_err(|_| ())?;
+                    drop(effect);
+                    let effect = proof.begin_effect()?;
                     sync_directory(parent, &support_path).map_err(|_| ())?;
+                    drop(effect);
                     backing.child.take().unwrap()
                 }
                 Err(_) => return Err(()),

@@ -83,6 +83,22 @@ pub(crate) struct DatabaseFileBinding {
 }
 
 impl DatabaseFileBinding {
+    pub(crate) fn current_metadata_bytes(&self) -> Option<usize> {
+        let mut bytes = std::mem::size_of::<(usize, usize, Self)>()
+            .checked_add(2 * std::mem::size_of::<usize>())?
+            .checked_add(self.root.current_metadata_bytes()?)?;
+        for path in [&self.name, &self.path] {
+            if path.capacity() > 8192 || path.as_os_str().as_encoded_bytes().len() > 4096 {
+                return None;
+            }
+            bytes = bytes.checked_add(path.capacity())?;
+        }
+        if self.identity.capacity() > 256 {
+            return None;
+        }
+        bytes.checked_add(self.identity.capacity())
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }

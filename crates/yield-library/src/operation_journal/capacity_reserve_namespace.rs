@@ -26,7 +26,9 @@ use super::capacity_reserve::{
 };
 use super::reserve_telemetry::{ReserveAttempt, observe};
 
+mod current;
 mod legacy;
+pub(super) use current::create_owned_current_reserve;
 pub(super) use legacy::create_owned_legacy_reserve;
 
 /// Reserved direct child name for the owner-created recovery-reserve namespace.
@@ -356,8 +358,8 @@ pub(crate) struct BoundReserve<'a> {
 /// descriptor and the protected file handle, while [`BoundReserveView`] supplies the short-lived
 /// borrowed view needed for descriptor validation or a recovery command.
 pub(crate) struct OwnedReserveAllocation {
-    root: BoundDatabaseRoot,
     reserve: ProtectedReserve,
+    root: BoundDatabaseRoot,
     observation: ReserveNamespaceObservation,
 }
 
@@ -409,6 +411,11 @@ pub(super) fn test_physical_reserve_proof(
 }
 
 impl BoundReserve<'_> {
+    #[cfg(test)]
+    pub(super) fn file_for_custody_test(&self) -> &File {
+        self.reserve.file()
+    }
+
     pub(super) fn observation(&self) -> &ReserveNamespaceObservation {
         &self.observation
     }
@@ -634,6 +641,23 @@ impl BoundReserve<'_> {
     }
 }
 
+/// Logical custody fixture only; its observation cannot qualify a native reserve or owner.
+#[cfg(all(test, unix))]
+pub(super) fn unqualified_current_bound_fixture<'a>(
+    root: &'a BoundDatabaseRoot,
+    profile: &'a WritableProfileGuard,
+    file: File,
+) -> BoundReserve<'a> {
+    let reserve = super::capacity_reserve::test_fixture_reserve(file);
+    let observation = ReserveNamespaceObservation::from_reserve(root.identity(), &reserve).unwrap();
+    BoundReserve {
+        _root: root,
+        _profile_guard: profile,
+        reserve,
+        observation,
+    }
+}
+
 /// Parent root and named original lock observations, without guard/lock/child ownership.
 #[allow(dead_code)]
 pub(super) struct ReadonlyProfileScope {
@@ -713,6 +737,11 @@ impl ReadonlyReserveNamespace {
 }
 
 impl OwnedReserveAllocation {
+    #[cfg(test)]
+    pub(super) fn file_for_custody_test(&self) -> &File {
+        self.reserve.file()
+    }
+
     pub(super) fn legacy_metadata_bytes(&self) -> Option<usize> {
         let root = self.root.legacy_metadata_bytes()?;
         let identity = self.reserve.observation().identity.capacity();

@@ -17,6 +17,11 @@ use historical_reply::HistoricalReply;
 mod queue_metrics;
 pub use queue_metrics::{JournalQueueClassMetrics, JournalQueueMetricsSnapshot};
 use queue_metrics::{QueueMetrics, QueueTicket};
+#[cfg(all(test, unix))]
+mod current_source_custody_tests;
+mod current_source_metadata;
+#[cfg(all(test, unix))]
+mod current_source_native_fault_tests;
 mod legacy_adoption_custody;
 mod legacy_adoption_volumes;
 mod recording_binding;
@@ -1077,13 +1082,22 @@ fn record_owner_runtime_drop_observation(
 }
 
 struct SourceVolumeBinding {
+    _current_reserve_failure: super::store::LegacyReserveFailureSink,
     #[allow(dead_code)]
     reserve: Option<OwnedReserveAllocation>,
     #[allow(dead_code)]
     owner: Option<VolumeOwnershipCapability>,
+    _current_volume_failure: super::capacity_volume_owner::LegacyVolumeFailureBacking,
+    #[cfg(all(test, unix))]
+    _current_before_root_drop: Option<current_source_custody_tests::BeforeRootDrop>,
+    // Original selected source ancestor closes after all native children and ownership backing.
+    _current_root: Option<crate::sample_sources::db::BoundDatabaseRoot>,
+    #[cfg(all(test, unix))]
+    _current_after_root_drop: Option<current_source_custody_tests::AfterRootDrop>,
     allocation_unit: Option<u64>,
     readiness: SourceVolumeBindingReadiness,
     registrations: BTreeSet<crate::sample_sources::db::SourceRegistrationId>,
+    _current_input: Option<current_source_metadata::CurrentInput>,
 }
 
 /// Owner-thread identity for one durable Issued chunk. The permit returned to a caller is not a
@@ -1579,6 +1593,7 @@ struct SourceAuthorityRecord {
     receipt: SourceAuthorityRegistrationReceipt,
     drain_marker: Option<SourceAuthorityDrainMarker>,
     readiness: SourceRegistrationReadiness,
+    _current_input: Option<current_source_metadata::CurrentInput>,
 }
 
 struct RetiredSourceAuthorityRecord {
@@ -1587,6 +1602,7 @@ struct RetiredSourceAuthorityRecord {
     database_file_identity: String,
     lease_identity: crate::sample_sources::db::SourceLeaseIdentity,
     receipt: SourceAuthorityRegistrationReceipt,
+    _current_input: Option<current_source_metadata::CurrentInput>,
 }
 
 impl RetiredSourceAuthorityRecord {
@@ -1750,6 +1766,7 @@ struct OwnerRuntime {
     reserve: Option<OwnedReserveAllocation>,
     volume_owner: Option<VolumeOwnershipCapability>,
     final_profile_guard: Option<WritableProfileGuard>,
+    source_registry_credits: Vec<current_source_metadata::CurrentInput>,
     source_volumes: BTreeMap<VolumeIdentity, SourceVolumeBinding>,
     source_registrations:
         HashMap<crate::sample_sources::db::SourceRegistrationId, SourceAuthorityRecord>,
@@ -1793,6 +1810,7 @@ impl OwnerRuntime {
             reserve: None,
             volume_owner: None,
             final_profile_guard: Some(final_profile_guard),
+            source_registry_credits: Vec::new(),
             source_volumes: BTreeMap::new(),
             source_registrations: HashMap::new(),
             retired_source_registrations: HashMap::new(),
@@ -3150,8 +3168,37 @@ impl OwnerRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     fn register_source_authority(
         &mut self,
+        input: SourceAuthorityRegistrationRequest,
+    ) -> Result<SourceAuthorityRegistrationReceipt, OperationJournalOwnerError> {
+        self.register_source_authority_funded(None, input)
+    }
+
+    fn validate_current_registry_credit(
+        &self,
+        credit: Option<&current_source_metadata::CurrentInput>,
+    ) -> Result<(), OperationJournalOwnerError> {
+        let Some(credit) = credit else {
+            return Ok(());
+        };
+        if credit.class != InputClass::Ordinary
+            || credit.publication
+            || credit.bytes < current_source_metadata::MIN_RETAINED_CURRENT_BYTES
+            || self.source_registry_credits.len() >= current_source_metadata::MAX_CURRENT_CREDITS
+        {
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: "original Current registry metadata credit is unavailable".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn register_source_authority_funded(
+        &mut self,
+        // Parameters drop in reverse order: the original request/confirmation must drop first.
+        current_input: Option<current_source_metadata::CurrentInput>,
         input: SourceAuthorityRegistrationRequest,
     ) -> Result<SourceAuthorityRegistrationReceipt, OperationJournalOwnerError> {
         let request = input.request;
@@ -3205,6 +3252,8 @@ impl OwnerRuntime {
                 reason: String::from("source authority carrier retention limit reached"),
             });
         }
+
+        self.validate_current_registry_credit(current_input.as_ref())?;
 
         let profile_guard = self
             .final_profile_guard
@@ -3330,13 +3379,16 @@ impl OwnerRuntime {
                     })?;
                 }
             }
-            work.push((facts.identity, descriptor, root));
+            work.push((facts.identity, root));
         }
 
         // Consume the source-owner proof before acquiring a lock, creating a reserve, or
         // persisting a binding. Every later physical effect revalidates this same deadline-bound
         // proof and converts it to a drain marker on partial failure.
         let mut proof = Some(request.accept_confirmation(input.confirmation)?);
+        if let Some(credit) = current_input.as_ref() {
+            self.source_registry_credits.push(credit.clone());
+        }
         let volume_identities = volume_ids.iter().cloned().collect::<Vec<_>>();
         let receipt = SourceAuthorityRegistrationReceipt::new(
             registration_id,
@@ -3350,9 +3402,17 @@ impl OwnerRuntime {
                 .or_insert_with(|| SourceVolumeBinding {
                     reserve: None,
                     owner: None,
+                    #[cfg(all(test, unix))]
+                    _current_before_root_drop: None,
+                    _current_root: None,
+                    #[cfg(all(test, unix))]
+                    _current_after_root_drop: None,
+                    _current_volume_failure: Default::default(),
+                    _current_reserve_failure: Default::default(),
                     allocation_unit: None,
                     readiness: SourceVolumeBindingReadiness::Incomplete,
                     registrations: BTreeSet::new(),
+                    _current_input: current_input.clone(),
                 });
             binding.allocation_unit = allocation_units.get(volume).copied();
             if *volume == profile_volume_id {
@@ -3369,10 +3429,37 @@ impl OwnerRuntime {
                 receipt: receipt.clone(),
                 drain_marker: None,
                 readiness: SourceRegistrationReadiness::Registering,
+                _current_input: current_input.clone(),
             },
         );
 
-        for (volume, descriptor, root) in work {
+        for (volume, root) in work {
+            let scope = match request.reserve_use(
+                root,
+                proof
+                    .as_ref()
+                    .expect("registration proof remains until installation completes"),
+                &profile_guard,
+            ) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    return self.retain_source_recovery(
+                        registration_id,
+                        "volume-ownership-scope",
+                        error.to_string(),
+                        proof.take(),
+                    );
+                }
+            };
+            if let Err(error) = super::capacity_volume_owner::validate_current_source_scope(&scope)
+            {
+                return self.retain_source_recovery(
+                    registration_id,
+                    "volume-ownership-native-scope",
+                    error.to_string(),
+                    proof.take(),
+                );
+            }
             if volume == profile_volume_id
                 || self.source_volumes.get(&volume).is_some_and(|binding| {
                     binding.readiness == SourceVolumeBindingReadiness::Complete
@@ -3394,21 +3481,50 @@ impl OwnerRuntime {
                     proof.take(),
                 );
             }
-            let owner =
-                match super::capacity_volume_owner::acquire_for_descriptor_after_clean_handoff(
-                    &descriptor,
-                    &profile_guard,
-                ) {
-                    Ok(owner) => owner,
-                    Err(error) => {
-                        return self.retain_source_recovery(
-                            registration_id,
-                            "volume-ownership",
-                            error.to_string(),
-                            proof.take(),
-                        );
-                    }
-                };
+            let original_root = match root.try_clone_for_owned_capability() {
+                Ok(root) => root,
+                Err(error) => {
+                    return self.retain_source_recovery(
+                        registration_id,
+                        "volume-ancestor-retention",
+                        error.to_string(),
+                        proof.take(),
+                    );
+                }
+            };
+            self.source_volumes
+                .get_mut(&volume)
+                .expect("source volume placeholder was inserted")
+                ._current_root = Some(original_root);
+            // The readonly clone must not extend the original confirmation deadline.
+            if let Err(error) = scope.validate_for_bootstrap() {
+                return self.retain_source_recovery(
+                    registration_id,
+                    "after-volume-ancestor-retention",
+                    error.to_string(),
+                    proof.take(),
+                );
+            }
+            let owner = match super::capacity_volume_owner::acquire_current_for_scope(
+                &scope,
+                &mut self
+                    .source_volumes
+                    .get_mut(&volume)
+                    .expect("source volume placeholder was inserted")
+                    ._current_volume_failure,
+            ) {
+                Ok(owner) => owner,
+                Err(()) => {
+                    return self.retain_source_recovery(
+                        registration_id,
+                        "volume-ownership",
+                        String::from(
+                            "original source volume acquisition retained affected native backing",
+                        ),
+                        proof.take(),
+                    );
+                }
+            };
             self.source_volumes
                 .get_mut(&volume)
                 .expect("source volume placeholder was inserted")
@@ -3442,14 +3558,15 @@ impl OwnerRuntime {
                     );
                 }
             };
-            match self.store().acquire_owned_source_reserve(
-                owner,
-                root,
-                &profile_guard,
-                proof
-                    .as_ref()
-                    .expect("registration proof remains until installation completes"),
-            ) {
+            let reserve_failure = &self
+                .source_volumes
+                .get(&volume)
+                .expect("source volume placeholder was inserted")
+                ._current_reserve_failure;
+            match self
+                .store()
+                .acquire_owned_current_reserve(owner, &scope, reserve_failure)
+            {
                 Ok(reserve) => {
                     let binding = self
                         .source_volumes
@@ -3457,6 +3574,19 @@ impl OwnerRuntime {
                         .expect("source volume placeholder was inserted");
                     binding.reserve = Some(reserve);
                     binding.readiness = SourceVolumeBindingReadiness::Complete;
+                    #[cfg(all(test, unix))]
+                    if self.store().current_reopen_fixture() {
+                        if let Err(reason) =
+                            self.current_same_generation_reopen_for_test(&volume, &scope)
+                        {
+                            return self.retain_source_recovery(
+                                registration_id,
+                                "test-only-existing-current-reopen",
+                                reason,
+                                proof.take(),
+                            );
+                        }
+                    }
                 }
                 Err(SourceReserveBindingFailure {
                     error,
@@ -3494,13 +3624,22 @@ impl OwnerRuntime {
         &mut self,
         registration_id: crate::sample_sources::db::SourceRegistrationId,
         stage: &'static str,
-        reason: String,
+        mut reason: String,
         proof: Option<crate::sample_sources::db::SourceAuthorityUseProof>,
     ) -> Result<SourceAuthorityRegistrationReceipt, OperationJournalOwnerError> {
         let record = self
             .source_registrations
             .get_mut(&registration_id)
             .expect("source registration placeholder was inserted");
+        // Persist at most 512 UTF-8 bytes; native diagnostics are not a retained input channel.
+        if reason.len() > 512 {
+            let mut end = 512;
+            while !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            reason.truncate(end);
+        }
+        let reason = reason.as_str().to_owned();
         record.drain_marker = proof.map(|proof| proof.into_drain_marker());
         record.metadata_registration.revoke();
         record.readiness = SourceRegistrationReadiness::RecoveryRequired {
@@ -3680,6 +3819,7 @@ impl OwnerRuntime {
                 database_file_identity: record.request.database_file_identity().to_owned(),
                 lease_identity: record.request.lease_identity().clone(),
                 receipt: receipt.clone(),
+                _current_input: record._current_input.clone(),
             },
         );
         Ok(())
@@ -4277,11 +4417,20 @@ impl Drop for OwnerRuntime {
         // Source registrations retain non-Send authority guards and external reserve/volume
         // bindings. Release these maps before the journal/profile core so a global shutdown is
         // visibly conservative and never mistaken for a successful per-source retirement.
-        self.source_registrations.clear();
-        self.retired_source_registrations.clear();
+        drop(std::mem::take(&mut self.source_volumes));
+        // HashMap.clear would retain bucket allocations. Destroy all registry nodes before
+        // the original credits that paid them, including during real worker unwind.
+        drop(std::mem::take(&mut self.source_registrations));
+        drop(std::mem::take(&mut self.retired_source_registrations));
+        let mut credit_heap = std::mem::take(&mut self.source_registry_credits).into_iter();
+        let current_registry_credits: [Option<current_source_metadata::CurrentInput>;
+            current_source_metadata::MAX_CURRENT_CREDITS] =
+            std::array::from_fn(|_| credit_heap.next());
+        // The bound is checked before every actual retention; free the keeper heap first.
+        drop(credit_heap);
+        drop(current_registry_credits);
         self.issued_chunk_tickets.clear();
         self.pending_chunk_releases.clear();
-        drop(std::mem::take(&mut self.source_volumes));
         // Keep this order explicit. The reserve root/descriptor must go first, then SQLite and
         // its profile-child lease, then the cross-process volume lock, and finally the profile
         // guard clone retained solely for this runtime.
@@ -4597,7 +4746,8 @@ impl OperationJournalClient {
         OperationJournalRequest<SourceAuthorityRegistrationReceipt>,
         OperationJournalOwnerQueueError,
     > {
-        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+        let input_bytes = current_source_metadata::input_bytes(&request)?;
+        self.submit(input_bytes, move |input, result| {
             JournalCommand::RegisterSource {
                 request,
                 input,
@@ -5873,6 +6023,30 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<(), OperationJournalOwnerError>>,
     },
+    #[cfg(all(test, unix))]
+    InspectCurrentNativeReserve {
+        volume: VolumeIdentity,
+        input: InputPermit,
+        result: SyncSender<
+            Result<current_source_native_fault_tests::NativeSnapshot, OperationJournalOwnerError>,
+        >,
+    },
+    #[cfg(all(test, unix))]
+    CurrentRefusedPrefix {
+        request: SourceAuthorityRegistrationRequest,
+        app: std::path::PathBuf,
+        panic_after_retention: bool,
+        probe: Option<Arc<Mutex<Option<current_source_custody_tests::Snapshot>>>>,
+        input: InputPermit,
+        result: SyncSender<Result<SourceAuthorityRegistrationReceipt, OperationJournalOwnerError>>,
+    },
+    #[cfg(all(test, unix))]
+    InspectCurrentRefusedPrefix {
+        volume: VolumeIdentity,
+        input: InputPermit,
+        result:
+            SyncSender<Result<current_source_custody_tests::Snapshot, OperationJournalOwnerError>>,
+    },
 
     PrepareRecordingCustody {
         operation: OperationId,
@@ -6405,13 +6579,54 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                 runtime.authenticate_source_registry_metadata(candidate)
             })
         }
+        #[cfg(all(test, unix))]
+        JournalCommand::CurrentRefusedPrefix {
+            request,
+            app,
+            panic_after_retention,
+            probe,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            runtime.current_refused_prefix_for_test(
+                current_source_metadata::CurrentInput::new(input),
+                request,
+                &app,
+                panic_after_retention,
+                probe,
+            )
+        }),
+        #[cfg(all(test, unix))]
+        JournalCommand::InspectCurrentNativeReserve {
+            volume,
+            input,
+            result,
+        } => {
+            let _input = input;
+            execute_store_result(result, move || {
+                runtime.inspect_current_native_reserve(&volume)
+            })
+        }
+        #[cfg(all(test, unix))]
+        JournalCommand::InspectCurrentRefusedPrefix {
+            volume,
+            input,
+            result,
+        } => {
+            let _input = input;
+            execute_store_result(result, move || {
+                runtime.inspect_current_refused_prefix(&volume)
+            })
+        }
         JournalCommand::RegisterSource {
             request,
             input,
             result,
         } => {
-            let _input = input;
-            execute_store_result(result, move || runtime.register_source_authority(request))
+            let input = current_source_metadata::CurrentInput::new(input);
+            execute_store_result(result, move || {
+                runtime.register_source_authority_funded(Some(input), request)
+            })
         }
         JournalCommand::BeginSourceDrain {
             receipt,
@@ -6895,6 +7110,18 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
         JournalCommand::AuthenticateSourceMetadata { result, .. } => {
             let _ = result.send(Err(error));
         }
+        #[cfg(all(test, unix))]
+        JournalCommand::CurrentRefusedPrefix { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        #[cfg(all(test, unix))]
+        JournalCommand::InspectCurrentNativeReserve { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        #[cfg(all(test, unix))]
+        JournalCommand::InspectCurrentRefusedPrefix { result, .. } => {
+            let _ = result.send(Err(error));
+        }
         JournalCommand::RegisterSource { result, .. } => {
             let _ = result.send(Err(error));
         }
@@ -7129,7 +7356,7 @@ mod tests {
         (fixture, owner)
     }
 
-    fn wait_until_available(owner: &OperationJournalOwner) {
+    pub(super) fn wait_until_available(owner: &OperationJournalOwner) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             match owner.status() {
@@ -7143,6 +7370,103 @@ mod tests {
                 _ => thread::sleep(Duration::from_millis(5)),
             }
         }
+    }
+
+    #[test]
+    fn current_source_registration_busy_preserves_confirmation_and_refusal_releases_debit() {
+        let (fixture, mut owner) = open_owner("current-source-input-custody");
+        let source_root = tempfile::tempdir().expect("source root");
+        let database = crate::sample_sources::SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.owner,
+            "current-input-source",
+        )
+        .expect("source database");
+        let authority = database
+            .prepare_source_authority()
+            .expect("original authority");
+        let request = authority.journal_request().expect("original confirmation");
+        assert!(request.current_metadata_bytes().expect("bounded inventory") > CONTROL_INPUT_BYTES);
+        let original = Arc::clone(&request.request);
+        let confirmation = request.confirmation.clone();
+        let client = owner.client();
+        let ordinary_before = client.shared.input_bytes.lock().expect("budget").remaining[0];
+        let occupied = client
+            .shared
+            .reserve_input(InputClass::Ordinary, ordinary_before)
+            .expect("occupy original ordinary pool");
+        assert!(matches!(client.register_source_authority(request),
+            Err(OperationJournalOwnerQueueError::InputBytesFull { requested, .. })
+                if requested > CONTROL_INPUT_BYTES));
+        // Admission rejected before the one-shot proof was consumed, so the exact original
+        // confirmation is still usable. Consuming it here performs no filesystem effect.
+        drop(occupied);
+        let proof = original
+            .accept_confirmation(confirmation)
+            .expect("Busy left proof unspent");
+        drop(proof);
+        drop(original);
+        drop(authority);
+        drop(database);
+        assert!(owner.shutdown());
+        drop(owner);
+        drop(fixture);
+
+        let (fixture, mut owner) = open_owner("current-source-refusal-debit");
+        let source_root = tempfile::tempdir().expect("source root");
+        let database = crate::sample_sources::SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.owner,
+            "current-refusal-source",
+        )
+        .expect("source database");
+        let authority = database
+            .prepare_source_authority()
+            .expect("original authority");
+        let client = owner.client();
+        let request = authority.journal_request().expect("original confirmation");
+        let original = Arc::clone(&request.request);
+        let confirmation = request.confirmation.clone();
+        let ordinary_before = client.shared.input_bytes.lock().expect("budget").remaining[0];
+        let response = client
+            .register_source_authority(request)
+            .expect("actual queue")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("actual reply");
+        assert!(matches!(
+            response,
+            Err(OperationJournalOwnerError::SourceAuthorityConflict { .. })
+        ));
+        // The result is sent before the registration closure is destroyed. A second real
+        // worker command runs only after that closure has dropped. This test-only control
+        // routing of a readonly point lookup leaves the measured ordinary credit unchanged.
+        let mut barrier = client
+            .submit_control(CONTROL_INPUT_BYTES, |input, result| JournalCommand::Get {
+                operation_id: OperationId::new(),
+                input,
+                result,
+            })
+            .expect("actual worker barrier");
+        assert!(
+            barrier
+                .recv_timeout(Duration::from_secs(2))
+                .expect("barrier reply")
+                .expect("readonly barrier")
+                .is_none()
+        );
+        assert_eq!(
+            client.shared.input_bytes.lock().expect("budget").remaining[0],
+            ordinary_before
+        );
+        drop(
+            original
+                .accept_confirmation(confirmation)
+                .expect("pre-effect refusal left proof unspent"),
+        );
+        drop(original);
+        drop(authority);
+        drop(database);
+        assert!(owner.shutdown());
     }
 
     #[test]
@@ -7352,6 +7676,14 @@ mod tests {
                     runtime.source_volumes.insert(
                         volume.clone(),
                         SourceVolumeBinding {
+                            _current_input: None,
+                            #[cfg(all(test, unix))]
+                            _current_before_root_drop: None,
+                            _current_root: None,
+                            #[cfg(all(test, unix))]
+                            _current_after_root_drop: None,
+                            _current_volume_failure: Default::default(),
+                            _current_reserve_failure: Default::default(),
                             owner: None,
                             reserve: None,
                             allocation_unit: Some(1),
@@ -8024,6 +8356,14 @@ mod tests {
         runtime.source_volumes.insert(
             invalid_volume,
             SourceVolumeBinding {
+                _current_input: None,
+                #[cfg(all(test, unix))]
+                _current_before_root_drop: None,
+                _current_root: None,
+                #[cfg(all(test, unix))]
+                _current_after_root_drop: None,
+                _current_volume_failure: Default::default(),
+                _current_reserve_failure: Default::default(),
                 owner: None,
                 reserve: None,
                 allocation_unit: Some(4096),
@@ -8396,6 +8736,14 @@ mod tests {
         runtime.source_volumes.insert(
             profile_volume,
             SourceVolumeBinding {
+                _current_input: None,
+                #[cfg(all(test, unix))]
+                _current_before_root_drop: None,
+                _current_root: None,
+                #[cfg(all(test, unix))]
+                _current_after_root_drop: None,
+                _current_volume_failure: Default::default(),
+                _current_reserve_failure: Default::default(),
                 owner: None,
                 reserve: None,
                 allocation_unit: Some(facts.allocation_unit),

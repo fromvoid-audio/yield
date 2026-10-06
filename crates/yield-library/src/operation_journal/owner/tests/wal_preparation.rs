@@ -2286,12 +2286,17 @@ mod integration {
         let WalPreparedDatabase::Lease(original_source) = &view.databases()[1] else {
             unreachable!();
         };
-        let retained_credit = budget.used();
+        // Other genuine owners can still change this shared budget. Observe this
+        // nonfinal Arc alias operation atomically; the original view remains held.
+        // No native effect or owner callback runs while this test-only lock is held.
+        let accounting = budget.test_accounting_guard();
+        let retained_credit = *accounting;
         assert!(retained_credit > 0);
         let historical_alias = original_source.clone();
-        assert_eq!(budget.used(), retained_credit);
+        assert_eq!(*accounting, retained_credit);
         drop(historical_alias);
-        assert_eq!(budget.used(), retained_credit);
+        assert_eq!(*accounting, retained_credit);
+        drop(accounting);
         let source_policy = original_source
             .original_binding()
             .retirement_forward_policy();

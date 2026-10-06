@@ -179,7 +179,24 @@ pub(super) fn read(
             ),
             params![volume.device.to_string()],
             |row| {
-                Ok((
+                // Validate ALL dynamic fields while borrowed from this original statement.
+                // A corrupt large later field must not make us copy an earlier large field.
+                for (index, maximum, field) in [
+                    (0, 20, "volume identity"),
+                    (1, MAX_IDENTITY_BYTES, "profile identity"),
+                    (2, MAX_IDENTITY_BYTES, "root identity"),
+                    (3, MAX_IDENTITY_BYTES, "file identity"),
+                    (7, RESERVE_FILE_NAME.len(), "namespace name"),
+                ] {
+                    if let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(index)? {
+                        if bytes.is_empty() || bytes.len() > maximum {
+                            return Ok(Err(ReserveBindingError::Corrupt(format!(
+                                "{field} is outside its bounded size"
+                            ))));
+                        }
+                    }
+                }
+                Ok(Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
@@ -189,10 +206,11 @@ pub(super) fn read(
                     row.get::<_, i64>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, i64>(8)?,
-                ))
+                )))
             },
         )
-        .optional()?;
+        .optional()?
+        .transpose()?;
     let Some((
         volume_device,
         profile_identity,

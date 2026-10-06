@@ -24,8 +24,10 @@ use uuid::Uuid;
 use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
 use crate::durable_capacity::VolumeIdentity;
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
+use crate::sample_sources::db::BoundDatabaseRoot;
+#[cfg(all(test, target_os = "macos"))]
+use crate::sample_sources::db::SourceAuthorityUseProof;
 use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
-use crate::sample_sources::db::{BoundDatabaseRoot, SourceAuthorityUseProof};
 
 use super::admission_claims::{
     AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimValidationError,
@@ -82,6 +84,7 @@ mod full_progress;
 #[cfg(test)]
 pub(crate) mod source_layout_tests;
 pub(crate) use frozen_copy::FrozenCopyData;
+pub(super) mod current_reserve_custody;
 mod database_attempt_metadata;
 mod database_attempts;
 #[allow(dead_code)] // Genuine preparation/latch consumer is OPT-2136; rows confer no authority.
@@ -90,6 +93,9 @@ mod database_claims;
 mod ordinary_claims;
 mod recovery_reserve;
 mod recovery_reserve_binding;
+use current_reserve_custody::{BoundCustody, OwnedCustody};
+#[cfg(test)]
+use current_reserve_custody::{CurrentReserveBoundary, CurrentReserveHook};
 mod staging_checkpoints;
 pub(crate) use chunk_claims::{
     ChunkClaimRecord, ChunkClaimRequest, ChunkClaimState, ChunkId, ChunkIssueReceipt,
@@ -1000,6 +1006,10 @@ pub struct OperationJournalStore {
     #[cfg(test)]
     recording_readback_corruption: std::sync::Mutex<Option<uuid::Uuid>>,
     #[cfg(test)]
+    current_reserve_test_hook: std::sync::Mutex<Option<CurrentReserveHook>>,
+    #[cfg(all(test, unix))]
+    current_reopen_fixture: std::cell::Cell<bool>,
+    #[cfg(test)]
     insert_test_hook:
         std::sync::Mutex<Option<Box<dyn FnMut(InsertTestBoundary) -> InsertTestDirective + Send>>>,
     #[cfg(test)]
@@ -1063,10 +1073,22 @@ pub(crate) enum RecoveryReserveContextError {
 
 // Closed original bootstrap capabilities. Existing current-lease gates remain unchanged.
 #[derive(Default)]
-struct LegacyReserveFailureSink {
+pub(super) struct LegacyReserveFailureSink {
     namespace:
         std::cell::RefCell<Option<super::capacity_reserve_namespace::LegacyReserveFailureBacking>>,
     reserve: std::cell::RefCell<Option<OwnedReserveAllocation>>,
+}
+#[cfg(all(test, unix))]
+impl LegacyReserveFailureSink {
+    pub(super) fn opened_reserve_for_test(
+        &self,
+    ) -> std::cell::Ref<'_, Option<OwnedReserveAllocation>> {
+        self.reserve.borrow()
+    }
+    pub(super) fn retain_opened_for_test(&self, reserve: OwnedReserveAllocation) {
+        assert!(self.reserve.borrow().is_none());
+        *self.reserve.borrow_mut() = Some(reserve);
+    }
 }
 pub(super) struct LegacyReserveBindingFailure {
     pub(super) original: SourceReserveBindingFailure,
@@ -1074,7 +1096,12 @@ pub(super) struct LegacyReserveBindingFailure {
     pub(super) reopened_reserve: Option<OwnedReserveAllocation>,
 }
 enum ReserveBootstrapProof<'a, 'b> {
+    #[cfg(all(test, target_os = "macos"))]
     Current(&'a SourceAuthorityUseProof),
+    ScopedCurrent {
+        source: &'a crate::sample_sources::db::CurrentReserveUseProof<'b>,
+        failure: &'a LegacyReserveFailureSink,
+    },
     Legacy {
         source: &'a crate::sample_sources::db::LegacyReserveUseProof<'b>,
         failure: &'a LegacyReserveFailureSink,
@@ -1083,9 +1110,29 @@ enum ReserveBootstrapProof<'a, 'b> {
 impl ReserveBootstrapProof<'_, '_> {
     fn validate_for_physical_use(&self) -> Result<(), String> {
         match self {
+            #[cfg(all(test, target_os = "macos"))]
             Self::Current(proof) => proof.validate_for_physical_use().map_err(|e| e.to_string()),
+            Self::ScopedCurrent { source, .. } => source
+                .validate_root_for_bootstrap(source.root())
+                .map_err(|e| e.to_string()),
             Self::Legacy { source, .. } => {
                 source.validate_for_bootstrap().map_err(|e| e.to_string())
+            }
+        }
+    }
+    fn begin_effect(
+        &self,
+    ) -> Result<Option<crate::sample_sources::db::SourceEffectPermit>, RecoveryReserveContextError>
+    {
+        match self {
+            Self::ScopedCurrent { source, .. } => source
+                .begin_bootstrap_effect()
+                .map(Some)
+                .map_err(|e| RecoveryReserveContextError::Reserve(e.to_string())),
+            _ => {
+                self.validate_for_physical_use()
+                    .map_err(RecoveryReserveContextError::Reserve)?;
+                Ok(None)
             }
         }
     }
@@ -1094,25 +1141,33 @@ impl ReserveBootstrapProof<'_, '_> {
         error: super::capacity_reserve_namespace::ReserveNamespaceFailure,
     ) -> RecoveryReserveContextError {
         let text = match self {
-            Self::Legacy { failure, .. } => {
+            Self::Legacy { failure, .. } | Self::ScopedCurrent { failure, .. } => {
                 let text = format!(
-                    "legacy reserve failure at {:?}; exact backing retained",
+                    "source reserve failure at {:?}; exact backing retained",
                     error.stage()
                 );
                 *failure.namespace.borrow_mut() = Some(error.into_legacy_backing());
                 text
             }
+            #[cfg(all(test, target_os = "macos"))]
             Self::Current(_) => error.to_string(),
         };
         RecoveryReserveContextError::Reserve(text)
     }
+    fn failure_sink(&self) -> Option<&LegacyReserveFailureSink> {
+        match self {
+            Self::Legacy { failure, .. } | Self::ScopedCurrent { failure, .. } => Some(failure),
+            #[cfg(all(test, target_os = "macos"))]
+            Self::Current(_) => None,
+        }
+    }
     fn retain_reopened(&self, reserve: OwnedReserveAllocation) {
-        if let Self::Legacy { failure, .. } = self {
+        if let Some(failure) = self.failure_sink() {
             *failure.reserve.borrow_mut() = Some(reserve);
         }
     }
     fn retain_bound(&self, reserve: super::capacity_reserve_namespace::BoundReserve<'_>) {
-        if !matches!(self, Self::Legacy { .. }) {
+        if self.failure_sink().is_none() {
             return;
         }
         match reserve.into_owned() {
@@ -1131,8 +1186,14 @@ impl ReserveBootstrapProof<'_, '_> {
         super::capacity_reserve_namespace::ReserveNamespaceFailure,
     > {
         match self {
+            #[cfg(all(test, target_os = "macos"))]
             Self::Current(_) => {
                 super::capacity_reserve_namespace::create_owned_reserve(root, profile)
+            }
+            Self::ScopedCurrent { source, .. } => {
+                super::capacity_reserve_namespace::create_owned_current_reserve(
+                    root, profile, source,
+                )
             }
             Self::Legacy { source, .. } => {
                 super::capacity_reserve_namespace::create_owned_legacy_reserve(
@@ -1148,8 +1209,8 @@ impl ReserveBootstrapProof<'_, '_> {
 /// registration state instead of dropping a lock or reserve after an ambiguous write boundary.
 pub(crate) struct SourceReserveBindingFailure {
     pub(crate) error: RecoveryReserveContextError,
-    pub(crate) volume_owner: VolumeOwnershipCapability,
     pub(crate) reserve: Option<OwnedReserveAllocation>,
+    pub(crate) volume_owner: VolumeOwnershipCapability,
 }
 
 #[cfg(target_os = "macos")]
@@ -2758,6 +2819,61 @@ impl OperationJournalStore {
     /// The returned ownership lock and reserve remain paired with the caller. Existing durable
     /// bindings are reopened through the same identity and active-charge checks as journal
     /// startup; a new binding is persisted only after a live reserve proof succeeds.
+    /// Actual Current bootstrap accepts only the privately correlated original descriptor scope.
+    /// Its failure sink is installed in the source-volume actor before any effect.
+    pub(super) fn acquire_owned_current_reserve(
+        &self,
+        volume_owner: VolumeOwnershipCapability,
+        proof: &crate::sample_sources::db::CurrentReserveUseProof<'_>,
+        failure: &LegacyReserveFailureSink,
+    ) -> Result<OwnedReserveAllocation, SourceReserveBindingFailure> {
+        let _custody = match proof.begin_bootstrap_effect() {
+            Ok(custody) => custody,
+            Err(error) => {
+                return Err(SourceReserveBindingFailure {
+                    error: RecoveryReserveContextError::Reserve(error.to_string()),
+                    reserve: None,
+                    volume_owner,
+                });
+            }
+        };
+        let retained_owner = match volume_owner.try_clone_for_context() {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Err(SourceReserveBindingFailure {
+                    error: error.into(),
+                    reserve: None,
+                    volume_owner,
+                });
+            }
+        };
+        let bootstrap = ReserveBootstrapProof::ScopedCurrent {
+            source: proof,
+            failure,
+        };
+        let reserve = OwnedCustody::new(
+            self.acquire_owned_source_reserve_inner(
+                volume_owner,
+                proof.root(),
+                proof.profile(),
+                &bootstrap,
+                &mut None,
+            )?,
+            &bootstrap,
+        );
+        if let Err(error) = proof.validate_root_for_bootstrap(proof.root()) {
+            // The worker still owns the original volume capability; returning this reserve in
+            // the failure transfers its exact opened descriptor into its preinstalled slot.
+            return Err(SourceReserveBindingFailure {
+                error: RecoveryReserveContextError::Reserve(error.to_string()),
+                reserve: Some(reserve.take()),
+                volume_owner: retained_owner,
+            });
+        }
+        Ok(reserve.take())
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn acquire_owned_source_reserve(
         &self,
         volume_owner: VolumeOwnershipCapability,
@@ -2821,6 +2937,50 @@ impl OperationJournalStore {
             namespace: failure.namespace.into_inner(),
             reopened_reserve: failure.reserve.into_inner(),
         })
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn set_current_reopen_fixture(&self) {
+        self.current_reopen_fixture.set(true);
+    }
+    #[cfg(all(test, unix))]
+    pub(super) fn current_reopen_fixture(&self) -> bool {
+        self.current_reopen_fixture.get()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn current_binding_generation_for_test(
+        &self,
+        volume: &VolumeIdentity,
+    ) -> Option<u64> {
+        recovery_reserve_binding::read(&self.connection, volume)
+            .unwrap()
+            .map(|b| b.owner_generation())
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn set_current_reserve_test_hook(
+        &self,
+        hook: impl FnMut(CurrentReserveBoundary, &File) + Send + 'static,
+    ) {
+        *self.current_reserve_test_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn notify_current_reserve_test_boundary(
+        &self,
+        proof: &ReserveBootstrapProof<'_, '_>,
+        boundary: CurrentReserveBoundary,
+        file: &File,
+    ) {
+        if !matches!(proof, ReserveBootstrapProof::ScopedCurrent { .. }) {
+            return;
+        }
+        let hook = self.current_reserve_test_hook.lock().unwrap().take();
+        if let Some(mut hook) = hook {
+            hook(boundary, file);
+            *self.current_reserve_test_hook.lock().unwrap() = Some(hook);
+        }
     }
 
     fn acquire_owned_source_reserve_inner(
@@ -2934,12 +3094,19 @@ impl OperationJournalStore {
                 return Err(fail(proof.namespace_error(error), volume_owner, None));
             }
         };
-        let mut reserve = match reserve.into_owned() {
+        let reserve = match reserve.into_owned() {
             Ok(reserve) => reserve,
             Err(error) => {
                 return Err(fail(proof.namespace_error(error), volume_owner, None));
             }
         };
+        let mut reserve = OwnedCustody::new(reserve, proof);
+        #[cfg(test)]
+        self.notify_current_reserve_test_boundary(
+            proof,
+            CurrentReserveBoundary::Created,
+            reserve.file_for_custody_test(),
+        );
         if let Some(hook) = after_reserve.as_mut() {
             hook();
         }
@@ -2948,17 +3115,17 @@ impl OperationJournalStore {
             .revalidate_and_prove()
             .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))
         {
-            return Err(fail(error, volume_owner, Some(reserve)));
+            return Err(fail(error, volume_owner, Some(reserve.take())));
         }
         if let Err(error) = self.validate_namespace() {
             return Err(fail(
                 RecoveryReserveContextError::Store(error),
                 volume_owner,
-                Some(reserve),
+                Some(reserve.take()),
             ));
         }
         if let Err(error) = volume_owner.revalidate() {
-            return Err(fail(error.into(), volume_owner, Some(reserve)));
+            return Err(fail(error.into(), volume_owner, Some(reserve.take())));
         }
         if let Err(error) = validate_proof() {
             return Err(fail(
@@ -2966,7 +3133,7 @@ impl OperationJournalStore {
                     "source authority proof is no longer valid: {error}"
                 )),
                 volume_owner,
-                Some(reserve),
+                Some(reserve.take()),
             ));
         }
         let observation = reserve.observation();
@@ -2979,12 +3146,30 @@ impl OperationJournalStore {
             volume_owner.owner_generation(),
         ) {
             Ok(binding) => binding,
-            Err(error) => return Err(fail(error.into(), volume_owner, Some(reserve))),
+            Err(error) => return Err(fail(error.into(), volume_owner, Some(reserve.take()))),
+        };
+        let effect = match proof.begin_effect() {
+            Ok(effect) => effect,
+            Err(error) => return Err(fail(error, volume_owner, Some(reserve.take()))),
         };
         if let Err(error) = recovery_reserve_binding::persist(&self.connection, &binding) {
-            return Err(fail(error.into(), volume_owner, Some(reserve)));
+            return Err(fail(error.into(), volume_owner, Some(reserve.take())));
         }
-        Ok(reserve)
+        drop(effect);
+        #[cfg(test)]
+        self.notify_current_reserve_test_boundary(
+            proof,
+            CurrentReserveBoundary::CreatedBound,
+            reserve.file_for_custody_test(),
+        );
+        if let Err(error) = validate_proof() {
+            return Err(fail(
+                RecoveryReserveContextError::Reserve(error),
+                volume_owner,
+                Some(reserve.take()),
+            ));
+        }
+        Ok(reserve.take())
     }
 
     fn rebind_clean_source_reserve(
@@ -3025,12 +3210,20 @@ impl OperationJournalStore {
                 binding.allocation_unit(),
             )
             .map_err(|reason| RecoveryReserveContextError::Reserve(reason.into()))?;
+        let effect = proof.begin_effect()?;
         let reserve =
             super::capacity_reserve_namespace::reopen_owned_reserve(root, profile_guard, &expected)
                 .map_err(|error| proof.namespace_error(error))?;
-        let mut reserve = reserve
+        let reserve = reserve
             .into_owned()
             .map_err(|error| proof.namespace_error(error))?;
+        let mut reserve = OwnedCustody::new(reserve, proof);
+        #[cfg(test)]
+        self.notify_current_reserve_test_boundary(
+            proof,
+            CurrentReserveBoundary::CleanRebindOpened,
+            reserve.file_for_custody_test(),
+        );
         let result = (|| -> Result<(), RecoveryReserveContextError> {
             let physical = reserve
                 .view(profile_guard)
@@ -3048,19 +3241,30 @@ impl OperationJournalStore {
                 .validate_for_physical_use()
                 .map_err(|error| RecoveryReserveContextError::Reserve(error))?;
             volume_owner.revalidate()?;
+            let sql_effect = proof.begin_effect()?;
             recovery_reserve_binding::rebind_owner_generation(
                 &self.connection,
                 &binding,
                 volume_owner.owner_generation(),
             )?;
+            drop(sql_effect);
+            #[cfg(test)]
+            self.notify_current_reserve_test_boundary(
+                proof,
+                CurrentReserveBoundary::CleanRebound,
+                reserve.file_for_custody_test(),
+            );
             volume_owner.revalidate()?;
+            proof
+                .validate_for_physical_use()
+                .map_err(RecoveryReserveContextError::Reserve)?;
             Ok(())
         })();
         if let Err(error) = result {
-            proof.retain_reopened(reserve);
             return Err(error);
         }
-        Ok(reserve)
+        drop(effect);
+        Ok(reserve.take())
     }
 
     /// Reopen a previously bound reserve after a crash-like owner restart.
@@ -3156,6 +3360,10 @@ impl OperationJournalStore {
                 binding.allocation_unit(),
             )
             .map_err(|reason| RecoveryReserveContextError::Reserve(reason.into()))?;
+        let _effect = match failure_proof {
+            Some(proof) => proof.begin_effect()?,
+            None => None,
+        };
         let reserve = super::capacity_reserve_namespace::reopen_owned_reserve_partial(
             root,
             profile_guard,
@@ -3166,14 +3374,20 @@ impl OperationJournalStore {
             Some(proof) => proof.namespace_error(error),
             None => RecoveryReserveContextError::Reserve(error.to_string()),
         })?;
+        let reserve = BoundCustody::new(reserve, failure_proof);
+        #[cfg(test)]
+        if let Some(proof) = failure_proof {
+            self.notify_current_reserve_test_boundary(
+                proof,
+                CurrentReserveBoundary::RecoveryReopened,
+                reserve.file_for_custody_test(),
+            );
+        }
         if reserve.profile_identity() != profile_identity
             || reserve.observation().volume() != volume_owner.volume()
             || reserve.observation().file_identity() != binding.file_identity()
             || reserve.observation().allocation_unit() != binding.allocation_unit()
         {
-            if let Some(proof) = failure_proof {
-                proof.retain_bound(reserve);
-            }
             return Err(RecoveryReserveContextError::Binding(
                 recovery_reserve_binding::ReserveBindingError::IdentityMismatch(
                     "reopened reserve descriptor differs from the durable binding".into(),
@@ -3181,15 +3395,17 @@ impl OperationJournalStore {
             ));
         }
         if let Err(error) = volume_owner.revalidate() {
-            if let Some(proof) = failure_proof {
-                proof.retain_bound(reserve);
-            }
             return Err(error.into());
+        }
+        if let Some(proof) = failure_proof {
+            if let Err(error) = proof.validate_for_physical_use() {
+                return Err(RecoveryReserveContextError::Reserve(error));
+            }
         }
         Ok(RecoveryReserveContext {
             store: self,
             volume_owner,
-            reserve,
+            reserve: reserve.take(),
             journal_identity: self.database_identity.clone(),
             profile_identity,
         })
@@ -3529,6 +3745,10 @@ impl OperationJournalStore {
             profile_guard: retained_profile_guard,
             #[cfg(test)]
             recording_readback_corruption: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            current_reserve_test_hook: std::sync::Mutex::new(None),
+            #[cfg(all(test, unix))]
+            current_reopen_fixture: std::cell::Cell::new(false),
             #[cfg(test)]
             insert_test_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -9542,6 +9762,7 @@ impl From<EncodeError> for OperationJournalStoreError {
 #[cfg(test)]
 mod tests {
     include!("store/historical_claim_observation_tests.rs");
+    include!("store/current_reserve_binding_bounds_tests.rs");
     include!("store/database_claims_tests.rs");
     include!("store/recording_retention_tests.rs");
     include!("store/record_materialization_tests.rs");

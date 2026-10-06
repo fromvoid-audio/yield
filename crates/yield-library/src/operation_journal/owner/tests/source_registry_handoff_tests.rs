@@ -65,6 +65,7 @@ mod integration {
         runtime.source_registrations.insert(
             receipt.registration_id,
             SourceAuthorityRecord {
+                _current_input: None,
                 metadata_registration,
                 request,
                 receipt,
@@ -364,6 +365,7 @@ mod integration {
             runtime.retired_source_registrations.insert(
                 crate::sample_sources::db::SourceRegistrationId::model_key_for_tests(n),
                 RetiredSourceAuthorityRecord {
+                    _current_input: None,
                     media_root_identity: input.request.media_root().identity().into(),
                     database_root_identity: input.request.database_root().identity().into(),
                     database_file_identity: input.request.database_file_identity().into(),

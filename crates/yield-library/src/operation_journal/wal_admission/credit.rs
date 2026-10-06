@@ -22,6 +22,10 @@ impl HandshakeBudget {
     pub(crate) fn used(&self) -> usize {
         *self.bytes.lock().unwrap()
     }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn test_accounting_guard(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.bytes.lock().unwrap()
+    }
 }
 /// Private non-Clone debit. Immutable actor replies share the same original credit via Arc.
 #[derive(Debug)]
