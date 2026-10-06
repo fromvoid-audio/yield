@@ -3330,7 +3330,7 @@ impl OwnerRuntime {
                     })?;
                 }
             }
-            work.push((facts.identity, descriptor, root));
+            work.push((facts.identity, root));
         }
 
         // Consume the source-owner proof before acquiring a lock, creating a reserve, or
@@ -3372,7 +3372,24 @@ impl OwnerRuntime {
             },
         );
 
-        for (volume, descriptor, root) in work {
+        for (volume, root) in work {
+            let scope = match request.reserve_use(
+                root,
+                proof
+                    .as_ref()
+                    .expect("registration proof remains until installation completes"),
+                &profile_guard,
+            ) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    return self.retain_source_recovery(
+                        registration_id,
+                        "volume-ownership-scope",
+                        error.to_string(),
+                        proof.take(),
+                    );
+                }
+            };
             if volume == profile_volume_id
                 || self.source_volumes.get(&volume).is_some_and(|binding| {
                     binding.readiness == SourceVolumeBindingReadiness::Complete
@@ -3396,7 +3413,7 @@ impl OwnerRuntime {
             }
             let owner =
                 match super::capacity_volume_owner::acquire_for_descriptor_after_clean_handoff(
-                    &descriptor,
+                    scope.descriptor(),
                     &profile_guard,
                 ) {
                     Ok(owner) => owner,

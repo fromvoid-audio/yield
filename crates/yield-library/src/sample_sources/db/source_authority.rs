@@ -30,6 +30,7 @@ mod registration_generation;
 #[cfg(test)]
 #[path = "source_authority/registration_generation/native_tests.rs"]
 mod registration_generation_native_tests;
+mod reserve_use;
 
 const PREPARED: u8 = 0;
 const REGISTERED: u8 = 1;
@@ -268,6 +269,7 @@ pub enum SourceAuthorityError {
 pub(crate) struct SourceAuthorityRequest {
     registration_id: SourceRegistrationId,
     registration_generation: u64,
+    profile_owner: Uuid,
     lease_identity: SourceLeaseIdentity,
     media_root: BoundDatabaseRoot,
     database_root: BoundDatabaseRoot,
@@ -299,6 +301,7 @@ impl SourceAuthorityRequest {
     fn new(
         registration_id: SourceRegistrationId,
         registration_generation: u64,
+        profile_owner: Uuid,
         lease_identity: SourceLeaseIdentity,
         media_root: BoundDatabaseRoot,
         database_root: BoundDatabaseRoot,
@@ -309,6 +312,7 @@ impl SourceAuthorityRequest {
         Self {
             registration_id,
             registration_generation,
+            profile_owner,
             lease_identity,
             media_root,
             database_root,
@@ -345,6 +349,7 @@ impl SourceAuthorityRequest {
 
     pub(crate) fn matches_registration(&self, other: &Self) -> bool {
         self.registration_id == other.registration_id
+            && self.profile_owner == other.profile_owner
             && self.lease_identity == other.lease_identity
             && self.media_root.identity() == other.media_root.identity()
             && self.database_root.identity() == other.database_root.identity()
@@ -356,6 +361,9 @@ impl SourceAuthorityRequest {
         &self,
         profile_guard: &crate::app_dirs::WritableProfileGuard,
     ) -> Result<(), SourceAuthorityError> {
+        if Uuid::parse_str(profile_guard.owner_identity()).ok() != Some(self.profile_owner) {
+            return Err(SourceAuthorityError::RegistrationMismatch);
+        }
         self.media_root
             .validate_profile_guard(profile_guard)
             .map_err(|error| SourceAuthorityError::Database(SourceDbError::from(error)))?;
@@ -1067,6 +1075,8 @@ impl SourceDatabase {
             .as_ref()
             .ok_or(SourceDbError::ProfileOwnershipRequired)?;
         self.validate_profile_owned_open(profile_guard)?;
+        let profile_owner = Uuid::parse_str(profile_guard.owner_identity())
+            .map_err(|_| SourceAuthorityError::RegistrationMismatch)?;
         let source_lease = self
             .source_lease
             .as_ref()
@@ -1123,6 +1133,7 @@ impl SourceDatabase {
             request: Arc::new(SourceAuthorityRequest::new(
                 registration_id,
                 registration_generation,
+                profile_owner,
                 lease_identity,
                 media_root,
                 database_root,
