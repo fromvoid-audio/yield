@@ -3,7 +3,7 @@ use super::retained_backing::RetainedWeak;
 use super::*;
 use std::sync::{Arc, Mutex};
 
-const MAX_VOLUMES: usize = 32;
+pub(super) const MAX_VOLUMES: usize = 32;
 #[derive(Debug)]
 pub(super) struct ChargeMirror(
     Mutex<State>,

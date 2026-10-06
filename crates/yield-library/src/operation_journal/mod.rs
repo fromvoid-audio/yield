@@ -17,6 +17,8 @@ pub mod capacity_estimator;
 mod capacity_provider;
 #[cfg(any(test, feature = "test-support"))]
 pub use capacity_provider::ProviderReconciliationProbe;
+#[cfg(any(test, feature = "test-support"))]
+pub use capacity_provider::ProviderStartupProbe;
 #[allow(dead_code)]
 mod capacity_reserve;
 #[allow(dead_code)]

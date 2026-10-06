@@ -30,6 +30,8 @@ mod retained_backing;
 pub(crate) use charge_observer::PublicationChargeBinding;
 #[cfg(any(test, feature = "test-support"))]
 pub use funded_reconciliation::ProviderReconciliationProbe;
+#[cfg(any(test, feature = "test-support"))]
+pub use funded_startup::ProviderStartupProbe;
 use retained_backing::{RetainedArc, RetainedRc};
 pub(crate) const PUBLICATION_MIRROR_BYTES: usize = 4096;
 use charge_observer::{ChargeMirror, ChargeMutation, ChargeObserver};
@@ -205,6 +207,21 @@ impl CapacityProvider {
     }
     pub(crate) fn unavailable() -> Self {
         Self::with_qualification(ProviderQualification::Unavailable, None)
+    }
+    #[cfg(test)]
+    pub(crate) fn outstanding_claim_count_for_test(&self) -> usize {
+        self.ledger
+            .borrow()
+            .charges_by_token
+            .values()
+            .map(|entry| {
+                entry
+                    .claims
+                    .values()
+                    .filter(|claim| claim.release_id.is_none())
+                    .count()
+            })
+            .sum()
     }
 
     /// Observe only an actual currently charged original-ledger volume; never native authority.
@@ -1045,6 +1062,11 @@ impl CapacityProvider {
     pub(crate) fn allow_disposition_for_test(&self) {
         self.ledger.borrow_mut().fail_disposition = false;
     }
+}
+
+#[cfg(test)]
+pub(super) fn funded_startup_header_for_test() -> usize {
+    funded_startup::header_bytes()
 }
 
 impl Drop for CapacityProvider {

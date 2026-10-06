@@ -9,7 +9,8 @@ pub(super) fn header_bytes() -> usize {
         + 2 * size_of::<usize>()
         + size_of::<ChargeMirror>()
         + 2 * size_of::<usize>()
-        + 32 * (size_of::<ChargeObserver>() + 2 * size_of::<usize>())
+        // A new observer is allocated before replacing one dead Weak registry slot.
+        + (charge_observer::MAX_VOLUMES + 1) * (size_of::<ChargeObserver>() + 2 * size_of::<usize>())
         + size_of::<super::super::owner::StartupCredit>()
         + 2 * size_of::<usize>()
 }
@@ -151,3 +152,8 @@ impl CapacityProvider {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(any(test, feature = "test-support"))]
+mod allocation_probe;
+#[cfg(any(test, feature = "test-support"))]
+pub use allocation_probe::ProviderStartupProbe;
