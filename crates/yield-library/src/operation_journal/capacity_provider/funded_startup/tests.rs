@@ -1,5 +1,5 @@
 //! Original provider reconstruction and actual strong/explicit Weak custody.
-use super::super::tests::{rebuild_claim, rebuild_snapshot};
+use super::super::tests::{facts, plan_and_claims, rebuild_claim, rebuild_snapshot};
 use super::*;
 
 #[test]
@@ -97,6 +97,86 @@ fn original_strict_header_pressure_refuses_before_provider_allocation() {
         Err(CapacityProviderError::RebuildResourceBound)
     ));
     assert_eq!(input.historical_test_remaining(), header_bytes() - 1);
+    drop(hold);
+    assert_eq!(input.historical_test_remaining(), baseline);
+}
+
+#[test]
+fn actual_lease_observer_and_weak_registry_retain_original_baseline() {
+    let input = InputPermit::historical_test_input(1);
+    let baseline = input.historical_test_remaining();
+    let mut funded = CapacityProvider::unavailable_for_input(&input).unwrap();
+    let volume = VolumeIdentity { device: 41 };
+    let image = rebuild_snapshot(vec![rebuild_claim(
+        OperationId::new(),
+        AdmissionClaimId::new(),
+        volume.clone(),
+        FullCapacityAllocationClass::DestinationStaging,
+        4096,
+        None,
+        false,
+    )]);
+    funded
+        .install_rebuilt_claims_for_input(&image, &input)
+        .unwrap();
+    // Existing qualified-fixture arithmetic only. Added admission graphs are a
+    // separate unfunded component; this case tests its ACTUAL lease alias custody.
+    funded.qualification = ProviderQualification::QualifiedFixture;
+    funded.facts = Some(CapacityFacts::new(
+        [(
+            volume.clone(),
+            facts(41, PROTECTED_FREE_SPACE_FLOOR + 1_000_000, 4096),
+        )]
+        .into(),
+    ));
+    let (plan, claims) = plan_and_claims(&[(
+        volume.clone(),
+        FullCapacityAllocationClass::DestinationStaging,
+        4096,
+        4096,
+    )]);
+    let lease = funded.admit(&plan, &claims).unwrap();
+    let observer = funded.publication_charge_observer(&volume).unwrap();
+    let weak = observer.downgrade();
+    let charged = input.historical_test_remaining();
+    drop(funded);
+    assert!(observer.observation().is_none());
+    assert_eq!(input.historical_test_remaining(), charged);
+    drop(lease);
+    drop(observer);
+    assert!(weak.upgrade().is_none());
+    assert!(input.historical_test_remaining() < baseline);
+    drop(weak);
+    assert_eq!(input.historical_test_remaining(), baseline);
+}
+
+#[test]
+fn original_install_strict_scratch_refusal_preserves_exact_image_and_tokens() {
+    let input = InputPermit::historical_test_input(1);
+    let funded = CapacityProvider::unavailable_for_input(&input).unwrap();
+    let image = rebuild_snapshot(vec![rebuild_claim(
+        OperationId::new(),
+        AdmissionClaimId::new(),
+        VolumeIdentity { device: 71 },
+        FullCapacityAllocationClass::DestinationStaging,
+        4096,
+        None,
+        false,
+    )]);
+    let baseline = input.historical_test_remaining();
+    let debit = scratch_bytes(image.claims(), &funded.ledger.borrow()).unwrap();
+    let hold = input
+        .reserve_historical_scratch(baseline - debit + 1)
+        .unwrap();
+    let original = normalized_ledger_image(&funded.ledger.borrow());
+    let token = funded.ledger.borrow().next_token;
+    assert!(matches!(
+        funded.install_rebuilt_claims_for_input(&image, &input),
+        Err(CapacityProviderError::RebuildResourceBound)
+    ));
+    assert_eq!(normalized_ledger_image(&funded.ledger.borrow()), original);
+    assert_eq!(funded.ledger.borrow().next_token, token);
+    assert_eq!(input.historical_test_remaining(), debit - 1);
     drop(hold);
     assert_eq!(input.historical_test_remaining(), baseline);
 }

@@ -4314,11 +4314,7 @@ impl OwnerRuntime {
                     self.startup_error_credit = Some(
                         input
                             .reserve_historical_scratch(bytes)
-                            .map_err(|_| {
-                                String::from(
-                                    "ordinary startup diagnostic resource envelope exceeded",
-                                )
-                            })?
+                            .map_err(|_| String::from(startup_credit::REFUSAL))?
                             .into_startup_credit(),
                     );
                 }
@@ -4368,11 +4364,7 @@ impl OwnerRuntime {
                     Some(
                         input
                             .reserve_historical_scratch(bytes)
-                            .map_err(|_| {
-                                String::from(
-                                    "ordinary startup readiness resource envelope exceeded",
-                                )
-                            })?
+                            .map_err(|_| String::from(startup_credit::REFUSAL))?
                             .into_startup_credit(),
                     )
                 } else {
@@ -5783,7 +5775,7 @@ struct OwnerShared {
     resource_admission: Arc<ResourceAdmission>,
     commands: Mutex<Option<OwnerCommandSenders>>,
     admission_gate: Mutex<()>,
-    lifecycle: AtomicU8,
+    lifecycle: Arc<AtomicU8>,
     unavailable: Mutex<Option<String>>,
     unavailable_startup_credit: Mutex<Option<StartupCredit>>,
     input_bytes: Arc<Mutex<InputBudget>>,
@@ -5802,15 +5794,20 @@ struct OwnerShared {
 
 impl OwnerShared {
     fn new(commands: OwnerCommandSenders) -> Self {
+        // Debit all original shared startup gate/pool allocations before allocating.
+        let initial = InputBudget::shared_initial();
+        let input_bytes = Arc::new(Mutex::new(initial));
+        let lifecycle = Arc::new(AtomicU8::new(OwnerLifecycle::Initializing as u8));
+        let resource_admission = ResourceAdmission::new();
         Self {
             queue_metrics: Arc::clone(&commands.ordinary.metrics),
-            resource_admission: ResourceAdmission::new(),
+            resource_admission,
             commands: Mutex::new(Some(commands)),
             admission_gate: Mutex::new(()),
-            lifecycle: AtomicU8::new(OwnerLifecycle::Initializing as u8),
+            lifecycle,
             unavailable: Mutex::new(None),
             unavailable_startup_credit: Mutex::new(None),
-            input_bytes: Arc::new(Mutex::new(InputBudget::shared_initial())),
+            input_bytes,
             #[cfg(test)]
             historical_scratch_maximum: AtomicUsize::new(0),
             #[cfg(test)]
@@ -6086,7 +6083,7 @@ impl InputPermit {
 
     #[cfg(test)]
     pub(super) fn historical_test_ordinary_limit() -> usize {
-        InputClass::Ordinary.limit()
+        InputBudget::shared_initial().remaining[InputClass::Ordinary.index()]
     }
 
     #[cfg(test)]

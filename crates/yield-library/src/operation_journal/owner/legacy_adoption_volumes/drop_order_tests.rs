@@ -125,7 +125,7 @@ fn legacy_partial_native_owner_drops_before_original_source_reservation_and_char
         probe.source_lock.unlock().unwrap();
         assert!(probe.root.upgrade().is_none());
     });
-    assert_eq!(f.remaining(), InputBudget::new().remaining[0]);
+    assert_eq!(f.remaining(), InputBudget::shared_initial().remaining[0]);
     assert_eq!(f.source_bytes(), source_bytes);
     assert_eq!(fs::read(lock_path).unwrap(), marker); // Dropping never marks an ambiguous owner clean.
 }
