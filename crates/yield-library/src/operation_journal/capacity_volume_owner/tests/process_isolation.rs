@@ -27,9 +27,11 @@ pub(in crate::operation_journal::capacity_volume_owner) fn run_in_child(case: &s
     let marker = marker_directory.path().join("entered");
     let module = if case == "fork_retains_actual_owner_lock_until_exec" {
         "operation_journal::capacity_volume_owner::tests::process_isolation"
-    } else if case
-        == "original_sealed_bootstrap_retains_exact_lock_and_registry_at_each_refused_prefix"
-    {
+    } else if matches!(
+        case,
+        "original_sealed_bootstrap_retains_exact_lock_and_registry_at_each_refused_prefix"
+            | "current_original_bootstrap_retains_real_dirty_prefix_and_lock_until_capsule_drop"
+    ) {
         "operation_journal::capacity_volume_owner::legacy_bootstrap::tests::native"
     } else {
         "operation_journal::capacity_volume_owner::tests"

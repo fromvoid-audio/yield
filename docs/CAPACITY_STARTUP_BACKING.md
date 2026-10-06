@@ -40,6 +40,14 @@ same original SQLite bytes through original and funded methods and returns scala
 zero evidence and checksum only; Shared pool/gate setup is outside measurement. Actual
 test results remain pending until recorded on the issue/PR.
 
+The Linux current-bootstrap lock-release fixture uses the same isolated-child route as
+the neighboring sealed-bootstrap fixture. Its complete original body, immediate lock
+assertions, exact child-entry marker and 30-second harness deadline are unchanged.
+The existing deterministic fork regression demonstrates that an inherited descriptor
+can retain ownership after all parent aliases drop. An earlier full run failed the
+post-drop lock assertion while three unchanged exact repetitions passed; the cause of
+that particular full-run failure was not conclusively established.
+
 The implemented original macOS production registry/bootstrap harness keeps the component
 hook OFF and observes original journal-descriptor volume/unit facts. Linux/GNU do not
 compile or execute its macOS body. Exact native requirements are tracked in OPT-2405;
