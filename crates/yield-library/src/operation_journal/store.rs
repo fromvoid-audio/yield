@@ -5984,6 +5984,8 @@ impl OperationJournalStore {
                 })?;
             if inventory.header().profile != self.profile_guard.profile_root_identity()
                 || inventory.header().acquisition != self.profile_guard.owner_identity()
+                || inventory.header().ownership_generation
+                    != self.profile_guard.ownership_generation()
             {
                 return Err(InitialClaimSettlementError::Store(database_claims::error(
                     "current profile binding mismatch",

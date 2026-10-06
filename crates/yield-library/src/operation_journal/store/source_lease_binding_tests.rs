@@ -264,7 +264,7 @@ mod source_lease_binding_storage {
             InventoryHeader {
                 profile: owner.profile_root_identity().into(),
                 acquisition: owner.owner_identity().into(),
-                ownership_generation: 1,
+                ownership_generation: owner.ownership_generation(),
                 decision_nonce: Uuid::new_v4(),
             },
             bindings,

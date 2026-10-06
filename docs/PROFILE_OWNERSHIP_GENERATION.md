@@ -38,3 +38,23 @@ checks the source and test code; it does not execute the Windows kernel or quali
 native filesystem allocation. Exact macOS and Windows/MSVC original-guard,
 clone-held lock and child-process execution is tracked in
 [OPT-2368](https://linear.app/boostnlvp/issue/OPT-2368).
+
+## Initial inventory persistence comparison (OPT-2371)
+
+The existing private initial-claim settlement boundary compares the inventory's
+profile, acquisition UUID and generation with its original retained profile guard
+before pinning the provisional lease or inserting journal rows. A wrong positive
+generation refuses with the existing profile-binding error. Earlier inventory and
+claim validation, native namespace checks and transaction outcome rules retain
+their original order and semantics.
+
+Actual profile-owned SQLite tests observe insertion hooks, all claim/inventory
+relations, nonce readback and provisional capacity counters on refusal. The matching
+generation exercises the original atomic storage path. Releasing every original
+guard and genuinely reacquiring the lock before reopen preserves exact historical
+inventory and nonce readback; stored generations are observations and are not
+compared with the new acquisition. Capacity fixtures remain logical persistence
+evidence, not physical qualification or live all-owner admission.
+
+This comparison supplies no header factory, joint decision, Start, permit, retry,
+refund or genuine settlement. Full OPT-2136/2168/2194 and native OPT-2368 stay open.
