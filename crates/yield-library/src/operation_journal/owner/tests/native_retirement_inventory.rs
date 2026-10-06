@@ -17,40 +17,15 @@ use crate::sample_sources::wal_transport::{SourceWalProducerOwner, SourceWalTran
 use crate::sample_sources::{SourceDatabase, SourceWriter};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
-pub(super) fn whole_journal_image(root: &std::path::Path) -> ([u64; 5], Option<i64>) {
-    let connection = rusqlite::Connection::open_with_flags(
-        root.join(crate::operation_journal::store::JOURNAL_DATABASE_ROOT_NAME)
-            .join(crate::operation_journal::store::JOURNAL_DATABASE_FILE_NAME),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    let tables = [
-        "operation_journal",
-        "operation_journal_full_progress",
-        "operation_journal_staging_checkpoints",
-        "operation_journal_chunk_staging",
-        "operation_journal_recording_chunks",
-    ];
-    let counts = tables.map(|table| {
-        connection
-            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                row.get::<_, u64>(0)
-            })
-            .unwrap()
-    });
-    let sequence = connection
-        .query_row(
-            "SELECT MAX(sequence) FROM (
-         SELECT sequence FROM operation_journal UNION ALL
-         SELECT sequence FROM operation_journal_full_progress UNION ALL
-         SELECT sequence FROM operation_journal_staging_checkpoints UNION ALL
-         SELECT sequence FROM operation_journal_chunk_staging UNION ALL
-         SELECT sequence FROM operation_journal_recording_chunks)",
-            [],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .unwrap();
-    (counts, sequence)
+pub(super) fn whole_journal_image(client: &OperationJournalClient) -> ([u64; 5], Option<i64>) {
+    client
+        .submit_control(CONTROL_INPUT_BYTES, |input, result| {
+            JournalCommand::InspectRetirementWholeJournal { input, result }
+        })
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap()
 }
 #[test]
 #[ignore = "requires a native qualified bootstrap, protected mounted roots and SDK/runtime; no fixture qualification"]
@@ -379,7 +354,7 @@ fn native_retirement_inventory_genuine_registered_original_consumer() {
     .unwrap();
     let validation_id = prepared.validation_operation_id();
     let record = prepared_record(validation_id, &prepared).unwrap();
-    let whole_before = whole_journal_image(fixture.owner.profile_root());
+    let whole_before = whole_journal_image(&journal.client());
     let ids_before = journal
         .prepared_admission_id_allocations
         .load(Ordering::Relaxed);
@@ -398,10 +373,7 @@ fn native_retirement_inventory_genuine_registered_original_consumer() {
         .expect("genuine native original ACK must produce historical observation");
     assert_eq!(inventory.inventory().bindings().len(), 2);
     assert_eq!(inventory.inventory().slices().len(), 6);
-    assert_eq!(
-        whole_journal_image(fixture.owner.profile_root()),
-        whole_before
-    );
+    assert_eq!(whole_journal_image(&journal.client()), whole_before);
     assert_eq!(
         journal
             .prepared_admission_id_allocations

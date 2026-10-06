@@ -2871,7 +2871,7 @@ mod integration {
         let inventory_no_effects = (inventory_case != 0).then(|| {
             (
                 prepared.validation_operation_id(),
-                native_retirement_inventory::whole_journal_image(fixture.owner.profile_root()),
+                native_retirement_inventory::whole_journal_image(&journal.client()),
                 journal
                     .prepared_admission_id_allocations
                     .load(Ordering::Relaxed),
@@ -2954,7 +2954,7 @@ mod integration {
         }
         if let Some((validation_id, whole_before, ids_before)) = inventory_no_effects {
             assert_eq!(
-                native_retirement_inventory::whole_journal_image(fixture.owner.profile_root()),
+                native_retirement_inventory::whole_journal_image(&journal.client()),
                 whole_before
             );
             assert_eq!(
