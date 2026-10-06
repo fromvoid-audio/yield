@@ -133,8 +133,8 @@ fn session_healthy_journal_shutdown_retains_repeat_success() {
         .expect("session startup");
     wait_for_snapshot(&session, |snapshot| snapshot.as_slice().is_empty());
     wait_for_preference_snapshot(&session, |_| true);
-    assert_eq!(session.shutdown(), Ok(()));
-    assert_eq!(session.shutdown(), Ok(()));
+    assert!(session.shutdown().is_ok());
+    assert!(session.shutdown().is_ok());
     assert!(matches!(
         session.add_root(root(&temp, "closed")),
         Err(SubmitError::Closed)
