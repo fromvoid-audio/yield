@@ -131,12 +131,16 @@ pub struct GlobalPreparationRequest {
     wal_binding: bool,
     handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
     #[cfg(all(test, target_os = "linux"))]
-    observation_expiry_probe: Option<bool>,
+    observation_expiry_probe: Option<(bool, &'static std::sync::atomic::AtomicBool)>,
 }
 impl GlobalPreparationRequest {
     #[cfg(all(test, target_os = "linux"))]
-    fn with_original_observation_expiry_probe(mut self, parked: bool) -> Self {
-        self.observation_expiry_probe = Some(parked);
+    fn with_original_observation_expiry_probe(
+        mut self,
+        parked: bool,
+        hit: &'static std::sync::atomic::AtomicBool,
+    ) -> Self {
+        self.observation_expiry_probe = Some((parked, hit));
         self
     }
     pub(crate) fn retirement_policy_input(
@@ -706,10 +710,14 @@ pub(super) fn run(
                 continue;
             }
             #[cfg(all(test, target_os = "linux"))]
-            let _observation_probe =
-                (command.request.observation_expiry_probe == Some(true)).then(|| {
+            let _observation_probe = command
+                .request
+                .observation_expiry_probe
+                .filter(|(parked, _)| *parked)
+                .map(|(_, hit)| {
                     crate::sqlite_budget::wal_objects::arm_original_mapping_expiry(
                         command.request.deadline,
+                        hit,
                     )
                 });
             let binding_result = retained_observation.wal_scope().map_or(Ok(()), |scope| {

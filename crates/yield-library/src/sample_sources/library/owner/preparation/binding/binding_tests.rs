@@ -22,19 +22,18 @@ mod integration {
     #[cfg(target_os = "linux")]
     #[test]
     fn original_global_native_mapping_deadline_during_capture_preserves_deadline_refusal() {
+        static HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        HIT.store(false, std::sync::atomic::Ordering::Release);
         fixture(|writer, guard, _| {
             let pending = writer
                 .submit_preparation(
                     request(writer, Duration::from_millis(150))
                         .with_wal_binding()
-                        .with_original_observation_expiry_probe(false),
+                        .with_original_observation_expiry_probe(false, &HIT),
                 )
                 .unwrap();
             let outcome = pending.recv_timeout(Duration::from_secs(3)).unwrap();
-            eprintln!(
-                "OPT2404 actual original Global capture refusal: {:?}",
-                outcome.as_ref().err()
-            );
+            assert!(HIT.load(std::sync::atomic::Ordering::Acquire));
             assert_eq!(outcome.err(), Some(GlobalPreparationError::Deadline));
             empty(writer);
             assert_eq!(charged(writer), 0);
@@ -48,12 +47,14 @@ mod integration {
     #[cfg(target_os = "linux")]
     #[test]
     fn original_global_native_mapping_deadline_while_parked_preserves_confirmed_cleanup() {
+        static HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        HIT.store(false, std::sync::atomic::Ordering::Release);
         fixture(|writer, guard, _| {
             let mut held = writer
                 .submit_preparation(
                     request(writer, Duration::from_millis(150))
                         .with_wal_binding()
-                        .with_original_observation_expiry_probe(true),
+                        .with_original_observation_expiry_probe(true, &HIT),
                 )
                 .unwrap()
                 .recv_timeout(Duration::from_secs(3))
@@ -66,7 +67,7 @@ mod integration {
                 .unwrap()
                 .recv_timeout(Duration::from_secs(3))
                 .unwrap();
-            eprintln!("OPT2404 actual original Global parked release: {outcome:?}");
+            assert!(HIT.load(std::sync::atomic::Ordering::Acquire));
             assert_eq!(outcome, Err(GlobalPreparationError::Deadline));
             drop(held);
             external(guard)

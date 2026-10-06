@@ -1,5 +1,5 @@
 //! Original kernel vnode-backed SHM observation; path text never establishes identity.
-use std::time::Instant;
+use super::ObservationDeadline;
 
 #[cfg(target_os = "macos")]
 #[link(name = "proc")]
@@ -49,7 +49,7 @@ fn matches(
     device: u64,
     inode: u64,
     bytes: u64,
-    deadline: Instant,
+    deadline: &mut ObservationDeadline,
 ) -> Option<bool> {
     let address = u64::try_from(address).ok()?;
     let end = region.address.checked_add(region.size)?;
@@ -72,7 +72,7 @@ fn matches(
         || vnode.device != device
         || vnode.inode != inode
         || u64::try_from(vnode.bytes).ok() != Some(bytes)
-        || Instant::now() >= deadline
+        || deadline.expired()
     {
         return None;
     }
@@ -85,7 +85,7 @@ pub(super) fn mapped_identity(
     device: u64,
     inode: u64,
     bytes: u64,
-    deadline: Instant,
+    deadline: &mut ObservationDeadline,
 ) -> Option<bool> {
     // proc_regionwithpathinfo: use libc's reviewed native vnode layout. The path
     // buffer is unavoidable fixed API backing; it is never parsed or reopened.
@@ -100,7 +100,7 @@ pub(super) fn mapped_identity(
         std::mem::size_of::<RegionWithPath>() + std::mem::size_of::<VnodeIdentity>() <= 3 * 512
     );
     const _: () = assert!(std::mem::size_of::<RegionInfo>() == 96);
-    if Instant::now() >= deadline || address == 0 {
+    if deadline.expired() || address == 0 {
         return None;
     }
     let mut record = std::mem::MaybeUninit::<RegionWithPath>::zeroed();
@@ -117,7 +117,7 @@ pub(super) fn mapped_identity(
             size,
         )
     };
-    if returned != size || Instant::now() >= deadline {
+    if returned != size || deadline.expired() {
         return None;
     }
     // SAFETY: the zero-initialized exact fixed record was filled by the kernel.
@@ -144,7 +144,7 @@ pub(super) fn mapped_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn darwin_mapping_record_rejects_aliases_private_regions_and_unknown_identity() {
@@ -174,7 +174,7 @@ mod tests {
                 7,
                 42,
                 32768,
-                Instant::now() + Duration::from_secs(2),
+                &mut ObservationDeadline::new(Instant::now() + Duration::from_secs(2)),
             )
         };
         assert_eq!(std::mem::size_of::<RegionInfo>(), 96);
@@ -217,7 +217,15 @@ mod tests {
         assert_eq!(check(&region, &vnode), None);
         vnode.mode = 0o100600;
         assert_eq!(
-            matches(&region, &vnode, 0x10000, 7, 42, 32768, Instant::now()),
+            matches(
+                &region,
+                &vnode,
+                0x10000,
+                7,
+                42,
+                32768,
+                &mut ObservationDeadline::new(Instant::now())
+            ),
             None
         );
         region.address = u64::MAX - 10;
