@@ -82,6 +82,17 @@ fn chunk_scalar_projection_preserves_original_states_optional_uuid_forms_and_pag
         .execute("UPDATE operation_journal_chunk_claim SET issue_id=NULL", [])
         .unwrap();
     assert!(fixture.read().is_ok());
+    // The original scalar parser accepts nil OperationId; higher audit/schema gates
+    // remain responsible for rejecting an absent/invalid operation correlation.
+    fixture.text("operation_id", &Uuid::nil().to_string());
+    let decoded = fixture.read().unwrap();
+    assert!(decoded.operation_id().as_uuid().is_nil());
+    let mut statement = fixture.connection.prepare("SELECT chunk_id, operation_id, claim_id, participant_id, output_key, logical_offset, logical_length, volume_device, allocation_class, allocated_bytes, allocation_unit, protected_free_bytes, state, issue_id, release_id FROM operation_journal_chunk_claim").unwrap();
+    let mut rows = statement.query([]).unwrap();
+    assert_eq!(
+        decoded,
+        original_scalar_probe::original_decode_row(rows.next().unwrap().unwrap()).unwrap()
+    );
 }
 
 #[test]
@@ -104,7 +115,7 @@ fn chunk_scalar_projection_enforces_original_output_byte_bounds_before_copy() {
 fn chunk_scalar_projection_large_unknown_diagnostics_are_bounded() {
     for field in ["allocation_class", "state"] {
         let fixture = Fixture::new();
-        fixture.text(field, &"é".repeat(1 << 19));
+        fixture.text(field, &"😀".repeat(1 << 18));
         let mut statement = fixture.connection.prepare("SELECT chunk_id, operation_id, claim_id, participant_id, output_key, logical_offset, logical_length, volume_device, allocation_class, allocated_bytes, allocation_unit, protected_free_bytes, state, issue_id, release_id FROM operation_journal_chunk_claim").unwrap();
         let mut rows = statement.query([]).unwrap();
         let Err(ChunkClaimReadError::Malformed(original_reason)) =
@@ -120,7 +131,7 @@ fn chunk_scalar_projection_large_unknown_diagnostics_are_bounded() {
             panic!("unknown closed scalar must refuse")
         };
         assert!(
-            reason.len() <= 256,
+            reason.len() <= 64 * 4 + "unknown allocation class ".len(),
             "diagnostic copied original large {field}: {}",
             reason.len()
         );
@@ -131,7 +142,7 @@ fn chunk_scalar_projection_large_unknown_diagnostics_are_bounded() {
 fn chunk_scalar_projection_keeps_all_original_semantic_refusals() {
     for (field, value) in [
         ("chunk_id", "not-a-uuid"),
-        ("operation_id", "00000000-0000-0000-0000-000000000000"),
+        ("operation_id", "not-a-uuid"),
         ("claim_id", "00000000-0000-0000-0000-000000000000"),
         ("participant_id", "not-a-uuid"),
         ("volume_device", "18446744073709551616"),
