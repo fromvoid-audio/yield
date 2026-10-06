@@ -1,6 +1,7 @@
 mod publication_issuance {
     use super::super::publication_bindings::PublicationBindingDraft;
     use super::*;
+    use crate::operation_journal::ParticipantId;
 
     // Authority-free durable row observations only. This fixture creates no Native provider,
     // source pin, live file-owner target, publication grant or physical allocation proof.
@@ -685,5 +686,22 @@ mod publication_issuance {
                 .1,
             staging
         );
+    }
+    #[test]
+    fn publication_issuance_string_scan_preserves_valid_unicode_and_refuses_oversize_diagnostics() {
+        let (_fixture, _store, staging, _binding, _sequence) = prepared();
+        let encoded = String::from_utf8(staging.encode().unwrap()).unwrap();
+        let surrogate = encoded.replace("staged.wav", r"\ud83d\ude00");
+        let parsed =
+            staging_checkpoints::StagingCheckpointRecord::decode(surrogate.as_bytes()).unwrap();
+        assert_eq!(parsed.locator(), "😀");
+        for replacement in [r"\ud83d", r"\ude00", r"\uXXXX"] {
+            let bad = encoded.replace("staged.wav", replacement);
+            assert!(staging_checkpoints::StagingCheckpointRecord::decode(bad.as_bytes()).is_err());
+        }
+        let oversized = serde_json::to_vec(&"\u{200d}".repeat(1025)).unwrap();
+        assert!(staging_checkpoints::bounded_string_tokens(&oversized).is_err());
+        let escaped = serde_json::to_vec(&"\u{1}".repeat(1024)).unwrap();
+        staging_checkpoints::bounded_string_tokens(&escaped).unwrap();
     }
 }

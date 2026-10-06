@@ -288,31 +288,86 @@ impl StagingCheckpointRecord {
     }
 }
 
-// Validate a string token's raw wire size without allocating or interpreting authority.
-// Legal UTF-8 text/JSON escapes cannot exceed six times its decoded byte allowance.
+// Scan decoded byte counts without allocating, including UTF-8 Unicode escapes.
+// All accepted text fields are <=1024 bytes; malformed strings cannot inflate serde scratch
+// or its diagnostic projection. This preserves64KiB whitespace and arbitrary key ordering.
 pub(super) fn bounded_string_tokens(bytes: &[u8]) -> Result<(), String> {
-    let (mut quoted, mut escaped, mut length) = (false, false, 0usize);
-    for byte in bytes {
-        if !quoted {
-            if *byte == b'"' {
-                quoted = true;
-                length = 0;
+    fn invalid() -> String {
+        "staging checkpoint string token bounds/shape".into()
+    }
+    fn hex(bytes: &[u8], start: usize) -> Option<u16> {
+        bytes
+            .get(start..start.checked_add(4)?)?
+            .iter()
+            .try_fold(0u16, |v, b| {
+                let digit = match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    b'A'..=b'F' => b - b'A' + 10,
+                    _ => return None,
+                };
+                Some(v * 16 + u16::from(digit))
+            })
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let (start, mut decoded) = (i, 0usize);
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] == b'\\' {
+                let escape = *bytes.get(i + 1).ok_or_else(invalid)?;
+                if escape == b'u' {
+                    let code = hex(bytes, i + 2).ok_or_else(invalid)?;
+                    i += 6;
+                    decoded += if (0xd800..=0xdbff).contains(&code) {
+                        if bytes.get(i..i + 2) != Some(b"\\u") {
+                            return Err(invalid());
+                        }
+                        let low = hex(bytes, i + 2).ok_or_else(invalid)?;
+                        if !(0xdc00..=0xdfff).contains(&low) {
+                            return Err(invalid());
+                        }
+                        i += 6;
+                        4
+                    } else if (0xdc00..=0xdfff).contains(&code) {
+                        return Err(invalid());
+                    } else if code < 0x80 {
+                        1
+                    } else if code < 0x800 {
+                        2
+                    } else {
+                        3
+                    };
+                } else {
+                    if !matches!(
+                        escape,
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
+                    ) {
+                        return Err(invalid());
+                    }
+                    i += 2;
+                    decoded += 1;
+                }
+            } else {
+                i += 1;
+                decoded += 1;
             }
-        } else if escaped {
-            escaped = false;
-            length += 1;
-        } else if *byte == b'"' {
-            quoted = false;
-        } else {
-            length += 1;
-            escaped = *byte == b'\\';
+            if decoded > 1024 || i - start > MAX_STRING_TOKEN_BYTES {
+                return Err(invalid());
+            }
         }
-        if quoted && length > MAX_STRING_TOKEN_BYTES {
-            return Err("staging checkpoint string token exceeds accepted text bound".into());
+        if i == bytes.len() {
+            return Err(invalid());
         }
+        i += 1;
     }
     Ok(())
 }
+
 fn bounded_text<'de, D: serde::Deserializer<'de>, const N: usize>(
     decoder: D,
 ) -> Result<String, D::Error> {
