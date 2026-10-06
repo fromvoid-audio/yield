@@ -194,11 +194,16 @@ mod publication_issuance {
             Some(original)
         );
         assert!(matches!(
-            reopened
-                .checkpoint_staging(&staging)
-                .expect("replay observation"),
-            staging_checkpoints::StagingCheckpointReceipt::Replay { .. }
+            reopened.checkpoint_staging(&staging),
+            Err(OperationJournalStoreError::StagingCheckpoint { reason })
+                if reason == "publication grant was already reserved"
         ));
+        assert_eq!(
+            reopened
+                .read_staging_checkpoint_row(staging.output_id())
+                .unwrap(),
+            Some((sequence, staging.clone(), true))
+        );
         assert!(
             reopened
                 .reserve_publication_binding_fixture(&staging, sequence, prepared_binding(&staging))
