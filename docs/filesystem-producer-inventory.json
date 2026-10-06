@@ -1292,6 +1292,66 @@
       "issue": "OPT-2402",
       "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
       "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io/windows_owned_security.rs",
+      "function": "windows_owned_security_metadata_first_refuses_actual_device_and_reparse_directory",
+      "operation": "fs::create_dir",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2409",
+      "reason": "Windows cfg(test)-only controlled external ACL fixture descendants and unchanged-byte sentinels; no production namespace producer or ACL setter. Held-original name substitution and metadata-first reparse refusal require genuine native execution in OPT-2410.",
+      "retirement": "Retain as native regression fixture while the read-only exact-held-directory snapshot exists; fixture execution cannot qualify publication or canonical bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io/windows_owned_security.rs",
+      "function": "windows_owned_security_metadata_first_refuses_actual_device_and_reparse_directory",
+      "operation": "fs::remove_dir",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2409",
+      "reason": "Windows cfg(test)-only controlled external ACL fixture descendants and unchanged-byte sentinels; no production namespace producer or ACL setter. Held-original name substitution and metadata-first reparse refusal require genuine native execution in OPT-2410.",
+      "retirement": "Retain as native regression fixture while the read-only exact-held-directory snapshot exists; fixture execution cannot qualify publication or canonical bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io/windows_owned_security.rs",
+      "function": "windows_owned_security_metadata_first_refuses_actual_device_and_reparse_directory",
+      "operation": "fs::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2409",
+      "reason": "Windows cfg(test)-only controlled external ACL fixture descendants and unchanged-byte sentinels; no production namespace producer or ACL setter. Held-original name substitution and metadata-first reparse refusal require genuine native execution in OPT-2410.",
+      "retirement": "Retain as native regression fixture while the read-only exact-held-directory snapshot exists; fixture execution cannot qualify publication or canonical bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io/windows_owned_security.rs",
+      "function": "windows_owned_security_original_handle_survives_foreign_name_replacement",
+      "operation": "fs::create_dir",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2409",
+      "reason": "Windows cfg(test)-only controlled external ACL fixture descendants and unchanged-byte sentinels; no production namespace producer or ACL setter. Held-original name substitution and metadata-first reparse refusal require genuine native execution in OPT-2410.",
+      "retirement": "Retain as native regression fixture while the read-only exact-held-directory snapshot exists; fixture execution cannot qualify publication or canonical bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io/windows_owned_security.rs",
+      "function": "windows_owned_security_original_handle_survives_foreign_name_replacement",
+      "operation": "fs::rename",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2409",
+      "reason": "Windows cfg(test)-only controlled external ACL fixture descendants and unchanged-byte sentinels; no production namespace producer or ACL setter. Held-original name substitution and metadata-first reparse refusal require genuine native execution in OPT-2410.",
+      "retirement": "Retain as native regression fixture while the read-only exact-held-directory snapshot exists; fixture execution cannot qualify publication or canonical bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io/windows_owned_security.rs",
+      "function": "windows_owned_security_original_handle_survives_foreign_name_replacement",
+      "operation": "fs::write",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2409",
+      "reason": "Windows cfg(test)-only controlled external ACL fixture descendants and unchanged-byte sentinels; no production namespace producer or ACL setter. Held-original name substitution and metadata-first reparse refusal require genuine native execution in OPT-2410.",
+      "retirement": "Retain as native regression fixture while the read-only exact-held-directory snapshot exists; fixture execution cannot qualify publication or canonical bootstrap."
     }
   ]
 }
