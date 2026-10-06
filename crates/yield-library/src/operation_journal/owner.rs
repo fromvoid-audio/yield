@@ -7283,7 +7283,7 @@ mod tests {
         (fixture, owner)
     }
 
-    fn wait_until_available(owner: &OperationJournalOwner) {
+    pub(super) fn wait_until_available(owner: &OperationJournalOwner) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             match owner.status() {

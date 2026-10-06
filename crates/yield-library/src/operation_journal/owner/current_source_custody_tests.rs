@@ -270,6 +270,7 @@ fn current_original_worker_lost_reply_replay_and_shutdown_retain_dirty_backing_a
     let expected_root = std::fs::metadata(media.path()).unwrap();
     let store = OperationJournalStore::open(&profile).unwrap();
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+    super::tests::wait_until_available(&owner);
     let client = owner.client();
     let before = client.shared.input_bytes.lock().unwrap().remaining[0];
     let bytes = current_source_metadata::input_bytes(&envelope).unwrap();
@@ -361,6 +362,7 @@ fn current_original_worker_panic_closes_native_capsule_before_releasing_metadata
     let app_path = app_override.path().to_owned();
     let store = OperationJournalStore::open(&profile).unwrap();
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+    super::tests::wait_until_available(&owner);
     let client = owner.client();
     let bytes = current_source_metadata::input_bytes(&envelope).unwrap();
     let probe = Arc::new(Mutex::new(None));

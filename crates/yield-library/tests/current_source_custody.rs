@@ -5,7 +5,9 @@ use yield_library::{
     app_dirs::{AppRootGuard, WritableProfileGuard},
     durable_capacity::PROTECTED_FREE_SPACE_FLOOR,
     filesystem_identity::stable_filesystem_identity_from_open_file,
-    operation_journal::{OperationId, OperationJournalOwner, OperationJournalStore},
+    operation_journal::{
+        OperationId, OperationJournalOwner, OperationJournalOwnerStatus, OperationJournalStore,
+    },
     sample_sources::{SourceDatabase, db::SourceAuthorityRegistration},
 };
 const WAIT: Duration = Duration::from_secs(30);
@@ -61,6 +63,22 @@ fn run_original_queue(
             return;
         }
     };
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        match owner.status() {
+            OperationJournalOwnerStatus::Available => break,
+            OperationJournalOwnerStatus::Unavailable { reason } => {
+                assert!(!physical, "genuine Native bootstrap unavailable: {reason}");
+                assert!(!reserve_path.exists());
+                let _ = owner.shutdown();
+                return;
+            }
+            status if std::time::Instant::now() >= deadline => {
+                panic!("original bootstrap did not finish: {status:?}");
+            }
+            _ => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
     assert!(
         physical,
         "unsupported target must not bootstrap physical ownership"
@@ -105,6 +123,17 @@ fn run_original_queue(
     let mut authority = source.prepare_source_authority().unwrap();
     let store = OperationJournalStore::open(profile).unwrap();
     let mut owner = OperationJournalOwner::start(store).unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    while owner.status() != OperationJournalOwnerStatus::Available {
+        if let OperationJournalOwnerStatus::Unavailable { reason } = owner.status() {
+            panic!("genuine restart unavailable: {reason}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "original restart timed out"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let mut reply = owner
         .client()
         .register_source_authority(authority.journal_request().unwrap())
