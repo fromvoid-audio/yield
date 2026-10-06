@@ -25,7 +25,10 @@ use crate::operation_journal::model::OperationId;
 use uuid::Uuid;
 
 mod charge_observer;
+mod funded_reconciliation;
 pub(crate) use charge_observer::PublicationChargeBinding;
+#[cfg(any(test, feature = "test-support"))]
+pub use funded_reconciliation::ProviderReconciliationProbe;
 pub(crate) const PUBLICATION_MIRROR_BYTES: usize = 4096;
 use charge_observer::{ChargeMirror, ChargeMutation, ChargeObserver};
 use std::sync::Arc;
@@ -327,6 +330,36 @@ impl CapacityProvider {
         } else {
             Err(CapacityProviderError::RebuildLedgerConflict)
         }
+    }
+
+    pub(crate) fn validate_rebuilt_claims_for_input(
+        &self,
+        snapshot: &OrdinaryClaimRebuildSnapshot,
+        input: &super::owner::InputPermit,
+    ) -> Result<(), CapacityProviderError> {
+        if !snapshot.readiness().can_install() {
+            return Err(CapacityProviderError::RebuildNotReady);
+        }
+        let ledger = self
+            .ledger
+            .try_borrow()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        // The borrowed live image cannot change between inventory, debit and comparison.
+        // Declaration order keeps credit until canonical and both normalized images drop.
+        let _credit = funded_reconciliation::reserve(snapshot.claims(), &ledger, input)?;
+        let canonical = stage_rebuilt_ledger(snapshot.claims(), INITIAL_LEASE_TOKEN)?;
+        #[cfg(test)]
+        funded_reconciliation::after_stage(input);
+        if ledger_matches_rebuild(&ledger, &canonical) {
+            Ok(())
+        } else {
+            Err(CapacityProviderError::RebuildLedgerConflict)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_reconciliation_debit_for_test() -> usize {
+        funded_reconciliation::bytes(&[], &Self::unavailable().ledger.borrow()).unwrap()
     }
 
     #[cfg(test)]
@@ -1141,7 +1174,7 @@ fn stage_rebuilt_ledger(
         if !has_unreleased_claim {
             continue;
         }
-        claim_ids.sort();
+        claim_ids.sort_unstable();
         let token = staged.next_token;
         staged.next_token = staged
             .next_token
@@ -1253,7 +1286,7 @@ fn normalized_ledger_image(
             .iter()
             .filter_map(|(claim_id, claim)| claim.release_id.is_none().then_some(*claim_id))
             .collect::<Vec<_>>();
-        claim_ids.sort();
+        claim_ids.sort_unstable();
         charge.disposition = if matches!(
             charge.disposition,
             ProvisionalLeaseDisposition::AuditPending { .. }
@@ -1716,6 +1749,8 @@ pub(crate) enum CapacityProviderError {
     RebuildIdentityConflict,
     #[error("restart rebuild conflicts with the live owner-thread ledger")]
     RebuildLedgerConflict,
+    #[error("capacity reconciliation resource envelope exceeded")]
+    RebuildResourceBound,
 }
 
 fn disposition_operation(disposition: &ProvisionalLeaseDisposition) -> Option<OperationId> {

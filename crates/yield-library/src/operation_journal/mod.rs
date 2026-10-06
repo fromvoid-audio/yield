@@ -15,6 +15,8 @@ pub mod capacity_admission_telemetry;
 pub mod capacity_estimator;
 #[allow(dead_code)]
 mod capacity_provider;
+#[cfg(any(test, feature = "test-support"))]
+pub use capacity_provider::ProviderReconciliationProbe;
 #[allow(dead_code)]
 mod capacity_reserve;
 #[allow(dead_code)]

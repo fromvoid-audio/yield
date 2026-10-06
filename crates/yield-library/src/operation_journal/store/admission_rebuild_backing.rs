@@ -44,12 +44,23 @@ impl FundedSnapshot {
     pub(in crate::operation_journal) fn validate_provider(
         &self,
         provider: &super::super::capacity_provider::CapacityProvider,
+        input: Option<&InputPermit>,
     ) -> Result<(), super::super::capacity_provider::CapacityProviderError> {
-        provider.validate_rebuilt_claims(&self.snapshot)
+        match input {
+            Some(input) => provider.validate_rebuilt_claims_for_input(&self.snapshot, input),
+            None => provider.validate_rebuilt_claims(&self.snapshot),
+        }
     }
     #[cfg(test)]
     pub(super) fn matches_original(&self, original: &OrdinaryClaimRebuildSnapshot) -> bool {
         self.snapshot == *original
+    }
+    #[cfg(test)]
+    pub(in crate::operation_journal) fn install_provider_component(
+        &self,
+        provider: &super::super::capacity_provider::CapacityProvider,
+    ) -> Result<(), super::super::capacity_provider::CapacityProviderError> {
+        provider.install_rebuilt_claims(&self.snapshot)
     }
 }
 
@@ -185,6 +196,11 @@ fn resource_error(error: OperationJournalStoreError) -> OperationJournalStoreErr
 
 #[cfg(any(test, feature = "test-support"))]
 impl OperationJournalStore {
+    #[cfg(test)]
+    pub(in crate::operation_journal) fn empty_collection_debit_for_test() -> usize {
+        collection_bytes(0, 0).unwrap()
+    }
+
     /// Original-connection collection allocation fixture, without an owner or effects.
     pub fn install_ordinary_collection_fixture_for_test(
         &self,
