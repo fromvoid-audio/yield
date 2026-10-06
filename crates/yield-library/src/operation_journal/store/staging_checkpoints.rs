@@ -11,7 +11,6 @@ use uuid::Uuid;
 use crate::file_operation_owner::{
     AuthorityFence, EffectOutcome, FileOperationResult, RootRegistrationRef, RootRole,
 };
-use crate::operation_journal::codec::parse_unique_value;
 use crate::operation_journal::model::OperationId;
 use crate::operation_journal::participants::{ParticipantId, ParticipantKind};
 
@@ -30,6 +29,11 @@ pub(super) const CREATE_TABLE: &str = "CREATE TABLE operation_journal_staging_ch
 
 const RECORD_SCHEMA_VERSION: u32 = 1;
 pub(super) const MAX_RECORD_BYTES: usize = 64 * 1024;
+// Valid shapes contain <=2048 text bytes (locator1024 + physical256 + source3*256).
+// Worst JSON escaping is six bytes per text byte; 4096 covers all fixed scalars/keys.
+// Keep the historical SQL constraint, but reject oversized observations before decoding.
+const MAX_OBSERVATION_BYTES: usize = 6 * (1024 + 256 + 3 * 256) + 4096;
+const _: () = assert!(MAX_OBSERVATION_BYTES <= MAX_RECORD_BYTES);
 pub(super) const MAX_ROWS: i64 = 8192;
 
 /// A serialized root observation, intentionally separate from the live registration type.
@@ -263,18 +267,18 @@ impl StagingCheckpointRecord {
     pub(super) fn encode(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
         let encoded = serde_json::to_vec(self).map_err(|error| error.to_string())?;
-        if encoded.len() > MAX_RECORD_BYTES {
+        if encoded.len() > MAX_OBSERVATION_BYTES {
             return Err(String::from("staging checkpoint exceeds its record bound"));
         }
         Ok(encoded)
     }
 
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() > MAX_RECORD_BYTES {
+        if bytes.len() > MAX_OBSERVATION_BYTES {
             return Err(String::from("staging checkpoint exceeds its record bound"));
         }
-        let value = parse_unique_value(bytes).map_err(|error| error.to_string())?;
-        let record: Self = serde_json::from_value(value).map_err(|error| error.to_string())?;
+        // Typed fields reject duplicates/unknown keys without an owned JSON Value graph.
+        let record: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
         record.validate()?;
         Ok(record)
     }
@@ -636,61 +640,30 @@ impl OperationJournalStore {
         &self,
         output_id: Uuid,
     ) -> Result<Option<(i64, StagingCheckpointRecord, bool)>, OperationJournalStoreError> {
-        let raw = self.connection.query_row(
-            "SELECT typeof(output_id), typeof(sequence), sequence, typeof(record), length(record), record, typeof(grant_reserved), grant_reserved FROM operation_journal_staging_checkpoints WHERE output_id = ?1",
-            params![output_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?, row.get::<_, String>(1)?,
-                    match row.get_ref(2)? { ValueRef::Integer(value) => Some(value), _ => None },
-                    row.get::<_, String>(3)?,
-                    match row.get_ref(4)? { ValueRef::Integer(value) => Some(value), _ => None },
-                    match row.get_ref(5)? { ValueRef::Blob(value) => Some(value.to_vec()), _ => None },
-                    row.get::<_, String>(6)?,
-                    match row.get_ref(7)? { ValueRef::Integer(value) => Some(value), _ => None },
-                ))
-            },
-        ).optional()?;
-        let Some((
-            key_type,
-            sequence_type,
-            sequence,
-            record_type,
-            length,
-            blob,
-            reserved_type,
-            reserved,
-        )) = raw
-        else {
+        let found = self.connection.query_row(
+            "SELECT output_id, sequence, record, grant_reserved FROM operation_journal_staging_checkpoints WHERE output_id = ?1",
+            params![output_id.to_string()], |row| {
+                let (ValueRef::Text(key), ValueRef::Integer(sequence), ValueRef::Blob(bytes), ValueRef::Integer(reserved)) =
+                    (row.get_ref(0)?, row.get_ref(1)?, row.get_ref(2)?, row.get_ref(3)?) else {
+                    return Ok(Err(checkpoint_error("staging checkpoint has malformed SQLite cells")));
+                };
+                if key != output_id.to_string().as_bytes() || sequence <= 0
+                    || bytes.len() > MAX_OBSERVATION_BYTES || !matches!(reserved, 0 | 1) {
+                    return Ok(Err(checkpoint_error("staging checkpoint has malformed SQLite cells")));
+                }
+                let record = match StagingCheckpointRecord::decode(bytes) {
+                    Ok(record) => record,
+                    Err(error) => return Ok(Err(checkpoint_error(error))),
+                };
+                if record.output_id() != output_id {
+                    return Ok(Err(checkpoint_error("staging checkpoint key differs from its record")));
+                }
+                Ok(Ok((sequence, record, reserved == 1)))
+            }).optional()?.transpose()?;
+        let Some((sequence, record, reserved)) = found else {
             return Ok(None);
         };
-        let sequence = sequence
-            .ok_or_else(|| checkpoint_error("staging checkpoint sequence is not an integer"))?;
-        let length = length
-            .ok_or_else(|| checkpoint_error("staging checkpoint length is not an integer"))?;
-        let blob =
-            blob.ok_or_else(|| checkpoint_error("staging checkpoint record is not a blob"))?;
-        if key_type != "text"
-            || sequence_type != "integer"
-            || sequence <= 0
-            || record_type != "blob"
-            || length < 0
-            || length as usize != blob.len()
-            || blob.len() > MAX_RECORD_BYTES
-            || reserved_type != "integer"
-            || !matches!(reserved, Some(0 | 1))
-        {
-            return Err(checkpoint_error(
-                "staging checkpoint has malformed SQLite cells",
-            ));
-        }
-        let record = StagingCheckpointRecord::decode(&blob).map_err(checkpoint_error)?;
-        if record.output_id() != output_id {
-            return Err(checkpoint_error(
-                "staging checkpoint key differs from its record",
-            ));
-        }
         self.ensure_sequence_unique(sequence)?;
-        Ok(Some((sequence, record, reserved == Some(1))))
+        Ok(Some((sequence, record, reserved)))
     }
 }

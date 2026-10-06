@@ -589,4 +589,74 @@ mod publication_issuance {
         let reserved:bool = raw.query_row("SELECT grant_reserved FROM operation_journal_staging_checkpoints WHERE output_id=?1",params![staging.output_id().to_string()],|row|row.get(0)).unwrap();
         assert!(!reserved);
     }
+    #[test]
+    fn publication_issuance_staging_readback_borrows_before_bounded_typed_decode() {
+        let (_fixture, store, staging, binding, sequence) = prepared();
+        store
+            .reserve_publication_binding_fixture(&staging, sequence, binding)
+            .unwrap();
+        let original = staging.encode().unwrap();
+        let mut duplicate = b"{\"schema_version\":1,".to_vec();
+        duplicate.extend_from_slice(&original[1..]);
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        for corrupt in [
+            vec![b' '; 64 * 1024 + 1],
+            duplicate,
+            b"{\"unknown\":[]}".to_vec(),
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE operation_journal_staging_checkpoints SET record=?1 WHERE output_id=?2",
+                    params![corrupt, staging.output_id().to_string()],
+                )
+                .unwrap();
+            assert!(
+                store
+                    .read_staging_checkpoint_row(staging.output_id())
+                    .is_err()
+            );
+            assert!(store.read_publication_binding(staging.output_id()).is_err());
+            let reserved:bool=store.connection.query_row("SELECT grant_reserved FROM operation_journal_staging_checkpoints WHERE output_id=?1",
+                params![staging.output_id().to_string()],|row|row.get(0)).unwrap();
+            assert!(reserved);
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE operation_journal_staging_checkpoints SET record=?1 WHERE output_id=?2",
+                params![original, staging.output_id().to_string()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .read_publication_binding(staging.output_id())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn publication_issuance_staging_maximum_valid_text_fits_conservative_decode_bound() {
+        let (_fixture, _store, staging, _binding, _sequence) = prepared();
+        let mut value = serde_json::to_value(&staging).unwrap();
+        value["locator"] = serde_json::json!("\n".repeat(1024));
+        value["physical_object_id"] = serde_json::json!("\n".repeat(256));
+        value["source_root"] = value["staging_root"].clone();
+        value["source_fence"] = serde_json::json!({"source_id":"\n".repeat(256),"root_identity":"\n".repeat(256),
+            "database_identity":"\n".repeat(256),"lifecycle_generation":u64::MAX,"source_revision":u64::MAX,"lease_epoch":u64::MAX});
+        let record = staging_checkpoints::StagingCheckpointRecord::decode(
+            &serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let encoded = record.encode().unwrap();
+        assert!(encoded.len() <= 16 * 1024);
+        assert_eq!(
+            staging_checkpoints::StagingCheckpointRecord::decode(&encoded).unwrap(),
+            record
+        );
+    }
 }
