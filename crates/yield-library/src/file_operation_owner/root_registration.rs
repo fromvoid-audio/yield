@@ -118,10 +118,6 @@ impl RootRegistry {
             slots.iter().filter(|slot| slot.is_some()).count()
         })
     }
-    #[cfg(test)]
-    pub(super) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
     pub(super) fn insert(&mut self, key: RootRegistrationRef, value: RootRegistrationState) {
         let slot = self
             .slots
