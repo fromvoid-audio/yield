@@ -314,3 +314,29 @@ fn original_completion_worker_start_never_reopens_actor_closed_entry() {
     pending.complete_before_effect([2; 32], true);
     assert!(registry.unresolved());
 }
+
+#[test]
+fn original_completion_and_actor_closure_never_leave_executable_entry() {
+    for _ in 0..64 {
+        let shared = shared();
+        let mut registry = Registry::new();
+        let operation = OperationId::new();
+        let mut pending = registry.issue(operation, &shared).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                barrier.wait();
+                pending.original_worker_started();
+                pending.complete_before_effect([7; 32], true);
+            });
+            barrier.wait();
+            let _ = registry.close_for_cancellation(operation);
+            worker.join().unwrap();
+        });
+        assert!(!pending.enter());
+        registry.poll_completions();
+        assert!(pending.completion_observed());
+        assert!(registry.unresolved());
+        assert!(registry.close_for_charge_release(operation).is_err());
+    }
+}

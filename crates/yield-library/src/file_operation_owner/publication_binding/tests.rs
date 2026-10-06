@@ -126,11 +126,11 @@ mod integration {
             observation(&result, worker),
             observation(&result.clone(), worker)
         );
-        for field in 0..11 {
+        for field in 0..14 {
             let mut foreign = result.clone();
             match field {
                 0 => foreign.operation_id = OperationId::new(),
-                1 => foreign.participant_id = ParticipantId::new("foreign-completion").unwrap(),
+                1 => foreign.participant_id = ParticipantId::new(),
                 2 => foreign.effect_id = EffectId::new(),
                 3 => foreign.fingerprint = RequestFingerprint([5; 32]),
                 4 => foreign.target_registration = RootRegistrationRef::synthetic_for_test(),
@@ -149,6 +149,19 @@ mod integration {
                     foreign.outcome = EffectOutcome::RetainedUncertain {
                         reason: "original unknown boundary".into(),
                     }
+                }
+                11 => foreign.source_fences.push(
+                    SourceFence::new(SourceId::new(), "foreign-root", "foreign-db", 1, None, 1)
+                        .unwrap(),
+                ),
+                12 => foreign.root_bindings[0].expected = ExpectedObject::Absent,
+                13 => {
+                    foreign.root_bindings[1].authority =
+                        AuthorityFence::Profile(ProfileAuthorityFence {
+                            owner: worker,
+                            generation: u64::MAX,
+                            lease_epoch: 1,
+                        })
                 }
                 _ => unreachable!(),
             }
