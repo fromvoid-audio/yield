@@ -186,7 +186,7 @@ mod exact_database_claim_persistence {
                 InventoryHeader {
                     profile: f.owner.profile_root_identity().into(),
                     acquisition: f.owner.owner_identity().into(),
-                    ownership_generation: 1,
+                    ownership_generation: f.owner.ownership_generation(),
                     decision_nonce: Uuid::new_v4(),
                 },
                 bindings,
@@ -761,7 +761,7 @@ mod exact_database_claim_persistence {
             InventoryHeader {
                 profile: owner.profile_root_identity().into(),
                 acquisition: owner.owner_identity().into(),
-                ownership_generation: 1,
+                ownership_generation: owner.ownership_generation(),
                 decision_nonce: Uuid::new_v4(),
             },
             bindings,
@@ -803,6 +803,65 @@ mod exact_database_claim_persistence {
             .connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
+    }
+    #[test]
+    fn original_profile_generation_mismatch_refuses_before_pin_or_sql() {
+        let f = fixture();
+        let store = OperationJournalStore::open(&f.owner).unwrap();
+        let (record, claims, inventory) = input(&f.owner, 2);
+        let mut header = inventory.header().clone();
+        header.ownership_generation = if f.owner.ownership_generation() == i64::MAX as u64 {
+            1
+        } else {
+            f.owner.ownership_generation() + 1
+        };
+        let bad = DatabaseClaimInventory::new(
+            header,
+            inventory.bindings().to_vec(),
+            inventory.slices().to_vec(),
+        )
+        .unwrap();
+        let provider = logical_provider(&record);
+        let plan = full_capacity_plan_for_record(&record).unwrap();
+        let lease = provider.admit(&plan, &claims).unwrap();
+        let sql_entries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_entries = std::sync::Arc::clone(&sql_entries);
+        store.set_insert_test_hook(move |_| {
+            observed_entries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            InsertTestDirective::Continue
+        });
+        assert!(matches!(
+            store.settle_initial_claims_with_inventory(
+                &record, &claims, &provider, lease, Some(&bad)
+            ),
+            Err(InitialClaimSettlementError::Store(
+                OperationJournalStoreError::InconsistentRecord { reason }
+            )) if reason.contains("current profile binding mismatch")
+        ));
+        assert_eq!(sql_entries.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(store.get(record.operation_id).unwrap().is_none());
+        for table in [
+            database_claims::BINDING_TABLE,
+            database_claims::SLICE_TABLE,
+            ordinary_claims::TABLE_NAME,
+        ] {
+            assert_eq!(rows(&store, table), 0);
+        }
+        assert!(
+            store
+                .read_database_claim_inventory_for_nonce(
+                    bad.header().decision_nonce,
+                    bad.digest().unwrap()
+                )
+                .unwrap()
+                .is_none()
+        );
+        for claim in claims.claims() {
+            assert_eq!(
+                provider.outstanding(claim.volume(), claim.allocation_class()),
+                0
+            );
+        }
     }
     #[test]
     fn same_volume_split_is_atomic_and_reopens_with_retained_charges() {
