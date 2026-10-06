@@ -16,8 +16,33 @@ pub struct SourceLeaseMaintenanceAllocation {
     allocation: LifecycleDatabaseAllocation,
     owner: Weak<()>,
     deadline: Instant,
+    retirement: Option<super::lease_maintenance_preparation::retirement_policy::Input>,
 }
 impl SourceLeaseMaintenanceAllocation {
+    /// Attach one complete frozen family to this genuine original observation. This only
+    /// requests original-owner planning; it cannot issue a positive policy or effect grant.
+    pub(crate) fn bind_retirement_policy(
+        &mut self,
+        args: &crate::operation_journal::source_registry_retirement::SourceRegistryRetirementIntentArgs,
+    ) -> Result<(), LifecycleAllocationError> {
+        if self.retirement.is_some()
+            || !args
+                .lease_fence()
+                .matches_allocation(&self.subject, &self.allocation)
+        {
+            return Err(LifecycleAllocationError::Unknown);
+        }
+        self.retirement =
+            Some(super::lease_maintenance_preparation::retirement_policy::Input::new(args)?);
+        Ok(())
+    }
+
+    pub(super) fn retirement_input(
+        &self,
+    ) -> Option<super::lease_maintenance_preparation::retirement_policy::Input> {
+        self.retirement
+    }
+
     pub(crate) fn preparation_scratch_bytes(&self) -> Option<usize> {
         // Actual recaptured allocation/subjects and checked CONTROL/native scratch; no
         // StoredSourceLeaseFence encoding is created during the preparation phase.
@@ -212,6 +237,7 @@ impl SourceWriter {
                 allocation,
                 owner: Arc::downgrade(&self.reference_liveness),
                 deadline,
+                retirement: None,
             })
         })
     }

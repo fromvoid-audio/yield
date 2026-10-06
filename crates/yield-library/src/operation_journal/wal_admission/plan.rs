@@ -409,6 +409,14 @@ impl WalPreparationInput {
         // Build the fixed typed policy while the complete original topology/DTO scratch
         // is funded. finish releases that staging; afterward transfer no variable backing.
         let retirement = if let UniversalCommandArgs::SourceRegistryRetirement(args) = args {
+            // The same genuine allocation moves through the original funded Source FIFO.
+            // Attach the complete frozen RELEASE family before releasing DTO scratch.
+            for source in &mut sources {
+                let SourceInput::Lease(input) = &mut source.input else {
+                    return Err(bad());
+                };
+                input.bind_retirement_policy(args).map_err(|_| bad())?;
+            }
             Some(
                 GlobalPreparationRequest::retirement_policy_input(args)
                     .map_err(WalPreparationError::Global)?,

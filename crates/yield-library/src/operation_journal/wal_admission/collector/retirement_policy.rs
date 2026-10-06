@@ -414,11 +414,23 @@ impl Collector {
         if lease.correlation() != &expected {
             return Err(bad());
         }
+        let source_policy = lease
+            .original_binding()
+            .retirement_forward_policy()
+            .ok_or_else(bad)?;
+        if !source_policy.matches_original(
+            args,
+            policy.family_digest(),
+            fence,
+            lease.scope_descriptor_bytes(),
+        ) {
+            return Err(bad());
+        }
         let source = pair(
             args.source_work(),
             fence.device(),
             fence.allocation_unit(),
-            fence.write_ceilings(),
+            source_policy.component_ceilings(),
         )?;
         let draining = pair(
             args.draining_work(),

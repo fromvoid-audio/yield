@@ -34,6 +34,35 @@ impl SourceLeaseMaintenanceBinding {
     }
 }
 impl SourceLeaseMaintenancePreparation {
+    /// Seal planning only after this same original preparation retains Registered custody.
+    /// Generic pre-audit diagnostics retain no retirement policy; no fallback can issue one.
+    pub(crate) fn capture_retirement_forward_policy(
+        &self,
+        binding: &mut SourceLeaseMaintenanceBinding,
+        registration: &SourceAuthorityRegistration,
+        encoded: &[u8],
+    ) -> Result<(), SourceLeaseMaintenancePreparationError> {
+        let Some(input) = self.observation().retirement_input() else {
+            return Ok(());
+        };
+        if binding.retirement.is_some()
+            || self.custody.registered.is_none()
+            || self.custody.policy.is_none()
+        {
+            return Err(LifecycleAllocationError::Unknown.into());
+        }
+        self.validate_registered_lease_binding(binding, registration)?;
+        let policy = super::retirement_policy::SourceRetirementForwardPolicy::capture(
+            input,
+            &binding.stored,
+            self.nonce(),
+            encoded,
+        )?;
+        self.validate_registered_lease_binding(binding, registration)?;
+        binding.retirement = Some(policy);
+        Ok(())
+    }
+
     /// Capture the original registration/source tuple inside the retained empty MAIN transaction.
     /// A genuine Prepared registration can be observed; that is not admitted retirement authority.
     pub fn capture_lease_binding(
