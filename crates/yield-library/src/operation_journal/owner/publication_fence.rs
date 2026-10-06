@@ -4,6 +4,9 @@ use super::{InputPermit, OperationId, OperationJournalOwnerError, OwnerShared};
 use crate::sample_sources::db::SourceRegistrationId;
 use std::sync::{Arc, Mutex};
 
+mod custody;
+use custody::Custody;
+
 const MAX_FENCES: usize = 32;
 pub(super) const HEADER_BYTES: usize = 8192;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,24 +25,32 @@ struct Fence {
     source: SourceRegistrationId,
     generation: u64,
     state: Mutex<State>,
+    // Last: scalar state drops before the original shared header debit.
+    _backing: Custody<InputPermit>,
 }
 pub(super) struct PendingFence {
-    fence: Arc<Fence>,
+    fence: Custody<Fence>,
     entered: bool,
 }
 pub(super) struct Registry {
-    slots: [Option<Arc<Fence>>; MAX_FENCES],
+    slots: [Option<Custody<Fence>>; MAX_FENCES],
     incarnation: uuid::Uuid,
     next: u64,
     exhausted: bool,
-    input: Option<InputPermit>,
+    input: Option<Custody<InputPermit>>,
 }
 const _: () = assert!(
     std::mem::size_of::<Registry>()
-        + MAX_FENCES * (std::mem::size_of::<Fence>() + 2 * std::mem::size_of::<usize>())
+        + (MAX_FENCES + 1) * (std::mem::size_of::<Fence>() + 2 * std::mem::size_of::<usize>())
+        + std::mem::size_of::<InputPermit>()
+        + 2 * std::mem::size_of::<usize>()
         + super::super::capacity_provider::PUBLICATION_MIRROR_BYTES
         <= HEADER_BYTES
 );
+// Arc headers are two machine words; these private payload alignments need no extra pad.
+const _: () = assert!(std::mem::align_of::<Fence>() <= std::mem::align_of::<usize>());
+const _: () = assert!(std::mem::align_of::<InputPermit>() <= std::mem::align_of::<usize>());
+
 fn quarantine(state: &mut State) {
     *state = match *state {
         State::CompletedNoEffect { digest, .. } | State::UnknownCompletion { digest } => {
@@ -104,7 +115,7 @@ impl Registry {
             return Err(refused("original publication fence state is unknown"));
         }
         if self.input.is_none() {
-            self.input = Some(
+            self.input = Some(Custody::new(
                 shared
                     .reserve_publication_input(HEADER_BYTES)
                     .map_err(|error| {
@@ -112,13 +123,13 @@ impl Registry {
                             "original publication fence backing unavailable: {error}"
                         ))
                     })?,
-            );
+            ));
         }
         // The original registry is the sole remaining owner only after all executable
         // grant/entry custody dropped. Unsettled or unknown attempts are never reclaimed.
         for slot in &mut self.slots {
             let reusable = slot.as_ref().is_some_and(|fence| {
-                Arc::strong_count(fence) == 1
+                fence.strong_count() == 1
                     && matches!(
                         fence.state.lock().map(|state| *state),
                         Ok(State::Pending | State::Closed)
@@ -148,13 +159,18 @@ impl Registry {
             return Err(refused("original publication fence generations exhausted"));
         };
         self.next = generation;
-        let fence = Arc::new(Fence {
+        let fence = Custody::new(Fence {
             operation,
             source,
             generation,
             state: Mutex::new(State::Pending),
+            _backing: self
+                .input
+                .as_ref()
+                .expect("prepaid original fence header")
+                .clone(),
         });
-        *slot = Some(Arc::clone(&fence));
+        *slot = Some(fence.clone());
         Ok(PendingFence {
             fence,
             entered: false,
@@ -165,7 +181,7 @@ impl Registry {
         self.slots
             .iter()
             .flatten()
-            .any(|original| Arc::ptr_eq(original, &fence.fence))
+            .any(|original| original.ptr_eq(&fence.fence))
             .then_some((self.incarnation, fence.fence.generation))
     }
     // Bounded original actor scan. Observation is deliberately not settlement.
@@ -279,7 +295,7 @@ impl PendingFence {
     }
     #[cfg(all(test, unix))]
     pub(super) fn completion_observer(&self) -> impl Fn() -> bool + use<> {
-        let fence = Arc::clone(&self.fence);
+        let fence = self.fence.clone();
         move || {
             matches!(
                 fence.state.lock().map(|s| *s),
