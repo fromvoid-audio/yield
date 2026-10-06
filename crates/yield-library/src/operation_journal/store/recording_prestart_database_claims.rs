@@ -47,6 +47,32 @@ impl OperationJournalStore {
                 return Err(OperationJournalStoreError::RecordingPrestartResourceBound);
             }
         }
+        // Character-count UUID projections are not byte bounds: SQLite length(TEXT)
+        // stops at NUL. Check the complete stored bytes before either ID page or
+        // original inventory/readback columns can be copied into owned Rust values.
+        for (table, fields) in [
+            (
+                database_claims::BINDING_TABLE,
+                &["binding_id", "operation_id", "decision_nonce"][..],
+            ),
+            (
+                database_claims::SLICE_TABLE,
+                &[
+                    "slice_id",
+                    "operation_id",
+                    "binding_id",
+                    "claim_id",
+                    "participant_id",
+                ][..],
+            ),
+            (ordinary_claims::TABLE_NAME, &["claim_id"][..]),
+        ] {
+            for field in fields {
+                self.prestart_database_text_bound(table, field, 36 * 4)?;
+            }
+        }
+        self.prestart_database_text_bound(database_claims::BINDING_TABLE, "volume", 20 * 4)?;
+        self.prestart_database_text_bound(database_claims::BINDING_TABLE, "main_file", 256)?;
         // A valid V17 Recording inventory has authoritative/global participants, never
         // a V18 lease/retirement scope. Its canonical encoding is therefore V1. Refuse
         // unsupported nested lease materialization before copying the original blob;
@@ -57,6 +83,24 @@ impl OperationJournalStore {
               OR substr(inventory,1,6)!=X'595743420100'))
              OR (ordinal!=0 AND inventory IS NOT NULL))",
             [MAX_INVENTORY_BYTES as i64],
+            |row| row.get(0),
+        )?;
+        if bad {
+            return Err(OperationJournalStoreError::RecordingPrestartResourceBound);
+        }
+        Ok(())
+    }
+
+    fn prestart_database_text_bound(
+        &self,
+        table: &str,
+        field: &str,
+        maximum: i64,
+    ) -> Result<(), OperationJournalStoreError> {
+        // Only private hard-coded table/field names reach this scalar query.
+        let bad: bool = self.connection.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE typeof({field})!='text' OR length(CAST({field} AS BLOB))>?1)"),
+            [maximum],
             |row| row.get(0),
         )?;
         if bad {

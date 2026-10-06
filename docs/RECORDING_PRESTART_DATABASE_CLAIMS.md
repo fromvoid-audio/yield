@@ -56,7 +56,12 @@ reply and verifies temporary release while the lifetime credit stays held. That
 unissued facade still refuses and creates no producer or Source authority.
 
 Before any original inventory copy, scalar SQL checks its type, original length,
-relation ceilings and magic. The existing pre-start record decoder only supports
+relation ceilings and magic. Every copied binding/slice UUID column and ordinary
+claim ID must also be SQLite TEXT with at most 144 actual UTF-8 bytes; volume and
+main_file columns have their closed 80/256-byte readback bounds. SQLite's
+character-count projections stop at NUL, so the preflight counts the entire BLOB
+cast before any ID page or inventory is owned. Oversized, embedded-NUL-suffix and
+wrong-type row fixtures refuse before the original inventory-copy counter moves. The existing pre-start record decoder only supports
 V17 Recording. A valid matching inventory therefore has canonical V1 encoding:
 V2 lease scope and V3/V4 retirement bindings require V18 retirement semantics.
 The magic check excludes those unsupported nested allocations; it does not replace

@@ -137,13 +137,23 @@ fn recording_prestart_database_claims_complete_multiple_inventory_is_not_truncat
 
 #[test]
 fn recording_prestart_database_claims_shape_refuses_before_original_inventory_copy() {
-    for corrupt in ["oversized", "lease_version", "wrong_type"] {
+    for corrupt in [
+        "oversized",
+        "lease_version",
+        "wrong_type",
+        "oversized_operation_id",
+        "nul_operation_id",
+        "nul_slice_id",
+        "nul_claim_id",
+        "nul_nonce",
+        "wrong_id_type",
+    ] {
         let f = fixture();
         let store = OperationJournalStore::open(&f.owner).unwrap();
         persist_recording_database_fixture(&store, &f.owner);
         store
             .connection
-            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .execute_batch("PRAGMA ignore_check_constraints=ON; PRAGMA foreign_keys=OFF")
             .unwrap();
         match corrupt {
             "oversized" => {
@@ -151,6 +161,34 @@ fn recording_prestart_database_claims_shape_refuses_before_original_inventory_co
             }
             "lease_version" => {
                 store.connection.execute("UPDATE operation_journal_database_binding SET inventory=CAST(X'595743420200' || substr(inventory,7) AS BLOB) WHERE ordinal=0", []).unwrap();
+            }
+            "oversized_operation_id" => {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE operation_journal_database_binding SET operation_id=?1",
+                        ["x".repeat(1024 * 1024)],
+                    )
+                    .unwrap();
+            }
+            "nul_operation_id" | "nul_slice_id" | "nul_claim_id" | "nul_nonce" => {
+                let value = format!("{}\0{}", "a".repeat(36), "x".repeat(1024 * 1024));
+                // The original character-count guard sees 36 despite the hidden suffix.
+                let length: i64 = store
+                    .connection
+                    .query_row("SELECT length(?1)", [&value], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(length, 36);
+                let (table, field) = match corrupt {
+                    "nul_operation_id" => (database_claims::BINDING_TABLE, "operation_id"),
+                    "nul_slice_id" => (database_claims::SLICE_TABLE, "slice_id"),
+                    "nul_claim_id" => (ordinary_claims::TABLE_NAME, "claim_id"),
+                    _ => (database_claims::BINDING_TABLE, "decision_nonce"),
+                };
+                store.connection.execute(&format!("UPDATE {table} SET {field}=?1 WHERE rowid=(SELECT rowid FROM {table} LIMIT 1)"), [&value]).unwrap();
+            }
+            "wrong_id_type" => {
+                store.connection.execute("UPDATE operation_journal_database_binding SET binding_id=zeroblob(36) WHERE ordinal=0", []).unwrap();
             }
             _ => {
                 store.connection.execute("UPDATE operation_journal_database_binding SET inventory='retained unsupported text' WHERE ordinal=0", []).unwrap();
