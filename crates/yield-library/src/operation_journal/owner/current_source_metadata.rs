@@ -20,7 +20,13 @@ const VOLUME_DYNAMIC: usize = 2 * OWNER_DYNAMIC + 2 * RESERVE_DYNAMIC + PATH + 4
 // registry/lock paths are all bounded before retention; passwd lookup uses a fixed 16KiB Vec.
 // Marker read/write buffers are <=1025 bytes, with Vec/String growth to <=2048 bytes each.
 // Reserve binding/profile/context identity copies and one bounded native diagnostic coexist.
-const PRODUCER_SCRATCH: usize =
-    6 * PATH + 16 * 1024 + std::mem::size_of::<Vec<u8>>() + 2 * 2048 + 12 * IDENTITY + PATH;
+// One terminal-check owner context alias overlaps the installed owner + inner Store alias.
+const PRODUCER_SCRATCH: usize = OWNER_DYNAMIC
+    + 6 * PATH
+    + 16 * 1024
+    + std::mem::size_of::<Vec<u8>>()
+    + 2 * 2048
+    + 12 * IDENTITY
+    + PATH;
 
 pub(super) const NATIVE_BACKING_BYTES: usize = 2 * VOLUME_DYNAMIC + PRODUCER_SCRATCH;
