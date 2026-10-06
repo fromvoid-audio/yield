@@ -8,8 +8,8 @@ The private byte visitor validates every original u8 scalar while retaining at m
 65,537 bytes. The extra byte preserves an invalid oversized shape, which can never
 pass the original inventory check or return a decoded start. Valid inventories keep
 all original bytes. Explicit capped reserve growth keeps vector capacity at or below
-65,537 bytes; old/new allocation overlap during the final reserve is at most
-65,536 + 65,537 bytes. This component bound excludes allocator metadata, the raw
+65,537 bytes; old/new requested backing overlap during the final reserve is at most
+65,536 + 65,537 bytes. This component bound excludes allocator rounding and metadata, the raw
 image, serializer output, command JSON, SQLite workspace and complete audit maps.
 
 For an overflowing inventory, canonical comparison borrows its original array

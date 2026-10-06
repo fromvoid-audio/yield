@@ -63,7 +63,7 @@ fn attempt_inventory_bytes_canonical_overflow_checks_complete_wire() {
         canonical_overflow(input.as_bytes(), canonical.as_bytes(), canonical.len() - 1)
             .unwrap_err()
             .to_string(),
-        "attempt encoding bound"
+        "unsupported database claim inventory: attempt encoding bound"
     );
     let whitespace = input.replace("[0", "[ 0");
     assert_eq!(
@@ -74,7 +74,7 @@ fn attempt_inventory_bytes_canonical_overflow_checks_complete_wire() {
         )
         .unwrap_err()
         .to_string(),
-        "attempt encoding bound"
+        "unsupported database claim inventory: attempt encoding bound"
     );
     for input in [
         input.replace("[0", "[ 0"),
