@@ -69,7 +69,7 @@ impl GlobalWalPreparationClient {
             canceled: Arc::clone(&canceled),
             ready,
             binding_credit,
-            handshake_credit: handshake_credit.as_ref().map(Arc::clone),
+            handshake_credit: handshake_credit.clone(),
         }))?;
         Ok(GlobalPreparationPending {
             ready: receiver,

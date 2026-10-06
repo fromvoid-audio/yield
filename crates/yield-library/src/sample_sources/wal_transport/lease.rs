@@ -133,8 +133,27 @@ impl SourceWalTransport {
 /// use yield_library::sample_sources::wal_transport::SourceLeaseWalTransportObservation;
 /// let forged = SourceLeaseWalTransportObservation {};
 /// ```
-#[derive(Clone, Debug)]
-pub struct SourceLeaseWalTransportObservation(Arc<LeaseReport>);
+pub struct SourceLeaseWalTransportObservation(Option<Arc<LeaseReport>>);
+impl Clone for SourceLeaseWalTransportObservation {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl std::fmt::Debug for SourceLeaseWalTransportObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SourceLeaseWalTransportObservation")
+            .field(self.report())
+            .finish()
+    }
+}
+impl Drop for SourceLeaseWalTransportObservation {
+    fn drop(&mut self) {
+        // The allocation must be gone before its moved payload refunds the credit.
+        if let Some(report) = self.0.take().and_then(Arc::into_inner) {
+            drop(report);
+        }
+    }
+}
 #[derive(Debug)]
 struct LeaseReport {
     binding: SourceLeaseMaintenanceBinding,
@@ -146,37 +165,41 @@ struct LeaseReport {
 }
 impl PartialEq for SourceLeaseWalTransportObservation {
     fn eq(&self, other: &Self) -> bool {
-        self.0.registered_custody_retained == other.0.registered_custody_retained
-            && self.0.binding.registration_generation() == other.0.binding.registration_generation()
-            && self.0.binding.retirement_forward_policy()
-                == other.0.binding.retirement_forward_policy()
-            && self.0.bytes == other.0.bytes
-            && self.0.correlation == other.0.correlation
-            && self.0.wal_bytes == other.0.wal_bytes
+        self.report().registered_custody_retained == other.report().registered_custody_retained
+            && self.report().binding.registration_generation()
+                == other.report().binding.registration_generation()
+            && self.report().binding.retirement_forward_policy()
+                == other.report().binding.retirement_forward_policy()
+            && self.report().bytes == other.report().bytes
+            && self.report().correlation == other.report().correlation
+            && self.report().wal_bytes == other.report().wal_bytes
     }
 }
 impl Eq for SourceLeaseWalTransportObservation {}
 impl SourceLeaseWalTransportObservation {
+    fn report(&self) -> &LeaseReport {
+        self.0.as_deref().expect("live original lease report")
+    }
     // Historical original-producer marker only; no current claim or decision authority.
     pub(crate) fn registered_custody_was_retained(&self) -> bool {
-        self.0.registered_custody_retained
+        self.report().registered_custody_retained
     }
 
     /// Genuine original binding, retaining only historical issuer observations.
     pub fn original_binding(&self) -> &SourceLeaseMaintenanceBinding {
-        &self.0.binding
+        &self.report().binding
     }
     /// Canonical historical descriptor; decoding it cannot construct this native observation.
     pub fn scope_descriptor_bytes(&self) -> &[u8] {
-        &self.0.bytes
+        &self.report().bytes
     }
     /// Historical correlation, never allocated claims or a decision.
     pub fn correlation(&self) -> &SourceWalTransportCorrelation {
-        &self.0.correlation
+        &self.report().correlation
     }
     /// Actual original WAL observation, never watermark permission.
     pub fn wal_bytes(&self) -> u64 {
-        self.0.wal_bytes
+        self.report().wal_bytes
     }
 }
 
@@ -331,14 +354,14 @@ impl SourceLeaseWalTransportOwner {
         if Instant::now() >= self.deadline() {
             return Err(SourceWalTransportRejection::Deadline);
         }
-        let scope = SourceLeaseWalTransportObservation(Arc::new(LeaseReport {
+        let scope = SourceLeaseWalTransportObservation(Some(Arc::new(LeaseReport {
             binding,
             bytes,
             correlation: self.request.correlation.clone(),
             wal_bytes,
             registered_custody_retained: self.request.handshake.is_some(),
             _credit: credit,
-        }));
+        })));
         self.scope = Some(scope.clone());
         self.request
             .ticket

@@ -23,10 +23,50 @@ const _: () = assert!(
         < 2048
 );
 
+// Private aliases free their Arc allocation before the moved credit refunds.
+// Neither a raw Arc nor a Weak escapes this holder.
+pub(super) struct CreditRef<T> {
+    inner: Option<Arc<T>>,
+}
+impl<T> CreditRef<T> {
+    fn new(value: T) -> Self {
+        Self {
+            inner: Some(Arc::new(value)),
+        }
+    }
+}
+impl<T> Clone for CreditRef<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+impl<T: std::fmt::Debug> std::fmt::Debug for CreditRef<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::ops::Deref::deref(self).fmt(f)
+    }
+}
+impl<T> std::ops::Deref for CreditRef<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.inner.as_deref().expect("live original global credit")
+    }
+}
+impl<T> Drop for CreditRef<T> {
+    fn drop(&mut self) {
+        if let Some(credit) = self.inner.take().and_then(Arc::into_inner) {
+            drop(credit);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(in super::super) struct Budget(Mutex<usize>);
 impl Budget {
-    pub(super) fn reserve(self: &Arc<Self>) -> Result<Arc<Credit>, GlobalLibraryWriterQueueError> {
+    pub(super) fn reserve(
+        self: &Arc<Self>,
+    ) -> Result<CreditRef<Credit>, GlobalLibraryWriterQueueError> {
         let mut bytes = self
             .0
             .lock()
@@ -36,7 +76,7 @@ impl Budget {
             .filter(|n| *n <= GLOBAL_PREPARATION_MAX_BYTES)
             .ok_or(GlobalLibraryWriterQueueError::Full)?;
         *bytes = next;
-        Ok(Arc::new(Credit(Arc::clone(self))))
+        Ok(CreditRef::new(Credit(Arc::clone(self))))
     }
 }
 #[derive(Debug)]
@@ -296,12 +336,12 @@ pub(super) struct SharedHandshakeCredit(
 impl SharedHandshakeCredit {
     pub(super) fn reserve(
         budget: &Arc<crate::operation_journal::wal_admission::HandshakeBudget>,
-    ) -> Result<Arc<Self>, GlobalLibraryWriterQueueError> {
+    ) -> Result<CreditRef<Self>, GlobalLibraryWriterQueueError> {
         let mut credit = budget.credit();
         credit
             .resize(HANDOFF_BYTES)
             .map_err(|_| GlobalLibraryWriterQueueError::Full)?;
-        Ok(Arc::new(Self(Mutex::new(credit))))
+        Ok(CreditRef::new(Self(Mutex::new(credit))))
     }
     pub(super) fn retain(
         &self,
