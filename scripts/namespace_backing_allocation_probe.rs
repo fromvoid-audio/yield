@@ -91,7 +91,30 @@ fn observe(store: &OperationJournalStore, expected_success: bool, name: &str) {
 fn main() {
     let root = std::env::temp_dir().join(format!("yield-namespace-probe-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
-    let app = AppRootGuard::set(root.clone()).unwrap();
+    run(&root);
+    let mut unicode = root.clone();
+    for _ in 0..3 {
+        unicode.push("界".repeat(70));
+        std::fs::create_dir(&unicode).unwrap();
+    }
+    run(&unicode);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut bytes = vec![b'x'; 180];
+        bytes.extend_from_slice(&[0xff, 0xfe]);
+        let invalid = root.join(std::ffi::OsString::from_vec(bytes));
+        std::fs::create_dir(&invalid).unwrap();
+        run(&invalid);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+fn run(root: &std::path::Path) {
+    println!(
+        "original root encoded_bytes={}",
+        root.as_os_str().as_encoded_bytes().len()
+    );
+    let app = AppRootGuard::set(root.to_path_buf()).unwrap();
     let guard = WritableProfileGuard::acquire_current().unwrap();
     let store = OperationJournalStore::open(&guard).unwrap();
     let path = store.retained_namespace_path_for_test();
@@ -112,6 +135,13 @@ fn main() {
         let saved = path.with_file_name("namespace-original.saved");
         std::fs::rename(&path, &saved).unwrap();
         observe(&store, false, "original-missing-path");
+        std::fs::create_dir(&path).unwrap();
+        observe(&store, false, "original-directory-native-io");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        observe(&store, false, "original-replaced-file");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_file(&path).unwrap();
         std::fs::rename(saved, &path).unwrap();
     }
     assert_eq!(std::fs::read(&path).unwrap(), original);
@@ -119,5 +149,4 @@ fn main() {
     drop(store);
     drop(guard);
     drop(app);
-    std::fs::remove_dir_all(root).unwrap();
 }
