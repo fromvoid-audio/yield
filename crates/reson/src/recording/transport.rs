@@ -130,7 +130,7 @@ impl Initialization {
         }
     }
 }
-const _: () = assert!(size_of::<Initialization>() <= 128);
+const _: () = assert!(size_of::<Option<Initialization>>() <= 128);
 impl Sink {
     fn check(&self) -> io::Result<()> {
         if self.failed {

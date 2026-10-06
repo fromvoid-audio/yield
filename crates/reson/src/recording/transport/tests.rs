@@ -352,7 +352,7 @@ fn original_producer_waits_for_header_pcm_and_separate_flush_acknowledgements() 
 
 #[test]
 fn original_initialization_refuses_holes_overflow_and_incomplete_flush_without_dispatch() {
-    assert!(size_of::<Initialization>() <= 128);
+    assert!(size_of::<Option<Initialization>>() <= 128);
     for case in 0..3 {
         let (mut sink, receiver) = sink(Duration::from_secs(1), 1024);
         sink.initialization = Some(Initialization::new());
