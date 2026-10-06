@@ -246,7 +246,7 @@ fn registered_retirement_codec_and_storage() {
                 .connection
                 .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                 .unwrap(),
-            12
+            JOURNAL_SCHEMA_VERSION
         );
         let changed_digest = changed.digest().unwrap();
         reopened.connection.execute("UPDATE operation_journal_database_binding SET inventory_digest=?1,inventory=CASE WHEN ordinal=0 THEN ?2 ELSE NULL END WHERE operation_id=?3",params![changed_digest.as_slice(),changed.encode().unwrap(),record.operation_id.to_string()]).unwrap();
@@ -608,7 +608,7 @@ fn retirement_forward_codec_and_storage() {
                 .connection
                 .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                 .unwrap(),
-            12
+            JOURNAL_SCHEMA_VERSION
         );
         // Correlating digest cannot repair unequal frozen transition component budgets.
         let bad_image = bad.encode().unwrap();
