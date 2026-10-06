@@ -145,7 +145,7 @@ impl InputBudget {
             && self.remaining[1] <= CONTROL_INPUT_RESERVED_BYTES
             && self.publication_remaining <= PUBLICATION_INPUT_BYTES
             && PUBLICATION_INPUT_BYTES - self.publication_remaining
-                <= ORDINARY_INPUT_BYTES - self.remaining[0]
+                <= ORDINARY_INPUT_BYTES - startup_credit::POOL_BYTES - self.remaining[0]
     }
 }
 

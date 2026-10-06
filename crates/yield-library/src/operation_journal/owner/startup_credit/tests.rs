@@ -72,3 +72,26 @@ fn detached_original_refund_poison_closes_actual_lifecycle_and_resource_gate() {
     );
     assert_eq!(shared.resource_admission.snapshot().0, false);
 }
+
+#[test]
+fn permanent_startup_debit_cannot_mask_corrupt_publication_accounting() {
+    let shared = shared();
+    let baseline = InputBudget::shared_initial();
+    shared.input_bytes.lock().unwrap().publication_remaining -= 1;
+    assert!(matches!(
+        shared.reserve_input(InputClass::Control, 1),
+        Err(OperationJournalOwnerQueueError::Unavailable { .. })
+    ));
+    let budget = *shared.input_bytes.lock().unwrap();
+    assert!(budget.unavailable);
+    assert_eq!(budget.remaining, baseline.remaining);
+    assert_eq!(
+        budget.publication_remaining,
+        baseline.publication_remaining - 1
+    );
+    assert_eq!(
+        shared.lifecycle.load(Ordering::Acquire),
+        OwnerLifecycle::Unavailable as u8
+    );
+    assert_eq!(shared.resource_admission.snapshot().0, false);
+}
