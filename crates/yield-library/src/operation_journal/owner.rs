@@ -3158,13 +3158,14 @@ impl OwnerRuntime {
         &mut self,
         input: SourceAuthorityRegistrationRequest,
     ) -> Result<SourceAuthorityRegistrationReceipt, OperationJournalOwnerError> {
-        self.register_source_authority_funded(input, None)
+        self.register_source_authority_funded(None, input)
     }
 
     fn register_source_authority_funded(
         &mut self,
-        input: SourceAuthorityRegistrationRequest,
+        // Parameters drop in reverse order: the original request/confirmation must drop first.
         current_input: Option<Arc<InputPermit>>,
+        input: SourceAuthorityRegistrationRequest,
     ) -> Result<SourceAuthorityRegistrationReceipt, OperationJournalOwnerError> {
         let request = input.request;
         let registration_id = request.registration_id();
@@ -4657,6 +4658,11 @@ impl OperationJournalClient {
             .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<SourceVolumeBinding>()))
             .and_then(|bytes| bytes.checked_add(6 * std::mem::size_of::<VolumeIdentity>()))
             .and_then(|bytes| bytes.checked_add(512))
+            .and_then(|bytes| {
+                bytes.checked_add(std::mem::size_of::<
+                    crate::sample_sources::db::CurrentReserveUseProof<'static>,
+                >())
+            })
             .ok_or_else(|| OperationJournalOwnerQueueError::InvalidRecord {
                 reason: String::from(
                     "Current source registration metadata exceeds its bounded field inventory",
@@ -6477,7 +6483,7 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
         } => {
             let input = Arc::new(input);
             execute_store_result(result, move || {
-                runtime.register_source_authority_funded(request, Some(input))
+                runtime.register_source_authority_funded(Some(input), request)
             })
         }
         JournalCommand::BeginSourceDrain {
