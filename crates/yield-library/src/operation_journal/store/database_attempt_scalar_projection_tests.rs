@@ -85,6 +85,15 @@ fn database_attempt_scalar_projection_nonce_and_audit_keys_remain_bounded() {
         );
         assert_eq!(database_attempts::SCALAR_COPIED_BYTES.with(|b| b.get()), 0);
         assert_eq!(retained_image(&store), before);
-        assert!(OperationJournalStore::open(&f.owner).is_err());
+        drop(store);
+        let reopened = OperationJournalStore::open(&f.owner).unwrap();
+        database_attempts::SCALAR_COPIED_BYTES.with(|b| b.set(0));
+        assert!(
+            reopened
+                .read_database_attempt_for_nonce(a.nonce, a.digest().unwrap())
+                .is_err()
+        );
+        assert_eq!(database_attempts::SCALAR_COPIED_BYTES.with(|b| b.get()), 0);
+        assert_eq!(retained_image(&reopened), before);
     }
 }
