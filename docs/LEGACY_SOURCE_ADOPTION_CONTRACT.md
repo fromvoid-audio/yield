@@ -585,7 +585,8 @@ The bound names compiler-sized headers, at most two entry inventories, roots,
 owners, reserves, closed acquisition/namespace failure capsules, 8192-byte path
 capacity bounds, 256-byte native identity capacities, three bounded argument
 copies and encoding scratch, one transient context owner, four canonical path
-backings, marker backing, and two simultaneous target vectors (capacity at most
+backings, the fixed 16KiB passwd lookup buffer plus its Vec header, marker
+backing, and two simultaneous target vectors (capacity at most
 four). Observation-map scratch additionally uses the actual source-volume count
 plus three, with a conservative complete pinned-Rust tree-node inventory per
 volume. Each returned copied checkpoint has its own header plus thirteen

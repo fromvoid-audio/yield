@@ -48,6 +48,7 @@ const RETAINED_BYTES: usize = std::mem::size_of::<RetainedLegacyVolumes>()
         + FAILURE_BYTES)
     + OWNER_BYTES
     + 4 * PATH_BACKING // Simultaneous canonical home/library/support/app paths.
+    + 16 * 1024 + std::mem::size_of::<Vec<u8>>() // canonical_user_home passwd scratch.
     + std::mem::size_of::<crate::sample_sources::db::LegacyReserveUseProof<'static>>()
     + 2 * (std::mem::size_of::<Vec<crate::sample_sources::db::LegacyReserveTarget>>()
         + 4 * std::mem::size_of::<crate::sample_sources::db::LegacyReserveTarget>())

@@ -497,8 +497,9 @@ pub(crate) fn open_canonical_global_app_root() -> Result<(PathBuf, Dir), Profile
 /// Exact native directory backing after a refused legacy-only app bootstrap. No profile grant.
 #[derive(Default)]
 pub(crate) struct LegacyAppRootBacking {
-    parent: Option<Dir>,
+    // Close the affected child before its retained ancestor namespace.
     child: Option<Dir>,
+    parent: Option<Dir>,
 }
 impl LegacyAppRootBacking {
     pub(crate) fn metadata_bytes(&self) -> usize {
