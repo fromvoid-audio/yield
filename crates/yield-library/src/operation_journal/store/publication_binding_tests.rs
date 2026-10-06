@@ -640,7 +640,7 @@ mod publication_issuance {
     }
 
     #[test]
-    fn publication_issuance_staging_maximum_valid_text_fits_conservative_decode_bound() {
+    fn publication_issuance_staging_maximum_valid_text_fits_canonical_temporary_bound() {
         let (_fixture, _store, staging, _binding, _sequence) = prepared();
         let mut value = serde_json::to_value(&staging).unwrap();
         value["locator"] = serde_json::json!("\u{1}".repeat(1024));
