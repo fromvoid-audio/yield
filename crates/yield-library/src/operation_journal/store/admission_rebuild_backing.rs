@@ -215,6 +215,29 @@ fn resource_error(error: OperationJournalStoreError) -> OperationJournalStoreErr
 
 #[cfg(any(test, feature = "test-support"))]
 impl OperationJournalStore {
+    /// Keep collection-pressure fixtures beyond the same original namespace
+    /// phase on each platform; Windows formatter scratch is larger than Unix.
+    #[cfg(test)]
+    pub(in crate::operation_journal) fn ordinary_collection_pressure_rows_for_test(
+        &self,
+    ) -> Result<usize, OperationJournalStoreError> {
+        let required = self
+            .retained_namespace_working_bytes_for_test()
+            .checked_add(2)
+            .ok_or(OperationJournalStoreError::OrdinaryRebuildResourceBound)?;
+        let mut rows = 32usize;
+        loop {
+            let debit = collection_bytes(rows, 0)
+                .ok_or(OperationJournalStoreError::OrdinaryRebuildResourceBound)?;
+            if debit >= required {
+                return Ok(rows);
+            }
+            rows = rows
+                .checked_mul(2)
+                .ok_or(OperationJournalStoreError::OrdinaryRebuildResourceBound)?;
+        }
+    }
+
     /// Original-connection collection allocation fixture, without an owner or effects.
     pub fn install_ordinary_collection_fixture_for_test(
         &self,

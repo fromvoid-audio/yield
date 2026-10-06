@@ -142,3 +142,10 @@ debit. Applying pressure before dispatch could instead refuse the larger precedi
 namespace loan. The gate exists only in test builds; the actual consumer refusal,
 typed reason, zero operation IDs, unchanged database bytes, reply-header custody and
 exact final refund remain asserted.
+
+Collection-pressure fixture row counts derive from the original namespace bound
+and the original collection formula on the current platform, using checked
+arithmetic. Their exact collection-debit-minus-one margin therefore still funds
+the preceding namespace phase, including Windows' larger native formatter scratch.
+This changes fixture setup only; no production quota or wider refusal margin is
+introduced.

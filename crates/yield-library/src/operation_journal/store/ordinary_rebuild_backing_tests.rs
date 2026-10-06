@@ -108,8 +108,9 @@ fn ordinary_rebuild_backing_refuses_collection_pressure_without_partial_snapshot
         1,
     )
     .unwrap();
+    let rows = store.ordinary_collection_pressure_rows_for_test().unwrap();
     store
-        .install_ordinary_collection_fixture_for_test(operation, 512, false)
+        .install_ordinary_collection_fixture_for_test(operation, rows, false)
         .unwrap();
     let before = store.rebuild_admission_snapshot().unwrap();
     let debit = store

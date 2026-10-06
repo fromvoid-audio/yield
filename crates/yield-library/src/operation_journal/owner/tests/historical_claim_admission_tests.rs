@@ -13,8 +13,9 @@ fn ordinary_rebuild_backing_actual_queued_collection_pressure_precedes_identity_
     store
         .install_historical_claim_fixture(old_id, 1, wire.as_bytes(), Uuid::new_v4())
         .unwrap();
+    let rows = store.ordinary_collection_pressure_rows_for_test().unwrap();
     store
-        .install_ordinary_collection_fixture_for_test(old_id, 512, false)
+        .install_ordinary_collection_fixture_for_test(old_id, rows, false)
         .unwrap();
     let collection_debit = store
         .ordinary_collection_allocation_probe_for_test(true)
@@ -68,7 +69,7 @@ fn ordinary_rebuild_backing_actual_queued_collection_pressure_precedes_identity_
     let store = OperationJournalStore::open(&fixture.owner).unwrap();
     assert_eq!(store.get(old_id).unwrap().unwrap().operation_id, old_id);
     let snapshot = store.rebuild_admission_snapshot().unwrap();
-    assert_eq!(snapshot.claims().len(), 512);
+    assert_eq!(snapshot.claims().len(), rows);
 }
 
 #[test]
