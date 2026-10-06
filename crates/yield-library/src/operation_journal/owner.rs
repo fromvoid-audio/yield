@@ -2001,6 +2001,32 @@ impl OwnerRuntime {
             }
         }
 
+        #[cfg(test)]
+        if input.is_some_and(|input| {
+            input
+                .shared
+                .provider_reconciliation_component
+                .load(Ordering::Acquire)
+        }) {
+            // Original queued provider component only. No descriptor/witness bypass
+            // can admit work: this hook always terminates Unsupported before IDs/SQL.
+            let provider = CapacityProvider::unavailable();
+            snapshot
+                .install_provider_component(&provider)
+                .map_err(|error| PreparedAdmissionError::RecoveryRequired {
+                    reason: error.to_string(),
+                })?;
+            snapshot
+                .validate_provider(&provider, input)
+                .map_err(|error| PreparedAdmissionError::RecoveryRequired {
+                    reason: error.to_string(),
+                })?;
+            return Err(PreparedAdmissionError::Unsupported {
+                reason: "funded provider component verified; physical admission unsupported".into(),
+            }
+            .into());
+        }
+
         #[cfg(all(test, target_os = "macos"))]
         let observation = self
             .refresh_live_descriptor_capacity_for_admission(prepared.facts_fault)
@@ -2021,11 +2047,11 @@ impl OwnerRuntime {
         // Reconcile the fresh durable image against the existing owner-thread ledger before
         // arithmetic. An exact image is a no-op; any changed/nonempty conflict remains held and
         // blocks admission without replacing live accounting.
-        snapshot.validate_provider(provider).map_err(|error| {
-            PreparedAdmissionError::RecoveryRequired {
+        snapshot
+            .validate_provider(provider, input)
+            .map_err(|error| PreparedAdmissionError::RecoveryRequired {
                 reason: format!("current durable/live capacity image differs: {error}"),
-            }
-        })?;
+            })?;
         provider
             .validate_recovery_state()
             .map_err(PreparedAdmissionError::from)?;
@@ -5655,6 +5681,8 @@ struct OwnerShared {
     recovery_audit_pause: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     recovery_audit_entered: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    provider_reconciliation_component: std::sync::atomic::AtomicBool,
     results: Mutex<ResultBudget>,
     #[cfg(test)]
     shutdown_cas_gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
@@ -5676,6 +5704,8 @@ impl OwnerShared {
             recovery_audit_pause: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             recovery_audit_entered: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            provider_reconciliation_component: std::sync::atomic::AtomicBool::new(false),
             results: Mutex::new(ResultBudget::new()),
             #[cfg(test)]
             shutdown_cas_gate: Mutex::new(None),
@@ -7325,6 +7355,7 @@ mod tests {
         include!("owner/tests/queue_metrics_integration.rs");
     }
     mod historical_claim_admission_tests;
+    mod provider_reconciliation_tests;
     mod resource_custody_tests;
     mod source_registry_handoff_tests;
     #[test]

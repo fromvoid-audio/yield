@@ -44,12 +44,23 @@ impl FundedSnapshot {
     pub(in crate::operation_journal) fn validate_provider(
         &self,
         provider: &super::super::capacity_provider::CapacityProvider,
+        input: Option<&InputPermit>,
     ) -> Result<(), super::super::capacity_provider::CapacityProviderError> {
-        provider.validate_rebuilt_claims(&self.snapshot)
+        match input {
+            Some(input) => provider.validate_rebuilt_claims_for_input(&self.snapshot, input),
+            None => provider.validate_rebuilt_claims(&self.snapshot),
+        }
     }
     #[cfg(test)]
     pub(super) fn matches_original(&self, original: &OrdinaryClaimRebuildSnapshot) -> bool {
         self.snapshot == *original
+    }
+    #[cfg(test)]
+    pub(in crate::operation_journal) fn install_provider_component(
+        &self,
+        provider: &super::super::capacity_provider::CapacityProvider,
+    ) -> Result<(), super::super::capacity_provider::CapacityProviderError> {
+        provider.install_rebuilt_claims(&self.snapshot)
     }
 }
 
@@ -192,10 +203,28 @@ impl OperationJournalStore {
         rows: usize,
         released: bool,
     ) -> Result<(), OperationJournalStoreError> {
+        self.install_ordinary_collection_volume_fixture_for_test(
+            operation,
+            rows,
+            released,
+            VolumeIdentity { device: 1 },
+            1,
+        )
+    }
+
+    /// Original SQLite fixture image; supplied scalar facts do not qualify or issue claims.
+    pub(in crate::operation_journal) fn install_ordinary_collection_volume_fixture_for_test(
+        &self,
+        operation: OperationId,
+        rows: usize,
+        released: bool,
+        volume: VolumeIdentity,
+        allocated_bytes: u64,
+    ) -> Result<(), OperationJournalStoreError> {
         self.connection.execute_batch("DELETE FROM operation_journal_ordinary_claim_release; DELETE FROM operation_journal_ordinary_claim")?;
         for index in 1..=rows {
             let claim = Uuid::from_u128(index as u128).to_string();
-            self.connection.execute("INSERT INTO operation_journal_ordinary_claim VALUES (?1,?2,'1','DestinationStaging',1)", params![claim, operation.to_string()])?;
+            self.connection.execute("INSERT INTO operation_journal_ordinary_claim VALUES (?1,?2,?3,'DestinationStaging',?4)", params![claim, operation.to_string(), volume.device.to_string(), i64::try_from(allocated_bytes).unwrap()])?;
             if released {
                 self.connection.execute(
                     "INSERT INTO operation_journal_ordinary_claim_release VALUES (?1,?2,?1)",

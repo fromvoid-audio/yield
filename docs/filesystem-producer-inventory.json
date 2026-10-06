@@ -972,6 +972,56 @@
       "issue": "OPT-2391",
       "reason": "cfg(test) genuine original journal worker/Store connection and ordinary pool for complete recovery audit error, exact pressure, lost reply and teardown. No provider, Native qualification, identity allocation or claim effects.",
       "retirement": "Keep only for this original audit custody regression; never activate the no-capacity fixture as production bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/provider_reconciliation_tests.rs",
+      "function": "provider_reconciliation_actual_queued_component_funds_before_graph_and_never_admits",
+      "classification": "fixture",
+      "issue": "OPT-2390",
+      "reason": "cfg(test) original queued Store/owner provider component and exact shared-pool pressure; test-only hook always ends Unsupported before identity or SQL effects. No descriptor witness or physical qualification supplied.",
+      "retirement": "Keep only as the explicit provider reconciliation component fixture; never activate test-only component/start paths in production.",
+      "operation": "journal::open",
+      "count": 2
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/provider_reconciliation_tests.rs",
+      "function": "provider_reconciliation_actual_queued_component_funds_before_graph_and_never_admits",
+      "classification": "fixture",
+      "issue": "OPT-2390",
+      "reason": "cfg(test) original queued Store/owner provider component and exact shared-pool pressure; test-only hook always ends Unsupported before identity or SQL effects. No descriptor witness or physical qualification supplied.",
+      "retirement": "Keep only as the explicit provider reconciliation component fixture; never activate test-only component/start paths in production.",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/provider_reconciliation_tests.rs",
+      "function": "native_original_queue_pressure",
+      "classification": "fixture",
+      "issue": "OPT-2390",
+      "reason": "cfg(macos,test) original queued provider graph-pressure harness with portable hook OFF; separate production registry selection and fixture bootstrap, genuine reserve descriptor facts, no operation ID or SQL effects. Native execution pending OPT-2395; no physical qualification inferred.",
+      "retirement": "Retain only as this native original-provider refusal verification harness; never replace native production/bootstrap resources with a portable permission fixture.",
+      "operation": "journal::open",
+      "count": 2
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/provider_reconciliation_tests.rs",
+      "function": "native_original_queue_pressure",
+      "classification": "fixture",
+      "issue": "OPT-2390",
+      "reason": "cfg(macos,test) original queued provider graph-pressure harness with portable hook OFF; separate production registry selection and fixture bootstrap, genuine reserve descriptor facts, no operation ID or SQL effects. Native execution pending OPT-2395; no physical qualification inferred.",
+      "retirement": "Retain only as this native original-provider refusal verification harness; never replace native production/bootstrap resources with a portable permission fixture.",
+      "operation": "journal::start",
+      "count": 1
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/provider_reconciliation_tests.rs",
+      "function": "native_original_queue_pressure",
+      "classification": "fixture",
+      "issue": "OPT-2390",
+      "reason": "cfg(macos,test) original queued provider graph-pressure harness with portable hook OFF; separate production registry selection and fixture bootstrap, genuine reserve descriptor facts, no operation ID or SQL effects. Native execution pending OPT-2395; no physical qualification inferred.",
+      "retirement": "Retain only as this native original-provider refusal verification harness; never replace native production/bootstrap resources with a portable permission fixture.",
+      "operation": "journal::start_with_capacity_fixture_for_test",
+      "count": 1
     }
   ]
 }
