@@ -2117,17 +2117,50 @@ impl SourceWriter {
         &self,
         identity: SourceWriterCommandIdentity,
     ) -> Result<Option<SourceWriterReceipt>, SourceWriterError> {
-        let current = self.current_revision()?;
-        self.ensure_stored_source_id(&current.source_id)?;
-        let batch = self.database.write_batch()?;
-        let result = match read_receipt_row(batch.curation_transaction(), identity)? {
-            Some(row) => Some(Self::decode_receipt_observation(&current, identity, row)?.2),
-            None => None,
-        };
-        batch
-            .rollback_curation_prepared()
-            .map_err(SourceWriterError::from)?;
-        Ok(result)
+        self.read_receipt_observation_with_deadline(
+            identity,
+            Instant::now() + Duration::from_secs(2),
+        )
+    }
+
+    pub(super) fn read_receipt_observation_with_deadline(
+        &self,
+        identity: SourceWriterCommandIdentity,
+        deadline: Instant,
+    ) -> Result<Option<SourceWriterReceipt>, SourceWriterError> {
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        let _progress = SnapshotProgressGuard::install(&self.database.connection, deadline);
+        let result = (|| {
+            // Full owner validation owns its own audit transaction. Keep it outside this
+            // deferred snapshot, then pin the exact revision before bounded row materialization.
+            let before = self.current_revision()?;
+            let transaction = self
+                .database
+                .connection
+                .unchecked_transaction()
+                .map_err(map_sql_error)?;
+            if self.database.get_revision()? != before.revision() {
+                return Err(SourceWriterError::StaleFence);
+            }
+            self.ensure_stored_source_id(&before.source_id)?;
+            let row = read_receipt_row(&transaction, identity)?;
+            transaction.rollback().map_err(map_sql_error)?;
+            // Historical DTO decoding cannot prolong the SQLite snapshot or acquire a grant.
+            let observation = match row {
+                Some(row) => Some(Self::decode_receipt_observation(&before, identity, row)?.2),
+                None => None,
+            };
+            if before != self.current_revision()? {
+                return Err(SourceWriterError::StaleFence);
+            }
+            Ok(observation)
+        })();
+        if Instant::now() >= deadline {
+            return Err(SourceWriterError::SnapshotBudgetExceeded);
+        }
+        result
     }
 
     /// Apply one exact curation command, or return its durable receipt on replay.
