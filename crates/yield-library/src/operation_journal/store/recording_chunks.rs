@@ -166,7 +166,7 @@ impl OperationJournalStore {
         self.validate_recording_capacity_binding_with_input(proposal, plan, None)
     }
 
-    pub(crate) fn validate_recording_capacity_binding_with_input(
+    pub(in crate::operation_journal) fn validate_recording_capacity_binding_with_input(
         &self,
         proposal: &RecordingProposal,
         plan: &crate::operation_journal::full_capacity::FullCapacityPlan,

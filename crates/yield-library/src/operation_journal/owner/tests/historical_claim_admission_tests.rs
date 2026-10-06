@@ -305,13 +305,19 @@ fn historical_claim_late_send_disposes_payload_before_original_reply_credit() {
 fn historical_claim_earliest_consumer_refusal_keeps_precharged_reply_through_delivery() {
     let fixture = fixture("historical-claim-earliest-refusal");
     let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let durable_path = fixture
+        .owner
+        .profile_root()
+        .join(crate::operation_journal::JOURNAL_DATABASE_ROOT_NAME)
+        .join(crate::operation_journal::JOURNAL_DATABASE_FILE_NAME);
+    let original_bytes = fs::read(&durable_path).unwrap();
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
     wait_until_available(&owner);
     let limit = InputBudget::shared_initial().remaining[InputClass::Ordinary.index()];
-    let retained = owner
+    owner
         .shared
-        .reserve_input(InputClass::Ordinary, limit - 64 * 1024)
-        .unwrap();
+        .historical_consumer_pause
+        .store(true, Ordering::Release);
     let mut request = owner
         .client()
         .admit_prepared(prepared_copy_input(
@@ -321,6 +327,34 @@ fn historical_claim_earliest_consumer_refusal_keeps_precharged_reply_through_del
         ))
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
+    while !owner
+        .shared
+        .historical_consumer_entered
+        .load(Ordering::Acquire)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "same original namespace never reached consumer boundary"
+        );
+        std::thread::yield_now();
+    }
+    // The namespace working loan can exceed the consumer loan. Pressure before
+    // dispatch would test the earlier producer instead. Drain this same actual
+    // pool only after successful namespace validation, with request/header live.
+    let remaining = owner.shared.input_bytes.lock().unwrap().remaining[0];
+    let margin = crate::operation_journal::store::HISTORICAL_DIAGNOSTIC_BYTES - 1;
+    let retained = owner
+        .shared
+        .reserve_input(InputClass::Ordinary, remaining - margin)
+        .unwrap();
+    assert_eq!(
+        owner.shared.input_bytes.lock().unwrap().remaining[0],
+        margin
+    );
+    owner
+        .shared
+        .historical_consumer_pause
+        .store(false, Ordering::Release);
     while !request
         .historical_reply
         .as_ref()
@@ -340,6 +374,7 @@ fn historical_claim_earliest_consumer_refusal_keeps_precharged_reply_through_del
         retained.bytes + HISTORICAL_REPLY_BYTES
     );
     assert_eq!(owner.prepared_admission_id_allocations(), 0);
+    assert_eq!(fs::read(&durable_path).unwrap(), original_bytes);
     let Err(OperationJournalOwnerError::PreparedAdmission(
         PreparedAdmissionError::RecoveryRequired { reason },
     )) = request.recv_timeout(Duration::from_secs(5)).unwrap()

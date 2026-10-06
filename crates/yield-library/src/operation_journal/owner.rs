@@ -1972,6 +1972,8 @@ impl OwnerRuntime {
         // a bootstrap observation and cannot authorize a later request after new recovery rows
         // or settlement evidence arrive.
         if let Some(input) = input {
+            #[cfg(test)]
+            input.historical_consumer_test_gate();
             input.fund_historical_consumer().map_err(|error| {
                 PreparedAdmissionError::RecoveryRequired {
                     reason: error.to_string(),
@@ -5805,6 +5807,10 @@ struct OwnerShared {
     #[cfg(test)]
     recovery_audit_entered: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    historical_consumer_pause: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    historical_consumer_entered: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     provider_reconciliation_component: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     startup_component: std::sync::atomic::AtomicBool,
@@ -5837,6 +5843,10 @@ impl OwnerShared {
             recovery_audit_pause: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             recovery_audit_entered: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            historical_consumer_pause: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            historical_consumer_entered: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             provider_reconciliation_component: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -6159,6 +6169,33 @@ impl InputPermit {
 
     pub(super) fn has_historical_error_consumer(&self) -> bool {
         self.historical_reply.is_some()
+    }
+
+    /// Stop only after the same original namespace has succeeded, before the
+    /// original consumer loan. Tests can then apply pressure at that exact stage.
+    #[cfg(test)]
+    fn historical_consumer_test_gate(&self) {
+        if self
+            .shared
+            .historical_consumer_pause
+            .load(Ordering::Acquire)
+        {
+            self.shared
+                .historical_consumer_entered
+                .store(true, Ordering::Release);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while self
+                .shared
+                .historical_consumer_pause
+                .load(Ordering::Acquire)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "original historical consumer test gate timed out"
+                );
+                std::thread::yield_now();
+            }
+        }
     }
 
     pub(super) fn retain_historical_error(

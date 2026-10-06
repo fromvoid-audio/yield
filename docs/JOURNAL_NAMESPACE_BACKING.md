@@ -134,3 +134,11 @@ metadata SQL/native descriptor facts, physical reserve proof or future ledger gr
 Those remain genuine separate implementation and qualification prerequisites on the
 tracking parents. Supported native descriptor facts can make later metadata guards
 reachable where Linux refuses earlier; full native execution is still separate.
+
+The existing earliest-consumer pressure regression pauses the genuine actor only
+after its original namespace validation succeeds and immediately before its original
+consumer loan. It then drains that same pool to exactly one byte below the consumer
+debit. Applying pressure before dispatch could instead refuse the larger preceding
+namespace loan. The gate exists only in test builds; the actual consumer refusal,
+typed reason, zero operation IDs, unchanged database bytes, reply-header custody and
+exact final refund remain asserted.
