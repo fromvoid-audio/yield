@@ -1352,6 +1352,46 @@
       "issue": "OPT-2409",
       "reason": "Windows cfg(test)-only controlled external ACL fixture descendants and unchanged-byte sentinels; no production namespace producer or ACL setter. Held-original name substitution and metadata-first reparse refusal require genuine native execution in OPT-2410.",
       "retirement": "Retain as native regression fixture while the read-only exact-held-directory snapshot exists; fixture execution cannot qualify publication or canonical bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "operation": "fs::remove_file",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "cfg(macos,test) actual original production Store/root/profile/registry/reserve startup with component hook off. Retained real WAL evidence triggers original queued namespace refusal; both caller APIs retain exact namespace/reply backing through genuine worker join, with unchanged original database and zero IDs. Native SDK/runtime and supported filesystem execution is separate.",
+      "retirement": "Retain only this exact original namespace consumer verification. This fixture does not supply physical qualification, permits, retry, reservation refund, effect, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "operation": "fs::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "cfg(macos,test) actual original production Store/root/profile/registry/reserve startup with component hook off. Retained real WAL evidence triggers original queued namespace refusal; both caller APIs retain exact namespace/reply backing through genuine worker join, with unchanged original database and zero IDs. Native SDK/runtime and supported filesystem execution is separate.",
+      "retirement": "Retain only this exact original namespace consumer verification. This fixture does not supply physical qualification, permits, retry, reservation refund, effect, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "cfg(macos,test) actual original production Store/root/profile/registry/reserve startup with component hook off. Retained real WAL evidence triggers original queued namespace refusal; both caller APIs retain exact namespace/reply backing through genuine worker join, with unchanged original database and zero IDs. Native SDK/runtime and supported filesystem execution is separate.",
+      "retirement": "Retain only this exact original namespace consumer verification. This fixture does not supply physical qualification, permits, retry, reservation refund, effect, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "operation": "journal::start",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "cfg(macos,test) actual original production Store/root/profile/registry/reserve startup with component hook off. Retained real WAL evidence triggers original queued namespace refusal; both caller APIs retain exact namespace/reply backing through genuine worker join, with unchanged original database and zero IDs. Native SDK/runtime and supported filesystem execution is separate.",
+      "retirement": "Retain only this exact original namespace consumer verification. This fixture does not supply physical qualification, permits, retry, reservation refund, effect, cleanup or settlement."
     }
   ]
 }

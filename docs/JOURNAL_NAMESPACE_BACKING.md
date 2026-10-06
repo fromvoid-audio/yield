@@ -14,7 +14,7 @@ SQLite/sidecar primitives. Successful guards remain local. Selected failures mov
 their loans into a separate namespace slot on the original historical reply;
 observer consumption cannot refund that slot, and a second failure cannot replace
 it. Missing or poisoned consumers refuse before original error construction.
-This implementation is awaiting its first complete verification run. The probe
+Exact software validation and merge evidence are recorded on OPT-2402. The probe
 does not grant a physical reserve, permit, retry, durable reservation refund,
 effect, cleanup confirmation or settlement. Native runtime verification and full
 tracking parents remain open.
@@ -68,3 +68,45 @@ I/O refusals preserve original durable bytes. Linux memory-VFS contracts are
 separate from the genuine original file-VFS replacement regression and Windows
 native HRESULT parity harness. Cross-compilation does not execute Windows tests
 or qualify a physical backend. Parent1553/2373/2117 remain open.
+
+The macOS-only `namespace_backing_native_production_error_outlives_original_worker_join`
+regression calls `OperationJournalOwner::start` with the real profile-volume owner,
+reserve bootstrap and provider rebuild, and explicitly asserts the startup component
+hook is off. Both original queued result APIs retain the exact namespace and reply
+debit after actual worker join, with the original database and WAL evidence unchanged
+and no prepared-admission ID allocation. Dropping the caller error restores the exact
+permanent pool baseline. It uses no substituted registry, descriptor, database or
+physical grant. This native body is implemented but is not compiled or executed by
+Linux or Windows GNU checks. Running it requires a supported macOS SDK/runtime and a
+writable supported local filesystem with the production registry/reserve resources.
+The existing native startup regression independently covers the original descriptor-
+bound historical image; neither test completes upstream physical qualification.
+
+Windows `namespace_backing_native_original_connection_refusal` opens the original
+Store/root/profile/SQLite connection and exercises documented `SQLITE_FCNTL_NULL_IO`
+on that same connection. From immediately before this destructive fault, a child-only
+`ManuallyDrop` also prevents every assertion/unwind path from invoking invalid-VFS
+teardown. Its real `WIN32_GET_HANDLE` result becomes invalid; the
+original and funded full error display and typed refusal agree, the exact working
+and measured native-reason debit stays with the original diagnostic consumer, and
+durable bytes remain unchanged. A scalar observer holds only the same permanently
+funded pool Arc, and verifies its exact permanent baseline after the original
+funding input, selected diagnostic and reply allocation are destroyed. No SQL runs after the fault. The pinned Windows VFS
+requires a non-null handle during `winClose`, so this one-shot fault runs in a child
+that intentionally exits before invalid-VFS destruction. The parent verifies the
+actual exit/marker and owns temporary-tree cleanup after OS handle release. This
+harness covers the native refusal and error-credit path; it does not prove normal
+worker/Store teardown. The macOS queued harness and portable actual worker tests
+cover normal joins separately. The existing genuine BOOL-error SDK parity test
+covers the full Windows native message grammar independently. Native execution of
+these Windows bodies remains unverified here; GNU compilation is only a compiler
+check, and missing harness/compiler contracts must be fixed before resource deferral.
+
+On Linux, the Store's SQLite pathname can be a descriptor-relative `/proc/self/fd`
+alias. It expires when the original Store closes. Actual queued tests compare the
+original bytes through that pathname while it is live, then verify the same journal
+and sidecar namespace through the still-held original fixture profile after worker
+join. This readback route is verification only; it does not replace the production
+retained root, SQLite connection or identity check. Native Windows execution is
+tracked by OPT-2419; native macOS production bootstrap and namespace caller checks
+use OPT-2405. Both remain open until their actual resource-dependent runs.

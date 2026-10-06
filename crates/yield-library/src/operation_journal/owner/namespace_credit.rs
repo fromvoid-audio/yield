@@ -98,6 +98,18 @@ impl JournalNamespaceFundingProbe {
         self.input.shared.input_bytes.lock().unwrap().remaining[0]
     }
 
+    /// Borrow-free scalar observer of this exact original pool and its permanent
+    /// baseline. Cloning the original Arc allocates no replacement pool or grant.
+    pub fn pool_bytes_observer_for_test(&self) -> impl Fn() -> (usize, usize) + use<> {
+        let pool = self.input.shared.input_bytes.clone();
+        move || {
+            (
+                pool.lock().unwrap().remaining[InputClass::Ordinary.index()],
+                InputBudget::shared_initial().remaining[InputClass::Ordinary.index()],
+            )
+        }
+    }
+
     /// Retain a same-Store selected failure through diagnostic caller destruction.
     pub fn retain_command_error_for_test(
         &self,
