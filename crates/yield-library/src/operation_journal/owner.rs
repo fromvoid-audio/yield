@@ -6049,6 +6049,14 @@ struct CapacityLedgerTestSnapshot {
 #[allow(dead_code)]
 enum JournalCommand {
     #[cfg(test)]
+    InstallRecoveryAuditFixture {
+        operation: OperationId,
+        wire: Vec<u8>,
+        corrupt_text_bytes: usize,
+        input: InputPermit,
+        result: SyncSender<Result<(), OperationJournalOwnerError>>,
+    },
+    #[cfg(test)]
     InstallHistoricalClaimFixture {
         operation: OperationId,
         sequence: i64,
@@ -6536,6 +6544,26 @@ fn run_owner(
 // Returned outputs retain their independent result/producer custody. Input is not settlement.
 fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool {
     match command {
+        #[cfg(test)]
+        JournalCommand::InstallRecoveryAuditFixture {
+            operation,
+            wire,
+            corrupt_text_bytes,
+            input,
+            result,
+        } => {
+            let _input = input;
+            execute_store_result(result, move || {
+                runtime
+                    .store()
+                    .replace_historical_row_fixture_for_test(operation, 1, &wire)?;
+                runtime.store().install_recovery_audit_fixture_for_test(
+                    operation,
+                    1,
+                    corrupt_text_bytes,
+                )
+            })
+        }
         #[cfg(test)]
         JournalCommand::InstallHistoricalClaimFixture {
             operation,
@@ -7118,6 +7146,10 @@ where
 
 fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
     match &command {
+        #[cfg(test)]
+        JournalCommand::InstallRecoveryAuditFixture { result, .. } => {
+            let _ = result.send(Err(error));
+        }
         #[cfg(test)]
         JournalCommand::InstallHistoricalClaimFixture { result, .. } => {
             let _ = result.send(Err(error));
