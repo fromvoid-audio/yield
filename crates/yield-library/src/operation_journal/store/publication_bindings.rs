@@ -72,11 +72,7 @@ impl RootObservation {
         match &self.authority {
             AuthorityObservation::Source(source) => source.validate()?,
             AuthorityObservation::Profile(profile) => {
-                if profile.owner.is_nil()
-                    || profile.owner != self.registration.owner()
-                    || profile.generation == 0
-                    || profile.lease_epoch == 0
-                {
+                if profile.owner.is_nil() || profile.generation == 0 || profile.lease_epoch == 0 {
                     return Err("publication profile observation is invalid".into());
                 }
             }
@@ -250,6 +246,7 @@ impl PublicationBindingDraft {
             || staged.object != staging.logical_object_id()
             || staged.bytes != staging.bytes()
             || target.binding.registration != self.command.target_registration
+            || target.binding.registration.owner() != stage.binding.registration.owner()
             || target.binding.expected != ExpectedObservation::Absent
             || expected_absent.marker != 1
             || self.charge.allocation_class() != FullCapacityAllocationClass::DestinationStaging
@@ -292,6 +289,12 @@ impl PublicationBindingDraft {
     }
     pub(super) fn publication_effect(&self) -> Uuid {
         self.command.effect_id
+    }
+    #[cfg(test)]
+    pub(super) fn canonical_command_fixture(value: serde_json::Value) -> Vec<u8> {
+        let command: CommandObservation =
+            serde_json::from_value(value).expect("data-only command fixture");
+        serde_json::to_vec(&command).expect("data-only canonical command fixture")
     }
     pub(super) fn encode(&self) -> Result<Vec<u8>, OperationJournalStoreError> {
         let encoded =
@@ -431,6 +434,17 @@ impl OperationJournalStore {
             "INSERT INTO operation_journal_publication_issuance(output_id, publication_effect_id, record) VALUES (?1, ?2, ?3)",
             params![binding.output_id.to_string(), binding.publication_effect().to_string(), encoded])?;
         Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn publication_binding_observation_for_test(
+        &self,
+        output: Uuid,
+    ) -> serde_json::Value {
+        let binding = self
+            .read_publication_binding(output)
+            .expect("exact durable original binding readback")
+            .expect("retained issuance binding");
+        serde_json::to_value(binding).expect("bounded data-only issuance observation")
     }
     pub(super) fn read_publication_binding(
         &self,

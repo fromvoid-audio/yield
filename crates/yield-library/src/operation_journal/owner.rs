@@ -11293,6 +11293,17 @@ mod tests {
             return;
         }
         if publication_handoff {
+            let original_command_bytes = publication
+                .original_target()
+                .publication_command()
+                .unwrap()
+                .canonical_bytes()
+                .unwrap();
+            let original_command: serde_json::Value =
+                serde_json::from_slice(&original_command_bytes).unwrap();
+            let original_charge = serde_json::to_value(publication.charge.claim()).unwrap();
+            let original_command_fingerprint = *blake3::hash(&original_command_bytes).as_bytes();
+            drop(original_command_bytes);
             let original_fingerprint = publication.original_target().fingerprint();
             let foreign = crate::file_operation_owner::FileOperationOwner::start().unwrap();
             let publication = match foreign.submit_publication(publication) {
@@ -11359,6 +11370,28 @@ mod tests {
             let _ = file_owner.shutdown();
             drop(database);
             let _ = owner.shutdown();
+            let restarted =
+                OperationJournalStore::open(&fixture.owner).expect("original handoff restart");
+            let binding =
+                restarted.publication_binding_observation_for_test(staged_output.as_uuid());
+            assert_eq!(binding["command"], original_command);
+            assert_eq!(binding["charge"], original_charge);
+            assert_eq!(
+                binding["command_fingerprint"],
+                serde_json::json!(original_command_fingerprint)
+            );
+            assert_eq!(
+                binding["chunk"]["chunk_id"],
+                serde_json::json!(checkpoint_claim.chunk_id().as_uuid())
+            );
+            assert!(binding["slot_generation"].as_u64().unwrap() > 0);
+            assert!(
+                !Uuid::parse_str(binding["issuer_incarnation"].as_str().unwrap())
+                    .unwrap()
+                    .is_nil()
+            );
+            assert!(binding["checkpoint_sequence"].as_i64().unwrap() > 0);
+            assert!(restarted.prove_clean_handoff_durable().is_err());
             return;
         }
         let permit = publication

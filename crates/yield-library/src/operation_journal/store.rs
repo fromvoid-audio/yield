@@ -9940,6 +9940,7 @@ mod tests {
     include!("store/historical_claim_observation_tests.rs");
     include!("store/current_reserve_binding_bounds_tests.rs");
     include!("store/ordinary_rebuild_backing_tests.rs");
+    include!("store/publication_binding_tests.rs");
     include!("store/database_claims_tests.rs");
     include!("store/recording_retention_tests.rs");
     include!("store/record_materialization_tests.rs");

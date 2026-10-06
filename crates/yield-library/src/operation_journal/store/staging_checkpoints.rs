@@ -621,6 +621,17 @@ impl OperationJournalStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn reserve_publication_binding_fixture(
+        &self,
+        record: &StagingCheckpointRecord,
+        sequence: i64,
+        mut binding: super::PublicationBindingDraft,
+    ) -> Result<(), OperationJournalStoreError> {
+        binding.finish(sequence);
+        self.reserve_staging_grant_record_bound(record, sequence, Some(&binding))
+    }
+
     pub(super) fn read_staging_checkpoint_row(
         &self,
         output_id: Uuid,

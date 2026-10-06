@@ -368,3 +368,22 @@ fn original_completion_poison_preserves_first_digest_and_never_settles() {
     assert!(registry.unresolved());
     assert!(registry.issue(OperationId::new(), &shared).is_err());
 }
+
+#[test]
+fn issuance_identity_observes_only_original_retained_slot_and_incarnation() {
+    let shared = shared();
+    let mut original = Registry::new();
+    let mut foreign = Registry::new();
+    let first = original.issue(OperationId::new(), &shared).unwrap();
+    let second = original.issue(OperationId::new(), &shared).unwrap();
+    let other = foreign.issue(OperationId::new(), &shared).unwrap();
+    let a = original.issuance_observation(&first).unwrap();
+    let b = original.issuance_observation(&second).unwrap();
+    let c = foreign.issuance_observation(&other).unwrap();
+    assert!(!a.0.is_nil());
+    assert_eq!(a.0, b.0);
+    assert_ne!(a.1, b.1);
+    assert_ne!(a.0, c.0);
+    assert!(original.issuance_observation(&other).is_none());
+    assert!(foreign.issuance_observation(&first).is_none());
+}
