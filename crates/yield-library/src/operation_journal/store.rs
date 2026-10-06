@@ -76,6 +76,7 @@ mod historical_claim_observation;
 mod legacy_allocation_observation;
 mod recording_chunks;
 mod recording_prestart_budget;
+mod recording_prestart_database_claims;
 pub use legacy_allocation_observation::{LegacyJournalObservation, LegacyJournalObservationError};
 pub(crate) use recording_prestart_budget::COMMAND_INPUT_BYTES as RECORDING_PRESTART_INPUT_BYTES;
 mod recording_controls;

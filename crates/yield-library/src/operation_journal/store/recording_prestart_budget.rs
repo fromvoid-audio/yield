@@ -32,7 +32,9 @@ const _: () = {
 // capped re-encoding, complete small claim/release maps and auxiliary SQL/key context.
 // This is incremental factory backing; the original connection/cache/runtime already
 // exist and are not created or enlarged by this preparation.
-pub(crate) const COMMAND_INPUT_BYTES: usize = 3 * 1024 * 1024 + 512 * 1024 - 64 * 1024;
+const RECORD_INPUT_BYTES: usize = 3 * 1024 * 1024 + 512 * 1024 - 64 * 1024;
+pub(crate) const COMMAND_INPUT_BYTES: usize =
+    RECORD_INPUT_BYTES + recording_prestart_database_claims::ADDITIONAL_INPUT_BYTES;
 const TREE_BYTES: usize = 448 * 1536 + 32 * 1024;
 const TYPED_BYTES: usize = 448 * 1024 + 32 * 1024 + 64 * 1024;
 const LOCAL_PROPOSAL_BYTES: usize = 192 * 1024;
@@ -50,8 +52,10 @@ const _: () = assert!(
         + ENCODE_BYTES
         + REBUILD_BYTES
         + AUXILIARY_BYTES
-        == COMMAND_INPUT_BYTES
+        == RECORD_INPUT_BYTES
 );
+// Original ordinary pool: four MiB minus its disjoint 64-KiB control reservation.
+const _: () = assert!(COMMAND_INPUT_BYTES <= 4 * 1024 * 1024 - 64 * 1024);
 
 impl OperationJournalStore {
     pub(crate) fn begin_recording_prestart_read(&self) -> Result<(), OperationJournalStoreError> {
@@ -129,11 +133,10 @@ impl OperationJournalStore {
         }
         self.prestart_bounded_count(recording_chunks::TABLE_NAME, MAX_RECORDING_ROWS)?;
         self.prestart_bounded_count(chunk_claims::TABLE_NAME, 0)?;
+        self.preflight_recording_database_claims()?;
         // These original audits may own arbitrary command JSON/aggregate maps. Until their
         // complete backing is budgeted, the narrow factory refuses before materialization.
         for table in [
-            database_claims::BINDING_TABLE,
-            database_claims::SLICE_TABLE,
             database_attempts::START_TABLE,
             database_attempts::OUTCOME_TABLE,
             FULL_PROGRESS_TABLE_NAME,

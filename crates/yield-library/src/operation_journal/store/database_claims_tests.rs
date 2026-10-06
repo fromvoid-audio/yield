@@ -4,12 +4,196 @@ mod exact_database_claim_persistence {
     include!("database_attempt_metadata_tests.rs");
     include!("database_attempts_tests.rs");
     include!("source_lease_binding_tests.rs");
+    include!("recording_prestart_database_claims_tests.rs");
     use super::*;
     use crate::operation_journal::database_claims::{
         ClaimDirection, DatabaseBinding, DatabaseClaimInventory, DatabaseClaimSlice,
         DatabaseParticipant, DatabaseRole, InventoryHeader, RevisionDomain, SourceBinding,
         command_digest,
     };
+
+    fn recording_database_inputs(
+        owner: &WritableProfileGuard,
+    ) -> (
+        crate::operation_journal::recording_commands::RecordingProposal,
+        StoredOperationRecord,
+        AdmissionClaimInventory,
+        DatabaseClaimInventory,
+    ) {
+        use crate::operation_journal::recording_commands::recording_proposal_for_test;
+        let proposal = recording_proposal_for_test(2, 100);
+        let mut record = finite_recording_record(&proposal);
+        let mut allocations = record
+            .full_capacity_plan
+            .as_ref()
+            .unwrap()
+            .allocations()
+            .to_vec();
+        for (class, bytes) in [
+            (FullCapacityAllocationClass::SourceDatabaseCommit, 8192),
+            (FullCapacityAllocationClass::SourceWalShm, 16384),
+            (FullCapacityAllocationClass::GlobalDatabaseCommit, 8192),
+            (FullCapacityAllocationClass::GlobalWalShm, 16384),
+        ] {
+            allocations.push(
+                crate::operation_journal::full_capacity::FullCapacityAllocation::new(
+                    VolumeIdentity { device: 1 },
+                    1,
+                    class,
+                    bytes,
+                    bytes,
+                    PROTECTED_FREE_SPACE_FLOOR,
+                )
+                .unwrap(),
+            );
+        }
+        record.full_capacity_plan = Some(FullCapacityPlan::new(allocations).unwrap());
+        let claims = AdmissionClaimInventory::new(
+            record
+                .full_capacity_plan
+                .as_ref()
+                .unwrap()
+                .allocations()
+                .iter()
+                .map(|a| {
+                    AdmissionClaim::new(
+                        AdmissionClaimId::new(),
+                        a.volume().clone(),
+                        a.class(),
+                        a.allocated_bytes(),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap();
+        let digest = command_digest(&record, 1).unwrap();
+        let descriptors = proposal.participants().descriptors();
+        let source = descriptors
+            .iter()
+            .find(|d| d.kind() == ParticipantKind::SourceDatabase)
+            .unwrap()
+            .source_fence()
+            .unwrap();
+        let bindings = [DatabaseRole::Source, DatabaseRole::Global]
+            .into_iter()
+            .map(|role| DatabaseBinding {
+                id: Uuid::new_v4(),
+                role,
+                volume: 1,
+                allocation_unit: 1,
+                main_file: if role == DatabaseRole::Source {
+                    source.database_identity().into()
+                } else {
+                    "global-database".into()
+                },
+                registration: Uuid::new_v4(),
+                owner_generation: 1,
+                lifecycle: if role == DatabaseRole::Source {
+                    source.lifecycle_generation()
+                } else {
+                    1
+                },
+                database_root: "database-root".into(),
+                root_binding: "root-binding".into(),
+                source: (role == DatabaseRole::Source).then(|| SourceBinding {
+                    source_id: source.source_id().as_str().into(),
+                    media_root: source.root_identity().into(),
+                    lease_owner: "owner".into(),
+                    lease_epoch: source.lease_epoch(),
+                    lease_fence: None,
+                }),
+                current_revision: if role == DatabaseRole::Source {
+                    source.source_revision()
+                } else {
+                    1
+                },
+                participants: descriptors
+                    .iter()
+                    .filter(|d| match role {
+                        DatabaseRole::Source => matches!(
+                            d.kind(),
+                            ParticipantKind::SourceDatabase | ParticipantKind::Readiness
+                        ),
+                        DatabaseRole::Global => matches!(
+                            d.kind(),
+                            ParticipantKind::GlobalLibrary | ParticipantKind::Harvest
+                        ),
+                    })
+                    .map(|d| DatabaseParticipant {
+                        id: d.id().as_uuid(),
+                        requirement: 1,
+                        revision_domain: if role == DatabaseRole::Source {
+                            RevisionDomain::SourceAuthoritative
+                        } else {
+                            RevisionDomain::GlobalMutationGeneration
+                        },
+                        command_digest: digest,
+                        before: if role == DatabaseRole::Source {
+                            source.source_revision()
+                        } else {
+                            1
+                        },
+                        after: if role == DatabaseRole::Source {
+                            source.source_revision().checked_add(1).unwrap()
+                        } else {
+                            2
+                        },
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let mut slices = Vec::new();
+        for b in &bindings {
+            let classes = match b.role {
+                DatabaseRole::Source => [
+                    FullCapacityAllocationClass::SourceDatabaseCommit,
+                    FullCapacityAllocationClass::SourceWalShm,
+                ],
+                DatabaseRole::Global => [
+                    FullCapacityAllocationClass::GlobalDatabaseCommit,
+                    FullCapacityAllocationClass::GlobalWalShm,
+                ],
+            };
+            for p in &b.participants {
+                for class in classes {
+                    let sidecar = matches!(
+                        class,
+                        FullCapacityAllocationClass::SourceWalShm
+                            | FullCapacityAllocationClass::GlobalWalShm
+                    );
+                    let claim = claims
+                        .claims()
+                        .iter()
+                        .find(|c| c.allocation_class() == class)
+                        .unwrap();
+                    slices.push(DatabaseClaimSlice {
+                        id: Uuid::new_v4(),
+                        claim: claim.claim_id().as_uuid(),
+                        binding: b.id,
+                        participant: p.id,
+                        direction: ClaimDirection::RequiredForward,
+                        class,
+                        ceiling: if sidecar { 8192 } else { 4096 },
+                        wal_ceiling: if sidecar { 4096 } else { 0 },
+                        shm_ceiling: if sidecar { 4096 } else { 0 },
+                    });
+                }
+            }
+        }
+        let inventory = DatabaseClaimInventory::new(
+            InventoryHeader {
+                profile: owner.profile_root_identity().into(),
+                acquisition: owner.owner_identity().into(),
+                ownership_generation: owner.ownership_generation(),
+                decision_nonce: Uuid::new_v4(),
+            },
+            bindings,
+            slices,
+        )
+        .unwrap();
+        (proposal, record, claims, inventory)
+    }
 
     // Integration of both production transaction hooks; capacity/bindings remain explicit
     // synthetic observations, not live all-owner reservations or physical permission.
@@ -22,177 +206,7 @@ mod exact_database_claim_persistence {
         for fault in 0..5 {
             let f = fixture();
             let store = OperationJournalStore::open(&f.owner).unwrap();
-            let proposal = recording_proposal_for_test(2, 100);
-            let mut record = finite_recording_record(&proposal);
-            let mut allocations = record
-                .full_capacity_plan
-                .as_ref()
-                .unwrap()
-                .allocations()
-                .to_vec();
-            for (class, bytes) in [
-                (FullCapacityAllocationClass::SourceDatabaseCommit, 8192),
-                (FullCapacityAllocationClass::SourceWalShm, 16384),
-                (FullCapacityAllocationClass::GlobalDatabaseCommit, 8192),
-                (FullCapacityAllocationClass::GlobalWalShm, 16384),
-            ] {
-                allocations.push(
-                    crate::operation_journal::full_capacity::FullCapacityAllocation::new(
-                        VolumeIdentity { device: 1 },
-                        1,
-                        class,
-                        bytes,
-                        bytes,
-                        PROTECTED_FREE_SPACE_FLOOR,
-                    )
-                    .unwrap(),
-                );
-            }
-            record.full_capacity_plan = Some(FullCapacityPlan::new(allocations).unwrap());
-            let claims = AdmissionClaimInventory::new(
-                record
-                    .full_capacity_plan
-                    .as_ref()
-                    .unwrap()
-                    .allocations()
-                    .iter()
-                    .map(|a| {
-                        AdmissionClaim::new(
-                            AdmissionClaimId::new(),
-                            a.volume().clone(),
-                            a.class(),
-                            a.allocated_bytes(),
-                        )
-                        .unwrap()
-                    })
-                    .collect(),
-            )
-            .unwrap();
-            let digest = command_digest(&record, 1).unwrap();
-            let descriptors = proposal.participants().descriptors();
-            let source = descriptors
-                .iter()
-                .find(|d| d.kind() == ParticipantKind::SourceDatabase)
-                .unwrap()
-                .source_fence()
-                .unwrap();
-            let bindings = [DatabaseRole::Source, DatabaseRole::Global]
-                .into_iter()
-                .map(|role| DatabaseBinding {
-                    id: Uuid::new_v4(),
-                    role,
-                    volume: 1,
-                    allocation_unit: 1,
-                    main_file: if role == DatabaseRole::Source {
-                        source.database_identity().into()
-                    } else {
-                        "global-database".into()
-                    },
-                    registration: Uuid::new_v4(),
-                    owner_generation: 1,
-                    lifecycle: if role == DatabaseRole::Source {
-                        source.lifecycle_generation()
-                    } else {
-                        1
-                    },
-                    database_root: "database-root".into(),
-                    root_binding: "root-binding".into(),
-                    source: (role == DatabaseRole::Source).then(|| SourceBinding {
-                        source_id: source.source_id().as_str().into(),
-                        media_root: source.root_identity().into(),
-                        lease_owner: "owner".into(),
-                        lease_epoch: source.lease_epoch(),
-                        lease_fence: None,
-                    }),
-                    current_revision: if role == DatabaseRole::Source {
-                        source.source_revision()
-                    } else {
-                        1
-                    },
-                    participants: descriptors
-                        .iter()
-                        .filter(|d| match role {
-                            DatabaseRole::Source => matches!(
-                                d.kind(),
-                                ParticipantKind::SourceDatabase | ParticipantKind::Readiness
-                            ),
-                            DatabaseRole::Global => matches!(
-                                d.kind(),
-                                ParticipantKind::GlobalLibrary | ParticipantKind::Harvest
-                            ),
-                        })
-                        .map(|d| DatabaseParticipant {
-                            id: d.id().as_uuid(),
-                            requirement: 1,
-                            revision_domain: if role == DatabaseRole::Source {
-                                RevisionDomain::SourceAuthoritative
-                            } else {
-                                RevisionDomain::GlobalMutationGeneration
-                            },
-                            command_digest: digest,
-                            before: if role == DatabaseRole::Source {
-                                source.source_revision()
-                            } else {
-                                1
-                            },
-                            after: if role == DatabaseRole::Source {
-                                source.source_revision().checked_add(1).unwrap()
-                            } else {
-                                2
-                            },
-                        })
-                        .collect(),
-                })
-                .collect::<Vec<_>>();
-            let mut slices = Vec::new();
-            for b in &bindings {
-                let classes = match b.role {
-                    DatabaseRole::Source => [
-                        FullCapacityAllocationClass::SourceDatabaseCommit,
-                        FullCapacityAllocationClass::SourceWalShm,
-                    ],
-                    DatabaseRole::Global => [
-                        FullCapacityAllocationClass::GlobalDatabaseCommit,
-                        FullCapacityAllocationClass::GlobalWalShm,
-                    ],
-                };
-                for p in &b.participants {
-                    for class in classes {
-                        let sidecar = matches!(
-                            class,
-                            FullCapacityAllocationClass::SourceWalShm
-                                | FullCapacityAllocationClass::GlobalWalShm
-                        );
-                        let claim = claims
-                            .claims()
-                            .iter()
-                            .find(|c| c.allocation_class() == class)
-                            .unwrap();
-                        slices.push(DatabaseClaimSlice {
-                            id: Uuid::new_v4(),
-                            claim: claim.claim_id().as_uuid(),
-                            binding: b.id,
-                            participant: p.id,
-                            direction: ClaimDirection::RequiredForward,
-                            class,
-                            ceiling: if sidecar { 8192 } else { 4096 },
-                            wal_ceiling: if sidecar { 4096 } else { 0 },
-                            shm_ceiling: if sidecar { 4096 } else { 0 },
-                        });
-                    }
-                }
-            }
-            let inventory = DatabaseClaimInventory::new(
-                InventoryHeader {
-                    profile: f.owner.profile_root_identity().into(),
-                    acquisition: f.owner.owner_identity().into(),
-                    ownership_generation: f.owner.ownership_generation(),
-                    decision_nonce: Uuid::new_v4(),
-                },
-                bindings,
-                slices,
-            )
-            .unwrap();
+            let (proposal, record, claims, inventory) = recording_database_inputs(&f.owner);
             let provider = logical_provider(&record);
             match fault {
                 1 => store.set_insert_test_hook(|at| {
