@@ -35,4 +35,6 @@ diagnostic or stored header authorizes effects, retry, refund or settlement.
 
 Linux runs the genuine native guard and child-process tests. Windows GNU compilation
 checks the source and test code; it does not execute the Windows kernel or qualify
-native filesystem allocation. Existing platform acceptance remains separate.
+native filesystem allocation. Exact macOS and Windows/MSVC original-guard,
+clone-held lock and child-process execution is tracked in
+[OPT-2368](https://linear.app/boostnlvp/issue/OPT-2368).
