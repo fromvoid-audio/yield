@@ -200,6 +200,9 @@ impl RecorderWriter {
         if let Some(producer) = &settlement {
             producer.validate_limits(limits)?;
         }
+        let buffer_capacity = settlement
+            .as_ref()
+            .map_or(16_384, |producer| producer.serializer_capacity(limits));
         let (barrier, joined_issuer) = match settlement {
             Some(producer) => {
                 let (barrier, joined) = producer.start(mode.clone(), health.clone());
@@ -207,7 +210,7 @@ impl RecorderWriter {
             }
             None => (None, None),
         };
-        let writer = WavSampleWriter::new_with_barrier(sink, limits, barrier)?;
+        let writer = WavSampleWriter::new_with_barrier(sink, limits, barrier, buffer_capacity)?;
         let worker_mode = Arc::clone(&mode);
         let join = thread::Builder::new()
             .name("reson-recording-writer".into())
@@ -545,16 +548,18 @@ struct WavSampleWriter {
     terminal: Option<TerminalFacts>,
     limits: RecordingLimits,
     written_samples: u64,
+    buffer_capacity: usize,
 }
 impl WavSampleWriter {
     #[cfg(test)]
     fn new(sink: Box<dyn RecordingSink>, limits: RecordingLimits) -> Result<Self, AudioInputError> {
-        Self::new_with_barrier(sink, limits, None)
+        Self::new_with_barrier(sink, limits, None, 16_384)
     }
     fn new_with_barrier(
         mut sink: Box<dyn RecordingSink>,
         limits: RecordingLimits,
         barrier: Option<BarrierIssuer>,
+        buffer_capacity: usize,
     ) -> Result<Self, AudioInputError> {
         if sink
             .stream_position()
@@ -572,7 +577,7 @@ impl WavSampleWriter {
             sample_format: hound::SampleFormat::Float,
         };
         let buffer = InspectableBuffer(Arc::new(Mutex::new(BufWriter::with_capacity(
-            16_384,
+            buffer_capacity,
             BoundedSink {
                 inner: sink,
                 position: 0,
@@ -595,6 +600,7 @@ impl WavSampleWriter {
             terminal: None,
             limits,
             written_samples: 0,
+            buffer_capacity,
         })
     }
     fn write_samples(&mut self, samples: &[f32]) -> Result<(), AudioInputError> {
@@ -635,8 +641,8 @@ impl WavSampleWriter {
             .filter(|n| *n <= self.limits.max_bytes && *n - 8 <= u64::from(u32::MAX))
             .ok_or_else(|| failed("recording extent exceeds finite format"))?;
         let pending_offset = buffer.get_ref().position;
-        if buffer.capacity() != 16_384
-            || buffer.buffer().len() > 16_384
+        if buffer.capacity() != self.buffer_capacity
+            || buffer.buffer().len() > self.buffer_capacity
             || pending_offset < 68
             || pending_offset % 4 != 0
             || pending_offset.checked_add(buffer.buffer().len() as u64) != Some(object_bytes)

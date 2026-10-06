@@ -297,6 +297,16 @@ pub(super) struct JoinedIssuer {
     health: Arc<RecordingHealthState>,
 }
 impl ProducerSettlement {
+    pub(super) fn serializer_capacity(&self, limits: RecordingLimits) -> usize {
+        let ceiling = super::RECORDING_TRANSPORT_MAX_WRITE_BYTES;
+        if self.original_limits.is_some() {
+            let frame_bytes = usize::from(limits.channels()) * size_of::<f32>();
+            ceiling / frame_bytes * frame_bytes
+        } else {
+            ceiling
+        }
+    }
+
     pub(super) fn validate_limits(&self, limits: RecordingLimits) -> Result<(), AudioInputError> {
         if self
             .original_limits

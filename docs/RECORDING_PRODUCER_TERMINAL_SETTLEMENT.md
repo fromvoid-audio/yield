@@ -102,8 +102,11 @@ initial WAV header synchronously. The receiver also continues running while anot
 performs Stop/Cancel and joins the serializer. No capture callback waits on this channel.
 
 Each request retains exact immutable bytes and its serializer offset. At most one write
-(up to 16384 bytes) or flush awaits acknowledgement. A write advances the sink cursor only
-after acknowledgement; seeking updates a checked local cursor and cannot exceed the finite
+(up to 16384 bytes) or flush awaits acknowledgement. Original finite initialization first
+buffers at most 68 header bytes; those Write returns mean byte custody only. Its first Flush
+waits for one complete header request at offset zero and a separate Flush acknowledgement.
+After initialization, a write advances the sink cursor only after acknowledgement;
+seeking updates a checked local cursor and cannot exceed the finite
 allocation or use end-relative seeks. Refusal, request/receiver loss, queue failure or the
 fixed two-second acknowledgement deadline permanently fails the sink. The timed-out request
 can remain retained for audit; late acknowledgement cannot resume encoding. A lost response

@@ -34,6 +34,7 @@ impl RecordingTransport {
             limit: limits.max_bytes(),
             failed: false,
             timeout: RECORDING_TRANSPORT_ACK_TIMEOUT,
+            initialization: Some(Initialization::new()),
         };
         let (binding, settlements) = RecordingSinkBinding::bind_with_limits(Box::new(sink), limits);
         (binding, RecordingTransportReceiver { rx }, settlements)
@@ -112,7 +113,24 @@ struct Sink {
     limit: u64,
     failed: bool,
     timeout: Duration,
+    initialization: Option<Initialization>,
 }
+
+// Only the original finite factory installs this bounded initialization custody.
+// Writes here are buffered bytes, never an acknowledgement of retained/durable output.
+struct Initialization {
+    bytes: [u8; 68],
+    filled: usize,
+}
+impl Initialization {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 68],
+            filled: 0,
+        }
+    }
+}
+const _: () = assert!(size_of::<Initialization>() <= 128);
 impl Sink {
     fn check(&self) -> io::Result<()> {
         if self.failed {
@@ -172,11 +190,31 @@ impl Write for Sink {
         else {
             return Err(self.invalid());
         };
+        if let Some(initial) = self.initialization.as_mut() {
+            if self.position > initial.filled as u64 || end > initial.bytes.len() as u64 {
+                return Err(self.invalid());
+            }
+            initial.bytes[self.position as usize..end as usize].copy_from_slice(&bytes[..size]);
+            initial.filled = initial.filled.max(end as usize);
+            self.position = end;
+            return Ok(size);
+        }
         self.request(RecordingTransportRequestKind::Write, &bytes[..size])?;
         self.position = end;
         Ok(size)
     }
     fn flush(&mut self) -> io::Result<()> {
+        self.check()?;
+        if let Some(initial) = self.initialization.take() {
+            if initial.filled != initial.bytes.len() || self.position != initial.filled as u64 {
+                return Err(self.invalid());
+            }
+            self.position = 0;
+            self.request(RecordingTransportRequestKind::Write, &initial.bytes)?;
+            self.position = initial.filled as u64;
+            // The scratch ends before the separate real flush acknowledgement and capture.
+            drop(initial);
+        }
         self.request(RecordingTransportRequestKind::Flush, &[])
     }
 }
@@ -194,6 +232,13 @@ impl Seek for Sink {
         else {
             return Err(self.invalid());
         };
+        if self
+            .initialization
+            .as_ref()
+            .is_some_and(|initial| offset > initial.filled as u64)
+        {
+            return Err(self.invalid());
+        }
         self.position = offset;
         Ok(offset)
     }
