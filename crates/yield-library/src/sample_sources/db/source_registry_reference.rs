@@ -68,6 +68,7 @@ pub enum SourceRegistryAuditObservation {
 }
 
 mod audit_decoder;
+mod expected_decoder;
 
 /// Historical scalar subject. Deserialization confers no source custody or freshness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -174,7 +175,7 @@ pub enum SourceRegistryReferenceTransition {
 }
 
 /// Exact expected prior relation identity; a hash is observation, never proof of a row.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceRegistryReferenceExpected {
     /// No prior relation is expected.

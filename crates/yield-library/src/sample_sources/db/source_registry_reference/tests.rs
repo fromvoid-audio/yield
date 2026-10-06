@@ -416,3 +416,106 @@ fn real_retained_capture_never_reads_directory_entry_payloads() {
         .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
     owner.close().unwrap();
 }
+
+#[test]
+fn source_expected_typed_decode_preserves_exact_historical_representations() {
+    #[derive(Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+    enum Original {
+        Absent {},
+        Present {
+            state: SourceRegistryReferenceTransition,
+            row_identity: [u8; 32],
+        },
+    }
+    let row = serde_json::to_string(&[1u8; 32]).unwrap();
+    let cases = vec![
+        r#"{"status":"absent"}"#.into(),
+        r#"["absent"]"#.into(),
+        format!(r#"{{"status":"present","state":"enrolled","row_identity":{row}}}"#),
+        format!(r#"{{"row_identity":{row},"state":"draining","status":"present"}}"#),
+        format!(r#"{{"\u0073tatus":"present","\u0073tate":"retired","row_identity":{row}}}"#),
+        format!(r#"["present","enrolled",{row}]"#),
+        format!(r#"{{"status":"present","state":{{"draining":null}},"row_identity":{row}}}"#),
+        format!(r#"["present",{{"retired":null}},{row}]"#),
+        r#"{"status":0}"#.into(),
+        r#"[0]"#.into(),
+        r#"{"status":"absent","state":"enrolled"}"#.into(),
+        format!(r#"{{"status":"absent","row_identity":{row}}}"#),
+        r#"{"status":"absent","status":"absent"}"#.into(),
+        format!(
+            r#"{{"status":"present","state":"enrolled","\u0073tate":"draining","row_identity":{row}}}"#
+        ),
+        format!(
+            r#"{{"status":"present","state":"enrolled","row_identity":{row},"row_identity":{row}}}"#
+        ),
+        r#"{"status":"present","state":"enrolled"}"#.into(),
+        format!(r#"{{"state":"enrolled","row_identity":{row}}}"#),
+        r#"{"status":"absent","unknown":[[[0]]]}"#.into(),
+        r#"{"status":"present","state":"enrolled","row_identity":[]}"#.into(),
+        r#"{"status":"present","state":[],"row_identity":[]}"#.into(),
+        format!(r#"["present","enrolled",{row},[[[0]]]]"#),
+        r#"["absent",{}]"#.into(),
+        r#"{"status":"absent"} false"#.into(),
+        r#"[]"#.into(),
+        "null".into(),
+        format!(
+            r#"{{"status":"present","state":{{"enrolled":null,"enrolled":null}},"row_identity":{row}}}"#
+        ),
+        format!(r#"{{"status":"present","state":{{"enrolled":{{"x":0}}}},"row_identity":{row}}}"#),
+        format!(
+            r#"{{"status":"present","state":"enrolled","row_identity":{}}}"#,
+            serde_json::to_string(&vec![1u8; 33]).unwrap()
+        ),
+        format!(r#"{{"{}":0,"status":"absent"}}"#, "\\u2028".repeat(2600)),
+        format!(r#"{{"status":"{}"}}"#, "\\u2028".repeat(2600)),
+    ];
+    for wire in cases {
+        let original = serde_json::from_str::<Original>(&wire).map(|v| match v {
+            Original::Absent {} => SourceRegistryReferenceExpected::Absent {},
+            Original::Present {
+                state,
+                row_identity,
+            } => SourceRegistryReferenceExpected::Present {
+                state,
+                row_identity,
+            },
+        });
+        let actual = serde_json::from_str::<SourceRegistryReferenceExpected>(&wire);
+        assert_eq!(actual.is_ok(), original.is_ok(), "{wire}");
+        if let Ok(original) = original {
+            assert_eq!(actual.unwrap(), original, "{wire}");
+        }
+    }
+}
+
+#[test]
+fn source_expected_typed_decode_actual_public_preserves_identity_and_refusals() {
+    let base = proposal();
+    let mut value = serde_json::to_value(&base.stored).unwrap();
+    value["expected"] = serde_json::json!(["absent"]);
+    assert_eq!(
+        SourceRegistryReferenceProposal::decode(&serde_json::to_vec(&value).unwrap()).unwrap(),
+        base
+    );
+    let mut stored = base.stored.clone();
+    stored.transition = SourceRegistryReferenceTransition::Draining;
+    stored.expected = SourceRegistryReferenceExpected::Present {
+        state: SourceRegistryReferenceTransition::Enrolled,
+        row_identity: [1; 32],
+    };
+    let expected = SourceRegistryReferenceProposal::from_stored(stored).unwrap();
+    let mut value = serde_json::to_value(&expected.stored).unwrap();
+    value["expected"] = serde_json::json!(["present",{"enrolled":null},vec![1;32]]);
+    assert_eq!(
+        SourceRegistryReferenceProposal::decode(&serde_json::to_vec(&value).unwrap()).unwrap(),
+        expected
+    );
+    for field in ["row_identity", "unknown"] {
+        value["expected"] =
+            serde_json::json!({"status":"present","state":"enrolled",field:vec![0u8;6000]});
+        let wire = serde_json::to_vec(&value).unwrap();
+        assert!(wire.len() < SOURCE_REGISTRY_REFERENCE_MAX_BYTES);
+        assert!(SourceRegistryReferenceProposal::decode(&wire).is_err());
+    }
+}

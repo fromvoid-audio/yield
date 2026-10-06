@@ -76,8 +76,8 @@ Those measurements include real parser scratch and diagnostic formatting for
 these inputs, not a general error-allocation bound.
 
 The actual caller also owns ordinary subject strings, media-root bytes and
-canonical encoding. `SourceRegistryReferenceExpected` still uses tagged
-`Content`. Recording proposals still retain their strict generic tree parser,
+canonical encoding. The prior-row expectation now has its separate
+[typed decoder component](SOURCE_EXPECTED_TYPED_DECODE_BOUNDARY.md). Recording proposals still retain their strict generic tree parser,
 and participant/string/backing bounds remain unfinished. No complete proposal,
 owner input pool, SQLite/runtime baseline, stack, RSS or native bound is claimed.
 
