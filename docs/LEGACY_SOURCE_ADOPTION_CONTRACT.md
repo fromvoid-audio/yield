@@ -552,7 +552,8 @@ returns or drops it. An initial handler refusal closes the source normally while
 preserving source/control evidence; it installs no slot. Successful and lost-reply
 custody retain the original slot, lock and metadata credit until normal shutdown. The original 64KiB input debit covers retained metadata. OPT-2356 adds its
 derived 28,888-byte capture scratch debit before capture and retains both on
-the worker; native SQLite allocator memory is not certified by these debits. Candidate construction temporarily holds
+the worker (OPT-2349 additionally charges one separate bound MAIN reserve-root
+inventory before transfer/capture); native SQLite allocator memory is not certified by these debits. Candidate construction temporarily holds
 two SQLite connections, then retains one. This is no whole-process heap/RSS bound.
 
 Actual SQLite tests turn off SQL `query_only` and still observe zero forwarded
@@ -591,7 +592,7 @@ four). Observation-map scratch additionally uses the actual source-volume count
 plus three, with a conservative complete pinned-Rust tree-node inventory per
 volume. Each returned copied checkpoint has its own header plus thirteen
 1024-byte string debit. The original 64KiB metadata and 28,888-byte source-capture
-scratch remain charged independently: schema, metadata and scalar row-reference
+scratch, plus the new explicit MAIN reserve-root inventory, remain charged independently: schema, metadata and scalar row-reference
 captures are sequential within that original scratch bound. The pool ceiling and
 supported source input limits are unchanged. Native SQLite allocations, physical
 reserve extents and process RSS are outside these Rust metadata bounds.

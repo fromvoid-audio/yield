@@ -13,7 +13,7 @@ const IDENTITY_BACKING: usize = 256;
 pub(super) const REPLY_BYTES: usize = std::mem::size_of::<
     super::super::legacy_adoption_commands::LegacyAdoptionIntentArgs,
 >() + 13 * 1024;
-const ROOT_BYTES: usize = std::mem::size_of::<BoundDatabaseRoot>()
+pub(super) const ROOT_BYTES: usize = std::mem::size_of::<BoundDatabaseRoot>()
     + 2 * PATH_BACKING
     + 2 * IDENTITY_BACKING
     + 2 * std::mem::size_of::<usize>()

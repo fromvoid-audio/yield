@@ -1081,7 +1081,9 @@ impl BoundDatabaseRoot {
     ) -> Result<(), String> {
         #[cfg(windows)]
         {
-            let _ = (profile_guard, after_sync);
+            let _ = after_sync;
+            self.validate_profile_guard(profile_guard)
+                .map_err(|e| e.to_string())?;
             proof
                 .validate_root_for_bootstrap(self)
                 .map_err(|e| e.to_string())
@@ -1090,6 +1092,8 @@ impl BoundDatabaseRoot {
         {
             let profile_root = profile_guard
                 .profile_root_dir()
+                .map_err(|e| e.to_string())?;
+            self.validate_profile_guard(profile_guard)
                 .map_err(|e| e.to_string())?;
             // Descriptor acquisition and each previous native sync may consume the original
             // cooperative budget. Only the genuine borrowed seal can authorize the next effect.
@@ -1101,6 +1105,8 @@ impl BoundDatabaseRoot {
             if let Some(observe) = after_sync {
                 observe(1);
             }
+            self.validate_profile_guard(profile_guard)
+                .map_err(|e| e.to_string())?;
             proof
                 .validate_root_for_bootstrap(self)
                 .map_err(|e| e.to_string())?;

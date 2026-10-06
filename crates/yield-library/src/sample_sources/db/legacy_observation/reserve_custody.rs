@@ -82,6 +82,9 @@ impl LegacySourceReadOwner {
             BoundDatabaseRoot::for_external_source_root(&profile, root.as_ref())
                 .map_err(refused)?,
         );
+        if root.legacy_metadata_bytes().is_none() {
+            return Err(LegacyObservationError("legacy reserve root metadata bound"));
+        }
         let descriptor = root.try_clone_descriptor().map_err(refused)?;
         let facts = descriptor_capacity_facts(&descriptor).map_err(refused)?;
         if facts.identity != *main.volume() || facts.allocation_unit != main.allocation_unit() {

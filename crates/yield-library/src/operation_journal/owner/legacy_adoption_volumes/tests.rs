@@ -45,7 +45,7 @@ impl Fixture {
         let input = shared
             .reserve_input(
                 InputClass::Ordinary,
-                64 * 1024 + crate::sample_sources::db::LEGACY_CAPTURE_SCRATCH_BYTES,
+                super::super::legacy_adoption_custody::INPUT_BYTES,
             )
             .unwrap();
         runtime

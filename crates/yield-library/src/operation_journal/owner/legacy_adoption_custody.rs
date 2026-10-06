@@ -9,8 +9,11 @@ use std::sync::{Weak, atomic::AtomicBool};
 
 // Preserve 64KiB for frozen <=32KiB input and bounded observation/header metadata;
 // additionally charge the derived sequential schema/row scratch peak, not audio input bytes.
+// One separately bound original MAIN reserve root has its own explicit inventory.
 // The already-open source SQLite connection is transferred, never opened by this route.
-const INPUT_BYTES: usize = 64 * 1024 + crate::sample_sources::db::LEGACY_CAPTURE_SCRATCH_BYTES;
+pub(super) const INPUT_BYTES: usize = 64 * 1024
+    + crate::sample_sources::db::LEGACY_CAPTURE_SCRATCH_BYTES
+    + super::legacy_adoption_volumes::ROOT_BYTES;
 
 /// Refusal of original readonly custody; none of these states authorizes a retry or mutation.
 #[derive(Debug, Error)]
