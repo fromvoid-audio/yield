@@ -24,8 +24,8 @@ fn ordinary_rebuild_backing_matches_zero_small_and_complete_multiple_pages() {
             let input = super::super::owner::InputPermit::historical_test_input(1);
             let available = input.historical_test_remaining();
             let funded = store.rebuild_admission_snapshot_for_input(&input).unwrap();
-            assert_eq!(*funded, old);
-            assert_eq!(funded.claims.len(), count);
+            assert!(funded.matches_original(&old));
+            assert_eq!(funded.claims().len(), count);
             assert!(input.historical_test_remaining() < available);
             drop(funded);
             assert_eq!(input.historical_test_remaining(), available);
@@ -87,7 +87,7 @@ fn ordinary_rebuild_backing_preserves_malformed_missing_and_orphan_audit() {
         let input = super::super::owner::InputPermit::historical_test_input(1);
         let available = input.historical_test_remaining();
         let funded = store.rebuild_admission_snapshot_for_input(&input).unwrap();
-        assert_eq!(*funded, old, "{scenario}");
+        assert!(funded.matches_original(&old), "{scenario}");
         drop(funded);
         assert_eq!(input.historical_test_remaining(), available, "{scenario}");
     }

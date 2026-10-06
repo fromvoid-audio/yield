@@ -180,9 +180,12 @@ pub(super) fn copy_error_message(
     let length = lossy_length(message.to_bytes())?;
     // Original lossy String growth plus actual StoreSql Display and the consumer's
     // diagnostic formatting buffer, with both UUIDs and all fixed prefixes named.
-    let prefix = "operation journal SQLite error: ".len()
+    let historical_prefix = "operation journal SQLite error: ".len()
         + "ordinary claim  operation  requires audit: ".len()
         + 2 * 36;
+    let ordinary_page_prefix = "ordinary-claim release page was retained but could not be decoded: "
+        .len() + "ordinary-claim SQLite error: ".len();
+    let prefix = historical_prefix.max(ordinary_page_prefix);
     // Pinned Rust RawVec<u8> uses an eight-byte minimum non-zero growth
     // allocation. Name it independently of geometric growth for tiny lossy input.
     let bytes = length

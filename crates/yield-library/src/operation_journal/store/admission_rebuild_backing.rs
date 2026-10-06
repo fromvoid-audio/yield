@@ -4,7 +4,6 @@ use super::*;
 use crate::operation_journal::owner::InputPermit;
 use std::cell::RefCell;
 use std::mem::size_of;
-use std::ops::Deref;
 
 /// Single-owner snapshot: output backing drops before its final original-pool credit.
 /// No Clone or uncharged deep-copy API is supplied.
@@ -32,10 +31,25 @@ impl FundedSnapshot {
         self.snapshot
     }
 }
-impl Deref for FundedSnapshot {
-    type Target = OrdinaryClaimRebuildSnapshot;
-    fn deref(&self) -> &Self::Target {
-        &self.snapshot
+impl FundedSnapshot {
+    pub(in crate::operation_journal) fn claims(&self) -> &[RebuildClaim] {
+        self.snapshot.claims()
+    }
+    pub(in crate::operation_journal) fn readiness(&self) -> &CapacityRebuildReadiness {
+        self.snapshot.readiness()
+    }
+    pub(in crate::operation_journal) fn proves_durable_zero(&self) -> bool {
+        self.snapshot.proves_durable_zero()
+    }
+    pub(in crate::operation_journal) fn validate_provider(
+        &self,
+        provider: &super::super::capacity_provider::CapacityProvider,
+    ) -> Result<(), super::super::capacity_provider::CapacityProviderError> {
+        provider.validate_rebuilt_claims(&self.snapshot)
+    }
+    #[cfg(test)]
+    pub(super) fn matches_original(&self, original: &OrdinaryClaimRebuildSnapshot) -> bool {
+        self.snapshot == *original
     }
 }
 
@@ -164,5 +178,57 @@ fn resource_error(error: OperationJournalStoreError) -> OperationJournalStoreErr
             OperationJournalStoreError::OrdinaryRebuildResourceBound
         }
         other => other,
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl OperationJournalStore {
+    /// Original-connection collection allocation fixture, without an owner or effects.
+    pub fn install_ordinary_collection_fixture_for_test(
+        &self,
+        operation: OperationId,
+        rows: usize,
+        released: bool,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.connection.execute_batch("DELETE FROM operation_journal_ordinary_claim_release; DELETE FROM operation_journal_ordinary_claim")?;
+        for index in 1..=rows {
+            let claim = Uuid::from_u128(index as u128).to_string();
+            self.connection.execute("INSERT INTO operation_journal_ordinary_claim VALUES (?1,?2,'1','DestinationStaging',1)", params![claim, operation.to_string()])?;
+            if released {
+                self.connection.execute(
+                    "INSERT INTO operation_journal_ordinary_claim_release VALUES (?1,?2,?1)",
+                    params![claim, operation.to_string()],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Measure only original ordinary collection construction and custody.
+    /// Full-family audits, provider graphs and native/RSS allocation are outside this probe.
+    pub fn ordinary_collection_allocation_probe_for_test(
+        &self,
+        funded: bool,
+    ) -> Result<(usize, bool, usize), OperationJournalStoreError> {
+        let input = InputPermit::historical_test_input(1);
+        self.connection.execute_batch("BEGIN")?;
+        let mut collection = None;
+        let result = self.rebuild_ordinary_claim_snapshot_with_funding(
+            funded.then_some(&input),
+            &mut collection,
+        );
+        self.connection.execute_batch("ROLLBACK")?;
+        let snapshot = result?;
+        let bytes = collection
+            .as_ref()
+            .map_or(0, |backing| backing._credit.historical_test_funded_bytes());
+        let scalar = (
+            snapshot.claims().len(),
+            snapshot.proves_durable_zero(),
+            bytes,
+        );
+        drop(snapshot);
+        drop(collection);
+        Ok(scalar)
     }
 }
