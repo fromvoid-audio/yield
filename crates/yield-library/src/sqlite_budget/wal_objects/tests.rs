@@ -67,6 +67,15 @@ fn exact_size_replacement_of_main_or_wal_cannot_substitute_native_binding() {
         fs::rename(&path, &parked).unwrap();
         fs::copy(&parked, &path).unwrap();
         assert!(capture(&f).is_none(), "same-size replacement {name}");
+        assert_eq!(
+            f.connection.observe_retained_wal_objects(
+                &f.root,
+                Path::new("test.db"),
+                Instant::now() + Duration::from_secs(2),
+            ),
+            Err(WalObservationRefusal::Unavailable),
+            "actual binding loss keeps its cause",
+        );
         fs::remove_file(&path).unwrap();
         fs::rename(&parked, &path).unwrap();
         assert_eq!(capture(&f).unwrap(), facts);
@@ -223,4 +232,61 @@ fn kernel_map_stream_checks_complete_input_with_fixed_backing() {
     partial.extend(std::iter::repeat_n(b'0', 250));
     partial.extend(b"42\n");
     assert_eq!(scan(&partial), None);
+}
+
+#[test]
+fn original_native_expired_observation_reports_deadline_without_mutation() {
+    let f = fixture();
+    let changes = f.connection.total_changes();
+    assert_eq!(
+        f.connection
+            .observe_retained_wal_objects(&f.root, Path::new("test.db"), Instant::now()),
+        Err(WalObservationRefusal::Deadline),
+    );
+    assert_eq!(changes, f.connection.total_changes());
+    assert!(!f.connection.is_autocommit());
+    assert!(capture(&f).is_some());
+    f.connection.execute_batch("ROLLBACK").unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_map_stream_io_refusal_is_not_relabelled_after_deadline() {
+    // Stream-parser contract only; the genuine Global/native tests cover producer behavior.
+    struct FailingRead {
+        deadline: Instant,
+        entered: bool,
+    }
+    impl std::io::Read for FailingRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            self.entered = true;
+            while Instant::now() < self.deadline {
+                std::thread::park_timeout(self.deadline.saturating_duration_since(Instant::now()));
+            }
+            Err(std::io::Error::other("original read refusal"))
+        }
+    }
+    let original_deadline = Instant::now() + Duration::from_secs(1);
+    let mut reader = FailingRead {
+        deadline: original_deadline,
+        entered: false,
+    };
+    let mut tracker = ObservationDeadline::new(original_deadline);
+    let result =
+        super::mapped_identity_stream_with_deadline(&mut reader, 0x10000, 7, 42, &mut tracker);
+    assert!(reader.entered);
+    assert_eq!(
+        tracker.outcome(result),
+        Err(WalObservationRefusal::Unavailable)
+    );
+    assert!(Instant::now() >= original_deadline);
+
+    // An actual original stream clock check, instead, records Deadline.
+    let mut expired = ObservationDeadline::new(Instant::now());
+    let result =
+        super::mapped_identity_stream_with_deadline(std::io::empty(), 0x10000, 7, 42, &mut expired);
+    assert_eq!(
+        expired.outcome(result),
+        Err(WalObservationRefusal::Deadline)
+    );
 }

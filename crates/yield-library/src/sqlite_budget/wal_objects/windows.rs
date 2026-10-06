@@ -178,10 +178,10 @@ pub(super) fn retained_wal_objects(
     connection: &OwnedConnection,
     root: &BoundDatabaseRoot,
     name: &Path,
-    deadline: Instant,
+    deadline: &mut super::ObservationDeadline,
 ) -> Option<WalObjects> {
     use std::ffi::OsString;
-    if Instant::now() >= deadline
+    if deadline.expired()
         || name.components().count() != 1
         || !matches!(
             name.components().next(),
@@ -243,7 +243,7 @@ pub(super) fn retained_wal_objects(
     if facts(&root.open_file_read_nofollow(name).ok()?)? != result.main
         || facts(&root.open_file_read_nofollow(Path::new(&wal_name)).ok()?)? != result.wal
         || facts(&root.open_file_read_nofollow(Path::new(&shm_name)).ok()?)? != result.shm
-        || Instant::now() >= deadline
+        || deadline.expired()
     {
         return None;
     }

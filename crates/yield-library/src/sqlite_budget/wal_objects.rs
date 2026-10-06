@@ -22,6 +22,47 @@ pub(crate) struct WalObjects {
     pub(crate) shm: WalObjectFacts,
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod deadline_probe;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use deadline_probe::arm_original_mapping_expiry;
+
+/// Only an original observer's own clock check establishes Deadline. Native
+/// binding, stream, shape and I/O refusals keep their original unavailable cause.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalObservationRefusal {
+    Deadline,
+    Unavailable,
+}
+
+pub(super) struct ObservationDeadline {
+    instant: Instant,
+    refused: bool,
+}
+impl ObservationDeadline {
+    fn new(instant: Instant) -> Self {
+        Self {
+            instant,
+            refused: false,
+        }
+    }
+    pub(super) fn expired(&mut self) -> bool {
+        if Instant::now() >= self.instant {
+            self.refused = true;
+            true
+        } else {
+            false
+        }
+    }
+    fn outcome<T>(&self, value: Option<T>) -> Result<T, WalObservationRefusal> {
+        value.ok_or(if self.refused {
+            WalObservationRefusal::Deadline
+        } else {
+            WalObservationRefusal::Unavailable
+        })
+    }
+}
+
 impl OwnedConnection {
     /// Capture only objects proven against this actual private forwarding VFS. The borrowed
     /// sole-owner connection keeps callback/mapping lifetimes fixed; filenames alone never
@@ -32,98 +73,114 @@ impl OwnedConnection {
         name: &Path,
         deadline: Instant,
     ) -> Option<WalObjects> {
-        #[cfg(windows)]
-        {
-            windows::retained_wal_objects(self, root, name, deadline)
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-        {
-            let _ = (root, name, deadline);
-            None
-        }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            use std::{ffi::OsString, os::unix::fs::MetadataExt};
-            if Instant::now() >= deadline
-                || rusqlite::version_number() != 3_050_002
-                || name.components().count() != 1
-                || !matches!(
-                    name.components().next(),
-                    Some(std::path::Component::Normal(_))
-                )
+        self.observe_retained_wal_objects(root, name, deadline).ok()
+    }
+
+    pub(crate) fn observe_retained_wal_objects(
+        &self,
+        root: &BoundDatabaseRoot,
+        name: &Path,
+        deadline: Instant,
+    ) -> Result<WalObjects, WalObservationRefusal> {
+        let mut deadline = ObservationDeadline::new(deadline);
+        let observed = (|| {
+            #[cfg(windows)]
             {
-                return None;
+                windows::retained_wal_objects(self, root, name, &mut deadline)
             }
-            let registration = self.registration.as_ref()?;
-            // SAFETY: the adapter has process lifetime; this private registration owns the
-            // forwarding VFS and every file callback for the borrowed live connection.
-            #[cfg(target_os = "linux")]
-            let native = unsafe { ffi::sqlite3_vfs_find(c"yield-linux-retained-root-v1".as_ptr()) };
-            #[cfg(target_os = "macos")]
-            let native = unsafe { ffi::sqlite3_vfs_find(c"unix".as_ptr()) };
-            if native.is_null() || registration.context.native != native {
-                return None;
-            }
-            let mapping = registration
-                .context
-                .state
-                .lock()
-                .ok()?
-                .mapped_shm_region_zero?;
-            let mut wal_name = OsString::from(name);
-            wal_name.push("-wal");
-            let mut shm_name = OsString::from(name);
-            shm_name.push("-shm");
-            let main = root.open_file_read_nofollow(name).ok()?;
-            let wal = root.open_file_read_nofollow(Path::new(&wal_name)).ok()?;
-            let shm = root.open_file_read_nofollow(Path::new(&shm_name)).ok()?;
-            let result = WalObjects {
-                main: facts(&main)?,
-                wal: facts(&wal)?,
-                shm: facts(&shm)?,
-            };
-            if result.main.bytes == 0
-                || result.shm.bytes < 32768
-                || result.shm.bytes % 32768 != 0
-                || result.main.identity == result.wal.identity
-                || result.main.identity == result.shm.identity
-                || result.wal.identity == result.shm.identity
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             {
-                return None;
+                let _ = (root, name);
+                None
             }
-            let shm_metadata = shm.metadata().ok()?;
-            if !mapped_identity(
-                mapping,
-                shm_metadata.dev(),
-                shm_metadata.ino(),
-                shm_metadata.len(),
-                deadline,
-            )? || !native_identity(
-                self,
-                &registration.context,
-                ffi::SQLITE_FCNTL_FILE_POINTER,
-                0,
-                &main,
-            ) || !native_identity(
-                self,
-                &registration.context,
-                ffi::SQLITE_FCNTL_JOURNAL_POINTER,
-                1,
-                &wal,
-            ) {
-                return None;
-            }
-            // Reopen all three current direct children and compare while original handles stay
-            // retained. A mapped inode cannot be reused while SQLite's live mapping retains it.
-            if facts(&root.open_file_read_nofollow(name).ok()?)? != result.main
-                || facts(&root.open_file_read_nofollow(Path::new(&wal_name)).ok()?)? != result.wal
-                || facts(&root.open_file_read_nofollow(Path::new(&shm_name)).ok()?)? != result.shm
-                || Instant::now() >= deadline
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
-                return None;
+                use std::{ffi::OsString, os::unix::fs::MetadataExt};
+                if deadline.expired()
+                    || rusqlite::version_number() != 3_050_002
+                    || name.components().count() != 1
+                    || !matches!(
+                        name.components().next(),
+                        Some(std::path::Component::Normal(_))
+                    )
+                {
+                    return None;
+                }
+                let registration = self.registration.as_ref()?;
+                // SAFETY: the adapter has process lifetime; this private registration owns the
+                // forwarding VFS and every file callback for the borrowed live connection.
+                #[cfg(target_os = "linux")]
+                let native =
+                    unsafe { ffi::sqlite3_vfs_find(c"yield-linux-retained-root-v1".as_ptr()) };
+                #[cfg(target_os = "macos")]
+                let native = unsafe { ffi::sqlite3_vfs_find(c"unix".as_ptr()) };
+                if native.is_null() || registration.context.native != native {
+                    return None;
+                }
+                let mapping = registration
+                    .context
+                    .state
+                    .lock()
+                    .ok()?
+                    .mapped_shm_region_zero?;
+                let mut wal_name = OsString::from(name);
+                wal_name.push("-wal");
+                let mut shm_name = OsString::from(name);
+                shm_name.push("-shm");
+                let main = root.open_file_read_nofollow(name).ok()?;
+                let wal = root.open_file_read_nofollow(Path::new(&wal_name)).ok()?;
+                let shm = root.open_file_read_nofollow(Path::new(&shm_name)).ok()?;
+                let result = WalObjects {
+                    main: facts(&main)?,
+                    wal: facts(&wal)?,
+                    shm: facts(&shm)?,
+                };
+                if result.main.bytes == 0
+                    || result.shm.bytes < 32768
+                    || result.shm.bytes % 32768 != 0
+                    || result.main.identity == result.wal.identity
+                    || result.main.identity == result.shm.identity
+                    || result.wal.identity == result.shm.identity
+                {
+                    return None;
+                }
+                let shm_metadata = shm.metadata().ok()?;
+                if !mapped_identity(
+                    mapping,
+                    shm_metadata.dev(),
+                    shm_metadata.ino(),
+                    shm_metadata.len(),
+                    &mut deadline,
+                )? || !native_identity(
+                    self,
+                    &registration.context,
+                    ffi::SQLITE_FCNTL_FILE_POINTER,
+                    0,
+                    &main,
+                ) || !native_identity(
+                    self,
+                    &registration.context,
+                    ffi::SQLITE_FCNTL_JOURNAL_POINTER,
+                    1,
+                    &wal,
+                ) {
+                    return None;
+                }
+                // Reopen all three current direct children and compare while original handles stay
+                // retained. A mapped inode cannot be reused while SQLite's live mapping retains it.
+                if facts(&root.open_file_read_nofollow(name).ok()?)? != result.main
+                    || facts(&root.open_file_read_nofollow(Path::new(&wal_name)).ok()?)?
+                        != result.wal
+                    || facts(&root.open_file_read_nofollow(Path::new(&shm_name)).ok()?)?
+                        != result.shm
+                    || deadline.expired()
+                {
+                    return None;
+                }
+                Some(result)
             }
-            Some(result)
-        }
+        })();
+        deadline.outcome(observed)
     }
 }
 
@@ -195,10 +252,10 @@ fn mapped_identity(
     device: u64,
     inode: u64,
     _bytes: u64,
-    deadline: Instant,
+    deadline: &mut ObservationDeadline,
 ) -> Option<bool> {
     let file = std::fs::File::open("/proc/self/maps").ok()?;
-    mapped_identity_stream(file, address, device, inode, deadline)
+    mapped_identity_stream_with_deadline(file, address, device, inode, deadline)
 }
 
 #[cfg(target_os = "macos")]
@@ -207,22 +264,41 @@ fn mapped_identity(
     device: u64,
     inode: u64,
     bytes: u64,
-    deadline: Instant,
+    deadline: &mut ObservationDeadline,
 ) -> Option<bool> {
     darwin::mapped_identity(address, device, inode, bytes, deadline)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn mapped_identity_stream(
+    reader: impl std::io::Read,
+    address: usize,
+    device: u64,
+    inode: u64,
+    deadline: Instant,
+) -> Option<bool> {
+    mapped_identity_stream_with_deadline(
+        reader,
+        address,
+        device,
+        inode,
+        &mut ObservationDeadline::new(deadline),
+    )
 }
 
 // Read the complete bounded kernel stream, including after a match, to reject duplicate
 // mappings and oversized observations. Only the first five fields carry identity; a pathname
 // is never authority. Fixed backing also bounds pathological long pathname lines.
 #[cfg(target_os = "linux")]
-fn mapped_identity_stream(
+fn mapped_identity_stream_with_deadline(
     mut reader: impl std::io::Read,
     address: usize,
     device: u64,
     inode: u64,
-    deadline: Instant,
+    deadline: &mut ObservationDeadline,
 ) -> Option<bool> {
+    #[cfg(test)]
+    deadline_probe::wait_for_original_deadline();
     const MAX_MAP_BYTES: usize = 2 * 1024 * 1024;
     let mut chunk = [0u8; 512];
     let mut prefix = [0u8; 256];
@@ -231,7 +307,7 @@ fn mapped_identity_stream(
     let mut total = 0usize;
     let mut found = false;
     loop {
-        if Instant::now() >= deadline {
+        if deadline.expired() {
             return None;
         }
         let n = match reader.read(&mut chunk) {
@@ -254,7 +330,7 @@ fn mapped_identity_stream(
                     &mut found,
                 )?;
             }
-            return (Instant::now() < deadline).then_some(found);
+            return (!deadline.expired()).then_some(found);
         }
         for &byte in &chunk[..n] {
             if byte == b'\n' {

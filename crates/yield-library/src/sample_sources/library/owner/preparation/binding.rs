@@ -217,12 +217,19 @@ fn objects(
         .ok_or(GlobalPreparationError::DatabaseBinding)?;
     database
         .connection
-        .retained_wal_objects(
+        .observe_retained_wal_objects(
             root,
             Path::new(super::super::super::LIBRARY_DB_FILE_NAME),
             deadline,
         )
-        .ok_or(GlobalPreparationError::DatabaseBinding)
+        .map_err(|refusal| match refusal {
+            crate::sqlite_budget::wal_objects::WalObservationRefusal::Deadline => {
+                GlobalPreparationError::Deadline
+            }
+            crate::sqlite_budget::wal_objects::WalObservationRefusal::Unavailable => {
+                GlobalPreparationError::DatabaseBinding
+            }
+        })
 }
 pub(super) fn capture(
     database: &LibraryDatabase,
@@ -232,7 +239,16 @@ pub(super) fn capture(
     main_identity: &str,
     lifecycle: Option<&crate::lifecycle_allocation::LifecycleDatabaseAllocation>,
 ) -> Result<GlobalWalScope, GlobalPreparationError> {
+    #[cfg(all(test, target_os = "linux"))]
+    let _observation_probe = request
+        .observation_expiry_probe
+        .filter(|(parked, _)| !*parked)
+        .map(|(_, hit)| {
+            crate::sqlite_budget::wal_objects::arm_original_mapping_expiry(request.deadline, hit)
+        });
     let observed = objects(database, request.deadline)?;
+    #[cfg(all(test, target_os = "linux"))]
+    drop(_observation_probe);
     let acquisition = request.owner.acquisition.as_str();
     let facts = [&observed.main, &observed.wal, &observed.shm];
     if database.connection.is_autocommit()
