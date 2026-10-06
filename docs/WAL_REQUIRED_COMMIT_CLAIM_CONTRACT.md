@@ -113,6 +113,14 @@ bindings by verified `(volume, main-file identity, role)` and slices by
 The header contains profile identity string, acquisition identity string, positive
 profile ownership generation (u64), decision nonce (UUID), binding count (u16) and
 slice count (u16). It is followed by every sorted binding, then every sorted slice.
+The genuine profile guard issues that generation after acquiring its original native
+lock (OPT-2365). It is a checked process-local acquisition serial, shared unchanged
+by guard clones and meaningful only with the acquisition UUID and original live
+root/lock ownership. It is not durable or monotonic across processes; a fresh
+process may reuse a numeric serial with a different acquisition UUID. A stored
+serial cannot reconstruct current ownership or a decision latch. The actual
+OPT-2136 inventory consumer must compare all original context at its joint decision;
+the producer alone does not construct or qualify an inventory header.
 Validate SQLite storage ranges before identity allocation: persisted generations,
 revisions and byte ceilings must fit positive/nonnegative i64 fields as applicable.
 Volume IDs retain the existing canonical u64-text storage, not a lossy i64 cast.

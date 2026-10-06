@@ -2059,7 +2059,8 @@ fn profile_error_path(error: &ProfileOwnershipError) -> PathBuf {
         | ProfileOwnershipError::ProfileChildDatabaseRootReplaced { path }
         | ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable { path, .. }
         | ProfileOwnershipError::Unsupported { path } => path.clone(),
-        ProfileOwnershipError::AppDirectory(_) => PathBuf::new(),
+        ProfileOwnershipError::AppDirectory(_)
+        | ProfileOwnershipError::OwnershipGenerationExhausted => PathBuf::new(),
     }
 }
 
