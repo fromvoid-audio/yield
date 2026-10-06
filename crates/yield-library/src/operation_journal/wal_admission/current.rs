@@ -7,6 +7,7 @@ use std::{
 #[derive(Clone, Copy)]
 enum BoundaryRefusal {
     Changed,
+    Busy,
     Revoked,
 }
 
@@ -21,6 +22,38 @@ pub(crate) struct CurrentRound {
     #[cfg(all(test, target_os = "linux"))]
     snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     _credit: super::HandshakeCredit,
+}
+/// Exact Ready publication provenance; never current effect or SQL authority.
+pub(in crate::operation_journal) struct OriginalReadyRound {
+    round: Arc<CurrentRound>,
+    cohort: u64,
+}
+const _: () = assert!(std::mem::size_of::<OriginalReadyRound>() <= 16);
+impl OriginalReadyRound {
+    pub(super) fn new(round: Arc<CurrentRound>, cohort: u64) -> Self {
+        Self { round, cohort }
+    }
+    pub(super) fn require_current(
+        &self,
+        original: &Arc<CurrentRound>,
+    ) -> Result<(), super::WalPreparationError> {
+        use super::WalPreparationError;
+        if !Arc::ptr_eq(&self.round, original) {
+            return Err(WalPreparationError::InvalidInput);
+        }
+        match original.with_boundaries(|state| {
+            state.cohort == self.cohort
+                && !state.invalidated
+                && state.slots == original.expected
+                && original.sources_present(state)
+                && state.decision == Decision::Preparing
+                && Instant::now() < original.deadline
+        }) {
+            Ok(true) => Ok(()),
+            Err(BoundaryRefusal::Busy) => Err(WalPreparationError::Busy),
+            _ => Err(WalPreparationError::InvalidInput),
+        }
+    }
 }
 struct RoundState {
     slots: u64,
@@ -187,6 +220,7 @@ pub(crate) struct CurrentRequest {
     source: Option<uuid::Uuid>,
 }
 impl CurrentRound {
+    pub(crate) const READY_PHASE_BYTES: usize = 64;
     pub(super) fn new(
         count: usize,
         deadline: Instant,
@@ -272,9 +306,18 @@ impl CurrentRound {
                 return compare();
             };
             match first {
-                Some(boundary) => boundary
-                    .with_current(|| visit(rest, compare))
-                    .ok_or(BoundaryRefusal::Revoked)?,
+                Some(boundary) => {
+                    boundary
+                        .try_current(|| visit(rest, compare))
+                        .map_err(|error| match error {
+                            crate::sample_sources::db::DecisionBoundaryRefusal::Busy => {
+                                BoundaryRefusal::Busy
+                            }
+                            crate::sample_sources::db::DecisionBoundaryRefusal::Revoked => {
+                                BoundaryRefusal::Revoked
+                            }
+                        })?
+                }
                 None => visit(rest, compare),
             }
         }
@@ -295,6 +338,7 @@ impl CurrentRound {
             + source_count
                 * crate::sample_sources::db::RegisteredDecisionBoundary::MAX_BACKING_BYTES
             + 64
+            + Self::READY_PHASE_BYTES
     }
     pub(super) fn request(self: &Arc<Self>, index: usize) -> CurrentRequest {
         let bit = 1u64
@@ -314,12 +358,12 @@ impl CurrentRound {
     pub(super) fn invalidated(&self) -> bool {
         match self.with_boundaries(|state| state.invalidated) {
             Ok(invalidated) => invalidated,
-            Err(BoundaryRefusal::Changed) => false, // Pending ACK, not current validity.
+            Err(BoundaryRefusal::Changed | BoundaryRefusal::Busy) => false, // Pending ACK, not current validity.
             Err(BoundaryRefusal::Revoked) => true,
         }
     }
     pub(super) fn complete(&self) -> bool {
-        self.with_complete(|| ()).is_some()
+        self.with_complete(|_| ()).is_some()
     }
     /// Start a new sealed commit-acknowledgement round. The sole journal-side guard
     /// resolves NoAttempt on every pre-SQL refusal, including partial acknowledgement.
@@ -338,7 +382,7 @@ impl CurrentRound {
     }
     /// Scalar publication competes with original worker cleanup under this same mutex.
     /// Never run native I/O, SQLite or owner waits inside this closure.
-    pub(super) fn with_complete<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
+    pub(super) fn with_complete<T>(&self, publish: impl FnOnce(u64) -> T) -> Option<T> {
         self.with_boundaries(|state| {
             if Instant::now() >= self.deadline
                 || state.invalidated
@@ -348,7 +392,7 @@ impl CurrentRound {
             {
                 return None;
             }
-            Some(publish())
+            Some(publish(state.cohort))
         })
         .ok()
         .flatten()

@@ -1592,6 +1592,30 @@ mod integration {
     fn genuine_foreign_source_registration_cannot_fill_original_decision_slot() {
         original_retirement_custody(10);
     }
+    #[test]
+    fn genuine_original_source_gate_contention_is_pending_then_current_then_revoked() {
+        original_retirement_custody(11);
+    }
+    #[test]
+    fn source_gate_becoming_busy_between_completion_and_publication_preserves_preparing_round() {
+        original_retirement_custody(12);
+    }
+    #[test]
+    fn genuine_ready_retirement_command_preserves_busy_input_until_original_gate_releases() {
+        original_retirement_custody(13);
+    }
+    #[test]
+    fn genuine_ready_retirement_busy_command_cancellation_retains_original_cleanup() {
+        original_retirement_custody(14);
+    }
+    #[test]
+    fn genuine_ready_retirement_busy_command_original_deadline_refuses_without_sql() {
+        original_retirement_custody(15);
+    }
+    #[test]
+    fn genuine_ready_retirement_busy_command_original_drain_revokes_without_sql() {
+        original_retirement_custody(16);
+    }
     fn original_retirement_custody(outcome: u8) {
         original_retirement_custody_with_source_policy(outcome, None);
     }
@@ -2108,7 +2132,7 @@ mod integration {
         .unwrap();
         let budget = input.budget_for_test();
         let mut local_collector = None;
-        let handle = if outcome == 0 || outcome == 4 || outcome == 5 {
+        let handle = if outcome == 0 || outcome == 4 || outcome == 5 || outcome >= 13 {
             journal
                 .client()
                 .prepare_wal_owners(input)
@@ -2127,6 +2151,59 @@ mod integration {
             let acquisition = Uuid::parse_str(fixture.owner.owner_identity()).unwrap();
             let (mut collector, handle) =
                 crate::operation_journal::wal_admission::Collector::new(input, permit, acquisition);
+            if outcome == 12 {
+                let round = loop {
+                    if let Some(round) = collector.preparing_round_for_tests() {
+                        break round;
+                    }
+                    assert!(Instant::now() < deadline);
+                    collector.poll();
+                    thread::sleep(Duration::from_millis(1));
+                };
+                while !round.all_ack_slots_for_tests() {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let token = actor
+                    .tokens
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+                let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+                let holder = Arc::new(Mutex::new(None));
+                let published_holder = Arc::clone(&holder);
+                let publication = Arc::clone(&round);
+                let completion = Arc::clone(&round);
+                // Poll first observes revocation, then completion, then publication.
+                round.snapshot_hook_for_tests(Box::new(move || {
+                    completion.snapshot_hook_for_tests(Box::new(move || {
+                        publication.snapshot_hook_for_tests(Box::new(move || {
+                            *published_holder.lock().unwrap() = Some(thread::spawn(move || {
+                                assert!(
+                                    token
+                                        .with_current(|| {
+                                            entered_tx.send(()).unwrap();
+                                            release_rx
+                                                .recv_timeout(Duration::from_secs(1))
+                                                .unwrap();
+                                        })
+                                        .is_some()
+                                );
+                            }));
+                            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                        }));
+                    }));
+                }));
+                assert!(!collector.poll());
+                assert!(matches!(handle.status(), WalPreparationStatus::Preparing));
+                assert!(!round.invalidated_for_tests());
+                release_tx.send(()).unwrap();
+                holder.lock().unwrap().take().unwrap().join().unwrap();
+            }
             while matches!(handle.status(), WalPreparationStatus::Preparing) {
                 assert!(Instant::now() < deadline);
                 collector.poll();
@@ -2286,6 +2363,37 @@ mod integration {
                 thread::sleep(Duration::from_millis(1));
             }
             assert_eq!(collector.decision_nonce(), Some(nonce));
+            if outcome == 11 {
+                let token = actor
+                    .tokens
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+                let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+                let holder = thread::spawn(move || {
+                    assert!(
+                        token
+                            .with_current(|| {
+                                entered_tx.send(()).unwrap();
+                                release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                            })
+                            .is_some()
+                    );
+                });
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let started = Instant::now();
+                assert!(!collector.decision_acknowledged());
+                assert!(!collector.round_for_tests().invalidated_for_tests());
+                assert!(!collector.start_settlement());
+                assert!(started.elapsed() < Duration::from_millis(100));
+                release_tx.send(()).unwrap();
+                holder.join().unwrap();
+                assert!(collector.decision_acknowledged());
+            }
             if outcome == 10 {
                 assert!(
                     collector.decision_acknowledged(),
@@ -2493,13 +2601,67 @@ mod integration {
                 WalPreparationError::InvalidInput
             ))
         ));
-        let result = journal
-            .client()
-            .admit_prepared(prepared)
-            .unwrap()
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap();
-        if outcome >= 4 || source_policy_fault.is_some() {
+        let busy = if outcome >= 13 {
+            let token = actor
+                .tokens
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let holder = thread::spawn(move || {
+                assert!(
+                    token
+                        .with_current(|| {
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+                        })
+                        .is_some()
+                );
+            });
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            Some((release_tx, holder))
+        } else {
+            None
+        };
+        let mut admitted = journal.client().admit_prepared(prepared).unwrap();
+        if outcome >= 13 {
+            assert!(
+                matches!(
+                    admitted.recv_timeout(Duration::from_millis(50)),
+                    Err(OperationJournalRequestError::Empty)
+                ),
+                "genuine Ready command must retain original input while its gate is busy"
+            );
+            if outcome == 14 {
+                handle.abort();
+            } else if outcome == 15 {
+                while Instant::now() < deadline + Duration::from_millis(20) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            } else if outcome == 16 {
+                actor.drain_requested.store(true, Ordering::Release);
+            }
+            let (release, holder) = busy.unwrap();
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            if outcome == 16 {
+                while !actor.drained.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline + Duration::from_secs(1));
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        let result = admitted.recv_timeout(Duration::from_secs(3)).unwrap();
+        if outcome >= 14 {
+            assert!(
+                result.is_err(),
+                "revoked original command cannot succeed: {result:?}"
+            );
+        } else if outcome == 4 || outcome == 5 || source_policy_fault.is_some() {
             assert!(
                 matches!(
                     result,
@@ -2511,7 +2673,8 @@ mod integration {
             );
         } else {
             assert!(
-                matches!(result, Err(OperationJournalOwnerError::PreparedAdmission(PreparedAdmissionError::Unsupported { reason })) if reason.contains("original owners acknowledged"))
+                matches!(&result, Err(OperationJournalOwnerError::PreparedAdmission(PreparedAdmissionError::Unsupported { reason })) if reason.contains("original owners acknowledged")),
+                "original retirement acknowledgement result: {result:?}"
             );
         }
         assert!(
@@ -2546,10 +2709,15 @@ mod integration {
         handle.abort();
         let aborted = wait(&handle, terminal);
         assert!(
-            if outcome >= 4 || source_policy_fault.is_some() {
+            if outcome == 4 || outcome == 5 || source_policy_fault.is_some() {
                 matches!(
                     aborted,
                     WalPreparationStatus::Rejected(WalPreparationError::InvalidInput)
+                )
+            } else if outcome >= 14 {
+                matches!(
+                    aborted,
+                    WalPreparationStatus::Aborted | WalPreparationStatus::Rejected(_)
                 )
             } else {
                 matches!(aborted, WalPreparationStatus::Aborted)

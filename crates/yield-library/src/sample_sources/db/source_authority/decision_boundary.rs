@@ -5,6 +5,11 @@ use super::*;
 pub(crate) struct RegisteredDecisionBoundary(Arc<AuthorityState>);
 const _: () = assert!(std::mem::size_of::<RegisteredDecisionBoundary>() <= 16);
 
+pub(crate) enum DecisionBoundaryRefusal {
+    Busy,
+    Revoked,
+}
+
 impl SourceAuthorityRegistration {
     pub(crate) fn decision_boundary(&self) -> Option<RegisteredDecisionBoundary> {
         let backing = std::mem::size_of::<AuthorityState>()
@@ -23,6 +28,29 @@ impl RegisteredDecisionBoundary {
     }
     pub(crate) fn registration(&self) -> Uuid {
         self.0.registration_id.0
+    }
+
+    /// Coordinator polling never waits behind native validation on the original gate.
+    pub(crate) fn try_current<T>(
+        &self,
+        compare: impl FnOnce() -> T,
+    ) -> Result<T, DecisionBoundaryRefusal> {
+        let gate = self
+            .0
+            .effect_gate
+            .state
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => DecisionBoundaryRefusal::Busy,
+                std::sync::TryLockError::Poisoned(_) => DecisionBoundaryRefusal::Revoked,
+            })?;
+        if !gate.open
+            || self.0.phase() != REGISTERED
+            || !self.0.lease_liveness.load(Ordering::Acquire)
+        {
+            return Err(DecisionBoundaryRefusal::Revoked);
+        }
+        Ok(compare())
     }
 
     /// Runs only bounded scalar work while drain/abandon compete on this same gate.

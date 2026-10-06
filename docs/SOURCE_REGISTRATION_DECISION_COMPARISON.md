@@ -8,7 +8,7 @@ Generic/global acknowledgements cannot fill these slots. Tokens retain the
 original private lifecycle state rather than decode stored observations.
 
 Each complete/decision comparison snapshots a fixed array of token references.
-It locks the original Source gates in inventory order, then the round mutex,
+It tries the original Source gates in inventory order, then locks the round mutex,
 matching producer gate-before-round ordering. The final mutex check requires
 an unchanged checked token-cohort revision. A late Source acknowledgement cannot
 fill a previously empty snapshot and bypass its missing gate lock. A changed
@@ -46,3 +46,22 @@ issuer, qualified directions, atomic nonce/intent/claims/inventory and uncertain
 readback/restart remain open, as do OPT-2194 and OPT-2168. No token, private Boolean,
 lifetime count, copied observation or test fixture issues effects, permits,
 retries, refunds or settlement.
+
+Coordinator comparisons use `try_lock` on each original Source gate. A gate busy
+with existing native validation leaves completion, acknowledgement and the test
+start cutoff pending without revoking the round. A gate becoming busy between
+completion and Ready publication likewise preserves Preparing until a fresh
+comparison succeeds. Releasing that gate permits a fresh comparison; drain or
+abandonment still refuses it. Producer ACK installation keeps its existing
+original ownership semantics.
+
+The actual retirement command retains its original prepared input and input debit
+when the original Ready gate is busy. Ready provenance captures the exact round
+Arc and cohort at successful publication. Retry requires that same Arc and frozen
+cohort, still-complete original slots, current registration and original deadline;
+only gate contention is Busy. Cancellation, expiry, revocation, changed cohort or
+an incomplete round refuse. Successful comparison advances the private command
+phase once to a fresh decision nonce; later polls consume its genuine owner ACKs
+without replacing that nonce. A separate prepaid 64-byte allowance covers the
+fixed Ready/phase metadata. During overlap, old and new rounds retain their own
+charged backing; checked budget growth can refuse without losing the original.

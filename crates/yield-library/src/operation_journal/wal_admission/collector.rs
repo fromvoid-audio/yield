@@ -166,6 +166,7 @@ pub(in crate::operation_journal) struct Collector {
     reason: Option<WalPreparationError>,
     global_started: bool,
     snapshot: Option<WalPreparationObservation>,
+    ready_cohort: Option<u64>,
     current: Option<Arc<super::CurrentRound>>,
     done: bool,
     _journal_input: Arc<super::super::owner::InputPermit>,
@@ -194,6 +195,7 @@ impl Collector {
                 reason: None,
                 global_started: false,
                 snapshot: None,
+                ready_cohort: None,
                 current: None,
                 done: false,
                 _journal_input: Arc::new(journal_input),
@@ -230,19 +232,60 @@ impl Collector {
     pub(in crate::operation_journal) fn round_for_tests(&self) -> Arc<super::CurrentRound> {
         Arc::clone(self.current.as_ref().unwrap())
     }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::operation_journal) fn preparing_round_for_tests(
+        &self,
+    ) -> Option<Arc<super::CurrentRound>> {
+        self.current.as_ref().map(Arc::clone)
+    }
     /// Request a new original commit-acknowledgement round; earlier Ready is insufficient.
+    pub(in crate::operation_journal) fn original_ready_round(
+        &self,
+    ) -> Result<super::OriginalReadyRound, WalPreparationError> {
+        if self.snapshot.is_none()
+            || self.reason.is_some()
+            || self.decision.is_some()
+            || self.shared.canceled.load(Ordering::Acquire)
+            || Instant::now() >= self.input.deadline
+        {
+            return Err(WalPreparationError::InvalidInput);
+        }
+        Ok(super::OriginalReadyRound::new(
+            Arc::clone(
+                self.current
+                    .as_ref()
+                    .ok_or(WalPreparationError::InvalidInput)?,
+            ),
+            self.ready_cohort.ok_or(WalPreparationError::InvalidInput)?,
+        ))
+    }
+    #[cfg(all(test, target_os = "linux"))]
     pub(in crate::operation_journal) fn begin_decision(
         &mut self,
         expected_digest: [u8; 32],
+    ) -> Result<(), WalPreparationError> {
+        let ready = self.original_ready_round()?;
+        self.begin_decision_from_ready(expected_digest, &ready)
+    }
+    pub(in crate::operation_journal) fn begin_decision_from_ready(
+        &mut self,
+        expected_digest: [u8; 32],
+        ready: &super::OriginalReadyRound,
     ) -> Result<(), WalPreparationError> {
         if expected_digest != self.input.digest
             || self.snapshot.is_none()
             || self.reason.is_some()
             || self.decision.is_some()
-            || !self.current.as_ref().is_some_and(|round| round.complete())
+            || self.shared.canceled.load(Ordering::Acquire)
+            || Instant::now() >= self.input.deadline
         {
             return Err(WalPreparationError::InvalidInput);
         }
+        ready.require_current(
+            self.current
+                .as_ref()
+                .ok_or(WalPreparationError::InvalidInput)?,
+        )?;
         let mut credit = self.input.budget.credit();
         credit
             .resize(super::CurrentRound::retained_bytes(
@@ -662,12 +705,19 @@ impl Collector {
             match self.make_snapshot() {
                 Ok(snapshot) => {
                     if let Some(round) = &self.current {
-                        if round
-                            .with_complete(|| {
-                                self.publish(WalPreparationStatus::Ready(snapshot.clone()))
-                            })
-                            .is_none()
-                        {
+                        let publication = round.with_complete(|cohort| {
+                            self.publish(WalPreparationStatus::Ready(snapshot.clone()));
+                            cohort
+                        });
+                        if let Some(cohort) = publication {
+                            self.ready_cohort = Some(cohort);
+                        } else {
+                            // A Source gate may become busy after the earlier completion
+                            // check. Keep the original round pending; only actual revocation
+                            // may turn this failed publication comparison into owner loss.
+                            if !round.invalidated() {
+                                return false;
+                            }
                             self.fail(WalPreparationError::OwnerLost);
                             return self.poll_abort();
                         }
