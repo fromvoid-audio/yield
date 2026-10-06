@@ -31,7 +31,10 @@ mod integration {
                 )
                 .unwrap();
             let outcome = pending.recv_timeout(Duration::from_secs(3)).unwrap();
-            eprintln!("OPT2404 actual original Global capture result: {outcome:?}");
+            eprintln!(
+                "OPT2404 actual original Global capture refusal: {:?}",
+                outcome.as_ref().err()
+            );
             assert_eq!(outcome.err(), Some(GlobalPreparationError::Deadline));
             empty(writer);
             assert_eq!(charged(writer), 0);
