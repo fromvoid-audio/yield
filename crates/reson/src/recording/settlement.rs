@@ -28,6 +28,8 @@ pub struct RecordingSinkBinding {
 impl RecordingSinkBinding {
     /// Allocate two one-element channels for this exact sink/serializer instance.
     /// Retain the receiver in the admitted adapter before moving the binding to startup.
+    /// This generic codec binding leaves format selection to startup. Use
+    /// `RecordingTransport::bind` to preserve an original finite transport preparation.
     pub fn bind(sink: Box<dyn RecordingSink>) -> (Self, RecordingSettlements) {
         let instance = Arc::new(Instance);
         let (barrier_tx, barrier_rx) = mpsc::sync_channel(1);
@@ -39,6 +41,7 @@ impl RecordingSinkBinding {
                     instance: instance.clone(),
                     barrier_tx,
                     joined_tx,
+                    original_limits: None,
                 },
             },
             RecordingSettlements {
@@ -49,6 +52,17 @@ impl RecordingSinkBinding {
                 joined_taken: false,
             },
         )
+    }
+
+    // Only the original finite transport factory fixes this preparation. Generic codec
+    // bindings intentionally leave format selection to their caller.
+    pub(super) fn bind_with_limits(
+        sink: Box<dyn RecordingSink>,
+        limits: RecordingLimits,
+    ) -> (Self, RecordingSettlements) {
+        let (mut binding, settlements) = Self::bind(sink);
+        binding.producer.original_limits = Some(limits);
+        (binding, settlements)
     }
 }
 
@@ -269,6 +283,7 @@ pub(super) struct ProducerSettlement {
     instance: Arc<Instance>,
     barrier_tx: SyncSender<RecordingTerminalBarrier>,
     joined_tx: SyncSender<RecordingJoinedCompletion>,
+    original_limits: Option<RecordingLimits>,
 }
 pub(super) struct BarrierIssuer {
     instance: Arc<Instance>,
@@ -282,6 +297,18 @@ pub(super) struct JoinedIssuer {
     health: Arc<RecordingHealthState>,
 }
 impl ProducerSettlement {
+    pub(super) fn validate_limits(&self, limits: RecordingLimits) -> Result<(), AudioInputError> {
+        if self
+            .original_limits
+            .is_some_and(|original| original != limits)
+        {
+            return Err(AudioInputError::RecordingFailed {
+                detail: "recording startup differs from original transport limits".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn start(
         self,
         mode: Arc<AtomicU8>,

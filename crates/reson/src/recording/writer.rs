@@ -34,7 +34,7 @@ pub trait RecordingSink: Write + Seek + Send {}
 impl<T: Write + Seek + Send> RecordingSink for T {}
 
 /// Validated finite float32 WAV and callback-ring bounds.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecordingLimits {
     sample_rate: u32,
     channels: u16,
@@ -197,6 +197,9 @@ impl RecorderWriter {
         health: Arc<RecordingHealthState>,
         settlement: Option<ProducerSettlement>,
     ) -> Result<Self, AudioInputError> {
+        if let Some(producer) = &settlement {
+            producer.validate_limits(limits)?;
+        }
         let (barrier, joined_issuer) = match settlement {
             Some(producer) => {
                 let (barrier, joined) = producer.start(mode.clone(), health.clone());

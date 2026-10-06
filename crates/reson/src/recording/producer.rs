@@ -27,10 +27,12 @@ pub struct RecordingProducer {
 impl RecordingProducer {
     /// Consume the exact sink binding and start the original finite serializer.
     /// The paired owner must handle its pre-finalize barrier separately from Stop/join.
+    /// Transport-created bindings reject changed limits before allocating the capture ring.
     pub fn start(
         binding: RecordingSinkBinding,
         limits: RecordingLimits,
     ) -> Result<Self, AudioInputError> {
+        binding.producer.validate_limits(limits)?;
         let health = Arc::new(RecordingHealthState::default());
         let (capture, consumer) = RecorderWriter::prepare_capture(limits, health.clone());
         let writer = RecorderWriter::spawn_prepared_with_settlement(

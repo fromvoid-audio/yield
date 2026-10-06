@@ -95,9 +95,10 @@ fn original_transport_limits_refuse_changed_producer_before_ring_and_header() {
         let supplied = RecordingLimits::new(rate, channels, frames).unwrap();
         let (binding, receiver, mut settlements) = RecordingTransport::bind(original);
         super::super::writer::PREPARED_RING_BYTES.with(|bytes| bytes.set(0));
-        let (started, header_bytes) = thread::scope(|scope| {
+        let (started, header_bytes, barriers, joined) = thread::scope(|scope| {
             let owner = scope.spawn(move || {
                 let mut header_bytes = 0;
+                let mut barriers = 0;
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(1)) {
                         Ok(request) => {
@@ -105,9 +106,16 @@ fn original_transport_limits_refuse_changed_producer_before_ring_and_header() {
                             request.acknowledge().unwrap();
                         }
                         Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => return header_bytes,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return (
+                                header_bytes,
+                                barriers,
+                                settlements.recv_joined(Duration::ZERO).is_ok(),
+                            );
+                        }
                     }
                     if let Ok(barrier) = settlements.recv_barrier(Duration::ZERO) {
+                        barriers += 1;
                         barrier.deny();
                     }
                 }
@@ -118,15 +126,24 @@ fn original_transport_limits_refuse_changed_producer_before_ring_and_header() {
                     assert!(producer.cancel().is_err());
                     true
                 }
-                Err(_) => false,
+                Err(crate::input::AudioInputError::RecordingFailed { detail }) => {
+                    assert_eq!(
+                        detail,
+                        "recording startup differs from original transport limits"
+                    );
+                    false
+                }
+                Err(error) => panic!("unexpected startup refusal: {error:?}"),
             };
-            (started, owner.join().unwrap())
+            let (header_bytes, barriers, joined) = owner.join().unwrap();
+            (started, header_bytes, barriers, joined)
         });
         let ring_bytes = super::super::writer::PREPARED_RING_BYTES.with(|bytes| bytes.get());
         eprintln!(
             "original transport mismatch {rate}/{channels}/{frames}: started={started}, ring_bytes={ring_bytes}, header_bytes={header_bytes}"
         );
-        all_refused_before_resources &= !started && ring_bytes == 0 && header_bytes == 0;
+        all_refused_before_resources &=
+            !started && ring_bytes == 0 && header_bytes == 0 && barriers == 0 && !joined;
     }
     assert!(
         all_refused_before_resources,
