@@ -115,7 +115,10 @@ fn idle_source_wal_expired_original_lease_refuses_without_checkpoint_or_renewal(
     database(|db, _, _| {
         pressure(db);
         db.connection
-            .execute("UPDATE source_lease SET expires_at = unixepoch() - 1", [])
+            .execute(
+                "UPDATE source_lease SET acquired_at = unixepoch() - 2, expires_at = unixepoch() - 1",
+                [],
+            )
             .unwrap();
         let expires = expiry(db);
         let control = db
