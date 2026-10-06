@@ -110,3 +110,11 @@ join. This readback route is verification only; it does not replace the producti
 retained root, SQLite connection or identity check. Native Windows execution is
 tracked by OPT-2419; native macOS production bootstrap and namespace caller checks
 use OPT-2405. Both remain open until their actual resource-dependent runs.
+
+The nested ordinary-claim reader also takes a fresh namespace loan after the
+original BEGIN and before original collection allocation. Its precommit guard
+preserves the expected active transaction and otherwise performs the same original
+profile/root/file/SQLite/sidecar sequence. A real retained-WAL regression on that
+same nested reader verifies full unfunded/funded error parity, no collection
+allocation, exact retained namespace debit, original rollback/autocommit and
+unchanged durable evidence, followed by exact final consumer refund.

@@ -100,3 +100,61 @@ fn namespace_backing_native_original_connection_refusal() {
     // does not claim normal Store/worker shutdown or physical qualification.
     std::process::exit(0);
 }
+
+#[test]
+fn namespace_backing_nested_original_ordinary_reader_retains_precommit_failure() {
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let path = store.retained_namespace_path_for_test();
+    let original = fs::read(&path).unwrap();
+    // The same original BEGIN precedes this nested reader. The precommit guard
+    // must not treat that expected transaction as an audit failure.
+    store.connection.execute_batch("BEGIN").unwrap();
+    let wal = path.with_file_name("journal.sqlite3-wal");
+    fs::write(&wal, b"nested original namespace evidence").unwrap();
+    let unfunded = store
+        .rebuild_ordinary_claim_snapshot_inside_transaction()
+        .unwrap_err();
+    assert!(matches!(
+        unfunded,
+        OperationJournalStoreError::RequiresAudit { .. }
+    ));
+    let expected = unfunded.to_string();
+    drop(unfunded);
+    let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+    let observe_pool = funding.pool_bytes_observer_for_test();
+    let (available, baseline) = observe_pool();
+    let mut collection = None;
+    let error = store
+        .rebuild_ordinary_claim_snapshot_with_funding(Some(&funding.input), &mut collection)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OperationJournalStoreError::RequiresAudit { .. }
+    ));
+    assert_eq!(error.to_string(), expected);
+    assert!(
+        collection.is_none(),
+        "selected failure precedes original collection allocation"
+    );
+    assert_eq!(
+        observe_pool().0,
+        available - store.retained_namespace_working_bytes_for_test()
+    );
+    drop(error);
+    assert_eq!(
+        observe_pool().0,
+        available - store.retained_namespace_working_bytes_for_test(),
+        "nested selected error backing remains with its original consumer"
+    );
+    store.connection.execute_batch("ROLLBACK").unwrap();
+    assert!(store.connection.is_autocommit());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        fs::read(&wal).unwrap(),
+        b"nested original namespace evidence"
+    );
+    fs::remove_file(wal).unwrap();
+    drop(funding);
+    assert_eq!(observe_pool().0, baseline);
+}

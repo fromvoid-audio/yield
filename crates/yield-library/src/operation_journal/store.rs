@@ -7240,7 +7240,7 @@ impl OperationJournalStore {
         input: Option<&super::owner::InputPermit>,
         collection: &mut Option<admission_rebuild_backing::Collection>,
     ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
-        self.validate_namespace_for_precommit()?;
+        self.validate_namespace_with_input(input, true)?;
         if let Some(input) = input {
             *collection = Some(admission_rebuild_backing::Collection::new(
                 &self.connection,
