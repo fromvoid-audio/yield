@@ -540,4 +540,37 @@ mod publication_issuance {
                 .is_none()
         );
     }
+    #[test]
+    fn publication_issuance_effect_collision_rolls_back_original_boolean() {
+        let (_fixture, store, staging, binding, sequence) = prepared();
+        store.connection.execute("INSERT INTO operation_journal_publication_issuance(output_id,publication_effect_id,record) VALUES (?1,?2,?3)",
+            params![Uuid::new_v4().to_string(),binding.publication_effect().to_string(),binding.encode().unwrap()]).unwrap();
+        assert!(
+            store
+                .reserve_publication_binding_fixture(&staging, sequence, binding)
+                .is_err()
+        );
+        assert!(
+            !store
+                .read_staging_checkpoint_row(staging.output_id())
+                .unwrap()
+                .unwrap()
+                .2
+        );
+        assert!(
+            store
+                .read_publication_binding(staging.output_id())
+                .unwrap()
+                .is_none()
+        );
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM operation_journal_publication_issuance",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }

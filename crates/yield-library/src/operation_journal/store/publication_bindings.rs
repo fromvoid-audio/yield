@@ -324,7 +324,7 @@ impl OperationJournalStore {
         binding.validate_staging(staging)?;
         self.validate_publication_charge_record(binding)?;
         let count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM operation_journal_publication_issuance",
+            "SELECT COUNT(*) FROM (SELECT 1 FROM operation_journal_publication_issuance LIMIT 8192)",
             [],
             |row| row.get(0),
         )?;
