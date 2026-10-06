@@ -3,7 +3,7 @@ use super::super::codec::historical_observation;
 use super::super::owner::InputPermit;
 use super::*;
 use std::cell::RefCell;
-mod borrowed_sql;
+pub(super) mod borrowed_sql;
 use borrowed_sql::Statement;
 
 impl OperationJournalStore {

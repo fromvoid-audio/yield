@@ -8,6 +8,10 @@
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, Row, params};
 use thiserror::Error;
+mod funded;
+pub(super) use funded::{
+    PageFailure, read_claim_page as read_funded_page, read_release_page as read_funded_release_page,
+};
 use uuid::Uuid;
 
 use crate::durable_capacity::VolumeIdentity;
@@ -581,7 +585,36 @@ fn validate_cursor(cursor: OrdinaryClaimCursor) -> Result<(), OrdinaryClaimReadE
         .map_err(|error| malformed(None, error.to_string()))
 }
 
-fn decode_row(row: &Row<'_>) -> Result<OrdinaryClaimRecord, OrdinaryClaimReadError> {
+trait RowValues {
+    fn get_ref(&self, index: usize) -> Result<ValueRef<'_>, OrdinaryClaimReadError>;
+}
+impl RowValues for Row<'_> {
+    fn get_ref(&self, index: usize) -> Result<ValueRef<'_>, OrdinaryClaimReadError> {
+        Row::get_ref(self, index).map_err(OrdinaryClaimReadError::from)
+    }
+}
+struct BorrowedValues<'a>(&'a [ValueRef<'a>]);
+impl RowValues for BorrowedValues<'_> {
+    fn get_ref(&self, index: usize) -> Result<ValueRef<'_>, OrdinaryClaimReadError> {
+        self.0
+            .get(index)
+            .copied()
+            .ok_or_else(|| rusqlite::Error::InvalidColumnIndex(index).into())
+    }
+}
+// Both original rusqlite rows and funded native rows use the EXACT same decoder.
+pub(super) fn decode_claim_values(
+    values: [ValueRef<'_>; 5],
+) -> Result<OrdinaryClaimRecord, OrdinaryClaimReadError> {
+    decode_row(&BorrowedValues(&values))
+}
+pub(super) fn decode_release_values(
+    values: [ValueRef<'_>; 3],
+) -> Result<OrdinaryClaimReleaseRecord, OrdinaryClaimReadError> {
+    decode_release_row(&BorrowedValues(&values))
+}
+
+fn decode_row(row: &impl RowValues) -> Result<OrdinaryClaimRecord, OrdinaryClaimReadError> {
     let claim_text = text_value(row, 0, "claim_id", None, MAX_UUID_TEXT_BYTES)?;
     let claim_uuid = parse_uuid(&claim_text, "claim_id", false)?;
     let claim_id = AdmissionClaimId::from_uuid(claim_uuid)
@@ -626,7 +659,9 @@ fn decode_row(row: &Row<'_>) -> Result<OrdinaryClaimRecord, OrdinaryClaimReadErr
     })
 }
 
-fn decode_release_row(row: &Row<'_>) -> Result<OrdinaryClaimReleaseRecord, OrdinaryClaimReadError> {
+fn decode_release_row(
+    row: &impl RowValues,
+) -> Result<OrdinaryClaimReleaseRecord, OrdinaryClaimReadError> {
     let claim_text = text_value(row, 0, "claim_id", None, MAX_UUID_TEXT_BYTES)?;
     let claim_uuid = parse_uuid(&claim_text, "claim_id", false)?;
     let claim_id = AdmissionClaimId::from_uuid(claim_uuid)
@@ -649,7 +684,7 @@ fn decode_release_row(row: &Row<'_>) -> Result<OrdinaryClaimReleaseRecord, Ordin
 }
 
 fn text_value(
-    row: &Row<'_>,
+    row: &impl RowValues,
     index: usize,
     field: &str,
     claim: Option<&str>,
@@ -722,7 +757,7 @@ fn parse_allocation_class(
 }
 
 fn positive_integer_value(
-    row: &Row<'_>,
+    row: &impl RowValues,
     index: usize,
     field: &str,
     claim: &str,

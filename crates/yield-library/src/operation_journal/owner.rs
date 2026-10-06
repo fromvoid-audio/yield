@@ -1941,7 +1941,10 @@ impl OwnerRuntime {
         }
         let snapshot = match input {
             Some(input) => self.store().rebuild_admission_snapshot_for_input(input),
-            None => self.store().rebuild_admission_snapshot(),
+            None => self
+                .store()
+                .rebuild_admission_snapshot()
+                .map(super::store::FundedSnapshot::unfunded),
         }
         .map_err(|error| PreparedAdmissionError::RecoveryRequired {
             reason: error.to_string(),
@@ -1996,11 +1999,11 @@ impl OwnerRuntime {
         // Reconcile the fresh durable image against the existing owner-thread ledger before
         // arithmetic. An exact image is a no-op; any changed/nonempty conflict remains held and
         // blocks admission without replacing live accounting.
-        provider
-            .validate_rebuilt_claims(&snapshot)
-            .map_err(|error| PreparedAdmissionError::RecoveryRequired {
+        snapshot.validate_provider(provider).map_err(|error| {
+            PreparedAdmissionError::RecoveryRequired {
                 reason: format!("current durable/live capacity image differs: {error}"),
-            })?;
+            }
+        })?;
         provider
             .validate_recovery_state()
             .map_err(PreparedAdmissionError::from)?;

@@ -444,6 +444,26 @@
       "retirement": "Keep only as the explicit historical observer/owner funding fixture; never enable start_without_capacity_for_test as production bootstrap."
     },
     {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "ordinary_rebuild_backing_actual_queued_collection_pressure_precedes_identity_allocation",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2387",
+      "reason": "cfg(test) genuine original queued admission with exact ordinary collection pressure; original same-connection SQLite rows retained unchanged and reopened only after genuine owner join. No provider, physical capacity, permit or filesystem mutation authority.",
+      "retirement": "Keep only as this explicit original collection funding/refusal fixture; never activate the test-only owner start in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "ordinary_rebuild_backing_actual_queued_collection_pressure_precedes_identity_allocation",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2387",
+      "reason": "cfg(test) genuine original queued admission with exact ordinary collection pressure; original same-connection SQLite rows retained unchanged and reopened only after genuine owner join. No provider, physical capacity, permit or filesystem mutation authority.",
+      "retirement": "Keep only as this explicit original collection funding/refusal fixture; never activate the test-only owner start in production."
+    },
+    {
       "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/reconcile.rs",
       "function": "reconcile_source_entry",
       "operation": "method::remove_file",
