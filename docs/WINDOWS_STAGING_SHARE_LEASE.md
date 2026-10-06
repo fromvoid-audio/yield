@@ -26,6 +26,11 @@ allocation, synchronization and qualified physical policy remain implementation
 requirements of OPT-2218. This lease is no qualification receipt and issues no
 publication, retry, refund or settlement authority.
 
+The separate [created-stage handoff assessment](WINDOWS_CREATED_STAGE_CUSTODY.md)
+rejects a permissive readonly bridge between closing a writer and acquiring this
+lease. It specifies the missing original creator/private consumer requirements;
+this observation lease does not implement that producer or qualify its candidate.
+
 Two actual Windows tests exercise original readonly-handle acquisition, existing
 write/delete conflicts, new conflicts, read compatibility, identity/byte
 preservation and closure after the last retained Arc alias. Linux does not execute
