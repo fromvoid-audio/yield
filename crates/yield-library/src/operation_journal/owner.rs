@@ -13,8 +13,11 @@ pub use super::wal_admission::{
 };
 mod frozen_copy;
 mod historical_reply;
+mod namespace_credit;
 mod startup_credit;
 use historical_reply::HistoricalReply;
+#[cfg(any(test, feature = "test-support"))]
+pub use namespace_credit::JournalNamespaceFundingProbe;
 pub(super) use startup_credit::StartupCredit;
 mod queue_metrics;
 pub use queue_metrics::{JournalQueueClassMetrics, JournalQueueMetricsSnapshot};
@@ -1950,7 +1953,7 @@ impl OwnerRuntime {
             .validate_shape()
             .map_err(OperationJournalOwnerError::from)?;
         self.store()
-            .validate_for_admission()
+            .validate_namespace_with_input(input, false)
             .map_err(OperationJournalOwnerError::from)?;
         if let UniversalCommandArgs::Recording(proposal) = &prepared.args {
             self.store()
@@ -5629,6 +5632,7 @@ impl OperationJournalClient {
                 _header: header,
                 consumer: Mutex::new(None),
                 observer: Mutex::new(None),
+                namespace: Mutex::new(None),
                 #[cfg(test)]
                 consumer_refused: std::sync::atomic::AtomicBool::new(false),
             });
@@ -6062,6 +6066,7 @@ pub(super) struct InputPermit {
 struct HistoricalReplyBacking {
     consumer: Mutex<Option<InputPermit>>,
     observer: Mutex<Option<HistoricalObserverCredits>>,
+    namespace: Mutex<Option<namespace_credit::NamespaceCredits>>,
     #[cfg(test)]
     consumer_refused: std::sync::atomic::AtomicBool,
     // Release working/consumer storage first; the private wrapper already freed the Arc.
@@ -6089,6 +6094,27 @@ impl InputPermit {
         Arc::new(OwnerShared::new(senders))
             .reserve_input(InputClass::Ordinary, bytes)
             .expect("test original input pool")
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn historical_test_namespace_input(bytes: usize) -> Self {
+        let (senders, _receivers) = OwnerCommandReceivers::channel();
+        let shared = Arc::new(OwnerShared::new(senders));
+        let header = shared
+            .reserve_input(InputClass::Ordinary, HISTORICAL_REPLY_BYTES)
+            .expect("original namespace reply header");
+        let mut input = shared
+            .reserve_input(InputClass::Ordinary, bytes)
+            .expect("original namespace test input");
+        input.historical_reply = Some(HistoricalReply::new(HistoricalReplyBacking {
+            consumer: Mutex::new(None),
+            observer: Mutex::new(None),
+            namespace: Mutex::new(None),
+            #[cfg(test)]
+            consumer_refused: std::sync::atomic::AtomicBool::new(false),
+            _header: header,
+        }));
+        input
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -7550,6 +7576,7 @@ mod tests {
     }
     mod capacity_startup_tests;
     mod historical_claim_admission_tests;
+    mod namespace_backing_tests;
     mod provider_reconciliation_tests;
     mod resource_custody_tests;
     mod source_registry_handoff_tests;

@@ -21,7 +21,7 @@ fn ordinary_rebuild_backing_matches_zero_small_and_complete_multiple_pages() {
                 store.connection.execute("INSERT INTO operation_journal_ordinary_claim_release SELECT claim_id,operation_id,claim_id FROM operation_journal_ordinary_claim", []).unwrap();
             }
             let old = store.rebuild_admission_snapshot().unwrap();
-            let input = super::super::owner::InputPermit::historical_test_input(1);
+            let input = super::super::owner::InputPermit::historical_test_namespace_input(1);
             let available = input.historical_test_remaining();
             let funded = store.rebuild_admission_snapshot_for_input(&input).unwrap();
             assert!(funded.matches_original(&old));
@@ -84,7 +84,7 @@ fn ordinary_rebuild_backing_preserves_malformed_missing_and_orphan_audit() {
                 .unwrap();
         }
         let old = store.rebuild_admission_snapshot().unwrap();
-        let input = super::super::owner::InputPermit::historical_test_input(1);
+        let input = super::super::owner::InputPermit::historical_test_namespace_input(1);
         let available = input.historical_test_remaining();
         let funded = store.rebuild_admission_snapshot_for_input(&input).unwrap();
         assert!(funded.matches_original(&old), "{scenario}");
@@ -108,9 +108,22 @@ fn ordinary_rebuild_backing_refuses_collection_pressure_without_partial_snapshot
         1,
     )
     .unwrap();
+    store
+        .install_ordinary_collection_fixture_for_test(operation, 512, false)
+        .unwrap();
     let before = store.rebuild_admission_snapshot().unwrap();
-    let limit = super::super::owner::InputPermit::historical_test_ordinary_limit();
-    let input = super::super::owner::InputPermit::historical_test_input(limit - 4096);
+    let debit = store
+        .ordinary_collection_allocation_probe_for_test(true)
+        .unwrap()
+        .2;
+    assert!(
+        debit - 1 > store.retained_namespace_working_bytes_for_test(),
+        "preceding original namespace phase must remain funded"
+    );
+    let input = super::super::owner::InputPermit::historical_test_namespace_input(1);
+    let held = input
+        .reserve_historical_scratch(input.historical_test_remaining() - debit + 1)
+        .unwrap();
     let available = input.historical_test_remaining();
     assert!(matches!(
         store.rebuild_admission_snapshot_for_input(&input),
@@ -119,6 +132,7 @@ fn ordinary_rebuild_backing_refuses_collection_pressure_without_partial_snapshot
     assert_eq!(input.historical_test_remaining(), available);
     assert_eq!(store.rebuild_admission_snapshot().unwrap(), before);
     assert!(store.connection.is_autocommit());
+    drop(held);
 }
 
 #[test]

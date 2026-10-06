@@ -1,9 +1,20 @@
 //! Original namespace working loan and selected-error transfer.
-//! This module is not wired until the complete source-derived envelope is installed.
+//! Original startup and admission dispatch retain selected failures on their reply.
 use super::*;
 use crate::operation_journal::owner::InputPermit;
 
 impl OperationJournalStore {
+    pub(super) fn validate_namespace_with_input(
+        &self,
+        input: Option<&InputPermit>,
+        precommit: bool,
+    ) -> Result<(), OperationJournalStoreError> {
+        match input {
+            Some(input) => self.validate_namespace_for_input(input, precommit),
+            None if precommit => self.validate_namespace_for_precommit(),
+            None => self.validate_namespace(),
+        }
+    }
     /// Fund the same original namespace at the startup/admission boundary.
     /// Existing unfunded callers retain their original entry points.
     pub(super) fn validate_namespace_for_input(

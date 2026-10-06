@@ -28,7 +28,7 @@ fn historical_claim_sqlite_borrowed_observer_preserves_original_lookup_and_full_
         1,
     )
     .unwrap();
-    let input = super::super::owner::InputPermit::historical_test_input(1);
+    let input = super::super::owner::InputPermit::historical_test_namespace_input(1);
     let available = input.historical_test_remaining();
     assert!(store.observe_claim_operation(operation_id, &input).unwrap());
     assert_eq!(input.historical_test_remaining(), available);

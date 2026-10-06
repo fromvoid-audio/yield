@@ -2,6 +2,37 @@
 //! Wiring requires the original detached StartupCredit implementation (OPT-2400).
 use super::*;
 
+/// Original pool/input for normal-build namespace allocation diagnostics only.
+/// Construction installs no capacity, admission, execution or settlement authority.
+#[cfg(any(test, feature = "test-support"))]
+pub struct JournalNamespaceFundingProbe {
+    pub(in crate::operation_journal) input: InputPermit,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl JournalNamespaceFundingProbe {
+    pub fn new() -> Self {
+        let (commands, _receivers) = OwnerCommandReceivers::channel();
+        let shared = Arc::new(OwnerShared::new(commands));
+        Self {
+            input: shared
+                .startup_input()
+                .expect("original diagnostic startup input"),
+        }
+    }
+
+    pub fn remaining_bytes(&self) -> usize {
+        self.input.shared.input_bytes.lock().unwrap().remaining[0]
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for JournalNamespaceFundingProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub(super) struct NamespaceCredits {
     // The enclosing reply wrapper frees its allocation before these final credits.
     _working: StartupCredit,

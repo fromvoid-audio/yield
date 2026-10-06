@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use yield_library::{
     app_dirs::{AppRootGuard, WritableProfileGuard},
     operation_journal::OperationJournalStore,
+    operation_journal::owner::JournalNamespaceFundingProbe,
 };
 
 struct Trace;
@@ -86,6 +87,47 @@ fn observe(store: &OperationJournalStore, expected_success: bool, name: &str) {
     println!(
         "case={name} success={} rust_peak={} largest={}",
         measured.0, measured.1, measured.2
+    );
+    // Both readers borrow this SAME retained Store. Setup/pool headers are outside
+    // the measured phase; selected errors and complete Display are inside it.
+    let funding = JournalNamespaceFundingProbe::new();
+    let remaining = funding.remaining_bytes();
+    let bound = store.retained_namespace_working_bytes_for_test();
+    let baseline = LIVE.load(Relaxed);
+    let funded = measure(|| {
+        match store.funded_retained_namespace_allocation_probe_for_test(&funding, false) {
+            Ok(()) => true,
+            Err(error) => {
+                let diagnostic = error.to_string();
+                assert!(!diagnostic.is_empty());
+                drop(diagnostic);
+                drop(error);
+                false
+            }
+        }
+    });
+    assert_eq!(funded.0, measured.0, "same original namespace outcome");
+    assert_eq!(
+        LIVE.load(Relaxed),
+        baseline,
+        "selected backing destroyed before input"
+    );
+    assert!(funded.1 <= bound, "live backing exceeds derived debit");
+    assert!(funded.2 <= bound, "allocation exceeds derived debit");
+    assert_eq!(
+        remaining - funding.remaining_bytes(),
+        if expected_success { 0 } else { bound },
+        "success is local; original selected error retains its exact debit"
+    );
+    println!(
+        "funded_case={name} rust_peak={} largest={} debit={bound}",
+        funded.1, funded.2
+    );
+    drop(funding);
+    assert_eq!(
+        LIVE.load(Relaxed),
+        before,
+        "all funding setup and selected backing destroyed"
     );
 }
 fn main() {

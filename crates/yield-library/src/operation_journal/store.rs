@@ -71,6 +71,7 @@ use super::validation::{RecordConsistency, classify_record};
 mod admission_rebuild_backing;
 mod chunk_claims;
 mod chunk_staging;
+mod namespace_backing;
 #[cfg(any(test, feature = "test-support"))]
 mod namespace_backing_probe;
 pub(super) use admission_rebuild_backing::FundedSnapshot;
@@ -1810,7 +1811,7 @@ impl OperationJournalStore {
         &self,
         input: Option<&super::owner::InputPermit>,
     ) -> Result<FundedSnapshot, OperationJournalStoreError> {
-        self.validate_namespace()?;
+        self.validate_namespace_with_input(input, false)?;
         self.connection.execute_batch("BEGIN")?;
         // Original transaction/validation order; credit precedes all working backing.
         let mut collection = None;
@@ -1828,12 +1829,12 @@ impl OperationJournalStore {
                     return Err(error);
                 }
             };
-        if let Err(error) = self.validate_namespace_for_precommit() {
+        if let Err(error) = self.validate_namespace_with_input(input, true) {
             let _ = self.connection.execute_batch("ROLLBACK");
             return Err(error);
         }
         self.connection.execute_batch("ROLLBACK")?;
-        self.validate_namespace()?;
+        self.validate_namespace_with_input(input, false)?;
         Ok(FundedSnapshot::new(
             snapshot,
             collection.map(admission_rebuild_backing::Collection::into_credit),
@@ -1862,7 +1863,7 @@ impl OperationJournalStore {
         &self,
         input: Option<&super::owner::InputPermit>,
     ) -> Result<FundedSnapshot, OperationJournalStoreError> {
-        self.validate_namespace()?;
+        self.validate_namespace_with_input(input, false)?;
         self.connection.execute_batch("BEGIN")?;
         // Declare credit before output/working backing so error/unwind drops backing first.
         let mut collection = None;
@@ -1885,13 +1886,13 @@ impl OperationJournalStore {
                     },
                 )?,
             }
-            self.validate_namespace_for_precommit()?;
+            self.validate_namespace_with_input(input, true)?;
             Ok(snapshot)
         })();
         match result {
             Ok(snapshot) => {
                 self.connection.execute_batch("ROLLBACK")?;
-                self.validate_namespace()?;
+                self.validate_namespace_with_input(input, false)?;
                 Ok(FundedSnapshot::new(
                     snapshot,
                     collection.map(admission_rebuild_backing::Collection::into_credit),

@@ -2,6 +2,26 @@
 use super::*;
 
 impl OperationJournalStore {
+    /// Same retained namespace with its original pool debit and selected-error keeper.
+    /// Consume any returned owned error before dropping the diagnostic funding input.
+    pub fn funded_retained_namespace_allocation_probe_for_test(
+        &self,
+        funding: &super::super::owner::JournalNamespaceFundingProbe,
+        precommit: bool,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.validate_namespace_for_input(&funding.input, precommit)
+    }
+
+    pub fn retained_namespace_working_bytes_for_test(&self) -> usize {
+        namespace_backing::working_bytes(
+            &self.database_root,
+            &self.profile_guard,
+            &self.database_path,
+        )
+        .and_then(|n| n.checked_add(std::mem::size_of::<namespace_backing::NamespaceLoan<'_>>()))
+        .expect("original retained namespace bound")
+    }
+
     /// Validate the original retained namespace for allocation diagnostics.
     /// This observation supplies no admission, effect or native qualification authority.
     pub fn retained_namespace_allocation_probe_for_test(
