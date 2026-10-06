@@ -65,3 +65,12 @@ phase once to a fresh decision nonce; later polls consume its genuine owner ACKs
 without replacing that nonce. A separate prepaid 64-byte allowance covers the
 fixed Ready/phase metadata. During overlap, old and new rounds retain their own
 charged backing; checked budget growth can refuse without losing the original.
+
+The collector retains `OwnerLost` as its refusal reason even after every original
+owner has completed NoAttempt cleanup, and therefore can report
+`Unavailable(OwnerLost)` on real drain. That label alone proves neither custody
+release nor unknown settlement. The genuine drain regression separately requires
+actual Source writer restoration with zero registered uses, zero handshake and
+journal input debit, completed Global abort/reuse observation, zero durable IDs
+and unchanged rows. Unknown SQLite entry still retains its original owners until
+genuine outcome/readback; no refusal reason may authorize retry or settlement.

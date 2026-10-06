@@ -2722,6 +2722,11 @@ mod integration {
                     aborted,
                     WalPreparationStatus::Rejected(WalPreparationError::InvalidInput)
                 )
+            } else if outcome == 16 {
+                matches!(
+                    aborted,
+                    WalPreparationStatus::Unavailable(WalPreparationError::OwnerLost)
+                )
             } else if outcome >= 14 {
                 matches!(
                     aborted,
@@ -2735,6 +2740,49 @@ mod integration {
         drop(view);
         drop(handle);
         assert_eq!(budget.used(), 0);
+        if outcome == 16 {
+            // OwnerLost remains the refusal reason after confirmed NoAttempt cleanup;
+            // that diagnostic alone cannot prove cleanup or resolve an unknown SQL attempt.
+            assert!(
+                actor
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event == "reuse:retiring-pre-audit"),
+                "original Source writer was not restored"
+            );
+            let released = Instant::now() + Duration::from_secs(1);
+            while *journal.shared.input_bytes.lock().unwrap() != InputBudget::new() {
+                assert!(
+                    Instant::now() < released,
+                    "original journal input debit remains held"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            // The same actual Global writer must have completed its earlier abort before
+            // it can accept another bounded observation; no physical effect is requested.
+            let request = crate::sample_sources::library::GlobalPreparationRequest::new(
+                global.preparation_owner(),
+                [13; 32],
+                Instant::now() + Duration::from_secs(1),
+                1,
+                16 * 1024,
+            )
+            .unwrap();
+            let mut pending = global.submit_preparation(request).unwrap();
+            let original = pending
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            original
+                .abort()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            drop(pending);
+            assert_eq!(budget.used(), 0);
+        }
         drop(actor);
         assert!(global.shutdown());
         assert!(journal.shutdown());
