@@ -1616,6 +1616,11 @@ mod integration {
     fn genuine_ready_retirement_busy_command_original_drain_revokes_without_sql() {
         original_retirement_custody(16);
     }
+    #[test]
+    fn original_source_deadline_crossing_registration_comparison_keeps_deadline_refusal() {
+        original_retirement_custody(17);
+    }
+
     fn original_retirement_custody(outcome: u8) {
         original_retirement_custody_with_source_policy(outcome, None);
     }
@@ -2132,7 +2137,8 @@ mod integration {
         .unwrap();
         let budget = input.budget_for_test();
         let mut local_collector = None;
-        let handle = if outcome == 0 || outcome == 4 || outcome == 5 || outcome >= 13 {
+        let handle = if outcome == 0 || outcome == 4 || outcome == 5 || (13..=16).contains(&outcome)
+        {
             journal
                 .client()
                 .prepare_wal_owners(input)
@@ -2300,6 +2306,70 @@ mod integration {
             );
         }
 
+        if outcome == 17 {
+            let collector = local_collector.as_mut().unwrap();
+            let round = collector.preparing_round_for_tests().unwrap();
+            let events = Arc::clone(&actor.events);
+            round.snapshot_hook_for_tests(Box::new(move || {
+                // The journal already sampled the original deadline. Let the genuine
+                // Source independently reach that SAME deadline and restore its writer
+                // before the pending original-registration comparison resumes.
+                while !events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event == "reuse:retiring-pre-audit")
+                {
+                    assert!(Instant::now() < deadline + Duration::from_secs(2));
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(Instant::now() >= deadline);
+            }));
+            assert!(Instant::now() < deadline);
+            while !collector.poll() {
+                assert!(Instant::now() < deadline + Duration::from_secs(3));
+                thread::sleep(Duration::from_millis(1));
+            }
+            let status = handle.status();
+            assert!(
+                matches!(
+                    status,
+                    WalPreparationStatus::Rejected(WalPreparationError::Deadline)
+                ),
+                "original deadline crossed during genuine Source comparison: {status:?}"
+            );
+            assert_eq!(
+                journal
+                    .prepared_admission_id_allocations
+                    .load(Ordering::Relaxed),
+                0
+            );
+            let outside =
+                rusqlite::Connection::open(fixture.owner.profile_root().join(LIBRARY_DB_FILE_NAME))
+                    .unwrap();
+            assert_eq!(
+                outside
+                    .query_row(
+                        "SELECT count(*) FROM source_lifecycle_references",
+                        [],
+                        |row| row.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            drop(local_collector.take());
+            drop(view);
+            drop(handle);
+            assert_eq!(budget.used(), 0);
+            drop(actor);
+            assert!(global.shutdown());
+            assert!(journal.shutdown());
+            assert_eq!(
+                *journal.shared.input_bytes.lock().unwrap(),
+                InputBudget::new()
+            );
+            return;
+        }
         if let Some(collector) = local_collector.as_mut() {
             if outcome == 9 || outcome == 10 {
                 actor.pause_validation.store(true, Ordering::Release);
