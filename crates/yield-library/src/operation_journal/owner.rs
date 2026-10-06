@@ -11585,7 +11585,6 @@ mod tests {
                     .is_ok()
             );
             assert!(completion());
-            drop(completion);
             assert!(duplicate.take_unused_live_chunk_grant().unwrap().is_none());
             duplicate.acknowledge().unwrap();
             let mut exact_again = file_owner.submit(exact).unwrap();
@@ -11611,7 +11610,29 @@ mod tests {
             staged.acknowledge().unwrap();
             let _ = file_owner.shutdown();
             drop(database);
+            let original_shared = Arc::clone(&owner.shared);
+            let publication_baseline = InputBudget::new().publication_remaining;
             let _ = owner.shutdown();
+            // This genuine observer retains only the original fence allocation after
+            // both actual workers joined; neither a grant nor runtime resource survives.
+            assert!(completion());
+            assert_eq!(
+                original_shared
+                    .input_bytes
+                    .lock()
+                    .unwrap()
+                    .publication_remaining,
+                publication_baseline - publication_fence::HEADER_BYTES
+            );
+            drop(completion);
+            assert_eq!(
+                original_shared
+                    .input_bytes
+                    .lock()
+                    .unwrap()
+                    .publication_remaining,
+                publication_baseline
+            );
             let restarted =
                 OperationJournalStore::open(&fixture.owner).expect("original handoff restart");
             let binding =
