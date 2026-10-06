@@ -108,6 +108,7 @@ impl ProviderStartupProbe<'_> {
     }
 }
 impl super::super::super::store::OperationJournalStore {
+    /// Prepare the original borrowed Store and input pool outside allocation measurement.
     pub fn provider_startup_probe_for_test(&self) -> ProviderStartupProbe<'_> {
         ProviderStartupProbe {
             store: self,
