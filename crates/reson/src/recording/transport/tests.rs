@@ -92,79 +92,91 @@ fn original_producer_folds_initial_header_and_emits_whole_frame_batches() {
             let limits = RecordingLimits::new(48_000, channels, 16384).unwrap();
             let frame_bytes = usize::from(channels) * 4;
             let (binding, receiver, mut settlements) = RecordingTransport::bind(limits);
-            let (initial, initial_header, pcm, pending, bytes) = thread::scope(|scope| {
-                let owner = scope.spawn(move || {
-                    let mut object = Cursor::new(Vec::new());
-                    let mut initial = Vec::new();
-                    let mut initial_header = None;
-                    let mut pcm = Vec::new();
-                    let mut capturing = false;
-                    let mut pending = None;
-                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                    loop {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "original settlement completion"
-                        );
-                        match receiver.recv_timeout(Duration::from_millis(1)) {
-                            Ok(request) => {
-                                match request.kind() {
-                                    RecordingTransportRequestKind::Write => {
-                                        if !capturing {
-                                            initial.push((request.offset(), request.bytes().len()));
-                                        } else if request.offset() >= 68 {
-                                            pcm.push((request.offset(), request.bytes().len()));
+            let (initial, initial_header, pcm, pending, pending_bytes, bytes) =
+                thread::scope(|scope| {
+                    let owner = scope.spawn(move || {
+                        let mut object = Cursor::new(Vec::new());
+                        let mut initial = Vec::new();
+                        let mut initial_header = None;
+                        let mut pcm = Vec::new();
+                        let mut capturing = false;
+                        let mut pending = None;
+                        let mut pending_bytes = Vec::new();
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        loop {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "original settlement completion"
+                            );
+                            match receiver.recv_timeout(Duration::from_millis(1)) {
+                                Ok(request) => {
+                                    match request.kind() {
+                                        RecordingTransportRequestKind::Write => {
+                                            if !capturing {
+                                                initial.push((
+                                                    request.offset(),
+                                                    request.bytes().len(),
+                                                ));
+                                            } else if request.offset() >= 68 {
+                                                pcm.push((request.offset(), request.bytes().len()));
+                                            }
+                                            object.seek(SeekFrom::Start(request.offset())).unwrap();
+                                            object.write_all(request.bytes()).unwrap();
                                         }
-                                        object.seek(SeekFrom::Start(request.offset())).unwrap();
-                                        object.write_all(request.bytes()).unwrap();
-                                    }
-                                    RecordingTransportRequestKind::Flush => {
-                                        if !capturing {
-                                            initial_header = Some(object.get_ref().clone());
+                                        RecordingTransportRequestKind::Flush => {
+                                            if !capturing {
+                                                initial_header = Some(object.get_ref().clone());
+                                            }
+                                            capturing = true;
                                         }
-                                        capturing = true;
                                     }
+                                    request.acknowledge().unwrap();
                                 }
-                                request.acknowledge().unwrap();
+                                Err(RecvTimeoutError::Timeout) => {}
+                                Err(RecvTimeoutError::Disconnected) => assert!(pending.is_some()),
                             }
-                            Err(RecvTimeoutError::Timeout) => {}
-                            Err(RecvTimeoutError::Disconnected) => assert!(pending.is_some()),
-                        }
-                        if pending.is_none() {
-                            if let Ok(barrier) = settlements.recv_barrier(Duration::ZERO) {
-                                assert!(settlements.owns_barrier(&barrier));
-                                pending = Some((
-                                    barrier.write_inventory().pending_offset(),
-                                    barrier.write_inventory().pending_bytes().len(),
-                                ));
-                                barrier.acknowledge().unwrap();
+                            if pending.is_none() {
+                                if let Ok(barrier) = settlements.recv_barrier(Duration::ZERO) {
+                                    assert!(settlements.owns_barrier(&barrier));
+                                    pending = Some((
+                                        barrier.write_inventory().pending_offset(),
+                                        barrier.write_inventory().pending_bytes().len(),
+                                    ));
+                                    pending_bytes =
+                                        barrier.write_inventory().pending_bytes().to_vec();
+                                    barrier.acknowledge().unwrap();
+                                }
+                            }
+                            if let Ok(joined) = settlements.recv_joined(Duration::ZERO) {
+                                assert!(settlements.owns_completion(&joined));
+                                assert_eq!(joined.frames(), frames as u64);
+                                assert_eq!(joined.write_inventory().pending_bytes(), pending_bytes);
+                                assert_eq!(
+                                    pending.unwrap(),
+                                    (
+                                        joined.write_inventory().pending_offset(),
+                                        joined.write_inventory().pending_bytes().len()
+                                    )
+                                );
+                                break (
+                                    initial,
+                                    initial_header.unwrap(),
+                                    pcm,
+                                    pending.unwrap(),
+                                    pending_bytes,
+                                    object.into_inner(),
+                                );
                             }
                         }
-                        if let Ok(joined) = settlements.recv_joined(Duration::ZERO) {
-                            assert!(settlements.owns_completion(&joined));
-                            assert_eq!(joined.frames(), frames as u64);
-                            assert_eq!(
-                                pending.unwrap(),
-                                (
-                                    joined.write_inventory().pending_offset(),
-                                    joined.write_inventory().pending_bytes().len()
-                                )
-                            );
-                            break (
-                                initial,
-                                initial_header.unwrap(),
-                                pcm,
-                                pending.unwrap(),
-                                object.into_inner(),
-                            );
-                        }
-                    }
+                    });
+                    let mut producer = RecordingProducer::start(binding, limits).unwrap();
+                    let samples: Vec<_> = (0..frames * usize::from(channels))
+                        .map(|index| ((index % 61) as f32 - 30.0) / 32.0)
+                        .collect();
+                    producer.submit(&samples);
+                    assert_eq!(producer.stop().unwrap().frames, frames as u64);
+                    owner.join().unwrap()
                 });
-                let mut producer = RecordingProducer::start(binding, limits).unwrap();
-                producer.submit(&vec![0.25; frames * usize::from(channels)]);
-                assert_eq!(producer.stop().unwrap().frames, frames as u64);
-                owner.join().unwrap()
-            });
             eprintln!(
                 "original {channels}-channel {frames} frames initial={initial:?} pcm={pcm:?} pending={pending:?}"
             );
@@ -192,13 +204,18 @@ fn original_producer_folds_initial_header_and_emits_whole_frame_batches() {
                 })
                 && (pending.0 - 68) % frame_bytes as u64 == 0
                 && pending.1 % frame_bytes == 0;
+            assert_eq!(
+                &bytes[pending.0 as usize..pending.0 as usize + pending.1],
+                pending_bytes
+            );
             let mut reader = hound::WavReader::new(Cursor::new(bytes)).unwrap();
             assert_eq!(reader.spec().channels, channels);
             assert_eq!(reader.duration(), frames as u32);
             assert!(
                 reader
                     .samples::<f32>()
-                    .all(|sample| sample.unwrap() == 0.25)
+                    .enumerate()
+                    .all(|(index, sample)| sample.unwrap() == ((index % 61) as f32 - 30.0) / 32.0)
             );
         }
     }
