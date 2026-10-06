@@ -7,7 +7,7 @@ use super::full_capacity::FullCapacityAllocationClass;
 use super::model::{MAX_RECORD_BYTES, OperationDisposition, OperationPhase};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
+#[allow(dead_code)]
 pub(super) mod inventory_bytes;
 
 pub(crate) const MAX_ATTEMPTS_PER_OPERATION: usize = 256;
@@ -38,7 +38,6 @@ pub(crate) struct DatabaseAttemptStart {
     pub database_slice: Uuid,
     pub sidecar_slice: Uuid,
     /// Full exact canonical binding image includes every owner/profile/lease/physical identity.
-    #[serde(deserialize_with = "inventory_bytes::deserialize")]
     pub inventory: Vec<u8>,
     pub schema: u32,
     pub phase: OperationPhase,
@@ -293,21 +292,12 @@ impl DatabaseAttemptStart {
         encode_bounded(self, MAX_START_BYTES)
     }
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-        require(
-            !bytes.is_empty() && bytes.len() <= MAX_START_BYTES,
-            "attempt encoding bound",
-        )?;
-        let value: Self = serde_json::from_slice(bytes)
-            .map_err(|_| database_claims::DatabaseClaimError("unsupported attempt image"))?;
-        let canonical = encode_bounded(&value, MAX_START_BYTES)?;
-        require(
-            if value.inventory.len() > database_claims::MAX_INVENTORY_BYTES {
-                inventory_bytes::canonical_overflow(bytes, &canonical, MAX_START_BYTES)?
-            } else {
-                canonical == bytes
-            },
-            "noncanonical attempt image",
-        )?;
+        let value: Self = decode_canonical(bytes, MAX_START_BYTES)?;
+        #[cfg(test)]
+        {
+            inventory_bytes::OWNED_BYTES.with(|n| n.set(n.get() + value.inventory.len()));
+            inventory_bytes::MAX_CAPACITY.with(|n| n.set(n.get().max(value.inventory.capacity())));
+        }
         value.encode()?;
         Ok(value)
     }
