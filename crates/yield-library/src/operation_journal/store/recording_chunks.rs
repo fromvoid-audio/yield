@@ -11,6 +11,32 @@ use crate::operation_journal::recording_commands::{
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PayloadReader {
+    Control,
+    Chunk,
+}
+#[cfg(test)]
+thread_local! {
+    pub(super) static PAYLOAD_READ_HOOK: std::cell::RefCell<Option<(PayloadReader, Box<dyn FnOnce(&rusqlite::Connection)>)>> = const { std::cell::RefCell::new(None) };
+    pub(super) static PAYLOAD_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(super) fn payload_read_boundary(kind: PayloadReader, connection: &rusqlite::Connection) {
+    let hook = PAYLOAD_READ_HOOK.with(|h| {
+        let mut h = h.borrow_mut();
+        if h.as_ref().is_some_and(|(reader, _)| *reader == kind) {
+            h.take()
+        } else {
+            None
+        }
+    });
+    if let Some((_, hook)) = hook {
+        hook(connection);
+    }
+}
+
 pub(super) const TABLE_NAME: &str = "operation_journal_recording_chunks";
 pub(super) const CREATE_TABLE: &str = "CREATE TABLE operation_journal_recording_chunks (
     chunk_id TEXT NOT NULL PRIMARY KEY,
@@ -182,11 +208,15 @@ impl OperationJournalStore {
         {
             return Err(error("retained recording row shape/binding"));
         }
+        #[cfg(test)]
+        payload_read_boundary(PayloadReader::Chunk, &self.connection);
         let bytes: Vec<u8> = self.connection.query_row(
             "SELECT record FROM operation_journal_recording_chunks WHERE chunk_id=?1",
             params![chunk_id.to_string()],
             |r| r.get(0),
         )?;
+        #[cfg(test)]
+        PAYLOAD_COPIED_BYTES.with(|n| n.set(n.get() + bytes.len()));
         let chunk = RecordingCapturedChunk::decode(&bytes, proposal).map_err(error)?;
         if chunk.chunk_id() != chunk_id || slot(chunk.role()) != stored_slot {
             return Err(error("recording row slot/key differs from immutable bytes"));

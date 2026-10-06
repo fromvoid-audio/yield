@@ -94,8 +94,15 @@ impl OperationJournalStore {
                 ));
             }
             previous_sequence = Some(sequence);
+            #[cfg(test)]
+            super::recording_chunks::payload_read_boundary(
+                super::recording_chunks::PayloadReader::Control,
+                &self.connection,
+            );
             let bytes: Vec<u8> = self.connection.query_row("SELECT record FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=?2",
                 params![proposal.operation_id().to_string(), role.slot()], |r|r.get(0))?;
+            #[cfg(test)]
+            super::recording_chunks::PAYLOAD_COPIED_BYTES.with(|n| n.set(n.get() + bytes.len()));
             if self.recording_prestart_scope.get() {
                 // Complete preflight bounds this BLOB inside the same read snapshot. The
                 // narrow factory supports only genuine canonical empty reservations: never
