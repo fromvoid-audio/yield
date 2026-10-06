@@ -622,6 +622,18 @@ impl WalPreparationInput {
         })
     }
     #[cfg(all(test, unix))]
+    pub(in crate::operation_journal) fn replace_source_retirement_policy_for_test(
+        &mut self,
+        args: Option<&super::super::source_registry_retirement::SourceRegistryRetirementIntentArgs>,
+    ) {
+        assert_eq!(self.sources.len(), 1);
+        let SourceInput::Lease(input) = &mut self.sources[0].input else {
+            panic!("original retirement requires lease input");
+        };
+        input.replace_retirement_policy_for_test(args).unwrap();
+    }
+
+    #[cfg(all(test, unix))]
     pub(in crate::operation_journal) fn budget_for_test(&self) -> Arc<HandshakeBudget> {
         Arc::clone(&self.budget)
     }

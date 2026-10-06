@@ -37,6 +37,18 @@ impl SourceLeaseMaintenanceAllocation {
         Ok(())
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn replace_retirement_policy_for_test(
+        &mut self,
+        args: Option<&crate::operation_journal::source_registry_retirement::SourceRegistryRetirementIntentArgs>,
+    ) -> Result<(), LifecycleAllocationError> {
+        self.retirement = None;
+        if let Some(args) = args {
+            self.bind_retirement_policy(args)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn retirement_input(
         &self,
     ) -> Option<super::lease_maintenance_preparation::retirement_policy::Input> {

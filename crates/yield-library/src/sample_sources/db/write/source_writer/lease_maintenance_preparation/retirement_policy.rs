@@ -129,3 +129,29 @@ fn components_valid(per: [u64; 3], unit: u64) -> bool {
             .checked_add(per[2])
             .is_some_and(|sum| sum <= i64::MAX as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::components_valid;
+
+    #[test]
+    fn source_release_component_pair_stays_in_sqlite_range() {
+        let max = i64::MAX as u64;
+        assert!(components_valid([1, max - 1, 1], 1));
+        assert!(!components_valid([1, max, 1], 1));
+        assert!(!components_valid([1, u64::MAX, 1], 1));
+        assert!(!components_valid([max + 1, 1, 1], 1));
+    }
+
+    #[test]
+    fn source_release_components_require_complete_aligned_caps() {
+        assert!(components_valid([4096; 3], 4096));
+        assert!(!components_valid([4096; 3], 0));
+        assert!(!components_valid([4096, 4097, 4096], 4096));
+        for missing in 0..3 {
+            let mut per = [4096; 3];
+            per[missing] = 0;
+            assert!(!components_valid(per, 4096));
+        }
+    }
+}
