@@ -5651,6 +5651,10 @@ struct OwnerShared {
     input_bytes: Mutex<InputBudget>,
     #[cfg(test)]
     historical_scratch_maximum: AtomicUsize,
+    #[cfg(test)]
+    recovery_audit_pause: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    recovery_audit_entered: std::sync::atomic::AtomicBool,
     results: Mutex<ResultBudget>,
     #[cfg(test)]
     shutdown_cas_gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
@@ -5668,6 +5672,10 @@ impl OwnerShared {
             input_bytes: Mutex::new(InputBudget::new()),
             #[cfg(test)]
             historical_scratch_maximum: AtomicUsize::new(0),
+            #[cfg(test)]
+            recovery_audit_pause: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            recovery_audit_entered: std::sync::atomic::AtomicBool::new(false),
             results: Mutex::new(ResultBudget::new()),
             #[cfg(test)]
             shutdown_cas_gate: Mutex::new(None),
@@ -5939,6 +5947,23 @@ impl InputPermit {
     #[cfg(test)]
     pub(super) fn historical_test_remaining(&self) -> usize {
         self.shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()]
+    }
+
+    #[cfg(test)]
+    pub(super) fn recovery_audit_test_gate(&self) {
+        if self.shared.recovery_audit_pause.load(Ordering::Acquire) {
+            self.shared
+                .recovery_audit_entered
+                .store(true, Ordering::Release);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while self.shared.recovery_audit_pause.load(Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "original recovery audit test gate timed out"
+                );
+                std::thread::yield_now();
+            }
+        }
     }
 
     pub(super) fn has_historical_error_consumer(&self) -> bool {

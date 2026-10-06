@@ -133,6 +133,25 @@ impl<'a> Statement<'a> {
             }
         }
     }
+    /// Borrow the original projection name, matching rusqlite Row::get errors.
+    pub(in crate::operation_journal::store) fn column_name(
+        &self,
+        index: i32,
+    ) -> Result<&str, OperationJournalStoreError> {
+        if index < 0 || index >= unsafe { ffi::sqlite3_column_count(self.raw) } {
+            return Err(rusqlite::Error::InvalidColumnIndex(index as usize).into());
+        }
+        // SAFETY: the statement is live, index checked, SQL static. The engine owns
+        // the NUL-terminated name until finalize; no owned row/name leaves this borrow.
+        let pointer = unsafe { ffi::sqlite3_column_name(self.raw, index) };
+        if pointer.is_null() {
+            self.check(ffi::SQLITE_NOMEM)?;
+            unreachable!("null name reports OOM");
+        }
+        Ok(unsafe { CStr::from_ptr(pointer) }
+            .to_str()
+            .expect("static ASCII SQL projection"))
+    }
     fn check(&self, code: i32) -> Result<(), OperationJournalStoreError> {
         if code == ffi::SQLITE_OK {
             return Ok(());

@@ -19,7 +19,10 @@ const DIAGNOSTIC_BYTES: usize = 4 * (
     + 4 * 36
     + "charge  remains active in state ReleaseObserved".len()
 );
-const FIXED_BYTES: usize = 3 * size_of::<Statement<'static>>()
+const COLUMN_NAME_BYTES: usize = c"EXISTS(SELECT 1 FROM operation_journal WHERE operation_id = ?1 UNION ALL SELECT 1 FROM operation_journal_full_progress WHERE operation_id = ?1)".to_bytes().len();
+const FIXED_BYTES: usize = 2 * COLUMN_NAME_BYTES
+    + size_of::<FromSqlError>()
+    + 3 * size_of::<Statement<'static>>()
     + size_of::<(
         String,
         String,
@@ -81,6 +84,8 @@ enum AuditFailure {
     Funded(FundedFailure),
 }
 fn audit(connection: &Connection, path: &Path, input: &InputPermit) -> Result<(), AuditFailure> {
+    #[cfg(test)]
+    input.recovery_audit_test_gate();
     // Exact original PathBuf clone (n) plus geometric String growth (2 * 3n)
     // for invalid-UTF8 Path::display in the original owner error consumer.
     let bytes = path
@@ -107,6 +112,13 @@ fn audit(connection: &Connection, path: &Path, input: &InputPermit) -> Result<()
                 ),
                 AuditError::Sql(error) => match error {
                     OperationJournalStoreError::HistoricalClaimResourceBound => error,
+                    OperationJournalStoreError::Sql(error) => audit_error(
+                        path,
+                        format!(
+                            "recovery reserve admission audit failed: {}",
+                            LedgerError::Sql(error)
+                        ),
+                    ),
                     _ => audit_error(
                         path,
                         format!("recovery reserve admission audit failed: {error}"),
@@ -140,31 +152,54 @@ fn corrupt_field() -> AuditError {
 }
 fn scalar<T: FromSql>(statement: &Statement<'_>, index: i32) -> Result<T, AuditError> {
     let value = statement.get_ref(index)?;
-    T::column_result(value).map_err(|error| {
-        let error = match error {
-            FromSqlError::InvalidType => rusqlite::Error::InvalidColumnType(
-                index as usize,
-                "recovery audit column".into(),
-                value.data_type(),
-            ),
-            FromSqlError::OutOfRange(value) => {
-                rusqlite::Error::IntegralValueOutOfRange(index as usize, value)
-            }
-            other => rusqlite::Error::FromSqlConversionFailure(
-                index as usize,
-                value.data_type(),
-                Box::new(other),
-            ),
-        };
-        AuditError::Sql(error.into())
-    })
+    match T::column_result(value) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let error = match error {
+                FromSqlError::InvalidType => {
+                    let name = statement.column_name(index)?;
+                    if name.len() > COLUMN_NAME_BYTES {
+                        return Err(corrupt_field());
+                    }
+                    rusqlite::Error::InvalidColumnType(
+                        index as usize,
+                        name.to_owned(),
+                        value.data_type(),
+                    )
+                }
+                FromSqlError::OutOfRange(value) => {
+                    rusqlite::Error::IntegralValueOutOfRange(index as usize, value)
+                }
+                FromSqlError::Other(error) => rusqlite::Error::FromSqlConversionFailure(
+                    index as usize,
+                    value.data_type(),
+                    error,
+                ),
+                error => rusqlite::Error::FromSqlConversionFailure(
+                    index as usize,
+                    value.data_type(),
+                    Box::new(error),
+                ),
+            };
+            Err(AuditError::Sql(error.into()))
+        }
+    }
 }
 fn text(statement: &Statement<'_>, index: i32, maximum: usize) -> Result<String, AuditError> {
     if let ValueRef::Text(bytes) = statement.get_ref(index)? {
         if bytes.len() > maximum {
             return Err(corrupt_field());
         }
-        let value = std::str::from_utf8(bytes).map_err(|_| corrupt_field())?;
+        let value = std::str::from_utf8(bytes).map_err(|error| {
+            AuditError::Sql(
+                rusqlite::Error::FromSqlConversionFailure(
+                    index as usize,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+                .into(),
+            )
+        })?;
         let valid = match maximum {
             36 => Uuid::parse_str(value).ok().is_some_and(|id| {
                 let mut buffer = [0; 36];
@@ -319,6 +354,13 @@ mod tests {
             "UPDATE operation_journal_recovery_reserve SET budget_bytes=-1",
             "UPDATE operation_journal_recovery_reserve SET margin_bytes=268435456",
             "UPDATE operation_journal_recovery_reserve SET purpose='Unknown'",
+            "UPDATE operation_journal_recovery_reserve SET budget_bytes='wrong-type'",
+            "UPDATE operation_journal_recovery_reserve SET operation_id='00000000-0000-0000-0000-000000000000'",
+            "UPDATE operation_journal_recovery_reserve SET remaining_bytes=1",
+            "UPDATE operation_journal_recovery_reserve_transition SET kind='Charged' WHERE transition_sequence=2",
+            "UPDATE operation_journal_recovery_reserve_transition SET amount_bytes=0 WHERE transition_sequence=2",
+            "UPDATE operation_journal_recovery_reserve_transition SET amount_bytes=12 WHERE transition_sequence=3",
+            "ALTER TABLE operation_journal_recovery_reserve_transition RENAME TO original_transitions; CREATE TABLE operation_journal_recovery_reserve_transition AS SELECT * FROM original_transitions; INSERT INTO operation_journal_recovery_reserve_transition SELECT * FROM original_transitions WHERE transition_sequence=2",
             "UPDATE operation_journal_recovery_reserve SET volume_device='07'",
             "UPDATE operation_journal_recovery_reserve SET charge_id='invalid'",
             "UPDATE operation_journal_recovery_reserve SET state=CAST(x'ff' AS TEXT)",
@@ -387,6 +429,27 @@ mod tests {
         assert!(original.contains("no such table: operation_journal_recovery_reserve_transition"));
         drop(error);
         assert_eq!(input.historical_test_remaining(), before);
+    }
+    #[test]
+    fn recovery_funded_original_wrong_type_column_error_parity() {
+        let (_directory, connection, operation, charge) = fixture();
+        history(&connection, operation, charge, 1);
+        connection.execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE operation_journal_recovery_reserve SET budget_bytes='wrong-type'").unwrap();
+        let LedgerError::Sql(original) = prove_no_active_charges(&connection).unwrap_err() else {
+            panic!("original wrong-type error");
+        };
+        let input = InputPermit::historical_test_input(1);
+        let native = RefCell::new(None);
+        let _fixed = input.reserve_historical_scratch(FIXED_BYTES).unwrap();
+        let Err(AuditError::Sql(OperationJournalStoreError::Sql(funded))) =
+            run(&connection, &input, &native)
+        else {
+            panic!("funded wrong-type error");
+        };
+        assert_eq!(original.to_string(), funded.to_string());
+        assert!(
+            matches!(funded,rusqlite::Error::InvalidColumnType(5,ref name,rusqlite::types::Type::Text) if name=="budget_bytes")
+        );
     }
     #[test]
     fn recovery_funded_quota_refuses_before_sql_and_effects() {
