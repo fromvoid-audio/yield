@@ -770,6 +770,9 @@ impl ReadonlyDatabaseRoot {
 
 impl BoundDatabaseRoot {
     /// Original retained metadata only; native descriptor/allocator memory is separate.
+    // Pinned Arc<File> backing: two usize-sized atomic controls plus aligned File payload.
+    pub(crate) const LEGACY_ARC_FILE_BYTES: usize = std::mem::size_of::<(usize, usize, fs::File)>();
+
     pub(crate) fn legacy_metadata_bytes(&self) -> Option<usize> {
         let bounded =
             |p: &PathBuf| p.as_os_str().as_encoded_bytes().len() <= 4096 && p.capacity() <= 8192;
@@ -782,8 +785,7 @@ impl BoundDatabaseRoot {
         }
         Some(
             std::mem::size_of::<Self>()
-                + 2 * std::mem::size_of::<usize>()
-                + std::mem::size_of::<fs::File>()
+                + Self::LEGACY_ARC_FILE_BYTES
                 + self.path.capacity()
                 + self.named_path.as_ref().map_or(0, PathBuf::capacity)
                 + self.identity.capacity()

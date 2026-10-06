@@ -16,8 +16,8 @@ pub(super) const REPLY_BYTES: usize = std::mem::size_of::<
 pub(super) const ROOT_BYTES: usize = std::mem::size_of::<BoundDatabaseRoot>()
     + 2 * PATH_BACKING
     + 2 * IDENTITY_BACKING
-    + 2 * std::mem::size_of::<usize>()
-    + std::mem::size_of::<std::fs::File>();
+    + 2 * std::mem::size_of::<usize>() // The outer Arc<BoundDatabaseRoot> controls.
+    + BoundDatabaseRoot::LEGACY_ARC_FILE_BYTES;
 const OWNER_BYTES: usize = std::mem::size_of::<VolumeOwnershipCapability>()
     + 2 * PATH_BACKING
     + 3 * IDENTITY_BACKING
@@ -25,8 +25,7 @@ const OWNER_BYTES: usize = std::mem::size_of::<VolumeOwnershipCapability>()
 const RESERVE_BYTES: usize = std::mem::size_of::<OwnedReserveAllocation>()
     + 2 * PATH_BACKING
     + 5 * IDENTITY_BACKING
-    + 2 * std::mem::size_of::<usize>()
-    + std::mem::size_of::<std::fs::File>();
+    + BoundDatabaseRoot::LEGACY_ARC_FILE_BYTES;
 const FAILURE_BYTES: usize = std::mem::size_of::<
     super::super::capacity_volume_owner::LegacyVolumeFailureBacking,
 >() + OWNER_BYTES
@@ -108,7 +107,7 @@ impl RetainedLegacyVolumes {
                 ..
             } = entry
             {
-                bytes += root.legacy_metadata_bytes()?;
+                bytes += root.legacy_metadata_bytes()? + 2 * std::mem::size_of::<usize>();
                 if let Some(owner) = owner {
                     bytes += owner.legacy_metadata_bytes()?;
                 }
