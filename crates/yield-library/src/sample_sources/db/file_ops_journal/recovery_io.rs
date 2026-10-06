@@ -32,6 +32,8 @@ use super::super::{DatabaseRootBindingGuard, SourceDatabase};
 #[cfg(any(windows, test))]
 mod windows_final_namespace;
 #[cfg(any(windows, test))]
+mod windows_index_input;
+#[cfg(any(windows, test))]
 mod windows_observation;
 #[cfg(any(windows, test))]
 mod windows_rename_information;
@@ -597,9 +599,9 @@ impl fmt::Display for BoundDatabaseRootError {
 
 /// Descriptor chain for one bounded nested index locator. Never exposes a native pathname.
 pub(crate) struct HeldIndexFile {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     chain: Vec<fs::File>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     names: Vec<std::ffi::OsString>,
 }
 impl HeldIndexFile {
@@ -621,7 +623,7 @@ impl HeldIndexFile {
         expected_modified: Option<i64>,
     ) -> Result<(), super::super::SourceIndexInspectionError> {
         use super::super::SourceIndexInspectionError as E;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             for (i, name) in self.names.iter().enumerate() {
                 let current = open_index_component(&self.chain[i], name, i + 1 < self.names.len())?;
@@ -649,7 +651,7 @@ impl HeldIndexFile {
             }
             Ok(())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (expected_identity, expected_size, expected_modified);
             Err(E::Unsupported)
@@ -691,11 +693,25 @@ impl HeldIndexFile {
             }
             Ok(file)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            windows_index_input::read(self.chain.last().ok_or(E::Unavailable)?)
+                .map_err(|_| E::Unavailable)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             Err(E::Unsupported)
         }
     }
+}
+#[cfg(windows)]
+fn open_index_component(
+    parent: &fs::File,
+    name: &OsStr,
+    directory: bool,
+) -> Result<fs::File, super::super::SourceIndexInspectionError> {
+    windows_index_input::component(parent, name, directory)
+        .map_err(|_| super::super::SourceIndexInspectionError::Unavailable)
 }
 #[cfg(target_os = "linux")]
 fn open_index_component(
@@ -801,26 +817,30 @@ impl BoundDatabaseRoot {
         if relative.as_os_str().as_encoded_bytes().len() > 1024 {
             return Err(E::ByteLimit);
         }
-        let names = relative
-            .components()
-            .map(|component| match component {
-                Component::Normal(name) => Ok(name.to_os_string()),
-                _ => Err(E::InvalidPath),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if names.is_empty() || names.len() > 32 {
+        let mut names = Vec::with_capacity(32);
+        for component in relative.components() {
+            if names.len() == 32 {
+                return Err(E::InvalidPath);
+            }
+            match component {
+                Component::Normal(name) => names.push(name.to_os_string()),
+                _ => return Err(E::InvalidPath),
+            }
+        }
+        if names.is_empty() {
             return Err(E::InvalidPath);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
-            let mut chain = vec![self._capability.try_clone().map_err(|_| E::Unavailable)?];
+            let mut chain = Vec::with_capacity(33);
+            chain.push(self._capability.try_clone().map_err(|_| E::Unavailable)?);
             for (i, name) in names.iter().enumerate() {
                 let next = open_index_component(chain.last().unwrap(), name, i + 1 < names.len())?;
                 chain.push(next);
             }
             Ok(HeldIndexFile { chain, names })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = names;
             Err(E::Unsupported)
@@ -2080,7 +2100,7 @@ mod tests {
 
 #[cfg(test)]
 mod index_inspection_primitive_tests {
-    #![cfg(target_os = "linux")]
+    #![cfg(any(target_os = "linux", windows))]
     use super::super::super::{
         SourceIndexClassification, SourceIndexEntry, SourceIndexInspectionError as E,
     };

@@ -16496,7 +16496,7 @@ mod tests {
     mod collection_history_group_tests;
     #[cfg(feature = "test-support")]
     mod compound_batch_fault;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     mod feature_job_tests;
     mod feature_progress_tests;
     #[cfg(target_os = "linux")]
