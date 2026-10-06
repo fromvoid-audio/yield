@@ -358,8 +358,10 @@ impl CapacityProvider {
     }
 
     #[cfg(test)]
-    pub(crate) fn empty_reconciliation_debit_for_test() -> usize {
-        funded_reconciliation::bytes(&[], &Self::unavailable().ledger.borrow()).unwrap()
+    pub(crate) fn reconciliation_debit_for_test(snapshot: &OrdinaryClaimRebuildSnapshot) -> usize {
+        let provider = Self::unavailable();
+        provider.install_rebuilt_claims(snapshot).unwrap();
+        funded_reconciliation::bytes(snapshot.claims(), &provider.ledger.borrow()).unwrap()
     }
 
     #[cfg(test)]
