@@ -165,7 +165,11 @@ fn namespace_backing_actual_queued_error_outlives_request_and_original_worker_jo
         let bound = store.retained_namespace_working_bytes_for_test();
         let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
         wait_until_available(&owner);
-        let baseline = *owner.shared.input_bytes.lock().unwrap();
+        let baseline = InputBudget::shared_initial();
+        let mut active = baseline;
+        active.remaining[InputClass::Ordinary.index()] -= resource_custody::HEADER_BYTES;
+        active.publication_remaining -= resource_custody::HEADER_BYTES;
+        assert_eq!(*owner.shared.input_bytes.lock().unwrap(), active);
         let pool = owner.shared.input_bytes.clone();
         let wal = path.with_file_name("journal.sqlite3-wal");
         fs::write(&wal, b"original queued namespace sidecar evidence").unwrap();
@@ -228,7 +232,11 @@ fn namespace_backing_actual_queued_lost_reply_refunds_only_after_worker_join() {
     let original_bytes = fs::read(&path).unwrap();
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
     wait_until_available(&owner);
-    let baseline = *owner.shared.input_bytes.lock().unwrap();
+    let baseline = InputBudget::shared_initial();
+    let mut active = baseline;
+    active.remaining[InputClass::Ordinary.index()] -= resource_custody::HEADER_BYTES;
+    active.publication_remaining -= resource_custody::HEADER_BYTES;
+    assert_eq!(*owner.shared.input_bytes.lock().unwrap(), active);
     let wal = path.with_file_name("journal.sqlite3-wal");
     fs::write(&wal, b"lost reply namespace evidence").unwrap();
     let request = owner
