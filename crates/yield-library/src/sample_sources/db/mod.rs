@@ -32,6 +32,7 @@ pub use legacy_observation::{
     LegacyCommonAllocationObservation, LegacyObservationError, LegacySourceImage,
     LegacySourcePagerObservation, LegacySourceReadOwner,
 };
+pub(crate) use legacy_observation::{LegacyReserveTarget, LegacyReserveUseProof};
 mod open;
 mod open_profiles;
 /// Private rename-recovery metadata retained after immediate file pruning.

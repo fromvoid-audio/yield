@@ -16,6 +16,7 @@ mod queue_metrics;
 pub use queue_metrics::{JournalQueueClassMetrics, JournalQueueMetricsSnapshot};
 use queue_metrics::{QueueMetrics, QueueTicket};
 mod legacy_adoption_custody;
+mod legacy_adoption_volumes;
 mod recording_binding;
 pub use legacy_adoption_custody::{LegacyAdoptionCustody, LegacyAdoptionCustodyError};
 pub use recording_binding::{RecordingProducerCustody, RecordingProducerCustodyError};
@@ -3045,6 +3046,8 @@ impl OwnerRuntime {
             .as_ref()
             .ok_or_else(|| String::from("owner profile guard is not installed"))?;
         self.validate_source_authorities_for_admission(profile_guard)?;
+        self.validate_legacy_volume_bindings()
+            .map_err(|e| e.to_string())?;
         let profile_owner = self
             .volume_owner
             .as_ref()
@@ -3071,6 +3074,21 @@ impl OwnerRuntime {
             reserves.push(binding.reserve.as_ref().ok_or_else(|| {
                 String::from("a complete source binding has no retained reserve")
             })?);
+        }
+        if let Some(volumes) = self
+            .legacy_adoption
+            .as_ref()
+            .and_then(|s| s.volumes.as_ref())
+        {
+            for entry in &volumes.entries {
+                if let legacy_adoption_volumes::LegacyVolumeEntry::Owned {
+                    owner, reserve, ..
+                } = entry
+                {
+                    volume_owners.push(owner.as_ref().ok_or("legacy volume owner is incomplete")?);
+                    reserves.push(reserve.as_ref().ok_or("legacy reserve is incomplete")?);
+                }
+            }
         }
         Ok(LiveAdmissionWitness {
             observation,
@@ -3713,6 +3731,8 @@ impl OwnerRuntime {
             .ok_or_else(|| String::from("capacity provider is not installed"))?
             .prove_no_live_charges()
             .map_err(|error| error.to_string())?;
+        self.validate_legacy_volume_bindings()
+            .map_err(|e| e.to_string())?;
         self.store()
             .prove_clean_handoff_durable()
             .map_err(|error| error.to_string())?;
@@ -3781,6 +3801,43 @@ impl OwnerRuntime {
             owner.mark_clean_after_handoff().map_err(|error| {
                 format!("source volume {volume:?} clean handoff failed: {error}")
             })?;
+        }
+        if let Some(volumes) = self
+            .legacy_adoption
+            .as_mut()
+            .and_then(|s| s.volumes.as_mut())
+        {
+            for entry in &mut volumes.entries {
+                if let legacy_adoption_volumes::LegacyVolumeEntry::Owned {
+                    owner,
+                    reserve,
+                    volume,
+                    ..
+                } = entry
+                {
+                    let reserve = reserve
+                        .as_mut()
+                        .ok_or("legacy reserve remains incomplete")?;
+                    let proof = reserve
+                        .view(profile_guard)
+                        .revalidate_and_prove()
+                        .map_err(|e| e.to_string())?;
+                    if proof.volume() != volume
+                        || !proof.non_sparse()
+                        || proof.physical_bytes()
+                            < crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+                    {
+                        return Err(
+                            "legacy reserve cannot prove its complete protected floor".into()
+                        );
+                    }
+                    owner
+                        .as_mut()
+                        .ok_or("legacy volume owner remains incomplete")?
+                        .mark_clean_after_handoff()
+                        .map_err(|e| e.to_string())?;
+                }
+            }
         }
         let volume_owner = self
             .volume_owner
@@ -3948,6 +4005,13 @@ impl OwnerRuntime {
             provenance.insert(observed_volume, observed_provenance);
         }
 
+        self.observe_legacy_reserve_facts(
+            &mut facts,
+            &mut provenance,
+            require_full_floor,
+            #[cfg(test)]
+            facts_reader,
+        )?;
         Ok(LiveDescriptorCapacityObservation { facts, provenance })
     }
 
@@ -5627,6 +5691,12 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<LegacyAdoptionCustody, OperationJournalOwnerError>>,
     },
+    PrepareLegacyVolumes {
+        command: crate::sample_sources::db::SourceCommandId,
+        digest: [u8; 32],
+        input: InputPermit,
+        result: SyncSender<Result<LegacyAdoptionCustody, OperationJournalOwnerError>>,
+    },
     ValidateLegacyCustody {
         command: crate::sample_sources::db::SourceCommandId,
         digest: [u8; 32],
@@ -6080,6 +6150,14 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             result,
         } => execute_store_result(result, move || {
             runtime.prepare_legacy_custody(source, participant, command, input)
+        }),
+        JournalCommand::PrepareLegacyVolumes {
+            command,
+            digest,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            runtime.prepare_legacy_volumes(command, digest, input)
         }),
         JournalCommand::ValidateLegacyCustody {
             command,
@@ -6572,6 +6650,9 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             let _ = result.send(Err(error));
         }
         JournalCommand::PrepareLegacyCustody { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::PrepareLegacyVolumes { result, .. } => {
             let _ = result.send(Err(error));
         }
         JournalCommand::ValidateLegacyCustody { result, .. } => {

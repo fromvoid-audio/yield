@@ -769,6 +769,29 @@ impl ReadonlyDatabaseRoot {
 }
 
 impl BoundDatabaseRoot {
+    /// Original retained metadata only; native descriptor/allocator memory is separate.
+    // Pinned Arc<File> backing: two usize-sized atomic controls plus aligned File payload.
+    pub(crate) const LEGACY_ARC_FILE_BYTES: usize = std::mem::size_of::<(usize, usize, fs::File)>();
+
+    pub(crate) fn legacy_metadata_bytes(&self) -> Option<usize> {
+        let bounded =
+            |p: &PathBuf| p.as_os_str().as_encoded_bytes().len() <= 4096 && p.capacity() <= 8192;
+        if !bounded(&self.path)
+            || self.named_path.as_ref().is_some_and(|p| !bounded(p))
+            || self.identity.capacity() > 256
+            || self.profile_identity.capacity() > 256
+        {
+            return None;
+        }
+        Some(
+            std::mem::size_of::<Self>()
+                + Self::LEGACY_ARC_FILE_BYTES
+                + self.path.capacity()
+                + self.named_path.as_ref().map_or(0, PathBuf::capacity)
+                + self.identity.capacity()
+                + self.profile_identity.capacity(),
+        )
+    }
     /// Hold a bounded normal-component chain without data access or symlink traversal.
     pub(crate) fn inspect_index_file(
         &self,
@@ -1048,6 +1071,54 @@ impl BoundDatabaseRoot {
         }
         let directory = cap_std::fs::Dir::from_std_file(self._capability.try_clone()?);
         directory.symlink_metadata(name)
+    }
+
+    /// Flush each original namespace only while the genuine pre-lease seal remains live.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn sync_legacy_namespace(
+        &self,
+        profile_guard: &WritableProfileGuard,
+        proof: &crate::sample_sources::db::LegacyReserveUseProof<'_>,
+        #[cfg(test)] after_sync: Option<fn(u8)>,
+    ) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            let _ = after_sync;
+            self.validate_profile_guard(profile_guard)
+                .map_err(|e| e.to_string())?;
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(windows))]
+        {
+            let profile_root = profile_guard
+                .profile_root_dir()
+                .map_err(|e| e.to_string())?;
+            self.validate_profile_guard(profile_guard)
+                .map_err(|e| e.to_string())?;
+            // Descriptor acquisition and each previous native sync may consume the original
+            // cooperative budget. Only the genuine borrowed seal can authorize the next effect.
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())?;
+            sync_retained_directory(&profile_root.into_std_file()).map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            if let Some(observe) = after_sync {
+                observe(1);
+            }
+            self.validate_profile_guard(profile_guard)
+                .map_err(|e| e.to_string())?;
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())?;
+            sync_retained_directory(&self._capability).map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            if let Some(observe) = after_sync {
+                observe(2);
+            }
+            Ok(())
+        }
     }
 
     /// Flush the retained profile and child directory entries before a durable child-file write.

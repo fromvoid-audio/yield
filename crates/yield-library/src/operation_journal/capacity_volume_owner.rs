@@ -42,6 +42,9 @@ const MAX_IDENTITY_BYTES: usize = 256;
 #[cfg(any(windows, test))]
 mod windows_lock;
 
+mod legacy_bootstrap;
+pub(super) use legacy_bootstrap::{LegacyVolumeFailureBacking, acquire_legacy_for_descriptor};
+
 /// This capability can only be used for recovery coordination in this milestone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum VolumeOwnershipReadiness {
@@ -307,11 +310,12 @@ impl RegistryRoot {
 /// before dropping the capability.
 #[derive(Debug)]
 pub(crate) struct VolumeOwnershipCapability {
+    // Close the affected locked file before its retained ancestor namespace.
+    lock_file: File,
     registry: RegistryRoot,
     volume: VolumeIdentity,
     lock_path: PathBuf,
     lock_identity: String,
-    lock_file: File,
     marker: OwnershipMarker,
     /// Production macOS ownership retains and revalidates the original volume descriptor and
     /// UUID. Fixture providers and non-macOS builds keep the established device-only behavior.
@@ -418,6 +422,30 @@ impl ReadonlyVolumeOwner {
 }
 
 impl VolumeOwnershipCapability {
+    pub(super) fn legacy_metadata_bytes(&self) -> Option<usize> {
+        let paths = [&self.registry.path, &self.lock_path];
+        if paths
+            .iter()
+            .any(|p| p.as_os_str().as_encoded_bytes().len() > 4096 || p.capacity() > 8192)
+            || [
+                &self.registry.identity,
+                &self.lock_identity,
+                &self.marker.owner_profile_identity,
+            ]
+            .iter()
+            .any(|s| s.capacity() > 256)
+        {
+            return None;
+        }
+        Some(
+            std::mem::size_of::<Self>()
+                + 6 * std::mem::size_of::<usize>()
+                + paths.iter().map(|p| p.capacity()).sum::<usize>()
+                + self.registry.identity.capacity()
+                + self.lock_identity.capacity()
+                + self.marker.owner_profile_identity.capacity(),
+        )
+    }
     /// Return the live volume identity bound to this capability.
     #[allow(dead_code)]
     pub(super) fn readonly_observation(&self) -> Result<ReadonlyVolumeOwner, VolumeOwnershipError> {

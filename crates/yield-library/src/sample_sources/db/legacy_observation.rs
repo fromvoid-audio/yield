@@ -18,8 +18,10 @@ pub use common_allocation::{
     LegacyCommonAllocationObservation,
 };
 mod image;
+mod reserve_custody;
 mod rows;
 pub use allocation::LegacySourcePagerObservation;
+pub(crate) use reserve_custody::{LegacyReserveTarget, LegacyReserveUseProof};
 pub(crate) use rows::SCRATCH_BYTES as LEGACY_CAPTURE_SCRATCH_BYTES;
 
 /// Refusal to inspect an unsupported, stale or unbounded legacy source.
@@ -73,6 +75,7 @@ pub struct LegacySourceReadOwner {
     media_root: Arc<BoundDatabaseRoot>,
     profile: WritableProfileGuard,
     original_digest: Option<[u8; 32]>,
+    main_reserve_root: Option<Arc<BoundDatabaseRoot>>,
 }
 impl SourceDatabase {
     /// Open the explicit first legacy-inspection route. Ordinary opens still reject migration.
@@ -143,6 +146,7 @@ impl LegacySourceReadOwner {
             media_root,
             profile: profile.try_clone().map_err(refused)?,
             original_digest: None,
+            main_reserve_root: None,
         };
         owner.validate(profile)?;
         // No unsupported schema survives a successful open; capture remains separately callable.

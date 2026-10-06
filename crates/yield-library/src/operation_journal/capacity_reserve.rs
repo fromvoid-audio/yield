@@ -15,6 +15,11 @@ use crate::durable_capacity::{
 };
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 
+#[cfg(any(target_os = "macos", test))]
+mod legacy;
+#[cfg(target_os = "macos")]
+pub(super) use legacy::allocate_legacy_protected_reserve;
+
 /// One descriptor-bound observation retained by a protected reserve handle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ReserveObservation {
@@ -395,6 +400,9 @@ pub(super) enum ReserveFailureStage {
 /// Typed reserve failure reason. The failed value retains the original owned file.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(super) enum ReserveFailureReason {
+    #[cfg(any(target_os = "macos", test))]
+    #[error("original legacy bootstrap custody is no longer current")]
+    LegacyCustodyClosed,
     #[error("protected reserve allocation is unsupported on this target")]
     Unsupported,
     #[error("reserve descriptor is not a regular file")]

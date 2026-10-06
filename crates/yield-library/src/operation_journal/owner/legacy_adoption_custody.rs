@@ -9,8 +9,11 @@ use std::sync::{Weak, atomic::AtomicBool};
 
 // Preserve 64KiB for frozen <=32KiB input and bounded observation/header metadata;
 // additionally charge the derived sequential schema/row scratch peak, not audio input bytes.
+// One separately bound original MAIN reserve root has its own explicit inventory.
 // The already-open source SQLite connection is transferred, never opened by this route.
-const INPUT_BYTES: usize = 64 * 1024 + crate::sample_sources::db::LEGACY_CAPTURE_SCRATCH_BYTES;
+pub(super) const INPUT_BYTES: usize = 64 * 1024
+    + crate::sample_sources::db::LEGACY_CAPTURE_SCRATCH_BYTES
+    + super::legacy_adoption_volumes::ROOT_BYTES;
 
 /// Refusal of original readonly custody; none of these states authorizes a retry or mutation.
 #[derive(Debug, Error)]
@@ -27,6 +30,9 @@ pub enum LegacyAdoptionCustodyError {
     /// Genuine original-owner preparation rejected before any intent or writes.
     #[error(transparent)]
     Preparation(#[from] LegacyAdoptionInputError),
+    /// Partial reserve bootstrap remains retained; no retry or cleanup is authorized.
+    #[error("original legacy reserve custody requires recovery")]
+    ReserveRecovery,
 }
 
 /// Privately issued observation of original source custody on the exact journal worker.
@@ -39,14 +45,39 @@ pub enum LegacyAdoptionCustodyError {
 /// let _ = yield_library::operation_journal::owner::LegacyAdoptionCustody {};
 /// ```
 pub struct LegacyAdoptionCustody {
-    args: LegacyAdoptionIntentArgs,
-    digest: [u8; 32],
-    owner: Weak<OwnerShared>,
+    pub(super) args: LegacyAdoptionIntentArgs,
+    pub(super) digest: [u8; 32],
+    pub(super) owner: Weak<OwnerShared>,
+    // Newly returned reserve checkpoints retain their own reply-copy credit after delivery.
+    pub(super) _reply_input: Option<InputPermit>,
 }
 impl LegacyAdoptionCustody {
     /// Original bounded passive input; cloning/encoding this observation grants no custody.
     pub fn input(&self) -> &LegacyAdoptionIntentArgs {
         &self.args
+    }
+    /// Install original pre-lease reserve custody on the same worker and return a newly
+    /// captured passive checkpoint. No ordinary claim, migration grant or lease is issued.
+    /// A failed physical preparation retains its partial backing until actual shutdown.
+    pub fn prepare_volume_custody(
+        &self,
+    ) -> Result<OperationJournalRequest<LegacyAdoptionCustody>, OperationJournalOwnerQueueError>
+    {
+        let shared = self
+            .owner
+            .upgrade()
+            .ok_or(OperationJournalOwnerQueueError::Closed)?;
+        let command = self.args.source_command_id();
+        let digest = self.digest;
+        OperationJournalClient { shared }.submit(
+            super::legacy_adoption_volumes::REPLY_BYTES,
+            move |input, result| JournalCommand::PrepareLegacyVolumes {
+                command,
+                digest,
+                input,
+                result,
+            },
+        )
     }
     /// Queue bounded revalidation on the original retained acquisition. Timeout or lost reply
     /// does not close, transfer or release its sole source slot. Consume the actual result.
@@ -71,11 +102,13 @@ impl LegacyAdoptionCustody {
 }
 
 pub(super) struct RetainedLegacyAdoption {
-    // Drop original SQLite/root/reservation ownership before refunding metadata credit.
-    source: LegacySourceReadOwner,
-    args: LegacyAdoptionIntentArgs,
-    digest: [u8; 32],
-    input: InputPermit,
+    // Added reserve/failure/volume backing closes before the original source reservation.
+    pub(super) volumes: Option<super::legacy_adoption_volumes::RetainedLegacyVolumes>,
+    // Original SQLite closes before its own root/reservation, and all backing before credit.
+    pub(super) source: LegacySourceReadOwner,
+    pub(super) args: LegacyAdoptionIntentArgs,
+    pub(super) digest: [u8; 32],
+    pub(super) input: InputPermit,
 }
 impl OperationJournalClient {
     /// Transfer one genuine original readonly source owner into this journal's sole pre-lease
@@ -172,6 +205,7 @@ impl OwnerRuntime {
             return Err(E::Closed.into());
         }
         let observation = LegacyAdoptionCustody {
+            _reply_input: None,
             args: args.clone(),
             digest,
             owner: Arc::downgrade(&input.shared),
@@ -180,6 +214,7 @@ impl OwnerRuntime {
             source,
             args,
             digest,
+            volumes: None,
             input,
         });
         Ok(observation)

@@ -112,6 +112,13 @@ fn legacy_custody_actual_worker_captures_and_revalidates_without_writes_or_lease
     let mut f = Fixture::new();
     let source_bytes = fs::read(f.path()).unwrap();
     let journal = journal_bytes(&f);
+    let explicit_root = f.profile.path().join("explicit-original-reserve");
+    fs::create_dir(&explicit_root).unwrap();
+    f.source
+        .as_mut()
+        .unwrap()
+        .bind_legacy_main_reserve_root(&explicit_root)
+        .unwrap();
     let custody = f.prepare().unwrap();
     assert_eq!(
         custody.input().profile_owner_identity(),
@@ -138,6 +145,25 @@ fn legacy_custody_actual_worker_captures_and_revalidates_without_writes_or_lease
         budget(&f.client()).remaining[0],
         f.baseline.remaining[0] - INPUT_BYTES
     );
+    // The original worker refuses missing physical floor before reserve effects and retains
+    // the same source, explicit root and complete input credit across repeated real commands.
+    for _ in 0..2 {
+        assert!(
+            custody
+                .prepare_volume_custody()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .is_err()
+        );
+        validate(&custody).unwrap();
+        assert_eq!(
+            budget(&f.client()).remaining[0],
+            f.baseline.remaining[0] - INPUT_BYTES
+        );
+        assert!(fs::read_dir(&explicit_root).unwrap().next().is_none());
+        assert_eq!(fs::read(f.path()).unwrap(), source_bytes);
+    }
     f.close();
     assert!(custody.revalidate().is_err());
 }

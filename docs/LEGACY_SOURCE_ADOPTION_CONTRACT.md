@@ -550,8 +550,10 @@ The entire journal preparation shares one cooperative two-second deadline.
 The private candidate preserves the live original connection until its caller
 returns or drops it. An initial handler refusal closes the source normally while
 preserving source/control evidence; it installs no slot. Successful and lost-reply
-custody retain the original slot, lock and metadata credit until normal shutdown. The 64KiB input debit covers retained metadata; native SQLite allocator
-memory is not certified by that debit. Candidate construction temporarily holds
+custody retain the original slot, lock and metadata credit until normal shutdown. The original 64KiB input debit covers retained metadata. OPT-2356 adds its
+derived 28,888-byte capture scratch debit before capture and retains both on
+the worker (OPT-2349 additionally charges one separate bound MAIN reserve-root
+inventory before transfer/capture); native SQLite allocator memory is not certified by these debits. Candidate construction temporarily holds
 two SQLite connections, then retains one. This is no whole-process heap/RSS bound.
 
 Actual SQLite tests turn off SQL `query_only` and still observe zero forwarded
@@ -563,3 +565,60 @@ These tests restrict effects; they do not qualify native physical allocation or
 power-loss durability. The permanent fence prepares custody only. Actual claims,
 durable intent, admitted mutable promotion, migration/receipt transaction,
 recovery and separately admitted lease bootstrap remain open under OPT-2117.
+
+
+### Original pre-lease volume and reserve custody (OPT-2349)
+
+The existing journal worker installs volume/reserve custody for its original
+retained legacy source. A borrowed, sealed proof retains the same source,
+profile, original reservation, frozen source image and permanent no-effect VFS
+fence. It checks those facts and the original cooperative deadline after native
+observations and immediately before each bootstrap effect. The fixed reserve
+child, native allocation/length/full-flush operations, marker truncate/each write,
+and each profile/child namespace sync have separate checks. Slow native I/O is
+not preempted; after it returns, an expired proof refuses the next effect.
+Separately mounted MAIN requires an explicit qualified original reserve-root
+binding retained by the source owner; a pathname or decoded volume does not
+supply that binding.
+
+The additional consumer reserves its metadata debit before capture or effects.
+The bound names compiler-sized headers, at most two entry inventories, roots,
+owners, reserves, closed acquisition/namespace failure capsules, 8192-byte path
+capacity bounds, 256-byte native identity capacities, both original-root Arc
+controls and the aligned Arc<File> control/payload allocation, three bounded argument
+copies and encoding scratch, one transient context owner, four canonical path
+backings, the fixed 16KiB passwd lookup buffer plus its Vec header, marker
+backing, and two simultaneous target vectors (capacity at most
+four). Observation-map scratch additionally uses the actual source-volume count
+plus three, with a conservative complete pinned-Rust tree-node inventory per
+volume. Each returned copied checkpoint has its own header plus thirteen
+1024-byte string debit. The original 64KiB metadata and 28,888-byte source-capture
+scratch, plus the new explicit MAIN reserve-root inventory, remain charged independently: schema, metadata and scalar row-reference
+captures are sequential within that original scratch bound. The pool ceiling and
+supported source input limits are unchanged. Native SQLite allocations, physical
+reserve extents and process RSS are outside these Rust metadata bounds.
+
+Failures retain the exact affected raw File, reopened OwnedReserve, native
+registry/lock descriptors and original ancestors in a closed charged slot. Raw
+recovery backing discards diagnostic strings and cached protected qualification;
+it is not a qualified reserve and supplies no successful ownership capability.
+Added reserve/failure backing closes before volume locks, original roots and the
+original source; metadata credits remain charged through that teardown. Partial
+reentry refuses without new effects or an unverified refund. Successful or
+lost-reply custody remains on the original worker until normal shutdown.
+
+Each confirmed binding prefix advances a private complete journal/source
+checkpoint on that worker. Existing public handles remain frozen. Only complete
+installation and final recapture issue a new passive checkpoint; stale handles
+refuse, and an exact completed duplicate returns the current checkpoint without
+another bootstrap. These checkpoints issue no current lease, capacity permit,
+mutable migration grant, retry/refund or settlement authority. The full adoption
+contract remains open under OPT-2117.
+
+Linux/Windows retain the original unsupported physical-floor gate before reserve
+namespace effects. Small native-file/callback fixtures prove sealed refusal,
+exact backing retention and native lock/credit drop order; they do not qualify a
+positive physical floor or two actual mounted volumes. Native APFS qualification
+and separately mounted MAIN/two-volume acceptance remain OPT-2354. Existing
+Current-source post-effect failure retention and equivalent effect-proof gaps
+remain OPT-2352; its APIs and existing gates are preserved here.

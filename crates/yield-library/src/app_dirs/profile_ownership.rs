@@ -494,6 +494,92 @@ pub(crate) fn open_canonical_global_app_root() -> Result<(PathBuf, Dir), Profile
     }
 }
 
+/// Exact native directory backing after a refused legacy-only app bootstrap. No profile grant.
+#[derive(Default)]
+pub(crate) struct LegacyAppRootBacking {
+    // Close the affected child before its retained ancestor namespace.
+    child: Option<Dir>,
+    parent: Option<Dir>,
+}
+impl LegacyAppRootBacking {
+    pub(crate) fn metadata_bytes(&self) -> usize {
+        let _held = (&self.parent, &self.child);
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// Bootstrap only under the original sealed pre-lease source proof. Existing Current APIs
+/// keep their original behavior; failure moves affected parent/child descriptors to the caller.
+pub(crate) fn open_legacy_canonical_app_root(
+    proof: &crate::sample_sources::db::LegacyReserveUseProof<'_>,
+) -> Result<(PathBuf, Dir), LegacyAppRootBacking> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = proof;
+        Err(LegacyAppRootBacking::default())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut backing = LegacyAppRootBacking::default();
+        let result = (|| {
+            proof.validate_for_bootstrap().map_err(|_| ())?;
+            let home = canonical_user_home().map_err(|_| ())?;
+            let bounded = |p: &PathBuf| {
+                p.as_os_str().as_encoded_bytes().len() <= 4096 && p.capacity() <= 8192
+            };
+            if !bounded(&home) {
+                return Err(());
+            }
+            let home_dir = open_profile_root(&home).map_err(|_| ())?;
+            ensure_current_user_owned(&home, &home_dir).map_err(|_| ())?;
+            let library = open_existing_child(&home_dir, "Library", &home).map_err(|_| ())?;
+            let library_path = home.join("Library");
+            ensure_current_user_owned(&library_path, &library).map_err(|_| ())?;
+            let support_path = library_path.join("Application Support");
+            let support = open_existing_child(&library, "Application Support", &library_path)
+                .map_err(|_| ())?;
+            ensure_current_user_owned(&support_path, &support).map_err(|_| ())?;
+            let app_path = support_path.join(super::APP_DIR_NAME);
+            if !bounded(&app_path) {
+                return Err(());
+            }
+            backing.parent = Some(support);
+            let parent = backing.parent.as_ref().unwrap();
+            let app = match parent.open_dir_nofollow(super::APP_DIR_NAME) {
+                Ok(app) => app,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    proof.validate_for_bootstrap().map_err(|_| ())?;
+                    parent
+                        .create_dir(super::APP_DIR_NAME)
+                        .or_else(|e| {
+                            if e.kind() == io::ErrorKind::AlreadyExists {
+                                Ok(())
+                            } else {
+                                Err(e)
+                            }
+                        })
+                        .map_err(|_| ())?;
+                    // Retain the parent even if a refused/raced child cannot be opened.
+                    let app = parent
+                        .open_dir_nofollow(super::APP_DIR_NAME)
+                        .map_err(|_| ())?;
+                    backing.child = Some(app);
+                    proof.validate_for_bootstrap().map_err(|_| ())?;
+                    sync_directory(parent, &support_path).map_err(|_| ())?;
+                    backing.child.take().unwrap()
+                }
+                Err(_) => return Err(()),
+            };
+            backing.child = Some(app);
+            ensure_current_user_owned(&app_path, backing.child.as_ref().unwrap())
+                .map_err(|_| ())?;
+            proof.validate_for_bootstrap().map_err(|_| ())?;
+            Ok((app_path, backing.child.take().unwrap()))
+        })();
+        result.map_err(|()| backing)
+    }
+}
+
 /// Open an absolute directory by walking every component without following symlinks.
 pub(crate) fn open_no_follow_directory(path: &Path) -> io::Result<Dir> {
     open_profile_root(path)
