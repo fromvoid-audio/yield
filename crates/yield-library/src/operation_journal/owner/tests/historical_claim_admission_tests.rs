@@ -1,5 +1,6 @@
 use super::*;
 use crate::operation_journal::FullCapacityAllocationClass;
+use std::time::Instant;
 
 #[test]
 fn historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pressure_before_effects()
@@ -86,9 +87,16 @@ fn historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pres
         1
     );
     assert_eq!(
-        sql.query_row("SELECT record FROM operation_journal", [], |row| row
-            .get::<_, Vec<u8>>(0))
+        sql.query_row("SELECT count(*) FROM operation_journal", [], |row| row
+            .get::<_, i64>(0))
             .unwrap(),
+        2
+    );
+    assert_eq!(
+        sql.query_row("SELECT record FROM operation_journal LIMIT 1", [], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .unwrap(),
         wire.as_bytes()
     );
     assert_eq!(
@@ -103,7 +111,7 @@ fn historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pres
 }
 
 #[test]
-fn historical_claim_unconsumed_actor_error_keeps_original_scratch_until_receiver_drop() {
+fn historical_claim_unconsumed_actor_error_hands_off_to_funded_diagnostics_until_receiver_drop() {
     let fixture = fixture("historical-claim-unconsumed-error");
     let store = OperationJournalStore::open(&fixture.owner).unwrap();
     let database = fixture
@@ -126,6 +134,17 @@ fn historical_claim_unconsumed_actor_error_keeps_original_scratch_until_receiver
     sql.execute(
         "INSERT INTO operation_journal_ordinary_claim VALUES (?1,?2,'1','DestinationStaging',1)",
         rusqlite::params![Uuid::new_v4().to_string(), old_id.to_string()],
+    )
+    .unwrap();
+    let second_id = OperationId::new();
+    sql.execute(
+        "INSERT INTO operation_journal VALUES (?1,2,?2)",
+        rusqlite::params![second_id.to_string(), wire.as_bytes()],
+    )
+    .unwrap();
+    sql.execute(
+        "INSERT INTO operation_journal_ordinary_claim VALUES (?1,?2,'1','DestinationStaging',1)",
+        rusqlite::params![Uuid::new_v4().to_string(), second_id.to_string()],
     )
     .unwrap();
     drop(sql);
@@ -160,7 +179,12 @@ fn historical_claim_unconsumed_actor_error_keeps_original_scratch_until_receiver
     // Join the genuine actor while keeping the result unconsumed. This separates
     // command input cleanup from the returned error backing's actual lifetime.
     assert!(owner.shutdown());
-    assert!(pool_before - owner.shared.input_bytes.lock().unwrap().remaining[0] >= 2 * wire.len());
+    assert_eq!(
+        pool_before - owner.shared.input_bytes.lock().unwrap().remaining[0],
+        super::super::store::HISTORICAL_DIAGNOSTIC_BYTES
+            + std::mem::size_of::<HistoricalReplyBacking>()
+            + 2 * std::mem::size_of::<usize>()
+    );
     assert_eq!(owner.prepared_admission_id_allocations(), 0);
     drop(request);
     assert_eq!(
@@ -189,7 +213,7 @@ fn historical_claim_late_send_disposes_payload_before_original_reply_credit() {
         .unwrap();
     let backing = Arc::new(HistoricalReplyBacking {
         _header: header,
-        terminal: Mutex::new([None, None, None]),
+        terminal: Mutex::new([None, None, None, None]),
     });
     let mut input = shared.reserve_input(InputClass::Ordinary, 1).unwrap();
     input.historical_reply = Some(Arc::clone(&backing));

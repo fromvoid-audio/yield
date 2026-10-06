@@ -148,6 +148,16 @@ thread_local! {
 
 const MAX_REBUILD_DIAGNOSTICS: usize = 32;
 const MAX_REBUILD_DIAGNOSTIC_CHARS: usize = 256;
+// Capped diagnostic graph plus the generic prepared consumer's four clones,
+// join buffer, and final 512-character reason, all overlapping. UTF-8 uses
+// at most four bytes per char and String/Vec growth at most twice the payload.
+pub(super) const HISTORICAL_DIAGNOSTIC_BYTES: usize = 2
+    * MAX_REBUILD_DIAGNOSTICS
+    * (std::mem::size_of::<String>() + 4 * MAX_REBUILD_DIAGNOSTIC_CHARS)
+    + 2 * 4 * (std::mem::size_of::<String>() + 4 * MAX_REBUILD_DIAGNOSTIC_CHARS)
+    + 2 * (4 * 4 * MAX_REBUILD_DIAGNOSTIC_CHARS + 3 * 2)
+    + 2 * 4 * 512
+    + 3 * std::mem::size_of::<Vec<String>>();
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // Keep SQLite itself from materializing an arbitrarily large key/value before the recovery
 // scanner can inspect its SQL type and length. This leaves room for the bounded JSON envelope
@@ -7028,6 +7038,11 @@ impl OperationJournalStore {
                     false
                 }
             };
+            // The original observer error is now dropped; its bounded replacement
+            // diagnostic has a separately precharged retained graph/reply debit.
+            if let Some(input) = input {
+                input.historical_error_consumed();
+            }
             let mut audit_pending = !operation_valid;
             let mut release_id = None;
             if let Some(release) = release_rows.remove(&claim.claim_id()) {

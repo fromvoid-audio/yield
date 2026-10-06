@@ -1912,6 +1912,13 @@ impl OwnerRuntime {
         // Re-read the durable ordinary-claim image for every request. Startup readiness is only
         // a bootstrap observation and cannot authorize a later request after new recovery rows
         // or settlement evidence arrive.
+        if let Some(input) = input {
+            input.fund_historical_consumer().map_err(|error| {
+                PreparedAdmissionError::RecoveryRequired {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
         let snapshot = match input {
             Some(input) => self.store().rebuild_admission_snapshot_for_input(input),
             None => self.store().rebuild_admission_snapshot(),
@@ -5305,7 +5312,7 @@ impl OperationJournalClient {
             )?;
             let backing = Arc::new(HistoricalReplyBacking {
                 _header: header,
-                terminal: Mutex::new([None, None, None]),
+                terminal: Mutex::new([None, None, None, None]),
             });
             input.historical_reply = Some(Arc::clone(&backing));
             Some(backing)
@@ -5707,7 +5714,7 @@ pub(super) struct InputPermit {
 
 struct HistoricalReplyBacking {
     _header: InputPermit,
-    terminal: Mutex<[Option<InputPermit>; 3]>,
+    terminal: Mutex<[Option<InputPermit>; 4]>,
 }
 
 impl InputPermit {
@@ -5729,11 +5736,31 @@ impl InputPermit {
             // Terminal permits have no reply Arc: the retained backing cannot form a cycle.
             let mut terminal = backing.terminal.lock().unwrap_or_else(|p| p.into_inner());
             assert!(
-                terminal.iter().all(Option::is_none),
-                "one terminal observer error per command"
+                terminal[1..].iter().all(Option::is_none),
+                "previous observer error must be consumed before the next lookup"
             );
-            *terminal = permits;
+            for (slot, permit) in terminal[1..].iter_mut().zip(permits) {
+                *slot = permit;
+            }
         }
+    }
+
+    pub(super) fn historical_error_consumed(&self) {
+        if let Some(backing) = &self.historical_reply {
+            let mut terminal = backing.terminal.lock().unwrap_or_else(|p| p.into_inner());
+            for permit in &mut terminal[1..] {
+                drop(permit.take());
+            }
+        }
+    }
+
+    fn fund_historical_consumer(&self) -> Result<(), OperationJournalStoreError> {
+        if let Some(backing) = &self.historical_reply {
+            let permit =
+                self.reserve_historical_scratch(super::store::HISTORICAL_DIAGNOSTIC_BYTES)?;
+            backing.terminal.lock().unwrap_or_else(|p| p.into_inner())[0] = Some(permit);
+        }
+        Ok(())
     }
 
     /// Private scratch debit from this exact queued command's original pool.
