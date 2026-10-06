@@ -1,6 +1,5 @@
 //! Read/share custody from the original object. No created-stage or effect authority.
-use super::{BindingError, validate_windows_held_staging};
-use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
+use super::validate_windows_staging_shape;
 use std::{
     fs::File,
     io,
@@ -9,21 +8,49 @@ use std::{
 use windows::Win32::{
     Foundation::HANDLE,
     Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, ReOpenFile,
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ, GetFileInformationByHandle, GetFileType, ReOpenFile,
     },
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Identity {
+    serial: u32,
+    index: u64,
+    created: u64,
+}
+fn identity(file: &File) -> io::Result<Identity> {
+    let handle = HANDLE(file.as_raw_handle());
+    // SAFETY: live borrowed handle; initialized ABI record lives through the native call.
+    let kind = unsafe { GetFileType(handle) }.0;
+    if kind != 1 {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle, &mut info) }
+        .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+    let id = Identity {
+        serial: info.dwVolumeSerialNumber,
+        index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        created: (u64::from(info.ftCreationTime.dwHighDateTime) << 32)
+            | u64::from(info.ftCreationTime.dwLowDateTime),
+    };
+    validate_windows_staging_shape(
+        kind,
+        info.dwFileAttributes,
+        id.serial,
+        id.index,
+        info.nNumberOfLinks,
+    )
+    .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    Ok(id)
+}
 
 /// Consume only the original readonly observation handle. Existing write/delete handles
 /// conflict under Windows' symmetric sharing checks; subsequent such opens conflict until
 /// this returned handle closes. Mappings can outlive handles and are outside that guarantee.
 pub(super) fn retain(original: File) -> io::Result<File> {
-    let validate = |file: &File| {
-        validate_windows_held_staging(file)
-            .map_err(|_: BindingError| io::Error::other("invalid original staging shape"))
-    };
-    validate(&original)?;
-    let expected = stable_filesystem_identity_from_open_file(&original)
-        .ok_or_else(|| io::Error::other("unknown original staging identity"))?;
+    let expected = identity(&original)?;
     // SAFETY: validated live disk/regular/nonreparse original, readonly desired access,
     // no locator, no creation, no mutation and no namespace/delete access.
     let handle = unsafe {
@@ -34,15 +61,11 @@ pub(super) fn retain(original: File) -> io::Result<File> {
             FILE_FLAG_OPEN_REPARSE_POINT,
         )
     }
-    .map_err(io::Error::other)?;
+    .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
     // SAFETY: successful ReOpenFile transfers one owned handle, closed on every error path.
     let retained = unsafe { File::from_raw_handle(handle.0) };
-    validate(&original)?;
-    validate(&retained)?;
-    if stable_filesystem_identity_from_open_file(&original).as_deref() != Some(&expected)
-        || stable_filesystem_identity_from_open_file(&retained).as_deref() != Some(&expected)
-    {
-        return Err(io::Error::other("original staging identity changed"));
+    if identity(&original)? != expected || identity(&retained)? != expected {
+        return Err(io::ErrorKind::InvalidData.into());
     }
     Ok(retained)
 }
@@ -50,6 +73,7 @@ pub(super) fn retain(original: File) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt, sync::Arc};
     use windows::Win32::Storage::FileSystem::{DELETE, FILE_SHARE_DELETE, FILE_SHARE_WRITE};
     const ALL_SHARING: u32 = FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0;
@@ -137,3 +161,12 @@ mod tests {
         }
     }
 }
+
+const _: () = assert!(
+    2 * std::mem::size_of::<Identity>()
+        + std::mem::size_of::<BY_HANDLE_FILE_INFORMATION>()
+        + 2 * std::mem::size_of::<File>()
+        + std::mem::size_of::<HANDLE>()
+        + std::mem::size_of::<io::Error>()
+        <= 256
+);

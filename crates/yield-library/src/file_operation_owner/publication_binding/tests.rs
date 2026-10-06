@@ -1,4 +1,4 @@
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod integration {
     //! Genuine profile/root/file-worker observations; no Native capacity or namespace effects.
     use super::super::*;
@@ -101,6 +101,7 @@ mod integration {
             thread::sleep(Duration::from_millis(2));
         }
     }
+    #[cfg(unix)]
     #[test]
     fn original_completion_observation_refuses_foreign_result_fields_without_grant() {
         let f = Fixture::new();
@@ -190,6 +191,7 @@ mod integration {
         let _ = f.owner.shutdown();
     }
 
+    #[cfg(unix)]
     #[test]
     fn held_staging_revalidation_refuses_changed_original_without_moving_cursor() {
         use std::io::Seek;
@@ -222,6 +224,7 @@ mod integration {
         let _ = f.owner.shutdown();
     }
 
+    #[cfg(unix)]
     #[test]
     fn held_staging_revalidation_preserves_renamed_original_and_foreign_replacement() {
         let f = Fixture::new();
@@ -258,6 +261,7 @@ mod integration {
         let _ = f.owner.shutdown();
     }
 
+    #[cfg(unix)]
     #[test]
     fn held_staging_revalidation_refuses_links_length_and_closed_original_root() {
         let f = Fixture::new();
@@ -288,6 +292,7 @@ mod integration {
         let _ = f.owner.shutdown();
     }
 
+    #[cfg(unix)]
     #[test]
     fn original_publication_command_bytes_cannot_mint_primary_grant() {
         let f = Fixture::new();
@@ -324,6 +329,7 @@ mod integration {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].effect_id, result.effect_id());
     }
+    #[cfg(unix)]
     #[test]
     fn actual_original_worker_binds_exact_receipt_roots_descriptor_and_credit() {
         let f = Fixture::new();
@@ -393,6 +399,7 @@ mod integration {
             FILE_OPERATION_OWNER_MAX_INPUT_BYTES
         );
     }
+    #[cfg(unix)]
     #[test]
     fn duplicate_rechecks_actual_content_and_expiry_retains_original_credit() {
         let f = Fixture::new();
@@ -449,6 +456,7 @@ mod integration {
         f.owner.acknowledge_custody_for_test();
         let _ = f.owner.shutdown();
     }
+    #[cfg(unix)]
     #[test]
     fn original_result_capacity_refuses_and_refunds_preparation_input() {
         let f = Fixture::new();
@@ -479,6 +487,7 @@ mod integration {
         f.owner.acknowledge_custody_for_test();
         let _ = f.owner.shutdown();
     }
+    #[cfg(unix)]
     #[test]
     fn genuine_staging_replacement_target_collision_and_owner_loss_refuse() {
         for case in 0..3 {
@@ -525,6 +534,7 @@ mod integration {
             }
         }
     }
+    #[cfg(unix)]
     #[test]
     fn actual_binding_limit_result_and_input_saturation_preserve_original_limits() {
         let f = Fixture::new();
@@ -564,6 +574,7 @@ mod integration {
         let _ = f.owner.shutdown();
     }
 
+    #[cfg(unix)]
     #[test]
     fn original_queue_cancel_deadline_and_fifo_substitution_do_not_mint_binding() {
         let f = Fixture::new();
@@ -634,6 +645,7 @@ mod integration {
         f.owner.acknowledge_custody_for_test();
         let _ = f.owner.shutdown();
     }
+    #[cfg(unix)]
     #[test]
     fn genuine_registered_source_drain_closes_duplicate_preparation() {
         use crate::operation_journal::{
@@ -769,6 +781,7 @@ mod integration {
         drop((authority, original));
         assert!(journal.shutdown());
     }
+    #[cfg(unix)]
     #[test]
     fn original_profile_root_substitution_refuses_without_new_effect_or_root_permission() {
         let f = Fixture::new();
@@ -786,6 +799,88 @@ mod integration {
         drop((validation, pending));
         f.owner.acknowledge_custody_for_test();
         let _ = f.owner.shutdown();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_staging_share_original_worker_retains_binding_alias_through_retirement() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let f = Fixture::new();
+        let (mut validation, original) = f.validation();
+        let path = f.guard.profile_root().join("stage.bin");
+        let mut pending = f.prepare(original.clone(), EffectId::new(), "final.wav");
+        let target = wait(&mut pending).unwrap();
+        let alias = target.data.clone();
+        let open_writer = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .share_mode(7)
+                .open(&path)
+        };
+        assert!(open_writer().is_err());
+        f.owner.retire_root(f.stage).unwrap();
+        assert!(!target.is_current());
+        drop(target);
+        assert!(
+            open_writer().is_err(),
+            "retired original alias must retain sharing custody"
+        );
+        drop(alias);
+        drop(open_writer().unwrap());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"actual original retained bytes"
+        );
+        validation.acknowledge().unwrap();
+        drop((validation, pending, original));
+        f.owner.acknowledge_custody_for_test();
+        let _ = f.owner.shutdown();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_staging_share_original_worker_reply_loss_and_existing_writer_preserve_bytes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let f = Fixture::new();
+        let (mut validation, original) = f.validation();
+        let path = f.guard.profile_root().join("stage.bin");
+        let foreign = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(7)
+            .open(&path)
+            .unwrap();
+        let mut blocked = f.prepare(original.clone(), EffectId::new(), "final.wav");
+        assert!(matches!(wait(&mut blocked), Err(BindingError::Unknown)));
+        drop(foreign);
+        let mut delivered = f.prepare(original.clone(), EffectId::new(), "final.wav");
+        let target = wait(&mut delivered).unwrap();
+        // A duplicate keeps the same worker-owned binding; lost observation reply cannot
+        // release sharing custody while the original delivered binding remains live.
+        let duplicate = f.prepare(original.clone(), target.publication_effect(), "final.wav");
+        drop(duplicate);
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .share_mode(7)
+                .open(&path)
+                .is_err()
+        );
+        drop(target);
+        // Join the genuine worker before asserting that all possible undelivered aliases died.
+        validation.acknowledge().unwrap();
+        drop((validation, blocked, delivered, original));
+        f.owner.acknowledge_custody_for_test();
+        let _ = f.owner.shutdown();
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .share_mode(7)
+                .open(&path)
+                .unwrap(),
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"actual original retained bytes"
+        );
+        assert!(!f.guard.profile_root().join("final.wav").exists());
     }
 }
 
