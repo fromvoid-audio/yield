@@ -23,7 +23,7 @@ fn frozen(
     let held = prepare(writer);
     let binding = held.capture_lease_binding(registration).unwrap();
     let fence = binding.stored_fence().clone();
-    let writer = held.into_writer().unwrap();
+    let writer = held.abort().unwrap();
     let source = ParticipantId::new();
     let global = ParticipantId::new();
     let operation = OperationId::new();
@@ -71,6 +71,49 @@ fn source_retirement_policy_requires_original_registered_use_and_exact_encoded_s
     let (_fixture, writer) = fixture();
     let (registration, _proof, request) = registered(&writer.database);
     let (writer, args, prior_binding) = frozen(writer, &registration);
+    let reference = writer
+        .capture_registry_reference_observation(Some(&registration))
+        .unwrap();
+    let other_operation = OperationId::new();
+    let global = args.draining_work().participant_id();
+    let other_draining = SourceRegistryReferenceProposal::new(
+        &reference,
+        other_operation,
+        args.draining_work(),
+        Transition::Draining,
+        SourceRegistryReferenceExpected::Present {
+            state: Transition::Enrolled,
+            row_identity: [1; 32],
+        },
+    )
+    .unwrap();
+    let other_retired = SourceRegistryReferenceProposal::new(
+        &reference,
+        other_operation,
+        args.retired_work(),
+        Transition::Retired,
+        SourceRegistryReferenceExpected::Present {
+            state: Transition::Draining,
+            row_identity: [2; 32],
+        },
+    )
+    .unwrap();
+    let other_family = SourceRegistryRetirementIntentArgs::new(
+        args.source_participant(),
+        global,
+        args.lease_fence().clone(),
+        &other_draining,
+        &other_retired,
+    )
+    .unwrap();
+    let other_work = SourceRegistryRetirementIntentArgs::new(
+        ParticipantId::new(),
+        global,
+        args.lease_fence().clone(),
+        &other_draining,
+        &other_retired,
+    )
+    .unwrap();
     let initial_settings = settings(&writer);
     let outside = external(&writer);
     let initial_lease = lease(&outside);
@@ -108,6 +151,15 @@ fn source_retirement_policy_requires_original_registered_use_and_exact_encoded_s
         binding.stored_fence(),
         &bytes
     ));
+    for foreign in [&other_family, &other_work] {
+        foreign.validate().unwrap();
+        assert!(!policy.matches_original(
+            foreign,
+            &foreign.initial_forward_policy_digest().unwrap(),
+            binding.stored_fence(),
+            &bytes,
+        ));
+    }
     assert_eq!(
         policy.component_ceilings(),
         binding.stored_fence().write_ceilings()
@@ -134,7 +186,7 @@ fn source_retirement_policy_requires_original_registered_use_and_exact_encoded_s
     );
     drop(binding);
     drop(prior_binding);
-    let writer = held.into_writer().unwrap();
+    let writer = held.abort().unwrap();
     assert_eq!(count(&request), 0);
     assert_eq!(settings(&writer), initial_settings);
     assert_eq!(lease(&outside), initial_lease);
@@ -164,7 +216,7 @@ fn source_retirement_policy_refuses_prior_genuine_preparation_and_keeps_current_
     assert!(current.retirement_forward_policy().is_some());
     drop(current);
     drop(prior_binding);
-    let writer = held.into_writer().unwrap();
+    let writer = held.abort().unwrap();
     assert_eq!(count(&request), 0);
     assert_eq!(settings(&writer), initial_settings);
     writer
@@ -184,7 +236,7 @@ fn generic_registered_lease_preparation_retains_no_retirement_policy() {
     assert!(binding.retirement_forward_policy().is_none());
     assert_eq!(count(&request), 1);
     drop(binding);
-    let writer = held.into_writer().unwrap();
+    let writer = held.abort().unwrap();
     assert_eq!(count(&request), 0);
     writer
         .capture_lease_maintenance_allocation(Instant::now() + Duration::from_secs(2))

@@ -2100,6 +2100,12 @@ mod integration {
         let WalPreparedDatabase::Lease(original_source) = &view.databases()[1] else {
             unreachable!();
         };
+        let retained_credit = budget.used();
+        assert!(retained_credit > 0);
+        let historical_alias = original_source.clone();
+        assert_eq!(budget.used(), retained_credit);
+        drop(historical_alias);
+        assert_eq!(budget.used(), retained_credit);
         let source_policy = original_source
             .original_binding()
             .retirement_forward_policy();
