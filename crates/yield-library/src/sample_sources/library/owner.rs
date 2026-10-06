@@ -50,6 +50,7 @@ use dispatch_metrics::QueuedCommand;
 mod admission_metrics;
 pub use admission_metrics::GlobalAdmissionMetricsSnapshot;
 
+mod idle_maintenance;
 mod mutation_fence;
 mod preparation;
 pub use preparation::{
@@ -1638,6 +1639,7 @@ fn run_owner(
     }
     let mut snapshot_fences = SnapshotFences::default();
     let mut harvest_generation = harvest_facts::Generation::new();
+    let mut idle = idle_maintenance::Pacing::new(std::time::Instant::now());
     loop {
         if let Err(error) = database.validate_profile_guard(&profile_guard) {
             close_after_profile_change(
@@ -1651,9 +1653,35 @@ fn run_owner(
         }
         let (command, dispatch) = match command_rx.recv_timeout(OWNER_POLL_INTERVAL) {
             Ok(queued) => queued.received(),
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                match idle.poll(
+                    std::time::Instant::now(),
+                    &command_rx,
+                    &lifecycle,
+                    &admission_gate,
+                ) {
+                    idle_maintenance::Poll::Command(queued) => queued.received(),
+                    idle_maintenance::Poll::Maintain => {
+                        if let Err(error) = database.maintain_while_idle(&profile_guard) {
+                            close_after_profile_change(
+                                &command_rx,
+                                &lifecycle,
+                                &unavailable,
+                                &admission_gate,
+                                error,
+                            );
+                            break;
+                        }
+                        idle.activity(std::time::Instant::now());
+                        continue;
+                    }
+                    idle_maintenance::Poll::Wait => continue,
+                    idle_maintenance::Poll::Disconnected => break,
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        idle.activity(std::time::Instant::now());
         if let Err(error) = database.validate_profile_guard(&profile_guard) {
             reject_after_profile_change(command, &error);
             close_after_profile_change(
@@ -1697,6 +1725,7 @@ fn run_owner(
                     }
                     break;
                 }
+                idle.activity(std::time::Instant::now());
                 continue;
             }
             command => command,
@@ -1748,6 +1777,7 @@ fn run_owner(
             break;
         }
         reply.send();
+        idle.activity(std::time::Instant::now());
     }
 
     drop(database);
