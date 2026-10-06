@@ -301,7 +301,13 @@ mod integration {
         events: Arc<Mutex<Vec<String>>>,
         pause_abort: Arc<AtomicBool>,
         pause_validation: Arc<AtomicBool>,
+        validation_paused_seen: Arc<AtomicBool>,
         current_validations: Arc<AtomicUsize>,
+        drain_requested: Arc<AtomicBool>,
+        drained: Arc<AtomicBool>,
+        abandon_requested: Arc<AtomicBool>,
+        abandoned: Arc<AtomicBool>,
+        tokens: Arc<Mutex<HashMap<String, crate::sample_sources::db::RegisteredDecisionBoundary>>>,
     }
     impl SourceActor {
         fn start(
@@ -345,8 +351,20 @@ mod integration {
             let paused = Arc::clone(&pause_abort);
             let pause_validation = Arc::new(AtomicBool::new(false));
             let validation_paused = Arc::clone(&pause_validation);
+            let validation_paused_seen = Arc::new(AtomicBool::new(false));
+            let validation_pause_seen = Arc::clone(&validation_paused_seen);
             let current_validations = Arc::new(AtomicUsize::new(0));
             let validated_count = Arc::clone(&current_validations);
+            let drain_requested = Arc::new(AtomicBool::new(false));
+            let draining = Arc::clone(&drain_requested);
+            let drained = Arc::new(AtomicBool::new(false));
+            let drain_complete = Arc::clone(&drained);
+            let abandon_requested = Arc::new(AtomicBool::new(false));
+            let abandoning = Arc::clone(&abandon_requested);
+            let abandoned = Arc::new(AtomicBool::new(false));
+            let abandon_complete = Arc::clone(&abandoned);
+            let tokens = Arc::new(Mutex::new(HashMap::new()));
+            let published_tokens = Arc::clone(&tokens);
             let worker = thread::spawn(move || {
                 let mut writers = writers
                     .into_iter()
@@ -361,7 +379,7 @@ mod integration {
                         )
                     })
                     .collect::<HashMap<_, _>>();
-                let authorities = writers
+                let mut authorities = writers
                     .iter()
                     .map(|(id, w)| {
                         (
@@ -370,9 +388,15 @@ mod integration {
                         )
                     })
                     .collect::<HashMap<_, _>>();
+                for writer in writers.values() {
+                    assert!(matches!(
+                        writer.catalog_database().prepare_source_authority(),
+                        Err(crate::sample_sources::db::SourceAuthorityError::AlreadyPrepared)
+                    ));
+                }
                 // Drive the genuine confirmation lifecycle without installing a capacity provider.
                 // These fixtures prove transport custody, never physical qualification or admission.
-                let registrations = authorities
+                let mut registrations = authorities
                     .iter()
                     .map(|(id, authority)| {
                         let envelope = authority.journal_request().unwrap();
@@ -389,6 +413,12 @@ mod integration {
                         (id.clone(), (envelope.request, proof))
                     })
                     .collect::<HashMap<_, _>>();
+                if register {
+                    *published_tokens.lock().unwrap() = authorities
+                        .iter()
+                        .map(|(id, authority)| (id.clone(), authority.decision_boundary().unwrap()))
+                        .collect();
+                }
                 if let Some(sender) = observation {
                     assert_eq!(writers.len(), 1);
                     let id = writers.keys().next().unwrap().clone();
@@ -415,6 +445,18 @@ mod integration {
                 let mut held: HashMap<String, SourceWalProducerOwner> = HashMap::new();
                 let mut validated = std::collections::HashSet::new();
                 loop {
+                    if draining.swap(false, Ordering::AcqRel) {
+                        for (request, proof) in registrations.values_mut() {
+                            request
+                                .begin_drain(proof.take().unwrap().into_drain_marker())
+                                .unwrap();
+                        }
+                        drain_complete.store(true, Ordering::Release);
+                    }
+                    if abandoning.swap(false, Ordering::AcqRel) {
+                        authorities.clear();
+                        abandon_complete.store(true, Ordering::Release);
+                    }
                     if stopped.load(Ordering::Acquire) {
                         inbox.close();
                     }
@@ -443,24 +485,31 @@ mod integration {
                         }
                         held.insert(id, owner);
                     }
+                    validation_pause_seen
+                        .store(validation_paused.load(Ordering::Acquire), Ordering::Release);
                     let mut remaining = HashMap::new();
                     for (id, mut owner) in held.drain() {
                         if owner.settlement_held() {
+                            let round = owner.current_round_for_tests().unwrap();
                             owner.request_abort(None);
-                            assert!(owner.settlement_held());
-                            assert!(
-                                !owner
-                                    .current_round_for_tests()
-                                    .unwrap()
-                                    .invalidated_for_tests()
-                            );
-                            assert_eq!(owner.revalidate(authorities.get(&id)), Err(crate::sample_sources::wal_transport::SourceWalTransportRejection::Busy));
+                            let validation = owner.revalidate(authorities.get(&id));
+                            if validation != Err(crate::sample_sources::wal_transport::SourceWalTransportRejection::Busy) {
+                                // NoAttempt may resolve between the first fence observation and
+                                // this call. Only actual resolution permits ordinary cleanup.
+                                assert!(!round.cleanup_fenced_for_tests());
+                            }
                             match owner.into_writer() {
                                 Err(retained) => {
                                     remaining.insert(id, retained);
                                 }
-                                Ok(_) => {
-                                    panic!("unresolved original acknowledgement restored a writer")
+                                Ok(writer) => {
+                                    assert!(
+                                        !round.cleanup_fenced_for_tests(),
+                                        "unresolved ACK restored a writer"
+                                    );
+                                    assert_eq!(registrations[&id].0.registered_uses_for_tests(), 0);
+                                    recorded.lock().unwrap().push(format!("reuse:{id}"));
+                                    writers.insert(id, writer);
                                 }
                             }
                             continue;
@@ -528,7 +577,13 @@ mod integration {
                 events,
                 pause_abort,
                 pause_validation,
+                validation_paused_seen,
                 current_validations,
+                drain_requested,
+                drained,
+                abandon_requested,
+                abandoned,
+                tokens,
             }
         }
     }
@@ -1516,6 +1571,27 @@ mod integration {
         original_retirement_custody_with_source_policy(0, Some(true));
     }
 
+    #[test]
+    fn original_source_drain_revokes_real_retirement_decision_acknowledgement() {
+        original_retirement_custody(6);
+    }
+
+    #[test]
+    fn original_source_drain_races_real_decision_comparison_without_stale_acceptance() {
+        original_retirement_custody(7);
+    }
+    #[test]
+    fn original_source_guard_drop_revokes_ack_without_unlocking_native_custody() {
+        original_retirement_custody(8);
+    }
+    #[test]
+    fn original_late_source_ack_cannot_fill_an_unlocked_snapshot_before_drain() {
+        original_retirement_custody(9);
+    }
+    #[test]
+    fn genuine_foreign_source_registration_cannot_fill_original_decision_slot() {
+        original_retirement_custody(10);
+    }
     fn original_retirement_custody(outcome: u8) {
         original_retirement_custody_with_source_policy(outcome, None);
     }
@@ -1583,6 +1659,25 @@ mod integration {
         let actor = SourceActor::start_with_lease_observation(vec![writer], inbox, Some(send));
         let (allocation, fence, deadline, reference) =
             receive.recv_timeout(Duration::from_secs(3)).unwrap();
+        let foreign_actor = if outcome == 10 {
+            let foreign_media = fixture._base.path().join("foreign-registration");
+            fs::create_dir(&foreign_media).unwrap();
+            let foreign_writer = SourceWriter::new_for_scan(
+                SourceDatabase::open_for_catalog_with_profile_guard(
+                    &foreign_media,
+                    &fixture.owner,
+                    "foreign-registration",
+                )
+                .unwrap(),
+                SourceId::from_string("foreign-registration"),
+                1,
+            )
+            .unwrap();
+            let (_foreign_requester, foreign_inbox) = SourceWalTransport::channel();
+            Some(SourceActor::start(vec![foreign_writer], foreign_inbox))
+        } else {
+            None
+        };
         let source = ParticipantId::new();
         let global_id = ParticipantId::new();
         let operation = OperationId::new();
@@ -2013,7 +2108,7 @@ mod integration {
         .unwrap();
         let budget = input.budget_for_test();
         let mut local_collector = None;
-        let handle = if outcome == 0 || outcome >= 4 {
+        let handle = if outcome == 0 || outcome == 4 || outcome == 5 {
             journal
                 .client()
                 .prepare_wal_owners(input)
@@ -2129,13 +2224,129 @@ mod integration {
         }
 
         if let Some(collector) = local_collector.as_mut() {
+            if outcome == 9 || outcome == 10 {
+                actor.pause_validation.store(true, Ordering::Release);
+                while !actor.validation_paused_seen.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
             collector.begin_decision(digest).unwrap();
             let nonce = collector.decision_nonce().unwrap();
-            while !collector.decision_acknowledged() {
+            let mut foreign_custody = None;
+            if outcome == 10 {
+                let foreign = foreign_actor.as_ref().unwrap();
+                let token = loop {
+                    if let Some(token) = foreign
+                        .tokens
+                        .lock()
+                        .unwrap()
+                        .get("foreign-registration")
+                        .cloned()
+                    {
+                        break token;
+                    }
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                };
+                let round = collector.round_for_tests();
+                foreign_custody = Some(round.foreign_ack_for_tests(token));
+                assert!(!round.all_ack_slots_for_tests());
+                assert!(!collector.decision_acknowledged());
+                actor.pause_validation.store(false, Ordering::Release);
+            }
+            if outcome == 9 {
+                let round = collector.round_for_tests();
+                assert!(!round.all_ack_slots_for_tests());
+                let original = Arc::clone(&round);
+                let pause = Arc::clone(&actor.pause_validation);
+                let drain = Arc::clone(&actor.drain_requested);
+                let drained = Arc::clone(&actor.drained);
+                round.snapshot_hook_for_tests(Box::new(move || {
+                    // Snapshot contains no Source gate. Install the real original ACK,
+                    // then complete real drain before the comparison can lock the round.
+                    pause.store(false, Ordering::Release);
+                    while !original.all_ack_slots_for_tests() {
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    drain.store(true, Ordering::Release);
+                    while !drained.load(Ordering::Acquire) {
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }));
+                assert!(
+                    !collector.decision_acknowledged(),
+                    "late original token must invalidate the unlocked cohort"
+                );
+            }
+            while outcome != 9 && !collector.decision_acknowledged() {
                 assert!(Instant::now() < deadline);
                 thread::sleep(Duration::from_millis(1));
             }
             assert_eq!(collector.decision_nonce(), Some(nonce));
+            if outcome == 10 {
+                assert!(
+                    collector.decision_acknowledged(),
+                    "foreign refusal must preserve the genuine original round"
+                );
+                collector.refuse_decision(WalPreparationError::Canceled);
+                drop(foreign_custody.take());
+                while !collector.poll() {
+                    assert!(Instant::now() < deadline + Duration::from_secs(3));
+                    thread::sleep(Duration::from_millis(1));
+                }
+                drop(local_collector.take());
+                drop(view);
+                drop(handle);
+                assert_eq!(budget.used(), 0);
+                drop(foreign_actor);
+                drop(actor);
+                assert!(global.shutdown());
+                assert!(journal.shutdown());
+                return;
+            }
+            if outcome >= 6 {
+                let completed = if outcome == 9 {
+                    &actor.drained
+                } else if outcome == 8 {
+                    actor.abandon_requested.store(true, Ordering::Release);
+                    &actor.abandoned
+                } else {
+                    actor.drain_requested.store(true, Ordering::Release);
+                    &actor.drained
+                };
+                while !completed.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline);
+                    if outcome == 7 {
+                        // Either ordering may win before revocation completes; no stale
+                        // success is legal once the actual gate transition is observed.
+                        let _ = collector.decision_acknowledged();
+                        thread::yield_now();
+                    } else {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                assert!(
+                    !collector.decision_acknowledged(),
+                    "a genuine Draining original source cannot remain a current Registered acknowledgement"
+                );
+                assert!(!collector.start_settlement());
+                collector.refuse_decision(WalPreparationError::OwnerLost);
+                while !collector.poll() {
+                    assert!(Instant::now() < deadline + Duration::from_secs(3));
+                    thread::sleep(Duration::from_millis(1));
+                }
+                drop(local_collector.take());
+                drop(view);
+                drop(handle);
+                assert_eq!(budget.used(), 0);
+                drop(actor);
+                assert!(global.shutdown());
+                assert!(journal.shutdown());
+                return;
+            }
             assert!(collector.start_settlement());
             // An actual journal transaction exercises the owner fence, not admission:
             // this V1 storage fixture has no retirement inventory, qualified provider or permit.

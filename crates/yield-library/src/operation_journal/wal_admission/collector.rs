@@ -201,6 +201,35 @@ impl Collector {
             WalPreparationHandle(shared),
         )
     }
+    fn bind_source_round(&self, round: &super::CurrentRound) -> Result<(), WalPreparationError> {
+        for (index, owner) in self.held.iter().enumerate() {
+            let HeldOwner::Source(holder) = owner else {
+                continue;
+            };
+            let registration = match holder.status() {
+                SourceWalTransportStatus::Prepared(view) => view
+                    .original_binding()
+                    .and_then(|binding| binding.subject().registration())
+                    .map(|registration| registration.registration_id()),
+                SourceWalTransportStatus::PreparedLease(view) => view
+                    .original_binding()
+                    .stored_fence()
+                    .subject()
+                    .registration()
+                    .map(|registration| registration.registration_id()),
+                _ => None,
+            }
+            .ok_or(WalPreparationError::InvalidInput)?;
+            if !round.require_source(index, registration) {
+                return Err(WalPreparationError::InvalidInput);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::operation_journal) fn round_for_tests(&self) -> Arc<super::CurrentRound> {
+        Arc::clone(self.current.as_ref().unwrap())
+    }
     /// Request a new original commit-acknowledgement round; earlier Ready is insufficient.
     pub(in crate::operation_journal) fn begin_decision(
         &mut self,
@@ -216,11 +245,17 @@ impl Collector {
         }
         let mut credit = self.input.budget.credit();
         credit
-            .resize(std::mem::size_of::<super::CurrentRound>() + 64)
+            .resize(super::CurrentRound::retained_bytes(
+                self.held
+                    .iter()
+                    .filter(|owner| matches!(owner, HeldOwner::Source(_)))
+                    .count(),
+            ))
             .map_err(|_| WalPreparationError::Full)?;
         let (round, decision) =
             super::CurrentRound::decision_round(self.held.len(), self.input.deadline, credit)
                 .ok_or(WalPreparationError::InvalidInput)?;
+        self.bind_source_round(&round)?;
         for (index, owner) in self.held.iter().enumerate() {
             let result = match owner {
                 HeldOwner::Global(holder) => holder
@@ -327,6 +362,9 @@ impl Collector {
             .as_ref()
             .is_some_and(|round| round.invalidated())
         {
+            // Registration revocation can invalidate an ACK without native cleanup.
+            // Before SQLite starts, release the sole decision guard before abort polling.
+            drop(self.decision.take());
             self.fail(WalPreparationError::OwnerLost);
             return self.poll_abort();
         }
@@ -573,7 +611,12 @@ impl Collector {
             if self.current.is_none() {
                 let mut credit = self.input.budget.credit();
                 if credit
-                    .resize(std::mem::size_of::<super::CurrentRound>() + 64)
+                    .resize(super::CurrentRound::retained_bytes(
+                        self.held
+                            .iter()
+                            .filter(|owner| matches!(owner, HeldOwner::Source(_)))
+                            .count(),
+                    ))
                     .is_err()
                 {
                     self.fail(WalPreparationError::Full);
@@ -585,6 +628,10 @@ impl Collector {
                     self.fail(WalPreparationError::InvalidInput);
                     return self.poll_abort();
                 };
+                if let Err(error) = self.bind_source_round(&round) {
+                    self.fail(error);
+                    return self.poll_abort();
+                }
                 for (index, owner) in self.held.iter().enumerate() {
                     let result = match owner {
                         HeldOwner::Global(holder) => holder
