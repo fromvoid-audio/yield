@@ -2214,6 +2214,8 @@ struct AdmissionState {
     queued_commands: usize,
     #[cfg(feature = "test-support")]
     compound_batch_fault: Option<test_support::CompoundBatchFault>,
+    #[cfg(feature = "test-support")]
+    worker_panic: Option<Arc<test_support::WorkerPanicState>>,
     feature_analysis_metrics: FeatureAnalysisMetrics,
     command_metrics: command_metrics::CommandMetrics,
     shutdown: bool,
@@ -2235,6 +2237,8 @@ impl AdmissionState {
         Self {
             #[cfg(feature = "test-support")]
             compound_batch_fault: None,
+            #[cfg(feature = "test-support")]
+            worker_panic: None,
             retained_harvest: Default::default(),
             source_wal,
             source_wal_inbox: Some(source_wal_inbox),
@@ -4109,6 +4113,8 @@ fn run_worker_with_sources(
     let mut deferred = VecDeque::<QueuedCatalogCommand>::new();
     let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
     loop {
+        #[cfg(feature = "test-support")]
+        test_support::original_worker_failure(&admission);
         preparations.poll(&admission, &mut sources);
         let closing = admission_state(&admission, |state| state.shutdown || state.closed);
         if closing {

@@ -2983,6 +2983,7 @@ fn drain_shutdown(
 #[cfg(test)]
 mod tests {
     mod journal_shutdown;
+    mod catalog_shutdown;
 
     mod harvest_catalog_tests {
         use super::*;

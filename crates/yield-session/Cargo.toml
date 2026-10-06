@@ -19,6 +19,7 @@ yield-library.workspace = true
 sha2 = "=0.10.9"
 
 [dev-dependencies]
+yield-catalog = { path = "../yield-catalog", features = ["test-support"] }
 rusqlite = { version = "0.37.0" }
 tempfile.workspace = true
 yield-library = { workspace = true, features = ["test-support"] }
