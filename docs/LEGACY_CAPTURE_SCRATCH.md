@@ -56,6 +56,9 @@ The debit additionally includes the actual `Vec<AudioReference>` header and thre
 `rusqlite::Statement` headers, conservatively charging those stack headers too. Compile-time
 assertions require both preceding sequential stage inventories to fit within that derived
 debit. Vector capacities are fixed at the original supported row maxima and never grow.
+The pinned 64-bit build derives 28,888 bytes: 24,576 scalar bytes + 4,096 path bytes +
+24 vector-header bytes + 192 statement-header bytes. Existing progress-handler and ownership
+validation backing stays within the separately preserved observer/header credit.
 
 Pinned rusqlite 0.37 ordinary `prepare` borrows static SQL bytes, stores an empty named-
 parameter BTreeMap and no statement-cache key. Positional integer bindings never populate
@@ -86,13 +89,33 @@ before measurement. During one actual capture, it reports live peak above the ex
 baseline and the largest requested layout, then verifies the original image and bytes.
 It is a single-process diagnostic, not native allocation, allocator-resident overhead or RSS.
 
+Linux execution of the actual preceding production capture measured a 4,300,816-byte
+incremental live Rust peak and a 40,960-byte largest layout for all three encodings, failing
+the funded-peak assertion. The new actual route measured 28,688 bytes and a 24,576-byte
+largest layout with 128/1,024 rows, exactly 64 KiB/4 MiB aggregate inputs and one full
+4,096-byte path. Redistributing 40 bytes from another path preserves the maximum aggregate
+while exercising the maximum validation allocation. Measurements took approximately
+167/215/221 ms for UTF-8/UTF-16LE/UTF-16BE in this environment. These timings are observations,
+not native platform qualification or a hardware-independent latency guarantee.
+
+The historical comparison temporarily restores the actual preceding production row function
+with a deadline-argument adapter, compiles the same public original-owner route and records
+the expected allocation refusal. It then restores the new source byte-for-byte, rebuilds
+that exact route and repeats the probe. Seven canonical/reference regressions, ten genuine
+normal-build owner tests and nineteen actual legacy-observation tests passed. The latter
+include real maximum-input no-effect preparation: original/candidate/original captures all
+share the unchanged two-second deadline, retain the smaller page cap, deny SQL writes even
+after query-only is disabled, and preserve source bytes/absent auxiliary sidecars.
+
 ```bash
 cargo build --locked -p yield-library --lib
 rustc --edition=2024 scripts/legacy_capture_allocation_probe.rs \
   --extern yield_library="$CARGO_TARGET_DIR/debug/libyield_library.rlib" \
   --extern rusqlite="$CARGO_TARGET_DIR/debug/deps/librusqlite-HASH.rlib" \
   -L dependency="$CARGO_TARGET_DIR/debug/deps" -o /tmp/legacy-capture-probe
-/tmp/legacy-capture-probe
+/tmp/legacy-capture-probe UTF-8
+/tmp/legacy-capture-probe UTF-16le
+/tmp/legacy-capture-probe UTF-16be
 ```
 
 Choose HASH from the actual current locked rusqlite fingerprint. In this shared environment,
