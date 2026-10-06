@@ -33,7 +33,8 @@ missing and foreign policies, a prior genuine preparation, altered canonical
 scope, rollback/settings restoration, unchanged storage, writer reuse and strict
 credit conservation. Component fixtures verify alignment, complete nonzero caps
 and checked SQLite-range WAL/SHM totals; they issue no original-owner authority.
-Native macOS and Windows execution must be recorded separately from GNU compilation.
+Native macOS and Windows execution is tracked with exact commands and setup in
+OPT-2378; it remains separate from GNU compilation and full physical qualification.
 
 This is historical initial-forward RELEASE planning. It does not supply renewal,
 compensation, a qualified physical allocation, a durable inventory header, joint
