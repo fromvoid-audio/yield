@@ -26,6 +26,7 @@ mod decision_boundary;
 pub(crate) use decision_boundary::{DecisionBoundaryRefusal, RegisteredDecisionBoundary};
 mod registered_custody;
 pub(crate) use registered_custody::RegisteredDatabaseCustody;
+mod registration_generation;
 #[cfg(test)]
 #[path = "source_authority/registration_generation/native_tests.rs"]
 mod registration_generation_native_tests;
@@ -233,6 +234,9 @@ pub enum SourceAuthorityError {
     /// The source owner already has a registration for this source authority.
     #[error("source authority registration is already prepared")]
     AlreadyPrepared,
+    /// The process-local registration serial cannot issue another SQLite-range generation.
+    #[error("source authority registration generation is exhausted")]
+    RegistrationGenerationExhausted,
     /// The request has no retained source-owner confirmation to consume.
     #[error("source authority confirmation is missing or stale")]
     ConfirmationStale,
@@ -263,6 +267,7 @@ pub enum SourceAuthorityError {
 /// descriptors without accepting a pathname or serialized identity as authority.
 pub(crate) struct SourceAuthorityRequest {
     registration_id: SourceRegistrationId,
+    registration_generation: u64,
     lease_identity: SourceLeaseIdentity,
     media_root: BoundDatabaseRoot,
     database_root: BoundDatabaseRoot,
@@ -285,14 +290,15 @@ impl fmt::Debug for SourceAuthorityRequest {
 }
 
 impl SourceAuthorityRequest {
-    // Regression observation adapter: the baseline original request has no generation field.
-    #[cfg(test)]
+    /// Original process-local serial, meaningful only with UUID/acquisition and native custody.
+    /// Historical copies cannot reconstruct a registration or authorize a database effect.
     pub(crate) const fn registration_generation(&self) -> u64 {
-        0
+        self.registration_generation
     }
 
     fn new(
         registration_id: SourceRegistrationId,
+        registration_generation: u64,
         lease_identity: SourceLeaseIdentity,
         media_root: BoundDatabaseRoot,
         database_root: BoundDatabaseRoot,
@@ -302,6 +308,7 @@ impl SourceAuthorityRequest {
     ) -> Self {
         Self {
             registration_id,
+            registration_generation,
             lease_identity,
             media_root,
             database_root,
@@ -813,6 +820,10 @@ pub struct SourceAuthorityRegistration {
 }
 
 impl SourceAuthorityRegistration {
+    pub(crate) fn registration_generation(&self) -> u64 {
+        self.request.registration_generation()
+    }
+
     // Metadata only: source state is not complete journal/capacity installation evidence.
     pub(crate) fn registry_reference_observation(
         &self,
@@ -1040,6 +1051,17 @@ impl SourceDatabase {
     pub fn prepare_source_authority(
         &self,
     ) -> Result<SourceAuthorityRegistration, SourceAuthorityError> {
+        self.prepare_source_authority_with_generation_counter(
+            &registration_generation::NEXT_REGISTRATION_GENERATION,
+        )
+    }
+
+    // A private counter parameter exercises exhaustion on this exact native producer without
+    // resetting the shared process counter or constructing a caller registration.
+    fn prepare_source_authority_with_generation_counter(
+        &self,
+        counter: &std::sync::atomic::AtomicU64,
+    ) -> Result<SourceAuthorityRegistration, SourceAuthorityError> {
         let profile_guard = self
             .profile_guard
             .as_ref()
@@ -1058,6 +1080,13 @@ impl SourceDatabase {
         if !source_lease.try_reserve_authority_registration(registration_id.0)? {
             return Err(SourceAuthorityError::AlreadyPrepared);
         }
+        let registration_generation = match registration_generation::issue(counter) {
+            Ok(generation) => generation,
+            Err(error) => {
+                source_lease.clear_authority_registration(registration_id.0)?;
+                return Err(error);
+            }
+        };
         let state = Arc::new(AuthorityState::new(
             registration_id,
             lease_identity.clone(),
@@ -1093,6 +1122,7 @@ impl SourceDatabase {
         Ok(SourceAuthorityRegistration {
             request: Arc::new(SourceAuthorityRequest::new(
                 registration_id,
+                registration_generation,
                 lease_identity,
                 media_root,
                 database_root,

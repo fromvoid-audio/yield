@@ -147,6 +147,7 @@ struct LeaseReport {
 impl PartialEq for SourceLeaseWalTransportObservation {
     fn eq(&self, other: &Self) -> bool {
         self.0.registered_custody_retained == other.0.registered_custody_retained
+            && self.0.binding.registration_generation() == other.0.binding.registration_generation()
             && self.0.binding.retirement_forward_policy()
                 == other.0.binding.retirement_forward_policy()
             && self.0.bytes == other.0.bytes
