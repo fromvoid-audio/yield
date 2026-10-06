@@ -45,7 +45,7 @@ a facade or constructing producer plumbing.
 
 ## Original command and retained debits
 
-The command reserves 4,104,192 bytes from the existing ordinary input pool before
+The command reserves 3,604,480 bytes from the existing ordinary input pool before
 worker execution. Revalidation reserves the same temporary debit independently
 of the retained slot. The command estimate is for additional owned Rust backing;
 the existing worker, SQLite connection/cache, descriptor registrations and thread
@@ -125,13 +125,16 @@ journal admission or native physical qualification.
 | Complete small claim/release maps, sets, pages and diagnostics | 131,072 |
 | Auxiliary bounded keys, errors and original context | 65,536 |
 | Original record/rebuild subtotal | 3,604,480 |
-| Complete database-claim audit backing | 499,712 |
-| Conservative total and command debit | 4,104,192 |
+| Database phase: released tree category | -720,896 |
+| Database phase: complete database-claim backing | 499,712 |
+| Database phase conservative total | 3,383,296 |
+| Maximum stage and unchanged command debit | 3,604,480 |
 
 The OPT-2361 borrowed participant preflight consumes the prior 64 KiB category
 headroom without changing the original record/rebuild subtotal or any input-pool ceiling.
-OPT-2392 adds separately derived database-claim backing within the same original
-ordinary pool; attempt/outcome and full-progress backing remain unsupported.
+OPT-2392 stages separately derived database-claim backing after the initial
+two-tree decoder drops, preserving the original command debit and live producer
+revalidation headroom; attempt/outcome and full-progress backing remain unsupported.
 Its scanner is explicitly capped to the same 64 KiB Store row envelope; raw input
 plus old/new scratch backing can overlap at 256 KiB. Scanner backing drops before
 owned JSON construction. See [the participant preflight boundary](RECORDING_PARTICIPANT_PREFLIGHT.md)

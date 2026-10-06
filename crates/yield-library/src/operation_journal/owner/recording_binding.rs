@@ -39,6 +39,9 @@ const INPUT_BYTES: usize = 192 * 1024 + ROUTE_BYTES + 192 * 1024;
 // The command and retained slot are separate original-pool debits. All temporary read,
 // decode and complete rebuild backing is destroyed before shrinking the factory debit.
 const COMMAND_INPUT_BYTES: usize = super::super::store::RECORDING_PRESTART_INPUT_BYTES;
+// Revalidation retains the original producer while its independent temporary read
+// runs. Both complete debits must fit without borrowing the reserved control pool.
+const _: () = assert!(COMMAND_INPUT_BYTES + INPUT_BYTES <= super::ORDINARY_INPUT_BYTES);
 
 /// Refusal of original pre-start plumbing; no result authorizes capture or terminal SQL.
 #[derive(Debug, Error)]

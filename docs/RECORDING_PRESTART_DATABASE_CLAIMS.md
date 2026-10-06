@@ -6,9 +6,11 @@ their existing 8,192-row ceilings, 64-KiB binary inventory, 64 databases, 256 sl
 and 64 total participants. Nothing is truncated or reconstructed into live authority.
 
 The four-MiB owner pool and its separate 64-KiB control reservation are unchanged.
-The original 3,604,480-byte recording command reservation now includes 499,712 bytes
-for the incremental database audit, giving 4,104,192 bytes below the original
-4,128,768-byte ordinary quota. Compile-time guards cover the actual typed layouts.
+The original 3,604,480-byte recording command reservation is unchanged. The
+incremental database backing is 499,712 bytes, but does not overlap the initial
+two-tree record decoder. The database audit peak is 3,383,296 bytes after reusing
+the released 720,896-byte tree category. Compile-time guards cover actual typed
+layouts and both stage peaks within the original command debit.
 
 | Additional category | Bound |
 | --- | ---: |
@@ -23,13 +25,27 @@ These bounds include malformed count prefixes up to the original decoder ceiling
 Each validation-set entry is charged enough for a complete B-tree node, including
 the initial allocation. The audit pages operations and keeps one inventory at a time.
 
+The scoped complete audit strictly decodes each operation record first, before
+owning its database inventory. It then reads the original inventory and applies
+the unchanged semantic helper to the already-decoded record. The initial two-tree
+record decoder and binary inventory therefore cannot overlap. Subsequent command
+digest calculations materialize one JSON tree at a time; their required and
+optional encodings are sequential, not retained together. Reusing the released
+second tree category covers all 499,712 bytes above without enlarging the debit.
+
 During binary decoding and readback, the original 384-KiB encoding category covers
 the encoded input, canonical comparison, expected readback image, digest encoding
-and copied root image. `database_claims::read` releases these buffers before its
-caller decodes the operation record. The decoded inventory remains live and funded
-by the additional category while the original record/tree/validation-clone/proposal
-categories cover record comparison and command digest calculation. The retained
-ordinary snapshot and local proposal keep their existing categories throughout.
+and copied root image. The original typed-record, local-proposal, ordinary-snapshot
+and auxiliary categories remain charged while their owners are live. Ordinary
+unscoped database readback retains its previous audit order and acceptance.
+
+Initial preparation peaks at 3,604,480 bytes. Revalidation keeps the original
+458,752-byte producer debit throughout: its record phase is bounded by 4,063,232
+bytes and database phase by 3,842,048 bytes, both below the original 4,128,768-byte
+ordinary quota. A compile-time guard checks the two original live debits together;
+a real original-queue test holds the producer-sized credit through a revalidation
+reply and verifies temporary release while the lifetime credit stays held. That
+unissued facade still refuses and creates no producer or Source authority.
 
 Before any original inventory copy, scalar SQL checks its type, original length,
 relation ceilings and magic. The existing pre-start record decoder only supports
