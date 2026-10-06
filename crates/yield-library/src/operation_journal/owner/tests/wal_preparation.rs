@@ -636,11 +636,14 @@ mod integration {
                     .load(Ordering::Relaxed),
                 0
             );
-            assert_eq!(budget.used(), 0);
             drop(handle);
             drop(actor);
             assert!(global.shutdown());
             assert!(journal.shutdown());
+            // Terminal publication precedes destruction of the original collector's
+            // CurrentRound. Its shared debit remains funded until the last real
+            // holder drops; all original joins above establish that boundary.
+            assert_eq!(budget.used(), 0);
             return;
         }
         actor.pause_validation.store(false, Ordering::Release);
