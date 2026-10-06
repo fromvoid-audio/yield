@@ -126,6 +126,7 @@ pub(crate) struct DatabaseClaimSlice {
 enum InventoryPolicy {
     Historical,
     RetirementInitialForward,
+    RegisteredRetirementInitialForward { source_registration_generation: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,15 +175,31 @@ fn class_tag(class: FullCapacityAllocationClass) -> Result<u8> {
 }
 
 impl DatabaseClaimInventory {
-    // Test-only observation adapter for the missing registered-retirement format.
-    #[cfg(test)]
+    /// Explicit historical serial, separate from the preserved source lease epoch.
     pub(crate) fn new_registered_retirement_forward(
         header: InventoryHeader,
         bindings: Vec<DatabaseBinding>,
         slices: Vec<DatabaseClaimSlice>,
-        _source_registration_generation: u64,
+        source_registration_generation: u64,
     ) -> Result<Self> {
-        Self::new_retirement_forward(header, bindings, slices)
+        integer(source_registration_generation, true)?;
+        let mut value = Self::new_retirement_forward(header, bindings, slices)?;
+        value.policy = InventoryPolicy::RegisteredRetirementInitialForward {
+            source_registration_generation,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub(crate) fn source_registration_generation(&self) -> Option<u64> {
+        match self.policy {
+            InventoryPolicy::RegisteredRetirementInitialForward {
+                source_registration_generation,
+            } => Some(source_registration_generation),
+            _ => None,
+        }
+    }
+    fn retirement_forward(&self) -> bool {
+        !matches!(self.policy, InventoryPolicy::Historical)
     }
     /// Compare the immutable participant envelope and actual codec-normalized family. This
     /// does not validate a live registration or decide whether compensation is currently legal.
@@ -307,7 +324,7 @@ impl DatabaseClaimInventory {
                 )?;
             }
         }
-        if self.policy == InventoryPolicy::RetirementInitialForward {
+        if self.retirement_forward() {
             retirement_forward_policy::validate_record(self, record)?;
         }
         Ok(())
@@ -372,7 +389,10 @@ impl DatabaseClaimInventory {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.policy == InventoryPolicy::RetirementInitialForward {
+        if let Some(generation) = self.source_registration_generation() {
+            integer(generation, true)?;
+        }
+        if self.retirement_forward() {
             retirement_forward_policy::validate_shape(self)?;
         }
         require(
@@ -649,6 +669,9 @@ impl DatabaseClaimInventory {
     fn encoded_len(&self) -> Result<usize> {
         let mut n =
             6 + 2 + self.header.profile.len() + 2 + self.header.acquisition.len() + 8 + 16 + 4;
+        if self.source_registration_generation().is_some() {
+            n += 8;
+        }
         let version2 = self
             .bindings
             .iter()
@@ -723,19 +746,22 @@ impl DatabaseClaimInventory {
             .bindings
             .iter()
             .any(|b| b.source.as_ref().is_some_and(|s| s.lease_fence.is_some()));
-        out.extend_from_slice(
-            if self.policy == InventoryPolicy::RetirementInitialForward {
-                b"YWCB\x03\x00"
-            } else if version2 {
-                b"YWCB\x02\x00"
-            } else {
-                b"YWCB\x01\x00"
-            },
-        );
+        out.extend_from_slice(if self.source_registration_generation().is_some() {
+            b"YWCB\x04\x00"
+        } else if self.policy == InventoryPolicy::RetirementInitialForward {
+            b"YWCB\x03\x00"
+        } else if version2 {
+            b"YWCB\x02\x00"
+        } else {
+            b"YWCB\x01\x00"
+        });
         put_string(&mut out, &self.header.profile);
         put_string(&mut out, &self.header.acquisition);
         put_u64(&mut out, self.header.ownership_generation);
         put_uuid(&mut out, self.header.decision_nonce);
+        if let Some(generation) = self.source_registration_generation() {
+            put_u64(&mut out, generation);
+        }
         out.extend_from_slice(&(self.bindings.len() as u16).to_le_bytes());
         out.extend_from_slice(&(self.slices.len() as u16).to_le_bytes());
         for b in &self.bindings {
@@ -791,7 +817,9 @@ impl DatabaseClaimInventory {
     }
     pub(crate) fn digest(&self) -> Result<[u8; 32]> {
         let bytes = self.encode()?;
-        let domain = if bytes.starts_with(b"YWCB\x03\x00") {
+        let domain = if bytes.starts_with(b"YWCB\x04\x00") {
+            "yield.database-claim-inventory.v4"
+        } else if bytes.starts_with(b"YWCB\x03\x00") {
             "yield.database-claim-inventory.v3"
         } else if bytes.starts_with(b"YWCB\x02\x00") {
             "yield.database-claim-inventory.v2"
@@ -807,7 +835,8 @@ impl DatabaseClaimInventory {
         )?;
         let mut r = Reader(bytes);
         let magic = r.take(6)?;
-        let retirement_forward = magic == b"YWCB\x03\x00";
+        let registered = magic == b"YWCB\x04\x00";
+        let retirement_forward = registered || magic == b"YWCB\x03\x00";
         let version2 = retirement_forward || magic == b"YWCB\x02\x00";
         require(
             version2 || magic == b"YWCB\x01\x00",
@@ -819,6 +848,7 @@ impl DatabaseClaimInventory {
             ownership_generation: r.u64()?,
             decision_nonce: r.uuid()?,
         };
+        let source_registration_generation = if registered { Some(r.u64()?) } else { None };
         let nb = r.u16()? as usize;
         let ns = r.u16()? as usize;
         require(
@@ -952,7 +982,9 @@ impl DatabaseClaimInventory {
             });
         }
         require(r.0.is_empty(), "trailing inventory bytes")?;
-        let value = if retirement_forward {
+        let value = if let Some(generation) = source_registration_generation {
+            Self::new_registered_retirement_forward(header, bindings, slices, generation)?
+        } else if retirement_forward {
             Self::new_retirement_forward(header, bindings, slices)?
         } else {
             Self::new(header, bindings, slices)?
