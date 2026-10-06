@@ -16,6 +16,8 @@ use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 
 use super::BoundDatabaseRoot;
 
+mod native_error_message;
+
 /// Errors returned by a no-follow SQLite file or connection identity check.
 #[derive(Debug)]
 pub(crate) enum DatabaseIdentityError {
@@ -377,7 +379,12 @@ pub(crate) fn validate_connection_identity(
         unsafe { GetFileInformationByHandle(native_handle, &mut information) }.map_err(
             |error| DatabaseIdentityError::Unavailable {
                 path: path.to_path_buf(),
-                reason: format!("GetFileInformationByHandle failed: {error}"),
+                // BOOL::ok creates Error::from_thread without COM ErrorInfo. Capture
+                // its full native message once before any Rust message copy.
+                reason: native_error_message::win32_reason(error.code().0, |_| {
+                    Ok::<(), std::convert::Infallible>(())
+                })
+                .unwrap_or_else(|never| match never {}),
             },
         )?;
         let actual_identity = format_windows_identity(&information);
