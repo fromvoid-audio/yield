@@ -23,3 +23,14 @@ prestart attempt/full-progress zero-row gates remain unresolved. Journal schema
 and original ceilings are unchanged. Logical retained observations issue no
 permit, retry/refund/reservation-release or genuine settlement authority and
 provide no native physical qualification.
+
+Original checkpoint `98df9f567` compiled and executed the actual first-insertion
+regression, failing its zero-copy assertion with copied label capacity 256
+versus zero (one runtime failure; no compiler or fixture failure). Changed
+checkpoint `3758e66d3` passed all three `database_attempt_initial_borrow`
+regressions, including 72 original-reference validation combinations, actual
+retained SQLite image equality and validated readback digest. The first after
+launcher stopped before Cargo at an unavailable remote-tracking-ref guard;
+the executed run used the exact committed SHA instead. Zero-selected integration
+targets are not execution evidence. Repository checks remain separately recorded
+on the Linear issue and PR.
