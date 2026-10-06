@@ -13,3 +13,5 @@ Production generic admission retains descriptor refresh and live witness orderin
 Full tracking parents OPT-2373/2117/1553 remain open. This leaf provides no physical capacity, permit, Source grant, retry/refund or settlement authority.
 
 The implemented macOS original-queue pressure tests keep the component hook OFF. Production bootstrap uses OperationJournalOwner::start; the separate fixture case uses its named fixture registry. SDK compilation and genuine macOS/APFS execution are scoped by [OPT-2395](https://linear.app/boostnlvp/issue/OPT-2395), including exact requirements and original prepared-admission matrix. Linux and Windows GNU checks do not compile or execute macOS-only tests; native fixture observations do not establish physical qualification.
+
+Normal-build same-SQLite probe: all eight cases (0/1/64/259 rows, outstanding/released) matched the original unfunded comparison. At 259 outstanding rows Rust peak113720 bytes/debit2091776; at259 released rows peak106512/debit3166912. Staging and comparison allocations are unchanged but now debited before use. These scoped measurements exclude baseline snapshot/provider setup and native SQLite/RSS.
