@@ -51,7 +51,7 @@ fn ordinary_rebuild_backing_actual_queued_collection_pressure_precedes_identity_
     assert!(owner.shutdown());
     assert_eq!(
         owner.shared.input_bytes.lock().unwrap().remaining[0],
-        InputClass::Ordinary.limit()
+        InputBudget::shared_initial().remaining[InputClass::Ordinary.index()]
     );
     let store = OperationJournalStore::open(&fixture.owner).unwrap();
     assert_eq!(store.get(old_id).unwrap().unwrap().operation_id, old_id);
@@ -78,7 +78,7 @@ fn historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pres
         .unwrap();
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
     wait_until_available(&owner);
-    let pool_before = InputClass::Ordinary.limit();
+    let pool_before = InputBudget::shared_initial().remaining[InputClass::Ordinary.index()];
     let retained = owner
         .shared
         .reserve_input(InputClass::Ordinary, 3 * MAX_RECORD_BYTES)
@@ -162,7 +162,7 @@ fn historical_claim_unconsumed_actor_error_hands_off_to_funded_diagnostics_until
         .join("operation_journal/journal.sqlite3");
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
     wait_until_available(&owner);
-    let pool_before = InputClass::Ordinary.limit();
+    let pool_before = InputBudget::shared_initial().remaining[InputClass::Ordinary.index()];
     let old_id = OperationId::new();
     // Introduce a malformed historical row after genuine startup. The actor must
     // retain its original typed error rather than allocating an operation identity.
@@ -294,7 +294,7 @@ fn historical_claim_earliest_consumer_refusal_keeps_precharged_reply_through_del
     let store = OperationJournalStore::open(&fixture.owner).unwrap();
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
     wait_until_available(&owner);
-    let limit = InputClass::Ordinary.limit();
+    let limit = InputBudget::shared_initial().remaining[InputClass::Ordinary.index()];
     let retained = owner
         .shared
         .reserve_input(InputClass::Ordinary, limit - 64 * 1024)
@@ -466,7 +466,7 @@ fn recovery_funded_actual_queued_admission_error_lost_reply_and_teardown() {
         }
         assert_eq!(
             owner.shared.input_bytes.lock().unwrap().remaining[0],
-            InputClass::Ordinary.limit()
+            InputBudget::shared_initial().remaining[InputClass::Ordinary.index()]
         );
         let connection = rusqlite::Connection::open(database).unwrap();
         assert_eq!(
@@ -577,7 +577,7 @@ fn recovery_funded_actual_queued_exact_audit_pressure_refuses_without_effects() 
     assert_eq!(owner.prepared_admission_id_allocations(), 0);
     assert_eq!(
         owner.shared.input_bytes.lock().unwrap().remaining[0],
-        InputClass::Ordinary.limit()
+        InputBudget::shared_initial().remaining[InputClass::Ordinary.index()]
     );
     let connection = rusqlite::Connection::open(database).unwrap();
     assert_eq!(

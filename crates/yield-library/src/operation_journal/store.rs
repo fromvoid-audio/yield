@@ -1793,28 +1793,49 @@ impl OperationJournalStore {
     pub(crate) fn rebuild_ordinary_claim_snapshot(
         &self,
     ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
+        self.rebuild_ordinary_startup_snapshot_with_funding(None)
+            .map(FundedSnapshot::into_unfunded)
+    }
+
+    pub(super) fn rebuild_ordinary_startup_snapshot_for_input(
+        &self,
+        input: &super::owner::InputPermit,
+    ) -> Result<FundedSnapshot, OperationJournalStoreError> {
+        self.rebuild_ordinary_startup_snapshot_with_funding(Some(input))
+    }
+
+    fn rebuild_ordinary_startup_snapshot_with_funding(
+        &self,
+        input: Option<&super::owner::InputPermit>,
+    ) -> Result<FundedSnapshot, OperationJournalStoreError> {
         self.validate_namespace()?;
         self.connection.execute_batch("BEGIN")?;
-        let snapshot = match self.rebuild_ordinary_claim_snapshot_inside_transaction() {
-            Ok(snapshot) => {
-                if let Err(error) = self.validate_chunk_claims_inside_transaction() {
+        // Original transaction/validation order; credit precedes all working backing.
+        let mut collection = None;
+        let snapshot =
+            match self.rebuild_ordinary_claim_snapshot_with_funding(input, &mut collection) {
+                Ok(snapshot) => {
+                    if let Err(error) = self.validate_chunk_claims_inside_transaction() {
+                        let _ = self.connection.execute_batch("ROLLBACK");
+                        return Err(error);
+                    }
+                    snapshot
+                }
+                Err(error) => {
                     let _ = self.connection.execute_batch("ROLLBACK");
                     return Err(error);
                 }
-                snapshot
-            }
-            Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK");
-                return Err(error);
-            }
-        };
+            };
         if let Err(error) = self.validate_namespace_for_precommit() {
             let _ = self.connection.execute_batch("ROLLBACK");
             return Err(error);
         }
         self.connection.execute_batch("ROLLBACK")?;
         self.validate_namespace()?;
-        Ok(snapshot)
+        Ok(FundedSnapshot::new(
+            snapshot,
+            collection.map(admission_rebuild_backing::Collection::into_credit),
+        ))
     }
 
     /// Read the ordinary-claim image and recovery-reserve history in one consistent admission

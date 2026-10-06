@@ -23,7 +23,10 @@ mod integration {
         .unwrap()
     }
     fn full(shared: &Arc<OwnerShared>) {
-        assert_eq!(*shared.input_bytes.lock().unwrap(), InputBudget::new());
+        assert_eq!(
+            *shared.input_bytes.lock().unwrap(),
+            InputBudget::shared_initial()
+        );
         assert_eq!(*shared.results.lock().unwrap(), ResultBudget::new());
     }
     fn available_shared() -> (Arc<OwnerShared>, OwnerCommandReceivers) {
