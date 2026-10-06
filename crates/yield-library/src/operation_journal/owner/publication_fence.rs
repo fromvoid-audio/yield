@@ -39,6 +39,14 @@ const _: () = assert!(
         + super::super::capacity_provider::PUBLICATION_MIRROR_BYTES
         <= HEADER_BYTES
 );
+fn quarantine(state: &mut State) {
+    *state = match *state {
+        State::CompletedNoEffect { digest, .. } | State::UnknownCompletion { digest } => {
+            State::UnknownCompletion { digest }
+        }
+        _ => State::Unknown,
+    };
+}
 fn refused(reason: &str) -> OperationJournalOwnerError {
     OperationJournalOwnerError::StagingGrant {
         reason: reason.into(),
@@ -159,7 +167,7 @@ impl Registry {
                         *observed = true;
                     }
                 }
-                Err(poisoned) => *poisoned.into_inner() = State::Unknown,
+                Err(poisoned) => quarantine(&mut poisoned.into_inner()),
             }
         }
     }
@@ -250,11 +258,11 @@ impl PendingFence {
         match self.fence.state.lock() {
             Ok(mut state) if *state == State::Pending => *state = State::WorkerActive,
             Ok(state) if *state == State::Closed => {}
-            Ok(mut state) => *state = State::Unknown,
-            Err(poisoned) => *poisoned.into_inner() = State::Unknown,
+            Ok(mut state) => quarantine(&mut state),
+            Err(poisoned) => quarantine(&mut poisoned.into_inner()),
         }
     }
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, unix))]
     pub(super) fn completion_observer(&self) -> impl Fn() -> bool + use<> {
         let fence = Arc::clone(&self.fence);
         move || {
@@ -302,7 +310,7 @@ impl PendingFence {
                     _ => State::UnknownCompletion { digest },
                 };
             }
-            Err(poisoned) => *poisoned.into_inner() = State::Unknown,
+            Err(poisoned) => quarantine(&mut poisoned.into_inner()),
         }
     }
     // Called only under original resource admission, establishing admission→fence order.
@@ -325,7 +333,7 @@ impl PendingFence {
             }
             Ok(_) => Err(UseError::Closed),
             Err(poisoned) => {
-                *poisoned.into_inner() = State::Unknown;
+                quarantine(&mut poisoned.into_inner());
                 Err(UseError::Unknown)
             }
         }
@@ -347,7 +355,7 @@ impl Drop for PendingFence {
                 ) => {}
                 _ => *state = State::Unknown,
             },
-            Err(poisoned) => *poisoned.into_inner() = State::Unknown,
+            Err(poisoned) => quarantine(&mut poisoned.into_inner()),
         }
     }
 }

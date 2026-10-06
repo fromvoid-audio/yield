@@ -340,3 +340,31 @@ fn original_completion_and_actor_closure_never_leave_executable_entry() {
         assert!(registry.close_for_charge_release(operation).is_err());
     }
 }
+
+#[test]
+fn original_completion_poison_preserves_first_digest_and_never_settles() {
+    let shared = shared();
+    let mut registry = Registry::new();
+    let mut pending = registry.issue(OperationId::new(), &shared).unwrap();
+    pending.complete_before_effect([7; 32], true);
+    assert!(
+        std::panic::catch_unwind(|| {
+            let _lock = pending.fence.state.lock().unwrap();
+            panic!("original completed slot poison");
+        })
+        .is_err()
+    );
+    registry.poll_completions();
+    assert_eq!(
+        *pending.fence.state.lock().unwrap_err().into_inner(),
+        State::UnknownCompletion { digest: [7; 32] }
+    );
+    pending.complete_before_effect([8; 32], true);
+    assert_eq!(
+        *pending.fence.state.lock().unwrap_err().into_inner(),
+        State::UnknownCompletion { digest: [7; 32] }
+    );
+    assert!(!pending.enter());
+    assert!(registry.unresolved());
+    assert!(registry.issue(OperationId::new(), &shared).is_err());
+}

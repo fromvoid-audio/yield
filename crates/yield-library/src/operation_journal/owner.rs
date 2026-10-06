@@ -10136,7 +10136,14 @@ mod tests {
         native_live_chunk_and_staging_issuer(None, None, None, None, None, true);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    #[ignore = "Requires native macOS original registered source, reserve and volume resources; OPT-2325"]
+    fn native_original_completion_handoff_requires_macos_resources() {
+        native_live_chunk_and_staging_issuer(None, None, None, None, None, true);
+    }
+
+    #[cfg(unix)]
     fn native_live_chunk_and_staging_issuer(
         fault: Option<(usize, super::super::store::InsertTestBoundary)>,
         close_before_entry: Option<bool>,

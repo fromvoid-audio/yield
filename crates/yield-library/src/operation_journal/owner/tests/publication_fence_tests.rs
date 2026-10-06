@@ -58,6 +58,16 @@ mod integration {
         fence.original_worker_started();
         fence.complete_before_effect([3; 32], true);
         assert!(!fence.completion_observed());
+        // Saturate the actual original ordinary command queue. Control dispatch must
+        // still poll completion first without executing any of these foreign writes.
+        let (full, _) =
+            crate::operation_journal::work_progress::test_full_progress_store_snapshots();
+        let full = StoredFullProgressRecord::new(full).unwrap();
+        let mut ordinary = Vec::new();
+        for _ in 0..28 {
+            ordinary.push(client.persist_full(full.clone(), None).unwrap());
+        }
+        assert!(client.persist_full(full, None).is_err());
         let before = runtime.store().get(operation).unwrap().unwrap();
         let mut request = client
             .request_cancel_before_publish(
@@ -80,6 +90,7 @@ mod integration {
         drop(fence);
         drop(client);
         shared.commands.lock().unwrap().take();
+        receivers.reject_pending(|| OperationJournalOwnerError::Closed);
         assert!(
             receivers
                 .recv_with_idle(|| runtime.poll_original_work())
