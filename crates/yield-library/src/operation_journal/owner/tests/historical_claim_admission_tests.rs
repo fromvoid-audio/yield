@@ -59,7 +59,9 @@ fn historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pres
     let mut request = owner.client().admit_prepared(request_input).unwrap();
     assert!(matches!(
         request.recv_timeout(Duration::from_secs(5)).unwrap(),
-        Err(OperationJournalOwnerError::CapacityProviderUnavailable)
+        Err(OperationJournalOwnerError::PreparedAdmission(
+            PreparedAdmissionError::DescriptorRefreshRejected { .. }
+        ))
     ));
     drop(request);
     assert!(
