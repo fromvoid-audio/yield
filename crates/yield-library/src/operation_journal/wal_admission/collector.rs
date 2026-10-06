@@ -19,7 +19,10 @@ use std::{
     },
     time::Instant,
 };
+mod journal_input;
+mod retirement_inventory;
 mod retirement_policy;
+use journal_input::JournalInput;
 
 /// Copied historical scope from one original owner. It contains no live acknowledgement.
 #[derive(Clone, Debug)]
@@ -47,8 +50,8 @@ impl WalPreparedDatabase {
 }
 struct Snapshot {
     databases: Vec<WalPreparedDatabase>,
+    _journal_input: JournalInput,
     _credit: HandshakeCredit,
-    _journal_input: Arc<super::super::owner::InputPermit>,
 }
 /// Immutable original-owner historical preparation inventory. Copies retain all byte debits.
 /// It cannot latch a journal decision, authorize capacity or settle an operation.
@@ -61,19 +64,30 @@ struct Snapshot {
 /// fn decode<T: serde::de::DeserializeOwned>() {}
 /// decode::<WalPreparationObservation>();
 /// ```
-#[derive(Clone)]
-pub struct WalPreparationObservation(Arc<Snapshot>);
+pub struct WalPreparationObservation(Option<Arc<Snapshot>>);
+impl Clone for WalPreparationObservation {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl Drop for WalPreparationObservation {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.0.take().and_then(Arc::into_inner) {
+            drop(snapshot);
+        }
+    }
+}
 impl std::fmt::Debug for WalPreparationObservation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WalPreparationObservation")
-            .field("databases", &self.0.databases.len())
+            .field("databases", &self.databases().len())
             .finish()
     }
 }
 impl WalPreparationObservation {
     /// Borrow historical original scope in actual acquisition order.
     pub fn databases(&self) -> &[WalPreparedDatabase] {
-        &self.0.databases
+        &self.0.as_deref().expect("live original snapshot").databases
     }
 }
 /// Observed pre-intent collection/cleanup state, never durable admission or settlement.
@@ -95,6 +109,10 @@ pub enum WalPreparationStatus {
 struct Shared {
     canceled: AtomicBool,
     status: Mutex<WalPreparationStatus>,
+    #[cfg(test)]
+    retirement_for_tests: Mutex<Option<retirement_inventory::Observation>>,
+    #[cfg(all(test, target_os = "linux"))]
+    retirement_hook_for_tests: Mutex<Option<Box<dyn FnOnce(uuid::Uuid) + Send>>>,
 }
 /// Sole non-Clone cancellation handle. Only the original journal actor can publish outcomes.
 /// A copied observation cannot preserve current custody or acknowledge settlement.
@@ -114,6 +132,20 @@ struct Shared {
 /// ```
 pub struct WalPreparationHandle(Arc<Shared>);
 impl WalPreparationHandle {
+    #[cfg(test)]
+    pub(in crate::operation_journal) fn retirement_inventory_for_tests(
+        &self,
+    ) -> Option<retirement_inventory::Observation> {
+        self.0.retirement_for_tests.lock().unwrap().clone()
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::operation_journal) fn retirement_hook_for_tests(
+        &self,
+        hook: impl FnOnce(uuid::Uuid) + Send + 'static,
+    ) {
+        *self.0.retirement_hook_for_tests.lock().unwrap() = Some(Box::new(hook));
+    }
+
     /// Observe bounded collection/cleanup without waiting for SQLite or another owner.
     pub fn status(&self) -> WalPreparationStatus {
         self.0
@@ -169,7 +201,7 @@ pub(in crate::operation_journal) struct Collector {
     ready_cohort: Option<u64>,
     current: Option<Arc<super::CurrentRound>>,
     done: bool,
-    _journal_input: Arc<super::super::owner::InputPermit>,
+    _journal_input: JournalInput,
 }
 impl Collector {
     pub(in crate::operation_journal) fn new(
@@ -180,6 +212,10 @@ impl Collector {
         let shared = Arc::new(Shared {
             canceled: AtomicBool::new(false),
             status: Mutex::new(WalPreparationStatus::Preparing),
+            #[cfg(test)]
+            retirement_for_tests: Mutex::new(None),
+            #[cfg(all(test, target_os = "linux"))]
+            retirement_hook_for_tests: Mutex::new(None),
         });
         let capacity = input.sources.len() + usize::from(input.global.is_some());
         let held = Vec::with_capacity(capacity);
@@ -198,7 +234,7 @@ impl Collector {
                 ready_cohort: None,
                 current: None,
                 done: false,
-                _journal_input: Arc::new(journal_input),
+                _journal_input: JournalInput::new(journal_input),
             },
             WalPreparationHandle(shared),
         )
@@ -318,6 +354,12 @@ impl Collector {
         self.current = Some(round);
         self.decision = Some(decision);
         Ok(())
+    }
+    fn checked_decision_acknowledged(&self) -> Result<bool, WalPreparationError> {
+        self.decision
+            .as_ref()
+            .ok_or(WalPreparationError::InvalidInput)?
+            .checked_acknowledged()
     }
     pub(in crate::operation_journal) fn decision_acknowledged(&self) -> bool {
         self.decision
@@ -785,11 +827,11 @@ impl Collector {
                 },
             });
         }
-        Ok(WalPreparationObservation(Arc::new(Snapshot {
+        Ok(WalPreparationObservation(Some(Arc::new(Snapshot {
             databases,
             _credit: credit,
-            _journal_input: Arc::clone(&self._journal_input),
-        })))
+            _journal_input: self._journal_input.clone(),
+        }))))
     }
     fn owner_boundary_refusal(&self) -> WalPreparationError {
         // A producer can reach the SAME original deadline after the journal's

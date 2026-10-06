@@ -6120,6 +6120,11 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<(), OperationJournalOwnerError>>,
     },
+    #[cfg(test)]
+    InspectRetirementWholeJournal {
+        input: InputPermit,
+        result: SyncSender<Result<([u64; 5], Option<i64>), OperationJournalOwnerError>>,
+    },
     #[cfg(all(test, unix))]
     InspectCurrentNativeReserve {
         volume: VolumeIdentity,
@@ -7106,6 +7111,13 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                 )
             })
         }
+        #[cfg(test)]
+        JournalCommand::InspectRetirementWholeJournal { input, result } => {
+            let _input = input;
+            execute_store_result(result, move || {
+                runtime.store().retirement_whole_image_for_test()
+            })
+        }
         JournalCommand::Get {
             operation_id,
             input,
@@ -7315,6 +7327,10 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
         JournalCommand::InspectCapacity { result, .. } => {
             let _ = result.send(Err(error));
         }
+        #[cfg(test)]
+        JournalCommand::InspectRetirementWholeJournal { result, .. } => {
+            let _ = result.send(Err(error));
+        }
         JournalCommand::Get { result, .. } => {
             let _ = result.send(Err(error));
         }
@@ -7338,6 +7354,7 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 
 #[cfg(test)]
 mod tests {
+    mod native_retirement_inventory;
     #[cfg(target_os = "linux")]
     mod wal_preparation;
 

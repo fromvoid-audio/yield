@@ -1634,6 +1634,15 @@ mod integration {
         outcome: u8,
         source_policy_fault: Option<bool>,
     ) {
+        original_retirement_custody_with_inventory(outcome, source_policy_fault, 0);
+    }
+    include!("retirement_inventory_tests.rs");
+    fn original_retirement_custody_with_inventory(
+        outcome: u8,
+        source_policy_fault: Option<bool>,
+        inventory_case: u8,
+    ) {
+        let observe_inventory = matches!(inventory_case, 1 | 2 | 4 | 5);
         use crate::operation_journal::source_registry_retirement::SourceRegistryRetirementIntentArgs;
         use crate::operation_journal::work_plan::{
             WORK_PLAN_VERSION_REGISTRY_RETIREMENT, WorkPlan, WorkPrerequisite, WorkUnitKey,
@@ -1668,26 +1677,44 @@ mod integration {
         }
         let mut journal = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
         wait_until_available(&journal);
+        let previous_global = if inventory_case == 4 {
+            let mut previous = GlobalLibraryWriter::start(&fixture.owner).unwrap();
+            let limit = Instant::now() + Duration::from_secs(5);
+            while previous.status() != GlobalLibraryWriterStatus::Available {
+                assert!(Instant::now() < limit);
+                thread::sleep(Duration::from_millis(1));
+            }
+            let owner = previous.preparation_owner();
+            assert!(previous.shutdown());
+            Some(owner)
+        } else {
+            None
+        };
         let mut global = GlobalLibraryWriter::start(&fixture.owner).unwrap();
         let startup = Instant::now() + Duration::from_secs(5);
         while global.status() != GlobalLibraryWriterStatus::Available {
             assert!(Instant::now() < startup);
             thread::sleep(Duration::from_millis(1));
         }
-        let media = fixture._base.path().join("retiring-pre-audit");
-        fs::create_dir(&media).unwrap();
-        let writer = SourceWriter::new_for_scan(
-            SourceDatabase::open_for_catalog_with_profile_guard(
-                &media,
-                &fixture.owner,
-                "retiring-pre-audit",
+        let writer = if inventory_case == 5 {
+            source(&fixture, "retiring-pre-audit")
+        } else {
+            let media = fixture._base.path().join("retiring-pre-audit");
+            fs::create_dir(&media).unwrap();
+            let writer = SourceWriter::new_for_scan(
+                SourceDatabase::open_for_catalog_with_profile_guard(
+                    &media,
+                    &fixture.owner,
+                    "retiring-pre-audit",
+                )
+                .unwrap(),
+                SourceId::from_string("retiring-pre-audit"),
+                1,
             )
-            .unwrap(),
-            SourceId::from_string("retiring-pre-audit"),
-            1,
-        )
-        .unwrap();
-        assert!(writer.current_revision().is_err());
+            .unwrap();
+            assert!(writer.current_revision().is_err());
+            writer
+        };
         let (requester, inbox) = SourceWalTransport::channel();
         let (send, receive) = mpsc::sync_channel(1);
         let actor = SourceActor::start_with_lease_observation(vec![writer], inbox, Some(send));
@@ -2237,6 +2264,11 @@ mod integration {
         let WalPreparedDatabase::Global(original) = &view.databases()[0] else {
             unreachable!();
         };
+        if let Some(previous) = previous_global {
+            assert_eq!(previous.acquisition(), original.owner().acquisition());
+            assert_ne!(previous.registration(), original.owner().registration());
+            assert!(previous.generation() < original.owner().generation());
+        }
         let descriptor: serde_json::Value =
             serde_json::from_slice(original.wal_scope().unwrap().descriptor_bytes()).unwrap();
         assert!(
@@ -2734,6 +2766,12 @@ mod integration {
             1,
         )
         .unwrap();
+        let inventory_expectation = observe_inventory.then(|| {
+            (
+                prepared_record(prepared.validation_operation_id(), &prepared).unwrap(),
+                claims.clone(),
+            )
+        });
         // A valid envelope with a different ordinary-claim identity cannot consume
         // the existing original preparation, even though its plan totals match.
         let mut foreign_claims = claims.claims().to_vec();
@@ -2792,6 +2830,53 @@ mod integration {
         } else {
             None
         };
+        let (projection_tx, projection_rx) = std::sync::mpsc::sync_channel(1);
+        let mut projection_gate = None;
+        let full_credit = Arc::new(Mutex::new(None));
+        if inventory_case == 2 {
+            let token = actor
+                .tokens
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            handle.retirement_hook_for_tests(move |nonce| {
+                let holder = thread::spawn(move || {
+                    assert!(
+                        token
+                            .with_current(|| {
+                                entered_tx.send(()).unwrap();
+                                release_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+                            })
+                            .is_some()
+                    );
+                });
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                projection_tx.send((nonce, holder)).unwrap();
+            });
+            projection_gate = Some(release_tx);
+        } else if inventory_case == 3 {
+            let budget = Arc::clone(&budget);
+            let full_credit = Arc::clone(&full_credit);
+            handle.retirement_hook_for_tests(move |_| {
+                let mut credit = budget.credit();
+                credit.resize(64 * 1024 - budget.used()).unwrap();
+                *full_credit.lock().unwrap() = Some(credit);
+            });
+        }
+        let inventory_no_effects = (inventory_case != 0).then(|| {
+            (
+                prepared.validation_operation_id(),
+                native_retirement_inventory::whole_journal_image(&journal.client()),
+                journal
+                    .prepared_admission_id_allocations
+                    .load(Ordering::Relaxed),
+            )
+        });
         let mut admitted = journal.client().admit_prepared(prepared).unwrap();
         if outcome >= 13 {
             let early = admitted.recv_timeout(Duration::from_millis(50));
@@ -2818,8 +2903,35 @@ mod integration {
                 }
             }
         }
+        let projected_nonce = if let Some(release) = projection_gate {
+            let (nonce, holder) = projection_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let debit = budget.used();
+            let input = *journal.shared.input_bytes.lock().unwrap();
+            assert!(matches!(
+                admitted.recv_timeout(Duration::from_millis(50)),
+                Err(OperationJournalRequestError::Empty)
+            ));
+            assert_eq!(budget.used(), debit);
+            assert_eq!(*journal.shared.input_bytes.lock().unwrap(), input);
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            Some(nonce)
+        } else {
+            None
+        };
         let result = admitted.recv_timeout(Duration::from_secs(3)).unwrap();
-        if outcome >= 14 {
+        if inventory_case == 3 {
+            assert!(
+                matches!(
+                    result,
+                    Err(OperationJournalOwnerError::WalPreparation(
+                        WalPreparationError::Full
+                    ))
+                ),
+                "{result:?}"
+            );
+            drop(full_credit.lock().unwrap().take());
+        } else if outcome >= 14 {
             assert!(
                 result.is_err(),
                 "revoked original command cannot succeed: {result:?}"
@@ -2840,6 +2952,40 @@ mod integration {
                 "original retirement acknowledgement result: {result:?}"
             );
         }
+        if let Some((validation_id, whole_before, ids_before)) = inventory_no_effects {
+            assert_eq!(
+                native_retirement_inventory::whole_journal_image(&journal.client()),
+                whole_before
+            );
+            assert_eq!(
+                journal
+                    .prepared_admission_id_allocations
+                    .load(Ordering::Relaxed),
+                ids_before
+            );
+            assert!(
+                journal
+                    .client()
+                    .get(validation_id)
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let inventory_native_context = observe_inventory.then(|| view.clone());
+        let inventory_alias = if observe_inventory {
+            let observation = handle
+                .retirement_inventory_for_tests()
+                .expect("actual original ACK consumer must produce historical inventory");
+            if let Some(nonce) = projected_nonce {
+                assert_eq!(observation.inventory().header().decision_nonce, nonce);
+            }
+            Some(observation)
+        } else {
+            None
+        };
         assert!(
             journal
                 .client()
@@ -2872,7 +3018,12 @@ mod integration {
         handle.abort();
         let aborted = wait(&handle, terminal);
         assert!(
-            if outcome == 4 || outcome == 5 || source_policy_fault.is_some() {
+            if inventory_case == 3 {
+                matches!(
+                    aborted,
+                    WalPreparationStatus::Rejected(WalPreparationError::Full)
+                )
+            } else if outcome == 4 || outcome == 5 || source_policy_fault.is_some() {
                 matches!(
                     aborted,
                     WalPreparationStatus::Rejected(WalPreparationError::InvalidInput)
@@ -2894,7 +3045,11 @@ mod integration {
         );
         drop(view);
         drop(handle);
-        assert_eq!(budget.used(), 0);
+        if inventory_alias.is_some() {
+            assert!(budget.used() > 0);
+        } else {
+            assert_eq!(budget.used(), 0);
+        }
         if outcome == 16 {
             // OwnerLost remains the refusal reason after confirmed NoAttempt cleanup;
             // that diagnostic alone cannot prove cleanup or resolve an unknown SQL attempt.
@@ -2960,6 +3115,37 @@ mod integration {
             );
         } else {
             assert!(journal.shutdown());
+        }
+        if let Some(alias) = inventory_alias {
+            let context = inventory_native_context.unwrap();
+            let [
+                WalPreparedDatabase::Global(global),
+                WalPreparedDatabase::Lease(source),
+            ] = context.databases()
+            else {
+                unreachable!()
+            };
+            let (record, claims) = inventory_expectation.as_ref().unwrap();
+            assert_actual_retirement_inventory(
+                alias.inventory(),
+                alias.encoded(),
+                &fixture.owner,
+                source,
+                global,
+                &retirement,
+                record,
+                claims,
+            );
+            let context_alias = context.clone();
+            concurrent_inventory_drop(context, context_alias);
+            assert!(budget.used() > 0);
+            let other = alias.clone();
+            concurrent_inventory_drop(alias, other);
+            assert_eq!(
+                budget.used(),
+                0,
+                "actual joined producers and final aliases release all original debits"
+            );
         }
     }
     #[test]

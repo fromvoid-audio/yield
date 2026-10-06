@@ -4,6 +4,7 @@ use crate::sample_sources::db::{SourceRegistryReferenceSubject, SourceRegistryRe
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+mod canonical;
 
 /// Whole canonical stored lease scope ceiling, independent of the operation record cap.
 pub const MAX_SOURCE_LEASE_SCOPE_BYTES: usize = 16 * 1024;
@@ -35,6 +36,16 @@ pub struct StoredSourceLeaseFence {
     objects: [Object; 3],
 }
 impl StoredSourceLeaseFence {
+    pub(crate) fn canonical_retirement_view(&self) -> impl Serialize + '_ {
+        canonical::Fence::new(self)
+    }
+    pub(crate) fn existing_encoding_bound(&self) -> Option<usize> {
+        Self::encoding_bound(
+            &self.subject,
+            self.objects.each_ref().map(|o| o.identity.as_str()),
+        )
+    }
+
     // Exact native input strings; JSON escapes quotes/backslashes at most twofold because
     // validated identity strings contain no control characters. Byte-array elements take
     // at most four bytes each. 4 KiB covers fixed names, UUIDs, enum tags and u64 scalars.

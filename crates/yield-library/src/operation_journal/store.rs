@@ -3433,6 +3433,38 @@ impl OperationJournalStore {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn retirement_whole_image_for_test(
+        &self,
+    ) -> Result<([u64; 5], Option<i64>), OperationJournalStoreError> {
+        let tables = [
+            "operation_journal",
+            "operation_journal_full_progress",
+            "operation_journal_staging_checkpoints",
+            "operation_journal_chunk_staging",
+            "operation_journal_recording_chunks",
+        ];
+        let mut counts = [0; 5];
+        for (count, table) in counts.iter_mut().zip(tables) {
+            *count =
+                self.connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, u64>(0)
+                    })?;
+        }
+        let sequence = self.connection.query_row(
+            "SELECT MAX(sequence) FROM (
+             SELECT sequence FROM operation_journal UNION ALL
+             SELECT sequence FROM operation_journal_full_progress UNION ALL
+             SELECT sequence FROM operation_journal_staging_checkpoints UNION ALL
+             SELECT sequence FROM operation_journal_chunk_staging UNION ALL
+             SELECT sequence FROM operation_journal_recording_chunks)",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        Ok((counts, sequence))
+    }
+
     fn open_inner(
         profile_guard: &WritableProfileGuard,
         #[cfg(test)] before_sqlite_open: Option<&dyn Fn(&Path)>,

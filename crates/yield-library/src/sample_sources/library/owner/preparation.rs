@@ -232,8 +232,8 @@ impl GlobalPreparationRequest {
 pub struct GlobalPreparationObservation {
     data: Arc<ObservationData>,
     // Shared with the original worker; final view releases only this local memory credit.
-    _binding_credit: Option<Arc<binding::Credit>>,
-    _handshake_credit: Option<Arc<binding::SharedHandshakeCredit>>,
+    _binding_credit: Option<binding::CreditRef<binding::Credit>>,
+    _handshake_credit: Option<binding::CreditRef<binding::SharedHandshakeCredit>>,
 }
 impl PartialEq for GlobalPreparationObservation {
     fn eq(&self, other: &Self) -> bool {
@@ -314,7 +314,7 @@ pub struct GlobalPreparationPending {
     ready: Receiver<Result<GlobalPreparationReservation, GlobalPreparationError>>,
     canceled: Arc<AtomicBool>,
     armed: bool,
-    _handshake_credit: Option<Arc<binding::SharedHandshakeCredit>>,
+    _handshake_credit: Option<binding::CreditRef<binding::SharedHandshakeCredit>>,
 }
 impl GlobalPreparationPending {
     pub(crate) fn cancel(&self) {
@@ -423,8 +423,8 @@ pub(super) struct Command {
     request: GlobalPreparationRequest,
     canceled: Arc<AtomicBool>,
     ready: SyncSender<Result<GlobalPreparationReservation, GlobalPreparationError>>,
-    binding_credit: Option<Arc<binding::Credit>>,
-    handshake_credit: Option<Arc<binding::SharedHandshakeCredit>>,
+    binding_credit: Option<binding::CreditRef<binding::Credit>>,
+    handshake_credit: Option<binding::CreditRef<binding::SharedHandshakeCredit>>,
 }
 impl Command {
     pub(super) fn reject(self) {
@@ -623,8 +623,8 @@ pub(super) fn run(
                 wal_scope,
                 lifecycle_policy_entered: policy.is_some(),
             }),
-            _binding_credit: command.binding_credit.as_ref().map(Arc::clone),
-            _handshake_credit: command.handshake_credit.as_ref().map(Arc::clone),
+            _binding_credit: command.binding_credit.clone(),
+            _handshake_credit: command.handshake_credit.clone(),
         };
         if let Some(credit) = &command.handshake_credit {
             // Capture staging is over. Keep complete retained data, headers and conservative

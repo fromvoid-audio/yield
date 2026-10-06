@@ -464,6 +464,36 @@
       "retirement": "Keep only as this explicit original collection funding/refusal fixture; never activate the test-only owner start in production."
     },
     {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/native_retirement_inventory.rs",
+      "function": "native_retirement_inventory_genuine_registered_original_consumer",
+      "operation": "fs::create_dir",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2382",
+      "reason": "cfg(test) resource-required genuine production bootstrap, journal Registered Source and original Source/Global retirement consumer harness; isolated protected roots and original SQLite ownership. Historical inventory never supplies physical qualification, Start, permit or settlement.",
+      "retirement": "Execute only with genuine native SDK/runtime and independently qualified mounted objects; keep the all-target body typechecked and preserve strict no-intent, timely original cleanup and all-alias funding assertions."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/native_retirement_inventory.rs",
+      "function": "native_retirement_inventory_genuine_registered_original_consumer",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2382",
+      "reason": "cfg(test) resource-required genuine production bootstrap, journal Registered Source and original Source/Global retirement consumer harness; isolated protected roots and original SQLite ownership. Historical inventory never supplies physical qualification, Start, permit or settlement.",
+      "retirement": "Execute only with genuine native SDK/runtime and independently qualified mounted objects; keep the all-target body typechecked and preserve strict no-intent, timely original cleanup and all-alias funding assertions."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/native_retirement_inventory.rs",
+      "function": "native_retirement_inventory_genuine_registered_original_consumer",
+      "operation": "journal::start",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2382",
+      "reason": "cfg(test) resource-required genuine production bootstrap, journal Registered Source and original Source/Global retirement consumer harness; isolated protected roots and original SQLite ownership. Historical inventory never supplies physical qualification, Start, permit or settlement.",
+      "retirement": "Execute only with genuine native SDK/runtime and independently qualified mounted objects; keep the all-target body typechecked and preserve strict no-intent, timely original cleanup and all-alias funding assertions."
+    },
+    {
       "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/reconcile.rs",
       "function": "reconcile_source_entry",
       "operation": "method::remove_file",

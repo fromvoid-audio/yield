@@ -1,4 +1,5 @@
 //! One original owner round. Journal decisions and native cleanup compete under a short lock.
+use super::WalPreparationError;
 use std::{
     sync::{Arc, Condvar, Mutex},
     time::Instant,
@@ -119,6 +120,11 @@ impl OriginalDecision {
         self.round.nonce
     }
     pub(in crate::operation_journal) fn acknowledged(&self) -> bool {
+        self.checked_acknowledged().unwrap_or(false)
+    }
+    pub(in crate::operation_journal) fn checked_acknowledged(
+        &self,
+    ) -> Result<bool, WalPreparationError> {
         self.round
             .with_boundaries(|state| {
                 state.decision == Decision::Deciding
@@ -127,7 +133,11 @@ impl OriginalDecision {
                     && self.round.sources_present(state)
                     && Instant::now() < self.round.deadline
             })
-            .unwrap_or(false)
+            .map_err(|error| match error {
+                BoundaryRefusal::Busy => WalPreparationError::Busy,
+                BoundaryRefusal::Revoked => WalPreparationError::OwnerLost,
+                BoundaryRefusal::Changed => WalPreparationError::InvalidInput,
+            })
     }
     #[cfg(all(test, target_os = "linux"))]
     pub(in crate::operation_journal) fn start_sqlite(&mut self) -> bool {
