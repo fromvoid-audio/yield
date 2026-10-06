@@ -17,18 +17,28 @@ pub(super) const PARKED_BYTES: usize = 12 * 1024;
 const REPORT_BYTES: usize = std::mem::size_of::<Report>() + 64;
 
 #[derive(Clone)]
-pub(super) struct ScopeView(Arc<Report>);
+pub(super) struct ScopeView(Option<Arc<Report>>);
+impl Drop for ScopeView {
+    fn drop(&mut self) {
+        if let Some(report) = self.0.take().and_then(Arc::into_inner) {
+            drop(report);
+        }
+    }
+}
 struct Report {
     // Original private binding drops before its memory credit; no duplicate descriptor buffer.
     binding: SourceWalBinding,
     _credit: ByteCredit,
 }
 impl ScopeView {
+    fn report(&self) -> &Report {
+        self.0.as_deref().expect("live original Source scope")
+    }
     pub(super) fn bytes(&self) -> &[u8] {
-        self.0.binding.descriptor_bytes()
+        self.report().binding.descriptor_bytes()
     }
     pub(super) fn binding(&self) -> &SourceWalBinding {
-        &self.0.binding
+        &self.report().binding
     }
 }
 impl std::fmt::Debug for ScopeView {
@@ -67,7 +77,7 @@ impl ByteCredit {
     }
     pub(super) fn in_handshake(
         shared: &Arc<Shared>,
-        budget: Option<&Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
+        budget: Option<&crate::operation_journal::wal_admission::HandshakeBudget>,
     ) -> Self {
         let mut credit = Self::new(shared);
         credit.handshake = budget.map(|budget| budget.credit());
@@ -123,7 +133,7 @@ pub(super) fn capture_scope(
     shared: &Arc<Shared>,
     held: &SourceWalPreparation,
     registration: &SourceAuthorityRegistration,
-    handshake: Option<&Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
+    handshake: Option<&crate::operation_journal::wal_admission::HandshakeBudget>,
 ) -> Result<ScopeView, SourceWalTransportRejection> {
     let mut credit = ByteCredit::in_handshake(shared, handshake);
     credit.resize(CAPTURE_BYTES)?;
@@ -136,8 +146,8 @@ pub(super) fn capture_scope(
         .and_then(|n| n.checked_add(REPORT_BYTES))
         .ok_or(SourceWalTransportRejection::InvalidContext)?;
     credit.resize(bytes)?;
-    Ok(ScopeView(Arc::new(Report {
+    Ok(ScopeView(Some(Arc::new(Report {
         binding,
         _credit: credit,
-    })))
+    }))))
 }

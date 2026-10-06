@@ -1,41 +1,85 @@
-//! One combined handshake ceiling, additionally to each original owner's local ceiling.
+//! Combined local accounting and original post-reservation input custody.
+use super::WalPreparationError;
+use super::collector::journal_input::JournalInput;
 use std::sync::{Arc, Mutex};
 
 pub(crate) const MAX_BYTES: usize = 64 * 1024;
-#[derive(Debug)]
-pub(crate) struct HandshakeBudget {
+
+/// Every real alias retains the original journal debit. No raw Arc/Weak escapes.
+pub(crate) struct HandshakeBudget(Option<Arc<Backing>>);
+pub(super) const BACKING_BYTES: usize = std::mem::size_of::<Backing>() + 64;
+struct Backing {
     bytes: Mutex<usize>,
+    // The raw budget allocation is freed by into_inner before this custody drops.
+    journal_input: Mutex<Option<JournalInput>>,
+}
+impl Clone for HandshakeBudget {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl Drop for HandshakeBudget {
+    fn drop(&mut self) {
+        if let Some(backing) = self.0.take().and_then(Arc::into_inner) {
+            drop(backing);
+        }
+    }
+}
+impl std::fmt::Debug for HandshakeBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandshakeBudget")
+            .field("bytes", &self.backing().bytes)
+            .finish_non_exhaustive()
+    }
 }
 impl HandshakeBudget {
-    pub(super) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            bytes: Mutex::new(0),
-        })
+    fn backing(&self) -> &Backing {
+        self.0.as_deref().expect("live original handshake budget")
     }
-    pub(crate) fn credit(self: &Arc<Self>) -> HandshakeCredit {
+    pub(super) fn new() -> Self {
+        Self(Some(Arc::new(Backing {
+            bytes: Mutex::new(0),
+            journal_input: Mutex::new(None),
+        })))
+    }
+    pub(super) fn bind_journal_input(
+        &self,
+        input: JournalInput,
+    ) -> Result<(), WalPreparationError> {
+        let mut retained = self
+            .backing()
+            .journal_input
+            .lock()
+            .map_err(|_| WalPreparationError::Full)?;
+        if retained.is_some() {
+            return Err(WalPreparationError::InvalidInput);
+        }
+        *retained = Some(input);
+        Ok(())
+    }
+    pub(crate) fn credit(&self) -> HandshakeCredit {
         HandshakeCredit {
-            budget: Arc::clone(self),
+            budget: self.clone(),
             bytes: 0,
         }
     }
     #[cfg(test)]
     pub(crate) fn used(&self) -> usize {
-        *self.bytes.lock().unwrap()
+        *self.backing().bytes.lock().unwrap()
     }
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn test_accounting_guard(&self) -> std::sync::MutexGuard<'_, usize> {
-        self.bytes.lock().unwrap()
+        self.backing().bytes.lock().unwrap()
     }
 }
-/// Private non-Clone debit. Immutable actor replies share the same original credit via Arc.
 #[derive(Debug)]
 pub(crate) struct HandshakeCredit {
-    budget: Arc<HandshakeBudget>,
+    budget: HandshakeBudget,
     bytes: usize,
 }
 impl HandshakeCredit {
     pub(crate) fn resize(&mut self, bytes: usize) -> Result<(), ()> {
-        let mut current = self.budget.bytes.lock().map_err(|_| ())?;
+        let mut current = self.budget.backing().bytes.lock().map_err(|_| ())?;
         let next = current
             .checked_sub(self.bytes)
             .ok_or(())?
@@ -49,9 +93,7 @@ impl HandshakeCredit {
 }
 impl Drop for HandshakeCredit {
     fn drop(&mut self) {
-        // Poison cannot refund another holder's debit or reopen capacity. The handshake
-        // stays unavailable; no effect/claim/rollback outcome follows from this drop.
-        if let Ok(mut current) = self.budget.bytes.lock() {
+        if let Ok(mut current) = self.budget.backing().bytes.lock() {
             *current = current
                 .checked_sub(self.bytes)
                 .expect("original handshake debit");

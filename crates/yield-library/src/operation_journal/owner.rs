@@ -1922,7 +1922,7 @@ impl OwnerRuntime {
                 .owner_identity(),
         )
         .map_err(|_| WalPreparationError::InvalidInput)?;
-        let (collector, handle) = super::wal_admission::Collector::new(input, debit, acquisition);
+        let (collector, handle) = super::wal_admission::Collector::new(input, debit, acquisition)?;
         self.wal_preparation = Some(collector);
         self.poll_wal_preparation();
         Ok(handle)

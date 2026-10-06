@@ -1,9 +1,9 @@
 //! Private original input custody; raw Arc/Weak handles never escape.
 use crate::operation_journal::owner::InputPermit;
 use std::sync::Arc;
-pub(super) struct JournalInput(Option<Arc<InputPermit>>);
+pub(in crate::operation_journal::wal_admission) struct JournalInput(Option<Arc<InputPermit>>);
 impl JournalInput {
-    pub(super) fn new(input: InputPermit) -> Self {
+    pub(in crate::operation_journal::wal_admission) fn new(input: InputPermit) -> Self {
         Self(Some(Arc::new(input)))
     }
 }

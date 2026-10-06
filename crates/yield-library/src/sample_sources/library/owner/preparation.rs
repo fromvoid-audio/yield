@@ -129,7 +129,7 @@ pub struct GlobalPreparationRequest {
     lifecycle_policy: bool,
     retirement: Option<retirement_policy::Input>,
     wal_binding: bool,
-    handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
+    handshake: Option<crate::operation_journal::wal_admission::HandshakeBudget>,
     #[cfg(all(test, target_os = "linux"))]
     observation_expiry_probe: Option<(bool, &'static std::sync::atomic::AtomicBool)>,
 }
@@ -155,7 +155,7 @@ impl GlobalPreparationRequest {
 
     pub(crate) fn in_handshake(
         mut self,
-        budget: Arc<crate::operation_journal::wal_admission::HandshakeBudget>,
+        budget: crate::operation_journal::wal_admission::HandshakeBudget,
     ) -> Self {
         self.handshake = Some(budget);
         self.wal_binding = true;

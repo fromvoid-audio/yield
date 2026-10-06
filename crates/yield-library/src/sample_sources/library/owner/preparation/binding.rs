@@ -351,7 +351,7 @@ pub(super) struct SharedHandshakeCredit(
 );
 impl SharedHandshakeCredit {
     pub(super) fn reserve(
-        budget: &Arc<crate::operation_journal::wal_admission::HandshakeBudget>,
+        budget: &crate::operation_journal::wal_admission::HandshakeBudget,
     ) -> Result<CreditRef<Self>, GlobalLibraryWriterQueueError> {
         let mut credit = budget.credit();
         credit
