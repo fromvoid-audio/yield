@@ -5306,14 +5306,13 @@ impl OperationJournalClient {
         };
         let historical_reply = if historical {
             // Fund the Arc allocation (including both reference counters) before allocating.
-            let header = self.shared.reserve_input(
-                class,
-                std::mem::size_of::<HistoricalReplyBacking>() + 2 * std::mem::size_of::<usize>(),
-            )?;
+            let header = self.shared.reserve_input(class, HISTORICAL_REPLY_BYTES)?;
             let backing = Arc::new(HistoricalReplyBacking {
                 _header: header,
                 consumer: Mutex::new(None),
                 observer: Mutex::new(None),
+                #[cfg(test)]
+                consumer_refused: AtomicBool::new(false),
             });
             input.historical_reply = Some(Arc::clone(&backing));
             Some(backing)
@@ -5717,7 +5716,16 @@ struct HistoricalReplyBacking {
     _header: InputPermit,
     consumer: Mutex<Option<InputPermit>>,
     observer: Mutex<Option<HistoricalObserverCredits>>,
+    #[cfg(test)]
+    consumer_refused: AtomicBool,
 }
+// This first-stage refusal can occur before any observer/consumer debit succeeds.
+// Fund its owned reason (including String growth) BEFORE queueing/Arc allocation.
+const HISTORICAL_REFUSAL_REPLY_BYTES: usize =
+    2 * "historical claim observation resource envelope exceeded".len();
+const HISTORICAL_REPLY_BYTES: usize = std::mem::size_of::<HistoricalReplyBacking>()
+    + 2 * std::mem::size_of::<usize>()
+    + HISTORICAL_REFUSAL_REPLY_BYTES;
 
 struct HistoricalObserverCredits {
     _sql: InputPermit,
@@ -5785,7 +5793,14 @@ impl InputPermit {
     fn fund_historical_consumer(&self) -> Result<(), OperationJournalStoreError> {
         if let Some(backing) = &self.historical_reply {
             let permit =
-                self.reserve_historical_scratch(super::store::HISTORICAL_DIAGNOSTIC_BYTES)?;
+                match self.reserve_historical_scratch(super::store::HISTORICAL_DIAGNOSTIC_BYTES) {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        #[cfg(test)]
+                        backing.consumer_refused.store(true, Ordering::Release);
+                        return Err(error);
+                    }
+                };
             *backing.consumer.lock().unwrap_or_else(|p| p.into_inner()) = Some(permit);
         }
         Ok(())

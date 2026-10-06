@@ -163,9 +163,7 @@ fn historical_claim_unconsumed_actor_error_hands_off_to_funded_diagnostics_until
     assert!(owner.shutdown());
     assert_eq!(
         pool_before - owner.shared.input_bytes.lock().unwrap().remaining[0],
-        crate::operation_journal::store::HISTORICAL_DIAGNOSTIC_BYTES
-            + std::mem::size_of::<HistoricalReplyBacking>()
-            + 2 * std::mem::size_of::<usize>()
+        crate::operation_journal::store::HISTORICAL_DIAGNOSTIC_BYTES + HISTORICAL_REPLY_BYTES
     );
     assert_eq!(owner.prepared_admission_id_allocations(), 0);
     drop(request);
@@ -204,6 +202,7 @@ fn historical_claim_late_send_disposes_payload_before_original_reply_credit() {
         _header: header,
         consumer: Mutex::new(None),
         observer: Mutex::new(None),
+        consumer_refused: AtomicBool::new(false),
     });
     let mut input = shared.reserve_input(InputClass::Ordinary, 1).unwrap();
     input.historical_reply = Some(Arc::clone(&backing));
@@ -227,4 +226,60 @@ fn historical_claim_late_send_disposes_payload_before_original_reply_credit() {
     assert!(before - shared.input_bytes.lock().unwrap().remaining[0] >= 4096);
     drop(backing);
     assert_eq!(shared.input_bytes.lock().unwrap().remaining[0], before);
+}
+
+#[test]
+fn historical_claim_earliest_consumer_refusal_keeps_precharged_reply_through_delivery() {
+    let fixture = fixture("historical-claim-earliest-refusal");
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+    wait_until_available(&owner);
+    let limit = InputClass::Ordinary.limit();
+    let retained = owner
+        .shared
+        .reserve_input(InputClass::Ordinary, limit - 64 * 1024)
+        .unwrap();
+    let mut request = owner
+        .client()
+        .admit_prepared(prepared_copy_input(
+            FullCapacityAllocationClass::DestinationStaging,
+            VolumeIdentity { device: 1 },
+            1,
+        ))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !request
+        .historical_reply
+        .as_ref()
+        .unwrap()
+        .consumer_refused
+        .load(Ordering::Acquire)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "genuine actor never reached consumer funding refusal"
+        );
+        std::thread::yield_now();
+    }
+    assert!(owner.shutdown());
+    assert_eq!(
+        limit - owner.shared.input_bytes.lock().unwrap().remaining[0],
+        retained.bytes + HISTORICAL_REPLY_BYTES
+    );
+    assert_eq!(owner.prepared_admission_id_allocations(), 0);
+    let Err(OperationJournalOwnerError::PreparedAdmission(
+        PreparedAdmissionError::RecoveryRequired { reason },
+    )) = request.recv_timeout(Duration::from_secs(5)).unwrap()
+    else {
+        panic!("changed original funding refusal")
+    };
+    let expected = OperationJournalStoreError::HistoricalClaimResourceBound.to_string();
+    assert_eq!(reason, expected);
+    assert_eq!(HISTORICAL_REFUSAL_REPLY_BYTES, 2 * expected.len());
+    assert_eq!(
+        limit - owner.shared.input_bytes.lock().unwrap().remaining[0],
+        retained.bytes
+    );
+    drop(retained);
+    assert_eq!(owner.shared.input_bytes.lock().unwrap().remaining[0], limit);
 }
