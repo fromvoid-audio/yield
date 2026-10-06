@@ -67,7 +67,9 @@ impl Collection {
             + size_of::<RefCell<Option<InputPermit>>>()
             + 3 * size_of::<InputPermit>()
             + 2 * size_of::<String>()
-            + 2 * "ordinary claim rebuild count is not a nonnegative SQLite integer".len();
+            + "ordinary claim rebuild count is not a nonnegative SQLite integer".len()
+            + 2 * ("historical claim observation rejected: ".len()
+                + "ordinary claim rebuild count is not a nonnegative SQLite integer".len());
         let sql = input
             .reserve_historical_scratch(sql_bytes)
             .map_err(resource_error)?;

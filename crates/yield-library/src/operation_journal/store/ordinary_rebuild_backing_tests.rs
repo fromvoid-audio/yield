@@ -120,3 +120,60 @@ fn ordinary_rebuild_backing_refuses_collection_pressure_without_partial_snapshot
     assert_eq!(store.rebuild_admission_snapshot().unwrap(), before);
     assert!(store.connection.is_autocommit());
 }
+
+#[test]
+fn ordinary_rebuild_backing_native_count_and_page_errors_preserve_original_sqlite_error() {
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    // Exercise actual original-connection prepare failure without an alternate DB.
+    // The component fixture calls the readers directly; namespace checks in the
+    // production rebuild continue to reject a changed schema before these readers.
+    store
+        .connection
+        .execute_batch(
+            "ALTER TABLE operation_journal_ordinary_claim RENAME TO ordinary_count_error_fixture",
+        )
+        .unwrap();
+    let input = super::super::owner::InputPermit::historical_test_input(1);
+    let available = input.historical_test_remaining();
+    let original =
+        ordinary_claims::read_page(&store.connection, None, ordinary_claims::MAX_PAGE_ROWS)
+            .unwrap_err();
+    let count = match admission_rebuild_backing::Collection::new(&store.connection, &input) {
+        Err(error) => error,
+        Ok(_) => panic!("missing original relation must fail count"),
+    };
+    let OperationJournalStoreError::Sql(count_sql) = count else {
+        panic!("count preserves typed SQLite error")
+    };
+    let ordinary_claims::OrdinaryClaimReadError::Sql(original_sql) = original else {
+        panic!("original preserves typed SQLite error")
+    };
+    assert_eq!(
+        count_sql.sqlite_error_code(),
+        original_sql.sqlite_error_code()
+    );
+    assert_eq!(count_sql.to_string(), original_sql.to_string());
+    drop(count_sql);
+    drop(original_sql);
+    assert_eq!(input.historical_test_remaining(), available);
+    let page = ordinary_claims::read_funded_page(&store.connection, &input, None).unwrap_err();
+    assert!(
+        input.historical_test_remaining() < available,
+        "owned page error retains its exact native-copy credit"
+    );
+    assert!(
+        page.to_string()
+            .contains("no such table: operation_journal_ordinary_claim")
+    );
+    // Error statements have finalized even while the owned error backing remains.
+    store
+        .connection
+        .execute_batch(
+            "ALTER TABLE ordinary_count_error_fixture RENAME TO operation_journal_ordinary_claim",
+        )
+        .unwrap();
+    drop(page);
+    assert_eq!(input.historical_test_remaining(), available);
+    assert!(store.connection.is_autocommit());
+}
