@@ -176,6 +176,16 @@ impl Drop for ProfileChildLease {
 }
 
 impl WritableProfileGuard {
+    /// Additional Rust metadata retained by one original participant clone.
+    /// Shared child-lease registry backing remains owned by its original guard.
+    pub(crate) fn participant_clone_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>()
+            .checked_add(self.profile_root.capacity())?
+            .checked_add(self.lock_path.capacity())?
+            .checked_add(self.profile_identity.capacity())?
+            .checked_add(self.lock_identity.capacity())?
+            .checked_add(self.owner_identity.capacity())
+    }
     /// Resolve the current profile and acquire its nonblocking writable-owner lock.
     pub fn acquire_current() -> Result<Self, ProfileOwnershipError> {
         Self::acquire_with_generation_counter(&generation::NEXT_GENERATION)

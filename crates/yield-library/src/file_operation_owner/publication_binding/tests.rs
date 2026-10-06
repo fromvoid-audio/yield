@@ -89,6 +89,34 @@ mod integration {
                 .unwrap()
         }
     }
+    #[test]
+    fn original_root_backing_survives_retirement_through_actual_publication_alias() {
+        let f = Fixture::new();
+        let (mut validation, result) = f.validation();
+        let mut pending = f.prepare(result, EffectId::new(), "retained-final.wav");
+        let target = wait(&mut pending).unwrap();
+        let life = target.data.lives[1].clone();
+        assert!(life.load(Ordering::Acquire));
+        f.owner.retire_root(f.target).unwrap();
+        assert!(!target.is_current());
+        assert!(!life.load(Ordering::Acquire));
+        validation.acknowledge().unwrap();
+        drop((target, pending, validation));
+        f.owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            f.owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
+        assert_eq!(
+            f.owner.input_bytes_remaining_for_test(),
+            FILE_OPERATION_OWNER_MAX_INPUT_BYTES - RootLiveness::BACKING_BYTES
+        );
+        drop(life);
+        assert_eq!(
+            f.owner.input_bytes_remaining_for_test(),
+            FILE_OPERATION_OWNER_MAX_INPUT_BYTES
+        );
+    }
     fn wait(
         pending: &mut PublicationTargetPending,
     ) -> Result<PreparedPublicationTarget, BindingError> {

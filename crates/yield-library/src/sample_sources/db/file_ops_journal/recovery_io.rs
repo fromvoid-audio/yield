@@ -785,6 +785,30 @@ impl ReadonlyDatabaseRoot {
 }
 
 impl BoundDatabaseRoot {
+    /// Owned clone metadata; shared original descriptor/lease backing is not allocated again.
+    pub(crate) fn participant_clone_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>()
+            .checked_add(self.path.capacity())?
+            .checked_add(self.named_path.as_ref().map_or(0, PathBuf::capacity))?
+            .checked_add(self.identity.capacity())?
+            .checked_add(self.profile_identity.capacity())
+    }
+
+    /// Prepayment before original profile-root construction. Native alias capture
+    /// has finite existing platform bounds; this is backing, never root authority.
+    pub(crate) fn profile_participant_bytes(guard: &WritableProfileGuard) -> Option<usize> {
+        #[cfg(windows)]
+        let alias = windows_final_namespace::BUFFER_UNITS.checked_mul(4)?;
+        #[cfg(not(windows))]
+        // /.vol/ + two decimal u64s and /, or /proc/self/fd/ + decimal i32.
+        // Formatting may double capacity; both final and construction are prepaid.
+        let alias = (6usize + 20 + 1 + 20).checked_mul(4)?;
+        std::mem::size_of::<Self>()
+            .checked_add(Self::LEGACY_ARC_FILE_BYTES)?
+            .checked_add(alias)?
+            .checked_add(guard.profile_root().as_os_str().as_encoded_bytes().len())?
+            .checked_add(guard.profile_root_identity().len().checked_mul(2)?)
+    }
     /// Original retained metadata only; native descriptor/allocator memory is separate.
     // Pinned Arc<File> backing: two usize-sized atomic controls plus aligned File payload.
     pub(crate) const LEGACY_ARC_FILE_BYTES: usize = std::mem::size_of::<(usize, usize, fs::File)>();

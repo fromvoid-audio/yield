@@ -45,7 +45,7 @@ pub(super) struct BindingData {
     // Retained read-only original handle for the future backend, not effect rights.
     staged_file: std::fs::File,
     volume: crate::durable_capacity::VolumeIdentity,
-    lives: Vec<Arc<AtomicBool>>,
+    lives: Vec<RootLiveness>,
     shared: Weak<OwnerShared>,
     _input: InputPermit,
 }
