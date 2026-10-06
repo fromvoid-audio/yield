@@ -14,7 +14,7 @@ pub use super::wal_admission::{
 mod frozen_copy;
 mod historical_reply;
 mod namespace_credit;
-pub use namespace_credit::NamespaceCommandError;
+pub use namespace_credit::RetainedCommandError;
 mod startup_credit;
 use historical_reply::HistoricalReply;
 #[cfg(any(test, feature = "test-support"))]
@@ -603,7 +603,7 @@ impl From<CapacityProviderError> for PreparedAdmissionError {
 pub enum OperationJournalOwnerError {
     /// Original namespace failure retaining its pool backing through caller destruction.
     #[error(transparent)]
-    NamespaceBacked(NamespaceCommandError),
+    RetainedBacking(RetainedCommandError),
     /// Original memory-only recording preparation could not be retained or revalidated.
     #[error(transparent)]
     RecordingProducerCustody(#[from] RecordingProducerCustodyError),

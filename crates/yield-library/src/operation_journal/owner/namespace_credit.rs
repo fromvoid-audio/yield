@@ -4,12 +4,12 @@ use super::*;
 
 /// Original command failure and its namespace backing after request consumption.
 /// This owns no authority and cannot be cloned or expose its backing keeper.
-pub struct NamespaceCommandError {
+pub struct RetainedCommandError {
     error: Option<Box<OperationJournalOwnerError>>,
     reply: Option<HistoricalReply>,
 }
 
-impl NamespaceCommandError {
+impl RetainedCommandError {
     /// Borrow the original typed command failure without detaching its backing.
     pub fn original_error(&self) -> &OperationJournalOwnerError {
         self.error
@@ -18,25 +18,25 @@ impl NamespaceCommandError {
     }
 }
 
-impl std::fmt::Debug for NamespaceCommandError {
+impl std::fmt::Debug for RetainedCommandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self.original_error(), f)
     }
 }
 
-impl std::fmt::Display for NamespaceCommandError {
+impl std::fmt::Display for RetainedCommandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self.original_error(), f)
     }
 }
 
-impl std::error::Error for NamespaceCommandError {
+impl std::error::Error for RetainedCommandError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.original_error())
     }
 }
 
-impl Drop for NamespaceCommandError {
+impl Drop for RetainedCommandError {
     fn drop(&mut self) {
         // Destroy the original owned error and its Box allocation before releasing
         // the original reply allocation or any selected namespace backing debit.
@@ -59,8 +59,8 @@ pub(super) fn retain_result_error<T>(
             if selected {
                 // NamespaceLoan prepays this exact Box size before the original
                 // namespace producer. The live reply retains that debit here.
-                Err(OperationJournalOwnerError::NamespaceBacked(
-                    NamespaceCommandError {
+                Err(OperationJournalOwnerError::RetainedBacking(
+                    RetainedCommandError {
                         error: Some(Box::new(error)),
                         reply: Some(reply),
                     },

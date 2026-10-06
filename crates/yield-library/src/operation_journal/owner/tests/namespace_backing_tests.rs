@@ -193,7 +193,7 @@ fn namespace_backing_actual_queued_error_outlives_request_and_original_worker_jo
             request.recv_timeout(Duration::from_secs(5)).unwrap()
         };
         let error = result.unwrap_err();
-        let OperationJournalOwnerError::NamespaceBacked(ref backed) = error else {
+        let OperationJournalOwnerError::RetainedBacking(ref backed) = error else {
             panic!("selected namespace error must retain original backing")
         };
         assert!(matches!(

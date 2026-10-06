@@ -48,7 +48,7 @@ It introduces no pathname quota, truncation or replacement capability. The full
 captured SDK reason is measured separately and prepaid before its Rust copy,
 including its variable contribution to enclosing Store/worker/owner formatting.
 
-Consuming a queued namespace failure returns `OperationJournalOwnerError::NamespaceBacked`.
+Consuming a queued namespace failure returns `OperationJournalOwnerError::RetainedBacking`.
 Its non-Clone carrier exposes only a borrowed `original_error()` with the original
 typed cause, path, native source and diagnostic. The carrier holds the original
 reply while the caller owns the error; it explicitly destroys the owned error
