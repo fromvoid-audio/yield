@@ -36,7 +36,9 @@ pub(crate) const COMMAND_INPUT_BYTES: usize = 3 * 1024 * 1024 + 512 * 1024 - 64 
 const TREE_BYTES: usize = 448 * 1536 + 32 * 1024;
 const TYPED_BYTES: usize = 448 * 1024 + 32 * 1024 + 64 * 1024;
 const LOCAL_PROPOSAL_BYTES: usize = 192 * 1024;
-const RAW_AND_SCRATCH_BYTES: usize = 64 * 1024 + 128 * 1024;
+// Borrowed participant preflight: raw 64 KiB plus up to 192 KiB while
+// old/new scratch backing overlap during growth. Scratch drops before trees.
+const RAW_AND_SCRATCH_BYTES: usize = 64 * 1024 + 192 * 1024;
 const ENCODE_BYTES: usize = 3 * 128 * 1024;
 const REBUILD_BYTES: usize = 128 * 1024;
 const AUXILIARY_BYTES: usize = 64 * 1024;
@@ -48,7 +50,7 @@ const _: () = assert!(
         + ENCODE_BYTES
         + REBUILD_BYTES
         + AUXILIARY_BYTES
-        <= COMMAND_INPUT_BYTES
+        == COMMAND_INPUT_BYTES
 );
 
 impl OperationJournalStore {

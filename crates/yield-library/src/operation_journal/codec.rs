@@ -1644,6 +1644,11 @@ pub fn decode_with_limits(
     decode_value(bounded_value(bytes, limits)?).map_err(Into::into)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static PRESTART_VALUE_PARSE_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Scoped pre-start envelope: inspect bounded data before allocating generic typed commands.
 /// None means the complete inventory is outside this factory's supported resource shape;
 /// neither result establishes a live source, admission or terminal capability.
@@ -1651,6 +1656,13 @@ pub(crate) fn decode_prestart_recording(
     bytes: &[u8],
     limits: JsonMaterializationLimits,
 ) -> Result<Option<StoredOperationRecord>, BoundedDecodeError> {
+    if bytes.len() <= MAX_RECORD_BYTES
+        && super::recording_commands::participant_preflight::prestart_exceeds(bytes)
+    {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    PRESTART_VALUE_PARSE_ENTRIES.with(|entries| entries.set(entries.get().saturating_add(1)));
     let value = bounded_value(bytes, limits)?;
     if value.get("schema_version").and_then(Value::as_u64) != Some(u64::from(SCHEMA_V17))
         || !value
