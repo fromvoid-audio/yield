@@ -5,7 +5,7 @@ use crate::operation_journal::{OperationId, ParticipantId, StoredRelativePath};
 use crate::sample_sources::{SourceDatabase, SourceWriter};
 
 #[cfg(test)]
-#[path = "reference_owner_tests/wal_maintenance.rs"]
+#[path = "reference_owner_tests/tests/wal_maintenance.rs"]
 mod wal_maintenance;
 
 struct ReferenceFixture {
