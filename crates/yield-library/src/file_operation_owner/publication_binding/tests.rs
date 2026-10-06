@@ -750,10 +750,16 @@ mod integration {
             u64::try_from(original.lease_identity().epoch()).unwrap(),
         )
         .unwrap();
+        let source_graph = original.retained_graph_metadata_bytes().unwrap();
+        let source_baseline = f.owner.input_bytes_remaining_for_test();
         let source = f
             .owner
             .register_source_root(original.clone(), &f.guard, fence.clone())
             .unwrap();
+        assert!(
+            source_baseline - f.owner.input_bytes_remaining_for_test() >= source_graph,
+            "the FileOwner original request graph has independent retained backing"
+        );
         let bytes = b"actual original retained bytes";
         let command = FileOperationCommand::for_staging_validation(
             OperationId::new(),
@@ -769,7 +775,7 @@ mod integration {
             BoundedRelativeLocator::new("stage.bin").unwrap(),
             OwnedObjectIdentity::new(),
             StagingValidation::new(bytes.len() as u64, *blake3::hash(bytes).as_bytes()),
-            vec![fence],
+            vec![fence.clone()],
             Some(source),
         )
         .unwrap();
@@ -787,6 +793,17 @@ mod integration {
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
+        let rejected_baseline = f.owner.input_bytes_remaining_for_test();
+        assert!(
+            f.owner
+                .register_source_root(original.clone(), &f.guard, fence)
+                .is_err()
+        );
+        assert_eq!(
+            f.owner.input_bytes_remaining_for_test(),
+            rejected_baseline,
+            "the real revoked Source construction destroys its original keeper before refund"
+        );
         let mut duplicate = f.prepare(result.clone(), effect, "final.wav");
         assert!(matches!(wait(&mut duplicate), Err(BindingError::Closed)));
         f.owner.retire_root(source).unwrap();

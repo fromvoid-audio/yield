@@ -2320,27 +2320,54 @@ impl FileOperationOwner {
                     .participant_clone_bytes()
                     .and_then(|root| bytes.checked_add(root))
             })
+            .and_then(|bytes| bytes.checked_add(request.retained_graph_metadata_bytes()?))
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ProductionRootCapability>()))
             .ok_or_else(|| String::from("source root backing overflow"))?;
         let input = self
             .shared
             .reserve_input(bytes)
             .map_err(|error| error.to_string())?;
-        let retained_guard = profile_guard
-            .try_clone()
+        // Move the original graph into credit-last custody before any fallible clone.
+        // A function argument otherwise outlives a later local debit on early return.
+        let mut construction = SourceRootConstruction {
+            root: None,
+            profile_guard: None,
+            request: Some(request),
+            input: Some(input),
+        };
+        construction.profile_guard = Some(
+            profile_guard
+                .try_clone()
+                .map_err(|error| error.to_string())?,
+        );
+        construction
+            .request
+            .as_ref()
+            .expect("original Source request")
+            .validate_registered_boundary(
+                construction
+                    .profile_guard
+                    .as_ref()
+                    .expect("original profile clone"),
+            )
             .map_err(|error| error.to_string())?;
-        request
-            .validate_registered_boundary(&retained_guard)
-            .map_err(|error| error.to_string())?;
-        let root = request
-            .media_root()
-            .try_clone_for_owned_capability()
-            .map_err(|error| error.to_string())?;
+        construction.root = Some(
+            construction
+                .request
+                .as_ref()
+                .expect("original Source request")
+                .media_root()
+                .try_clone_for_owned_capability()
+                .map_err(|error| error.to_string())?,
+        );
         let capability = ProductionRootCapability {
-            root,
-            profile_guard: retained_guard,
-            source: Some(request),
-            _input: Some(input),
+            root: construction.root.take().expect("original root clone"),
+            profile_guard: construction
+                .profile_guard
+                .take()
+                .expect("original profile clone"),
+            source: construction.request.take(),
+            _input: construction.input.take(),
         }
         .bind_input()?;
         let registration = RootRegistrationRef {
@@ -2820,6 +2847,14 @@ impl Drop for RootRegistrationState {
     }
 }
 
+// Fields are destroyed in this order on every construction error.
+struct SourceRootConstruction {
+    root: Option<BoundDatabaseRoot>,
+    profile_guard: Option<WritableProfileGuard>,
+    request: Option<Arc<SourceAuthorityRequest>>,
+    input: Option<InputPermit>,
+}
+
 /// Descriptor-bound custody retained by the worker, never reconstructed from a root reference.
 struct ProductionRootCapability {
     root: BoundDatabaseRoot,
@@ -2841,10 +2876,9 @@ impl ProductionRootCapability {
             })
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
             .and_then(|bytes| {
-                bytes.checked_add(if self.source.is_none() {
-                    BoundDatabaseRoot::LEGACY_ARC_FILE_BYTES
-                } else {
-                    0
+                bytes.checked_add(match self.source.as_ref() {
+                    None => BoundDatabaseRoot::LEGACY_ARC_FILE_BYTES,
+                    Some(source) => source.retained_graph_metadata_bytes()?,
                 })
             })
             .ok_or_else(|| String::from("original root backing overflow"))?;
