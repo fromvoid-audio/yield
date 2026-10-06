@@ -702,7 +702,7 @@ impl WorkerState {
             Err(_) => return Err(BindingError::Unknown),
         }
         // Nonblocking no-follow regular-file observation, including FIFO substitution refusal.
-        let mut file = stage_cap
+        let file = stage_cap
             .root
             .open_observation_file_nofollow(Path::new(staging.locator.as_str()))
             .map_err(|_| BindingError::Unknown)?;
@@ -710,6 +710,8 @@ impl WorkerState {
         // This refuses file-handle write/delete aliases, not surviving writable mappings.
         #[cfg(windows)]
         let mut file = windows_staging_share::retain(file).map_err(|_| BindingError::Unknown)?;
+        #[cfg(not(windows))]
+        let mut file = file;
         let metadata = file.metadata().map_err(|_| BindingError::Unknown)?;
         if !metadata.is_file()
             || metadata.len() != proof.bytes
