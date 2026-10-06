@@ -139,6 +139,15 @@ impl CapacityProvider {
             .map_err(|_| CapacityProviderError::RebuildResourceBound)?
             .into_startup_credit();
         let staged = stage_rebuilt_ledger(snapshot.claims(), ledger.next_token)?;
+        #[cfg(test)]
+        SECOND_STAGE_UNWIND.with(|probe| {
+            let (panic, _) = probe.get();
+            probe.set((false, input.historical_test_remaining()));
+            assert!(
+                !panic,
+                "original funded startup second-stage unwind fixture"
+            );
+        });
         let mutation = ChargeMutation::begin(&ledger);
         ledger.next_token = staged.next_token;
         ledger.charges_by_token = staged.charges_by_token;
@@ -148,6 +157,11 @@ impl CapacityProvider {
         mutation.finish(&ledger);
         Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SECOND_STAGE_UNWIND: std::cell::Cell<(bool, usize)> = const { std::cell::Cell::new((false, usize::MAX)) };
 }
 
 #[cfg(test)]
