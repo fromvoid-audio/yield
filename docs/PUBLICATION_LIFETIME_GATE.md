@@ -817,3 +817,29 @@ bounded readback precedes return of the private grant. Existing reserved schema-
 history remains reserved without fabricated association. This provides durable
 issuance evidence, not completion settlement or namespace effect authority. See
 [durable issuance limits and recovery behavior](PUBLICATION_ISSUANCE_BINDING.md).
+
+## Original fence allocation custody (OPT-2412)
+
+The original publication registry prepays its existing 8 KiB header on the original
+`reserve_publication_input` factory before either its shared credit header or its
+first fence allocation. Every genuine registry slot, pending grant/worker handle,
+and private completion observer retains that same debit through private aliases.
+Dropping the actor's registry cannot refund while a worker still retains a fence.
+No raw `Arc` or `Weak` escapes these wrappers.
+
+Every alias drops through `Arc::into_inner`. The winning last alias frees its Arc
+allocation before dropping its moved payload. Fence fields are scalar and the
+shared backing drops last; its own allocation is freed before the original input
+permit refunds. Concurrent final drops return exactly one original debit. Pending
+closure, entered/unsettled/unknown and completion state remain unchanged: memory
+credit return is not storage-charge refund, durable completion or settlement.
+
+The compile-time bound includes the registry, 33 fence payloads plus Arc headers
+(32 retained slots and one conservative construction transient), one original
+input-permit payload/header and the existing 4 KiB mirror allowance. Private
+payload alignment assertions cover Arc header padding. This fits the unchanged
+8 KiB header; slot reclamation actually destroys an old eligible cell before a
+replacement allocation. The original 2 MiB publication subset, 4 MiB input pool
+and control margin remain unchanged. Larger exact completion receipts and SQL
+snapshot/error overlap require separately proved prepaid backing before adoption;
+this scalar custody fix does not supply that future allowance.

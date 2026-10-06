@@ -39,6 +39,8 @@ pub(super) struct Registry {
     exhausted: bool,
     input: Option<Custody<InputPermit>>,
 }
+// Measure the nested optional-slot layout, plus32 retained cells and one
+// conservative construction transient. Old eligible cells actually drop first.
 const _: () = assert!(
     std::mem::size_of::<Registry>()
         + (MAX_FENCES + 1) * (std::mem::size_of::<Fence>() + 2 * std::mem::size_of::<usize>())
