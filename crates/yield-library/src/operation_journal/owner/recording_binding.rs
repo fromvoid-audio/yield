@@ -1,10 +1,36 @@
 //! Original pre-start producer plumbing, with no startup or terminal/effect authority.
+use super::super::participants::{ParticipantKind, ParticipantRequirement};
 use super::*;
 use reson::recording::{
     RecordingLimits, RecordingSettlements, RecordingSinkBinding, RecordingTransport,
     RecordingTransportReceiver,
 };
 use std::sync::Weak;
+
+/// Correlate the exact destination observation with this consumer's held original Source.
+/// This borrowed check does not register a Source, issue admission or grant an effect.
+pub(super) fn matches_original_destination(
+    proposal: &RecordingProposal,
+    request: &crate::sample_sources::db::SourceAuthorityRequest,
+    epoch: u64,
+) -> bool {
+    let parent = proposal.destination().parent();
+    proposal
+        .participants()
+        .descriptors()
+        .iter()
+        .any(|participant| {
+            participant.id() == parent.participant_id()
+                && participant.kind() == ParticipantKind::SourceDatabase
+                && participant.requirement() == ParticipantRequirement::Required
+                && participant.source_fence().is_some_and(|fence| {
+                    fence.source_id() == parent.source_id()
+                        && fence.root_identity() == request.media_root().identity()
+                        && fence.database_identity() == request.database_file_identity()
+                        && fence.lease_epoch() == epoch
+                })
+        })
+}
 
 // Validated proposal (192 KiB), original route backing and original pin/receipt context.
 // No callback ring, serializer or pending write is allocated by this pre-start factory.
@@ -175,7 +201,7 @@ impl OwnerRuntime {
         let _source_effect = pin.begin_effect()?;
         let proposal = self.store().recording_prestart_proposal(operation)?;
         let epoch = u64::try_from(registration.lease_identity.epoch()).map_err(|_| E::Changed)?;
-        if !proposal.matches_original_destination(&source.request, epoch) {
+        if !matches_original_destination(&proposal, &source.request, epoch) {
             return Err(E::Changed.into());
         }
         let snapshot = self.store().rebuild_recording_prestart_snapshot()?;

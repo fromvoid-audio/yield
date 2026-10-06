@@ -280,26 +280,6 @@ impl RecordingProposal {
     pub(crate) fn destination(&self) -> &NamespaceTarget {
         &self.destination
     }
-    /// Compare only the destination's exact Source participant with a held original request.
-    /// This borrowed correlation check is not registration, admission or effect authority.
-    pub(crate) fn matches_original_destination(
-        &self,
-        request: &crate::sample_sources::db::SourceAuthorityRequest,
-        epoch: u64,
-    ) -> bool {
-        let parent = self.destination.parent();
-        self.participants.descriptors().iter().any(|participant| {
-            participant.id() == parent.participant_id()
-                && participant.kind() == ParticipantKind::SourceDatabase
-                && participant.requirement() == ParticipantRequirement::Required
-                && participant.source_fence().is_some_and(|fence| {
-                    fence.source_id() == parent.source_id()
-                        && fence.root_identity() == request.media_root().identity()
-                        && fence.database_identity() == request.database_file_identity()
-                        && fence.lease_epoch() == epoch
-                })
-        })
-    }
     pub(crate) fn retained_metadata_bound(&self) -> Result<u64, RecordingValueError> {
         // SQLite page/rollback growth still requires enforced journal metadata admission;
         // this is only the exact finite maximum encoded payload inventory.

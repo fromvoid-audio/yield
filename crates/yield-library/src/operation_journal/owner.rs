@@ -2313,7 +2313,8 @@ impl OwnerRuntime {
                 reason: "recording lease epoch invalid".into(),
             }
         })?;
-        let current = proposal.matches_original_destination(&source.request, epoch);
+        let current =
+            recording_binding::matches_original_destination(proposal, &source.request, epoch);
         if !current {
             return Err(OperationJournalOwnerError::ChunkClaim {
                 reason: "recording source differs from frozen participant".into(),
