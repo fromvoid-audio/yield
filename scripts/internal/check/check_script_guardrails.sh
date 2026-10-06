@@ -572,6 +572,13 @@ run_taste_invariants_fixture
 run_nextest_quick_profile_fixture
 
 run_expect_exit_code \
+  "actual Markdown link checker fixtures" \
+  0 \
+  "$ROOT_DIR" \
+  python3 \
+  scripts/internal/check/test_markdown_links.py
+
+run_expect_exit_code \
   "parallel isolation runner unit tests" \
   0 \
   "$ROOT_DIR" \
