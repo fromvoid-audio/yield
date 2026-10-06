@@ -1261,10 +1261,39 @@ fn recording_prestart_refuses_actual_cancel_disposition_and_preserves_reservatio
     assert_eq!(store.recording_retained_totals().unwrap(), before);
 }
 
+fn recording_projection_raw_state(
+    connection: &rusqlite::Connection,
+) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    let tables = connection.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'operation_journal%' ORDER BY name").unwrap()
+        .query_map([], |r|r.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let sql = format!(
+                "SELECT * FROM \"{}\" ORDER BY 1",
+                table.replace('"', "\"\"")
+            );
+            let mut statement = connection.prepare(&sql).unwrap();
+            let columns = statement.column_count();
+            let values = statement
+                .query_map([], |r| {
+                    (0..columns)
+                        .map(|n| r.get::<_, rusqlite::types::Value>(n))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (table, values)
+        })
+        .collect()
+}
+
 #[test]
 fn recording_payload_projection_changed_blob_refuses_before_copy() {
     use super::recording_chunks::{PAYLOAD_COPIED_BYTES, PAYLOAD_READ_HOOK, PayloadReader};
     use crate::operation_journal::recording_commands::recording_proposal_for_test;
+    let mut observations = Vec::new();
     for kind in [PayloadReader::Control, PayloadReader::Chunk] {
         let f = fixture();
         let store = OperationJournalStore::open(&f.owner).unwrap();
@@ -1294,6 +1323,8 @@ fn recording_payload_projection_changed_blob_refuses_before_copy() {
         let changed = vec![b'x'; bound + 1];
         let changed_for_hook = changed.clone();
         let id_for_hook = id.clone();
+        let baseline = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let baseline_for_hook = baseline.clone();
         PAYLOAD_READ_HOOK.with(|h| *h.borrow_mut() = Some((kind, Box::new(move |connection| {
             assert!(connection.is_autocommit());
             connection.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
@@ -1316,12 +1347,11 @@ fn recording_payload_projection_changed_blob_refuses_before_copy() {
             "actual recording payload {kind:?}: changed={} copied={copied}",
             changed.len()
         );
-        // Ignore legitimate control payloads read before the chunk boundary.
-        if kind == PayloadReader::Chunk {
-            assert!(copied < 4096, "oversized chunk was copied: {copied}");
-        } else {
-            assert_eq!(copied, 0, "oversized control was copied");
-        }
+        observations.push((kind, copied));
+        assert_eq!(
+            recording_projection_raw_state(&store.connection),
+            *baseline.borrow().as_ref().unwrap()
+        );
         let retained: Vec<u8> = store
             .connection
             .query_row(
@@ -1343,6 +1373,10 @@ fn recording_payload_projection_changed_blob_refuses_before_copy() {
             )
             .unwrap();
         assert_eq!(after, changed);
+        assert_eq!(
+            recording_projection_raw_state(&reopened.connection),
+            *baseline.borrow().as_ref().unwrap()
+        );
         assert!(
             reopened
                 .verify_recording_reservation(&proposal, true)
@@ -1352,4 +1386,8 @@ fn recording_payload_projection_changed_blob_refuses_before_copy() {
                     .is_err()
         );
     }
+    assert!(
+        observations.iter().all(|(_, copied)| *copied == 0),
+        "oversized retained payloads copied: {observations:?}"
+    );
 }
