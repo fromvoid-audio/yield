@@ -38,7 +38,12 @@ activation, operation identities or effects. Historical fixture rows are observa
 not qualified issuance. Normal-build scripts/provider_startup_probe.rs reconstructs the
 same original SQLite bytes through original and funded methods and returns scalar counts,
 zero evidence and checksum only; Shared pool/gate setup is outside measurement. Actual
-test results remain pending until recorded on the issue/PR.
+Test results and their exact tested revisions are recorded on OPT-2400 and its PR.
+
+The display counter measures serialized output length before reserving the output buffer.
+Its writer allocates no backing, but an arbitrary nested Display implementation can still
+allocate internally. Funding those original namespace/native error implementations remains
+part of OPT-2401/2402; this counter does not establish a whole-startup allocation bound.
 
 The Linux current-bootstrap lock-release fixture uses the same isolated-child route as
 the neighboring sealed-bootstrap fixture. Its complete original body, immediate lock
