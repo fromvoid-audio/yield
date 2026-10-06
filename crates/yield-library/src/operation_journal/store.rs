@@ -6025,6 +6025,18 @@ impl OperationJournalStore {
         expected_sequence: i64,
         observation: RetryObservation,
     ) -> Result<JournalRetryReceipt, OperationJournalStoreError> {
+        super::retry_telemetry::observe(
+            super::retry_telemetry::JournalRetryCall::RetryPending,
+            || self.record_retry_pending_inner(operation_id, expected_sequence, observation),
+        )
+    }
+
+    fn record_retry_pending_inner(
+        &self,
+        operation_id: OperationId,
+        expected_sequence: i64,
+        observation: RetryObservation,
+    ) -> Result<JournalRetryReceipt, OperationJournalStoreError> {
         if expected_sequence <= 0 {
             return Err(OperationJournalStoreError::InvalidExpectedSequence {
                 expected: expected_sequence,
@@ -6079,6 +6091,24 @@ impl OperationJournalStore {
     /// durable incomplete staging evidence. The V1-V16 operation codec keeps its RetryPending
     /// retry lease; a validated chunk checkpoint projects PartialNeedsRetry on recovery.
     pub(crate) fn record_post_intent_chunk_exhaustion(
+        &self,
+        operation_id: OperationId,
+        expected_sequence: i64,
+        observation: RetryObservation,
+    ) -> Result<(JournalRetryReceipt, OperationDisposition), OperationJournalStoreError> {
+        super::retry_telemetry::observe(
+            super::retry_telemetry::JournalRetryCall::ChunkExhaustion,
+            || {
+                self.record_post_intent_chunk_exhaustion_inner(
+                    operation_id,
+                    expected_sequence,
+                    observation,
+                )
+            },
+        )
+    }
+
+    fn record_post_intent_chunk_exhaustion_inner(
         &self,
         operation_id: OperationId,
         expected_sequence: i64,
@@ -10015,6 +10045,7 @@ impl From<EncodeError> for OperationJournalStoreError {
 
 #[cfg(test)]
 mod tests {
+    include!("store/retry_telemetry_integration_tests.rs");
     include!("store/historical_claim_observation_tests.rs");
     include!("store/current_reserve_binding_bounds_tests.rs");
     include!("store/ordinary_rebuild_backing_tests.rs");
