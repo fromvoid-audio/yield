@@ -820,6 +820,7 @@ mod integration {
         drop(another_copy);
         drop(handle);
         assert_eq!(budget.used(), 0);
+        drop(budget);
         assert_eq!(
             client.shared.input_bytes.lock().unwrap().remaining[0],
             InputBudget::shared_initial().remaining[0]
@@ -2188,7 +2189,8 @@ mod integration {
                 .unwrap();
             let acquisition = Uuid::parse_str(fixture.owner.owner_identity()).unwrap();
             let (mut collector, handle) =
-                crate::operation_journal::wal_admission::Collector::new(input, permit, acquisition);
+                crate::operation_journal::wal_admission::Collector::new(input, permit, acquisition)
+                    .unwrap();
             if outcome == 12 {
                 let round = loop {
                     if let Some(round) = collector.preparing_round_for_tests() {
@@ -2413,6 +2415,7 @@ mod integration {
             drop(actor);
             assert!(global.shutdown());
             assert!(journal.shutdown());
+            drop(budget);
             assert_eq!(
                 *journal.shared.input_bytes.lock().unwrap(),
                 InputBudget::shared_initial()
@@ -2478,6 +2481,7 @@ mod integration {
             drop(actor);
             assert!(global.shutdown());
             assert!(journal.shutdown());
+            drop(budget);
             assert_eq!(
                 *journal.shared.input_bytes.lock().unwrap(),
                 InputBudget::shared_initial()
@@ -3068,6 +3072,8 @@ mod integration {
             let mut live_header = InputBudget::shared_initial();
             live_header.remaining[InputClass::Ordinary.index()] -= resource_custody::HEADER_BYTES;
             live_header.publication_remaining -= resource_custody::HEADER_BYTES;
+            assert_eq!(budget.used(), 0);
+            drop(budget);
             let released = Instant::now() + Duration::from_secs(1);
             loop {
                 let observed = *journal.shared.input_bytes.lock().unwrap();
@@ -3102,21 +3108,18 @@ mod integration {
                 .unwrap()
                 .unwrap();
             drop(pending);
-            assert_eq!(budget.used(), 0);
-        }
-        drop(actor);
-        assert!(global.shutdown());
-        if outcome == 16 {
-            // OwnerLost conservatively denies clean handoff, even when NoAttempt
-            // backing has been destroyed. Memory release does not waive that refusal.
+            drop(actor);
+            assert!(global.shutdown());
             assert!(!journal.shutdown());
             assert_eq!(
                 *journal.shared.input_bytes.lock().unwrap(),
                 InputBudget::shared_initial()
             );
-        } else {
-            assert!(journal.shutdown());
+            return;
         }
+        drop(actor);
+        assert!(global.shutdown());
+        assert!(journal.shutdown());
         if let Some(detached_report) = detached_report {
             assert!(matches!(detached_report, WalPreparedDatabase::Lease(_)));
             assert!(budget.used() > 0);

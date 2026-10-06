@@ -216,7 +216,7 @@ impl SourceWalTransportOwner {
             return Err(SourceWalTransportRejection::Deadline);
         }
         let observation = SourceWalTransportObservation {
-            data: Arc::new(ObservationData {
+            data: Some(Arc::new(ObservationData {
                 revision: self.request.expected.take().expect("original revision"),
                 correlation: self.request.correlation.clone(),
                 nonce: held.nonce().to_string(),
@@ -225,7 +225,7 @@ impl SourceWalTransportOwner {
                 policy_family: native.family(),
                 registered_custody_retained: self.request.handshake.is_some(),
                 _credit: credit,
-            }),
+            })),
         };
         self.request
             .ticket

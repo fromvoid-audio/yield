@@ -19,7 +19,7 @@ use std::{
     },
     time::Instant,
 };
-mod journal_input;
+pub(super) mod journal_input;
 mod retirement_inventory;
 mod retirement_policy;
 use journal_input::JournalInput;
@@ -208,7 +208,9 @@ impl Collector {
         input: WalPreparationInput,
         journal_input: super::super::owner::InputPermit,
         profile_acquisition: uuid::Uuid,
-    ) -> (Self, WalPreparationHandle) {
+    ) -> Result<(Self, WalPreparationHandle), WalPreparationError> {
+        let journal_input = JournalInput::new(journal_input);
+        input.budget.bind_journal_input(journal_input.clone())?;
         let shared = Arc::new(Shared {
             canceled: AtomicBool::new(false),
             status: Mutex::new(WalPreparationStatus::Preparing),
@@ -219,7 +221,7 @@ impl Collector {
         });
         let capacity = input.sources.len() + usize::from(input.global.is_some());
         let held = Vec::with_capacity(capacity);
-        (
+        Ok((
             Self {
                 input,
                 profile_acquisition,
@@ -234,10 +236,10 @@ impl Collector {
                 ready_cohort: None,
                 current: None,
                 done: false,
-                _journal_input: JournalInput::new(journal_input),
+                _journal_input: journal_input,
             },
             WalPreparationHandle(shared),
-        )
+        ))
     }
     fn bind_source_round(&self, round: &super::CurrentRound) -> Result<(), WalPreparationError> {
         for (index, owner) in self.held.iter().enumerate() {
@@ -656,7 +658,7 @@ impl Collector {
                 source.input,
                 correlation.clone(),
                 self.input.deadline,
-                Arc::clone(&self.input.budget),
+                self.input.budget.clone(),
             ) {
                 Ok(request) => {
                     let Some(bytes) = self.input.retained_bytes() else {
