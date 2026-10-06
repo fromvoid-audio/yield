@@ -206,6 +206,15 @@ impl OperationJournalStore {
         start: &DatabaseAttemptStart,
         new_start: bool,
     ) -> Result<(StoredOperationRecord, DatabaseClaimInventory)> {
+        self.attempt_context_with_input(start, new_start, None)
+    }
+
+    fn attempt_context_with_input(
+        &self,
+        start: &DatabaseAttemptStart,
+        new_start: bool,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(StoredOperationRecord, DatabaseClaimInventory)> {
         let operation = OperationId::from_uuid(start.operation);
         let inventory = database_claims::read(&self.connection, operation)?
             .ok_or_else(|| error("missing actual binding"))?;
@@ -214,13 +223,20 @@ impl OperationJournalStore {
             .read_row(operation)?
             .ok_or_else(|| error("orphan start"))?
             .record;
-        self.validate_database_attempt_journal_claims(&record)?;
+        self.validate_database_attempt_journal_claims_with_input(&record, input)?;
         start
             .validate_bound(&record, &inventory, new_start)
             .map_err(error)?;
         Ok((record, inventory))
     }
     fn audit_attempts(&self) -> Result<Audit> {
+        self.audit_attempts_with_input(None)
+    }
+
+    fn audit_attempts_with_input(
+        &self,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<Audit> {
         count(&self.connection, START_TABLE, None)?;
         count(&self.connection, OUTCOME_TABLE, None)?;
         let mut audit = Audit::default();
@@ -248,7 +264,7 @@ impl OperationJournalStore {
                     }
                     let start =
                         read_start(&self.connection, id)?.ok_or_else(|| error("orphan outcome"))?;
-                    let (_, inventory) = self.attempt_context(&start, false)?;
+                    let (_, inventory) = self.attempt_context_with_input(&start, false, input)?;
                     read_outcome(&self.connection, &start)?;
                     if table == START_TABLE {
                         let binding = inventory
@@ -298,8 +314,16 @@ impl OperationJournalStore {
         }
         Ok(audit)
     }
+    #[allow(dead_code)] // Preserve the original unfunded entry point.
     pub(super) fn validate_database_attempts_inside_transaction(&self) -> Result<()> {
-        self.audit_attempts().map(|_| ())
+        self.validate_database_attempts_inside_transaction_with_input(None)
+    }
+
+    pub(super) fn validate_database_attempts_inside_transaction_with_input(
+        &self,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<()> {
+        self.audit_attempts_with_input(input).map(|_| ())
     }
 
     /// Point readback is observation only, including exact nonce response-loss recovery.

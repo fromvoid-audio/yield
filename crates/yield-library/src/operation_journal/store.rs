@@ -71,6 +71,9 @@ use super::validation::{RecordConsistency, classify_record};
 mod admission_rebuild_backing;
 mod chunk_claims;
 mod chunk_staging;
+mod namespace_backing;
+#[cfg(any(test, feature = "test-support"))]
+mod namespace_backing_probe;
 pub(super) use admission_rebuild_backing::FundedSnapshot;
 mod historical_claim_observation;
 mod legacy_allocation_observation;
@@ -1808,30 +1811,32 @@ impl OperationJournalStore {
         &self,
         input: Option<&super::owner::InputPermit>,
     ) -> Result<FundedSnapshot, OperationJournalStoreError> {
-        self.validate_namespace()?;
+        self.validate_namespace_with_input(input, false)?;
         self.connection.execute_batch("BEGIN")?;
         // Original transaction/validation order; credit precedes all working backing.
         let mut collection = None;
-        let snapshot =
-            match self.rebuild_ordinary_claim_snapshot_with_funding(input, &mut collection) {
-                Ok(snapshot) => {
-                    if let Err(error) = self.validate_chunk_claims_inside_transaction() {
-                        let _ = self.connection.execute_batch("ROLLBACK");
-                        return Err(error);
-                    }
-                    snapshot
-                }
-                Err(error) => {
+        let snapshot = match self
+            .rebuild_ordinary_claim_snapshot_with_funding(input, &mut collection)
+        {
+            Ok(snapshot) => {
+                if let Err(error) = self.validate_chunk_claims_inside_transaction_with_input(input)
+                {
                     let _ = self.connection.execute_batch("ROLLBACK");
                     return Err(error);
                 }
-            };
-        if let Err(error) = self.validate_namespace_for_precommit() {
+                snapshot
+            }
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.validate_namespace_with_input(input, true) {
             let _ = self.connection.execute_batch("ROLLBACK");
             return Err(error);
         }
         self.connection.execute_batch("ROLLBACK")?;
-        self.validate_namespace()?;
+        self.validate_namespace_with_input(input, false)?;
         Ok(FundedSnapshot::new(
             snapshot,
             collection.map(admission_rebuild_backing::Collection::into_credit),
@@ -1860,14 +1865,14 @@ impl OperationJournalStore {
         &self,
         input: Option<&super::owner::InputPermit>,
     ) -> Result<FundedSnapshot, OperationJournalStoreError> {
-        self.validate_namespace()?;
+        self.validate_namespace_with_input(input, false)?;
         self.connection.execute_batch("BEGIN")?;
         // Declare credit before output/working backing so error/unwind drops backing first.
         let mut collection = None;
         let result = (|| {
             let snapshot =
                 self.rebuild_ordinary_claim_snapshot_with_funding(input, &mut collection)?;
-            self.validate_chunk_claims_inside_transaction()?;
+            self.validate_chunk_claims_inside_transaction_with_input(input)?;
             match input {
                 Some(input) => recovery_reserve::prove_no_active_charges_for_input(
                     &self.connection,
@@ -1883,13 +1888,13 @@ impl OperationJournalStore {
                     },
                 )?,
             }
-            self.validate_namespace_for_precommit()?;
+            self.validate_namespace_with_input(input, true)?;
             Ok(snapshot)
         })();
         match result {
             Ok(snapshot) => {
                 self.connection.execute_batch("ROLLBACK")?;
-                self.validate_namespace()?;
+                self.validate_namespace_with_input(input, false)?;
                 Ok(FundedSnapshot::new(
                     snapshot,
                     collection.map(admission_rebuild_backing::Collection::into_credit),
@@ -7267,7 +7272,7 @@ impl OperationJournalStore {
         input: Option<&super::owner::InputPermit>,
         collection: &mut Option<admission_rebuild_backing::Collection>,
     ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
-        self.validate_namespace_for_precommit()?;
+        self.validate_namespace_with_input(input, true)?;
         if let Some(input) = input {
             *collection = Some(admission_rebuild_backing::Collection::new(
                 &self.connection,
@@ -7503,9 +7508,16 @@ impl OperationJournalStore {
     }
 
     fn validate_chunk_claims_inside_transaction(&self) -> Result<(), OperationJournalStoreError> {
+        self.validate_chunk_claims_inside_transaction_with_input(None)
+    }
+
+    fn validate_chunk_claims_inside_transaction_with_input(
+        &self,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
         self.validate_recording_inventory_inside_transaction()?;
         self.validate_database_claims_inside_transaction()?;
-        self.validate_database_attempts_inside_transaction()?;
+        self.validate_database_attempts_inside_transaction_with_input(input)?;
         if chunk_claims::exceeds_row_limit(&self.connection, ordinary_claims::MAX_PAGE_ROWS)
             .map_err(|error| OperationJournalStoreError::ChunkClaim {
                 reason: error.to_string(),
@@ -9967,10 +9979,13 @@ fn validate_connection_identity(
 
 fn map_identity_error(error: DatabaseIdentityError) -> OperationJournalStoreError {
     match error {
-        DatabaseIdentityError::Io { path, source } => io_error(&path, source),
-        DatabaseIdentityError::NotRegular { path } => {
-            audit_error(&path, "journal database is not a regular file")
+        DatabaseIdentityError::Io { path, source } => {
+            OperationJournalStoreError::Io { path, source }
         }
+        DatabaseIdentityError::NotRegular { path } => OperationJournalStoreError::RequiresAudit {
+            path,
+            reason: "journal database is not a regular file".into(),
+        },
         DatabaseIdentityError::Replaced { path } => {
             OperationJournalStoreError::DatabaseReplaced { path }
         }
@@ -9980,7 +9995,12 @@ fn map_identity_error(error: DatabaseIdentityError) -> OperationJournalStoreErro
         DatabaseIdentityError::ConnectionMismatch { path, reason } => {
             OperationJournalStoreError::ConnectionIdentityMismatch { path, reason }
         }
-        DatabaseIdentityError::UnsafeSidecar { path, reason } => audit_error(&path, reason),
+        DatabaseIdentityError::UnsafeSidecar { path, reason } => {
+            OperationJournalStoreError::RequiresAudit {
+                path,
+                reason: reason.into(),
+            }
+        }
     }
 }
 
@@ -10029,6 +10049,7 @@ mod tests {
     include!("store/historical_claim_observation_tests.rs");
     include!("store/current_reserve_binding_bounds_tests.rs");
     include!("store/ordinary_rebuild_backing_tests.rs");
+    include!("store/namespace_backing_native_tests.rs");
     include!("store/publication_binding_tests.rs");
     include!("store/database_claims_tests.rs");
     include!("store/recording_retention_tests.rs");

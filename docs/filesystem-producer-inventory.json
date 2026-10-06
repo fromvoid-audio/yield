@@ -1124,6 +1124,176 @@
       "retirement": "Keep as isolated original database-claim scalar projection regression coverage."
     },
     {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/capacity_startup_tests.rs",
+      "function": "capacity_startup_actual_worker_component_preserves_original_bytes_and_exact_refunds",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2400",
+      "reason": "cfg(test) original worker/store/provider startup component and exact original-pool header pressure. Hook always ends explicit Unsupported before activation/IDs/effects; full original durable image and post-join exact pool refill checked. No physical proof or qualification supplied.",
+      "retirement": "Retain only this explicit original-startup verification harness; no portable hook or fixture rows may activate admission or waive native original production resource acceptance."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/capacity_startup_tests.rs",
+      "function": "capacity_startup_native_production_rebuilds_original_descriptor_bound_image",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2400",
+      "reason": "cfg(macos,test) original production registry/bootstrap and actual descriptor facts; component hook OFF. Historical seeded claim is a fixture observation, not qualified issuance or physical qualification. Genuine native execution separately required.",
+      "retirement": "Retain only this explicit original-startup verification harness; no portable hook or fixture rows may activate admission or waive native original production resource acceptance."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/capacity_startup_tests.rs",
+      "function": "capacity_startup_native_production_rebuilds_original_descriptor_bound_image",
+      "operation": "journal::start",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2400",
+      "reason": "cfg(macos,test) original production registry/bootstrap and actual descriptor facts; component hook OFF. Historical seeded claim is a fixture observation, not qualified issuance or physical qualification. Genuine native execution separately required.",
+      "retirement": "Retain only this explicit original-startup verification harness; no portable hook or fixture rows may activate admission or waive native original production resource acceptance."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_same_original_store_preserves_outcome_and_selected_debit",
+      "operation": "fs::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated actual retained journal/profile fixture creates and removes only controlled WAL evidence to test original namespace refusal, unchanged durable bytes, exact pool pressure and original request/error lifetime. No production filesystem effect, grant, retry or settlement is issued.",
+      "retirement": "Keep as same-original namespace backing regression; genuine platform and physical qualification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_same_original_store_preserves_outcome_and_selected_debit",
+      "operation": "fs::remove_file",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated actual retained journal/profile fixture creates and removes only controlled WAL evidence to test original namespace refusal, unchanged durable bytes, exact pool pressure and original request/error lifetime. No production filesystem effect, grant, retry or settlement is issued.",
+      "retirement": "Keep as same-original namespace backing regression; genuine platform and physical qualification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_error_outlives_request_and_original_worker_join",
+      "operation": "fs::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated actual retained journal/profile fixture creates and removes only controlled WAL evidence to test original namespace refusal, unchanged durable bytes, exact pool pressure and original request/error lifetime. No production filesystem effect, grant, retry or settlement is issued.",
+      "retirement": "Keep as same-original namespace backing regression; genuine platform and physical qualification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_error_outlives_request_and_original_worker_join",
+      "operation": "fs::remove_file",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated actual retained journal/profile fixture creates and removes only controlled WAL evidence to test original namespace refusal, unchanged durable bytes, exact pool pressure and original request/error lifetime. No production filesystem effect, grant, retry or settlement is issued.",
+      "retirement": "Keep as same-original namespace backing regression; genuine platform and physical qualification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_lost_reply_refunds_only_after_worker_join",
+      "operation": "fs::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated actual retained journal/profile fixture creates and removes only controlled WAL evidence to test original namespace refusal, unchanged durable bytes, exact pool pressure and original request/error lifetime. No production filesystem effect, grant, retry or settlement is issued.",
+      "retirement": "Keep as same-original namespace backing regression; genuine platform and physical qualification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_lost_reply_refunds_only_after_worker_join",
+      "operation": "fs::remove_file",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated actual retained journal/profile fixture creates and removes only controlled WAL evidence to test original namespace refusal, unchanged durable bytes, exact pool pressure and original request/error lifetime. No production filesystem effect, grant, retry or settlement is issued.",
+      "retirement": "Keep as same-original namespace backing regression; genuine platform and physical qualification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_same_original_store_preserves_outcome_and_selected_debit",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_exact_pressure_precedes_original_path_error",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_last_original_reply_alias_and_no_overwrite",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_missing_consumer_refuses_before_original_namespace",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_error_outlives_request_and_original_worker_join",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_error_outlives_request_and_original_worker_join",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_lost_reply_refunds_only_after_worker_join",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_lost_reply_refunds_only_after_worker_join",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
       "path": "crates/yield-library/src/sample_sources/db/file_ops_journal/recovery_io/windows_owned_security.rs",
       "function": "windows_owned_security_metadata_first_refuses_actual_device_and_reparse_directory",
       "operation": "fs::create_dir",
@@ -1184,34 +1354,44 @@
       "retirement": "Retain as native regression fixture while the read-only exact-held-directory snapshot exists; fixture execution cannot qualify publication or canonical bootstrap."
     },
     {
-      "path": "crates/yield-library/src/operation_journal/owner/tests/capacity_startup_tests.rs",
-      "function": "capacity_startup_actual_worker_component_preserves_original_bytes_and_exact_refunds",
-      "operation": "journal::open",
-      "count": 2,
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "operation": "fs::remove_file",
+      "count": 1,
       "classification": "fixture",
-      "issue": "OPT-2400",
-      "reason": "cfg(test) original worker/store/provider startup component and exact original-pool header pressure. Hook always ends explicit Unsupported before activation/IDs/effects; full original durable image and post-join exact pool refill checked. No physical proof or qualification supplied.",
-      "retirement": "Retain only this explicit original-startup verification harness; no portable hook or fixture rows may activate admission or waive native original production resource acceptance."
+      "issue": "OPT-2402",
+      "reason": "cfg(macos,test) actual original production Store/root/profile/registry/reserve startup with component hook off. Retained real WAL evidence triggers original queued namespace refusal; both caller APIs retain exact namespace/reply backing through genuine worker join, with unchanged original database and zero IDs. Native SDK/runtime and supported filesystem execution is separate.",
+      "retirement": "Retain only this exact original namespace consumer verification. This fixture does not supply physical qualification, permits, retry, reservation refund, effect, cleanup or settlement."
     },
     {
-      "path": "crates/yield-library/src/operation_journal/owner/tests/capacity_startup_tests.rs",
-      "function": "capacity_startup_native_production_rebuilds_original_descriptor_bound_image",
-      "operation": "journal::open",
-      "count": 2,
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "operation": "fs::write",
+      "count": 1,
       "classification": "fixture",
-      "issue": "OPT-2400",
-      "reason": "cfg(macos,test) original production registry/bootstrap and actual descriptor facts; component hook OFF. Historical seeded claim is a fixture observation, not qualified issuance or physical qualification. Genuine native execution separately required.",
-      "retirement": "Retain only this explicit original-startup verification harness; no portable hook or fixture rows may activate admission or waive native original production resource acceptance."
+      "issue": "OPT-2402",
+      "reason": "cfg(macos,test) actual original production Store/root/profile/registry/reserve startup with component hook off. Retained real WAL evidence triggers original queued namespace refusal; both caller APIs retain exact namespace/reply backing through genuine worker join, with unchanged original database and zero IDs. Native SDK/runtime and supported filesystem execution is separate.",
+      "retirement": "Retain only this exact original namespace consumer verification. This fixture does not supply physical qualification, permits, retry, reservation refund, effect, cleanup or settlement."
     },
     {
-      "path": "crates/yield-library/src/operation_journal/owner/tests/capacity_startup_tests.rs",
-      "function": "capacity_startup_native_production_rebuilds_original_descriptor_bound_image",
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "cfg(macos,test) actual original production Store/root/profile/registry/reserve startup with component hook off. Retained real WAL evidence triggers original queued namespace refusal; both caller APIs retain exact namespace/reply backing through genuine worker join, with unchanged original database and zero IDs. Native SDK/runtime and supported filesystem execution is separate.",
+      "retirement": "Retain only this exact original namespace consumer verification. This fixture does not supply physical qualification, permits, retry, reservation refund, effect, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
       "operation": "journal::start",
       "count": 1,
       "classification": "fixture",
-      "issue": "OPT-2400",
-      "reason": "cfg(macos,test) original production registry/bootstrap and actual descriptor facts; component hook OFF. Historical seeded claim is a fixture observation, not qualified issuance or physical qualification. Genuine native execution separately required.",
-      "retirement": "Retain only this explicit original-startup verification harness; no portable hook or fixture rows may activate admission or waive native original production resource acceptance."
+      "issue": "OPT-2402",
+      "reason": "cfg(macos,test) actual original production Store/root/profile/registry/reserve startup with component hook off. Retained real WAL evidence triggers original queued namespace refusal; both caller APIs retain exact namespace/reply backing through genuine worker join, with unchanged original database and zero IDs. Native SDK/runtime and supported filesystem execution is separate.",
+      "retirement": "Retain only this exact original namespace consumer verification. This fixture does not supply physical qualification, permits, retry, reservation refund, effect, cleanup or settlement."
     }
   ]
 }

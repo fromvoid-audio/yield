@@ -28,7 +28,8 @@ impl ProviderStartupProbe<'_> {
         .map_err(|e| e.to_string())?;
         let debit = if funded {
             header_bytes()
-                .checked_add(snapshot.collection_debit_for_test())
+                .checked_add(self.store.retained_namespace_working_bytes_for_test())
+                .and_then(|n| n.checked_add(snapshot.collection_debit_for_test()))
                 .and_then(|n| {
                     n.checked_add(scratch_bytes(snapshot.claims(), &provider.ledger.borrow())?)
                 })
@@ -112,7 +113,7 @@ impl super::super::super::store::OperationJournalStore {
     pub fn provider_startup_probe_for_test(&self) -> ProviderStartupProbe<'_> {
         ProviderStartupProbe {
             store: self,
-            input: InputPermit::historical_test_input(1),
+            input: InputPermit::historical_test_namespace_input(1),
         }
     }
 }

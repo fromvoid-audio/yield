@@ -13,6 +13,18 @@ fn ordinary_rebuild_backing_actual_queued_collection_pressure_precedes_identity_
     store
         .install_historical_claim_fixture(old_id, 1, wire.as_bytes(), Uuid::new_v4())
         .unwrap();
+    let rows = store.ordinary_collection_pressure_rows_for_test().unwrap();
+    store
+        .install_ordinary_collection_fixture_for_test(old_id, rows, false)
+        .unwrap();
+    let collection_debit = store
+        .ordinary_collection_allocation_probe_for_test(true)
+        .unwrap()
+        .2;
+    assert!(
+        collection_debit - 1 > store.retained_namespace_working_bytes_for_test(),
+        "exact preceding original namespace allocation must fit"
+    );
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
     wait_until_available(&owner);
     let prepared = prepared_copy_input(
@@ -23,12 +35,13 @@ fn ordinary_rebuild_backing_actual_queued_collection_pressure_precedes_identity_
     let request_bytes = bounded_prepared_admission_input(&prepared).unwrap();
     let available = owner.shared.input_bytes.lock().unwrap().remaining[0];
     // Fund the genuine command, reply header, and complete terminal consumer;
-    // leave exactly 4 KiB for the count/collection phase, not an earlier refusal.
+    // Leave one byte below the exact collection debit, while funding the original
+    // preceding namespace phase. This remains a collection-stage refusal.
     let held_bytes = available
         - request_bytes
         - HISTORICAL_REPLY_BYTES
         - crate::operation_journal::store::HISTORICAL_DIAGNOSTIC_BYTES
-        - 4096;
+        - (collection_debit - 1);
     let held = owner
         .shared
         .reserve_input(InputClass::Ordinary, held_bytes)
@@ -56,7 +69,7 @@ fn ordinary_rebuild_backing_actual_queued_collection_pressure_precedes_identity_
     let store = OperationJournalStore::open(&fixture.owner).unwrap();
     assert_eq!(store.get(old_id).unwrap().unwrap().operation_id, old_id);
     let snapshot = store.rebuild_admission_snapshot().unwrap();
-    assert_eq!(snapshot.claims().len(), 1);
+    assert_eq!(snapshot.claims().len(), rows);
 }
 
 #[test]
@@ -256,6 +269,7 @@ fn historical_claim_late_send_disposes_payload_before_original_reply_credit() {
         _header: header,
         consumer: Mutex::new(None),
         observer: Mutex::new(None),
+        namespace: Mutex::new(None),
         consumer_refused: std::sync::atomic::AtomicBool::new(false),
     });
     let mut input = shared.reserve_input(InputClass::Ordinary, 1).unwrap();
@@ -292,13 +306,19 @@ fn historical_claim_late_send_disposes_payload_before_original_reply_credit() {
 fn historical_claim_earliest_consumer_refusal_keeps_precharged_reply_through_delivery() {
     let fixture = fixture("historical-claim-earliest-refusal");
     let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let durable_path = fixture
+        .owner
+        .profile_root()
+        .join(crate::operation_journal::JOURNAL_DATABASE_ROOT_NAME)
+        .join(crate::operation_journal::JOURNAL_DATABASE_FILE_NAME);
+    let original_bytes = fs::read(&durable_path).unwrap();
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
     wait_until_available(&owner);
     let limit = InputBudget::shared_initial().remaining[InputClass::Ordinary.index()];
-    let retained = owner
+    owner
         .shared
-        .reserve_input(InputClass::Ordinary, limit - 64 * 1024)
-        .unwrap();
+        .historical_consumer_pause
+        .store(true, Ordering::Release);
     let mut request = owner
         .client()
         .admit_prepared(prepared_copy_input(
@@ -308,6 +328,34 @@ fn historical_claim_earliest_consumer_refusal_keeps_precharged_reply_through_del
         ))
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
+    while !owner
+        .shared
+        .historical_consumer_entered
+        .load(Ordering::Acquire)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "same original namespace never reached consumer boundary"
+        );
+        std::thread::yield_now();
+    }
+    // The namespace working loan can exceed the consumer loan. Pressure before
+    // dispatch would test the earlier producer instead. Drain this same actual
+    // pool only after successful namespace validation, with request/header live.
+    let remaining = owner.shared.input_bytes.lock().unwrap().remaining[0];
+    let margin = crate::operation_journal::store::HISTORICAL_DIAGNOSTIC_BYTES - 1;
+    let retained = owner
+        .shared
+        .reserve_input(InputClass::Ordinary, remaining - margin)
+        .unwrap();
+    assert_eq!(
+        owner.shared.input_bytes.lock().unwrap().remaining[0],
+        margin
+    );
+    owner
+        .shared
+        .historical_consumer_pause
+        .store(false, Ordering::Release);
     while !request
         .historical_reply
         .as_ref()
@@ -327,6 +375,7 @@ fn historical_claim_earliest_consumer_refusal_keeps_precharged_reply_through_del
         retained.bytes + HISTORICAL_REPLY_BYTES
     );
     assert_eq!(owner.prepared_admission_id_allocations(), 0);
+    assert_eq!(fs::read(&durable_path).unwrap(), original_bytes);
     let Err(OperationJournalOwnerError::PreparedAdmission(
         PreparedAdmissionError::RecoveryRequired { reason },
     )) = request.recv_timeout(Duration::from_secs(5)).unwrap()
@@ -352,6 +401,7 @@ fn historical_claim_concurrent_last_reply_aliases_refund_exact_original_pool() {
         let shared = Arc::new(OwnerShared::new(senders));
         let before = shared.input_bytes.lock().unwrap().remaining[0];
         let backing = HistoricalReply::new(HistoricalReplyBacking {
+            namespace: Mutex::new(None),
             consumer: Mutex::new(Some(
                 shared.reserve_input(InputClass::Ordinary, 1024).unwrap(),
             )),

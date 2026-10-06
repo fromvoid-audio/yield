@@ -2839,7 +2839,6 @@ mod integration {
         };
         let (projection_tx, projection_rx) = std::sync::mpsc::sync_channel(1);
         let mut projection_gate = None;
-        let full_credit = Arc::new(Mutex::new(None));
         if inventory_case == 2 {
             let token = actor
                 .tokens
@@ -2868,11 +2867,10 @@ mod integration {
             projection_gate = Some(release_tx);
         } else if inventory_case == 3 {
             let budget = budget.clone();
-            let full_credit = Arc::clone(&full_credit);
-            handle.retirement_hook_for_tests(move |_| {
+            handle.retirement_pressure_hook_for_tests(move |_| {
                 let mut credit = budget.credit();
                 credit.resize(64 * 1024 - budget.used()).unwrap();
-                *full_credit.lock().unwrap() = Some(credit);
+                credit
             });
         }
         let inventory_no_effects = (inventory_case != 0).then(|| {
@@ -2937,7 +2935,6 @@ mod integration {
                 ),
                 "{result:?}"
             );
-            drop(full_credit.lock().unwrap().take());
         } else if outcome >= 14 {
             assert!(
                 result.is_err(),

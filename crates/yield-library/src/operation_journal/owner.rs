@@ -13,8 +13,12 @@ pub use super::wal_admission::{
 };
 mod frozen_copy;
 mod historical_reply;
+mod namespace_credit;
+pub use namespace_credit::RetainedCommandError;
 mod startup_credit;
 use historical_reply::HistoricalReply;
+#[cfg(any(test, feature = "test-support"))]
+pub use namespace_credit::JournalNamespaceFundingProbe;
 pub(super) use startup_credit::StartupCredit;
 mod queue_metrics;
 pub use queue_metrics::{JournalQueueClassMetrics, JournalQueueMetricsSnapshot};
@@ -597,6 +601,9 @@ impl From<CapacityProviderError> for PreparedAdmissionError {
 /// Failure returned by an admitted journal command.
 #[derive(Debug, Error)]
 pub enum OperationJournalOwnerError {
+    /// Original namespace failure retaining its pool backing through caller destruction.
+    #[error(transparent)]
+    RetainedBacking(RetainedCommandError),
     /// Original memory-only recording preparation could not be retained or revalidated.
     #[error(transparent)]
     RecordingProducerCustody(#[from] RecordingProducerCustodyError),
@@ -739,8 +746,10 @@ impl<T> OperationJournalRequest<T> {
         {
             Ok(result) => {
                 self.result_permit.take();
-                self.historical_reply.take();
-                Ok(result)
+                Ok(namespace_credit::retain_result_error(
+                    result,
+                    self.historical_reply.take(),
+                ))
             }
             Err(TryRecvError::Empty) => Err(OperationJournalRequestError::Empty),
             Err(TryRecvError::Disconnected) => {
@@ -764,8 +773,10 @@ impl<T> OperationJournalRequest<T> {
         {
             Ok(result) => {
                 self.result_permit.take();
-                self.historical_reply.take();
-                Ok(result)
+                Ok(namespace_credit::retain_result_error(
+                    result,
+                    self.historical_reply.take(),
+                ))
             }
             Err(RecvTimeoutError::Timeout) => Err(OperationJournalRequestError::Empty),
             Err(RecvTimeoutError::Disconnected) => {
@@ -1950,17 +1961,19 @@ impl OwnerRuntime {
             .validate_shape()
             .map_err(OperationJournalOwnerError::from)?;
         self.store()
-            .validate_for_admission()
+            .validate_namespace_with_input(input, false)
             .map_err(OperationJournalOwnerError::from)?;
         if let UniversalCommandArgs::Recording(proposal) = &prepared.args {
             self.store()
-                .validate_recording_capacity_binding(proposal, &prepared.plan)?;
+                .validate_recording_capacity_binding_with_input(proposal, &prepared.plan, input)?;
         }
 
         // Re-read the durable ordinary-claim image for every request. Startup readiness is only
         // a bootstrap observation and cannot authorize a later request after new recovery rows
         // or settlement evidence arrive.
         if let Some(input) = input {
+            #[cfg(test)]
+            input.historical_consumer_test_gate();
             input.fund_historical_consumer().map_err(|error| {
                 PreparedAdmissionError::RecoveryRequired {
                     reason: error.to_string(),
@@ -5629,6 +5642,7 @@ impl OperationJournalClient {
                 _header: header,
                 consumer: Mutex::new(None),
                 observer: Mutex::new(None),
+                namespace: Mutex::new(None),
                 #[cfg(test)]
                 consumer_refused: std::sync::atomic::AtomicBool::new(false),
             });
@@ -5793,6 +5807,10 @@ struct OwnerShared {
     #[cfg(test)]
     recovery_audit_entered: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    historical_consumer_pause: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    historical_consumer_entered: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     provider_reconciliation_component: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     startup_component: std::sync::atomic::AtomicBool,
@@ -5825,6 +5843,10 @@ impl OwnerShared {
             recovery_audit_pause: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             recovery_audit_entered: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            historical_consumer_pause: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            historical_consumer_entered: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             provider_reconciliation_component: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -6062,6 +6084,7 @@ pub(super) struct InputPermit {
 struct HistoricalReplyBacking {
     consumer: Mutex<Option<InputPermit>>,
     observer: Mutex<Option<HistoricalObserverCredits>>,
+    namespace: Mutex<Option<namespace_credit::NamespaceCredits>>,
     #[cfg(test)]
     consumer_refused: std::sync::atomic::AtomicBool,
     // Release working/consumer storage first; the private wrapper already freed the Arc.
@@ -6089,6 +6112,27 @@ impl InputPermit {
         Arc::new(OwnerShared::new(senders))
             .reserve_input(InputClass::Ordinary, bytes)
             .expect("test original input pool")
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn historical_test_namespace_input(bytes: usize) -> Self {
+        let (senders, _receivers) = OwnerCommandReceivers::channel();
+        let shared = Arc::new(OwnerShared::new(senders));
+        let header = shared
+            .reserve_input(InputClass::Ordinary, HISTORICAL_REPLY_BYTES)
+            .expect("original namespace reply header");
+        let mut input = shared
+            .reserve_input(InputClass::Ordinary, bytes)
+            .expect("original namespace test input");
+        input.historical_reply = Some(HistoricalReply::new(HistoricalReplyBacking {
+            consumer: Mutex::new(None),
+            observer: Mutex::new(None),
+            namespace: Mutex::new(None),
+            #[cfg(test)]
+            consumer_refused: std::sync::atomic::AtomicBool::new(false),
+            _header: header,
+        }));
+        input
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -6125,6 +6169,33 @@ impl InputPermit {
 
     pub(super) fn has_historical_error_consumer(&self) -> bool {
         self.historical_reply.is_some()
+    }
+
+    /// Stop only after the same original namespace has succeeded, before the
+    /// original consumer loan. Tests can then apply pressure at that exact stage.
+    #[cfg(test)]
+    fn historical_consumer_test_gate(&self) {
+        if self
+            .shared
+            .historical_consumer_pause
+            .load(Ordering::Acquire)
+        {
+            self.shared
+                .historical_consumer_entered
+                .store(true, Ordering::Release);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while self
+                .shared
+                .historical_consumer_pause
+                .load(Ordering::Acquire)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "original historical consumer test gate timed out"
+                );
+                std::thread::yield_now();
+            }
+        }
     }
 
     pub(super) fn retain_historical_error(
@@ -7550,6 +7621,7 @@ mod tests {
     }
     mod capacity_startup_tests;
     mod historical_claim_admission_tests;
+    mod namespace_backing_tests;
     mod provider_reconciliation_tests;
     mod resource_custody_tests;
     mod source_registry_handoff_tests;

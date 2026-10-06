@@ -105,6 +105,7 @@ impl OwnerShared {
         input.historical_reply = Some(HistoricalReply::new(HistoricalReplyBacking {
             consumer: Mutex::new(None),
             observer: Mutex::new(None),
+            namespace: Mutex::new(None),
             #[cfg(test)]
             consumer_refused: std::sync::atomic::AtomicBool::new(false),
             _header: header,

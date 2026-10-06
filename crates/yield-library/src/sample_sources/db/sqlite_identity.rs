@@ -16,6 +16,9 @@ use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 
 use super::BoundDatabaseRoot;
 
+mod connection_observation;
+mod native_error_message;
+
 /// Errors returned by a no-follow SQLite file or connection identity check.
 #[derive(Debug)]
 pub(crate) enum DatabaseIdentityError {
@@ -314,104 +317,37 @@ pub(crate) fn validate_connection_identity(
     path: &Path,
     expected_identity: &str,
 ) -> Result<(), DatabaseIdentityError> {
-    #[cfg(unix)]
-    {
-        let mut moved = 0_i32;
-        let return_code = unsafe {
-            // Connection::handle is valid for the duration of this borrow. SQLite writes only
-            // the boolean result into moved; the operation does not retain any pointer.
-            rusqlite::ffi::sqlite3_file_control(
-                connection.handle(),
-                c"main".as_ptr(),
-                rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
-                (&mut moved as *mut i32).cast(),
-            )
-        };
-        if return_code != rusqlite::ffi::SQLITE_OK {
-            return Err(DatabaseIdentityError::Unavailable {
-                path: path.to_path_buf(),
-                reason: format!("SQLITE_FCNTL_HAS_MOVED returned {return_code}"),
-            });
-        }
-        if moved != 0 {
-            return Err(DatabaseIdentityError::Replaced {
-                path: path.to_path_buf(),
-            });
-        }
-        let _ = expected_identity;
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    {
-        use std::ptr::null_mut;
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-        };
-
-        let mut native_handle = HANDLE(null_mut());
-        let return_code = unsafe {
-            // SQLite returns a borrowed native handle. Inspect it without closing or wrapping it
-            // in an owning Rust file object.
-            rusqlite::ffi::sqlite3_file_control(
-                connection.handle(),
-                c"main".as_ptr(),
-                rusqlite::ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
-                (&mut native_handle as *mut HANDLE).cast(),
-            )
-        };
-        if return_code != rusqlite::ffi::SQLITE_OK {
-            return Err(DatabaseIdentityError::Unavailable {
-                path: path.to_path_buf(),
-                reason: format!("SQLITE_FCNTL_WIN32_GET_HANDLE returned {return_code}"),
-            });
-        }
-        if native_handle.is_invalid() {
-            return Err(DatabaseIdentityError::Unavailable {
-                path: path.to_path_buf(),
-                reason: String::from("SQLite returned an invalid native file handle"),
-            });
-        }
-        let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        unsafe { GetFileInformationByHandle(native_handle, &mut information) }.map_err(
-            |error| DatabaseIdentityError::Unavailable {
-                path: path.to_path_buf(),
-                reason: format!("GetFileInformationByHandle failed: {error}"),
-            },
-        )?;
-        let actual_identity = format_windows_identity(&information);
-        if actual_identity != expected_identity {
-            return Err(DatabaseIdentityError::ConnectionMismatch {
-                path: path.to_path_buf(),
-                reason: String::from("SQLite native handle identifies a different file"),
-            });
-        }
-        Ok(())
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (connection, expected_identity);
-        Err(DatabaseIdentityError::Unavailable {
-            path: path.to_path_buf(),
-            reason: String::from("no verified SQLite connection identity control exists"),
-        })
+    match validate_connection_identity_with_funding(connection, path, expected_identity, |_| {
+        Ok::<(), std::convert::Infallible>(())
+    }) {
+        Ok(()) => Ok(()),
+        Err(ConnectionIdentityFailure::Observed(error)) => Err(error),
+        Err(ConnectionIdentityFailure::Funding(never)) => match never {},
     }
 }
 
-#[cfg(windows)]
-fn format_windows_identity(
-    information: &windows::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION,
-) -> String {
-    let file_index =
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-    let creation_time = (u64::from(information.ftCreationTime.dwHighDateTime) << 32)
-        | u64::from(information.ftCreationTime.dwLowDateTime);
-    format!(
-        "windows:{}:{}:{}",
-        information.dwVolumeSerialNumber, file_index, creation_time
-    )
+/// Selected original native refusal or a pre-copy resource refusal.
+/// Neither carries filesystem, admission or retry authority.
+pub(crate) enum ConnectionIdentityFailure<E> {
+    Observed(DatabaseIdentityError),
+    Funding(E),
+}
+
+/// Query the same original connection and prepay each owned refusal allocation.
+/// Caller-owned working/header/consumer backing remains a separate obligation.
+pub(crate) fn validate_connection_identity_with_funding<E>(
+    connection: &Connection,
+    path: &Path,
+    expected_identity: &str,
+    reserve: impl FnMut(usize) -> Result<(), E>,
+) -> Result<(), ConnectionIdentityFailure<E>> {
+    match connection_observation::observe(connection, expected_identity) {
+        Ok(()) => Ok(()),
+        Err(refusal) => match connection_observation::materialize(refusal, path, reserve) {
+            Ok(error) => Err(ConnectionIdentityFailure::Observed(error)),
+            Err(error) => Err(ConnectionIdentityFailure::Funding(error)),
+        },
+    }
 }
 
 fn io_error(path: &Path, source: io::Error) -> DatabaseIdentityError {

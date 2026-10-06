@@ -94,8 +94,15 @@ impl OperationJournalStore {
     pub(super) fn configure_recording_metadata_policy(
         &self,
     ) -> Result<(), OperationJournalStoreError> {
+        self.configure_recording_metadata_policy_with_input(None)
+    }
+
+    pub(super) fn configure_recording_metadata_policy_with_input(
+        &self,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
         use crate::operation_journal::recording_commands::MAX_RECORDING_JOURNAL_DATABASE_BYTES;
-        self.validate_namespace()?;
+        self.validate_namespace_with_input(input, false)?;
         if rusqlite::version_number() != 3_050_002 {
             return Err(error(
                 "recording metadata bound requires bundled SQLite 3.50.2",
@@ -150,12 +157,22 @@ impl OperationJournalStore {
         }
         Ok(())
     }
+    #[allow(dead_code)] // Preserve the original unfunded entry point.
     pub(crate) fn validate_recording_capacity_binding(
         &self,
         proposal: &RecordingProposal,
         plan: &crate::operation_journal::full_capacity::FullCapacityPlan,
     ) -> Result<(), OperationJournalStoreError> {
-        self.configure_recording_metadata_policy()?;
+        self.validate_recording_capacity_binding_with_input(proposal, plan, None)
+    }
+
+    pub(in crate::operation_journal) fn validate_recording_capacity_binding_with_input(
+        &self,
+        proposal: &RecordingProposal,
+        plan: &crate::operation_journal::full_capacity::FullCapacityPlan,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.configure_recording_metadata_policy_with_input(input)?;
         let opened = crate::sample_sources::db::sqlite_identity::open_existing_database_file(
             &self.database_root,
             std::path::Path::new(super::JOURNAL_DATABASE_FILE_NAME),
@@ -180,7 +197,7 @@ impl OperationJournalStore {
                 "recording journal peak is not covered on its actual descriptor volume",
             ));
         }
-        self.validate_namespace()?;
+        self.validate_namespace_with_input(input, false)?;
         Ok(())
     }
     fn recording_proposal(
