@@ -183,6 +183,8 @@ mod integration {
             assert!(
                 request
                     .receiver
+                    .as_ref()
+                    .unwrap()
                     .recv_timeout(Duration::from_secs(2))
                     .unwrap()
                     .unwrap()
@@ -206,6 +208,8 @@ mod integration {
             assert_eq!(
                 request
                     .receiver
+                    .as_ref()
+                    .unwrap()
                     .recv_timeout(Duration::from_secs(2))
                     .unwrap()
                     .unwrap()

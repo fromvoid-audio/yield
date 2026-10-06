@@ -12,6 +12,8 @@ pub use super::wal_admission::{
     WalPreparationStatus, WalPreparedDatabase,
 };
 mod frozen_copy;
+mod historical_reply;
+use historical_reply::HistoricalReply;
 mod queue_metrics;
 pub use queue_metrics::{JournalQueueClassMetrics, JournalQueueMetricsSnapshot};
 use queue_metrics::{QueueMetrics, QueueTicket};
@@ -712,7 +714,8 @@ pub enum OperationJournalRequestError {
 /// does not cancel the admitted command; the worker still executes it and simply discards a result
 /// that has no receiver.
 pub struct OperationJournalRequest<T> {
-    receiver: Receiver<Result<T, OperationJournalOwnerError>>,
+    receiver: Option<Receiver<Result<T, OperationJournalOwnerError>>>,
+    historical_reply: Option<HistoricalReply>,
     result_permit: Option<ResultPermit>,
 }
 
@@ -721,14 +724,21 @@ impl<T> OperationJournalRequest<T> {
     pub fn try_result(
         &mut self,
     ) -> Result<Result<T, OperationJournalOwnerError>, OperationJournalRequestError> {
-        match self.receiver.try_recv() {
+        match self
+            .receiver
+            .as_ref()
+            .ok_or(OperationJournalRequestError::Disconnected)?
+            .try_recv()
+        {
             Ok(result) => {
                 self.result_permit.take();
+                self.historical_reply.take();
                 Ok(result)
             }
             Err(TryRecvError::Empty) => Err(OperationJournalRequestError::Empty),
             Err(TryRecvError::Disconnected) => {
                 self.result_permit.take();
+                self.historical_reply.take();
                 Err(OperationJournalRequestError::Disconnected)
             }
         }
@@ -739,14 +749,21 @@ impl<T> OperationJournalRequest<T> {
         &mut self,
         timeout: Duration,
     ) -> Result<Result<T, OperationJournalOwnerError>, OperationJournalRequestError> {
-        match self.receiver.recv_timeout(timeout) {
+        match self
+            .receiver
+            .as_ref()
+            .ok_or(OperationJournalRequestError::Disconnected)?
+            .recv_timeout(timeout)
+        {
             Ok(result) => {
                 self.result_permit.take();
+                self.historical_reply.take();
                 Ok(result)
             }
             Err(RecvTimeoutError::Timeout) => Err(OperationJournalRequestError::Empty),
             Err(RecvTimeoutError::Disconnected) => {
                 self.result_permit.take();
+                self.historical_reply.take();
                 Err(OperationJournalRequestError::Disconnected)
             }
         }
@@ -755,7 +772,10 @@ impl<T> OperationJournalRequest<T> {
 
 impl<T> Drop for OperationJournalRequest<T> {
     fn drop(&mut self) {
+        // Destroy unconsumed channel contents before releasing their count/backing.
+        drop(self.receiver.take());
         self.result_permit.take();
+        self.historical_reply.take();
     }
 }
 
@@ -1867,9 +1887,10 @@ impl OwnerRuntime {
         }
     }
 
-    fn admit_prepared(
+    fn admit_prepared_with_funding(
         &mut self,
         prepared: PreparedAdmissionInput,
+        input: Option<&InputPermit>,
     ) -> Result<OperationId, OperationJournalOwnerError> {
         if matches!(
             prepared.args,
@@ -1893,10 +1914,19 @@ impl OwnerRuntime {
         // Re-read the durable ordinary-claim image for every request. Startup readiness is only
         // a bootstrap observation and cannot authorize a later request after new recovery rows
         // or settlement evidence arrive.
-        let snapshot = self.store().rebuild_admission_snapshot().map_err(|error| {
-            PreparedAdmissionError::RecoveryRequired {
-                reason: error.to_string(),
-            }
+        if let Some(input) = input {
+            input.fund_historical_consumer().map_err(|error| {
+                PreparedAdmissionError::RecoveryRequired {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
+        let snapshot = match input {
+            Some(input) => self.store().rebuild_admission_snapshot_for_input(input),
+            None => self.store().rebuild_admission_snapshot(),
+        }
+        .map_err(|error| PreparedAdmissionError::RecoveryRequired {
+            reason: error.to_string(),
         })?;
         match snapshot.readiness() {
             CapacityRebuildReadiness::ReconciliationRequired { diagnostics } => {
@@ -4776,13 +4806,21 @@ impl OperationJournalClient {
             }
         })?;
         let input_bytes = bounded_prepared_admission_input(&prepared)?;
-        self.submit(input_bytes, move |input, result| {
-            JournalCommand::AdmitPrepared {
+        let historical = !matches!(
+            prepared.args,
+            UniversalCommandArgs::SourceRegistryRetirement(_)
+        );
+        self.submit_funded_with_reply(
+            InputClass::Ordinary,
+            input_bytes,
+            false,
+            historical,
+            move |input, result| JournalCommand::AdmitPrepared {
                 prepared,
                 input,
                 result,
-            }
-        })
+            },
+        )
     }
 
     /// Queue one bounded post-intent chunk claim. The owner allocates no chunk or operation
@@ -5235,6 +5273,20 @@ impl OperationJournalClient {
     where
         F: FnOnce(InputPermit, SyncSender<Result<T, OperationJournalOwnerError>>) -> JournalCommand,
     {
+        self.submit_funded_with_reply(class, input_bytes, publication, false, build)
+    }
+
+    fn submit_funded_with_reply<T, F>(
+        &self,
+        class: InputClass,
+        input_bytes: usize,
+        publication: bool,
+        historical: bool,
+        build: F,
+    ) -> Result<OperationJournalRequest<T>, OperationJournalOwnerQueueError>
+    where
+        F: FnOnce(InputPermit, SyncSender<Result<T, OperationJournalOwnerError>>) -> JournalCommand,
+    {
         let _admission = self
             .shared
             .admission_gate
@@ -5249,24 +5301,44 @@ impl OperationJournalClient {
             .as_ref()
             .cloned()
             .ok_or(OperationJournalOwnerQueueError::Closed)?;
-        let input = if publication {
+        let mut input = if publication {
             self.shared.reserve_publication_input(input_bytes)?
         } else {
             self.shared.reserve_input(class, input_bytes)?
+        };
+        let historical_reply = if historical {
+            // Fund the Arc allocation (including both reference counters) before allocating.
+            let header = self.shared.reserve_input(class, HISTORICAL_REPLY_BYTES)?;
+            let backing = HistoricalReply::new(HistoricalReplyBacking {
+                _header: header,
+                consumer: Mutex::new(None),
+                observer: Mutex::new(None),
+                #[cfg(test)]
+                consumer_refused: std::sync::atomic::AtomicBool::new(false),
+            });
+            input.historical_reply = Some(backing.clone());
+            Some(backing)
+        } else {
+            None
         };
         let result_permit = self.shared.reserve_result(class)?;
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let command = build(input, result_tx);
         match sender.sender(class).try_send(command) {
             Ok(()) => Ok(OperationJournalRequest {
-                receiver: result_rx,
+                receiver: Some(result_rx),
+                historical_reply,
                 result_permit: Some(result_permit),
             }),
-            Err(TrySendError::Full(_command)) => {
+            Err(TrySendError::Full(command)) => {
+                drop(command);
+                drop(result_rx);
                 drop(result_permit);
                 Err(OperationJournalOwnerQueueError::Full)
             }
-            Err(TrySendError::Disconnected(_command)) => {
+            Err(TrySendError::Disconnected(command)) => {
+                drop(command);
+                drop(result_rx);
                 drop(result_permit);
                 self.shared
                     .mark_unavailable("operation journal owner disconnected");
@@ -5397,6 +5469,8 @@ struct OwnerShared {
     lifecycle: AtomicU8,
     unavailable: Mutex<Option<String>>,
     input_bytes: Mutex<InputBudget>,
+    #[cfg(test)]
+    historical_scratch_maximum: AtomicUsize,
     results: Mutex<ResultBudget>,
     #[cfg(test)]
     shutdown_cas_gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
@@ -5412,6 +5486,8 @@ impl OwnerShared {
             lifecycle: AtomicU8::new(OwnerLifecycle::Initializing as u8),
             unavailable: Mutex::new(None),
             input_bytes: Mutex::new(InputBudget::new()),
+            #[cfg(test)]
+            historical_scratch_maximum: AtomicUsize::new(0),
             results: Mutex::new(ResultBudget::new()),
             #[cfg(test)]
             shutdown_cas_gate: Mutex::new(None),
@@ -5533,6 +5609,7 @@ impl OwnerShared {
             bytes: requested,
             class,
             publication,
+            historical_reply: None,
         })
     }
 
@@ -5634,6 +5711,122 @@ pub(super) struct InputPermit {
     bytes: usize,
     class: InputClass,
     publication: bool,
+    historical_reply: Option<HistoricalReply>,
+}
+
+struct HistoricalReplyBacking {
+    consumer: Mutex<Option<InputPermit>>,
+    observer: Mutex<Option<HistoricalObserverCredits>>,
+    #[cfg(test)]
+    consumer_refused: std::sync::atomic::AtomicBool,
+    // Release working/consumer storage first; the private wrapper already freed the Arc.
+    _header: InputPermit,
+}
+// This first-stage refusal can occur before any observer/consumer debit succeeds.
+// Fund its owned reason (including String growth) BEFORE queueing/Arc allocation.
+const HISTORICAL_REFUSAL_REPLY_BYTES: usize =
+    2 * "historical claim observation resource envelope exceeded".len();
+const HISTORICAL_REPLY_BYTES: usize = std::mem::size_of::<HistoricalReplyBacking>()
+    + 2 * std::mem::size_of::<usize>()
+    + HISTORICAL_REFUSAL_REPLY_BYTES;
+
+struct HistoricalObserverCredits {
+    _sql: InputPermit,
+    _parser: Option<InputPermit>,
+    _envelope: Option<InputPermit>,
+    _sqlite_error: Option<InputPermit>,
+}
+
+impl InputPermit {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn historical_test_input(bytes: usize) -> Self {
+        let (senders, _receivers) = OwnerCommandReceivers::channel();
+        Arc::new(OwnerShared::new(senders))
+            .reserve_input(InputClass::Ordinary, bytes)
+            .expect("test original input pool")
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn historical_test_funded_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn historical_test_ordinary_limit() -> usize {
+        InputClass::Ordinary.limit()
+    }
+
+    #[cfg(test)]
+    pub(super) fn historical_test_remaining(&self) -> usize {
+        self.shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()]
+    }
+
+    pub(super) fn retain_historical_error(
+        &self,
+        sql: InputPermit,
+        parser: Option<InputPermit>,
+        envelope: Option<InputPermit>,
+        sqlite_error: Option<InputPermit>,
+    ) {
+        if let Some(backing) = &self.historical_reply {
+            // Each named allocation is funded on the original pool. Terminal permits
+            // contain no reply Arc; the retained backing cannot form a cycle.
+            *backing.observer.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(HistoricalObserverCredits {
+                    _sql: sql,
+                    _parser: parser,
+                    _envelope: envelope,
+                    _sqlite_error: sqlite_error,
+                });
+        }
+    }
+
+    pub(super) fn historical_error_consumed(&self) {
+        if let Some(backing) = &self.historical_reply {
+            drop(
+                backing
+                    .observer
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take(),
+            );
+        }
+    }
+
+    fn fund_historical_consumer(&self) -> Result<(), OperationJournalStoreError> {
+        if let Some(backing) = &self.historical_reply {
+            let permit =
+                match self.reserve_historical_scratch(super::store::HISTORICAL_DIAGNOSTIC_BYTES) {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        #[cfg(test)]
+                        backing.consumer_refused.store(true, Ordering::Release);
+                        return Err(error);
+                    }
+                };
+            *backing.consumer.lock().unwrap_or_else(|p| p.into_inner()) = Some(permit);
+        }
+        Ok(())
+    }
+
+    /// Private scratch debit from this exact queued command's original pool.
+    pub(super) fn reserve_historical_scratch(
+        &self,
+        bytes: usize,
+    ) -> Result<Self, OperationJournalStoreError> {
+        if self.class != InputClass::Ordinary || self.publication {
+            return Err(OperationJournalStoreError::HistoricalClaimResourceBound);
+        }
+        let permit = self
+            .shared
+            .reserve_input(InputClass::Ordinary, bytes)
+            .map_err(|_| OperationJournalStoreError::HistoricalClaimResourceBound)?;
+        #[cfg(test)]
+        self.shared
+            .historical_scratch_maximum
+            .fetch_max(bytes, Ordering::Relaxed);
+        Ok(permit)
+    }
 }
 
 impl Drop for InputPermit {
@@ -5671,6 +5864,16 @@ struct CapacityLedgerTestSnapshot {
 
 #[allow(dead_code)]
 enum JournalCommand {
+    #[cfg(test)]
+    InstallHistoricalClaimFixture {
+        operation: OperationId,
+        sequence: i64,
+        wire: Vec<u8>,
+        claim: Uuid,
+        input: InputPermit,
+        result: SyncSender<Result<(), OperationJournalOwnerError>>,
+    },
+
     PrepareRecordingCustody {
         operation: OperationId,
         registration: SourceAuthorityRegistrationReceipt,
@@ -6124,6 +6327,23 @@ fn run_owner(
 // Returned outputs retain their independent result/producer custody. Input is not settlement.
 fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool {
     match command {
+        #[cfg(test)]
+        JournalCommand::InstallHistoricalClaimFixture {
+            operation,
+            sequence,
+            wire,
+            claim,
+            input,
+            result,
+        } => {
+            let _input = input;
+            execute_store_result(result, move || {
+                runtime
+                    .store()
+                    .install_historical_claim_fixture(operation, sequence, &wire, claim)
+            })
+        }
+
         JournalCommand::PrepareRecordingCustody {
             operation,
             registration,
@@ -6400,8 +6620,13 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                     }
                 }
             } else {
-                let _input = input;
-                execute_store_result(result, move || runtime.admit_prepared(prepared))
+                // Keep terminal backing through send, including disposal of a SendError payload.
+                let reply = input.historical_reply.clone();
+                let panicked = execute_store_result(result, move || {
+                    runtime.admit_prepared_with_funding(prepared, Some(&input))
+                });
+                drop(reply);
+                panicked
             }
         }
         JournalCommand::ClaimChunk {
@@ -6643,6 +6868,11 @@ where
 
 fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
     match &command {
+        #[cfg(test)]
+        JournalCommand::InstallHistoricalClaimFixture { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+
         JournalCommand::PrepareRecordingCustody { result, .. } => {
             let _ = result.send(Err(error));
         }
@@ -6775,6 +7005,7 @@ mod tests {
     mod queue_metrics_integration {
         include!("owner/tests/queue_metrics_integration.rs");
     }
+    mod historical_claim_admission_tests;
     mod resource_custody_tests;
     mod source_registry_handoff_tests;
     #[test]

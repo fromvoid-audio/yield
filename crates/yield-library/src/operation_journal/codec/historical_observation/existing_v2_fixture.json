@@ -1,0 +1,58 @@
+{
+  "schema_version": 2,
+  "operation_id": "fedcba98-7654-3210-fedc-ba9876543210",
+  "intent": {"actor": "User", "kind": "FileHistory", "label": "complete"},
+  "phase": "FilesystemPublished",
+  "disposition": "None",
+  "payload": {"bounded": true},
+  "capacity_plan": null,
+  "prepared": {
+    "ExistingExpectedIdentity": {
+      "direction": "Undo",
+      "source_id": "source-1",
+      "source_root": {"path": "/Volumes/Source", "identity": {"stable_id": "root-source", "change_marker": "m1", "len": 4096}},
+      "target_root": {"path": "/Volumes/Target", "identity": {"stable_id": "root-target", "change_marker": null, "len": 4096}},
+      "target": {"relative_path": "target.wav", "identity": {"stable_id": "target-1", "change_marker": "t1", "len": 12}},
+      "backup_root": {"path": "/Volumes/Backup", "identity": {"stable_id": "root-backup", "change_marker": null, "len": 4096}},
+      "backup": {"relative_path": "backup.wav", "identity": {"stable_id": "backup-1", "change_marker": "b1", "len": 12}},
+      "replacement": {"Existing": {"stable_id": "target-1", "change_marker": "t1", "len": 12}},
+      "staging": {"relative_path": "staging.wav", "absent": true},
+      "evidence": {
+        "target": {"Metadata": {"len": 12, "modified_ns": 10, "is_dir": false}},
+        "backup": {"ContentHash": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]}
+      }
+    }
+  },
+  "staged": {
+    "participant": {
+      "CopyValidated": {
+        "staging": {"relative_path": "staging.wav", "identity": {"stable_id": "staging-1", "change_marker": "s1", "len": 12}},
+        "evidence": {"ContentHash": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]}
+      }
+    }
+  },
+  "absent_final_recovery_observation": null,
+  "absent_final_transaction_owned_proof": null,
+  "absent_final_adoption_evidence": null,
+  "published": {
+    "mode": "NonAtomicCopyValidatePublish",
+    "final_claim": {
+      "ExpectedIdentityReplacement": {
+        "primitive": "QualifiedExpectedIdentityReplacement",
+        "result": "ExpectedIdentityReplaced",
+        "expected_target": {"stable_id": "target-1", "change_marker": "t1", "len": 12},
+        "displaced_target": {"stable_id": "target-1", "change_marker": "t1", "len": 12}
+      }
+    },
+    "reopened_final": {
+      "identity": {"stable_id": "staging-1", "change_marker": "s1", "len": 12},
+      "content": {"ContentHash": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]}
+    },
+    "visibility": "VisibilityVerified",
+    "whole_publication": "WholePublicationNonAtomic",
+    "synchronization": "BestEffortSync"
+  },
+  "replacement_qualification": null,
+  "created_unix_ms": 1,
+  "updated_unix_ms": 2
+}

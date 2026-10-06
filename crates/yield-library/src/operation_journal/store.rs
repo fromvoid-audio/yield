@@ -68,6 +68,7 @@ use super::validation::{RecordConsistency, classify_record};
 
 mod chunk_claims;
 mod chunk_staging;
+mod historical_claim_observation;
 mod legacy_allocation_observation;
 mod recording_chunks;
 mod recording_prestart_budget;
@@ -147,6 +148,16 @@ thread_local! {
 
 const MAX_REBUILD_DIAGNOSTICS: usize = 32;
 const MAX_REBUILD_DIAGNOSTIC_CHARS: usize = 256;
+// Capped diagnostic graph plus the generic prepared consumer's four clones,
+// join buffer, and final 512-character reason, all overlapping. UTF-8 uses
+// at most four bytes per char and String/Vec growth at most twice the payload.
+pub(super) const HISTORICAL_DIAGNOSTIC_BYTES: usize = 2
+    * MAX_REBUILD_DIAGNOSTICS
+    * (std::mem::size_of::<String>() + 4 * MAX_REBUILD_DIAGNOSTIC_CHARS)
+    + 2 * 4 * (std::mem::size_of::<String>() + 4 * MAX_REBUILD_DIAGNOSTIC_CHARS)
+    + 2 * (4 * 4 * MAX_REBUILD_DIAGNOSTIC_CHARS + 3 * 2)
+    + 2 * 4 * 512
+    + 3 * std::mem::size_of::<Vec<String>>();
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // Keep SQLite itself from materializing an arbitrarily large key/value before the recovery
 // scanner can inspect its SQL type and length. This leaves room for the bounded JSON envelope
@@ -167,6 +178,15 @@ const CREATE_FULL_PROGRESS_TABLE: &str = "CREATE TABLE operation_journal_full_pr
 /// Errors returned by the profile-owned operation journal store.
 #[derive(Debug, Error)]
 pub enum OperationJournalStoreError {
+    /// Historical claim observation cannot fit the original queued command's pool.
+    #[error("historical claim observation resource envelope exceeded")]
+    HistoricalClaimResourceBound,
+    /// The borrowed historical record is retained for audit without granting authority.
+    #[error("historical claim observation rejected: {reason}")]
+    HistoricalClaimObservation {
+        /// Bounded static rejection context.
+        reason: String,
+    },
     /// Complete retained inventory cannot fit the narrow pre-start resource envelope.
     #[error("recording pre-start resource envelope exceeded")]
     RecordingPrestartResourceBound,
@@ -1734,10 +1754,24 @@ impl OperationJournalStore {
     pub(crate) fn rebuild_admission_snapshot(
         &self,
     ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
+        self.rebuild_admission_snapshot_with_funding(None)
+    }
+
+    pub(super) fn rebuild_admission_snapshot_for_input(
+        &self,
+        input: &super::owner::InputPermit,
+    ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
+        self.rebuild_admission_snapshot_with_funding(Some(input))
+    }
+
+    fn rebuild_admission_snapshot_with_funding(
+        &self,
+        input: Option<&super::owner::InputPermit>,
+    ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
         self.validate_namespace()?;
         self.connection.execute_batch("BEGIN")?;
         let result = (|| {
-            let snapshot = self.rebuild_ordinary_claim_snapshot_inside_transaction()?;
+            let snapshot = self.rebuild_ordinary_claim_snapshot_with_funding(input)?;
             self.validate_chunk_claims_inside_transaction()?;
             recovery_reserve::prove_no_active_charges(&self.connection).map_err(|error| {
                 audit_error(
@@ -6886,6 +6920,13 @@ impl OperationJournalStore {
     fn rebuild_ordinary_claim_snapshot_inside_transaction(
         &self,
     ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
+        self.rebuild_ordinary_claim_snapshot_with_funding(None)
+    }
+
+    fn rebuild_ordinary_claim_snapshot_with_funding(
+        &self,
+        input: Option<&super::owner::InputPermit>,
+    ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
         self.validate_namespace_for_precommit()?;
         let mut claim_rows = Vec::new();
         let mut claim_cursor = None;
@@ -6961,9 +7002,20 @@ impl OperationJournalStore {
         let claim_ids: BTreeSet<_> = claim_rows.iter().map(|claim| claim.claim_id()).collect();
         let mut rebuild_claims = Vec::with_capacity(claim_rows.len());
         for claim in claim_rows {
-            let operation_valid = match self.read_row(claim.operation_id()) {
-                Ok(Some(_)) => true,
-                Ok(None) => {
+            let observed = match input {
+                Some(input) => self.observe_claim_operation(claim.operation_id(), input),
+                None => self.read_row(claim.operation_id()).map(|row| row.is_some()),
+            };
+            // Pool refusal cannot become an audit-only snapshot followed by admission.
+            if matches!(
+                observed,
+                Err(OperationJournalStoreError::HistoricalClaimResourceBound)
+            ) {
+                return Err(OperationJournalStoreError::HistoricalClaimResourceBound);
+            }
+            let operation_valid = match observed {
+                Ok(true) => true,
+                Ok(false) => {
                     push_rebuild_diagnostic(
                         &mut diagnostics,
                         format!(
@@ -6986,6 +7038,11 @@ impl OperationJournalStore {
                     false
                 }
             };
+            // The original observer error is now dropped; its bounded replacement
+            // diagnostic has a separately precharged retained graph/reply debit.
+            if let Some(input) = input {
+                input.historical_error_consumed();
+            }
             let mut audit_pending = !operation_valid;
             let mut release_id = None;
             if let Some(release) = release_rows.remove(&claim.claim_id()) {
@@ -9484,6 +9541,7 @@ impl From<EncodeError> for OperationJournalStoreError {
 
 #[cfg(test)]
 mod tests {
+    include!("store/historical_claim_observation_tests.rs");
     include!("store/database_claims_tests.rs");
     include!("store/recording_retention_tests.rs");
     include!("store/record_materialization_tests.rs");
