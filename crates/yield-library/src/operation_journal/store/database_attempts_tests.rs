@@ -22,6 +22,7 @@ mod attempt_integration {
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
     }
     include!("database_attempt_scalar_projection_tests.rs");
+    include!("database_attempt_inventory_backing_tests.rs");
 
     fn start(
         record: &StoredOperationRecord,
