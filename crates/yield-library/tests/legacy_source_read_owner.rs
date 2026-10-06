@@ -17,16 +17,23 @@ struct Fixture {
 }
 impl Fixture {
     fn new(sql: &str) -> Self {
+        Self::new_encoding(sql, "UTF-8")
+    }
+    fn new_encoding(sql: &str, encoding: &str) -> Self {
         let profile = tempdir().unwrap();
         let media = tempdir().unwrap();
         let root = AppRootGuard::set(profile.path().to_path_buf()).unwrap();
         let child = profile.path().join("legacy");
         std::fs::create_dir(&child).unwrap();
         let path = child.join(DB_FILE_NAME);
-        Connection::open(&path)
-            .unwrap()
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "encoding", encoding)
+            .unwrap();
+        connection
             .execute_batch(include_str!("fixtures/profile-v11/source.sql"))
             .unwrap();
+        drop(connection);
         if !sql.is_empty() {
             Connection::open(&path).unwrap().execute_batch(sql).unwrap();
         }
@@ -51,6 +58,79 @@ impl Fixture {
         self.profile.path().join("legacy/.yield-source-lease.lock")
     }
 }
+#[test]
+fn retained_capture_preserves_original_maximum_inputs_and_compiled_binary_order() {
+    for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+        let f = Fixture::new_encoding("DELETE FROM wav_files", encoding);
+        let mut connection = Connection::open(&f.path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        let header = std::mem::size_of::<(String, String)>();
+        let remaining = 65536 - ("revision".len() + 1 + header) - 127 * (4 + header);
+        for n in (0..127).rev() {
+            let length = remaining / 127 + if n == 0 { remaining % 127 } else { 0 };
+            transaction
+                .execute(
+                    "INSERT INTO metadata VALUES (?1,?2)",
+                    rusqlite::params![format!("m{n:03}"), "v".repeat(length)],
+                )
+                .unwrap();
+        }
+        let path_length = 4096 - std::mem::size_of::<(String, i64, i64)>();
+        for n in (0..1024).rev() {
+            let length = path_length + if n == 0 { 40 } else { 0 } - if n == 1 { 40 } else { 0 };
+            let relative = format!(
+                "{n:04}/{}{}",
+                "\u{e000}".repeat((length - 5) / 3),
+                "x".repeat((length - 5) % 3)
+            );
+            assert_eq!(relative.len(), length);
+            transaction
+                .execute(
+                    "INSERT INTO wav_files VALUES (?1,?2,?3)",
+                    rusqlite::params![relative, n as i64, -(n as i64)],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(connection);
+        let bytes = std::fs::read(&f.path).unwrap();
+        let owner = f.open().unwrap();
+        let image = owner.capture(&f.guard).unwrap();
+        assert_eq!((image.metadata_rows(), image.audio_rows()), (128, 1024));
+        assert_eq!(owner.capture(&f.guard).unwrap(), image);
+        assert_eq!(std::fs::read(&f.path).unwrap(), bytes);
+        for suffix in ["-journal", "-wal", "-shm"] {
+            assert!(!PathBuf::from(format!("{}{suffix}", f.path.display())).exists());
+        }
+        // Original source identity is frozen: even another complete valid image is refused.
+        let connection = Connection::open(&f.path).unwrap();
+        connection
+            .execute("UPDATE metadata SET value='8' WHERE key='revision'", [])
+            .unwrap();
+        drop(connection);
+        assert!(owner.capture(&f.guard).is_err());
+    }
+}
+#[test]
+fn retained_capture_refuses_noncompiled_collation_and_without_rowid_indexes() {
+    for schema in [
+        "CREATE TABLE metadata (key TEXT PRIMARY KEY COLLATE NOCASE, value TEXT NOT NULL)",
+        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID",
+    ] {
+        let f = Fixture::new("");
+        let connection = Connection::open(&f.path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "DROP TABLE metadata; {schema}; INSERT INTO metadata VALUES ('revision','7');"
+            ))
+            .unwrap();
+        drop(connection);
+        let before = std::fs::read(&f.path).unwrap();
+        assert!(f.open().is_err());
+        assert_eq!(std::fs::read(&f.path).unwrap(), before);
+    }
+}
+
 #[test]
 fn retained_legacy_read_owner_captures_exact_image_preserves_bytes_and_never_bootstraps() {
     let f = Fixture::new("INSERT INTO metadata VALUES ('fixture-key','preserved')");

@@ -20,6 +20,7 @@ pub use common_allocation::{
 mod image;
 mod rows;
 pub use allocation::LegacySourcePagerObservation;
+pub(crate) use rows::SCRATCH_BYTES as LEGACY_CAPTURE_SCRATCH_BYTES;
 
 /// Refusal to inspect an unsupported, stale or unbounded legacy source.
 #[derive(Debug, Error)]
@@ -385,7 +386,7 @@ impl LegacySourceReadOwner {
             .map_err(refused)?;
         let transaction = connection.unchecked_transaction().map_err(refused)?;
         let schema = image::capture(&transaction)?;
-        let rows = rows::capture(&transaction)?;
+        let rows = rows::capture(&transaction, deadline)?;
         transaction.commit().map_err(refused)?;
         let after: u64 = connection
             .pragma_query_value(None, "data_version", |r| r.get(0))
