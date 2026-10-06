@@ -1,4 +1,5 @@
 use super::*;
+use crate::operation_journal::FullCapacityAllocationClass;
 
 #[test]
 fn historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pressure_before_effects()

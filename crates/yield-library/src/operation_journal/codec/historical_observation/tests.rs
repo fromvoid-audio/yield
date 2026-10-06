@@ -125,3 +125,14 @@ fn historical_claim_projection_preserves_original_depth_boundary_and_object_iden
         "separate objects may reuse decoded keys"
     );
 }
+
+#[test]
+fn historical_claim_projection_keeps_maximum_scalar_wire_boundary() {
+    let original = wire("0", 1);
+    let mut padded = vec![b' '; super::super::super::model::MAX_RECORD_BYTES - original.len()];
+    padded.extend_from_slice(&original);
+    assert_eq!(padded.len(), super::super::super::model::MAX_RECORD_BYTES);
+    let old = decode(&padded).unwrap();
+    let new = projected(&padded).unwrap().unwrap();
+    assert_eq!(classify_record(&old), classify_record(&new));
+}

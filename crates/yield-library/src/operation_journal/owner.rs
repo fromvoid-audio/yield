@@ -5670,7 +5670,7 @@ impl InputPermit {
         &self,
         bytes: usize,
     ) -> Result<Self, OperationJournalStoreError> {
-        if self.class != InputClass::Ordinary {
+        if self.class != InputClass::Ordinary || self.publication {
             return Err(OperationJournalStoreError::HistoricalClaimResourceBound);
         }
         let permit = self

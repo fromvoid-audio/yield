@@ -14,18 +14,18 @@ mod tests;
 
 // Parser, scalar scanner recursion (at most the original serde 128 nesting limit),
 // owned vector headers, projected/typed record headers, and bounded SQL/error context.
-pub(super) const FIXED_BYTES: usize = size_of::<
-    serde_json::Deserializer<serde_json::de::SliceRead<'static>>,
->() + 128 * (size_of::<keys::Key>() + 8 * size_of::<usize>())
-    + 4 * size_of::<Vec<u8>>()
-    + 2 * size_of::<StoredOperationRecord>()
-    + 2 * size_of::<InputPermit>()
-    + size_of::<rusqlite::Statement<'static>>()
-    + size_of::<rusqlite::Rows<'static>>()
-    + 36
-    + 256;
+pub(in crate::operation_journal) const FIXED_BYTES: usize =
+    size_of::<serde_json::Deserializer<serde_json::de::SliceRead<'static>>>()
+        + 128 * (size_of::<keys::Key>() + 8 * size_of::<usize>())
+        + 4 * size_of::<Vec<u8>>()
+        + 2 * size_of::<StoredOperationRecord>()
+        + 2 * size_of::<InputPermit>()
+        + size_of::<rusqlite::Statement<'static>>()
+        + size_of::<rusqlite::Rows<'static>>()
+        + 36
+        + 256;
 
-pub(super) struct Scratch<'a> {
+pub(in crate::operation_journal) struct Scratch<'a> {
     input: &'a InputPermit,
     parser_bytes: usize,
     funded: usize,
@@ -33,10 +33,13 @@ pub(super) struct Scratch<'a> {
     _parser: InputPermit,
 }
 impl<'a> Scratch<'a> {
-    pub(super) fn new(
+    pub(in crate::operation_journal) fn new(
         input: &'a InputPermit,
         length: usize,
     ) -> Result<Self, OperationJournalStoreError> {
+        if length > super::super::model::MAX_RECORD_BYTES {
+            return Err(OperationJournalStoreError::HistoricalClaimResourceBound);
+        }
         let parser_bytes = length
             .checked_mul(2)
             .and_then(|n| n.checked_add(FIXED_BYTES))
@@ -70,7 +73,7 @@ fn malformed() -> OperationJournalStoreError {
     }
 }
 
-pub(super) fn observe(
+pub(in crate::operation_journal) fn observe(
     bytes: &[u8],
     scratch: &mut Scratch<'_>,
 ) -> Result<Option<StoredOperationRecord>, OperationJournalStoreError> {
@@ -107,7 +110,12 @@ pub(super) fn observe(
     // arrays and fixed record headers are funded simultaneously, not as a reuse.
     let tree_node =
         12 * size_of::<(String, Value)>() + 12 * size_of::<usize>() + 4 * size_of::<usize>();
-    let graph_bytes = (inventory.retained_keys + inventory.objects) * tree_node
+    // Wider GPUI builds enable serde_json preserve_order. The pinned IndexMap
+    // backing also fits: at most four dense/hash slots per entry, including
+    // geometric growth/load-factor rounding, plus a 32-byte control group.
+    let index_node = 4 * (size_of::<(String, Value)>() + 2 * size_of::<usize>() + 1) + 32;
+    let object_node = tree_node.max(index_node);
+    let graph_bytes = (inventory.retained_keys + inventory.objects) * object_node
         + (2 * inventory.array_entries + 4 * inventory.arrays) * size_of::<Value>()
         + inventory.nodes * size_of::<Value>()
         + 2 * inventory.string_bytes;

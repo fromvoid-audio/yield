@@ -39,7 +39,7 @@ impl OperationJournalStore {
         }
         // Declaration order also covers panic/early-return: rows, statement, then
         // the original scratch debit. No borrowed Native row outlives its credit.
-        let mut scratch = None;
+        let mut scratch;
         let mut statement = self.connection.prepare(
             "SELECT typeof(operation_id), typeof(sequence), sequence, typeof(record), length(record),
              CASE WHEN typeof(record) = 'blob' AND length(record) BETWEEN 0 AND ?2
@@ -91,9 +91,8 @@ impl OperationJournalStore {
                 "stored record length changed or exceeds its bound".into(),
             ));
         }
-        scratch = Some(historical_observation::Scratch::new(input, bytes.len())?);
-        let observed =
-            historical_observation::observe(bytes, scratch.as_mut().expect("installed scratch"));
+        scratch = historical_observation::Scratch::new(input, bytes.len())?;
+        let observed = historical_observation::observe(bytes, &mut scratch);
         // End the SQLite borrow before releasing its per-row scratch or falling through
         // to the unchanged other-family reader. No historical payload is copied here.
         drop(rows);
