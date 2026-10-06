@@ -22,7 +22,7 @@ pub(crate) struct PublicationCustody {
     charge: super::super::capacity_provider::PublicationChargeBinding,
 }
 pub(crate) type PublicationSourceUse = CountedSourceEntry<PublicationCustody>;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, unix))]
 impl PublicationSourceUse {
     pub(crate) fn validation(&self) -> &super::FileOperationResult {
         self._source.target.validation()

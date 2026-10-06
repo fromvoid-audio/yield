@@ -4653,7 +4653,7 @@ impl OperationJournalOwner {
             .load(Ordering::Relaxed)
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, unix))]
     fn synthetic_chunk_write_invocations(&self) -> usize {
         self.synthetic_chunk_write_invocations
             .load(Ordering::Relaxed)
@@ -7548,7 +7548,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     fn fixture_volume_registry(fixture: &Fixture) -> std::path::PathBuf {
         // macOS exposes the temporary root through /var -> /private/var. The
         // registry owner deliberately walks every path component without
@@ -10153,6 +10153,10 @@ mod tests {
         publication_handoff: bool,
     ) {
         use super::super::store::{InsertTestBoundary, InsertTestDirective};
+        use crate::durable_capacity::descriptor_capacity_facts;
+        use crate::file_operation_owner::{EffectOutcome, FileOperationOwner};
+        use crate::sample_sources::db::SourceDatabase;
+        use std::time::Instant;
         let fixture = fixture("journal-owner-live-chunk-grant");
         let registry_path = fixture_volume_registry(&fixture);
         let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
@@ -11187,7 +11191,7 @@ mod tests {
                     .shared
                     .mark_unavailable("native test: original unavailable after issuance");
             } else {
-                assert!(client.begin_command_drain());
+                assert!(owner.begin_command_drain());
             }
             assert!(matches!(
                 publication.begin_publication(),
