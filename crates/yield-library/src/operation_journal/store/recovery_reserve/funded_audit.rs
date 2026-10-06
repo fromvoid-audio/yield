@@ -66,7 +66,7 @@ impl FundedFailure {
     }
 }
 
-pub(super) fn prove_no_active_charges_for_input(
+pub(in crate::operation_journal::store) fn prove_no_active_charges_for_input(
     connection: &Connection,
     path: &Path,
     input: &InputPermit,
@@ -81,12 +81,13 @@ enum AuditFailure {
     Funded(FundedFailure),
 }
 fn audit(connection: &Connection, path: &Path, input: &InputPermit) -> Result<(), AuditFailure> {
-    // Exact original PathBuf clone plus its worst-case diagnostic rendering overlap.
+    // Exact original PathBuf clone (n) plus geometric String growth (2 * 3n)
+    // for invalid-UTF8 Path::display in the original owner error consumer.
     let bytes = path
         .as_os_str()
         .as_encoded_bytes()
         .len()
-        .checked_mul(4)
+        .checked_mul(7)
         .and_then(|n| n.checked_add(FIXED_BYTES))
         .ok_or(AuditFailure::Unfunded(
             OperationJournalStoreError::HistoricalClaimResourceBound,
@@ -345,6 +346,49 @@ mod tests {
         }
     }
     #[test]
+    fn recovery_funded_all_active_states_and_native_sql_selection() {
+        for (state, sequence, remaining) in [
+            ("Charged", 1, 11),
+            ("Spent", 2, 10),
+            ("ReleaseObserved", 3, 10),
+        ] {
+            let (_directory, connection, operation, charge) = fixture();
+            history(&connection, operation, charge, 1);
+            connection.execute("DELETE FROM operation_journal_recovery_reserve_transition WHERE transition_sequence>?1",params![sequence]).unwrap();
+            connection.execute("UPDATE operation_journal_recovery_reserve SET active_volume_device='7',state=?1,remaining_bytes=?2,transition_sequence=?3",params![state,remaining,sequence]).unwrap();
+            assert!(matches!(
+                prove_no_active_charges(&connection),
+                Err(LedgerError::ActiveForCleanHandoff { .. })
+            ));
+            let input = InputPermit::historical_test_input(1);
+            assert!(!succeeded(&connection, &input));
+        }
+        let (_directory, connection, _, _) = fixture();
+        connection
+            .execute_batch("DROP TABLE operation_journal_recovery_reserve_transition")
+            .unwrap();
+        let original = prove_no_active_charges(&connection)
+            .unwrap_err()
+            .to_string();
+        let input = InputPermit::historical_test_input(1);
+        let before = input.historical_test_remaining();
+        let Err(AuditFailure::Funded(error)) =
+            audit(&connection, Path::new("original.sqlite"), &input)
+        else {
+            panic!("native failure");
+        };
+        assert!(error.native.is_some());
+        assert!(
+            error
+                .error
+                .to_string()
+                .contains("no such table: operation_journal_recovery_reserve_transition")
+        );
+        assert!(original.contains("no such table: operation_journal_recovery_reserve_transition"));
+        drop(error);
+        assert_eq!(input.historical_test_remaining(), before);
+    }
+    #[test]
     fn recovery_funded_quota_refuses_before_sql_and_effects() {
         let (_directory, connection, operation, charge) = fixture();
         history(&connection, operation, charge, 1);
@@ -358,5 +402,72 @@ mod tests {
         ));
         assert!(prove_no_active_charges(&connection).is_ok());
         assert_eq!(input.historical_test_remaining(), 1);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::operation_journal::store::OperationJournalStore {
+    /// Stored history fixture on this original Store connection. No worker or effects.
+    pub fn install_recovery_audit_fixture_for_test(
+        &self,
+        operation: OperationId,
+        spends: usize,
+        corrupt_text_bytes: usize,
+    ) -> Result<(), OperationJournalStoreError> {
+        let connection = &self.connection;
+        connection.execute_batch("DELETE FROM operation_journal_recovery_reserve_transition; DELETE FROM operation_journal_recovery_reserve")?;
+        let charge = Uuid::from_u128(1).to_string();
+        if spends == 0 {
+            return Ok(());
+        }
+        let budget = i64::try_from(spends)
+            .ok()
+            .and_then(|n| n.checked_add(10))
+            .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+        connection.execute("INSERT INTO operation_journal_recovery_reserve VALUES(?1,'7',NULL,?2,'OperationRecovery',?3,0,0,0,'Reconstituted',?4)", params![charge,operation.to_string(),budget,budget-7])?;
+        connection.execute("INSERT INTO operation_journal_recovery_reserve_transition VALUES(?1,?2,1,'Charged',?3,?3,'Charged')",params![charge,Uuid::from_u128(2).to_string(),budget])?;
+        for index in 0..spends {
+            connection.execute("INSERT INTO operation_journal_recovery_reserve_transition VALUES(?1,?2,?3,'Spent',1,?4,'Spent')",params![charge,Uuid::from_u128(index as u128+3).to_string(),index as i64+2,budget-index as i64-1])?;
+        }
+        connection.execute("INSERT INTO operation_journal_recovery_reserve_transition VALUES(?1,?2,?3,'ReleaseObserved',1,10,'ReleaseObserved')",params![charge,Uuid::from_u128(spends as u128+3).to_string(),spends as i64+2])?;
+        connection.execute("INSERT INTO operation_journal_recovery_reserve_transition VALUES(?1,?2,?3,'Reconstituted',0,0,'Reconstituted')",params![charge,Uuid::from_u128(spends as u128+4).to_string(),spends as i64+3])?;
+        if corrupt_text_bytes != 0 {
+            connection.execute_batch("PRAGMA ignore_check_constraints=ON")?;
+            let result = connection.execute(
+                "UPDATE operation_journal_recovery_reserve SET purpose=?1",
+                params!["x".repeat(corrupt_text_bytes)],
+            );
+            connection.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
+            result?;
+        }
+        Ok(())
+    }
+    /// Scalar normal-build diagnostic; the isolated pool grants no production authority.
+    /// Returned values contain no row, path, error or backing that can escape its debit.
+    pub fn recovery_audit_allocation_probe_for_test(
+        &self,
+        funded: bool,
+    ) -> Result<(bool, usize), OperationJournalStoreError> {
+        self.connection.execute_batch("BEGIN")?;
+        let result = if funded {
+            let input = InputPermit::historical_test_input(1);
+            let bytes = FIXED_BYTES + 7 * self.database_path.as_os_str().as_encoded_bytes().len();
+            let valid = match audit(&self.connection, &self.database_path, &input) {
+                Ok(()) => true,
+                Err(AuditFailure::Funded(error)) => {
+                    drop(error);
+                    false
+                }
+                Err(AuditFailure::Unfunded(error)) => {
+                    self.connection.execute_batch("ROLLBACK")?;
+                    return Err(error);
+                }
+            };
+            (valid, bytes)
+        } else {
+            (prove_no_active_charges(&self.connection).is_ok(), 0)
+        };
+        self.connection.execute_batch("ROLLBACK")?;
+        Ok(result)
     }
 }
