@@ -1,12 +1,8 @@
 //! Immutable publication issuance observations. No decoder can reconstruct a live grant.
-use super::staging_checkpoints::{
-    StagingCheckpointRecord, StoredRootRef, StoredStagingSourceFence,
-};
+use super::staging_checkpoints::StagingCheckpointRecord;
 use super::{ChunkClaimState, ChunkId, OperationJournalStore, OperationJournalStoreError};
 use crate::operation_journal::admission_claims::AdmissionClaim;
 use crate::operation_journal::full_capacity::FullCapacityAllocationClass;
-use crate::operation_journal::model::OperationId;
-use crate::operation_journal::participants::ParticipantId;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -30,120 +26,26 @@ fn invalid(reason: impl Into<String>) -> OperationJournalStoreError {
     }
 }
 
-// These are explicitly data-only mirrors of the authority-free command wire shape.
-// Unlike file-owner roots/objects, none has an API returning a live registration or grant.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ProfileObservation {
-    owner: Uuid,
-    generation: u64,
-    lease_epoch: u64,
-}
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-enum AuthorityObservation {
-    Source(StoredStagingSourceFence),
-    Profile(ProfileObservation),
-}
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-enum ExpectedObservation {
-    Absent,
-    Exact(Uuid),
-}
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RootObservation {
-    registration: StoredRootRef,
-    authority: AuthorityObservation,
-    locator: String,
-    expected: ExpectedObservation,
-}
-impl RootObservation {
-    fn validate(&self) -> Result<(), String> {
-        self.registration.validate()?;
-        if self.locator.is_empty()
-            || self.locator.len() > 1024
-            || self.locator.contains('/')
-            || self.locator.contains('\\')
-            || matches!(self.locator.as_str(), "." | "..")
-        {
-            return Err("publication root locator is invalid".into());
-        }
-        match &self.authority {
-            AuthorityObservation::Source(source) => source.validate()?,
-            AuthorityObservation::Profile(profile) => {
-                if profile.owner.is_nil() || profile.generation == 0 || profile.lease_epoch == 0 {
-                    return Err("publication profile observation is invalid".into());
-                }
-            }
-        }
-        Ok(())
+fn ordinary_read_error(
+    error: super::ordinary_claims::OrdinaryClaimReadError,
+) -> OperationJournalStoreError {
+    match error {
+        super::ordinary_claims::OrdinaryClaimReadError::Sql(error) => error.into(),
+        other => invalid(format!("publication charge readback: {other}")),
     }
 }
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RootRoleObservation {
-    binding: RootObservation,
-}
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct CopyObservation {
-    object: Uuid,
-    bytes: u64,
-}
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct AbsenceObservation {
-    marker: u64,
-}
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-enum PublicationObservation {
-    PublishNoReplace {
-        staging: RootRoleObservation,
-        target: RootRoleObservation,
-        staged: CopyObservation,
-        expected_absent: AbsenceObservation,
-    },
-}
-
-fn one_source<'de, D: serde::Deserializer<'de>>(
-    decoder: D,
-) -> Result<Vec<StoredStagingSourceFence>, D::Error> {
-    struct One;
-    impl<'de> serde::de::Visitor<'de> for One {
-        type Value = Vec<StoredStagingSourceFence>;
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("at most one original source fence")
-        }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut seq: A,
-        ) -> Result<Self::Value, A::Error> {
-            let first = seq.next_element::<StoredStagingSourceFence>()?;
-            if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                return Err(serde::de::Error::custom(
-                    "multiple publication source fences",
-                ));
-            }
-            Ok(first.into_iter().collect())
-        }
+fn chunk_read_error(error: super::chunk_claims::ChunkClaimReadError) -> OperationJournalStoreError {
+    match error {
+        super::chunk_claims::ChunkClaimReadError::Sql(error) => error.into(),
+        other => invalid(format!("publication chunk readback: {other}")),
     }
-    decoder.deserialize_seq(One)
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct CommandObservation {
-    operation_id: OperationId,
-    participant_id: ParticipantId,
-    effect_id: Uuid,
-    #[serde(deserialize_with = "one_source")]
-    source_fences: Vec<StoredStagingSourceFence>,
-    target_registration: StoredRootRef,
-    expected: ExpectedObservation,
-    effect: PublicationObservation,
-}
+mod observations;
+use observations::{
+    AuthorityObservation, CommandObservation, ExpectedObservation, PublicationObservation,
+};
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ChunkObservation {
@@ -376,11 +278,11 @@ impl OperationJournalStore {
     ) -> Result<(), OperationJournalStoreError> {
         let ordinary =
             super::ordinary_claims::read_claim(&self.connection, binding.charge.claim_id())
-                .map_err(|error| invalid(format!("publication charge readback: {error}")))?
+                .map_err(ordinary_read_error)?
                 .ok_or_else(|| invalid("publication ordinary charge is absent"))?;
         let released =
             super::ordinary_claims::read_release(&self.connection, binding.charge.claim_id())
-                .map_err(|error| invalid(format!("publication release readback: {error}")))?
+                .map_err(ordinary_read_error)?
                 .is_some();
         if released
             || ordinary.operation_id() != binding.command.operation_id
@@ -396,7 +298,7 @@ impl OperationJournalStore {
             let chunk_id = ChunkId::from_uuid(selected.chunk_id)
                 .map_err(|_| invalid("publication selected chunk is invalid"))?;
             let chunk = super::chunk_claims::read(&self.connection, chunk_id)
-                .map_err(|error| invalid(format!("publication chunk readback: {error}")))?
+                .map_err(chunk_read_error)?
                 .ok_or_else(|| invalid("publication selected chunk is absent"))?;
             if chunk.operation_id() != binding.command.operation_id
                 || chunk.participant_id() != binding.command.participant_id
