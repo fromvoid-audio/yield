@@ -203,6 +203,41 @@ pub(in crate::operation_journal) struct Collector {
     done: bool,
     _journal_input: JournalInput,
 }
+// Fixed headers that coexist after original journal reservation. Snapshot and
+// CurrentRound have separate concrete credits; source/held Vec backing is charged
+// separately by WalPreparationInput. Including the whole Collector conservatively
+// counts its inline input again within the unchanged fixed allowance.
+pub(super) const FIXED_COLLECTOR_ALLOWANCE: usize = 2048;
+const INPUT_ARC_BYTES: usize = std::mem::size_of::<super::super::owner::InputPermit>() + 64;
+const SHARED_ARC_BYTES: usize = std::mem::size_of::<Shared>() + 64;
+const FIXED_COLLECTOR_HEADERS: usize = std::mem::size_of::<Collector>()
+    + SHARED_ARC_BYTES
+    + INPUT_ARC_BYTES
+    + super::credit::BACKING_BYTES;
+// The 64-byte slack covers two Arc counters plus payload alignment on supported
+// targets. This gate makes that target-layout assumption explicit.
+const _: () = assert!(std::mem::size_of::<usize>() <= 8);
+const _: () = assert!(std::mem::align_of::<Shared>() <= 64);
+const _: () = assert!(std::mem::align_of::<super::super::owner::InputPermit>() <= 64);
+const _: () = assert!(FIXED_COLLECTOR_HEADERS <= FIXED_COLLECTOR_ALLOWANCE);
+
+#[cfg(test)]
+mod fixed_headers {
+    use super::*;
+    #[test]
+    fn original_wal_fixed_collector_headers_fit_preexisting_allowance() {
+        eprintln!(
+            "active fixed headers: collector={} shared_with_arc_slack={} original_input_with_arc_slack={} budget_with_arc_slack={} total={} allowance={}; snapshot and current round separately charged",
+            std::mem::size_of::<Collector>(),
+            SHARED_ARC_BYTES,
+            INPUT_ARC_BYTES,
+            super::super::credit::BACKING_BYTES,
+            FIXED_COLLECTOR_HEADERS,
+            FIXED_COLLECTOR_ALLOWANCE
+        );
+        assert!(FIXED_COLLECTOR_HEADERS <= FIXED_COLLECTOR_ALLOWANCE);
+    }
+}
 impl Collector {
     pub(in crate::operation_journal) fn new(
         input: WalPreparationInput,

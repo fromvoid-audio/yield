@@ -31,6 +31,17 @@ and validation/topology scratch keep their existing separate checked charges.
 The original journal reserve precedes new post-reservation allocations and reply
 growth. This change does not claim original prepayment before factory construction.
 
+The active Collector phase has a separate compile-time layout gate inside the
+unchanged 2048-byte fixed input allowance. It conservatively counts the entire
+Collector, Shared handoff Arc, original InputPermit Arc and retained budget Arc;
+the two original Arc headers include 64 bytes for counters and payload alignment,
+with supported target pointer/alignment assumptions checked explicitly. This is
+an active coexistence accounting bound, not terminal handle custody. Snapshot
+allocation and its database Vec capacity are separately charged by make_snapshot;
+CurrentRound::retained_bytes separately charges its round, boundary storage and
+original Source backing. Those simultaneous credits remain in the same 64 KiB
+budget. No header allowance or ceiling increases.
+
 The actual-worker regressions detach reports, complete original cleanup and
 Source/Global/journal joins, drop every snapshot/handle and the strong diagnostic
 budget, then require the exact original 65536-byte journal debit while only report

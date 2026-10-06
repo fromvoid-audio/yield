@@ -576,7 +576,7 @@ impl WalPreparationInput {
         // Move the original caller vector, with its entire actual capacity. No option
         // vector, stable-sort scratch or second backing is allocated during transfer.
         let header_bytes = std::mem::size_of::<Self>()
-            .checked_add(2048)
+            .checked_add(super::collector::FIXED_COLLECTOR_ALLOWANCE)
             .and_then(|n| {
                 n.checked_add(
                     sources

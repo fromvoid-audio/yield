@@ -2864,7 +2864,7 @@ mod integration {
             });
             projection_gate = Some(release_tx);
         } else if inventory_case == 3 {
-            let budget = Arc::clone(&budget);
+            let budget = budget.clone();
             let full_credit = Arc::clone(&full_credit);
             handle.retirement_hook_for_tests(move |_| {
                 let mut credit = budget.credit();
