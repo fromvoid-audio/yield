@@ -200,7 +200,7 @@ impl Collector {
             source: None,
             current_revision: global.mutation_revision(),
             participants: vec![DatabaseParticipant {
-                id: args.global_participant().as_uuid(),
+                id: args.draining_work().participant_id().as_uuid(),
                 requirement: 1,
                 revision_domain: RevisionDomain::GlobalMutationGeneration,
                 command_digest,
@@ -328,7 +328,7 @@ impl Collector {
             _journal_input: self._journal_input.clone(),
             _credit: credit,
         })));
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(test)]
         {
             *self.shared.retirement_for_tests.lock().unwrap() = Some(observation.clone());
         }

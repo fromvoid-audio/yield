@@ -7338,6 +7338,7 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 
 #[cfg(test)]
 mod tests {
+    mod native_retirement_inventory;
     #[cfg(target_os = "linux")]
     mod wal_preparation;
 

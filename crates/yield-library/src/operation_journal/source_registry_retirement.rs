@@ -108,7 +108,7 @@ impl SourceRegistryRetirementIntentArgs {
         self.write_command_ordered(&mut digest, lexical)?;
         Ok(*digest.0.finalize().as_bytes())
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn write_codec_normalized_command(
         &self,
         writer: impl std::io::Write,

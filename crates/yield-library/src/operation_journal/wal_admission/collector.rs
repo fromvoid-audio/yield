@@ -109,7 +109,7 @@ pub enum WalPreparationStatus {
 struct Shared {
     canceled: AtomicBool,
     status: Mutex<WalPreparationStatus>,
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     retirement_for_tests: Mutex<Option<retirement_inventory::Observation>>,
     #[cfg(all(test, target_os = "linux"))]
     retirement_hook_for_tests: Mutex<Option<Box<dyn FnOnce(uuid::Uuid) + Send>>>,
@@ -132,7 +132,7 @@ struct Shared {
 /// ```
 pub struct WalPreparationHandle(Arc<Shared>);
 impl WalPreparationHandle {
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(in crate::operation_journal) fn retirement_inventory_for_tests(
         &self,
     ) -> Option<retirement_inventory::Observation> {
@@ -212,7 +212,7 @@ impl Collector {
         let shared = Arc::new(Shared {
             canceled: AtomicBool::new(false),
             status: Mutex::new(WalPreparationStatus::Preparing),
-            #[cfg(all(test, target_os = "linux"))]
+            #[cfg(test)]
             retirement_for_tests: Mutex::new(None),
             #[cfg(all(test, target_os = "linux"))]
             retirement_hook_for_tests: Mutex::new(None),

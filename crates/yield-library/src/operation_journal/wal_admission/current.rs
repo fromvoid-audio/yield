@@ -1,4 +1,5 @@
 //! One original owner round. Journal decisions and native cleanup compete under a short lock.
+use super::WalPreparationError;
 use std::{
     sync::{Arc, Condvar, Mutex},
     time::Instant,
