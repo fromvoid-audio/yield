@@ -48,5 +48,7 @@ settlement, control-state reconciliation, retry/refund/permit authority, clean
 physical volume handoff, or Native crash/power-loss qualification. Full
 OPT-1670/1665/1666/2197 remains open. Native maintenance/bootstrap/volume handoff
 under OPT-2235 and Windows handle-bound cleanup qualification remain required;
-Windows GNU compilation is compile evidence only. Unfiltered native failures
+Windows GNU compilation is compile evidence only. Original predecessor and final
+maintenance joins on macOS and Windows require the runtime checks in OPT-2381.
+Unfiltered native failures
 must be recorded separately from exact existing portable-suite filters.

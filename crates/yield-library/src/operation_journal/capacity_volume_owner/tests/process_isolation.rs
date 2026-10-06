@@ -17,7 +17,7 @@ impl Drop for IsolatedChild {
 
 /// Execute the original test body once, without other libtest cases that can fork while its
 /// flock descriptor is open. This changes fixture scheduling, never acquisition/retry policy.
-pub(super) fn run_in_child(case: &str) -> bool {
+pub(in crate::operation_journal::capacity_volume_owner) fn run_in_child(case: &str) -> bool {
     if std::env::var(CHILD_CASE).as_deref() == Ok(case) {
         fs::write(std::env::var_os(CHILD_MARKER).expect("child marker"), case)
             .expect("record exact test body entry");
@@ -27,6 +27,10 @@ pub(super) fn run_in_child(case: &str) -> bool {
     let marker = marker_directory.path().join("entered");
     let module = if case == "fork_retains_actual_owner_lock_until_exec" {
         "operation_journal::capacity_volume_owner::tests::process_isolation"
+    } else if case
+        == "original_sealed_bootstrap_retains_exact_lock_and_registry_at_each_refused_prefix"
+    {
+        "operation_journal::capacity_volume_owner::legacy_bootstrap::tests::native"
     } else {
         "operation_journal::capacity_volume_owner::tests"
     };
