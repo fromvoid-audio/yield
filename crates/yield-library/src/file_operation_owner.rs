@@ -4605,10 +4605,10 @@ mod tests {
     mod telemetry_tests;
 
     use super::*;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
     use crate::operation_journal::ParticipantId;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     use crate::test_runtime::TestRuntimeGuard;
 
     fn test_object() -> OwnedObjectIdentity {

@@ -812,19 +812,6 @@ impl BoundDatabaseRoot {
             .checked_add(guard.profile_root_identity().len().checked_mul(2)?)
     }
     /// Read-only security snapshot of this exact already retained owned directory.
-    /// Exact fixed owned Rust allocation used by serialized owned-root validation.
-    /// Original profile construction prepays it; Source roots do not query this policy.
-    pub(crate) const fn owned_directory_snapshot_bytes() -> usize {
-        #[cfg(windows)]
-        {
-            windows_owned_security::BUFFER_BYTES
-        }
-        #[cfg(not(windows))]
-        {
-            0
-        }
-    }
-
     #[cfg(windows)]
     pub(crate) fn validate_owned_directory_snapshot(&self) -> io::Result<()> {
         if !matches!(

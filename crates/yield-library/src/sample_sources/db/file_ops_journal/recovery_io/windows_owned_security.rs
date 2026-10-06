@@ -27,8 +27,11 @@ pub(super) enum SnapshotError {
     Malformed,
     ForeignOwner,
     ForeignMutation,
+    #[cfg(windows)]
     Unavailable,
+    #[cfg(windows)]
     NotDirectory,
+    #[cfg(windows)]
     Changed,
 }
 
@@ -364,6 +367,17 @@ mod tests {
     }
 
     #[test]
+    fn windows_owned_security_buffer_layout_has_exact_fixed_backing() {
+        let buffers = SnapshotBuffers {
+            token: [0; TOKEN_BYTES],
+            security: [0; SECURITY_BYTES],
+        };
+        assert_eq!(buffers.token.len() + buffers.security.len(), BUFFER_BYTES);
+        assert_eq!(std::mem::align_of::<SnapshotBuffers>(), 16);
+        assert_eq!(BUFFER_BYTES, 16_896);
+    }
+
+    #[test]
     fn windows_owned_security_owner_only_policy_has_no_privileged_sid_exemption() {
         let user = account(1001);
         let entries = [(0, 0, KNOWN_RIGHTS, user.clone())];
@@ -504,6 +518,7 @@ mod native_tests {
         let path = std::env::var_os(name).expect("external Windows ACL fixture is required");
         OpenOptions::new()
             .read(true)
+            .access_mode(0x80) // Match the actual original attribute-only root handle.
             .custom_flags(0x02000000 | 0x00200000)
             .share_mode(7)
             .open(path)
