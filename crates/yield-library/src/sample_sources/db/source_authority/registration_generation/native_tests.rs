@@ -51,7 +51,10 @@ fn original_registered_source_request_carries_checked_generation() {
 fn original_source_generation_exhaustion_clears_only_failed_construction_marker() {
     database(|db| {
         let original_changes = db.connection.total_changes();
-        let original_control = db.source_lease_control_total_changes_for_tests().unwrap();
+        let original_control = db
+            .source_lease_control_total_changes_for_tests()
+            .unwrap()
+            .unwrap();
         let original_expiry: i64 = db
             .connection
             .query_row("SELECT expires_at FROM source_lease", [], |row| row.get(0))
@@ -68,7 +71,9 @@ fn original_source_generation_exhaustion_clears_only_failed_construction_marker(
         }
         assert_eq!(db.connection.total_changes(), original_changes);
         assert_eq!(
-            db.source_lease_control_total_changes_for_tests().unwrap(),
+            db.source_lease_control_total_changes_for_tests()
+                .unwrap()
+                .unwrap(),
             original_control
         );
         assert_eq!(db.connection.query_row::<i64, _, _>(
