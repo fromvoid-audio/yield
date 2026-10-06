@@ -69,10 +69,10 @@ use super::selection_output_commands::{
 use super::validation::{RecordConsistency, classify_record};
 
 mod admission_rebuild_backing;
-#[cfg(any(test, feature = "test-support"))]
-mod namespace_backing_probe;
 mod chunk_claims;
 mod chunk_staging;
+#[cfg(any(test, feature = "test-support"))]
+mod namespace_backing_probe;
 pub(super) use admission_rebuild_backing::FundedSnapshot;
 mod historical_claim_observation;
 mod legacy_allocation_observation;
@@ -9918,10 +9918,13 @@ fn validate_connection_identity(
 
 fn map_identity_error(error: DatabaseIdentityError) -> OperationJournalStoreError {
     match error {
-        DatabaseIdentityError::Io { path, source } => io_error(&path, source),
-        DatabaseIdentityError::NotRegular { path } => {
-            audit_error(&path, "journal database is not a regular file")
+        DatabaseIdentityError::Io { path, source } => {
+            OperationJournalStoreError::Io { path, source }
         }
+        DatabaseIdentityError::NotRegular { path } => OperationJournalStoreError::RequiresAudit {
+            path,
+            reason: "journal database is not a regular file".into(),
+        },
         DatabaseIdentityError::Replaced { path } => {
             OperationJournalStoreError::DatabaseReplaced { path }
         }
@@ -9931,7 +9934,12 @@ fn map_identity_error(error: DatabaseIdentityError) -> OperationJournalStoreErro
         DatabaseIdentityError::ConnectionMismatch { path, reason } => {
             OperationJournalStoreError::ConnectionIdentityMismatch { path, reason }
         }
-        DatabaseIdentityError::UnsafeSidecar { path, reason } => audit_error(&path, reason),
+        DatabaseIdentityError::UnsafeSidecar { path, reason } => {
+            OperationJournalStoreError::RequiresAudit {
+                path,
+                reason: reason.into(),
+            }
+        }
     }
 }
 
