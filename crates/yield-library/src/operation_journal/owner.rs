@@ -2587,20 +2587,6 @@ impl OwnerRuntime {
         .ok_or_else(|| OperationJournalOwnerError::StagingGrant {
             reason: "original publication target lacks validated staging bytes".into(),
         })?;
-        let completion_command =
-            target
-                .publication_command()
-                .map_err(|_| OperationJournalOwnerError::StagingGrant {
-                    reason: "original completion command is invalid".into(),
-                })?;
-        let completion_bytes = completion_command.canonical_bytes().map_err(|_| {
-            OperationJournalOwnerError::StagingGrant {
-                reason: "original completion command is invalid".into(),
-            }
-        })?;
-        let completion_fingerprint = *blake3::hash(&completion_bytes).as_bytes();
-        drop(completion_bytes);
-        drop(completion_command);
         let fence = self.publication_fences.issue_for_source(
             validation.operation_id(),
             registration.registration_id,
@@ -2614,6 +2600,39 @@ impl OwnerRuntime {
             target.volume(),
             bytes,
         )?;
+        let issuer = self
+            .publication_fences
+            .issuance_observation(&fence)
+            .ok_or_else(|| OperationJournalOwnerError::StagingGrant {
+                reason: "original publication issuer observation is unavailable".into(),
+            })?;
+        let completion_command =
+            target
+                .publication_command()
+                .map_err(|_| OperationJournalOwnerError::StagingGrant {
+                    reason: "original completion command is invalid".into(),
+                })?;
+        let completion_bytes = completion_command.canonical_bytes().map_err(|_| {
+            OperationJournalOwnerError::StagingGrant {
+                reason: "original completion command is invalid".into(),
+            }
+        })?;
+        let completion_fingerprint = *blake3::hash(&completion_bytes).as_bytes();
+        let chunk = match charge_selector {
+            publication_charge::Selector::Ordinary(_) => None,
+            publication_charge::Selector::Chunk(chunk) => Some(chunk),
+        };
+        let binding =
+            self.store()
+                .capture_publication_binding(super::store::PublicationBindingCapture {
+                    canonical_command: &completion_bytes,
+                    validation,
+                    charge: &charge,
+                    chunk,
+                    issuer,
+                })?;
+        drop(completion_bytes);
+        drop(completion_command);
         let checkpoint_result = self.store().checkpoint_staging_result(validation);
         let checkpoint: StagingCheckpointAck = self
             .publication_write_result(checkpoint_result)?
@@ -2622,7 +2641,9 @@ impl OwnerRuntime {
             })?;
         source_pin.validate_for_issuance(&source.request, profile_guard)?;
         validate_publication_target(&target)?;
-        let grant_result = self.store().reserve_staging_grant(checkpoint, validation);
+        let grant_result = self
+            .store()
+            .reserve_staging_grant(checkpoint, validation, binding);
         self.publication_write_result(grant_result)?;
         validate_publication_target(&target)?;
         provider

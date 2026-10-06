@@ -42,6 +42,9 @@ pub(super) struct StoredRootRef {
 }
 
 impl StoredRootRef {
+    pub(super) fn owner(&self) -> Uuid {
+        self.owner
+    }
     fn from_live(reference: RootRegistrationRef) -> Self {
         Self {
             owner: reference.owner_identity().as_uuid(),
@@ -50,7 +53,7 @@ impl StoredRootRef {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), String> {
         if self.owner.is_nil() || self.registration_id.is_nil() || self.generation == 0 {
             return Err(String::from("staging root observation is invalid"));
         }
@@ -82,7 +85,7 @@ impl StoredStagingSourceFence {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), String> {
         if self.source_id.is_empty()
             || self.source_id.len() > 256
             || self.root_identity.is_empty()
@@ -202,6 +205,22 @@ impl StagingCheckpointRecord {
 
     pub(super) fn output_id(&self) -> Uuid {
         self.output_id
+    }
+
+    pub(super) fn effect_id(&self) -> Uuid {
+        self.effect_id
+    }
+    pub(super) fn request_fingerprint(&self) -> [u8; 32] {
+        self.request_fingerprint
+    }
+    pub(super) fn staging_root(&self) -> &StoredRootRef {
+        &self.staging_root
+    }
+    pub(super) fn locator(&self) -> &str {
+        &self.locator
+    }
+    pub(super) fn logical_object_id(&self) -> Uuid {
+        self.logical_object_id
     }
 
     pub(super) fn bytes(&self) -> u64 {
@@ -473,6 +492,7 @@ impl OperationJournalStore {
         &self,
         acknowledgement: StagingCheckpointAck,
         result: &FileOperationResult,
+        mut binding: super::PublicationBindingDraft,
     ) -> Result<(), OperationJournalStoreError> {
         let record = StagingCheckpointRecord::from_file_result(result).map_err(checkpoint_error)?;
         if record != acknowledgement.record {
@@ -480,13 +500,25 @@ impl OperationJournalStore {
                 "grant validation differs from acknowledged checkpoint",
             ));
         }
-        self.reserve_staging_grant_record(&record, acknowledgement.sequence)
+        binding.finish(acknowledgement.sequence);
+        self.reserve_staging_grant_record_bound(&record, acknowledgement.sequence, Some(&binding))
     }
 
+    // Exact old-schema reservation fixture only. Production issuance always binds its record.
+    #[cfg(test)]
     pub(super) fn reserve_staging_grant_record(
         &self,
         record: &StagingCheckpointRecord,
         acknowledged_sequence: i64,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.reserve_staging_grant_record_bound(record, acknowledged_sequence, None)
+    }
+
+    fn reserve_staging_grant_record_bound(
+        &self,
+        record: &StagingCheckpointRecord,
+        acknowledged_sequence: i64,
+        binding: Option<&super::PublicationBindingDraft>,
     ) -> Result<(), OperationJournalStoreError> {
         self.validate_namespace()?;
         self.connection.execute_batch("BEGIN EXCLUSIVE")?;
@@ -519,6 +551,9 @@ impl OperationJournalStore {
                 return Err(checkpoint_error(
                     "grant reservation lost its single-use transition",
                 ));
+            }
+            if let Some(binding) = binding {
+                self.insert_publication_binding_inside_transaction(record, binding)?;
             }
             #[cfg(test)]
             if let Some(InsertTestDirective::Fail(error)) =
@@ -567,6 +602,21 @@ impl OperationJournalStore {
             return Err(uncertain_outcome(
                 "grant reservation readback differs from exact checkpoint",
             ));
+        }
+        if let Some(binding) = binding {
+            let readback = self
+                .read_publication_binding(record.output_id())
+                .map_err(|_| {
+                    uncertain_outcome("publication binding readback failed after reservation")
+                })?
+                .ok_or_else(|| {
+                    uncertain_outcome("publication binding disappeared after reservation")
+                })?;
+            if readback != *binding {
+                return Err(uncertain_outcome(
+                    "publication binding readback differs from exact original issuance",
+                ));
+            }
         }
         Ok(())
     }
