@@ -848,7 +848,13 @@ impl DatabaseClaimInventory {
             ownership_generation: r.u64()?,
             decision_nonce: r.uuid()?,
         };
-        let source_registration_generation = if registered { Some(r.u64()?) } else { None };
+        let source_registration_generation = if registered {
+            let generation = r.u64()?;
+            integer(generation, true)?;
+            Some(generation)
+        } else {
+            None
+        };
         let nb = r.u16()? as usize;
         let ns = r.u16()? as usize;
         require(
