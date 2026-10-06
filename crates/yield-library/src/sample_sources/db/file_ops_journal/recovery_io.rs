@@ -1071,6 +1071,48 @@ impl BoundDatabaseRoot {
         directory.symlink_metadata(name)
     }
 
+    /// Flush each original namespace only while the genuine pre-lease seal remains live.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn sync_legacy_namespace(
+        &self,
+        profile_guard: &WritableProfileGuard,
+        proof: &crate::sample_sources::db::LegacyReserveUseProof<'_>,
+        #[cfg(test)] after_sync: Option<fn(u8)>,
+    ) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            let _ = (profile_guard, after_sync);
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(windows))]
+        {
+            let profile_root = profile_guard
+                .profile_root_dir()
+                .map_err(|e| e.to_string())?;
+            // Descriptor acquisition and each previous native sync may consume the original
+            // cooperative budget. Only the genuine borrowed seal can authorize the next effect.
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())?;
+            sync_retained_directory(&profile_root.into_std_file()).map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            if let Some(observe) = after_sync {
+                observe(1);
+            }
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())?;
+            sync_retained_directory(&self._capability).map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            if let Some(observe) = after_sync {
+                observe(2);
+            }
+            Ok(())
+        }
+    }
+
     /// Flush the retained profile and child directory entries before a durable child-file write.
     pub(crate) fn sync_namespace(
         &self,

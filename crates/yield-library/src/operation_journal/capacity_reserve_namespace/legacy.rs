@@ -86,6 +86,24 @@ fn finish_legacy_created_reserve<'a>(
     reserve: ProtectedReserve,
     proof: &LegacyReserveUseProof<'_>,
 ) -> Result<BoundReserve<'a>, ReserveNamespaceFailure> {
+    finish_legacy_created_reserve_inner(
+        root,
+        profile,
+        reserve,
+        proof,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn finish_legacy_created_reserve_inner<'a>(
+    root: &'a BoundDatabaseRoot,
+    profile: &'a WritableProfileGuard,
+    reserve: ProtectedReserve,
+    proof: &LegacyReserveUseProof<'_>,
+    #[cfg(test)] after_sync: Option<fn(u8)>,
+) -> Result<BoundReserve<'a>, ReserveNamespaceFailure> {
     let observation = match ReserveNamespaceObservation::from_reserve(root.identity(), &reserve) {
         Ok(observation) => observation,
         Err(reason) => {
@@ -107,7 +125,12 @@ fn finish_legacy_created_reserve<'a>(
             None,
         ));
     }
-    if let Err(error) = root.sync_namespace(profile) {
+    if let Err(error) = root.sync_legacy_namespace(
+        profile,
+        proof,
+        #[cfg(test)]
+        after_sync,
+    ) {
         return Err(ReserveNamespaceFailure::new(
             ReserveNamespaceFailureStage::Sync,
             ReserveNamespaceFailureReason::Sync(error.to_string()),
