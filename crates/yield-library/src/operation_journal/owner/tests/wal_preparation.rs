@@ -3385,45 +3385,51 @@ mod integration {
     }
     #[test]
     fn all_owner_detached_reports_retain_original_journal_input_after_joins() {
-        let mut rig = Rig::new("all-owner-detached-reports");
-        let input = rig.input(Instant::now() + Duration::from_secs(2));
-        let budget = input.budget_for_test();
-        let handle = rig.submit(input);
-        let WalPreparationStatus::Ready(view) = wait(&handle, |s| {
-            matches!(s, WalPreparationStatus::Ready(_)) || terminal(s)
-        }) else {
-            panic!("not ready")
-        };
-        let detached = view.databases().to_vec();
-        assert!(matches!(detached[0], WalPreparedDatabase::Global(_)));
-        assert!(matches!(detached[1], WalPreparedDatabase::Source(_)));
-        let client = rig.journal.client();
-        assert!(rig.journal.shutdown());
-        assert!(matches!(handle.status(), WalPreparationStatus::Aborted));
-        for i in 0..2 {
-            rig.outside_source(i)
-                .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
-                .unwrap();
+        for detached_index in 0..3 {
+            let mut rig = Rig::new("all-owner-detached-reports");
+            let input = rig.input(Instant::now() + Duration::from_secs(2));
+            let budget = input.budget_for_test();
+            let handle = rig.submit(input);
+            let WalPreparationStatus::Ready(view) = wait(&handle, |s| {
+                matches!(s, WalPreparationStatus::Ready(_)) || terminal(s)
+            }) else {
+                panic!("not ready")
+            };
+            let detached = view.databases()[detached_index].clone();
+            if detached_index == 0 {
+                assert!(matches!(detached, WalPreparedDatabase::Global(_)));
+            } else {
+                assert!(matches!(detached, WalPreparedDatabase::Source(_)));
+            }
+            let client = rig.journal.client();
+            assert!(rig.journal.shutdown());
+            assert!(matches!(handle.status(), WalPreparationStatus::Aborted));
+            for i in 0..2 {
+                rig.outside_source(i)
+                    .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+                    .unwrap();
+            }
+            drop(view);
+            drop(handle);
+            drop(rig.actor.take());
+            assert!(rig.global.shutdown());
+            assert!(
+                budget.used() > 0,
+                "detached original report backing remains live"
+            );
+            drop(budget);
+            assert_eq!(
+                ORDINARY_INPUT_BYTES - client.shared.input_bytes.lock().unwrap().remaining[0],
+                64 * 1024,
+                "detached original reports must retain the original journal backing debit"
+            );
+            let alias = detached.clone();
+            concurrent_inventory_drop(detached, alias);
+            assert_eq!(
+                client.shared.input_bytes.lock().unwrap().remaining[0],
+                ORDINARY_INPUT_BYTES
+            );
         }
-        drop(view);
-        drop(handle);
-        drop(rig.actor.take());
-        assert!(rig.global.shutdown());
-        assert!(
-            budget.used() > 0,
-            "detached original report backing remains live"
-        );
-        drop(budget);
-        assert_eq!(
-            ORDINARY_INPUT_BYTES - client.shared.input_bytes.lock().unwrap().remaining[0],
-            64 * 1024,
-            "detached original reports must retain the original journal backing debit"
-        );
-        drop(detached);
-        assert_eq!(
-            client.shared.input_bytes.lock().unwrap().remaining[0],
-            ORDINARY_INPUT_BYTES
-        );
     }
     #[test]
     fn all_owner_journal_shutdown_drains_real_custody_before_original_resources() {
