@@ -778,19 +778,46 @@ pub(super) fn exceeds_row_limit(
     Ok(false)
 }
 
+/// Match String's original SQLite type/UTF-8 errors without materializing its bytes.
+fn borrowed_text<'row>(row: &'row Row<'_>, index: usize) -> Result<&'row str, ChunkClaimReadError> {
+    use rusqlite::types::{Type, ValueRef};
+    match row.get_ref(index)? {
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error)).into()
+        }),
+        other => Err(rusqlite::Error::InvalidColumnType(
+            index,
+            row.as_ref().column_name(index)?.to_owned(),
+            other.data_type(),
+        )
+        .into()),
+    }
+}
+
+fn borrowed_optional_text<'row>(
+    row: &'row Row<'_>,
+    index: usize,
+) -> Result<Option<&'row str>, ChunkClaimReadError> {
+    if matches!(row.get_ref(index)?, rusqlite::types::ValueRef::Null) {
+        Ok(None)
+    } else {
+        borrowed_text(row, index).map(Some)
+    }
+}
+
 fn decode_row(row: &Row<'_>) -> Result<ChunkClaimRecord, ChunkClaimReadError> {
-    let chunk_id = ChunkId::parse(row.get::<_, String>(0)?.as_str())
+    let chunk_id = ChunkId::parse(borrowed_text(row, 0)?)
         .map_err(|error| ChunkClaimReadError::Malformed(error.to_string()))?;
-    let operation_id = OperationId::parse(row.get::<_, String>(1)?.as_str())
+    let operation_id = OperationId::parse(borrowed_text(row, 1)?)
         .map_err(|error| ChunkClaimReadError::Malformed(error.to_string()))?;
     let claim_id = AdmissionClaimId::from_uuid(
-        Uuid::parse_str(row.get::<_, String>(2)?.as_str())
+        Uuid::parse_str(borrowed_text(row, 2)?)
             .map_err(|error| ChunkClaimReadError::Malformed(error.to_string()))?,
     )
     .map_err(|error| ChunkClaimReadError::Malformed(error.to_string()))?;
-    let participant_id = ParticipantId::parse(row.get::<_, String>(3)?.as_str())
+    let participant_id = ParticipantId::parse(borrowed_text(row, 3)?)
         .map_err(|error| ChunkClaimReadError::Malformed(error.to_string()))?;
-    let output_key: String = row.get(4)?;
+    let output_key = borrowed_text(row, 4)?;
     if output_key.is_empty() || output_key.len() > MAX_OUTPUT_KEY_BYTES {
         return Err(ChunkClaimReadError::Malformed(String::from(
             "output key bounds",
@@ -798,14 +825,13 @@ fn decode_row(row: &Row<'_>) -> Result<ChunkClaimRecord, ChunkClaimReadError> {
     }
     let logical_offset = positive_u64(row.get::<_, i64>(5)?, "logical offset")?;
     let logical_length = positive_u64(row.get::<_, i64>(6)?, "logical length")?;
-    let volume_device = row
-        .get::<_, String>(7)?
+    let volume_device = borrowed_text(row, 7)?
         .parse::<u64>()
         .map_err(|_| ChunkClaimReadError::Malformed(String::from("volume device bounds")))?;
     let volume = VolumeIdentity {
         device: volume_device as u64,
     };
-    let allocation_class = allocation_class(row.get::<_, String>(8)?.as_str())?;
+    let allocation_class = allocation_class(borrowed_text(row, 8)?)?;
     if !supports_chunk_output_class(allocation_class) {
         return Err(ChunkClaimReadError::Malformed(String::from(
             "chunk output allocation class is not incrementally chargeable",
@@ -814,18 +840,18 @@ fn decode_row(row: &Row<'_>) -> Result<ChunkClaimRecord, ChunkClaimReadError> {
     let allocated_bytes = positive_u64(row.get::<_, i64>(9)?, "allocated bytes")?;
     let allocation_unit = positive_u64(row.get::<_, i64>(10)?, "allocation unit")?;
     let protected_free_bytes = positive_u64(row.get::<_, i64>(11)?, "protected floor")?;
-    let state = match row.get::<_, String>(12)?.as_str() {
+    let state = match borrowed_text(row, 12)? {
         "Claimed" => ChunkClaimState::Claimed,
         "Issued" => ChunkClaimState::Issued,
         "Released" => ChunkClaimState::Released,
         value => {
             return Err(ChunkClaimReadError::Malformed(format!(
-                "unknown state {value}"
+                "unknown state {value:.64}"
             )));
         }
     };
-    let issue_id = optional_uuid(row.get(13)?)?;
-    let release_id = optional_uuid(row.get(14)?)?;
+    let issue_id = optional_uuid(borrowed_optional_text(row, 13)?)?;
+    let release_id = optional_uuid(borrowed_optional_text(row, 14)?)?;
     if (state == ChunkClaimState::Claimed && (issue_id.is_some() || release_id.is_some()))
         || (state == ChunkClaimState::Issued && (issue_id.is_none() || release_id.is_some()))
         || (state == ChunkClaimState::Released && release_id.is_none())
@@ -839,7 +865,7 @@ fn decode_row(row: &Row<'_>) -> Result<ChunkClaimRecord, ChunkClaimReadError> {
         operation_id,
         claim_id,
         participant_id,
-        output_key,
+        output_key: output_key.to_owned(),
         logical_offset,
         logical_length,
         volume,
@@ -860,10 +886,10 @@ fn positive_u64(value: i64, field: &str) -> Result<u64, ChunkClaimReadError> {
     Ok(value as u64)
 }
 
-fn optional_uuid(value: Option<String>) -> Result<Option<Uuid>, ChunkClaimReadError> {
+fn optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, ChunkClaimReadError> {
     value
         .map(|value| {
-            Uuid::parse_str(&value)
+            Uuid::parse_str(value)
                 .map_err(|error| ChunkClaimReadError::Malformed(error.to_string()))
         })
         .transpose()
@@ -881,7 +907,7 @@ fn allocation_class(value: &str) -> Result<FullCapacityAllocationClass, ChunkCla
         "ExistingRecoveryPayload" => Ok(FullCapacityAllocationClass::ExistingRecoveryPayload),
         "OperationRecoveryPayload" => Ok(FullCapacityAllocationClass::OperationRecoveryPayload),
         value => Err(ChunkClaimReadError::Malformed(format!(
-            "unknown allocation class {value}"
+            "unknown allocation class {value:.64}"
         ))),
     }
 }
@@ -945,3 +971,15 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "chunk_claims/scalar_tests.rs"]
+mod scalar_tests;
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "chunk_claims/original_scalar_probe.rs"]
+mod original_scalar_probe;
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "chunk_claims/scalar_probe.rs"]
+mod scalar_probe;
