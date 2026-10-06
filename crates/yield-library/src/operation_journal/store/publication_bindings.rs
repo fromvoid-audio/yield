@@ -87,6 +87,7 @@ impl PublicationBindingDraft {
         if canonical_command.len() > MAX_COMMAND_BYTES {
             return Err(invalid("publication command exceeds durable binding bound"));
         }
+        super::staging_checkpoints::bounded_string_tokens(canonical_command).map_err(invalid)?;
         // Direct typed decoding rejects duplicate/unknown fields without an owned JSON tree.
         let command = serde_json::from_slice(canonical_command)
             .map_err(|_| invalid("original publication command shape is invalid"))?;
@@ -215,6 +216,7 @@ impl PublicationBindingDraft {
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(invalid("publication binding exceeds record bound"));
         }
+        super::staging_checkpoints::bounded_string_tokens(bytes).map_err(invalid)?;
         let record: Self = serde_json::from_slice(bytes)
             .map_err(|_| invalid("publication binding has malformed or duplicate fields"))?;
         if record.encode()? != bytes {

@@ -138,6 +138,7 @@ pub(super) struct StagingCheckpointRecord {
     request_fingerprint: [u8; 32],
 }
 
+const _: () = assert!(std::mem::size_of::<StagingCheckpointRecord>() <= 2048);
 impl StagingCheckpointRecord {
     /// Capture one successful, exact file-owner validation without treating it as authority.
     pub(super) fn from_file_result(result: &FileOperationResult) -> Result<Self, String> {
@@ -289,7 +290,7 @@ impl StagingCheckpointRecord {
 
 // Validate a string token's raw wire size without allocating or interpreting authority.
 // Legal UTF-8 text/JSON escapes cannot exceed six times its decoded byte allowance.
-fn bounded_string_tokens(bytes: &[u8]) -> Result<(), String> {
+pub(super) fn bounded_string_tokens(bytes: &[u8]) -> Result<(), String> {
     let (mut quoted, mut escaped, mut length) = (false, false, 0usize);
     for byte in bytes {
         if !quoted {
