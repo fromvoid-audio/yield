@@ -28,6 +28,14 @@ exceeds this ceiling. No copied path, registry, heap-growing token list or new
 physical source permit is introduced. Round references drop before their debit;
 original native reservations remain separately held by the original workers.
 
+Ready provenance distinguishes a foreign/malformed publication seal from loss of
+its correctly correlated original round. Wrong round identity, cohort, slots or
+source/phase shape refuse as InvalidInput. Actual original invalidation refuses
+as OwnerLost; the same original deadline takes precedence at the comparison
+boundary. Confirmed Source timeout cannot become owner loss merely because it
+occurs after an earlier journal clock sample. Unknown native cleanup still
+reports OwnerLost during abort polling; a deadline never confirms that cleanup.
+
 Registration revocation before SQLite entry resolves the sole decision guard as
 NoAttempt before abort polling, so native cleanup can complete. A lifetime count
 that still retains the source is not a current Registered acknowledgement. An
