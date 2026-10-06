@@ -8,6 +8,7 @@ use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
+pub(super) mod historical_observation;
 mod materialization;
 pub use materialization::{BoundedDecodeError, JsonMaterializationLimits, JsonResourceKind};
 use serde_json::{Map, Value};

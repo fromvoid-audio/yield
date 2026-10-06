@@ -1867,9 +1867,18 @@ impl OwnerRuntime {
         }
     }
 
+    #[cfg(test)]
     fn admit_prepared(
         &mut self,
         prepared: PreparedAdmissionInput,
+    ) -> Result<OperationId, OperationJournalOwnerError> {
+        self.admit_prepared_with_funding(prepared, None)
+    }
+
+    fn admit_prepared_with_funding(
+        &mut self,
+        prepared: PreparedAdmissionInput,
+        input: Option<&InputPermit>,
     ) -> Result<OperationId, OperationJournalOwnerError> {
         if matches!(
             prepared.args,
@@ -1893,10 +1902,12 @@ impl OwnerRuntime {
         // Re-read the durable ordinary-claim image for every request. Startup readiness is only
         // a bootstrap observation and cannot authorize a later request after new recovery rows
         // or settlement evidence arrive.
-        let snapshot = self.store().rebuild_admission_snapshot().map_err(|error| {
-            PreparedAdmissionError::RecoveryRequired {
-                reason: error.to_string(),
-            }
+        let snapshot = match input {
+            Some(input) => self.store().rebuild_admission_snapshot_for_input(input),
+            None => self.store().rebuild_admission_snapshot(),
+        }
+        .map_err(|error| PreparedAdmissionError::RecoveryRequired {
+            reason: error.to_string(),
         })?;
         match snapshot.readiness() {
             CapacityRebuildReadiness::ReconciliationRequired { diagnostics } => {
@@ -5636,6 +5647,29 @@ pub(super) struct InputPermit {
     publication: bool,
 }
 
+impl InputPermit {
+    #[cfg(test)]
+    pub(super) fn historical_test_input(bytes: usize) -> Self {
+        let (senders, _receivers) = OwnerCommandReceivers::channel();
+        Arc::new(OwnerShared::new(senders))
+            .reserve_input(InputClass::Ordinary, bytes)
+            .expect("test original input pool")
+    }
+
+    /// Private scratch debit from this exact queued command's original pool.
+    pub(super) fn reserve_historical_scratch(
+        &self,
+        bytes: usize,
+    ) -> Result<Self, OperationJournalStoreError> {
+        if self.class != InputClass::Ordinary {
+            return Err(OperationJournalStoreError::HistoricalClaimResourceBound);
+        }
+        self.shared
+            .reserve_input(InputClass::Ordinary, bytes)
+            .map_err(|_| OperationJournalStoreError::HistoricalClaimResourceBound)
+    }
+}
+
 impl Drop for InputPermit {
     fn drop(&mut self) {
         self.shared
@@ -6400,8 +6434,9 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                     }
                 }
             } else {
-                let _input = input;
-                execute_store_result(result, move || runtime.admit_prepared(prepared))
+                execute_store_result(result, move || {
+                    runtime.admit_prepared_with_funding(prepared, Some(&input))
+                })
             }
         }
         JournalCommand::ClaimChunk {
