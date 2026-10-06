@@ -10,8 +10,11 @@ terminal SQL, settle WAL attempts or release durable reservations.
 The factory establishes one original readonly SQLite transaction before reading
 owned rows. Scalar queries refuse the complete inventory when it contains more
 than 32 operation/ordinary-claim/release/recovery rows per relation, more than 16
-recording rows, any database binding/slice/attempt/outcome, full-progress or chunk
-claim row, any captured recording payload, or oversized/wrongly typed row text.
+recording rows, any database attempt/outcome, full-progress or chunk claim row,
+any captured recording payload, or oversized/wrongly typed row text. Database
+bindings/slices retain their original 8,192-row ceilings; complete V1 binary
+inventories retain their original 64-KiB limit and receive separate audit backing
+as described in [RECORDING_PRESTART_DATABASE_CLAIMS.md](RECORDING_PRESTART_DATABASE_CLAIMS.md).
 Recording rows must fit the 1 KiB empty-control envelope. Within the same original
 read snapshot, the control reader compares each BLOB directly with the expected
 canonical empty reservation encoded from the validated proposal. It does not
@@ -121,11 +124,17 @@ journal admission or native physical qualification.
 | Three capped canonical proposal encodings | 393,216 |
 | Complete small claim/release maps, sets, pages and diagnostics | 131,072 |
 | Auxiliary bounded keys, errors and original context | 65,536 |
-| Conservative total | 3,604,480 |
-| Original command debit | 3,604,480 |
+| Original record/rebuild subtotal | 3,604,480 |
+| Database phase: released tree category | -720,896 |
+| Database phase: complete database-claim backing | 528,088 |
+| Database phase conservative total | 3,411,672 |
+| Maximum stage and unchanged command debit | 3,604,480 |
 
 The OPT-2361 borrowed participant preflight consumes the prior 64 KiB category
-headroom without changing the original command debit or any input-pool ceiling.
+headroom without changing the original record/rebuild subtotal or any input-pool ceiling.
+OPT-2392 stages separately derived database-claim backing after the initial
+two-tree decoder drops, preserving the original command debit and live producer
+revalidation headroom; attempt/outcome and full-progress backing remain unsupported.
 Its scanner is explicitly capped to the same 64 KiB Store row envelope; raw input
 plus old/new scratch backing can overlap at 256 KiB. Scanner backing drops before
 owned JSON construction. See [the participant preflight boundary](RECORDING_PARTICIPANT_PREFLIGHT.md)

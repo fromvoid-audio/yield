@@ -9,6 +9,10 @@ use uuid::Uuid;
 
 pub(super) const BINDING_TABLE: &str = "operation_journal_database_binding";
 pub(super) const SLICE_TABLE: &str = "operation_journal_database_claim_slice";
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static INVENTORY_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 pub(super) const CREATE_BINDING: &str = "CREATE TABLE operation_journal_database_binding (
     binding_id TEXT NOT NULL PRIMARY KEY,
     operation_id TEXT NOT NULL REFERENCES operation_journal(operation_id),
@@ -122,9 +126,10 @@ pub(super) fn read(
         // Old operations stay inspectable, but no binding/required exception is reconstructed.
         return Ok(None);
     };
-    let inventory =
-        DatabaseClaimInventory::decode(&bytes.ok_or_else(|| error("root encoding type/length"))?)
-            .map_err(error)?;
+    let bytes = bytes.ok_or_else(|| error("root encoding type/length"))?;
+    #[cfg(test)]
+    INVENTORY_COPIED_BYTES.with(|counter| counter.set(counter.get().saturating_add(bytes.len())));
+    let inventory = DatabaseClaimInventory::decode(&bytes).map_err(error)?;
     verify(connection, operation, &inventory)?;
     Ok(Some(inventory))
 }
@@ -328,9 +333,17 @@ impl OperationJournalStore {
             .read_row(operation)?
             .ok_or_else(|| error("orphan inventory"))?
             .record;
-        self.verify_recording_initial_readback(&record)?;
-        inventory.validate_record(&record).map_err(error)?;
-        let plan = super::full_capacity_plan_for_record(&record)?;
+        self.validate_database_claim_record(&record, inventory)
+    }
+    fn validate_database_claim_record(
+        &self,
+        record: &crate::operation_journal::StoredOperationRecord,
+        inventory: &DatabaseClaimInventory,
+    ) -> Result<(), OperationJournalStoreError> {
+        let operation = record.operation_id;
+        self.verify_recording_initial_readback(record)?;
+        inventory.validate_record(record).map_err(error)?;
+        let plan = super::full_capacity_plan_for_record(record)?;
         let plan = crate::operation_journal::full_capacity::FullCapacityPlan::new(
             plan.allocations()
                 .iter()
@@ -410,9 +423,22 @@ impl OperationJournalStore {
                         return Err(error("restart noncanonical operation identity"));
                     }
                     let operation = OperationId::from_uuid(id);
-                    let inventory = read(&self.connection, operation)?
-                        .ok_or_else(|| error("missing restart inventory"))?;
-                    self.validate_database_claim_operation(operation, &inventory)?;
+                    if self.recording_prestart_scope.get() {
+                        // Finish the two-tree operation decoder before owning the binary
+                        // inventory. Subsequent comparisons reuse this exact decoded row;
+                        // command digest construction owns only one JSON tree at a time.
+                        let record = self
+                            .read_row(operation)?
+                            .ok_or_else(|| error("orphan inventory"))?
+                            .record;
+                        let inventory = read(&self.connection, operation)?
+                            .ok_or_else(|| error("missing restart inventory"))?;
+                        self.validate_database_claim_record(&record, &inventory)?;
+                    } else {
+                        let inventory = read(&self.connection, operation)?
+                            .ok_or_else(|| error("missing restart inventory"))?;
+                        self.validate_database_claim_operation(operation, &inventory)?;
+                    }
                     after = text;
                 }
             }

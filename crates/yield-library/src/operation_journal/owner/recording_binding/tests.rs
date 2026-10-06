@@ -149,6 +149,48 @@ fn recording_custody_scalar_facade_cannot_create_slot_and_drain_closes_original_
     );
 }
 
+#[test]
+fn recording_custody_revalidation_queues_while_original_retained_debit_is_held() {
+    let mut f = Fixture::new();
+    let client = f.owner.client();
+    let before = *client.shared.input_bytes.lock().unwrap();
+    // Hold the actual original-pool debit for a producer lifetime. This test issues
+    // no Source registration or producer slot: the unissued facade must still refuse.
+    let retained = client
+        .shared
+        .reserve_input(InputClass::Ordinary, INPUT_BYTES)
+        .unwrap();
+    let forged = RecordingProducerCustody {
+        operation: OperationId::new(),
+        digest: [1; 32],
+        owner: Arc::downgrade(&client.shared),
+    };
+    assert!(matches!(
+        forged
+            .revalidate()
+            .expect("temporary command and retained producer credit must coexist")
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap(),
+        Err(OperationJournalOwnerError::RecordingProducerCustody(
+            RecordingProducerCustodyError::Changed
+        ))
+    ));
+    // The worker may send its reply just before dropping temporary input custody.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while client.shared.input_bytes.lock().unwrap().remaining[0]
+        != before.remaining[0] - INPUT_BYTES
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "temporary command input was not released"
+        );
+        std::thread::yield_now();
+    }
+    drop(retained);
+    assert_eq!(*client.shared.input_bytes.lock().unwrap(), before);
+    assert!(f.owner.shutdown());
+}
+
 // Native acceptance uses the production constructor and real registered source/root/admission.
 // No fixture capacity registry, injected receipt, synthetic root or platform bypass is used.
 fn native_original_recording_custody(lost_reply: bool) {
