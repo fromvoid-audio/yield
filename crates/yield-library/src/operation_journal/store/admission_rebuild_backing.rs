@@ -260,7 +260,10 @@ impl OperationJournalStore {
         &self,
         funded: bool,
     ) -> Result<(usize, bool, usize), OperationJournalStoreError> {
-        let input = InputPermit::historical_test_input(1);
+        // The same nested reader now funds its original precommit namespace.
+        // Give this component probe the original reply keeper required by that
+        // guard, just as genuine queued startup/admission already does.
+        let input = InputPermit::historical_test_namespace_input(1);
         self.connection.execute_batch("BEGIN")?;
         let mut collection = None;
         let result = self.rebuild_ordinary_claim_snapshot_with_funding(
