@@ -129,6 +129,40 @@ pub(crate) fn slice_identity(
     Ok(id)
 }
 
+/// Distinct historical domain: changing the serial changes every work/component identity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn registered_slice_identity(
+    header: &InventoryHeader,
+    binding: &DatabaseBinding,
+    source_registration_generation: u64,
+    claim: Uuid,
+    family_digest: &[u8; 32],
+    work: WorkUnitKey,
+    direction: ClaimDirection,
+    class: FullCapacityAllocationClass,
+) -> Result<Uuid> {
+    integer(source_registration_generation, true)?;
+    let prior = slice_identity(
+        header,
+        binding,
+        claim,
+        family_digest,
+        work,
+        direction,
+        class,
+    )?;
+    let mut hash = blake3::Hasher::new_derive_key("yield.registered-retirement-forward-slice.v1");
+    hash.update(&source_registration_generation.to_le_bytes());
+    hash.update(prior.as_bytes());
+    let id = Uuid::from_bytes(
+        hash.finalize().as_bytes()[..16]
+            .try_into()
+            .expect("fixed digest"),
+    );
+    uuid(id)?;
+    Ok(id)
+}
+
 pub(super) fn validate_record(
     inventory: &DatabaseClaimInventory,
     record: &super::super::codec::StoredOperationRecord,
@@ -207,15 +241,29 @@ fn validate_work_pairs(
                 .iter()
                 .filter(|s| s.binding == binding.id && s.class == class)
             {
-                let expected = slice_identity(
-                    &inventory.header,
-                    binding,
-                    slice.claim,
-                    digest,
-                    work,
-                    direction,
-                    class,
-                )?;
+                let expected = if let Some(generation) = inventory.source_registration_generation()
+                {
+                    registered_slice_identity(
+                        &inventory.header,
+                        binding,
+                        generation,
+                        slice.claim,
+                        digest,
+                        work,
+                        direction,
+                        class,
+                    )?
+                } else {
+                    slice_identity(
+                        &inventory.header,
+                        binding,
+                        slice.claim,
+                        digest,
+                        work,
+                        direction,
+                        class,
+                    )?
+                };
                 if slice.id == expected {
                     require(selected.is_none(), "retirement policy duplicate work slice")?;
                     selected = Some(slice);

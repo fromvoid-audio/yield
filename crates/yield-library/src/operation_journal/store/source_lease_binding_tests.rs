@@ -298,6 +298,7 @@ mod source_lease_binding_storage {
         codec_and_domain_refusals();
         actual_atomic_storage_attempts_and_legacy_reopen();
         retirement_forward_codec_and_storage();
+        registered_retirement_codec_and_storage();
         expected_decoder_preserves_retained_retirement_refusals();
     }
     fn codec_and_domain_refusals() {
