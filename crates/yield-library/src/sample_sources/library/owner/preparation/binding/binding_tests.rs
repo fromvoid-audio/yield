@@ -42,6 +42,9 @@ mod integration {
             release(held);
             assert_eq!(charged(writer), HANDOFF_BYTES);
             drop(view);
+            // Release acknowledges native cleanup before the worker drops its scope.
+            // An ordinary command on that same owner also observes credit disposal.
+            empty(writer);
             assert_eq!(charged(writer), 0);
             outside.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
         });
