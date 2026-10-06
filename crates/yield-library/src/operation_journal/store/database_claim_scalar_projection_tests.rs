@@ -105,11 +105,16 @@ fn database_claim_scalar_projection_original_large_nul_rows_do_not_copy_or_mutat
                 .unwrap(),
             prefix.len()
         );
+        let selection = if table == "operation_journal_ordinary_claim" {
+            "WHERE allocation_class IN('SourceDatabaseCommit','SourceWalShm','GlobalDatabaseCommit','GlobalWalShm')"
+        } else {
+            ""
+        };
         store
             .connection
             .execute(
                 &format!(
-                    "UPDATE {table} SET {column}=?1 WHERE rowid=(SELECT rowid FROM {table} LIMIT 1)"
+                    "UPDATE {table} SET {column}=?1 WHERE rowid=(SELECT rowid FROM {table} {selection} LIMIT 1)"
                 ),
                 [&value],
             )
