@@ -1,4 +1,31 @@
 // Real SQLite persistence with historical scalar inputs: no physical qualification or Start grant.
+#[test]
+fn registered_retirement_inventory_preserves_serial_separately_from_lease_epoch() {
+    let f = fixture();
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    let (_, _, old) = forward_input(&store, &f.owner);
+    let source = old
+        .bindings()
+        .iter()
+        .find(|b| b.role == DatabaseRole::Source)
+        .unwrap();
+    let epoch = source.source.as_ref().unwrap().lease_epoch;
+    // Deliberately historical scalars: production issuance/custody belongs to2383/2382.
+    let serial = epoch.checked_add(31).unwrap();
+    let inventory = DatabaseClaimInventory::new_registered_retirement_forward(
+        old.header().clone(),
+        old.bindings().to_vec(),
+        old.slices().to_vec(),
+        serial,
+    )
+    .unwrap();
+    assert_eq!(
+        &inventory.encode().unwrap()[..6],
+        b"YWCB\x04\x00",
+        "genuine serial needs a separate historical policy"
+    );
+}
+
 fn forward_input(
     store: &OperationJournalStore,
     owner: &WritableProfileGuard,

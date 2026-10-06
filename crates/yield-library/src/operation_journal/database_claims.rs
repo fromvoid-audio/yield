@@ -174,6 +174,16 @@ fn class_tag(class: FullCapacityAllocationClass) -> Result<u8> {
 }
 
 impl DatabaseClaimInventory {
+    // Test-only observation adapter for the missing registered-retirement format.
+    #[cfg(test)]
+    pub(crate) fn new_registered_retirement_forward(
+        header: InventoryHeader,
+        bindings: Vec<DatabaseBinding>,
+        slices: Vec<DatabaseClaimSlice>,
+        _source_registration_generation: u64,
+    ) -> Result<Self> {
+        Self::new_retirement_forward(header, bindings, slices)
+    }
     /// Compare the immutable participant envelope and actual codec-normalized family. This
     /// does not validate a live registration or decide whether compensation is currently legal.
     pub(crate) fn validate_record(
