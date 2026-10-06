@@ -45,7 +45,11 @@ fn detached_original_refund_corruption_closes_actual_lifecycle_and_resource_gate
         shared.lifecycle.load(Ordering::Acquire),
         OwnerLifecycle::Unavailable as u8
     );
-    assert_eq!(shared.resource_admission.snapshot().0, false);
+    assert_eq!(shared.resource_admission.snapshot().0, true);
+    assert_eq!(
+        shared.resource_admission.validate_open(),
+        Err(resource_custody::UseError::Unknown)
+    );
     assert!(matches!(
         shared.status(),
         OperationJournalOwnerStatus::Unavailable { .. }
@@ -70,7 +74,11 @@ fn detached_original_refund_poison_closes_actual_lifecycle_and_resource_gate() {
         shared.lifecycle.load(Ordering::Acquire),
         OwnerLifecycle::Unavailable as u8
     );
-    assert_eq!(shared.resource_admission.snapshot().0, false);
+    assert_eq!(shared.resource_admission.snapshot().0, true);
+    assert_eq!(
+        shared.resource_admission.validate_open(),
+        Err(resource_custody::UseError::Unknown)
+    );
 }
 
 #[test]
@@ -93,5 +101,9 @@ fn permanent_startup_debit_cannot_mask_corrupt_publication_accounting() {
         shared.lifecycle.load(Ordering::Acquire),
         OwnerLifecycle::Unavailable as u8
     );
-    assert_eq!(shared.resource_admission.snapshot().0, false);
+    assert_eq!(shared.resource_admission.snapshot().0, true);
+    assert_eq!(
+        shared.resource_admission.validate_open(),
+        Err(resource_custody::UseError::Unknown)
+    );
 }
