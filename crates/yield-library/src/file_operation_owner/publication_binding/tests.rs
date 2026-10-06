@@ -102,6 +102,82 @@ mod integration {
         }
     }
     #[test]
+    fn original_completion_observation_refuses_foreign_result_fields_without_grant() {
+        let f = Fixture::new();
+        let (mut validation, original) = f.validation();
+        let mut pending = f.prepare(original.clone(), EffectId::new(), "final.wav");
+        let target = wait(&mut pending).unwrap();
+        let command = target.publication_command().unwrap();
+        let fingerprint =
+            RequestFingerprint(*blake3::hash(&command.canonical_bytes().unwrap()).as_bytes());
+        let result = rejection_result(
+            &command,
+            fingerprint,
+            EffectOutcome::Unsupported {
+                reason: "original backend unavailable".into(),
+            },
+        );
+        let worker = f.owner.owner_identity();
+        let observation = |result: &FileOperationResult, worker| {
+            completion_observation(&target, fingerprint.as_bytes(), result, worker)
+        };
+        assert!(observation(&result, worker).1);
+        assert_eq!(
+            observation(&result, worker),
+            observation(&result.clone(), worker)
+        );
+        for field in 0..11 {
+            let mut foreign = result.clone();
+            match field {
+                0 => foreign.operation_id = OperationId::new(),
+                1 => foreign.participant_id = ParticipantId::new("foreign-completion").unwrap(),
+                2 => foreign.effect_id = EffectId::new(),
+                3 => foreign.fingerprint = RequestFingerprint([5; 32]),
+                4 => foreign.target_registration = RootRegistrationRef::synthetic_for_test(),
+                5 => foreign.expected = ExpectedObject::Exact(test_object()),
+                6 => foreign.root_bindings.clear(),
+                7 => foreign.root_bindings.swap(0, 1),
+                8 => {
+                    foreign.root_bindings[0].registration =
+                        RootRegistrationRef::synthetic_for_test()
+                }
+                9 => {
+                    foreign.root_bindings[1].locator =
+                        BoundedRelativeLocator::new("foreign.wav").unwrap()
+                }
+                10 => {
+                    foreign.outcome = EffectOutcome::RetainedUncertain {
+                        reason: "original unknown boundary".into(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(!observation(&foreign, worker).1, "field {field}");
+        }
+        assert!(!observation(&result, OwnerIdentity(Uuid::new_v4())).1);
+        let mut oversized = result.clone();
+        oversized.outcome = EffectOutcome::Unsupported {
+            reason: "x".repeat(FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES + 1),
+        };
+        assert!(!observation(&oversized, worker).1);
+        let mut changed = result.clone();
+        changed.outcome = EffectOutcome::Unsupported {
+            reason: "different original reason".into(),
+        };
+        assert!(observation(&changed, worker).1);
+        assert_ne!(
+            observation(&changed, worker).0,
+            observation(&result, worker).0
+        );
+        // An observation has no original grant and cannot submit a primary publication.
+        assert!(f.owner.submit(command).is_err());
+        validation.acknowledge().unwrap();
+        drop((target, pending));
+        f.owner.acknowledge_custody_for_test();
+        let _ = f.owner.shutdown();
+    }
+
+    #[test]
     fn held_staging_revalidation_refuses_changed_original_without_moving_cursor() {
         use std::io::Seek;
         let f = Fixture::new();

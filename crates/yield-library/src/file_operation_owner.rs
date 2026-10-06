@@ -37,6 +37,7 @@ use crate::operation_journal::owner::{LiveChunkEffectGrant, StagingPublicationGr
 mod publication_handoff;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use publication_handoff::QueuedGrant;
+pub(crate) use publication_handoff::completion_observation;
 mod publication_binding;
 use crate::sample_sources::SourceId;
 use crate::sample_sources::db::{BoundDatabaseRoot, SourceAuthorityRequest};

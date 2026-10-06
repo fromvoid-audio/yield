@@ -1267,33 +1267,13 @@ impl StagingPublicationGrant {
         result: &crate::file_operation_owner::FileOperationResult,
         worker: crate::file_operation_owner::OwnerIdentity,
     ) {
-        use crate::file_operation_owner::EffectOutcome;
-        let (tag, reason, before_effect) = match result.outcome() {
-            EffectOutcome::Unsupported { reason } => (1u8, reason.as_str(), true),
-            EffectOutcome::SupersededBeforeEffect { reason } => (2, reason.as_str(), true),
-            EffectOutcome::RetryableBeforeEffect { reason } => (3, reason.as_str(), true),
-            EffectOutcome::Collision { reason } => (4, reason.as_str(), true),
-            EffectOutcome::RetainedUncertain { reason } => (5, reason.as_str(), false),
-            _ => (0, "unqualified publication completion", false),
-        };
-        let exact = before_effect
-            && reason.len()
-                <= crate::file_operation_owner::FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES
-            && worker == self.target.target().registration().owner_identity()
-            && result.operation_id() == self.target.validation().operation_id()
-            && result.participant_id() == self.target.validation().participant_id()
-            && result.effect_id() == self.target.publication_effect()
-            && result.target_registration() == self.target.target().registration()
-            && result.source_fences() == self.target.validation().source_fences()
-            && result.expected() == crate::file_operation_owner::ExpectedObject::Absent
-            && self.completion_fingerprint == result.fingerprint().as_bytes();
-        let mut digest = blake3::Hasher::new();
-        digest.update(b"yield-original-publication-no-effect-v1");
-        digest.update(&[tag]);
-        digest.update(&result.fingerprint().as_bytes());
-        digest.update(reason.as_bytes());
-        self.fence
-            .complete_before_effect(*digest.finalize().as_bytes(), exact);
+        let (digest, exact) = crate::file_operation_owner::completion_observation(
+            &self.target,
+            self.completion_fingerprint,
+            result,
+            worker,
+        );
+        self.fence.complete_before_effect(digest, exact);
     }
 
     pub(crate) fn begin_publication(
