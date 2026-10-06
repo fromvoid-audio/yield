@@ -10,6 +10,9 @@ use uuid::Uuid;
 
 pub(super) mod inventory_bytes;
 
+#[cfg(test)]
+pub(super) mod record_backing;
+
 pub(crate) const MAX_ATTEMPTS_PER_OPERATION: usize = 256;
 pub(crate) const MAX_ATTEMPTS: usize = 8192;
 pub(crate) const AUDIT_PAGE_ROWS: usize = 64;
@@ -256,6 +259,8 @@ impl DatabaseAttemptStart {
         new_start: bool,
     ) -> Result<()> {
         let mut historical = record.clone();
+        #[cfg(test)]
+        record_backing::observe(record, &historical, new_start);
         if !new_start {
             historical.phase = self.phase;
             historical.disposition = self.disposition;

@@ -23,6 +23,7 @@ mod attempt_integration {
     }
     include!("database_attempt_scalar_projection_tests.rs");
     include!("database_attempt_inventory_backing_tests.rs");
+    include!("database_attempt_initial_borrow_tests.rs");
 
     fn start(
         record: &StoredOperationRecord,
