@@ -2367,7 +2367,7 @@ impl FileOperationOwner {
         Ok(registration)
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn register_live_chunk_root_for_test(&self) -> Result<RootRegistrationRef, String> {
         self.register_root_for_test(
             AuthorityFence::Profile(ProfileAuthorityFence {
@@ -2379,7 +2379,7 @@ impl FileOperationOwner {
         )
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn live_chunk_effect_for_test(
         &self,
         grant: &LiveChunkEffectGrant,
@@ -2551,7 +2551,7 @@ impl FileOperationOwner {
         self.shared.execution_count.load(Ordering::Acquire)
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn force_next_live_chunk_uncertain_for_test(&self) {
         self.shared
             .force_live_chunk_uncertain

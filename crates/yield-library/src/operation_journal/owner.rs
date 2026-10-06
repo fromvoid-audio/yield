@@ -992,7 +992,7 @@ pub struct OperationJournalOwner {
     worker: Option<JoinHandle<()>>,
     #[cfg(test)]
     prepared_admission_id_allocations: Arc<AtomicUsize>,
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, unix))]
     synthetic_chunk_write_invocations: Arc<AtomicUsize>,
 }
 
@@ -4630,7 +4630,7 @@ impl OperationJournalOwner {
             worker: Some(worker),
             #[cfg(test)]
             prepared_admission_id_allocations,
-            #[cfg(all(test, target_os = "macos"))]
+            #[cfg(all(test, unix))]
             synthetic_chunk_write_invocations,
         })
     }
