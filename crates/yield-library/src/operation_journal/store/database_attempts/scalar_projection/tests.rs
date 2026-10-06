@@ -61,8 +61,8 @@ fn attempt_scalar_projection_defers_page_uuid_before_later_driver_failure() {
     )
     .unwrap();
     for (bad, sql) in [
-        (vec![0xff], "INSERT INTO p VALUES(1,CAST(?1 AS TEXT))"),
-        (vec![0x61], "INSERT INTO p VALUES(1,?1)"),
+        (vec![0xffu8], "INSERT INTO p VALUES(1,CAST(?1 AS TEXT))"),
+        (vec![0x61u8], "INSERT INTO p VALUES(1,?1)"),
     ] {
         c.execute("DELETE FROM p WHERE n=1", []).unwrap();
         c.execute(sql, params![bad]).unwrap();
@@ -106,7 +106,7 @@ fn attempt_scalar_projection_keeps_image_before_column_semantics() {
     assert_eq!(format!("{image_error:?}"), format!("{malformed:?}"));
     c.execute(
         "UPDATE operation_journal_database_attempt SET binding_id=CAST(?1 AS TEXT)",
-        params![[vec![b'z'; 35], vec![0xff]].concat()],
+        params![[vec![b'z'; 35], vec![0xffu8]].concat()],
     )
     .unwrap();
     let original=c.query_row("SELECT CASE WHEN length(operation_id)=36 THEN operation_id END, CASE WHEN length(binding_id)=36 THEN binding_id END FROM operation_journal_database_attempt",[],|r|r.get::<_,String>(1)).unwrap_err();

@@ -16,7 +16,7 @@ mod scalar_projection;
 use scalar_projection::UuidProjection;
 #[cfg(test)]
 thread_local! {
-    static SCALAR_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static SCALAR_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(super) const START_TABLE: &str = "operation_journal_database_attempt";
