@@ -59,6 +59,11 @@ impl std::fmt::Debug for StartupCredit {
     }
 }
 impl StartupCredit {
+    #[cfg(test)]
+    pub(super) fn bytes_for_test(&self) -> usize {
+        self.bytes
+    }
+
     fn fail_closed(&self) {
         if let Some(resource) = self.resource.as_ref() {
             resource.invalidate();
@@ -106,6 +111,7 @@ impl OwnerShared {
             consumer: Mutex::new(None),
             observer: Mutex::new(None),
             namespace: Mutex::new(None),
+            control: Mutex::new(None),
             #[cfg(test)]
             consumer_refused: std::sync::atomic::AtomicBool::new(false),
             _header: header,

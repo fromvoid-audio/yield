@@ -384,6 +384,86 @@
       "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
     },
     {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/control_backing_tests.rs",
+      "function": "control_backing_last_original_alias_preserves_selected_debit_and_no_overwrite",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2401",
+      "reason": "cfg(test) isolated original profile-owned Store/worker control-error custody fixture. SQLite authorizer rejects only genuine BEGIN on the same original Connection; actual queued/startup component checks preserve zero IDs, unchanged journal and exact payload-before-credit refund. No-capacity/component startup cannot qualify physical admission.",
+      "retirement": "Retain only explicit same-original transaction-control verification; no fixture or denied-control observation grants permits, qualified physical admission, retry/refund, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/control_backing_tests.rs",
+      "function": "control_backing_native_production_startup_preserves_original_failure_and_journal",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2401",
+      "reason": "cfg(macos,test) hook-OFF original production startup/registry/root/reserve harness. SQLite authorizer denies only BEGIN on the same original Store Connection; exact native startup diagnostic, zero IDs, unchanged original journal and post-join diagnostic custody checked. Genuine SDK/APFS/protected-floor execution is tracked in OPT-2405 and is not inferred from Linux fixtures.",
+      "retirement": "Retain only explicit same-original transaction-control verification; no fixture or denied-control observation grants permits, qualified physical admission, retry/refund, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/control_backing_tests.rs",
+      "function": "control_backing_native_production_startup_preserves_original_failure_and_journal",
+      "operation": "journal::start",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2401",
+      "reason": "cfg(macos,test) hook-OFF original production startup/registry/root/reserve harness. SQLite authorizer denies only BEGIN on the same original Store Connection; exact native startup diagnostic, zero IDs, unchanged original journal and post-join diagnostic custody checked. Genuine SDK/APFS/protected-floor execution is tracked in OPT-2405 and is not inferred from Linux fixtures.",
+      "retirement": "Retain only explicit same-original transaction-control verification; no fixture or denied-control observation grants permits, qualified physical admission, retry/refund, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/control_backing_tests.rs",
+      "function": "control_backing_original_startup_component_handoffs_native_diagnostic_then_refunds",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2401",
+      "reason": "cfg(test) isolated original profile-owned Store/worker control-error custody fixture. SQLite authorizer rejects only genuine BEGIN on the same original Connection; actual queued/startup component checks preserve zero IDs, unchanged journal and exact payload-before-credit refund. No-capacity/component startup cannot qualify physical admission.",
+      "retirement": "Retain only explicit same-original transaction-control verification; no fixture or denied-control observation grants permits, qualified physical admission, retry/refund, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/control_backing_tests.rs",
+      "function": "control_backing_queued_lost_reply_refunds_after_original_worker_join",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2401",
+      "reason": "cfg(test) isolated original profile-owned Store/worker control-error custody fixture. SQLite authorizer rejects only genuine BEGIN on the same original Connection; actual queued/startup component checks preserve zero IDs, unchanged journal and exact payload-before-credit refund. No-capacity/component startup cannot qualify physical admission.",
+      "retirement": "Retain only explicit same-original transaction-control verification; no fixture or denied-control observation grants permits, qualified physical admission, retry/refund, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/control_backing_tests.rs",
+      "function": "control_backing_queued_lost_reply_refunds_after_original_worker_join",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2401",
+      "reason": "cfg(test) isolated original profile-owned Store/worker control-error custody fixture. SQLite authorizer rejects only genuine BEGIN on the same original Connection; actual queued/startup component checks preserve zero IDs, unchanged journal and exact payload-before-credit refund. No-capacity/component startup cannot qualify physical admission.",
+      "retirement": "Retain only explicit same-original transaction-control verification; no fixture or denied-control observation grants permits, qualified physical admission, retry/refund, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/control_backing_tests.rs",
+      "function": "control_backing_queued_native_error_outlives_request_and_original_worker_join",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2401",
+      "reason": "cfg(test) isolated original profile-owned Store/worker control-error custody fixture. SQLite authorizer rejects only genuine BEGIN on the same original Connection; actual queued/startup component checks preserve zero IDs, unchanged journal and exact payload-before-credit refund. No-capacity/component startup cannot qualify physical admission.",
+      "retirement": "Retain only explicit same-original transaction-control verification; no fixture or denied-control observation grants permits, qualified physical admission, retry/refund, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/control_backing_tests.rs",
+      "function": "control_backing_queued_native_error_outlives_request_and_original_worker_join",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2401",
+      "reason": "cfg(test) isolated original profile-owned Store/worker control-error custody fixture. SQLite authorizer rejects only genuine BEGIN on the same original Connection; actual queued/startup component checks preserve zero IDs, unchanged journal and exact payload-before-credit refund. No-capacity/component startup cannot qualify physical admission.",
+      "retirement": "Retain only explicit same-original transaction-control verification; no fixture or denied-control observation grants permits, qualified physical admission, retry/refund, cleanup or settlement."
+    },
+    {
       "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
       "function": "historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pressure_before_effects",
       "operation": "journal::open",

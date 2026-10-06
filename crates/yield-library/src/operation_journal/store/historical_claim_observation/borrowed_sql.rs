@@ -14,6 +14,8 @@ pub(in crate::operation_journal::store) struct Statement<'a> {
     error_credit: &'a RefCell<Option<InputPermit>>,
     raw: *mut ffi::sqlite3_stmt,
     has_row: bool,
+    copy_message:
+        fn(&InputPermit, &CStr) -> Result<(String, InputPermit), OperationJournalStoreError>,
 }
 impl<'a> Statement<'a> {
     pub(in crate::operation_journal::store) fn new(
@@ -22,12 +24,26 @@ impl<'a> Statement<'a> {
         error_credit: &'a RefCell<Option<InputPermit>>,
         sql: &'static CStr,
     ) -> Result<Self, OperationJournalStoreError> {
+        Self::new_with_message_copy(connection, input, error_credit, sql, copy_error_message)
+    }
+
+    pub(in crate::operation_journal::store) fn new_with_message_copy(
+        connection: &'a Connection,
+        input: &'a InputPermit,
+        error_credit: &'a RefCell<Option<InputPermit>>,
+        sql: &'static CStr,
+        copy_message: fn(
+            &InputPermit,
+            &CStr,
+        ) -> Result<(String, InputPermit), OperationJournalStoreError>,
+    ) -> Result<Self, OperationJournalStoreError> {
         let mut statement = Self {
             connection,
             input,
             error_credit,
             raw: ptr::null_mut(),
             has_row: false,
+            copy_message,
         };
         // SAFETY: the original connection remains borrowed. Static SQL is NUL terminated;
         // SQLite writes only the supplied statement pointer. No other thread can access it.
@@ -172,7 +188,7 @@ impl<'a> Statement<'a> {
             }
         };
         let owned = if let Some(message) = message {
-            let (owned, credit) = copy_error_message(self.input, message)?;
+            let (owned, credit) = (self.copy_message)(self.input, message)?;
             *self.error_credit.borrow_mut() = Some(credit);
             Some(owned)
         } else {
@@ -196,7 +212,22 @@ pub(in crate::operation_journal::store) fn copy_error_message(
     input: &InputPermit,
     message: &CStr,
 ) -> Result<(String, InputPermit), OperationJournalStoreError> {
+    copy_error_message_with_bound(input, message, historical_message_bytes)
+}
+
+pub(in crate::operation_journal::store) fn copy_error_message_with_bound(
+    input: &InputPermit,
+    message: &CStr,
+    bytes_for_length: fn(usize) -> Option<usize>,
+) -> Result<(String, InputPermit), OperationJournalStoreError> {
     let length = lossy_length(message.to_bytes())?;
+    let bytes =
+        bytes_for_length(length).ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+    let credit = input.reserve_historical_scratch(bytes)?;
+    Ok((message.to_string_lossy().into_owned(), credit))
+}
+
+fn historical_message_bytes(length: usize) -> Option<usize> {
     // Original lossy String growth plus actual StoreSql Display and the consumer's
     // diagnostic formatting buffer, with both UUIDs and all fixed prefixes named.
     let historical_prefix = "operation journal SQLite error: ".len()
@@ -207,7 +238,7 @@ pub(in crate::operation_journal::store) fn copy_error_message(
     let prefix = historical_prefix.max(ordinary_page_prefix);
     // Pinned Rust RawVec<u8> uses an eight-byte minimum non-zero growth
     // allocation. Name it independently of geometric growth for tiny lossy input.
-    let bytes = length
+    length
         .checked_mul(2)
         .and_then(|n| n.checked_add(8))
         .and_then(|original| {
@@ -216,9 +247,6 @@ pub(in crate::operation_journal::store) fn copy_error_message(
                 .and_then(|n| n.checked_mul(2))
                 .and_then(|formatted| original.checked_add(formatted))
         })
-        .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
-    let credit = input.reserve_historical_scratch(bytes)?;
-    Ok((message.to_string_lossy().into_owned(), credit))
 }
 
 fn lossy_length(mut bytes: &[u8]) -> Result<usize, OperationJournalStoreError> {

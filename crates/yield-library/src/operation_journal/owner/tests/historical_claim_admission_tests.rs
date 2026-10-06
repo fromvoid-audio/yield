@@ -270,6 +270,7 @@ fn historical_claim_late_send_disposes_payload_before_original_reply_credit() {
         consumer: Mutex::new(None),
         observer: Mutex::new(None),
         namespace: Mutex::new(None),
+        control: Mutex::new(None),
         consumer_refused: std::sync::atomic::AtomicBool::new(false),
     });
     let mut input = shared.reserve_input(InputClass::Ordinary, 1).unwrap();
@@ -402,6 +403,7 @@ fn historical_claim_concurrent_last_reply_aliases_refund_exact_original_pool() {
         let before = shared.input_bytes.lock().unwrap().remaining[0];
         let backing = HistoricalReply::new(HistoricalReplyBacking {
             namespace: Mutex::new(None),
+            control: Mutex::new(None),
             consumer: Mutex::new(Some(
                 shared.reserve_input(InputClass::Ordinary, 1024).unwrap(),
             )),

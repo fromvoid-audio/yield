@@ -80,6 +80,7 @@ mod legacy_allocation_observation;
 mod recording_chunks;
 mod recording_prestart_budget;
 mod recording_prestart_database_claims;
+mod transaction_control;
 pub use legacy_allocation_observation::{LegacyJournalObservation, LegacyJournalObservationError};
 pub(crate) use recording_prestart_budget::COMMAND_INPUT_BYTES as RECORDING_PRESTART_INPUT_BYTES;
 mod recording_controls;
@@ -1812,7 +1813,8 @@ impl OperationJournalStore {
         input: Option<&super::owner::InputPermit>,
     ) -> Result<FundedSnapshot, OperationJournalStoreError> {
         self.validate_namespace_with_input(input, false)?;
-        self.connection.execute_batch("BEGIN")?;
+        let mut controls = transaction_control::Reader::new(&self.connection, input)?;
+        controls.begin()?;
         // Original transaction/validation order; credit precedes all working backing.
         let mut collection = None;
         let snapshot = match self
@@ -1821,21 +1823,21 @@ impl OperationJournalStore {
             Ok(snapshot) => {
                 if let Err(error) = self.validate_chunk_claims_inside_transaction_with_input(input)
                 {
-                    let _ = self.connection.execute_batch("ROLLBACK");
+                    controls.discard_rollback();
                     return Err(error);
                 }
                 snapshot
             }
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK");
+                controls.discard_rollback();
                 return Err(error);
             }
         };
         if let Err(error) = self.validate_namespace_with_input(input, true) {
-            let _ = self.connection.execute_batch("ROLLBACK");
+            controls.discard_rollback();
             return Err(error);
         }
-        self.connection.execute_batch("ROLLBACK")?;
+        controls.rollback()?;
         self.validate_namespace_with_input(input, false)?;
         Ok(FundedSnapshot::new(
             snapshot,
@@ -1866,7 +1868,8 @@ impl OperationJournalStore {
         input: Option<&super::owner::InputPermit>,
     ) -> Result<FundedSnapshot, OperationJournalStoreError> {
         self.validate_namespace_with_input(input, false)?;
-        self.connection.execute_batch("BEGIN")?;
+        let mut controls = transaction_control::Reader::new(&self.connection, input)?;
+        controls.begin()?;
         // Declare credit before output/working backing so error/unwind drops backing first.
         let mut collection = None;
         let result = (|| {
@@ -1893,7 +1896,7 @@ impl OperationJournalStore {
         })();
         match result {
             Ok(snapshot) => {
-                self.connection.execute_batch("ROLLBACK")?;
+                controls.rollback()?;
                 self.validate_namespace_with_input(input, false)?;
                 Ok(FundedSnapshot::new(
                     snapshot,
@@ -1901,7 +1904,7 @@ impl OperationJournalStore {
                 ))
             }
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK");
+                controls.discard_rollback();
                 Err(error)
             }
         }
