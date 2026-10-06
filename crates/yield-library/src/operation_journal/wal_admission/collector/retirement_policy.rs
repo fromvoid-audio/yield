@@ -314,12 +314,14 @@ impl Collector {
         plan: &FullCapacityPlan,
         claims: &AdmissionClaimInventory,
         digest: [u8; 32],
+        ready: &super::super::OriginalReadyRound,
     ) -> Result<(), WalPreparationError> {
         // A foreign envelope cannot consume or cancel another original preparation.
         if digest != self.input.digest {
             return Err(WalPreparationError::InvalidInput);
         }
-        let result = self.compare_retirement_policy(args, participants, plan, claims, digest);
+        let result =
+            self.compare_retirement_policy(args, participants, plan, claims, digest, ready);
         if let Err(error) = &result {
             // Matching original input with no admissible partition is definite NoAttempt.
             self.refuse_decision(error.clone());
@@ -334,6 +336,7 @@ impl Collector {
         plan: &FullCapacityPlan,
         claims: &AdmissionClaimInventory,
         digest: [u8; 32],
+        ready: &super::super::OriginalReadyRound,
     ) -> Result<(), WalPreparationError> {
         let bad = || WalPreparationError::InvalidInput;
         args.validate_against_participants(participants)
@@ -341,13 +344,12 @@ impl Collector {
         if digest != self.input.digest
             || self.reason.is_some()
             || self.done
-            || !self
-                .current
-                .as_ref()
-                .is_some_and(|current| current.complete())
+            || self.shared.canceled.load(Ordering::Acquire)
+            || Instant::now() >= self.input.deadline
         {
             return Err(bad());
         }
+        ready.require_provenance(self.current.as_ref().ok_or_else(bad)?)?;
         let snapshot = self.snapshot.as_ref().ok_or_else(bad)?;
         if snapshot.databases().len() != 2 || self.held.len() != 2 {
             return Err(bad());

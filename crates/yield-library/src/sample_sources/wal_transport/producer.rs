@@ -274,7 +274,14 @@ impl SourceWalTransportOwner {
             if Instant::now() >= self.request.deadline {
                 return Err(SourceWalTransportRejection::Deadline);
             }
-            *self.current.lock().unwrap_or_else(|p| p.into_inner()) = Some(request.acknowledge());
+            *self.current.lock().unwrap_or_else(|p| p.into_inner()) = Some(
+                request.acknowledge_registered(
+                    registration
+                        .ok_or(SourceWalTransportRejection::Scope)?
+                        .decision_boundary()
+                        .ok_or(SourceWalTransportRejection::Full)?,
+                ),
+            );
         }
         Ok(())
     }

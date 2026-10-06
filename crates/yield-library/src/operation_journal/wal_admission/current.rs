@@ -4,18 +4,100 @@ use std::{
     time::Instant,
 };
 
+#[derive(Clone, Copy)]
+enum BoundaryRefusal {
+    Changed,
+    Busy,
+    Revoked,
+}
+
+type SourceBoundaries = [Option<crate::sample_sources::db::RegisteredDecisionBoundary>; 64];
+
 pub(crate) struct CurrentRound {
     deadline: Instant,
     expected: u64,
     acknowledged: Mutex<RoundState>,
     resolved: Condvar,
     nonce: uuid::Uuid,
+    #[cfg(all(test, target_os = "linux"))]
+    snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     _credit: super::HandshakeCredit,
+}
+/// Exact Ready publication provenance; never current effect or SQL authority.
+pub(in crate::operation_journal) struct OriginalReadyRound {
+    round: Arc<CurrentRound>,
+    cohort: u64,
+}
+const _: () = assert!(std::mem::size_of::<OriginalReadyRound>() <= 16);
+impl OriginalReadyRound {
+    pub(super) fn new(round: Arc<CurrentRound>, cohort: u64) -> Self {
+        Self { round, cohort }
+    }
+    fn matches_ready(&self, original: &CurrentRound, state: &RoundState) -> bool {
+        state.cohort == self.cohort
+            && !state.invalidated
+            && state.slots == original.expected
+            && original.sources_present(state)
+            && state.decision == Decision::Preparing
+            && Instant::now() < original.deadline
+    }
+    /// Provenance permits frozen-policy comparison, never current native admission.
+    pub(super) fn require_provenance(
+        &self,
+        original: &Arc<CurrentRound>,
+    ) -> Result<(), super::WalPreparationError> {
+        if !Arc::ptr_eq(&self.round, original) {
+            return Err(super::WalPreparationError::InvalidInput);
+        }
+        let state = original
+            .acknowledged
+            .lock()
+            .map_err(|_| super::WalPreparationError::InvalidInput)?;
+        // Refuse malformed/foreign publication seals independently of live loss.
+        if state.cohort != self.cohort
+            || state.slots != original.expected
+            || !original.sources_present(&state)
+            || state.decision != Decision::Preparing
+        {
+            return Err(super::WalPreparationError::InvalidInput);
+        }
+        if Instant::now() >= original.deadline {
+            return Err(super::WalPreparationError::Deadline);
+        }
+        if state.invalidated {
+            return Err(super::WalPreparationError::OwnerLost);
+        }
+        Ok(())
+    }
+    pub(super) fn require_current(
+        &self,
+        original: &Arc<CurrentRound>,
+    ) -> Result<(), super::WalPreparationError> {
+        use super::WalPreparationError;
+        // The scalar round lock is released before trying any original native gate.
+        self.require_provenance(original)?;
+        match original.with_boundaries(|state| self.matches_ready(original, state)) {
+            Ok(true) => Ok(()),
+            Err(BoundaryRefusal::Busy) => Err(WalPreparationError::Busy),
+            Err(BoundaryRefusal::Revoked) => {
+                self.require_provenance(original)?;
+                Err(WalPreparationError::OwnerLost)
+            }
+            Ok(false) => {
+                self.require_provenance(original)?;
+                Err(WalPreparationError::InvalidInput)
+            }
+            Err(BoundaryRefusal::Changed) => Err(WalPreparationError::InvalidInput),
+        }
+    }
 }
 struct RoundState {
     slots: u64,
     invalidated: bool,
     decision: Decision,
+    sources: [Option<uuid::Uuid>; 64],
+    boundaries: SourceBoundaries,
+    cohort: u64,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Decision {
@@ -37,27 +119,33 @@ impl OriginalDecision {
         self.round.nonce
     }
     pub(in crate::operation_journal) fn acknowledged(&self) -> bool {
-        self.round.acknowledged.lock().is_ok_and(|state| {
-            state.decision == Decision::Deciding
-                && !state.invalidated
-                && state.slots == self.round.expected
-                && Instant::now() < self.round.deadline
-        })
+        self.round
+            .with_boundaries(|state| {
+                state.decision == Decision::Deciding
+                    && !state.invalidated
+                    && state.slots == self.round.expected
+                    && self.round.sources_present(state)
+                    && Instant::now() < self.round.deadline
+            })
+            .unwrap_or(false)
     }
     #[cfg(all(test, target_os = "linux"))]
     pub(in crate::operation_journal) fn start_sqlite(&mut self) -> bool {
-        let Ok(state) = self.round.acknowledged.lock() else {
-            return false;
-        };
-        if state.decision != Decision::Deciding
-            || state.invalidated
-            || state.slots != self.round.expected
-            || Instant::now() >= self.round.deadline
-        {
-            return false;
-        }
-        self.sqlite_started = true;
-        true
+        let round = Arc::clone(&self.round);
+        round
+            .with_boundaries(|state| {
+                if state.decision != Decision::Deciding
+                    || state.invalidated
+                    || state.slots != round.expected
+                    || !round.sources_present(state)
+                    || Instant::now() >= round.deadline
+                {
+                    return false;
+                }
+                self.sqlite_started = true;
+                true
+            })
+            .unwrap_or(false)
     }
     /// Caller must have a definite initial transaction outcome or exact durable readback.
     pub(in crate::operation_journal) fn resolve(&self) {
@@ -87,6 +175,30 @@ impl CurrentCustody {
 }
 #[cfg(all(test, target_os = "linux"))]
 impl CurrentRound {
+    pub(crate) fn foreign_ack_for_tests(
+        self: &Arc<Self>,
+        boundary: crate::sample_sources::db::RegisteredDecisionBoundary,
+    ) -> CurrentCustody {
+        let index = self
+            .acknowledged
+            .lock()
+            .unwrap()
+            .sources
+            .iter()
+            .position(Option::is_some)
+            .unwrap();
+        self.request(index).acknowledge_registered(boundary)
+    }
+    pub(crate) fn snapshot_hook_for_tests(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.snapshot_hook.lock().unwrap() = Some(hook);
+    }
+    pub(crate) fn all_ack_slots_for_tests(&self) -> bool {
+        let state = self.acknowledged.lock().unwrap();
+        self.sources_present(&state) && state.slots == self.expected
+    }
+    pub(crate) fn cleanup_fenced_for_tests(&self) -> bool {
+        self.acknowledged.lock().unwrap().decision == Decision::Deciding
+    }
     pub(crate) fn invalidated_for_tests(&self) -> bool {
         self.invalidated()
     }
@@ -141,8 +253,10 @@ impl Decision {
 pub(crate) struct CurrentRequest {
     round: Arc<CurrentRound>,
     bit: u64,
+    source: Option<uuid::Uuid>,
 }
 impl CurrentRound {
+    pub(crate) const READY_PHASE_BYTES: usize = 64;
     pub(super) fn new(
         count: usize,
         deadline: Instant,
@@ -158,11 +272,109 @@ impl CurrentRound {
                 slots: 0,
                 invalidated: false,
                 decision: Decision::Preparing,
+                sources: [None; 64],
+                boundaries: std::array::from_fn(|_| None),
+                cohort: 0,
             }),
             resolved: Condvar::new(),
             nonce: uuid::Uuid::new_v4(),
+            #[cfg(all(test, target_os = "linux"))]
+            snapshot_hook: Mutex::new(None),
             _credit: credit,
         }))
+    }
+    pub(super) fn require_source(&self, index: usize, registration: uuid::Uuid) -> bool {
+        let Ok(mut state) = self.acknowledged.lock() else {
+            return false;
+        };
+        if index >= 64
+            || state.slots != 0
+            || self.expected & (1u64 << index) == 0
+            || registration.is_nil()
+            || state.sources.iter().flatten().any(|id| *id == registration)
+        {
+            return false;
+        }
+        let Some(next) = state.cohort.checked_add(1) else {
+            state.invalidated = true;
+            return false;
+        };
+        state.cohort = next;
+        state.sources[index] = Some(registration);
+        true
+    }
+    fn sources_present(&self, state: &RoundState) -> bool {
+        state
+            .sources
+            .iter()
+            .zip(&state.boundaries)
+            .all(|(source, boundary)| match source {
+                Some(expected) => boundary
+                    .as_ref()
+                    .is_some_and(|b| b.registration() == *expected),
+                None => boundary.is_none(),
+            })
+    }
+    fn with_boundaries<T>(
+        &self,
+        compare: impl FnOnce(&RoundState) -> T,
+    ) -> Result<T, BoundaryRefusal> {
+        // Snapshot fixed Arc references; gate -> round is the producer lock order.
+        let (boundaries, cohort) = {
+            let state = self
+                .acknowledged
+                .lock()
+                .map_err(|_| BoundaryRefusal::Revoked)?;
+            (state.boundaries.clone(), state.cohort)
+        };
+        #[cfg(all(test, target_os = "linux"))]
+        {
+            let hook = self.snapshot_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        fn visit<T>(
+            boundaries: &[Option<crate::sample_sources::db::RegisteredDecisionBoundary>],
+            compare: impl FnOnce() -> Result<T, BoundaryRefusal>,
+        ) -> Result<T, BoundaryRefusal> {
+            let Some((first, rest)) = boundaries.split_first() else {
+                return compare();
+            };
+            match first {
+                Some(boundary) => {
+                    boundary
+                        .try_current(|| visit(rest, compare))
+                        .map_err(|error| match error {
+                            crate::sample_sources::db::DecisionBoundaryRefusal::Busy => {
+                                BoundaryRefusal::Busy
+                            }
+                            crate::sample_sources::db::DecisionBoundaryRefusal::Revoked => {
+                                BoundaryRefusal::Revoked
+                            }
+                        })?
+                }
+                None => visit(rest, compare),
+            }
+        }
+        visit(&boundaries, || {
+            let state = self
+                .acknowledged
+                .lock()
+                .map_err(|_| BoundaryRefusal::Revoked)?;
+            if state.cohort != cohort {
+                return Err(BoundaryRefusal::Changed);
+            }
+            Ok(compare(&state))
+        })
+    }
+    pub(super) fn retained_bytes(source_count: usize) -> usize {
+        std::mem::size_of::<Self>()
+            + std::mem::size_of::<SourceBoundaries>()
+            + source_count
+                * crate::sample_sources::db::RegisteredDecisionBoundary::MAX_BACKING_BYTES
+            + 64
+            + Self::READY_PHASE_BYTES
     }
     pub(super) fn request(self: &Arc<Self>, index: usize) -> CurrentRequest {
         let bit = 1u64
@@ -172,15 +384,22 @@ impl CurrentRound {
         CurrentRequest {
             round: Arc::clone(self),
             bit,
+            source: self
+                .acknowledged
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .sources[index],
         }
     }
     pub(super) fn invalidated(&self) -> bool {
-        self.acknowledged
-            .lock()
-            .map_or(true, |state| state.invalidated)
+        match self.with_boundaries(|state| state.invalidated) {
+            Ok(invalidated) => invalidated,
+            Err(BoundaryRefusal::Changed | BoundaryRefusal::Busy) => false, // Pending ACK, not current validity.
+            Err(BoundaryRefusal::Revoked) => true,
+        }
     }
     pub(super) fn complete(&self) -> bool {
-        self.with_complete(|| ()).is_some()
+        self.with_complete(|_| ()).is_some()
     }
     /// Start a new sealed commit-acknowledgement round. The sole journal-side guard
     /// resolves NoAttempt on every pre-SQL refusal, including partial acknowledgement.
@@ -199,26 +418,61 @@ impl CurrentRound {
     }
     /// Scalar publication competes with original worker cleanup under this same mutex.
     /// Never run native I/O, SQLite or owner waits inside this closure.
-    pub(super) fn with_complete<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
-        let state = self.acknowledged.lock().ok()?;
-        if Instant::now() >= self.deadline
-            || state.invalidated
-            || state.slots != self.expected
-            || state.decision != Decision::Preparing
-        {
-            return None;
-        }
-        Some(publish())
+    pub(super) fn with_complete<T>(&self, publish: impl FnOnce(u64) -> T) -> Option<T> {
+        self.with_boundaries(|state| {
+            if Instant::now() >= self.deadline
+                || state.invalidated
+                || state.slots != self.expected
+                || !self.sources_present(state)
+                || state.decision != Decision::Preparing
+            {
+                return None;
+            }
+            Some(publish(state.cohort))
+        })
+        .ok()
+        .flatten()
     }
 }
 impl CurrentRequest {
-    /// Original worker installs returned custody before it can clean up its native writer.
     pub(crate) fn acknowledge(self) -> CurrentCustody {
+        self.acknowledge_inner(None)
+    }
+    pub(crate) fn acknowledge_registered(
+        self,
+        boundary: crate::sample_sources::db::RegisteredDecisionBoundary,
+    ) -> CurrentCustody {
+        let round = Arc::clone(&self.round);
+        boundary
+            .with_current(|| self.acknowledge_inner(Some(boundary.clone())))
+            .unwrap_or_else(|| CurrentCustody(round))
+    }
+    fn acknowledge_inner(
+        self,
+        boundary: Option<crate::sample_sources::db::RegisteredDecisionBoundary>,
+    ) -> CurrentCustody {
         if Instant::now() < self.round.deadline
+            && self.source == boundary.as_ref().map(|b| b.registration())
             && let Ok(mut state) = self.round.acknowledged.lock()
             && !state.invalidated
             && matches!(state.decision, Decision::Preparing | Decision::Deciding)
         {
+            if let Some(boundary) = boundary.as_ref()
+                && state
+                    .boundaries
+                    .iter()
+                    .flatten()
+                    .any(|old| old.same_gate(boundary))
+            {
+                state.invalidated = true;
+                return CurrentCustody(Arc::clone(&self.round));
+            }
+            let Some(next) = state.cohort.checked_add(1) else {
+                state.invalidated = true;
+                return CurrentCustody(Arc::clone(&self.round));
+            };
+            state.cohort = next;
+            state.boundaries[self.bit.trailing_zeros() as usize] = boundary;
             state.slots |= self.bit;
         }
         CurrentCustody(self.round)
@@ -229,6 +483,60 @@ impl CurrentRequest {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn current_round_checked_cohort_overflow_refuses_without_ack_or_authority() {
+        // Logical bookkeeping fixture; no original owner token or physical authority.
+        let budget = super::super::HandshakeBudget::new();
+        let mut credit = budget.credit();
+        credit.resize(CurrentRound::retained_bytes(0)).unwrap();
+        let round = CurrentRound::new(1, Instant::now() + Duration::from_secs(1), credit).unwrap();
+        assert!(!round.require_source(1, uuid::Uuid::new_v4()));
+        round.acknowledged.lock().unwrap().cohort = u64::MAX;
+        let custody = round.request(0).acknowledge();
+        assert!(!round.complete());
+        assert!(round.invalidated());
+        assert_eq!(round.acknowledged.lock().unwrap().slots, 0);
+        drop(custody);
+        drop(round);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn original_ready_foreign_or_malformed_seal_is_distinct_from_correlated_loss() {
+        // Logical refusal bookkeeping only; no original native owner or qualification.
+        let budget = super::super::HandshakeBudget::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let original = CurrentRound::new(1, deadline, budget.credit()).unwrap();
+        let foreign = CurrentRound::new(1, deadline, budget.credit()).unwrap();
+        let custody = original.request(0).acknowledge();
+        let cohort = original.acknowledged.lock().unwrap().cohort;
+        let ready = OriginalReadyRound::new(Arc::clone(&original), cohort);
+        assert_eq!(
+            ready.require_provenance(&foreign),
+            Err(super::super::WalPreparationError::InvalidInput)
+        );
+        let malformed = OriginalReadyRound::new(Arc::clone(&original), cohort + 1);
+        assert_eq!(
+            malformed.require_provenance(&original),
+            Err(super::super::WalPreparationError::InvalidInput)
+        );
+        original.acknowledged.lock().unwrap().invalidated = true;
+        assert_eq!(
+            malformed.require_provenance(&original),
+            Err(super::super::WalPreparationError::InvalidInput)
+        );
+        assert_eq!(
+            ready.require_provenance(&original),
+            Err(super::super::WalPreparationError::OwnerLost)
+        );
+        drop(malformed);
+        drop(ready);
+        drop(custody);
+        drop(original);
+        drop(foreign);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn current_round_no_attempt_resolves_partial_ack_without_late_revival() {

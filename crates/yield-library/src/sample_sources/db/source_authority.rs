@@ -22,6 +22,8 @@ use super::file_ops_journal::BoundDatabaseRoot;
 use super::source_lease::{SourceLease, SourceLeaseError};
 use super::sqlite_identity::DatabaseFileBinding;
 use super::{SourceDatabase, SourceDbError};
+mod decision_boundary;
+pub(crate) use decision_boundary::{DecisionBoundaryRefusal, RegisteredDecisionBoundary};
 mod registered_custody;
 pub(crate) use registered_custody::RegisteredDatabaseCustody;
 

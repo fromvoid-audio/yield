@@ -301,7 +301,13 @@ mod integration {
         events: Arc<Mutex<Vec<String>>>,
         pause_abort: Arc<AtomicBool>,
         pause_validation: Arc<AtomicBool>,
+        validation_paused_seen: Arc<AtomicBool>,
         current_validations: Arc<AtomicUsize>,
+        drain_requested: Arc<AtomicBool>,
+        drained: Arc<AtomicBool>,
+        abandon_requested: Arc<AtomicBool>,
+        abandoned: Arc<AtomicBool>,
+        tokens: Arc<Mutex<HashMap<String, crate::sample_sources::db::RegisteredDecisionBoundary>>>,
     }
     impl SourceActor {
         fn start(
@@ -345,8 +351,20 @@ mod integration {
             let paused = Arc::clone(&pause_abort);
             let pause_validation = Arc::new(AtomicBool::new(false));
             let validation_paused = Arc::clone(&pause_validation);
+            let validation_paused_seen = Arc::new(AtomicBool::new(false));
+            let validation_pause_seen = Arc::clone(&validation_paused_seen);
             let current_validations = Arc::new(AtomicUsize::new(0));
             let validated_count = Arc::clone(&current_validations);
+            let drain_requested = Arc::new(AtomicBool::new(false));
+            let draining = Arc::clone(&drain_requested);
+            let drained = Arc::new(AtomicBool::new(false));
+            let drain_complete = Arc::clone(&drained);
+            let abandon_requested = Arc::new(AtomicBool::new(false));
+            let abandoning = Arc::clone(&abandon_requested);
+            let abandoned = Arc::new(AtomicBool::new(false));
+            let abandon_complete = Arc::clone(&abandoned);
+            let tokens = Arc::new(Mutex::new(HashMap::new()));
+            let published_tokens = Arc::clone(&tokens);
             let worker = thread::spawn(move || {
                 let mut writers = writers
                     .into_iter()
@@ -361,7 +379,7 @@ mod integration {
                         )
                     })
                     .collect::<HashMap<_, _>>();
-                let authorities = writers
+                let mut authorities = writers
                     .iter()
                     .map(|(id, w)| {
                         (
@@ -370,9 +388,15 @@ mod integration {
                         )
                     })
                     .collect::<HashMap<_, _>>();
+                for writer in writers.values() {
+                    assert!(matches!(
+                        writer.catalog_database().prepare_source_authority(),
+                        Err(crate::sample_sources::db::SourceAuthorityError::AlreadyPrepared)
+                    ));
+                }
                 // Drive the genuine confirmation lifecycle without installing a capacity provider.
                 // These fixtures prove transport custody, never physical qualification or admission.
-                let registrations = authorities
+                let mut registrations = authorities
                     .iter()
                     .map(|(id, authority)| {
                         let envelope = authority.journal_request().unwrap();
@@ -389,6 +413,12 @@ mod integration {
                         (id.clone(), (envelope.request, proof))
                     })
                     .collect::<HashMap<_, _>>();
+                if register {
+                    *published_tokens.lock().unwrap() = authorities
+                        .iter()
+                        .map(|(id, authority)| (id.clone(), authority.decision_boundary().unwrap()))
+                        .collect();
+                }
                 if let Some(sender) = observation {
                     assert_eq!(writers.len(), 1);
                     let id = writers.keys().next().unwrap().clone();
@@ -415,6 +445,18 @@ mod integration {
                 let mut held: HashMap<String, SourceWalProducerOwner> = HashMap::new();
                 let mut validated = std::collections::HashSet::new();
                 loop {
+                    if draining.swap(false, Ordering::AcqRel) {
+                        for (request, proof) in registrations.values_mut() {
+                            request
+                                .begin_drain(proof.take().unwrap().into_drain_marker())
+                                .unwrap();
+                        }
+                        drain_complete.store(true, Ordering::Release);
+                    }
+                    if abandoning.swap(false, Ordering::AcqRel) {
+                        authorities.clear();
+                        abandon_complete.store(true, Ordering::Release);
+                    }
                     if stopped.load(Ordering::Acquire) {
                         inbox.close();
                     }
@@ -443,24 +485,31 @@ mod integration {
                         }
                         held.insert(id, owner);
                     }
+                    validation_pause_seen
+                        .store(validation_paused.load(Ordering::Acquire), Ordering::Release);
                     let mut remaining = HashMap::new();
                     for (id, mut owner) in held.drain() {
                         if owner.settlement_held() {
+                            let round = owner.current_round_for_tests().unwrap();
                             owner.request_abort(None);
-                            assert!(owner.settlement_held());
-                            assert!(
-                                !owner
-                                    .current_round_for_tests()
-                                    .unwrap()
-                                    .invalidated_for_tests()
-                            );
-                            assert_eq!(owner.revalidate(authorities.get(&id)), Err(crate::sample_sources::wal_transport::SourceWalTransportRejection::Busy));
+                            let validation = owner.revalidate(authorities.get(&id));
+                            if validation != Err(crate::sample_sources::wal_transport::SourceWalTransportRejection::Busy) {
+                                // NoAttempt may resolve between the first fence observation and
+                                // this call. Only actual resolution permits ordinary cleanup.
+                                assert!(!round.cleanup_fenced_for_tests());
+                            }
                             match owner.into_writer() {
                                 Err(retained) => {
                                     remaining.insert(id, retained);
                                 }
-                                Ok(_) => {
-                                    panic!("unresolved original acknowledgement restored a writer")
+                                Ok(writer) => {
+                                    assert!(
+                                        !round.cleanup_fenced_for_tests(),
+                                        "unresolved ACK restored a writer"
+                                    );
+                                    assert_eq!(registrations[&id].0.registered_uses_for_tests(), 0);
+                                    recorded.lock().unwrap().push(format!("reuse:{id}"));
+                                    writers.insert(id, writer);
                                 }
                             }
                             continue;
@@ -528,7 +577,13 @@ mod integration {
                 events,
                 pause_abort,
                 pause_validation,
+                validation_paused_seen,
                 current_validations,
+                drain_requested,
+                drained,
+                abandon_requested,
+                abandoned,
+                tokens,
             }
         }
     }
@@ -1516,6 +1571,61 @@ mod integration {
         original_retirement_custody_with_source_policy(0, Some(true));
     }
 
+    #[test]
+    fn original_source_drain_revokes_real_retirement_decision_acknowledgement() {
+        original_retirement_custody(6);
+    }
+
+    #[test]
+    fn original_source_drain_races_real_decision_comparison_without_stale_acceptance() {
+        original_retirement_custody(7);
+    }
+    #[test]
+    fn original_source_guard_drop_revokes_ack_without_unlocking_native_custody() {
+        original_retirement_custody(8);
+    }
+    #[test]
+    fn original_late_source_ack_cannot_fill_an_unlocked_snapshot_before_drain() {
+        original_retirement_custody(9);
+    }
+    #[test]
+    fn genuine_foreign_source_registration_cannot_fill_original_decision_slot() {
+        original_retirement_custody(10);
+    }
+    #[test]
+    fn genuine_original_source_gate_contention_is_pending_then_current_then_revoked() {
+        original_retirement_custody(11);
+    }
+    #[test]
+    fn source_gate_becoming_busy_between_completion_and_publication_preserves_preparing_round() {
+        original_retirement_custody(12);
+    }
+    #[test]
+    fn genuine_ready_retirement_command_preserves_busy_input_until_original_gate_releases() {
+        original_retirement_custody(13);
+    }
+    #[test]
+    fn genuine_ready_retirement_busy_command_cancellation_retains_original_cleanup() {
+        original_retirement_custody(14);
+    }
+    #[test]
+    fn genuine_ready_retirement_busy_command_original_deadline_refuses_without_sql() {
+        original_retirement_custody(15);
+    }
+    #[test]
+    fn genuine_ready_retirement_busy_command_original_drain_revokes_without_sql() {
+        original_retirement_custody(16);
+    }
+    #[test]
+    fn original_source_deadline_crossing_registration_comparison_keeps_deadline_refusal() {
+        original_retirement_custody(17);
+    }
+
+    #[test]
+    fn genuine_original_ready_source_revocation_is_owner_loss_not_malformed_policy() {
+        original_retirement_custody(18);
+    }
+
     fn original_retirement_custody(outcome: u8) {
         original_retirement_custody_with_source_policy(outcome, None);
     }
@@ -1583,6 +1693,25 @@ mod integration {
         let actor = SourceActor::start_with_lease_observation(vec![writer], inbox, Some(send));
         let (allocation, fence, deadline, reference) =
             receive.recv_timeout(Duration::from_secs(3)).unwrap();
+        let foreign_actor = if outcome == 10 {
+            let foreign_media = fixture._base.path().join("foreign-registration");
+            fs::create_dir(&foreign_media).unwrap();
+            let foreign_writer = SourceWriter::new_for_scan(
+                SourceDatabase::open_for_catalog_with_profile_guard(
+                    &foreign_media,
+                    &fixture.owner,
+                    "foreign-registration",
+                )
+                .unwrap(),
+                SourceId::from_string("foreign-registration"),
+                1,
+            )
+            .unwrap();
+            let (_foreign_requester, foreign_inbox) = SourceWalTransport::channel();
+            Some(SourceActor::start(vec![foreign_writer], foreign_inbox))
+        } else {
+            None
+        };
         let source = ParticipantId::new();
         let global_id = ParticipantId::new();
         let operation = OperationId::new();
@@ -1682,7 +1811,7 @@ mod integration {
                 .is_err()
         );
         let (mut base_plan, mut base_claims, main, side) = plan(&fixture);
-        if outcome == 0 || outcome == 5 {
+        if outcome == 0 || outcome == 5 || outcome >= 13 {
             // An actual original worker supplies planning ceilings before freezing the
             // envelope. Its later retirement scope must independently match all of them.
             // This observation does not qualify physical capacity or issue an ACK.
@@ -2013,7 +2142,8 @@ mod integration {
         .unwrap();
         let budget = input.budget_for_test();
         let mut local_collector = None;
-        let handle = if outcome == 0 || outcome >= 4 {
+        let handle = if outcome == 0 || outcome == 4 || outcome == 5 || (13..=16).contains(&outcome)
+        {
             journal
                 .client()
                 .prepare_wal_owners(input)
@@ -2032,6 +2162,59 @@ mod integration {
             let acquisition = Uuid::parse_str(fixture.owner.owner_identity()).unwrap();
             let (mut collector, handle) =
                 crate::operation_journal::wal_admission::Collector::new(input, permit, acquisition);
+            if outcome == 12 {
+                let round = loop {
+                    if let Some(round) = collector.preparing_round_for_tests() {
+                        break round;
+                    }
+                    assert!(Instant::now() < deadline);
+                    collector.poll();
+                    thread::sleep(Duration::from_millis(1));
+                };
+                while !round.all_ack_slots_for_tests() {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let token = actor
+                    .tokens
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+                let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+                let holder = Arc::new(Mutex::new(None));
+                let published_holder = Arc::clone(&holder);
+                let publication = Arc::clone(&round);
+                let completion = Arc::clone(&round);
+                // Poll first observes revocation, then completion, then publication.
+                round.snapshot_hook_for_tests(Box::new(move || {
+                    completion.snapshot_hook_for_tests(Box::new(move || {
+                        publication.snapshot_hook_for_tests(Box::new(move || {
+                            *published_holder.lock().unwrap() = Some(thread::spawn(move || {
+                                assert!(
+                                    token
+                                        .with_current(|| {
+                                            entered_tx.send(()).unwrap();
+                                            release_rx
+                                                .recv_timeout(Duration::from_secs(1))
+                                                .unwrap();
+                                        })
+                                        .is_some()
+                                );
+                            }));
+                            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                        }));
+                    }));
+                }));
+                assert!(!collector.poll());
+                assert!(matches!(handle.status(), WalPreparationStatus::Preparing));
+                assert!(!round.invalidated_for_tests());
+                release_tx.send(()).unwrap();
+                holder.lock().unwrap().take().unwrap().join().unwrap();
+            }
             while matches!(handle.status(), WalPreparationStatus::Preparing) {
                 assert!(Instant::now() < deadline);
                 collector.poll();
@@ -2128,14 +2311,310 @@ mod integration {
             );
         }
 
+        if outcome == 18 {
+            let collector = local_collector.as_mut().unwrap();
+            let ready = collector.original_ready_round().unwrap();
+            actor.drain_requested.store(true, Ordering::Release);
+            while !actor
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "reuse:retiring-pre-audit")
+            {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(actor.drained.load(Ordering::Acquire));
+            assert!(
+                collector
+                    .preparing_round_for_tests()
+                    .unwrap()
+                    .invalidated_for_tests()
+            );
+            let refused = collector.validate_retirement_policy(
+                &retirement,
+                &participants,
+                &plan,
+                &claims,
+                digest,
+                &ready,
+            );
+            assert_eq!(refused, Err(WalPreparationError::OwnerLost));
+            while !collector.poll() {
+                assert!(Instant::now() < deadline + Duration::from_secs(1));
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(matches!(
+                handle.status(),
+                WalPreparationStatus::Unavailable(WalPreparationError::OwnerLost)
+            ));
+            assert_eq!(
+                journal
+                    .prepared_admission_id_allocations
+                    .load(Ordering::Relaxed),
+                0
+            );
+            let outside =
+                rusqlite::Connection::open(fixture.owner.profile_root().join(LIBRARY_DB_FILE_NAME))
+                    .unwrap();
+            assert_eq!(
+                outside
+                    .query_row(
+                        "SELECT count(*) FROM source_lifecycle_references",
+                        [],
+                        |row| row.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            drop(local_collector.take());
+            drop(ready);
+            drop(view);
+            drop(handle);
+            assert_eq!(budget.used(), 0);
+            drop(actor);
+            assert!(global.shutdown());
+            assert!(journal.shutdown());
+            assert_eq!(
+                *journal.shared.input_bytes.lock().unwrap(),
+                InputBudget::new()
+            );
+            return;
+        }
+        if outcome == 17 {
+            let collector = local_collector.as_mut().unwrap();
+            let round = collector.preparing_round_for_tests().unwrap();
+            let events = Arc::clone(&actor.events);
+            round.snapshot_hook_for_tests(Box::new(move || {
+                // The journal already sampled the original deadline. Let the genuine
+                // Source independently reach that SAME deadline and restore its writer
+                // before the pending original-registration comparison resumes.
+                while !events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event == "reuse:retiring-pre-audit")
+                {
+                    assert!(Instant::now() < deadline + Duration::from_secs(2));
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(Instant::now() >= deadline);
+            }));
+            assert!(Instant::now() < deadline);
+            while !collector.poll() {
+                assert!(Instant::now() < deadline + Duration::from_secs(3));
+                thread::sleep(Duration::from_millis(1));
+            }
+            let status = handle.status();
+            assert!(
+                matches!(
+                    status,
+                    WalPreparationStatus::Rejected(WalPreparationError::Deadline)
+                ),
+                "original deadline crossed during genuine Source comparison: {status:?}"
+            );
+            assert_eq!(
+                journal
+                    .prepared_admission_id_allocations
+                    .load(Ordering::Relaxed),
+                0
+            );
+            let outside =
+                rusqlite::Connection::open(fixture.owner.profile_root().join(LIBRARY_DB_FILE_NAME))
+                    .unwrap();
+            assert_eq!(
+                outside
+                    .query_row(
+                        "SELECT count(*) FROM source_lifecycle_references",
+                        [],
+                        |row| row.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            drop(local_collector.take());
+            drop(round);
+            drop(view);
+            drop(handle);
+            assert_eq!(budget.used(), 0);
+            drop(actor);
+            assert!(global.shutdown());
+            assert!(journal.shutdown());
+            assert_eq!(
+                *journal.shared.input_bytes.lock().unwrap(),
+                InputBudget::new()
+            );
+            return;
+        }
         if let Some(collector) = local_collector.as_mut() {
-            collector.begin_decision(digest).unwrap();
+            if outcome == 9 || outcome == 10 {
+                actor.pause_validation.store(true, Ordering::Release);
+                while !actor.validation_paused_seen.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            loop {
+                match collector.begin_decision(digest) {
+                    Ok(()) => break,
+                    Err(WalPreparationError::Busy) => {
+                        assert!(Instant::now() < deadline);
+                        assert!(collector.decision_nonce().is_none());
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("original Ready comparison refused: {error:?}"),
+                }
+            }
             let nonce = collector.decision_nonce().unwrap();
-            while !collector.decision_acknowledged() {
+            let mut foreign_custody = None;
+            if outcome == 10 {
+                let foreign = foreign_actor.as_ref().unwrap();
+                let token = loop {
+                    if let Some(token) = foreign
+                        .tokens
+                        .lock()
+                        .unwrap()
+                        .get("foreign-registration")
+                        .cloned()
+                    {
+                        break token;
+                    }
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                };
+                let round = collector.round_for_tests();
+                foreign_custody = Some(round.foreign_ack_for_tests(token));
+                assert!(!round.all_ack_slots_for_tests());
+                assert!(!collector.decision_acknowledged());
+                actor.pause_validation.store(false, Ordering::Release);
+            }
+            if outcome == 9 {
+                let round = collector.round_for_tests();
+                assert!(!round.all_ack_slots_for_tests());
+                let original = Arc::clone(&round);
+                let pause = Arc::clone(&actor.pause_validation);
+                let drain = Arc::clone(&actor.drain_requested);
+                let drained = Arc::clone(&actor.drained);
+                round.snapshot_hook_for_tests(Box::new(move || {
+                    // Snapshot contains no Source gate. Install the real original ACK,
+                    // then complete real drain before the comparison can lock the round.
+                    pause.store(false, Ordering::Release);
+                    while !original.all_ack_slots_for_tests() {
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    drain.store(true, Ordering::Release);
+                    while !drained.load(Ordering::Acquire) {
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }));
+                assert!(
+                    !collector.decision_acknowledged(),
+                    "late original token must invalidate the unlocked cohort"
+                );
+            }
+            while outcome != 9 && !collector.decision_acknowledged() {
                 assert!(Instant::now() < deadline);
                 thread::sleep(Duration::from_millis(1));
             }
             assert_eq!(collector.decision_nonce(), Some(nonce));
+            if outcome == 11 {
+                let token = actor
+                    .tokens
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+                let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+                let holder = thread::spawn(move || {
+                    assert!(
+                        token
+                            .with_current(|| {
+                                entered_tx.send(()).unwrap();
+                                release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                            })
+                            .is_some()
+                    );
+                });
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let started = Instant::now();
+                assert!(!collector.decision_acknowledged());
+                assert!(!collector.round_for_tests().invalidated_for_tests());
+                assert!(!collector.start_settlement());
+                assert!(started.elapsed() < Duration::from_millis(100));
+                release_tx.send(()).unwrap();
+                holder.join().unwrap();
+                assert!(collector.decision_acknowledged());
+            }
+            if outcome == 10 {
+                assert!(
+                    collector.decision_acknowledged(),
+                    "foreign refusal must preserve the genuine original round"
+                );
+                collector.refuse_decision(WalPreparationError::Canceled);
+                drop(foreign_custody.take());
+                while !collector.poll() {
+                    assert!(Instant::now() < deadline + Duration::from_secs(3));
+                    thread::sleep(Duration::from_millis(1));
+                }
+                drop(local_collector.take());
+                drop(view);
+                drop(handle);
+                assert_eq!(budget.used(), 0);
+                drop(foreign_actor);
+                drop(actor);
+                assert!(global.shutdown());
+                assert!(journal.shutdown());
+                return;
+            }
+            if outcome >= 6 {
+                let completed = if outcome == 9 {
+                    &actor.drained
+                } else if outcome == 8 {
+                    actor.abandon_requested.store(true, Ordering::Release);
+                    &actor.abandoned
+                } else {
+                    actor.drain_requested.store(true, Ordering::Release);
+                    &actor.drained
+                };
+                while !completed.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline);
+                    if outcome == 7 {
+                        // Either ordering may win before revocation completes; no stale
+                        // success is legal once the actual gate transition is observed.
+                        let _ = collector.decision_acknowledged();
+                        thread::yield_now();
+                    } else {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                assert!(
+                    !collector.decision_acknowledged(),
+                    "a genuine Draining original source cannot remain a current Registered acknowledgement"
+                );
+                assert!(!collector.start_settlement());
+                collector.refuse_decision(WalPreparationError::OwnerLost);
+                while !collector.poll() {
+                    assert!(Instant::now() < deadline + Duration::from_secs(3));
+                    thread::sleep(Duration::from_millis(1));
+                }
+                drop(local_collector.take());
+                drop(view);
+                drop(handle);
+                // Terminal status precedes the producer's final body/round Drop.
+                // NoAttempt is already proven; join the original workers before
+                // asserting destruction of every remaining backing holder.
+                drop(actor);
+                assert!(global.shutdown());
+                assert_eq!(budget.used(), 0);
+                assert!(journal.shutdown());
+                return;
+            }
             assert!(collector.start_settlement());
             // An actual journal transaction exercises the owner fence, not admission:
             // this V1 storage fixture has no retirement inventory, qualified provider or permit.
@@ -2282,13 +2761,65 @@ mod integration {
                 WalPreparationError::InvalidInput
             ))
         ));
-        let result = journal
-            .client()
-            .admit_prepared(prepared)
-            .unwrap()
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap();
-        if outcome >= 4 || source_policy_fault.is_some() {
+        let busy = if outcome >= 13 {
+            let token = actor
+                .tokens
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let holder = thread::spawn(move || {
+                assert!(
+                    token
+                        .with_current(|| {
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+                        })
+                        .is_some()
+                );
+            });
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            Some((release_tx, holder))
+        } else {
+            None
+        };
+        let mut admitted = journal.client().admit_prepared(prepared).unwrap();
+        if outcome >= 13 {
+            let early = admitted.recv_timeout(Duration::from_millis(50));
+            assert!(
+                matches!(early, Err(OperationJournalRequestError::Empty)),
+                "genuine Ready command must retain original input while its gate is busy: {early:?}"
+            );
+            if outcome == 14 {
+                handle.abort();
+            } else if outcome == 15 {
+                while Instant::now() < deadline + Duration::from_millis(20) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            } else if outcome == 16 {
+                actor.drain_requested.store(true, Ordering::Release);
+            }
+            let (release, holder) = busy.unwrap();
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            if outcome == 16 {
+                while !actor.drained.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline + Duration::from_secs(1));
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        let result = admitted.recv_timeout(Duration::from_secs(3)).unwrap();
+        if outcome >= 14 {
+            assert!(
+                result.is_err(),
+                "revoked original command cannot succeed: {result:?}"
+            );
+        } else if outcome == 4 || outcome == 5 || source_policy_fault.is_some() {
             assert!(
                 matches!(
                     result,
@@ -2300,7 +2831,8 @@ mod integration {
             );
         } else {
             assert!(
-                matches!(result, Err(OperationJournalOwnerError::PreparedAdmission(PreparedAdmissionError::Unsupported { reason })) if reason.contains("original owners acknowledged"))
+                matches!(&result, Err(OperationJournalOwnerError::PreparedAdmission(PreparedAdmissionError::Unsupported { reason })) if reason.contains("original owners acknowledged")),
+                "original retirement acknowledgement result: {result:?}"
             );
         }
         assert!(
@@ -2335,10 +2867,20 @@ mod integration {
         handle.abort();
         let aborted = wait(&handle, terminal);
         assert!(
-            if outcome >= 4 || source_policy_fault.is_some() {
+            if outcome == 4 || outcome == 5 || source_policy_fault.is_some() {
                 matches!(
                     aborted,
                     WalPreparationStatus::Rejected(WalPreparationError::InvalidInput)
+                )
+            } else if outcome == 16 {
+                matches!(
+                    aborted,
+                    WalPreparationStatus::Unavailable(WalPreparationError::OwnerLost)
+                )
+            } else if outcome >= 14 {
+                matches!(
+                    aborted,
+                    WalPreparationStatus::Aborted | WalPreparationStatus::Rejected(_)
                 )
             } else {
                 matches!(aborted, WalPreparationStatus::Aborted)
@@ -2348,9 +2890,72 @@ mod integration {
         drop(view);
         drop(handle);
         assert_eq!(budget.used(), 0);
+        if outcome == 16 {
+            // OwnerLost remains the refusal reason after confirmed NoAttempt cleanup;
+            // that diagnostic alone cannot prove cleanup or resolve an unknown SQL attempt.
+            assert!(
+                actor
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event == "reuse:retiring-pre-audit"),
+                "original Source writer was not restored"
+            );
+            // The original resource header remains deliberately charged until shutdown.
+            // Every WAL preparation/command debit must be gone independently of it.
+            let mut live_header = InputBudget::new();
+            live_header.remaining[InputClass::Ordinary.index()] -= resource_custody::HEADER_BYTES;
+            live_header.publication_remaining -= resource_custody::HEADER_BYTES;
+            let released = Instant::now() + Duration::from_secs(1);
+            loop {
+                let observed = *journal.shared.input_bytes.lock().unwrap();
+                if observed == live_header {
+                    break;
+                }
+                assert!(
+                    Instant::now() < released,
+                    "original journal input debit remains held: observed={observed:?}, expected={:?}",
+                    live_header
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            // The same actual Global writer must have completed its earlier abort before
+            // it can accept another bounded observation; no physical effect is requested.
+            let request = crate::sample_sources::library::GlobalPreparationRequest::new(
+                global.preparation_owner(),
+                [13; 32],
+                Instant::now() + Duration::from_secs(1),
+                1,
+                16 * 1024,
+            )
+            .unwrap();
+            let mut pending = global.submit_preparation(request).unwrap();
+            let original = pending
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            original
+                .abort()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            drop(pending);
+            assert_eq!(budget.used(), 0);
+        }
         drop(actor);
         assert!(global.shutdown());
-        assert!(journal.shutdown());
+        if outcome == 16 {
+            // OwnerLost conservatively denies clean handoff, even when NoAttempt
+            // backing has been destroyed. Memory release does not waive that refusal.
+            assert!(!journal.shutdown());
+            assert_eq!(
+                *journal.shared.input_bytes.lock().unwrap(),
+                InputBudget::new()
+            );
+        } else {
+            assert!(journal.shutdown());
+        }
     }
     #[test]
     fn all_owner_real_tag_and_layout_factories_keep_actual_original_family_policy() {

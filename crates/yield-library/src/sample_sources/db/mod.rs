@@ -72,9 +72,10 @@ pub(crate) mod sqlite_identity;
 mod starmap_layout;
 #[allow(unused_imports)]
 pub(crate) use source_authority::{
-    SourceAuthorityConfirmation, SourceAuthorityDrainMarker, SourceAuthorityGuard,
-    SourceAuthorityRequest, SourceAuthorityUseProof, SourceEffectPermit, SourceEffectPin,
-    SourceLeaseIdentity, SourceRegistrationId,
+    DecisionBoundaryRefusal, RegisteredDecisionBoundary, SourceAuthorityConfirmation,
+    SourceAuthorityDrainMarker, SourceAuthorityGuard, SourceAuthorityRequest,
+    SourceAuthorityUseProof, SourceEffectPermit, SourceEffectPin, SourceLeaseIdentity,
+    SourceRegistrationId,
 };
 pub use source_authority::{
     SourceAuthorityError, SourceAuthorityRegistration, SourceAuthorityRegistrationReceipt,

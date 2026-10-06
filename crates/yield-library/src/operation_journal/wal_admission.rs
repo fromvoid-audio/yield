@@ -14,6 +14,6 @@ pub use collector::{
 };
 pub(crate) use current::{CurrentCustody, CurrentRequest, CurrentRound};
 
-pub(super) use current::OriginalDecision;
+pub(super) use current::{OriginalDecision, OriginalReadyRound};
 
 pub(super) use plan::prepared_digest;

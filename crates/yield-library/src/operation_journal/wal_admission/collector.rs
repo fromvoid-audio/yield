@@ -166,6 +166,7 @@ pub(in crate::operation_journal) struct Collector {
     reason: Option<WalPreparationError>,
     global_started: bool,
     snapshot: Option<WalPreparationObservation>,
+    ready_cohort: Option<u64>,
     current: Option<Arc<super::CurrentRound>>,
     done: bool,
     _journal_input: Arc<super::super::owner::InputPermit>,
@@ -194,6 +195,7 @@ impl Collector {
                 reason: None,
                 global_started: false,
                 snapshot: None,
+                ready_cohort: None,
                 current: None,
                 done: false,
                 _journal_input: Arc::new(journal_input),
@@ -201,26 +203,102 @@ impl Collector {
             WalPreparationHandle(shared),
         )
     }
+    fn bind_source_round(&self, round: &super::CurrentRound) -> Result<(), WalPreparationError> {
+        for (index, owner) in self.held.iter().enumerate() {
+            let HeldOwner::Source(holder) = owner else {
+                continue;
+            };
+            let registration = match holder.status() {
+                SourceWalTransportStatus::Prepared(view) => view
+                    .original_binding()
+                    .and_then(|binding| binding.subject().registration())
+                    .map(|registration| registration.registration_id()),
+                SourceWalTransportStatus::PreparedLease(view) => view
+                    .original_binding()
+                    .stored_fence()
+                    .subject()
+                    .registration()
+                    .map(|registration| registration.registration_id()),
+                _ => None,
+            }
+            .ok_or(WalPreparationError::InvalidInput)?;
+            if !round.require_source(index, registration) {
+                return Err(WalPreparationError::InvalidInput);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::operation_journal) fn round_for_tests(&self) -> Arc<super::CurrentRound> {
+        Arc::clone(self.current.as_ref().unwrap())
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::operation_journal) fn preparing_round_for_tests(
+        &self,
+    ) -> Option<Arc<super::CurrentRound>> {
+        self.current.as_ref().map(Arc::clone)
+    }
     /// Request a new original commit-acknowledgement round; earlier Ready is insufficient.
+    pub(in crate::operation_journal) fn original_ready_round(
+        &self,
+    ) -> Result<super::OriginalReadyRound, WalPreparationError> {
+        if self.snapshot.is_none()
+            || self.reason.is_some()
+            || self.decision.is_some()
+            || self.shared.canceled.load(Ordering::Acquire)
+            || Instant::now() >= self.input.deadline
+        {
+            return Err(WalPreparationError::InvalidInput);
+        }
+        Ok(super::OriginalReadyRound::new(
+            Arc::clone(
+                self.current
+                    .as_ref()
+                    .ok_or(WalPreparationError::InvalidInput)?,
+            ),
+            self.ready_cohort.ok_or(WalPreparationError::InvalidInput)?,
+        ))
+    }
+    #[cfg(all(test, target_os = "linux"))]
     pub(in crate::operation_journal) fn begin_decision(
         &mut self,
         expected_digest: [u8; 32],
+    ) -> Result<(), WalPreparationError> {
+        let ready = self.original_ready_round()?;
+        self.begin_decision_from_ready(expected_digest, &ready)
+    }
+    pub(in crate::operation_journal) fn begin_decision_from_ready(
+        &mut self,
+        expected_digest: [u8; 32],
+        ready: &super::OriginalReadyRound,
     ) -> Result<(), WalPreparationError> {
         if expected_digest != self.input.digest
             || self.snapshot.is_none()
             || self.reason.is_some()
             || self.decision.is_some()
-            || !self.current.as_ref().is_some_and(|round| round.complete())
+            || self.shared.canceled.load(Ordering::Acquire)
+            || Instant::now() >= self.input.deadline
         {
             return Err(WalPreparationError::InvalidInput);
         }
+        ready.require_current(
+            self.current
+                .as_ref()
+                .ok_or(WalPreparationError::InvalidInput)?,
+        )?;
         let mut credit = self.input.budget.credit();
         credit
-            .resize(std::mem::size_of::<super::CurrentRound>() + 64)
+            .resize(super::CurrentRound::retained_bytes(
+                self.held
+                    .iter()
+                    .filter(|owner| matches!(owner, HeldOwner::Source(_)))
+                    .count(),
+            ))
             .map_err(|_| WalPreparationError::Full)?;
         let (round, decision) =
             super::CurrentRound::decision_round(self.held.len(), self.input.deadline, credit)
                 .ok_or(WalPreparationError::InvalidInput)?;
+        self.bind_source_round(&round)?;
         for (index, owner) in self.held.iter().enumerate() {
             let result = match owner {
                 HeldOwner::Global(holder) => holder
@@ -327,7 +405,10 @@ impl Collector {
             .as_ref()
             .is_some_and(|round| round.invalidated())
         {
-            self.fail(WalPreparationError::OwnerLost);
+            // Registration revocation can invalidate an ACK without native cleanup.
+            // Before SQLite starts, release the sole decision guard before abort polling.
+            drop(self.decision.take());
+            self.fail(self.owner_boundary_refusal());
             return self.poll_abort();
         }
         // Native producer status is current; the immutable snapshot itself is not.
@@ -337,14 +418,14 @@ impl Collector {
                     SourceWalTransportStatus::Prepared(_)
                     | SourceWalTransportStatus::PreparedLease(_) => {}
                     _ => {
-                        self.fail(WalPreparationError::OwnerLost);
+                        self.fail(self.owner_boundary_refusal());
                         return self.poll_abort();
                     }
                 },
                 HeldOwner::Global(holder) => match holder.try_release_outcome() {
                     Ok(None) => {}
                     _ => {
-                        self.fail(WalPreparationError::OwnerLost);
+                        self.fail(self.owner_boundary_refusal());
                         return self.poll_abort();
                     }
                 },
@@ -573,7 +654,12 @@ impl Collector {
             if self.current.is_none() {
                 let mut credit = self.input.budget.credit();
                 if credit
-                    .resize(std::mem::size_of::<super::CurrentRound>() + 64)
+                    .resize(super::CurrentRound::retained_bytes(
+                        self.held
+                            .iter()
+                            .filter(|owner| matches!(owner, HeldOwner::Source(_)))
+                            .count(),
+                    ))
                     .is_err()
                 {
                     self.fail(WalPreparationError::Full);
@@ -585,6 +671,10 @@ impl Collector {
                     self.fail(WalPreparationError::InvalidInput);
                     return self.poll_abort();
                 };
+                if let Err(error) = self.bind_source_round(&round) {
+                    self.fail(error);
+                    return self.poll_abort();
+                }
                 for (index, owner) in self.held.iter().enumerate() {
                     let result = match owner {
                         HeldOwner::Global(holder) => holder
@@ -615,12 +705,19 @@ impl Collector {
             match self.make_snapshot() {
                 Ok(snapshot) => {
                     if let Some(round) = &self.current {
-                        if round
-                            .with_complete(|| {
-                                self.publish(WalPreparationStatus::Ready(snapshot.clone()))
-                            })
-                            .is_none()
-                        {
+                        let publication = round.with_complete(|cohort| {
+                            self.publish(WalPreparationStatus::Ready(snapshot.clone()));
+                            cohort
+                        });
+                        if let Some(cohort) = publication {
+                            self.ready_cohort = Some(cohort);
+                        } else {
+                            // A Source gate may become busy after the earlier completion
+                            // check. Keep the original round pending; only actual revocation
+                            // may turn this failed publication comparison into owner loss.
+                            if !round.invalidated() {
+                                return false;
+                            }
                             self.fail(WalPreparationError::OwnerLost);
                             return self.poll_abort();
                         }
@@ -694,6 +791,18 @@ impl Collector {
             _journal_input: Arc::clone(&self._journal_input),
         })))
     }
+    fn owner_boundary_refusal(&self) -> WalPreparationError {
+        // A producer can reach the SAME original deadline after the journal's
+        // earlier clock sample, closing its round before this status comparison.
+        // Resample at classification; this supplies no cleanup or SQL authority.
+        // poll_abort still reports OwnerLost for genuinely unconfirmed cleanup.
+        if Instant::now() >= self.input.deadline {
+            WalPreparationError::Deadline
+        } else {
+            WalPreparationError::OwnerLost
+        }
+    }
+
     fn poll_abort(&mut self) -> bool {
         if let Some(pending) = self.awaiting.take() {
             match pending {
