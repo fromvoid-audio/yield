@@ -408,7 +408,7 @@ impl Collector {
             // Registration revocation can invalidate an ACK without native cleanup.
             // Before SQLite starts, release the sole decision guard before abort polling.
             drop(self.decision.take());
-            self.fail(WalPreparationError::OwnerLost);
+            self.fail(self.owner_boundary_refusal());
             return self.poll_abort();
         }
         // Native producer status is current; the immutable snapshot itself is not.
@@ -418,14 +418,14 @@ impl Collector {
                     SourceWalTransportStatus::Prepared(_)
                     | SourceWalTransportStatus::PreparedLease(_) => {}
                     _ => {
-                        self.fail(WalPreparationError::OwnerLost);
+                        self.fail(self.owner_boundary_refusal());
                         return self.poll_abort();
                     }
                 },
                 HeldOwner::Global(holder) => match holder.try_release_outcome() {
                     Ok(None) => {}
                     _ => {
-                        self.fail(WalPreparationError::OwnerLost);
+                        self.fail(self.owner_boundary_refusal());
                         return self.poll_abort();
                     }
                 },
@@ -791,6 +791,18 @@ impl Collector {
             _journal_input: Arc::clone(&self._journal_input),
         })))
     }
+    fn owner_boundary_refusal(&self) -> WalPreparationError {
+        // A producer can reach the SAME original deadline after the journal's
+        // earlier clock sample, closing its round before this status comparison.
+        // Resample at classification; this supplies no cleanup or SQL authority.
+        // poll_abort still reports OwnerLost for genuinely unconfirmed cleanup.
+        if Instant::now() >= self.input.deadline {
+            WalPreparationError::Deadline
+        } else {
+            WalPreparationError::OwnerLost
+        }
+    }
+
     fn poll_abort(&mut self) -> bool {
         if let Some(pending) = self.awaiting.take() {
             match pending {
