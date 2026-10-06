@@ -36,6 +36,8 @@ mod windows_index_input;
 #[cfg(any(windows, test))]
 mod windows_observation;
 #[cfg(any(windows, test))]
+mod windows_owned_security;
+#[cfg(any(windows, test))]
 mod windows_rename_information;
 
 /// Result of a descriptor-bound staged publication.
@@ -808,6 +810,26 @@ impl BoundDatabaseRoot {
             .checked_add(alias)?
             .checked_add(guard.profile_root().as_os_str().as_encoded_bytes().len())?
             .checked_add(guard.profile_root_identity().len().checked_mul(2)?)
+    }
+    /// Read-only security snapshot of this exact already retained owned directory.
+    #[cfg(windows)]
+    pub(crate) fn validate_owned_directory_snapshot(&self) -> io::Result<()> {
+        if !matches!(
+            self.namespace_kind,
+            BoundDatabaseRootNamespace::Profile | BoundDatabaseRootNamespace::ProfileChild
+        ) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        windows_owned_security::validate(&self._capability).map_err(|error| {
+            let kind = match error {
+                windows_owned_security::SnapshotError::ForeignOwner
+                | windows_owned_security::SnapshotError::ForeignMutation => {
+                    io::ErrorKind::PermissionDenied
+                }
+                _ => io::ErrorKind::InvalidData,
+            };
+            kind.into()
+        })
     }
     /// Original retained metadata only; native descriptor/allocator memory is separate.
     // Pinned Arc<File> backing: two usize-sized atomic controls plus aligned File payload.

@@ -2899,7 +2899,14 @@ impl ProductionRootCapability {
         }
         self.root
             .validate_profile_guard(&self.profile_guard)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        #[cfg(windows)]
+        if self.source.is_none() {
+            self.root
+                .validate_owned_directory_snapshot()
+                .map_err(|_| String::from("owned directory security snapshot refused"))?;
+        }
+        Ok(())
     }
 }
 
@@ -4746,6 +4753,63 @@ mod tests {
             },
             owner.test_mutating_authorization(vec![], 100, 0),
         )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_security_original_owner_registers_and_revalidates_private_profile() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let fixture = std::env::var_os("YIELD_WINDOWS_PRIVATE_DIRECTORY_FIXTURE")
+            .expect("externally prepared owner-only inheritable directory fixture");
+        let base = tempfile::tempdir_in(fixture).expect("isolated private profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("windows-private-root");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let owner = FileOperationOwner::start().expect("original owner");
+        let registration = owner
+            .register_profile_root(&guard)
+            .expect("private root registers");
+        let path = guard.profile_root().join("unchanged.bin");
+        std::fs::write(&path, b"unchanged original bytes").unwrap();
+        let mut request = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .unwrap();
+        assert!(matches!(
+            request
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .outcome(),
+            EffectOutcome::Unsupported { .. }
+        ));
+        request.acknowledge().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"unchanged original bytes");
+        drop(request);
+        owner.retire_root(registration).unwrap();
+        owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_security_original_owner_refuses_inherited_foreign_mutation() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let fixture = std::env::var_os("YIELD_WINDOWS_MUTABLE_DIRECTORY_FIXTURE").expect(
+            "externally prepared current-owner foreign-mutation inheritable directory fixture",
+        );
+        let base = tempfile::tempdir_in(fixture).expect("isolated refusing profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("windows-refused-root");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let owner = FileOperationOwner::start().expect("original owner");
+        assert!(owner.register_profile_root(&guard).is_err());
+        owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
     }
 
     #[cfg(target_os = "macos")]
