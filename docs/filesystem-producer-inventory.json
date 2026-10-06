@@ -882,6 +882,36 @@
       "issue": "OPT-2352",
       "reason": "Cfg(test,unix)-only disposable genuine profile Store/Source fixture validates the actual Current actor entry-point refusal at the original pool-derived metadata carrier bound. Original pool permits remain funded through real runtime teardown; confirmation remains unspent and no source reserve or physical authority is created.",
       "retirement": "Remove this exact row with its named metadata carrier test; never reuse fixture Store ownership or pool-only permits as physical qualification."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_native_fault_tests.rs",
+      "function": "native_case",
+      "operation": "fs::create_dir",
+      "count": 3,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only ignored native-resource harness creates dedicated Source subdirectories and starts the genuine original journal owner, including a prior clean retirement where required. Positive cases require an isolated ordinary macOS account and physically distinct APFS volume. Pause/inspection hooks supply no physical qualification, retry, permit, or settlement authority; dirty profile and Source paths are preserved.",
+      "retirement": "Remove this exact row when native_case or its named call is removed; never reuse its private fixture hooks in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_native_fault_tests.rs",
+      "function": "native_case",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only ignored native-resource harness creates dedicated Source subdirectories and starts the genuine original journal owner, including a prior clean retirement where required. Positive cases require an isolated ordinary macOS account and physically distinct APFS volume. Pause/inspection hooks supply no physical qualification, retry, permit, or settlement authority; dirty profile and Source paths are preserved.",
+      "retirement": "Remove this exact row when native_case or its named call is removed; never reuse its private fixture hooks in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_native_fault_tests.rs",
+      "function": "native_case",
+      "operation": "journal::start",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only ignored native-resource harness creates dedicated Source subdirectories and starts the genuine original journal owner, including a prior clean retirement where required. Positive cases require an isolated ordinary macOS account and physically distinct APFS volume. Pause/inspection hooks supply no physical qualification, retry, permit, or settlement authority; dirty profile and Source paths are preserved.",
+      "retirement": "Remove this exact row when native_case or its named call is removed; never reuse its private fixture hooks in production."
     }
   ]
 }
