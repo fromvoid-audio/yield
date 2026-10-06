@@ -71,6 +71,9 @@ owner has completed NoAttempt cleanup, and therefore can report
 `Unavailable(OwnerLost)` on real drain. That label alone proves neither custody
 release nor unknown settlement. The genuine drain regression separately requires
 actual Source writer restoration with zero registered uses, zero handshake and
-journal input debit, completed Global abort/reuse observation, zero durable IDs
-and unchanged rows. Unknown SQLite entry still retains its original owners until
+journal WAL input debit, completed Global abort/reuse observation, zero durable IDs
+and unchanged rows. The live journal retains exactly its original 4 KiB resource
+header; worker join releases that header too. `OwnerLost` still conservatively
+denies clean shutdown/handoff: releasing memory does not waive that refusal.
+Unknown SQLite entry still retains its original owners until
 genuine outcome/readback; no refusal reason may authorize retry or settlement.
