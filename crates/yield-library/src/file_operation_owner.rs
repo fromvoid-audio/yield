@@ -37,6 +37,7 @@ use crate::operation_journal::owner::{LiveChunkEffectGrant, StagingPublicationGr
 mod publication_handoff;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use publication_handoff::QueuedGrant;
+pub(crate) use publication_handoff::completion_observation;
 mod publication_binding;
 use crate::sample_sources::SourceId;
 use crate::sample_sources::db::{BoundDatabaseRoot, SourceAuthorityRequest};
@@ -2366,7 +2367,7 @@ impl FileOperationOwner {
         Ok(registration)
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn register_live_chunk_root_for_test(&self) -> Result<RootRegistrationRef, String> {
         self.register_root_for_test(
             AuthorityFence::Profile(ProfileAuthorityFence {
@@ -2378,7 +2379,7 @@ impl FileOperationOwner {
         )
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn live_chunk_effect_for_test(
         &self,
         grant: &LiveChunkEffectGrant,
@@ -2550,7 +2551,7 @@ impl FileOperationOwner {
         self.shared.execution_count.load(Ordering::Acquire)
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn force_next_live_chunk_uncertain_for_test(&self) {
         self.shared
             .force_live_chunk_uncertain
@@ -2941,6 +2942,11 @@ impl WorkerState {
         result_tx: SyncSender<Arc<FileOperationResult>>,
         shared: &Arc<OwnerShared>,
     ) {
+        if primary {
+            if let Some(grant) = &grant {
+                grant.original_worker_started();
+            }
+        }
         if let Some(existing) = self.receipts.get_mut(&key) {
             if existing.canonical.as_ref() == canonical.as_ref() {
                 let result = existing.result.clone();
@@ -2977,6 +2983,11 @@ impl WorkerState {
                     reason: String::from("unacknowledged effect receipt capacity is full"),
                 },
             ));
+            if primary {
+                if let Some(grant) = &grant {
+                    grant.retain_worker_completion(&result, shared.owner);
+                }
+            }
             let _ = result_tx.send(result);
             drop(input);
             return;
@@ -3066,6 +3077,11 @@ impl WorkerState {
         };
         drop(input);
         let result = Arc::new(rejection_result(&command, fingerprint, outcome));
+        if primary {
+            if let Some(grant) = &grant {
+                grant.retain_worker_completion(&result, shared.owner);
+            }
+        }
         shared.complete_admission(key);
         let aliases = usize::from(result_tx.send(Arc::clone(&result)).is_ok());
         let retained_outcome = telemetry::FileOwnerRetainedOutcome::from_outcome(result.outcome());

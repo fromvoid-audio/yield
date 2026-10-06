@@ -779,3 +779,31 @@ The genuine macOS issuer harness selects its actual durable issued chunk through
 the original live grant; supported SDK/native execution remains OPT-2310.
 Linux/Windows do not compile macOS-only harness bodies. Portable owned-store and
 provider fixtures confer no native effect or physical qualification authority.
+
+## Original worker completion observations (OPT-2388)
+
+The original primary file worker records its bounded pre-effect publication result
+in the original journal fence before sending the receipt. A worker-start state
+retains uncertainty if validation or result construction unwinds before completion.
+Closed actor gates remain closed. Completion compares the exact original owner,
+operation, participant, publication effect, command fingerprint, target, source
+fences and both root observations. Matching observations alone cannot publish:
+only the original moved grant retains its private slot. Comparison borrows fields;
+its scalar digest does not allocate another owned receipt or diagnostic.
+
+Each of the existing 32 fences holds one fixed digest and observation bit within
+the unchanged 8 KiB registry debit and composed publication ceiling. Exact repeats
+coalesce. Changed, foreign, unqualified or ambiguous completions become sticky
+uncertainty, retaining the first digest. The actual actor scans at most 32 slots
+before command dispatch and at its existing 50 ms idle poll, without another queue
+or worker acknowledgement wait. Receipt, tombstone and accepted lost-reply custody
+continue to retain the original grant and its separate input/target/native backing.
+
+An observed no-effect result closes execution but remains unresolved and cannot
+reclaim its slot, refund staging or charges, authorize retry, settle cancellation,
+or complete a clean handoff. Durable completion/checkpoint/readback and genuine
+settlement remain OPT-2217; qualified namespace effects remain OPT-2218/2219.
+The existing genuine macOS issuer/handoff harness now checks original actor
+observation after its actual queued read barrier. Supported SDK/runtime execution
+remains OPT-2325; Linux scalar fences, actual SQLite queue refusals and readonly
+file-owner observations do not construct a publication grant or qualify an effect.

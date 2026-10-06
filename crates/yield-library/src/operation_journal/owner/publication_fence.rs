@@ -9,10 +9,13 @@ pub(super) const HEADER_BYTES: usize = 8192;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Pending,
+    WorkerActive,
     Entered,
     Unsettled,
     Closed,
     Unknown,
+    CompletedNoEffect { digest: [u8; 32], observed: bool },
+    UnknownCompletion { digest: [u8; 32] },
 }
 struct Fence {
     operation: OperationId,
@@ -36,6 +39,14 @@ const _: () = assert!(
         + super::super::capacity_provider::PUBLICATION_MIRROR_BYTES
         <= HEADER_BYTES
 );
+fn quarantine(state: &mut State) {
+    *state = match *state {
+        State::CompletedNoEffect { digest, .. } | State::UnknownCompletion { digest } => {
+            State::UnknownCompletion { digest }
+        }
+        _ => State::Unknown,
+    };
+}
 fn refused(reason: &str) -> OperationJournalOwnerError {
     OperationJournalOwnerError::StagingGrant {
         reason: reason.into(),
@@ -80,12 +91,12 @@ impl Registry {
                 "publication fence belongs to another original runtime",
             ));
         }
-        if self
-            .slots
-            .iter()
-            .flatten()
-            .any(|fence| matches!(fence.state.lock().map(|s| *s), Err(_) | Ok(State::Unknown)))
-        {
+        if self.slots.iter().flatten().any(|fence| {
+            matches!(
+                fence.state.lock().map(|s| *s),
+                Err(_) | Ok(State::Unknown | State::UnknownCompletion { .. })
+            )
+        }) {
             self.exhausted = true;
             shared.resource_admission.invalidate();
             return Err(refused("original publication fence state is unknown"));
@@ -146,6 +157,19 @@ impl Registry {
             fence,
             entered: false,
         })
+    }
+    // Bounded original actor scan. Observation is deliberately not settlement.
+    pub(super) fn poll_completions(&self) {
+        for fence in self.slots.iter().flatten() {
+            match fence.state.lock() {
+                Ok(mut state) => {
+                    if let State::CompletedNoEffect { observed, .. } = &mut *state {
+                        *observed = true;
+                    }
+                }
+                Err(poisoned) => quarantine(&mut poisoned.into_inner()),
+            }
+        }
     }
     pub(super) fn unresolved(&self) -> bool {
         self.slots
@@ -221,10 +245,74 @@ fn close_pending(fence: &Fence) -> bool {
             *state = State::Closed;
             true
         }
-        State::Entered | State::Unsettled | State::Unknown => false,
+        State::WorkerActive
+        | State::Entered
+        | State::Unsettled
+        | State::Unknown
+        | State::CompletedNoEffect { .. }
+        | State::UnknownCompletion { .. } => false,
     }
 }
 impl PendingFence {
+    pub(super) fn original_worker_started(&self) {
+        match self.fence.state.lock() {
+            Ok(mut state) if *state == State::Pending => *state = State::WorkerActive,
+            Ok(state) if *state == State::Closed => {}
+            Ok(mut state) => quarantine(&mut state),
+            Err(poisoned) => quarantine(&mut poisoned.into_inner()),
+        }
+    }
+    #[cfg(all(test, unix))]
+    pub(super) fn completion_observer(&self) -> impl Fn() -> bool + use<> {
+        let fence = Arc::clone(&self.fence);
+        move || {
+            matches!(
+                fence.state.lock().map(|s| *s),
+                Ok(State::CompletedNoEffect { observed: true, .. })
+            )
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn completion_observed(&self) -> bool {
+        matches!(
+            self.fence.state.lock().map(|s| *s),
+            Ok(State::CompletedNoEffect { observed: true, .. })
+        )
+    }
+    // Only the exact original grant can publish; caller-data correlation is checked
+    // against its sealed target before reaching this original slot.
+    pub(super) fn complete_before_effect(&self, digest: [u8; 32], exact: bool) {
+        let exact = exact && self.fence.generation != 0;
+        match self.fence.state.lock() {
+            Ok(mut state) => {
+                *state = match *state {
+                    State::Pending | State::Closed | State::WorkerActive
+                        if exact && !self.entered =>
+                    {
+                        State::CompletedNoEffect {
+                            digest,
+                            observed: false,
+                        }
+                    }
+                    State::CompletedNoEffect {
+                        digest: original,
+                        observed,
+                    } if exact && original == digest && !self.entered => State::CompletedNoEffect {
+                        digest: original,
+                        observed,
+                    },
+                    State::CompletedNoEffect {
+                        digest: original, ..
+                    }
+                    | State::UnknownCompletion { digest: original } => {
+                        State::UnknownCompletion { digest: original }
+                    }
+                    _ => State::UnknownCompletion { digest },
+                };
+            }
+            Err(poisoned) => quarantine(&mut poisoned.into_inner()),
+        }
+    }
     // Called only under original resource admission, establishing admission→fence order.
     #[cfg(test)]
     pub(super) fn enter(&mut self) -> bool {
@@ -235,15 +323,17 @@ impl PendingFence {
             return Err(UseError::Unknown);
         }
         match self.fence.state.lock() {
-            Ok(mut state) if *state == State::Pending => {
+            Ok(mut state) if matches!(*state, State::Pending | State::WorkerActive) => {
                 *state = State::Entered;
                 self.entered = true;
                 Ok(())
             }
-            Ok(state) if *state == State::Unknown => Err(UseError::Unknown),
+            Ok(state) if matches!(*state, State::Unknown | State::UnknownCompletion { .. }) => {
+                Err(UseError::Unknown)
+            }
             Ok(_) => Err(UseError::Closed),
             Err(poisoned) => {
-                *poisoned.into_inner() = State::Unknown;
+                quarantine(&mut poisoned.into_inner());
                 Err(UseError::Unknown)
             }
         }
@@ -255,10 +345,17 @@ impl Drop for PendingFence {
             Ok(mut state) => match (*state, self.entered) {
                 (State::Pending, false) => *state = State::Closed,
                 (State::Entered, true) => *state = State::Unsettled,
-                (State::Closed | State::Unsettled | State::Unknown, _) => {}
+                (
+                    State::Closed
+                    | State::Unsettled
+                    | State::Unknown
+                    | State::CompletedNoEffect { .. }
+                    | State::UnknownCompletion { .. },
+                    _,
+                ) => {}
                 _ => *state = State::Unknown,
             },
-            Err(poisoned) => *poisoned.into_inner() = State::Unknown,
+            Err(poisoned) => quarantine(&mut poisoned.into_inner()),
         }
     }
 }

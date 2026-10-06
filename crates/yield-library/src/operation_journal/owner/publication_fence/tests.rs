@@ -179,3 +179,192 @@ fn publication_source_retirement_and_original_admission_entry_have_one_winner() 
         assert_eq!(admission.snapshot().1, 0);
     }
 }
+
+#[test]
+fn original_completion_coalesces_without_reclaiming_or_settling() {
+    let shared = shared();
+    let mut registry = Registry::new();
+    let operation = OperationId::new();
+    let pending = registry.issue(operation, &shared).unwrap();
+    pending.complete_before_effect([7; 32], true);
+    assert_eq!(
+        *pending.fence.state.lock().unwrap(),
+        State::CompletedNoEffect {
+            digest: [7; 32],
+            observed: false
+        }
+    );
+    registry.poll_completions();
+    pending.complete_before_effect([7; 32], true);
+    assert_eq!(
+        *pending.fence.state.lock().unwrap(),
+        State::CompletedNoEffect {
+            digest: [7; 32],
+            observed: true
+        }
+    );
+    assert!(registry.unresolved());
+    assert!(registry.close_for_cancellation(operation).is_err());
+    assert!(registry.close_for_charge_release(operation).is_err());
+    assert!(registry.close_for_mutation(operation).is_err());
+    drop(pending);
+    assert!(registry.issue(operation, &shared).is_err());
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().publication_remaining,
+        super::super::PUBLICATION_INPUT_BYTES - HEADER_BYTES
+    );
+}
+
+#[test]
+fn original_completion_conflict_keeps_first_evidence_sticky_and_closes_issuance() {
+    for exact in [true, false] {
+        let shared = shared();
+        let mut registry = Registry::new();
+        let mut pending = registry.issue(OperationId::new(), &shared).unwrap();
+        pending.complete_before_effect([7; 32], true);
+        pending.complete_before_effect([8; 32], exact);
+        assert_eq!(
+            *pending.fence.state.lock().unwrap(),
+            State::UnknownCompletion { digest: [7; 32] }
+        );
+        registry.poll_completions();
+        pending.complete_before_effect([7; 32], true);
+        assert_eq!(
+            *pending.fence.state.lock().unwrap(),
+            State::UnknownCompletion { digest: [7; 32] }
+        );
+        assert!(!pending.enter());
+        assert!(registry.issue(OperationId::new(), &shared).is_err());
+    }
+}
+
+#[test]
+fn original_completion_cannot_turn_entered_or_quiescent_execution_into_no_effect() {
+    for quiescent in [false, true] {
+        let shared = shared();
+        let mut registry = Registry::new();
+        let mut pending = registry.issue(OperationId::new(), &shared).unwrap();
+        assert!(pending.enter());
+        if quiescent {
+            *pending.fence.state.lock().unwrap() = State::Unsettled;
+        }
+        pending.complete_before_effect([9; 32], true);
+        assert_eq!(
+            *pending.fence.state.lock().unwrap(),
+            State::UnknownCompletion { digest: [9; 32] }
+        );
+        assert!(registry.unresolved());
+    }
+}
+
+#[test]
+fn original_completion_all_slots_retained_even_after_original_grants_drop() {
+    let shared = shared();
+    let mut registry = Registry::new();
+    for byte in 0..32 {
+        let pending = registry.issue(OperationId::new(), &shared).unwrap();
+        pending.original_worker_started();
+        pending.complete_before_effect([byte; 32], true);
+        drop(pending);
+    }
+    registry.poll_completions();
+    assert!(registry.issue(OperationId::new(), &shared).is_err());
+    assert_eq!(registry.slots.iter().flatten().count(), 32);
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().publication_remaining,
+        super::super::PUBLICATION_INPUT_BYTES - HEADER_BYTES
+    );
+}
+
+#[test]
+fn original_completion_worker_panic_and_zero_generation_never_become_closed_or_reusable() {
+    let shared = shared();
+    let mut registry = Registry::new();
+    let pending = registry.issue(OperationId::new(), &shared).unwrap();
+    let fence = Arc::clone(&pending.fence);
+    pending.original_worker_started();
+    drop(pending); // Original worker unwind without a completion.
+    assert_eq!(*fence.state.lock().unwrap(), State::Unknown);
+    assert!(registry.issue(OperationId::new(), &shared).is_err());
+    let invalid = PendingFence {
+        fence: Arc::new(Fence {
+            operation: OperationId::new(),
+            source: SourceRegistrationId::model_key_for_tests(0),
+            generation: 0,
+            state: Mutex::new(State::Pending),
+        }),
+        entered: false,
+    };
+    invalid.complete_before_effect([3; 32], true);
+    assert_eq!(
+        *invalid.fence.state.lock().unwrap(),
+        State::UnknownCompletion { digest: [3; 32] }
+    );
+}
+
+#[test]
+fn original_completion_worker_start_never_reopens_actor_closed_entry() {
+    let shared = shared();
+    let mut registry = Registry::new();
+    let operation = OperationId::new();
+    let mut pending = registry.issue(operation, &shared).unwrap();
+    registry.close_for_cancellation(operation).unwrap();
+    pending.original_worker_started();
+    assert!(!pending.enter());
+    pending.complete_before_effect([2; 32], true);
+    assert!(registry.unresolved());
+}
+
+#[test]
+fn original_completion_and_actor_closure_never_leave_executable_entry() {
+    for _ in 0..64 {
+        let shared = shared();
+        let mut registry = Registry::new();
+        let operation = OperationId::new();
+        let mut pending = registry.issue(operation, &shared).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                barrier.wait();
+                pending.original_worker_started();
+                pending.complete_before_effect([7; 32], true);
+            });
+            barrier.wait();
+            let _ = registry.close_for_cancellation(operation);
+            worker.join().unwrap();
+        });
+        assert!(!pending.enter());
+        registry.poll_completions();
+        assert!(pending.completion_observed());
+        assert!(registry.unresolved());
+        assert!(registry.close_for_charge_release(operation).is_err());
+    }
+}
+
+#[test]
+fn original_completion_poison_preserves_first_digest_and_never_settles() {
+    let shared = shared();
+    let mut registry = Registry::new();
+    let mut pending = registry.issue(OperationId::new(), &shared).unwrap();
+    pending.complete_before_effect([7; 32], true);
+    assert!(
+        std::panic::catch_unwind(|| {
+            let _lock = pending.fence.state.lock().unwrap();
+            panic!("original completed slot poison");
+        })
+        .is_err()
+    );
+    registry.poll_completions();
+    assert_eq!(
+        *pending.fence.state.lock().unwrap_err().into_inner(),
+        State::UnknownCompletion { digest: [7; 32] }
+    );
+    pending.complete_before_effect([8; 32], true);
+    assert_eq!(
+        *pending.fence.state.lock().unwrap_err().into_inner(),
+        State::UnknownCompletion { digest: [7; 32] }
+    );
+    assert!(!pending.enter());
+    assert!(registry.unresolved());
+    assert!(registry.issue(OperationId::new(), &shared).is_err());
+}

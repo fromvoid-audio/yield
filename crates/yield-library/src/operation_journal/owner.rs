@@ -992,7 +992,7 @@ pub struct OperationJournalOwner {
     worker: Option<JoinHandle<()>>,
     #[cfg(test)]
     prepared_admission_id_allocations: Arc<AtomicUsize>,
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, unix))]
     synthetic_chunk_write_invocations: Arc<AtomicUsize>,
 }
 
@@ -1234,6 +1234,7 @@ pub(crate) struct LiveChunkEffectGrant {
 #[allow(dead_code)] // The publication effect itself belongs to the subsequent route.
 pub(crate) struct StagingPublicationGrant {
     target: PreparedPublicationTarget,
+    completion_fingerprint: [u8; 32],
     fence: publication_fence::PendingFence,
     charge: super::capacity_provider::PublicationChargeBinding,
     native: native_read_capsule::NativeReadCapsule,
@@ -1256,6 +1257,23 @@ impl std::fmt::Debug for StagingPublicationGrant {
 impl StagingPublicationGrant {
     pub(crate) fn original_target(&self) -> &PreparedPublicationTarget {
         &self.target
+    }
+
+    pub(crate) fn original_worker_started(&self) {
+        self.fence.original_worker_started();
+    }
+    pub(crate) fn retain_worker_completion(
+        &self,
+        result: &crate::file_operation_owner::FileOperationResult,
+        worker: crate::file_operation_owner::OwnerIdentity,
+    ) {
+        let (digest, exact) = crate::file_operation_owner::completion_observation(
+            &self.target,
+            self.completion_fingerprint,
+            result,
+            worker,
+        );
+        self.fence.complete_before_effect(digest, exact);
     }
 
     pub(crate) fn begin_publication(
@@ -1891,6 +1909,10 @@ impl OwnerRuntime {
         self.wal_preparation = Some(collector);
         self.poll_wal_preparation();
         Ok(handle)
+    }
+    fn poll_original_work(&mut self) {
+        self.publication_fences.poll_completions();
+        self.poll_wal_preparation();
     }
     fn poll_wal_preparation(&mut self) {
         self.poll_retirement_admission();
@@ -2565,6 +2587,20 @@ impl OwnerRuntime {
         .ok_or_else(|| OperationJournalOwnerError::StagingGrant {
             reason: "original publication target lacks validated staging bytes".into(),
         })?;
+        let completion_command =
+            target
+                .publication_command()
+                .map_err(|_| OperationJournalOwnerError::StagingGrant {
+                    reason: "original completion command is invalid".into(),
+                })?;
+        let completion_bytes = completion_command.canonical_bytes().map_err(|_| {
+            OperationJournalOwnerError::StagingGrant {
+                reason: "original completion command is invalid".into(),
+            }
+        })?;
+        let completion_fingerprint = *blake3::hash(&completion_bytes).as_bytes();
+        drop(completion_bytes);
+        drop(completion_command);
         let fence = self.publication_fences.issue_for_source(
             validation.operation_id(),
             registration.registration_id,
@@ -2596,6 +2632,7 @@ impl OwnerRuntime {
             })?;
         Ok(StagingPublicationGrant {
             target,
+            completion_fingerprint,
             fence,
             charge,
             native,
@@ -4593,7 +4630,7 @@ impl OperationJournalOwner {
             worker: Some(worker),
             #[cfg(test)]
             prepared_admission_id_allocations,
-            #[cfg(all(test, target_os = "macos"))]
+            #[cfg(all(test, unix))]
             synthetic_chunk_write_invocations,
         })
     }
@@ -4616,7 +4653,7 @@ impl OperationJournalOwner {
             .load(Ordering::Relaxed)
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, unix))]
     fn synthetic_chunk_write_invocations(&self) -> usize {
         self.synthetic_chunk_write_invocations
             .load(Ordering::Relaxed)
@@ -6432,7 +6469,7 @@ fn run_owner(
     let panic_on_command = panic_on_command;
     let mut orderly_shutdown = true;
     loop {
-        let Some(command) = command_rx.recv_with_idle(|| runtime.poll_wal_preparation()) else {
+        let Some(command) = command_rx.recv_with_idle(|| runtime.poll_original_work()) else {
             if let Some(collector) = &runtime.wal_preparation {
                 collector.cancel();
             }
@@ -6463,6 +6500,7 @@ fn run_owner(
             break;
         }
     }
+    runtime.publication_fences.poll_completions();
     if !runtime.resource_admission.close_and_wait() {
         orderly_shutdown = false;
         if OwnerLifecycle::from_u8(shared.lifecycle.load(Ordering::Acquire))
@@ -7510,7 +7548,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     fn fixture_volume_registry(fixture: &Fixture) -> std::path::PathBuf {
         // macOS exposes the temporary root through /var -> /private/var. The
         // registry owner deliberately walks every path component without
@@ -10098,7 +10136,14 @@ mod tests {
         native_live_chunk_and_staging_issuer(None, None, None, None, None, true);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    #[ignore = "Requires native macOS original registered source, reserve and volume resources; OPT-2325"]
+    fn native_original_completion_handoff_requires_macos_resources() {
+        native_live_chunk_and_staging_issuer(None, None, None, None, None, true);
+    }
+
+    #[cfg(unix)]
     fn native_live_chunk_and_staging_issuer(
         fault: Option<(usize, super::super::store::InsertTestBoundary)>,
         close_before_entry: Option<bool>,
@@ -10108,6 +10153,10 @@ mod tests {
         publication_handoff: bool,
     ) {
         use super::super::store::{InsertTestBoundary, InsertTestDirective};
+        use crate::durable_capacity::descriptor_capacity_facts;
+        use crate::file_operation_owner::{EffectOutcome, FileOperationOwner};
+        use crate::sample_sources::db::SourceDatabase;
+        use std::time::Instant;
         let fixture = fixture("journal-owner-live-chunk-grant");
         let registry_path = fixture_volume_registry(&fixture);
         let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
@@ -11142,7 +11191,7 @@ mod tests {
                     .shared
                     .mark_unavailable("native test: original unavailable after issuance");
             } else {
-                assert!(client.begin_command_drain());
+                assert!(owner.begin_command_drain());
             }
             assert!(matches!(
                 publication.begin_publication(),
@@ -11182,6 +11231,7 @@ mod tests {
             );
             let retry = publication.original_target().publication_command().unwrap();
             let exact = publication.original_target().publication_command().unwrap();
+            let completion = publication.fence.completion_observer();
             let pending = file_owner.submit_publication(publication).unwrap();
             drop(pending); // Accepted loss retains the original grant; no entry happened.
             let mut duplicate = file_owner.submit(retry).unwrap();
@@ -11190,6 +11240,17 @@ mod tests {
                 result.outcome(),
                 crate::file_operation_owner::EffectOutcome::Unsupported { .. }
             ));
+            // An actual queued read is an actor barrier. Its dispatch scans the original
+            // completion first; this is not durable settlement.
+            let mut readback = client.get(operation_id).unwrap();
+            assert!(
+                readback
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(completion());
+            drop(completion);
             assert!(duplicate.take_unused_live_chunk_grant().unwrap().is_none());
             duplicate.acknowledge().unwrap();
             let mut exact_again = file_owner.submit(exact).unwrap();
