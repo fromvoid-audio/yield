@@ -541,7 +541,7 @@ mod attempt_integration {
         let store = OperationJournalStore::open(&f.owner).unwrap();
         let (record, _, _) = persist_fixture(&store, &f.owner, 1);
         let before = retained_image(&store).0;
-        store.connection.execute_batch("DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; PRAGMA user_version=11").unwrap();
+        store.connection.execute_batch("DROP TABLE operation_journal_publication_issuance; DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; PRAGMA user_version=11").unwrap();
         drop(store);
         let reopened = OperationJournalStore::open(&f.owner).unwrap();
         assert_eq!(retained_image(&reopened).0, before);

@@ -15529,7 +15529,7 @@ mod tests {
         let connection = Connection::open(&path).expect("open old schema fixture");
         connection
             .execute_batch(&format!(
-                "DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; DROP TABLE {}; DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
+                "DROP TABLE operation_journal_publication_issuance; DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; DROP TABLE {}; DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
                 recording_chunks::TABLE_NAME,
                 staging_checkpoints::TABLE_NAME,
                 chunk_staging::TABLE_NAME,
@@ -15571,7 +15571,7 @@ mod tests {
         let connection = Connection::open(database_path(&fixture.owner)).expect("open v8 fixture");
         connection
             .execute_batch(&format!(
-                "DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
+                "DROP TABLE operation_journal_publication_issuance; DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
                 recording_chunks::TABLE_NAME,
                 chunk_staging::TABLE_NAME,
                 STAGING_CHECKPOINT_SCHEMA_VERSION

@@ -573,4 +573,20 @@ mod publication_issuance {
             .unwrap();
         assert_eq!(count, 1);
     }
+    #[test]
+    fn publication_issuance_schema12_unexpected_namespace_refuses_without_partial_migration() {
+        let (fixture, store, staging, _binding, _sequence) = prepared();
+        store.connection.execute_batch("DROP TABLE operation_journal_publication_issuance; PRAGMA user_version=12; CREATE TABLE unknown_namespace(x INTEGER)").unwrap();
+        drop(store);
+        assert!(OperationJournalStore::open(&fixture.owner).is_err());
+        let raw = Connection::open(database_path(&fixture.owner)).unwrap();
+        let version: i64 = raw
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
+        let created:i64 = raw.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='operation_journal_publication_issuance'",[],|row|row.get(0)).unwrap();
+        assert_eq!(created, 0);
+        let reserved:bool = raw.query_row("SELECT grant_reserved FROM operation_journal_staging_checkpoint WHERE output_id=?1",params![staging.output_id().to_string()],|row|row.get(0)).unwrap();
+        assert!(!reserved);
+    }
 }
