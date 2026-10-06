@@ -90,7 +90,7 @@ fn scratch_bytes(claims: &[RebuildClaim], ledger: &ProvisionalLedger) -> Option<
         .checked_add(size_of::<InputPermit>())
 }
 impl CapacityProvider {
-    pub(super) fn unavailable_for_input(
+    pub(in crate::operation_journal) fn unavailable_for_input(
         input: &InputPermit,
     ) -> Result<Self, CapacityProviderError> {
         let credit = credit(input, header_bytes())?;
@@ -108,7 +108,7 @@ impl CapacityProvider {
             mirror,
         })
     }
-    pub(super) fn install_rebuilt_claims_for_input(
+    pub(in crate::operation_journal) fn install_rebuilt_claims_for_input(
         &self,
         snapshot: &OrdinaryClaimRebuildSnapshot,
         input: &InputPermit,

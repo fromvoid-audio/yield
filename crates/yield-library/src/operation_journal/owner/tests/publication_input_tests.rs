@@ -2,8 +2,7 @@
 #[cfg(test)]
 mod integration {
     use super::super::super::{
-        CONTROL_INPUT_RESERVED_BYTES, InputBudget, InputClass, ORDINARY_INPUT_BYTES,
-        PUBLICATION_INPUT_BYTES,
+        CONTROL_INPUT_RESERVED_BYTES, InputBudget, InputClass, PUBLICATION_INPUT_BYTES,
     };
     use super::super::*;
     use crate::operation_journal::store::{InsertTestBoundary, InsertTestDirective};
