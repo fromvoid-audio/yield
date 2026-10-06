@@ -1,5 +1,7 @@
 //! Original-worker read-only target preparation; no namespace, capacity or journal grant.
 use super::*;
+#[cfg(windows)]
+mod windows_staging_share;
 const MAX_BINDINGS: usize = 32;
 const BACKING: usize = 64 * 1024;
 const HEADER: usize = 16 * 1024;
@@ -704,6 +706,10 @@ impl WorkerState {
             .root
             .open_observation_file_nofollow(Path::new(staging.locator.as_str()))
             .map_err(|_| BindingError::Unknown)?;
+        // Keep the original-object read/share lease through hashing and every live binding.
+        // This refuses file-handle write/delete aliases, not surviving writable mappings.
+        #[cfg(windows)]
+        let mut file = windows_staging_share::retain(file).map_err(|_| BindingError::Unknown)?;
         let metadata = file.metadata().map_err(|_| BindingError::Unknown)?;
         if !metadata.is_file()
             || metadata.len() != proof.bytes
