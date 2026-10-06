@@ -5735,6 +5735,16 @@ impl InputPermit {
             .expect("test original input pool")
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn historical_test_funded_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn historical_test_ordinary_limit() -> usize {
+        InputClass::Ordinary.limit()
+    }
+
     #[cfg(test)]
     pub(super) fn historical_test_remaining(&self) -> usize {
         self.shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()]
@@ -5836,6 +5846,16 @@ struct CapacityLedgerTestSnapshot {
 
 #[allow(dead_code)]
 enum JournalCommand {
+    #[cfg(test)]
+    InstallHistoricalClaimFixture {
+        operation: OperationId,
+        sequence: i64,
+        wire: Vec<u8>,
+        claim: Uuid,
+        input: InputPermit,
+        result: SyncSender<Result<(), OperationJournalOwnerError>>,
+    },
+
     PrepareRecordingCustody {
         operation: OperationId,
         registration: SourceAuthorityRegistrationReceipt,
@@ -6289,6 +6309,23 @@ fn run_owner(
 // Returned outputs retain their independent result/producer custody. Input is not settlement.
 fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool {
     match command {
+        #[cfg(test)]
+        JournalCommand::InstallHistoricalClaimFixture {
+            operation,
+            sequence,
+            wire,
+            claim,
+            input,
+            result,
+        } => {
+            let _input = input;
+            execute_store_result(result, move || {
+                runtime
+                    .store()
+                    .install_historical_claim_fixture(operation, sequence, &wire, claim)
+            })
+        }
+
         JournalCommand::PrepareRecordingCustody {
             operation,
             registration,
@@ -6813,6 +6850,11 @@ where
 
 fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
     match &command {
+        #[cfg(test)]
+        JournalCommand::InstallHistoricalClaimFixture { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+
         JournalCommand::PrepareRecordingCustody { result, .. } => {
             let _ = result.send(Err(error));
         }

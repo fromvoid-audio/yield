@@ -48,6 +48,39 @@ debits. Projected record/backing is dropped before its debit. Normal paths
 explicitly end both SQLite lifetimes before releasing scratch or entering the
 unchanged other-family reader.
 
+The private SQL statements use the original connection and held admission read
+transaction. Each statement finalizes on success, error and unwind. Row slices
+borrow the statement; stepping and binding require a mutable statement borrow.
+No handle, row or alternate connection escapes. Every observer query uses this
+path, including family presence and unique-sequence checks. SQLite itself keeps
+its native allocations. Its borrowed error message is counted before making the
+same owned, UTF-8-lossy `rusqlite::SqliteFailure` message. The debit names lossy
+String growth and the complete Store/ordinary-claim display prefixes and two
+UUIDs, with overlapping error and formatted diagnostic buffers. Original path
+clones use native byte counts (UTF-16 on Windows), with separate worst-case lossy
+path-display and diagnostic formatting overlap.
+
+The generic, non-retirement request also funds a private reply Arc header before
+allocation. Named observer credits retain SQL, parser, envelope and SQLite error
+backing until the real rebuild consumer drops the original owned error after
+copying it into a separately funded capped diagnostic graph. The next claim can
+then reuse its original scratch allowance. The consumer debit includes all 32
+256-character diagnostics, UTF-8 and geometric String/Vec growth, the terminal
+consumer's four clones and join buffer, and its 512-character reason. It remains
+held through an unconsumed reply. Receiver Drop destroys channel contents before
+releasing count/backing; the actor keeps backing through send and disposal of a
+failed-send payload. Explicit consumption transfers the result to its caller;
+this account does not bound caller-owned output thereafter. Terminal permits do
+not reference the reply Arc, so this backing cannot form a retention cycle.
+
+The actor corruption fixtures insert through the same original Store connection
+and a test-only queued fixture command after genuine startup; they do not relax
+exclusive SQLite locking or manufacture production mutation authority. The
+normal allocator diagnostic also includes small and large invalid UTF-8 borrowed
+error-message fixtures through the same production copy routine. These measure
+Rust allocation behavior, with fixture pool setup explicitly included; they do
+not qualify native SQLite errors, allocator RSS or a physical backend.
+
 Startup, retirement admission, other record families, Recording/database/chunk
 audits and the existing whole-ledger collections/provider clones are outside
 this first component. Valid wire data can still encounter explicit pool

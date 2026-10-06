@@ -148,22 +148,9 @@ impl<'a> Statement<'a> {
             }
         };
         let owned = if let Some(message) = message {
-            let length = lossy_length(message.to_bytes())?;
-            // Original lossy String plus actual Display/ordinary-claim formatting overlap.
-            // Two UUIDs are 36 bytes each; fixed prefix is the unchanged consumer text.
-            let prefix = "ordinary claim  operation  requires audit: ".len() + 2 * 36;
-            let bytes = length
-                .checked_mul(2)
-                .and_then(|n| {
-                    length
-                        .checked_add(prefix)
-                        .and_then(|formatted| formatted.checked_mul(2))
-                        .and_then(|formatted| n.checked_add(formatted))
-                })
-                .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
-            let credit = self.input.reserve_historical_scratch(bytes)?;
+            let (owned, credit) = copy_error_message(self.input, message)?;
             *self.error_credit.borrow_mut() = Some(credit);
-            Some(message.to_string_lossy().into_owned())
+            Some(owned)
         } else {
             None
         };
@@ -181,6 +168,29 @@ impl Drop for Statement<'_> {
         }
     }
 }
+pub(super) fn copy_error_message(
+    input: &InputPermit,
+    message: &CStr,
+) -> Result<(String, InputPermit), OperationJournalStoreError> {
+    let length = lossy_length(message.to_bytes())?;
+    // Original lossy String growth plus actual StoreSql Display and the consumer's
+    // diagnostic formatting buffer, with both UUIDs and all fixed prefixes named.
+    let prefix = "operation journal SQLite error: ".len()
+        + "ordinary claim  operation  requires audit: ".len()
+        + 2 * 36;
+    let bytes = length
+        .checked_mul(2)
+        .and_then(|original| {
+            length
+                .checked_add(prefix)
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|formatted| original.checked_add(formatted))
+        })
+        .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+    let credit = input.reserve_historical_scratch(bytes)?;
+    Ok((message.to_string_lossy().into_owned(), credit))
+}
+
 fn lossy_length(mut bytes: &[u8]) -> Result<usize, OperationJournalStoreError> {
     let mut length = 0usize;
     while !bytes.is_empty() {
@@ -266,7 +276,7 @@ mod tests {
     fn historical_claim_native_sql_refuses_before_owned_message_and_finalizes_on_unwind() {
         let connection = Connection::open_in_memory().unwrap();
         let input =
-            InputPermit::historical_test_input(4 * crate::operation_journal::MAX_RECORD_BYTES - 1);
+            InputPermit::historical_test_input(InputPermit::historical_test_ordinary_limit() - 1);
         let credit = RefCell::new(None);
         assert!(matches!(
             Statement::new(&connection, &input, &credit, c"SELECT * FROM absent"),

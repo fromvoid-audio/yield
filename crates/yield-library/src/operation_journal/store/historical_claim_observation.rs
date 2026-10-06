@@ -7,6 +7,61 @@ mod borrowed_sql;
 use borrowed_sql::Statement;
 
 impl OperationJournalStore {
+    #[cfg(test)]
+    pub(super) fn install_historical_claim_fixture(
+        &self,
+        operation: OperationId,
+        sequence: i64,
+        wire: &[u8],
+        claim: Uuid,
+    ) -> Result<(), OperationJournalStoreError> {
+        // Test corruption uses the SAME genuine Store connection, never a competing
+        // opener or relaxed locking mode. This grants no production effect authority.
+        self.connection.execute(
+            "INSERT INTO operation_journal VALUES (?1,?2,?3)",
+            params![operation.to_string(), sequence, wire],
+        )?;
+        self.connection.execute("INSERT INTO operation_journal_ordinary_claim VALUES (?1,?2,'1','DestinationStaging',1)", params![claim.to_string(), operation.to_string()])?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Scalar allocation diagnostic for a borrowed SQLite-error conversion fixture.
+    /// This issues no SQL, worker, capacity or effect authority. The production
+    /// observer uses this same funded copy routine on actual borrowed sqlite3_errmsg.
+    pub fn historical_error_conversion_for_test(
+        &self,
+        nul_terminated: &[u8],
+    ) -> Result<(usize, usize), OperationJournalStoreError> {
+        let input = InputPermit::historical_test_input(1);
+        let sql = input.reserve_historical_scratch(historical_observation::FIXED_BYTES)?;
+        let message = std::ffi::CStr::from_bytes_with_nul(nul_terminated)
+            .map_err(|_| retained_error(None, "error fixture is not one NUL-terminated message"))?;
+        let (owned, credit) = borrowed_sql::copy_error_message(&input, message)?;
+        let length = owned.len();
+        let bytes = credit.historical_test_funded_bytes();
+        let error = OperationJournalStoreError::Sql(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some(owned),
+        ));
+        let formatted = format!(
+            "ordinary claim {} operation {} requires audit: {error}",
+            Uuid::nil(),
+            Uuid::nil()
+        );
+        let OperationJournalStoreError::Sql(rusqlite::Error::SqliteFailure(_, Some(ref copied))) =
+            error
+        else {
+            unreachable!("fixture constructs typed SQLite error")
+        };
+        assert!(formatted.ends_with(copied));
+        drop(formatted);
+        drop(error);
+        drop(credit);
+        drop(sql);
+        Ok((length, bytes))
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     /// Observe the real SQLite lookup with an isolated instance of the original heap pool.
     /// This component fixture installs no worker, physical capacity, or effect authority.

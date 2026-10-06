@@ -129,6 +129,34 @@ fn main() {
             new.2
         );
     }
+    // Borrowed errmsg conversion fixtures exercise the SAME normal-build funded
+    // routine used by actual sqlite3_errmsg. These synthetic messages establish
+    // Rust allocation coefficients only, not native SQLite or physical qualification.
+    for (case, bytes) in [
+        ("small_ascii", b"fixture SQLite error".to_vec()),
+        ("small_invalid_utf8", vec![0xff; 16]),
+        ("large_invalid_utf8", vec![0xff; 256 * 1024]),
+    ] {
+        let expected = String::from_utf8_lossy(&bytes).len();
+        let mut terminated = bytes.clone();
+        terminated.push(0);
+        let mut diagnostic = (0, 0);
+        let observed = measure(|| {
+            diagnostic = store
+                .historical_error_conversion_for_test(&terminated)
+                .unwrap();
+            diagnostic.0 == expected
+        });
+        assert!(observed.0);
+        println!(
+            "borrowed_errmsg_conversion_fixture case={case} raw={} copied={} dynamic_credit={} observed_peak={} observed_maximum_layout={} fixture_setup_included=true",
+            bytes.len(),
+            diagnostic.0,
+            diagnostic.1,
+            observed.1,
+            observed.2
+        );
+    }
     drop(store);
     drop(guard);
     drop(app);

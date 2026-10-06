@@ -16,18 +16,9 @@ fn historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pres
         .owner
         .profile_root()
         .join("operation_journal/journal.sqlite3");
-    let sql = rusqlite::Connection::open(&database).unwrap();
-    sql.execute(
-        "INSERT INTO operation_journal VALUES (?1,1,?2)",
-        rusqlite::params![old_id.to_string(), wire.as_bytes()],
-    )
-    .unwrap();
-    sql.execute(
-        "INSERT INTO operation_journal_ordinary_claim VALUES (?1,?2,'1','DestinationStaging',1)",
-        rusqlite::params![Uuid::new_v4().to_string(), old_id.to_string()],
-    )
-    .unwrap();
-    drop(sql);
+    store
+        .install_historical_claim_fixture(old_id, 1, wire.as_bytes(), Uuid::new_v4())
+        .unwrap();
     let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
     wait_until_available(&owner);
     let pool_before = owner.shared.input_bytes.lock().unwrap().remaining[0];
@@ -118,30 +109,28 @@ fn historical_claim_unconsumed_actor_error_hands_off_to_funded_diagnostics_until
     let old_id = OperationId::new();
     // Introduce a malformed historical row after genuine startup. The actor must
     // retain its original typed error rather than allocating an operation identity.
-    let sql = rusqlite::Connection::open(&database).unwrap();
     let wire = format!("{{{}", " ".repeat(MAX_RECORD_BYTES - 1));
-    sql.execute(
-        "INSERT INTO operation_journal VALUES (?1,1,?2)",
-        rusqlite::params![old_id.to_string(), wire.as_bytes()],
-    )
-    .unwrap();
-    sql.execute(
-        "INSERT INTO operation_journal_ordinary_claim VALUES (?1,?2,'1','DestinationStaging',1)",
-        rusqlite::params![Uuid::new_v4().to_string(), old_id.to_string()],
-    )
-    .unwrap();
-    let second_id = OperationId::new();
-    sql.execute(
-        "INSERT INTO operation_journal VALUES (?1,2,?2)",
-        rusqlite::params![second_id.to_string(), wire.as_bytes()],
-    )
-    .unwrap();
-    sql.execute(
-        "INSERT INTO operation_journal_ordinary_claim VALUES (?1,?2,'1','DestinationStaging',1)",
-        rusqlite::params![Uuid::new_v4().to_string(), second_id.to_string()],
-    )
-    .unwrap();
-    drop(sql);
+    for (sequence, operation) in [(1, old_id), (2, OperationId::new())] {
+        let copied = wire.as_bytes().to_vec();
+        let mut fixture_request = owner
+            .client()
+            .submit(
+                copied.len() + std::mem::size_of::<JournalCommand>(),
+                move |input, result| JournalCommand::InstallHistoricalClaimFixture {
+                    operation,
+                    sequence,
+                    wire: copied,
+                    claim: Uuid::new_v4(),
+                    input,
+                    result,
+                },
+            )
+            .unwrap();
+        fixture_request
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+    }
     let request = owner
         .client()
         .admit_prepared(prepared_copy_input(
