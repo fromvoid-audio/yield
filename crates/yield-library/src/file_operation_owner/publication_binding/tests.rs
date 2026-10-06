@@ -855,6 +855,15 @@ mod integration {
         // A duplicate keeps the same worker-owned binding; lost observation reply cannot
         // release sharing custody while the original delivered binding remains live.
         let duplicate = f.prepare(original.clone(), target.publication_effect(), "final.wav");
+        let end = Instant::now() + Duration::from_secs(3);
+        while Arc::strong_count(&target.data) == 1 {
+            assert!(
+                Instant::now() < end,
+                "original duplicate response was not retained"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        // Arc count proves the original worker prepared a reply before actual reply loss.
         drop(duplicate);
         assert!(
             std::fs::OpenOptions::new()
