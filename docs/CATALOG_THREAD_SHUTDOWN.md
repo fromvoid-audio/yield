@@ -38,3 +38,9 @@ or retirement settlement, failure capsule cleanup, reservation refund, retry or
 permit authority, clean physical volume handoff, or Native crash/power-loss
 qualification. Full OPT-1670/1665/1666/2197 and the Native qualification issues
 remain open. Windows GNU compilation is not Native execution evidence.
+
+The two existing positive Catalog reserve-bootstrap regressions require qualified
+macOS execution under OPT-2026; four existing Session maintenance/volume-handoff
+regressions require the same under OPT-2235. Their unchanged bodies and fail-closed
+production bootstrap remain required. Portable suite commands filter only those
+exact named cases, with full unfiltered results recorded separately.
