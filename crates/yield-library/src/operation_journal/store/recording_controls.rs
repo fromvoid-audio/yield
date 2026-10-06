@@ -99,8 +99,24 @@ impl OperationJournalStore {
                 super::recording_chunks::PayloadReader::Control,
                 &self.connection,
             );
-            let bytes: Vec<u8> = self.connection.query_row("SELECT record FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=?2",
-                params![proposal.operation_id().to_string(), role.slot()], |r|r.get(0))?;
+            // Guard the actual payload projection, even when it differs from the preceding
+            // scalar observation. Zero-length BLOBs retain the original decoder error.
+            let (bytes, payload_kind): (Option<Vec<u8>>, String) = self.connection.query_row(
+                "SELECT CASE WHEN typeof(record)='blob' AND length(record) BETWEEN 0 AND ?3 THEN record ELSE NULL END AS record, typeof(record) FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=?2",
+                params![proposal.operation_id().to_string(), role.slot(), CONTROL_BYTES as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)))?;
+            if payload_kind != "blob" {
+                return Err(super::recording_chunks::recording_payload_type_error(
+                    &payload_kind,
+                ));
+            }
+            let bytes = bytes.ok_or_else(|| {
+                if self.recording_prestart_scope.get() {
+                    OperationJournalStoreError::RecordingPrestartResourceBound
+                } else {
+                    error("invalid recording observation: recording control exceeds reserved bound")
+                }
+            })?;
             #[cfg(test)]
             super::recording_chunks::PAYLOAD_COPIED_BYTES.with(|n| n.set(n.get() + bytes.len()));
             if self.recording_prestart_scope.get() {

@@ -69,6 +69,18 @@ fn error(detail: impl ToString) -> OperationJournalStoreError {
         reason: detail.to_string(),
     }
 }
+// Match the previous Vec<u8> conversion error without projecting/copying a wrong-type value.
+pub(super) fn recording_payload_type_error(kind: &str) -> OperationJournalStoreError {
+    use rusqlite::types::Type;
+    let value_type = match kind {
+        "integer" => Type::Integer,
+        "real" => Type::Real,
+        "text" => Type::Text,
+        _ => Type::Null,
+    };
+    rusqlite::Error::InvalidColumnType(0, "record".into(), value_type).into()
+}
+
 fn slot(role: RecordingChunkRole) -> i64 {
     match role {
         RecordingChunkRole::Pcm { ordinal } => i64::from(ordinal),
@@ -210,11 +222,18 @@ impl OperationJournalStore {
         }
         #[cfg(test)]
         payload_read_boundary(PayloadReader::Chunk, &self.connection);
-        let bytes: Vec<u8> = self.connection.query_row(
-            "SELECT record FROM operation_journal_recording_chunks WHERE chunk_id=?1",
+        // The payload projection carries its own bound: the earlier scalar observation is
+        // not relied on to bound this copy. Empty BLOBs still reach the original decoder.
+        let (bytes, payload_kind): (Option<Vec<u8>>, String) = self.connection.query_row(
+            "SELECT CASE WHEN typeof(record)='blob' AND length(record) BETWEEN 0 AND 131072 THEN record ELSE NULL END AS record, typeof(record) FROM operation_journal_recording_chunks WHERE chunk_id=?1",
             params![chunk_id.to_string()],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
+        if payload_kind != "blob" {
+            return Err(recording_payload_type_error(&payload_kind));
+        }
+        let bytes = bytes
+            .ok_or_else(|| error("invalid recording observation: encoded value exceeds bound"))?;
         #[cfg(test)]
         PAYLOAD_COPIED_BYTES.with(|n| n.set(n.get() + bytes.len()));
         let chunk = RecordingCapturedChunk::decode(&bytes, proposal).map_err(error)?;
