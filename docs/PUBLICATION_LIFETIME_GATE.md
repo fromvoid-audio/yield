@@ -807,3 +807,13 @@ The existing genuine macOS issuer/handoff harness now checks original actor
 observation after its actual queued read barrier. Supported SDK/runtime execution
 remains OPT-2325; Linux scalar fences, actual SQLite queue refusals and readonly
 file-owner observations do not construct a publication grant or qualify an effect.
+
+
+## Durable original issuance association (OPT-2394)
+
+Schema 13 stores the exact original authority-free publication command and selected
+charge with its fresh single-use staging reservation in one transaction. Strict
+bounded readback precedes return of the private grant. Existing reserved schema-12
+history remains reserved without fabricated association. This provides durable
+issuance evidence, not completion settlement or namespace effect authority. See
+[durable issuance limits and recovery behavior](PUBLICATION_ISSUANCE_BINDING.md).
