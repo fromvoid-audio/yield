@@ -258,15 +258,19 @@ impl DatabaseAttemptStart {
         inventory: &DatabaseClaimInventory,
         new_start: bool,
     ) -> Result<()> {
-        let mut historical = record.clone();
-        #[cfg(test)]
-        record_backing::observe(record, &historical, new_start);
-        if !new_start {
+        let mut historical;
+        let context = if new_start {
+            record
+        } else {
+            historical = record.clone();
+            #[cfg(test)]
+            record_backing::observe(record, &historical, false);
             historical.phase = self.phase;
             historical.disposition = self.disposition;
-        }
+            &historical
+        };
         let expected = Self::from_context(
-            &historical,
+            context,
             inventory,
             self.attempt,
             self.nonce,
