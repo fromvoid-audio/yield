@@ -2,6 +2,15 @@ use super::*;
 
 #[test]
 fn session_reports_original_journal_failure_during_final_join() {
+    original_failure(false);
+}
+
+#[test]
+fn session_global_failure_still_joins_original_failed_journal() {
+    original_failure(true);
+}
+
+fn original_failure(global_panic: bool) {
     let temp = TempDir::new().expect("config base");
     let _base = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
     let root = profile_root(&temp);
@@ -38,6 +47,21 @@ fn session_reports_original_journal_failure_during_final_join() {
         .expect("accepted original command");
     ready.wait();
     assert!(persistence.status_error().is_none());
+    let global_failure = if global_panic {
+        let writer = persistence.writer.as_ref().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(writer.status(), GlobalLibraryWriterStatus::Available) {
+            assert!(Instant::now() < deadline, "global startup");
+            thread::yield_now();
+        }
+        Some(
+            writer
+                .panic_owner_for_test()
+                .expect("original global panic command"),
+        )
+    } else {
+        None
+    };
     let observed = client.clone();
     let release_thread = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -55,11 +79,26 @@ fn session_reports_original_journal_failure_during_final_join() {
     });
     let result = persistence.shutdown();
     assert!(release_thread.join().expect("release thread"));
-    assert!(
-        matches!(result, Err(SessionError::Persistence(ref reason))
-        if reason.contains("journal shutdown") && reason.contains("panicked")),
-        "{result:?}"
-    );
+    if global_panic {
+        assert_eq!(
+            result,
+            Err(SessionError::GlobalWriterDrain(
+                GlobalLibraryWriterDrainOutcome::WorkerPanicked
+            ))
+        );
+        assert!(
+            global_failure
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .is_err()
+        );
+    } else {
+        assert!(
+            matches!(result, Err(SessionError::Persistence(ref reason))
+            if reason.contains("journal shutdown") && reason.contains("panicked")),
+            "{result:?}"
+        );
+    }
     assert!(matches!(
         client.status(),
         OperationJournalOwnerStatus::Unavailable { .. }
@@ -84,4 +123,24 @@ fn session_reports_original_journal_failure_during_final_join() {
     let reopened = OperationJournalStore::open(&owner).expect("journal child lease released");
     drop(reopened);
     drop(owner);
+}
+
+#[test]
+fn session_healthy_journal_shutdown_retains_repeat_success() {
+    let temp = TempDir::new().expect("config base");
+    let _base = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+    let mut session = SourceRegistryService::start_portable_registry_for_test(profile_root(&temp))
+        .expect("session startup");
+    wait_for_snapshot(&session, |snapshot| snapshot.as_slice().is_empty());
+    wait_for_preference_snapshot(&session, |_| true);
+    assert_eq!(session.shutdown(), Ok(()));
+    assert_eq!(session.shutdown(), Ok(()));
+    assert!(matches!(
+        session.add_root(root(&temp, "closed")),
+        Err(SubmitError::Closed)
+    ));
+    let profile = WritableProfileGuard::acquire_current().expect("original profile released");
+    let journal = OperationJournalStore::open(&profile).expect("original child lease released");
+    drop(journal);
+    drop(profile);
 }
