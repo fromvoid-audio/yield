@@ -97,13 +97,8 @@ impl SourceRegistryRetirementIntentArgs {
         {
             return Err(SourceLeaseBindingError);
         }
-        if serde_json::to_vec(self)
-            .map_err(|_| SourceLeaseBindingError)?
-            .len()
-            > MAX_SOURCE_REGISTRY_RETIREMENT_BYTES
-        {
-            return Err(SourceLeaseBindingError);
-        }
+        // Check the same complete family limit without a second owned encoding.
+        self.initial_forward_policy_digest()?;
         Ok(())
     }
     fn proposals(

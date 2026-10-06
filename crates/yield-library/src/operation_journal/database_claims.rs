@@ -266,9 +266,12 @@ impl DatabaseClaimInventory {
                                 .and_then(|s| s.lease_fence.as_ref())
                                 .ok_or(DatabaseClaimError("missing lease scope"))?;
                             require(
-                                d.lease_fence() == Some(fence)
-                                    && args.lease_fence() == fence
-                                    && args.source_participant().as_uuid() == p.id,
+                                (if self.source_registration_generation().is_some() {
+                                    d.lease_fence() == Some(args.lease_fence())
+                                        && fence.matches_initial_policy(args.lease_fence())
+                                } else {
+                                    d.lease_fence() == Some(fence) && args.lease_fence() == fence
+                                }) && args.source_participant().as_uuid() == p.id,
                                 "immutable lease fence mismatch",
                             )?;
                             continue;

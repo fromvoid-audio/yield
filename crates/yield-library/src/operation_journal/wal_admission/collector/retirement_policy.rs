@@ -338,6 +338,18 @@ impl Collector {
         digest: [u8; 32],
         ready: &super::super::OriginalReadyRound,
     ) -> Result<(), WalPreparationError> {
+        self.compare_retirement_scope(args, participants, plan, claims, digest, Some(ready))
+    }
+
+    pub(super) fn compare_retirement_scope(
+        &self,
+        args: &SourceRegistryRetirementIntentArgs,
+        participants: &ParticipantSet,
+        plan: &FullCapacityPlan,
+        claims: &AdmissionClaimInventory,
+        digest: [u8; 32],
+        ready: Option<&super::super::OriginalReadyRound>,
+    ) -> Result<(), WalPreparationError> {
         let bad = || WalPreparationError::InvalidInput;
         args.validate_against_participants(participants)
             .map_err(|_| bad())?;
@@ -349,7 +361,9 @@ impl Collector {
         {
             return Err(bad());
         }
-        ready.require_provenance(self.current.as_ref().ok_or_else(bad)?)?;
+        if let Some(ready) = ready {
+            ready.require_provenance(self.current.as_ref().ok_or_else(bad)?)?;
+        }
         let snapshot = self.snapshot.as_ref().ok_or_else(bad)?;
         if snapshot.databases().len() != 2 || self.held.len() != 2 {
             return Err(bad());
