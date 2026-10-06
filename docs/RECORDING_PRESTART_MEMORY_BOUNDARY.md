@@ -117,12 +117,19 @@ journal admission or native physical qualification.
 | Two initial/validation-clone JSON trees | 1,441,792 |
 | Two typed record/validation representations | 1,114,112 |
 | Independent validated current proposal | 196,608 |
-| Raw record plus parser scratch | 196,608 |
+| Raw record plus parser scratch/reallocation peak | 262,144 |
 | Three capped canonical proposal encodings | 393,216 |
 | Complete small claim/release maps, sets, pages and diagnostics | 131,072 |
 | Auxiliary bounded keys, errors and original context | 65,536 |
-| Conservative total | 3,538,944 |
+| Conservative total | 3,604,480 |
 | Original command debit | 3,604,480 |
+
+The OPT-2361 borrowed participant preflight consumes the prior 64 KiB category
+headroom without changing the original command debit or any input-pool ceiling.
+Its scanner is explicitly capped to the same 64 KiB Store row envelope; raw input
+plus old/new scratch backing can overlap at 256 KiB. Scanner backing drops before
+owned JSON construction. See [the participant preflight boundary](RECORDING_PARTICIPANT_PREFLIGHT.md)
+for separate public-proposal limits and unchanged downstream acceptance.
 
 These categories overlap conservatively, including JSON-to-typed conversion and
 Recording validation clones. A current validated proposal has at most 64

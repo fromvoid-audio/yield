@@ -376,3 +376,123 @@ fn strict_chunk_codec_rejects_duplicate_unknown_and_oversized_input() {
             .is_err()
     );
 }
+
+#[test]
+fn recording_proposal_participant_excess_precedes_owned_graph() {
+    for field in ["descriptors", "checkpoints"] {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&proposal(2, 100).encode().unwrap()).unwrap();
+        value["participants"][field] = serde_json::Value::Array(vec![serde_json::json!({}); 65]);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        RECORDING_VALUE_PARSE_ENTRIES.with(|entries| entries.set(0));
+        assert!(RecordingProposal::decode(&bytes).is_err());
+        RECORDING_VALUE_PARSE_ENTRIES
+            .with(|entries| assert_eq!(entries.get(), 0, "entry65 {field}"));
+    }
+}
+
+#[test]
+fn recording_proposal_participant_preflight_keeps_boundary_and_historical_forms() {
+    let mut p = proposal(2, 100);
+    let mut descriptors = p.participants.descriptors().to_vec();
+    let mut checkpoints = p.participants.checkpoints().to_vec();
+    let fence = descriptors[0].source_fence().unwrap().clone();
+    while descriptors.len() < crate::operation_journal::participants::MAX_PARTICIPANTS {
+        let id = ParticipantId::new();
+        descriptors.push(
+            ParticipantDescriptor::new(
+                id,
+                ParticipantKind::Artifact,
+                ParticipantRequirement::OptionalRebuildable,
+                Some(fence.clone()),
+                Some(format!("artifact-{}", descriptors.len())),
+            )
+            .unwrap(),
+        );
+        checkpoints.push(
+            ParticipantCheckpoint::new(id, ParticipantCheckpointState::Pending, None, None)
+                .unwrap(),
+        );
+    }
+    p.participants = ParticipantSet::new(descriptors, checkpoints).unwrap();
+    let canonical = String::from_utf8(p.encode().unwrap()).unwrap();
+    let mut array: Value = serde_json::from_str(&canonical).unwrap();
+    let set = &array["participants"];
+    array["participants"] = serde_json::json!([set["descriptors"], set["checkpoints"]]);
+    let fields = [
+        "version",
+        "operation_id",
+        "output_id",
+        "work_key",
+        "participants",
+        "destination_root",
+        "staging_root",
+        "destination",
+        "staging_path",
+        "format",
+        "collision",
+    ];
+    let array: Vec<_> = fields.iter().map(|key| array[*key].clone()).collect();
+    for bytes in [
+        canonical.clone().into_bytes(),
+        format!(
+            " \n{}\t",
+            canonical.replace("\"participants\"", "\"\\u0070articipants\"")
+        )
+        .into_bytes(),
+        serde_json::to_vec(&array).unwrap(),
+    ] {
+        let old: RecordingProposal = decode_tree_value(&bytes).unwrap();
+        old.validate().unwrap();
+        RECORDING_VALUE_PARSE_ENTRIES.with(|n| n.set(0));
+        assert_eq!(RecordingProposal::decode(&bytes).unwrap(), old);
+        assert_eq!(old, p);
+        RECORDING_VALUE_PARSE_ENTRIES
+            .with(|n| assert_eq!(n.get(), 1, "accepted64 must retain original decoder"));
+    }
+    for bytes in [
+        canonical.replacen("{", "{\"version\":1,", 1),
+        canonical.replacen("{", "{\"unknown\":null,", 1),
+        format!("{canonical} null"),
+        canonical.replace(
+            "\"participants\":",
+            "\"participants\":null,\"participants\":",
+        ),
+        canonical.replace("\"format\":{", "\"format\":{\"unknown\":null,"),
+    ] {
+        assert!(decode_tree_value::<RecordingProposal>(bytes.as_bytes()).is_err());
+        assert!(RecordingProposal::decode(bytes.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn recording_proposal_participant_preflight_counts_array_form_and_escaped_keys() {
+    let p = proposal(2, 100);
+    let mut value: Value = serde_json::from_slice(&p.encode().unwrap()).unwrap();
+    value["participants"]["checkpoints"] = serde_json::json!(vec![Value::Null; 65]);
+    let bytes = serde_json::to_string(&value)
+        .unwrap()
+        .replace("\"checkpoints\"", "\"\\u0063heckpoints\"");
+    RECORDING_VALUE_PARSE_ENTRIES.with(|n| n.set(0));
+    assert!(RecordingProposal::decode(bytes.as_bytes()).is_err());
+    RECORDING_VALUE_PARSE_ENTRIES.with(|n| assert_eq!(n.get(), 0));
+    let set = &value["participants"];
+    value["participants"] = serde_json::json!([set["descriptors"], set["checkpoints"]]);
+    let fields = [
+        "version",
+        "operation_id",
+        "output_id",
+        "work_key",
+        "participants",
+        "destination_root",
+        "staging_root",
+        "destination",
+        "staging_path",
+        "format",
+        "collision",
+    ];
+    let array: Vec<_> = fields.iter().map(|key| value[*key].clone()).collect();
+    RECORDING_VALUE_PARSE_ENTRIES.with(|n| n.set(0));
+    assert!(RecordingProposal::decode(&serde_json::to_vec(&array).unwrap()).is_err());
+    RECORDING_VALUE_PARSE_ENTRIES.with(|n| assert_eq!(n.get(), 0));
+}

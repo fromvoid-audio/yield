@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub(crate) mod controls;
+pub(crate) mod participant_preflight;
 /// Bounded reconstruction and seal observations; no live closure or filesystem authority.
 pub mod prefix;
 
@@ -293,6 +294,11 @@ impl RecordingProposal {
     }
     /// Strict recovered proposal decoding, never positive admission.
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordingValueError> {
+        if bytes.len() <= MAX_RECORDING_VALUE_BYTES
+            && participant_preflight::proposal_exceeds(bytes)
+        {
+            return Err(invalid("participant collection exceeds existing bound"));
+        }
         let value: Self = decode_tree_value(bytes)?;
         value.validate()?;
         Ok(value)
