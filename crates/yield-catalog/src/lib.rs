@@ -233,6 +233,7 @@ impl CatalogTestGate {
         }
         state.at_boundary = false;
     }
+    #[cfg(target_os = "linux")]
     fn arm_feature_terminal(&self) -> CatalogTestFeatureTerminalPause<'_> {
         self.feature_terminal_state
             .lock()
@@ -404,11 +405,11 @@ impl CatalogTestGate {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 struct CatalogTestFeatureTerminalPause<'a> {
     gate: &'a CatalogTestGate,
 }
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl CatalogTestFeatureTerminalPause<'_> {
     fn wait_until_entered(&self) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -432,7 +433,7 @@ impl CatalogTestFeatureTerminalPause<'_> {
         }
     }
 }
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for CatalogTestFeatureTerminalPause<'_> {
     fn drop(&mut self) {
         self.gate
@@ -8398,6 +8399,7 @@ mod tests {
     }
 
     include!("index_pages_tests.rs");
+    #[cfg(target_os = "linux")]
     include!("index_reveal_tests.rs");
 
     #[test]
