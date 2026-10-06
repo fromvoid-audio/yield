@@ -5408,6 +5408,8 @@ struct OwnerShared {
     lifecycle: AtomicU8,
     unavailable: Mutex<Option<String>>,
     input_bytes: Mutex<InputBudget>,
+    #[cfg(test)]
+    historical_scratch_maximum: AtomicUsize,
     results: Mutex<ResultBudget>,
     #[cfg(test)]
     shutdown_cas_gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
@@ -5423,6 +5425,8 @@ impl OwnerShared {
             lifecycle: AtomicU8::new(OwnerLifecycle::Initializing as u8),
             unavailable: Mutex::new(None),
             input_bytes: Mutex::new(InputBudget::new()),
+            #[cfg(test)]
+            historical_scratch_maximum: AtomicUsize::new(0),
             results: Mutex::new(ResultBudget::new()),
             #[cfg(test)]
             shutdown_cas_gate: Mutex::new(None),
@@ -5648,12 +5652,17 @@ pub(super) struct InputPermit {
 }
 
 impl InputPermit {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn historical_test_input(bytes: usize) -> Self {
         let (senders, _receivers) = OwnerCommandReceivers::channel();
         Arc::new(OwnerShared::new(senders))
             .reserve_input(InputClass::Ordinary, bytes)
             .expect("test original input pool")
+    }
+
+    #[cfg(test)]
+    pub(super) fn historical_test_remaining(&self) -> usize {
+        self.shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()]
     }
 
     /// Private scratch debit from this exact queued command's original pool.
@@ -5664,9 +5673,15 @@ impl InputPermit {
         if self.class != InputClass::Ordinary {
             return Err(OperationJournalStoreError::HistoricalClaimResourceBound);
         }
-        self.shared
+        let permit = self
+            .shared
             .reserve_input(InputClass::Ordinary, bytes)
-            .map_err(|_| OperationJournalStoreError::HistoricalClaimResourceBound)
+            .map_err(|_| OperationJournalStoreError::HistoricalClaimResourceBound)?;
+        #[cfg(test)]
+        self.shared
+            .historical_scratch_maximum
+            .fetch_max(bytes, Ordering::Relaxed);
+        Ok(permit)
     }
 }
 
@@ -6810,6 +6825,7 @@ mod tests {
     mod queue_metrics_integration {
         include!("owner/tests/queue_metrics_integration.rs");
     }
+    mod historical_claim_admission_tests;
     mod resource_custody_tests;
     mod source_registry_handoff_tests;
     #[test]

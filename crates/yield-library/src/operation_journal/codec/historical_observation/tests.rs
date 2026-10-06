@@ -1,4 +1,5 @@
 use super::super::super::validation::{RecordConsistency, classify_record};
+use super::super::decode;
 use super::*;
 
 fn wire(payload: &str, version: u32) -> Vec<u8> {
@@ -105,4 +106,22 @@ fn historical_claim_projection_refuses_original_pool_pressure_without_fallback()
         Scratch::new(&input, super::super::super::model::MAX_RECORD_BYTES),
         Err(OperationJournalStoreError::HistoricalClaimResourceBound)
     ));
+}
+
+#[test]
+fn historical_claim_projection_preserves_original_depth_boundary_and_object_identity() {
+    for levels in [1, 64, 124, 125, 126, 127, 128, 129] {
+        let payload = format!("{}0{}", "[".repeat(levels), "]".repeat(levels));
+        let bytes = wire(&payload, 1);
+        assert_eq!(
+            decode(&bytes).is_ok(),
+            projected(&bytes).is_ok(),
+            "depth={levels}"
+        );
+    }
+    let bytes = wire(r#"[{"a":1},{"\u0061":2}]"#, 1);
+    assert!(
+        projected(&bytes).is_ok(),
+        "separate objects may reuse decoded keys"
+    );
 }

@@ -2,7 +2,7 @@
 //! The remaining bounded envelope uses the unchanged strict decoder and classifier.
 use super::super::owner::InputPermit;
 use super::super::store::OperationJournalStoreError;
-use super::{DecodeError, StoredOperationRecord, decode};
+use super::{DecodeError, StoredOperationRecord, decode_value, parse_unique_value};
 use serde_json::Value;
 use std::mem::size_of;
 
@@ -53,6 +53,7 @@ impl<'a> Scratch<'a> {
     fn ensure(&mut self, bytes: usize) -> Result<(), OperationJournalStoreError> {
         if bytes > self.funded {
             drop(self.extra.take());
+            self.funded = self.parser_bytes;
             self.extra = Some(
                 self.input
                     .reserve_historical_scratch(bytes - self.parser_bytes)?,
@@ -93,7 +94,8 @@ pub(super) fn observe(
         return Err(malformed());
     }
     drop(keys);
-    if !matches!(inventory.version, Some(1 | 2)) {
+    let version = inventory.version.ok_or_else(malformed)?;
+    if !matches!(version, 1 | 2) {
         return Ok(None);
     }
     let payload = inventory.payload.ok_or_else(malformed)?;
@@ -114,12 +116,20 @@ pub(super) fn observe(
             + 4 * size_of::<crate::durable_capacity::DurableVolumeCapacity>()
             + 2 * inventory.string_bytes;
     let envelope_bytes = FIXED_BYTES + 3 * projected_len + graph_bytes + typed_bytes;
-    scratch.ensure(envelope_bytes)?;
+    let identity_node = 12 * size_of::<crate::durable_capacity::VolumeIdentity>()
+        + 12 * size_of::<usize>()
+        + 4 * size_of::<usize>();
+    let classification_bytes = FIXED_BYTES + typed_bytes + inventory.array_entries * identity_node;
+    scratch.ensure(envelope_bytes.max(classification_bytes))?;
     let mut projected = Vec::with_capacity(projected_len);
     projected.extend_from_slice(&bytes[..payload.start]);
     projected.extend_from_slice(b"null");
     projected.extend_from_slice(&bytes[payload.end..]);
-    let record = decode(&projected).map_err(|error| match error {
+    // The original wire was bounded before projection. Replacing a one-byte scalar
+    // with null may add three bytes at the wire boundary; synthetic size is not a
+    // new historical compatibility gate. Reuse the unchanged parser and dispatch.
+    let value = parse_unique_value(&projected).map_err(|_| malformed())?;
+    let record = decode_value(value).map_err(|error| match error {
         DecodeError::Oversize { .. } => OperationJournalStoreError::HistoricalClaimResourceBound,
         _ => malformed(),
     })?;

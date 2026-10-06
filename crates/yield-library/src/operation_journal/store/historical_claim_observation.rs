@@ -4,6 +4,21 @@ use super::super::owner::InputPermit;
 use super::*;
 
 impl OperationJournalStore {
+    #[cfg(any(test, feature = "test-support"))]
+    /// Observe the real SQLite lookup with an isolated instance of the original heap pool.
+    /// This component fixture installs no worker, physical capacity, or effect authority.
+    /// Production admission uses the actual queued command's pool, never this fixture.
+    pub fn observe_historical_claim_for_test(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<bool, OperationJournalStoreError> {
+        let input = InputPermit::historical_test_input(1);
+        self.connection.execute_batch("BEGIN")?;
+        let result = self.observe_claim_operation(operation_id, &input);
+        self.connection.execute_batch("ROLLBACK")?;
+        result
+    }
+
     pub(super) fn observe_claim_operation(
         &self,
         operation_id: OperationId,
@@ -22,6 +37,9 @@ impl OperationJournalStore {
         if !legacy {
             return Ok(false);
         }
+        // Declaration order also covers panic/early-return: rows, statement, then
+        // the original scratch debit. No borrowed Native row outlives its credit.
+        let mut scratch = None;
         let mut statement = self.connection.prepare(
             "SELECT typeof(operation_id), typeof(sequence), sequence, typeof(record), length(record),
              CASE WHEN typeof(record) = 'blob' AND length(record) BETWEEN 0 AND ?2
@@ -73,8 +91,9 @@ impl OperationJournalStore {
                 "stored record length changed or exceeds its bound".into(),
             ));
         }
-        let mut scratch = historical_observation::Scratch::new(input, bytes.len())?;
-        let observed = historical_observation::observe(bytes, &mut scratch);
+        scratch = Some(historical_observation::Scratch::new(input, bytes.len())?);
+        let observed =
+            historical_observation::observe(bytes, scratch.as_mut().expect("installed scratch"));
         // End the SQLite borrow before releasing its per-row scratch or falling through
         // to the unchanged other-family reader. No historical payload is copied here.
         drop(rows);
