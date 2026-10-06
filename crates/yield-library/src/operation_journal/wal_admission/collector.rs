@@ -20,6 +20,7 @@ use std::{
     time::Instant,
 };
 mod journal_input;
+mod retirement_inventory;
 mod retirement_policy;
 use journal_input::JournalInput;
 
@@ -108,6 +109,10 @@ pub enum WalPreparationStatus {
 struct Shared {
     canceled: AtomicBool,
     status: Mutex<WalPreparationStatus>,
+    #[cfg(all(test, target_os = "linux"))]
+    retirement_for_tests: Mutex<Option<retirement_inventory::Observation>>,
+    #[cfg(all(test, target_os = "linux"))]
+    retirement_hook_for_tests: Mutex<Option<Box<dyn FnOnce(uuid::Uuid) + Send>>>,
 }
 /// Sole non-Clone cancellation handle. Only the original journal actor can publish outcomes.
 /// A copied observation cannot preserve current custody or acknowledge settlement.
@@ -127,6 +132,20 @@ struct Shared {
 /// ```
 pub struct WalPreparationHandle(Arc<Shared>);
 impl WalPreparationHandle {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::operation_journal) fn retirement_inventory_for_tests(
+        &self,
+    ) -> Option<retirement_inventory::Observation> {
+        self.0.retirement_for_tests.lock().unwrap().clone()
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::operation_journal) fn retirement_hook_for_tests(
+        &self,
+        hook: impl FnOnce(uuid::Uuid) + Send + 'static,
+    ) {
+        *self.0.retirement_hook_for_tests.lock().unwrap() = Some(Box::new(hook));
+    }
+
     /// Observe bounded collection/cleanup without waiting for SQLite or another owner.
     pub fn status(&self) -> WalPreparationStatus {
         self.0
@@ -193,6 +212,10 @@ impl Collector {
         let shared = Arc::new(Shared {
             canceled: AtomicBool::new(false),
             status: Mutex::new(WalPreparationStatus::Preparing),
+            #[cfg(all(test, target_os = "linux"))]
+            retirement_for_tests: Mutex::new(None),
+            #[cfg(all(test, target_os = "linux"))]
+            retirement_hook_for_tests: Mutex::new(None),
         });
         let capacity = input.sources.len() + usize::from(input.global.is_some());
         let held = Vec::with_capacity(capacity);
@@ -331,6 +354,12 @@ impl Collector {
         self.current = Some(round);
         self.decision = Some(decision);
         Ok(())
+    }
+    fn checked_decision_acknowledged(&self) -> Result<bool, WalPreparationError> {
+        self.decision
+            .as_ref()
+            .ok_or(WalPreparationError::InvalidInput)?
+            .checked_acknowledged()
     }
     pub(in crate::operation_journal) fn decision_acknowledged(&self) -> bool {
         self.decision

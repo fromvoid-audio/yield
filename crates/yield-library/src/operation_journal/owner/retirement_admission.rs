@@ -137,6 +137,61 @@ impl OwnerRuntime {
             self.retirement_admission = Some(pending);
             return;
         }
+        if ready {
+            let projection = (|| {
+                let collector = self
+                    .wal_preparation
+                    .as_ref()
+                    .ok_or(WalPreparationError::InvalidInput)?;
+                let profile = self
+                    .final_profile_guard
+                    .as_ref()
+                    .ok_or(WalPreparationError::InvalidInput)?;
+                let UniversalCommandArgs::SourceRegistryRetirement(args) = &pending.prepared.args
+                else {
+                    return Err(WalPreparationError::InvalidInput);
+                };
+                collector.original_retirement_inventory(
+                    profile,
+                    nonce,
+                    args,
+                    &pending.prepared.participants,
+                    &pending.prepared.plan,
+                    &pending.prepared.claims,
+                )
+            })();
+            match projection {
+                Ok(observation) => {
+                    if observation.inventory().header().decision_nonce != nonce
+                        || observation
+                            .inventory()
+                            .source_registration_generation()
+                            .is_none()
+                        || observation.encoded().is_empty()
+                        || observation.encoded().len() > 64 * 1024
+                    {
+                        if let Some(collector) = self.wal_preparation.as_mut() {
+                            collector.refuse_decision(WalPreparationError::InvalidInput);
+                        }
+                        let _ = pending
+                            .result
+                            .send(Err(WalPreparationError::InvalidInput.into()));
+                        return;
+                    }
+                }
+                Err(WalPreparationError::Busy) => {
+                    self.retirement_admission = Some(pending);
+                    return;
+                }
+                Err(error) => {
+                    if let Some(collector) = self.wal_preparation.as_mut() {
+                        collector.refuse_decision(error.clone());
+                    }
+                    let _ = pending.result.send(Err(error.into()));
+                    return;
+                }
+            }
+        }
         // ACK is owner cleanup custody, never a qualified physical-family policy. In
         // particular, the generic journal LiveWitness cannot qualify these transitions.
         // No ID, capacity lease or journal SQL is created on this boundary.
