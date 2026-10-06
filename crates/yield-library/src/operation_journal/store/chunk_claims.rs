@@ -981,5 +981,5 @@ mod scalar_tests;
 mod original_scalar_probe;
 
 #[cfg(any(test, feature = "test-support"))]
-#[path = "chunk_claims/scalar_probe.rs"]
+#[path = "chunk_claims/scalar_probe_test.rs"]
 mod scalar_probe;
