@@ -89,6 +89,34 @@ mod integration {
                 .unwrap()
         }
     }
+    #[test]
+    fn original_root_backing_survives_retirement_through_actual_publication_alias() {
+        let f = Fixture::new();
+        let (mut validation, result) = f.validation();
+        let mut pending = f.prepare(result, EffectId::new(), "retained-final.wav");
+        let target = wait(&mut pending).unwrap();
+        let life = target.data.lives[1].clone();
+        assert!(life.load(Ordering::Acquire));
+        f.owner.retire_root(f.target).unwrap();
+        assert!(!target.is_current());
+        assert!(!life.load(Ordering::Acquire));
+        validation.acknowledge().unwrap();
+        drop((target, pending, validation));
+        f.owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            f.owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
+        assert_eq!(
+            f.owner.input_bytes_remaining_for_test(),
+            FILE_OPERATION_OWNER_MAX_INPUT_BYTES - RootLiveness::BACKING_BYTES
+        );
+        drop(life);
+        assert_eq!(
+            f.owner.input_bytes_remaining_for_test(),
+            FILE_OPERATION_OWNER_MAX_INPUT_BYTES
+        );
+    }
     fn wait(
         pending: &mut PublicationTargetPending,
     ) -> Result<PreparedPublicationTarget, BindingError> {
@@ -722,10 +750,16 @@ mod integration {
             u64::try_from(original.lease_identity().epoch()).unwrap(),
         )
         .unwrap();
+        let source_graph = original.retained_graph_metadata_bytes().unwrap();
+        let source_baseline = f.owner.input_bytes_remaining_for_test();
         let source = f
             .owner
             .register_source_root(original.clone(), &f.guard, fence.clone())
             .unwrap();
+        assert!(
+            source_baseline - f.owner.input_bytes_remaining_for_test() >= source_graph,
+            "the FileOwner original request graph has independent retained backing"
+        );
         let bytes = b"actual original retained bytes";
         let command = FileOperationCommand::for_staging_validation(
             OperationId::new(),
@@ -741,7 +775,7 @@ mod integration {
             BoundedRelativeLocator::new("stage.bin").unwrap(),
             OwnedObjectIdentity::new(),
             StagingValidation::new(bytes.len() as u64, *blake3::hash(bytes).as_bytes()),
-            vec![fence],
+            vec![fence.clone()],
             Some(source),
         )
         .unwrap();
@@ -759,6 +793,17 @@ mod integration {
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
+        let rejected_baseline = f.owner.input_bytes_remaining_for_test();
+        assert!(
+            f.owner
+                .register_source_root(original.clone(), &f.guard, fence)
+                .is_err()
+        );
+        assert_eq!(
+            f.owner.input_bytes_remaining_for_test(),
+            rejected_baseline,
+            "the real revoked Source construction destroys its original keeper before refund"
+        );
         let mut duplicate = f.prepare(result.clone(), effect, "final.wav");
         assert!(matches!(wait(&mut duplicate), Err(BindingError::Closed)));
         f.owner.retire_root(source).unwrap();

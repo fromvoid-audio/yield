@@ -39,10 +39,12 @@ use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use publication_handoff::QueuedGrant;
 pub(crate) use publication_handoff::completion_observation;
 mod publication_binding;
+mod root_registration;
 use crate::sample_sources::SourceId;
 use crate::sample_sources::db::{BoundDatabaseRoot, SourceAuthorityRequest};
 pub(crate) use publication_binding::PreparedPublicationTarget;
 use publication_binding::{BindingData, BindingError, BindingRequest};
+use root_registration::{RegistrationReply, RootLiveness, RootRegistry};
 
 /// Maximum number of effect commands waiting for the file owner.
 pub const FILE_OPERATION_OWNER_COMMAND_CAPACITY: usize = 32;
@@ -2245,6 +2247,21 @@ impl FileOperationOwner {
         &self,
         profile_guard: &WritableProfileGuard,
     ) -> Result<RootRegistrationRef, String> {
+        self.shared
+            .ensure_accepting()
+            .map_err(|error| error.to_string())?;
+        let bytes = profile_guard
+            .participant_clone_bytes()
+            .and_then(|bytes| {
+                BoundDatabaseRoot::profile_participant_bytes(profile_guard)
+                    .and_then(|root| bytes.checked_add(root))
+            })
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ProductionRootCapability>()))
+            .ok_or_else(|| String::from("profile root backing overflow"))?;
+        let input = self
+            .shared
+            .reserve_input(bytes)
+            .map_err(|error| error.to_string())?;
         let retained_guard = profile_guard
             .try_clone()
             .map_err(|error| error.to_string())?;
@@ -2254,7 +2271,9 @@ impl FileOperationOwner {
             root,
             profile_guard: retained_guard,
             source: None,
-        };
+            _input: Some(input),
+        }
+        .bind_input()?;
         let registration = RootRegistrationRef {
             owner: self.shared.owner,
             registration_id: Uuid::new_v4(),
@@ -2290,21 +2309,67 @@ impl FileOperationOwner {
                 "source fence does not match retained source authority",
             ));
         }
-        let retained_guard = profile_guard
-            .try_clone()
+        self.shared
+            .ensure_accepting()
             .map_err(|error| error.to_string())?;
-        request
-            .validate_registered_boundary(&retained_guard)
+        let bytes = profile_guard
+            .participant_clone_bytes()
+            .and_then(|bytes| {
+                request
+                    .media_root()
+                    .participant_clone_bytes()
+                    .and_then(|root| bytes.checked_add(root))
+            })
+            .and_then(|bytes| bytes.checked_add(request.retained_graph_metadata_bytes()?))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ProductionRootCapability>()))
+            .ok_or_else(|| String::from("source root backing overflow"))?;
+        let input = self
+            .shared
+            .reserve_input(bytes)
             .map_err(|error| error.to_string())?;
-        let root = request
-            .media_root()
-            .try_clone_for_owned_capability()
-            .map_err(|error| error.to_string())?;
-        let capability = ProductionRootCapability {
-            root,
-            profile_guard: retained_guard,
-            source: Some(request),
+        // Move the original graph into credit-last custody before any fallible clone.
+        // A function argument otherwise outlives a later local debit on early return.
+        let mut construction = SourceRootConstruction {
+            root: None,
+            profile_guard: None,
+            request: Some(request),
+            input: Some(input),
         };
+        construction.profile_guard = Some(
+            profile_guard
+                .try_clone()
+                .map_err(|error| error.to_string())?,
+        );
+        construction
+            .request
+            .as_ref()
+            .expect("original Source request")
+            .validate_registered_boundary(
+                construction
+                    .profile_guard
+                    .as_ref()
+                    .expect("original profile clone"),
+            )
+            .map_err(|error| error.to_string())?;
+        construction.root = Some(
+            construction
+                .request
+                .as_ref()
+                .expect("original Source request")
+                .media_root()
+                .try_clone_for_owned_capability()
+                .map_err(|error| error.to_string())?,
+        );
+        let capability = ProductionRootCapability {
+            root: construction.root.take().expect("original root clone"),
+            profile_guard: construction
+                .profile_guard
+                .take()
+                .expect("original profile clone"),
+            source: construction.request.take(),
+            _input: construction.input.take(),
+        }
+        .bind_input()?;
         let registration = RootRegistrationRef {
             owner: self.shared.owner,
             registration_id: Uuid::new_v4(),
@@ -2326,20 +2391,42 @@ impl FileOperationOwner {
         label: &str,
         capability: Option<ProductionRootCapability>,
     ) -> Result<(), String> {
+        self.shared
+            .ensure_accepting()
+            .map_err(|error| error.to_string())?;
+        let mut end = label.len().min(FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES);
+        while !label.is_char_boundary(end) {
+            end -= 1;
+        }
+        let dynamic = match &authority {
+            AuthorityFence::Source(fence) => fence.dynamic_backing_bytes(),
+            AuthorityFence::Profile(_) => Some(0),
+        }
+        .ok_or_else(|| String::from("root registration backing overflow"))?;
+        let bytes = std::mem::size_of::<OwnerCommand>()
+            .checked_add(end)
+            .and_then(|bytes| bytes.checked_add(FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES))
+            .and_then(|bytes| bytes.checked_add(dynamic))
+            .ok_or_else(|| String::from("root registration backing overflow"))?;
+        let input = self
+            .shared
+            .reserve_input(bytes)
+            .map_err(|error| error.to_string())?;
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.shared
             .try_control(OwnerCommand::RegisterRoot {
                 registration,
                 authority,
-                label: bounded_diagnostic(label.to_owned()),
+                label: label[..end].to_owned(),
                 capability,
-                input: None,
+                input: Some(input),
                 result: result_tx,
             })
             .map_err(|error| error.to_string())?;
         result_rx
             .recv_timeout(Duration::from_secs(1))
             .map_err(|_| String::from("root registration timed out"))?
+            .receive()
     }
 
     #[cfg(test)]
@@ -2747,10 +2834,11 @@ struct AdmissionRecord {
 }
 
 struct RootRegistrationState {
-    alive: Arc<AtomicBool>,
+    alive: RootLiveness,
     authority: AuthorityFence,
     _label: String,
     capability: Option<ProductionRootCapability>,
+    _input: Option<InputPermit>,
 }
 
 impl Drop for RootRegistrationState {
@@ -2759,14 +2847,50 @@ impl Drop for RootRegistrationState {
     }
 }
 
+// Fields are destroyed in this order on every construction error.
+struct SourceRootConstruction {
+    root: Option<BoundDatabaseRoot>,
+    profile_guard: Option<WritableProfileGuard>,
+    request: Option<Arc<SourceAuthorityRequest>>,
+    input: Option<InputPermit>,
+}
+
 /// Descriptor-bound custody retained by the worker, never reconstructed from a root reference.
 struct ProductionRootCapability {
     root: BoundDatabaseRoot,
     profile_guard: WritableProfileGuard,
     source: Option<Arc<SourceAuthorityRequest>>,
+    // Drop original descriptors and metadata before refunding their backing.
+    _input: Option<InputPermit>,
 }
 
 impl ProductionRootCapability {
+    fn bind_input(mut self) -> Result<Self, String> {
+        let bytes = self
+            .profile_guard
+            .participant_clone_bytes()
+            .and_then(|bytes| {
+                self.root
+                    .participant_clone_bytes()
+                    .and_then(|root| bytes.checked_add(root))
+            })
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            .and_then(|bytes| {
+                bytes.checked_add(match self.source.as_ref() {
+                    None => BoundDatabaseRoot::LEGACY_ARC_FILE_BYTES,
+                    Some(source) => source.retained_graph_metadata_bytes()?,
+                })
+            })
+            .ok_or_else(|| String::from("original root backing overflow"))?;
+        let input = self._input.as_mut().expect("prepaid root construction");
+        if bytes > input.bytes {
+            return Err(String::from(
+                "original root exceeded prepaid construction backing",
+            ));
+        }
+        input.shrink(bytes);
+        Ok(self)
+    }
     fn validate(&self) -> Result<(), String> {
         if let Some(source) = self.source.as_ref() {
             source
@@ -2782,20 +2906,20 @@ impl ProductionRootCapability {
 struct WorkerState {
     publication_bindings: BTreeMap<EffectKey, Weak<BindingData>>,
     publication_binding_header: Option<InputPermit>,
-    registrations: BTreeMap<RootRegistrationRef, RootRegistrationState>,
+    registrations: RootRegistry,
     receipts: BTreeMap<EffectKey, ReceiptEntry>,
     tombstones: BTreeMap<EffectKey, ReceiptTombstone>,
 }
 
 impl WorkerState {
-    fn new() -> Self {
-        Self {
+    fn new(shared: &Arc<OwnerShared>) -> Result<Self, FileOperationOwnerQueueError> {
+        Ok(Self {
             publication_bindings: BTreeMap::new(),
             publication_binding_header: None,
-            registrations: BTreeMap::new(),
+            registrations: RootRegistry::new(shared)?,
             receipts: BTreeMap::new(),
             tombstones: BTreeMap::new(),
-        }
+        })
     }
 
     #[cfg(test)]
@@ -2866,48 +2990,59 @@ impl WorkerState {
                 input,
                 result,
             } => {
-                if registration.owner != shared.owner {
-                    let _ = result.send(Err(String::from("registration belongs to another owner")));
-                    drop(input);
+                macro_rules! refuse {
+                    ($error:expr) => {{
+                        let error = bounded_diagnostic($error);
+                        drop(capability);
+                        drop(label);
+                        drop(authority);
+                        let _ = result.send(RegistrationReply::refusal(error, input));
+                        return;
+                    }};
+                }
+                if input.is_none() {
+                    drop(capability);
+                    drop(label);
+                    drop(authority);
+                    let _ = result.send(RegistrationReply::unfunded());
                     return;
                 }
-                let response = match self.registrations.get(&registration) {
-                    Some(_) => Err(String::from(
-                        "root registration identity is already retained",
-                    )),
-                    None => {
-                        if self.registrations.len() >= FILE_OPERATION_OWNER_MAX_REGISTERED_ROOTS {
-                            let _ =
-                                result.send(Err(String::from("registered root capacity is full")));
-                            drop(input);
-                            return;
-                        }
-                        if let Some(capability) = capability.as_ref() {
-                            if let Err(error) = capability.validate() {
-                                let _ = result.send(Err(error));
-                                drop(input);
-                                return;
-                            }
-                        }
-                        self.registrations.insert(
-                            registration,
-                            RootRegistrationState {
-                                alive: Arc::new(AtomicBool::new(true)),
-                                authority,
-                                _label: label,
-                                capability,
-                            },
-                        );
-                        Ok(())
+                if registration.owner != shared.owner {
+                    refuse!(String::from("registration belongs to another owner"));
+                }
+                if self.registrations.get(&registration).is_some() {
+                    refuse!(String::from(
+                        "root registration identity is already retained"
+                    ));
+                }
+                if self.registrations.len() >= FILE_OPERATION_OWNER_MAX_REGISTERED_ROOTS {
+                    refuse!(String::from("registered root capacity is full"));
+                }
+                if let Some(retained) = capability.as_ref() {
+                    if let Err(error) = retained.validate() {
+                        refuse!(error);
+                    }
+                }
+                let alive = match RootLiveness::new(shared) {
+                    Ok(alive) => alive,
+                    Err(error) => {
+                        refuse!(error.to_string());
                     }
                 };
-                let accepted = response.is_ok();
-                if result.send(response).is_err() && accepted {
-                    // The caller lost the registration reference before it could observe
-                    // success. No effect can name this fresh UUID, so release its custody.
+                self.registrations.insert(
+                    registration,
+                    RootRegistrationState {
+                        alive,
+                        authority,
+                        _label: label,
+                        capability,
+                        _input: input,
+                    },
+                );
+                if result.send(RegistrationReply::success()).is_err() {
+                    // No caller observed the fresh UUID: drop its actual original custody.
                     self.registrations.remove(&registration);
                 }
-                drop(input);
             }
             OwnerCommand::RetireRoot {
                 registration,
@@ -3242,7 +3377,7 @@ enum OwnerCommand {
         label: String,
         capability: Option<ProductionRootCapability>,
         input: Option<InputPermit>,
-        result: SyncSender<Result<(), String>>,
+        result: SyncSender<RegistrationReply>,
     },
     RetireRoot {
         registration: RootRegistrationRef,
@@ -3888,6 +4023,16 @@ struct InputPermit {
     bytes: usize,
 }
 
+impl InputPermit {
+    fn shrink(&mut self, retained: usize) {
+        assert!(retained <= self.bytes);
+        let refund = self.bytes - retained;
+        self.bytes = retained;
+        if let Some(shared) = self.shared.upgrade() {
+            shared.refund_input(refund);
+        }
+    }
+}
 impl Drop for InputPermit {
     fn drop(&mut self) {
         if let Some(shared) = self.shared.upgrade() {
@@ -3913,7 +4058,13 @@ fn worker_main(
     receiver: Receiver<OwnerCommand>,
     ready: SyncSender<Result<(), String>>,
 ) {
-    let mut state = WorkerState::new();
+    let mut state = match WorkerState::new(&shared) {
+        Ok(state) => state,
+        Err(error) => {
+            let _ = ready.send(Err(error.to_string()));
+            return;
+        }
+    };
     let run = panic::catch_unwind(AssertUnwindSafe(|| {
         shared
             .lifecycle
@@ -4024,7 +4175,7 @@ fn finish_worker(shared: Arc<OwnerShared>, mut state: WorkerState) {
 /// observation; the journal must bind and commit it before any final namespace claim.
 fn validate_staging_effect(
     command: &FileOperationCommand,
-    registrations: &BTreeMap<RootRegistrationRef, RootRegistrationState>,
+    registrations: &RootRegistry,
 ) -> EffectOutcome {
     let EffectRequest::ValidateStaging {
         staging,
@@ -4177,7 +4328,7 @@ fn validate_for_owner(
     command: &FileOperationCommand,
     grant: Option<&QueuedGrant>,
     shared: &Arc<OwnerShared>,
-    registrations: &BTreeMap<RootRegistrationRef, RootRegistrationState>,
+    registrations: &RootRegistry,
 ) -> Result<(), EffectOutcome> {
     for (_, binding) in command.effect.role_bindings() {
         if binding.registration.owner != shared.owner {
@@ -4425,6 +4576,25 @@ impl fmt::Display for OwnerIdentity {
 
 #[cfg(test)]
 mod tests {
+    mod root_registration_tests {
+        include!("file_operation_owner/tests/root_registration_tests.rs");
+    }
+    #[test]
+    fn original_root_registration_retains_input_until_retirement() {
+        let owner = super::FileOperationOwner::start().expect("original owner");
+        let before = owner.input_bytes_remaining_for_test();
+        let root = owner
+            .register_root_for_test(profile_fence(owner.owner_identity()), "original root")
+            .expect("original registration");
+        assert!(
+            owner.input_bytes_remaining_for_test() < before,
+            "retained original root backing must remain charged"
+        );
+        owner
+            .retire_root(root)
+            .expect("retire original registration");
+        assert_eq!(owner.input_bytes_remaining_for_test(), before);
+    }
     mod telemetry_tests;
 
     use super::*;
@@ -4954,7 +5124,16 @@ mod tests {
                 authority: profile_fence(owner.owner_identity()),
                 label: String::from("lost reply"),
                 capability: None,
-                input: None,
+                input: Some(
+                    owner
+                        .shared
+                        .reserve_input(
+                            std::mem::size_of::<OwnerCommand>()
+                                + "lost reply".len()
+                                + FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES,
+                        )
+                        .unwrap(),
+                ),
                 result: reply,
             })
             .expect("registration queues");
