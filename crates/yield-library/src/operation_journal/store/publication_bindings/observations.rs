@@ -2,6 +2,7 @@
 use super::super::staging_checkpoints::{StoredRootRef, StoredStagingSourceFence};
 use crate::operation_journal::{OperationId, ParticipantId};
 use serde::{Deserialize, Serialize};
+use std::path::{Component, Path};
 use uuid::Uuid;
 
 // These are explicitly data-only mirrors of the authority-free command wire shape.
@@ -39,9 +40,12 @@ impl RootObservation {
         if self.locator.is_empty()
             || self.locator.len() > 1024
             || self.locator.contains('\0')
-            || self.locator.contains('/')
-            || self.locator.contains('\\')
-            || matches!(self.locator.as_str(), "." | "..")
+            || Path::new(&self.locator).is_absolute()
+            || Path::new(&self.locator).components().any(|component| {
+                matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+            })
+            || self.locator == "."
+            || self.locator.split(['/', '\\']).any(|component| component.is_empty() || component == ".")
         {
             return Err("publication root locator is invalid".into());
         }

@@ -104,6 +104,26 @@ mod publication_issuance {
     }
 
     #[test]
+    fn publication_issuance_preserves_original_nested_target_locator_contract() {
+        let (_fixture, store, staging, binding, sequence) = prepared();
+        let value = serde_json::to_value(&binding).unwrap();
+        let owner: Uuid = serde_json::from_value(value["command"]["target_registration"]["owner"].clone()).unwrap();
+        let claim: AdmissionClaim = serde_json::from_value(value["charge"].clone()).unwrap();
+        let leaf = "nested/target/out.wav";
+        crate::file_operation_owner::BoundedRelativeLocator::new(leaf).unwrap();
+        let canonical = command_bytes(&staging, owner, Uuid::new_v4(), leaf);
+        let nested = PublicationBindingDraft::capture(&canonical, &staging, &claim, (2, 1), None, (Uuid::new_v4(), 1)).unwrap();
+        store.reserve_publication_binding_fixture(&staging, sequence, nested).unwrap();
+        let retained = store.read_publication_binding(staging.output_id()).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(retained).unwrap()["command"]["effect"]["PublishNoReplace"]["target"]["binding"]["locator"], leaf);
+        for bad in ["../out.wav", "/out.wav", "nested//out.wav", "nested/./out.wav", "nested/"] {
+            assert!(crate::file_operation_owner::BoundedRelativeLocator::new(bad).is_err());
+            let canonical = command_bytes(&staging, owner, Uuid::new_v4(), bad);
+            assert!(PublicationBindingDraft::capture(&canonical, &staging, &claim, (2, 1), None, (Uuid::new_v4(), 1)).is_err());
+        }
+    }
+
+    #[test]
     fn publication_issuance_actual_atomic_readback_restart_and_duplicate_never_reissue() {
         let (fixture, store, staging, binding, sequence) = prepared();
         let before = store.get(staging.operation_id()).expect("operation before");
