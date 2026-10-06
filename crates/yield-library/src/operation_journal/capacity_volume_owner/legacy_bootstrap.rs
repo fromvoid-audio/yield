@@ -90,7 +90,7 @@ fn acquire_legacy_inner(
 }
 
 /// Current callers supply only a sealed internally-derived scope and preinstalled actor backing.
-pub(super) fn acquire_current_for_scope(
+pub(in super::super) fn acquire_current_for_scope(
     scope: &CurrentReserveUseProof<'_>,
     backing: &mut LegacyVolumeFailureBacking,
 ) -> Result<VolumeOwnershipCapability, ()> {

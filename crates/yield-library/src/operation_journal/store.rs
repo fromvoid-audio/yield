@@ -1132,13 +1132,20 @@ impl ReserveBootstrapProof<'_, '_> {
         };
         RecoveryReserveContextError::Reserve(text)
     }
+    fn failure_sink(&self) -> Option<&LegacyReserveFailureSink> {
+        match self {
+            Self::Legacy { failure, .. } | Self::ScopedCurrent { failure, .. } => Some(failure),
+            #[cfg(test)]
+            Self::Current(_) => None,
+        }
+    }
     fn retain_reopened(&self, reserve: OwnedReserveAllocation) {
-        if let Self::Legacy { failure, .. } | Self::ScopedCurrent { failure, .. } = self {
+        if let Some(failure) = self.failure_sink() {
             *failure.reserve.borrow_mut() = Some(reserve);
         }
     }
     fn retain_bound(&self, reserve: super::capacity_reserve_namespace::BoundReserve<'_>) {
-        if !matches!(self, Self::Legacy { .. } | Self::ScopedCurrent { .. }) {
+        if self.failure_sink().is_none() {
             return;
         }
         match reserve.into_owned() {

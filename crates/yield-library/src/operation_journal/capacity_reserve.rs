@@ -407,6 +407,7 @@ pub(super) enum ReserveFailureReason {
     #[cfg(any(target_os = "macos", test))]
     #[error("original legacy bootstrap custody is no longer current")]
     LegacyCustodyClosed,
+    #[cfg(any(target_os = "macos", test))]
     #[error("original current source bootstrap custody is no longer current")]
     CurrentCustodyClosed,
     #[error("protected reserve allocation is unsupported on this target")]

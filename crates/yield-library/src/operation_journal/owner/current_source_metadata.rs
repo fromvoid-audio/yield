@@ -1,6 +1,5 @@
 //! Explicit bounded dynamic inventory funded before consuming Current confirmation.
 //! Native allocations/extents, allocator bookkeeping and the original SQLite cache are separate.
-use super::*;
 
 const PATH: usize = 8192;
 const IDENTITY: usize = 256;
