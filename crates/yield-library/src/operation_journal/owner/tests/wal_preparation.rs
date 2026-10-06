@@ -1621,6 +1621,11 @@ mod integration {
         original_retirement_custody(17);
     }
 
+    #[test]
+    fn genuine_original_ready_source_revocation_is_owner_loss_not_malformed_policy() {
+        original_retirement_custody(18);
+    }
+
     fn original_retirement_custody(outcome: u8) {
         original_retirement_custody_with_source_policy(outcome, None);
     }
@@ -2306,6 +2311,77 @@ mod integration {
             );
         }
 
+        if outcome == 18 {
+            let collector = local_collector.as_mut().unwrap();
+            let ready = collector.original_ready_round().unwrap();
+            actor.drain_requested.store(true, Ordering::Release);
+            while !actor
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "reuse:retiring-pre-audit")
+            {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(actor.drained.load(Ordering::Acquire));
+            assert!(
+                collector
+                    .preparing_round_for_tests()
+                    .unwrap()
+                    .invalidated_for_tests()
+            );
+            let refused = collector.validate_retirement_policy(
+                &retirement,
+                &participants,
+                &plan,
+                &claims,
+                digest,
+                &ready,
+            );
+            assert_eq!(refused, Err(WalPreparationError::OwnerLost));
+            while !collector.poll() {
+                assert!(Instant::now() < deadline + Duration::from_secs(1));
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(matches!(
+                handle.status(),
+                WalPreparationStatus::Unavailable(WalPreparationError::OwnerLost)
+            ));
+            assert_eq!(
+                journal
+                    .prepared_admission_id_allocations
+                    .load(Ordering::Relaxed),
+                0
+            );
+            let outside =
+                rusqlite::Connection::open(fixture.owner.profile_root().join(LIBRARY_DB_FILE_NAME))
+                    .unwrap();
+            assert_eq!(
+                outside
+                    .query_row(
+                        "SELECT count(*) FROM source_lifecycle_references",
+                        [],
+                        |row| row.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            drop(local_collector.take());
+            drop(ready);
+            drop(view);
+            drop(handle);
+            assert_eq!(budget.used(), 0);
+            drop(actor);
+            assert!(global.shutdown());
+            assert!(journal.shutdown());
+            assert_eq!(
+                *journal.shared.input_bytes.lock().unwrap(),
+                InputBudget::new()
+            );
+            return;
+        }
         if outcome == 17 {
             let collector = local_collector.as_mut().unwrap();
             let round = collector.preparing_round_for_tests().unwrap();
