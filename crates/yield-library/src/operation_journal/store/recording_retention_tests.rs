@@ -1343,7 +1343,22 @@ fn recording_payload_projection_changed_blob_refuses_before_copy() {
                 .get_recording_chunk(proposal.operation_id(), header.chunk_id())
                 .map(|_| ())
         };
-        assert!(result.is_err(), "{kind:?}");
+        let decoder_error = if kind == PayloadReader::Control {
+            crate::operation_journal::recording_commands::controls::RecordingControlReservation::decode(&changed, &proposal).unwrap_err()
+        } else {
+            crate::operation_journal::recording_commands::RecordingCapturedChunk::decode(
+                &changed, &proposal,
+            )
+            .unwrap_err()
+        };
+        let expected = OperationJournalStoreError::RecordingRetention {
+            reason: decoder_error.to_string(),
+        };
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            expected.to_string(),
+            "{kind:?}"
+        );
         let copied = PAYLOAD_COPIED_BYTES.with(|n| n.get());
         eprintln!(
             "actual recording payload {kind:?}: changed={} copied={copied}",
