@@ -53,8 +53,19 @@ impl OriginalReadyRound {
             .acknowledged
             .lock()
             .map_err(|_| super::WalPreparationError::InvalidInput)?;
-        if !self.matches_ready(original, &state) {
+        // Refuse malformed/foreign publication seals independently of live loss.
+        if state.cohort != self.cohort
+            || state.slots != original.expected
+            || !original.sources_present(&state)
+            || state.decision != Decision::Preparing
+        {
             return Err(super::WalPreparationError::InvalidInput);
+        }
+        if Instant::now() >= original.deadline {
+            return Err(super::WalPreparationError::Deadline);
+        }
+        if state.invalidated {
+            return Err(super::WalPreparationError::OwnerLost);
         }
         Ok(())
     }
@@ -68,7 +79,15 @@ impl OriginalReadyRound {
         match original.with_boundaries(|state| self.matches_ready(original, state)) {
             Ok(true) => Ok(()),
             Err(BoundaryRefusal::Busy) => Err(WalPreparationError::Busy),
-            _ => Err(WalPreparationError::InvalidInput),
+            Err(BoundaryRefusal::Revoked) => {
+                self.require_provenance(original)?;
+                Err(WalPreparationError::OwnerLost)
+            }
+            Ok(false) => {
+                self.require_provenance(original)?;
+                Err(WalPreparationError::InvalidInput)
+            }
+            Err(BoundaryRefusal::Changed) => Err(WalPreparationError::InvalidInput),
         }
     }
 }
@@ -480,6 +499,42 @@ mod tests {
         assert_eq!(round.acknowledged.lock().unwrap().slots, 0);
         drop(custody);
         drop(round);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn original_ready_foreign_or_malformed_seal_is_distinct_from_correlated_loss() {
+        // Logical refusal bookkeeping only; no original native owner or qualification.
+        let budget = super::super::HandshakeBudget::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let original = CurrentRound::new(1, deadline, budget.credit()).unwrap();
+        let foreign = CurrentRound::new(1, deadline, budget.credit()).unwrap();
+        let custody = original.request(0).acknowledge();
+        let cohort = original.acknowledged.lock().unwrap().cohort;
+        let ready = OriginalReadyRound::new(Arc::clone(&original), cohort);
+        assert_eq!(
+            ready.require_provenance(&foreign),
+            Err(super::super::WalPreparationError::InvalidInput)
+        );
+        let malformed = OriginalReadyRound::new(Arc::clone(&original), cohort + 1);
+        assert_eq!(
+            malformed.require_provenance(&original),
+            Err(super::super::WalPreparationError::InvalidInput)
+        );
+        original.acknowledged.lock().unwrap().invalidated = true;
+        assert_eq!(
+            malformed.require_provenance(&original),
+            Err(super::super::WalPreparationError::InvalidInput)
+        );
+        assert_eq!(
+            ready.require_provenance(&original),
+            Err(super::super::WalPreparationError::OwnerLost)
+        );
+        drop(malformed);
+        drop(ready);
+        drop(custody);
+        drop(original);
+        drop(foreign);
         assert_eq!(budget.used(), 0);
     }
 
