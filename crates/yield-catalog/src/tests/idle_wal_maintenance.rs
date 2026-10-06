@@ -199,6 +199,17 @@ fn original_source_idle_worker_closing_joins_an_admitted_native_checkpoint() {
         WritableProfileGuard::acquire_current(),
         Err(ProfileOwnershipError::ProfileOwnedByAnotherProcess { .. })
     ));
+    let id = SourceId::from_string("idle-original");
+    assert!(matches!(
+        SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&id),
+        ),
+        Err(SourceDbError::ProfileOwnership(
+            ProfileOwnershipError::ProfileChildAlreadyLeased { .. }
+        ))
+    ));
     // Admission mutex remains available while the actual Native/SQLite pass is paused.
     assert!(service.admission.try_lock().is_ok());
     assert!(matches!(
@@ -211,6 +222,13 @@ fn original_source_idle_worker_closing_joins_an_admitted_native_checkpoint() {
     release.send(()).unwrap();
     joined.recv_timeout(Duration::from_secs(5)).unwrap();
     shutdown.join().unwrap();
+    let reopened = SourceDatabase::open_for_catalog_with_profile_guard(
+        fixture.root.path(),
+        &fixture.guard,
+        catalog_profile_child(&id),
+    )
+    .unwrap();
+    assert!(reopened.validate_profile_guard(&fixture.guard).is_ok());
     assert!(fs::metadata(main).unwrap().len() >= 34603008);
     assert_eq!(
         external
