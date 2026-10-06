@@ -694,6 +694,16 @@
       "retirement": "Remove this exact entry with the healthy repeated-shutdown regression; no runtime bootstrap exemption or permission is granted."
     },
     {
+      "path": "crates/yield-session/src/tests/maintenance_shutdown.rs",
+      "function": "original_maintenance_completion",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2377",
+      "reason": "Automated cfg(test) original maintenance completion regression reopens the isolated original journal only after real retained maintenance/Catalog/Global/Journal joins, profile release/reacquisition and late admission rejection. This proves child-lease release, without physical qualification, cleanup or durable Source settlement authority.",
+      "retirement": "Remove this exact entry with the original maintenance custody regression; no production bootstrap exception or permission is granted."
+    },
+    {
       "path": "crates/yield/src/logging.rs",
       "function": "new",
       "operation": "OpenOptions::create_new",

@@ -1413,7 +1413,7 @@ pub(super) fn acquire_native_reader_fixture_test(
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
-    mod process_isolation {
+    pub(super) mod process_isolation {
         include!("capacity_volume_owner/tests/process_isolation.rs");
     }
 

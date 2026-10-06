@@ -265,6 +265,12 @@ mod tests {
 
         #[test]
         fn original_sealed_bootstrap_retains_exact_lock_and_registry_at_each_refused_prefix() {
+            #[cfg(target_os = "linux")]
+            if crate::operation_journal::capacity_volume_owner::tests::process_isolation::run_in_child(
+                "original_sealed_bootstrap_retains_exact_lock_and_registry_at_each_refused_prefix",
+            ) {
+                return;
+            }
             let _test = TestRuntimeGuard::acquire();
             let profile_dir = tempfile::tempdir().unwrap();
             let media = tempfile::tempdir().unwrap();

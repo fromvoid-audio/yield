@@ -1403,7 +1403,13 @@ impl Persistence {
     }
 
     fn shutdown(&mut self) -> Result<(), SessionError> {
-        self.maintenance.shutdown();
+        let maintenance_result = if self.maintenance.shutdown() {
+            Ok(())
+        } else {
+            Err(SessionError::Persistence(String::from(
+                "maintenance shutdown was unconfirmed: original worker panicked",
+            )))
+        };
         let catalog_result = if let Some(catalog) = self.catalog.take() {
             let report = catalog.shutdown_with_report();
             if report.is_confirmed_join() {
@@ -1451,7 +1457,10 @@ impl Persistence {
             Ok(())
         };
         self.writable.take();
-        global_result.and(journal_result).and(catalog_result)
+        global_result
+            .and(journal_result)
+            .and(catalog_result)
+            .and(maintenance_result)
     }
 }
 
@@ -2993,6 +3002,7 @@ fn drain_shutdown(
 mod tests {
     mod catalog_shutdown;
     mod journal_shutdown;
+    mod maintenance_shutdown;
 
     mod harvest_catalog_tests {
         use super::*;

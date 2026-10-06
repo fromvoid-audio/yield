@@ -380,6 +380,9 @@ struct MaintenanceJob {
 pub(crate) struct MaintenanceService {
     admission: Arc<MaintenanceAdmission>,
     active: Option<MaintenanceJob>,
+    worker_panicked: bool,
+    #[cfg(test)]
+    completion_gate_for_test: Option<Arc<CompletionGateForTest>>,
 }
 
 impl MaintenanceService {
@@ -387,6 +390,9 @@ impl MaintenanceService {
         Self {
             admission,
             active: None,
+            worker_panicked: false,
+            #[cfg(test)]
+            completion_gate_for_test: None,
         }
     }
 
@@ -400,7 +406,12 @@ impl MaintenanceService {
         reservation: MaintenanceReservation,
         result: SyncSender<Result<GlobalStorageUsage, MaintenanceError>>,
     ) {
-        self.reap_finished();
+        // A successor may be admitted after the old operation finishes but before its
+        // original thread exits. Join that exact predecessor before replacing its handle.
+        if !self.join_original_worker() {
+            let _ = result.send(Err(MaintenanceError::WorkerPanicked));
+            return;
+        }
         let parts = reservation.into_parts();
         let Some(profile) = profile else {
             let _ = result.send(Err(MaintenanceError::ProfileUnavailable(String::from(
@@ -422,6 +433,8 @@ impl MaintenanceService {
         let thread_parts = parts.clone();
         let thread_result = result.clone();
         let id = parts.id;
+        #[cfg(test)]
+        let completion_gate = self.completion_gate_for_test.take();
         let thread = match thread::Builder::new()
             .name(String::from("yield-storage-maintenance"))
             .spawn(move || {
@@ -437,6 +450,10 @@ impl MaintenanceService {
                 };
                 let _ = thread_result.send(operation);
                 thread_parts.finish();
+                #[cfg(test)]
+                if let Some(gate) = completion_gate {
+                    gate.after_finish();
+                }
             }) {
             Ok(thread) => thread,
             Err(error) => {
@@ -456,7 +473,12 @@ impl MaintenanceService {
         reservation: MaintenanceReservation,
         result: SyncSender<Result<CacheClearOutcome, MaintenanceError>>,
     ) {
-        self.reap_finished();
+        // A successor may be admitted after the old operation finishes but before its
+        // original thread exits. Join that exact predecessor before replacing its handle.
+        if !self.join_original_worker() {
+            let _ = result.send(Err(MaintenanceError::WorkerPanicked));
+            return;
+        }
         let Some(profile) = profile else {
             let _ = result.send(Err(MaintenanceError::ProfileUnavailable(String::from(
                 "writable profile guard is unavailable",
@@ -492,6 +514,8 @@ impl MaintenanceService {
         let thread_parts = parts.clone();
         let thread_result = result.clone();
         let id = parts.id;
+        #[cfg(test)]
+        let completion_gate = self.completion_gate_for_test.take();
         let thread = match thread::Builder::new()
             .name(String::from("yield-cache-maintenance"))
             .spawn(move || {
@@ -504,6 +528,10 @@ impl MaintenanceService {
                 };
                 let _ = thread_result.send(operation);
                 thread_parts.finish();
+                #[cfg(test)]
+                if let Some(gate) = completion_gate {
+                    gate.after_finish();
+                }
             }) {
             Ok(thread) => thread,
             Err(error) => {
@@ -515,26 +543,23 @@ impl MaintenanceService {
         self.active = Some(MaintenanceJob { id, cancel, thread });
     }
 
-    pub(crate) fn shutdown(&mut self) {
-        if let Some(job) = self.active.take() {
+    /// Join original retained custody and report actual thread completion only.
+    pub(crate) fn shutdown(&mut self) -> bool {
+        if let Some(job) = self.active.as_ref() {
             job.cancel.store(true, Ordering::Release);
-            let _ = job.thread.join();
-            self.admission.release(job.id);
         }
+        self.join_original_worker()
     }
 
-    fn reap_finished(&mut self) {
-        let finished = self
-            .active
-            .as_ref()
-            .is_some_and(|job| job.thread.is_finished());
-        if !finished {
-            return;
-        }
+    fn join_original_worker(&mut self) -> bool {
         if let Some(job) = self.active.take() {
-            let _ = job.thread.join();
+            // Retain a genuine join panic even after later requests or repeated shutdown.
+            // Caught operation failures remain ordinary request results, not thread failures.
+            self.worker_panicked |= job.thread.join().is_err();
+            // Only the exact predecessor ID is released; a successor can already be reserved.
             self.admission.release(job.id);
         }
+        !self.worker_panicked
     }
 }
 
@@ -625,7 +650,88 @@ impl From<CacheMaintenanceError> for MaintenanceError {
 }
 
 #[cfg(test)]
+#[derive(Default)]
+struct CompletionGateStateForTest {
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+struct CompletionGateForTest {
+    state: Mutex<CompletionGateStateForTest>,
+    changed: std::sync::Condvar,
+    panic_after: bool,
+}
+
+#[cfg(test)]
+impl CompletionGateForTest {
+    fn after_finish(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.entered = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+        drop(state);
+        assert!(
+            !self.panic_after,
+            "original maintenance post-finish panic fixture"
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct CompletionControllerForTest {
+    gate: Arc<CompletionGateForTest>,
+}
+
+#[cfg(test)]
+impl CompletionControllerForTest {
+    pub(crate) fn wait_entered(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.gate.state.lock().unwrap();
+        while !state.entered {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            state = self.gate.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+        true
+    }
+
+    pub(crate) fn release(&self) {
+        self.gate.state.lock().unwrap().released = true;
+        self.gate.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for CompletionControllerForTest {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(test)]
+impl MaintenanceService {
+    pub(crate) fn arm_completion_for_test(
+        &mut self,
+        panic_after: bool,
+    ) -> CompletionControllerForTest {
+        assert!(self.completion_gate_for_test.is_none());
+        let gate = Arc::new(CompletionGateForTest {
+            state: Mutex::new(CompletionGateStateForTest::default()),
+            changed: std::sync::Condvar::new(),
+            panic_after,
+        });
+        self.completion_gate_for_test = Some(Arc::clone(&gate));
+        CompletionControllerForTest { gate }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    mod worker_custody;
     use super::*;
     use std::sync::mpsc;
 
