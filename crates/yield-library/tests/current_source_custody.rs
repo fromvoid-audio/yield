@@ -77,7 +77,8 @@ fn run_original_queue(
         let identity = stable_filesystem_identity_from_open_file(&held).unwrap();
         assert!(held.metadata().unwrap().len() >= PROTECTED_FREE_SPACE_FLOOR);
         // Closing a worker with an unretired registration is not clean settlement. Preserve
-        // this dedicated case directory and native dirty-marker evidence for verification.
+        // this dedicated case directory and reserve-object evidence for verification. This
+        // public harness does not inspect the private canonical ownership marker.
         assert!(owner.shutdown());
         assert_eq!(
             stable_filesystem_identity_from_open_file(&held).unwrap(),
@@ -137,7 +138,7 @@ fn original_native_current_external_queue_create_and_clean_rebind() {
 }
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "requires separate fresh external APFS volume; leaves dirty marker/evidence, no cleanup or retry"]
+#[ignore = "requires separate fresh external APFS volume; preserves reserve object evidence, no cleanup or retry"]
 fn original_native_current_external_queue_lost_reply_retains_reserve() {
     native_case(true);
 }

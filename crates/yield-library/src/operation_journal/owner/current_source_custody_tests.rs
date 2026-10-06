@@ -11,7 +11,49 @@ pub(super) struct Snapshot {
     root_device: u64,
     root_inode: u64,
     credit: Weak<InputPermit>,
+    drops: Arc<Mutex<DropObservation>>,
 }
+
+#[derive(Default)]
+struct DropObservation {
+    native_before_root: bool,
+    root_before_credit: bool,
+    root_count: usize,
+}
+pub(super) struct BeforeRootDrop {
+    native_fd: i32,
+    native_device: u64,
+    native_inode: u64,
+    root: Weak<std::fs::File>,
+    credit: Weak<InputPermit>,
+    observations: Arc<Mutex<DropObservation>>,
+}
+impl Drop for BeforeRootDrop {
+    fn drop(&mut self) {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let same = unsafe { libc::fstat(self.native_fd, stat.as_mut_ptr()) } == 0 && {
+            let stat = unsafe { stat.assume_init() };
+            stat.st_dev as u64 == self.native_device && stat.st_ino as u64 == self.native_inode
+        };
+        let count = self.root.strong_count();
+        let mut observation = self.observations.lock().unwrap();
+        observation.native_before_root = !same && count > 0 && self.credit.strong_count() > 0;
+        observation.root_count = count;
+    }
+}
+pub(super) struct AfterRootDrop {
+    root: Weak<std::fs::File>,
+    credit: Weak<InputPermit>,
+    observations: Arc<Mutex<DropObservation>>,
+}
+impl Drop for AfterRootDrop {
+    fn drop(&mut self) {
+        let mut observation = self.observations.lock().unwrap();
+        observation.root_before_credit = self.root.strong_count() + 1 == observation.root_count
+            && self.credit.strong_count() > 0;
+    }
+}
+
 impl OwnerRuntime {
     pub(super) fn current_refused_prefix_for_test(
         &mut self,
@@ -49,7 +91,9 @@ impl OwnerRuntime {
                 owner: None,
                 _current_volume_failure: Default::default(),
                 _current_reserve_failure: Default::default(),
+                _current_before_root_drop: None,
                 _current_root: Some(root.try_clone_for_owned_capability().unwrap()),
+                _current_after_root_drop: None,
                 allocation_unit: None,
                 readiness: SourceVolumeBindingReadiness::Incomplete,
                 registrations: BTreeSet::from([id]),
@@ -74,6 +118,32 @@ impl OwnerRuntime {
             )
             .is_err()
         );
+        let binding = self.source_volumes.get_mut(&volume).unwrap();
+        let file = binding
+            ._current_volume_failure
+            .held_lock_for_tests()
+            .unwrap();
+        let metadata = file.metadata().unwrap();
+        let root = binding
+            ._current_root
+            .as_ref()
+            .unwrap()
+            .current_drop_root_for_test();
+        let credit = Arc::downgrade(binding._current_input.as_ref().unwrap());
+        let observations = Arc::new(Mutex::new(DropObservation::default()));
+        binding._current_before_root_drop = Some(BeforeRootDrop {
+            native_fd: file.as_raw_fd(),
+            native_device: metadata.dev(),
+            native_inode: metadata.ino(),
+            root: root.clone(),
+            credit: credit.clone(),
+            observations: Arc::clone(&observations),
+        });
+        binding._current_after_root_drop = Some(AfterRootDrop {
+            root,
+            credit,
+            observations,
+        });
         let result = self.retain_source_recovery(
             id,
             "current-native-refused-prefix",
@@ -118,6 +188,13 @@ impl OwnerRuntime {
             root_device: root.dev(),
             root_inode: root.ino(),
             credit: Arc::downgrade(binding._current_input.as_ref().unwrap()),
+            drops: Arc::clone(
+                &binding
+                    ._current_before_root_drop
+                    .as_ref()
+                    .unwrap()
+                    .observations,
+            ),
         })
     }
 }
@@ -131,10 +208,25 @@ fn inspect(client: &OperationJournalClient, volume: VolumeIdentity) -> Snapshot 
             }
         })
         .unwrap();
-    reply
+    let snapshot = reply
         .recv_timeout(Duration::from_secs(10))
         .unwrap()
-        .unwrap()
+        .unwrap();
+    let mut barrier = client
+        .submit_control(CONTROL_INPUT_BYTES, |input, result| JournalCommand::Get {
+            operation_id: OperationId::new(),
+            input,
+            result,
+        })
+        .unwrap();
+    assert!(
+        barrier
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    snapshot
 }
 fn same_open_object(snapshot: &Snapshot) -> bool {
     let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -239,6 +331,9 @@ fn current_original_worker_lost_reply_replay_and_shutdown_retain_dirty_backing_a
     assert!(owner.shutdown()); // Worker closure only; no clean physical handoff is asserted.
     assert!(!same_open_object(&first));
     assert!(first.credit.upgrade().is_none());
+    let drops = first.drops.lock().unwrap();
+    assert!(drops.native_before_root && drops.root_before_credit);
+    drop(drops);
     assert_eq!(
         client.shared.input_bytes.lock().unwrap().remaining[0],
         ORDINARY_INPUT_BYTES
@@ -290,6 +385,9 @@ fn current_original_worker_panic_closes_native_capsule_before_releasing_metadata
     let snapshot = probe.lock().unwrap().take().unwrap();
     assert!(!same_open_object(&snapshot));
     assert!(snapshot.credit.upgrade().is_none());
+    let drops = snapshot.drops.lock().unwrap();
+    assert!(drops.native_before_root && drops.root_before_credit);
+    drop(drops);
     assert_eq!(
         client.shared.input_bytes.lock().unwrap().remaining[0],
         ORDINARY_INPUT_BYTES

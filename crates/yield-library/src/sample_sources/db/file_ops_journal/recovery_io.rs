@@ -973,6 +973,11 @@ impl BoundDatabaseRoot {
         Ok(observer)
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn current_drop_root_for_test(&self) -> std::sync::Weak<fs::File> {
+        Arc::downgrade(&self._capability)
+    }
+
     pub(crate) fn try_clone_descriptor(&self) -> io::Result<fs::File> {
         self._capability.try_clone()
     }

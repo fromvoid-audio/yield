@@ -812,6 +812,66 @@
       "issue": "OPT-1636",
       "reason": "Application diagnostic log creation/rotation/pruning, separate from source media and durable operation completion.",
       "retirement": "Remove with logging implementation; changing its namespace or caller requires explicit review."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_lost_reply_replay_and_shutdown_retain_dirty_backing_and_debit",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_lost_reply_replay_and_shutdown_retain_dirty_backing_and_debit",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_lost_reply_replay_and_shutdown_retain_dirty_backing_and_debit",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_panic_closes_native_capsule_before_releasing_metadata_credit",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_panic_closes_native_capsule_before_releasing_metadata_credit",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_worker_panic_closes_native_capsule_before_releasing_metadata_credit",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
+      "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
     }
   ]
 }

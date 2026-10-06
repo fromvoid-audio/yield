@@ -1086,8 +1086,12 @@ struct SourceVolumeBinding {
     #[allow(dead_code)]
     owner: Option<VolumeOwnershipCapability>,
     _current_volume_failure: super::capacity_volume_owner::LegacyVolumeFailureBacking,
+    #[cfg(all(test, unix))]
+    _current_before_root_drop: Option<current_source_custody_tests::BeforeRootDrop>,
     // Original selected source ancestor closes after all native children and ownership backing.
     _current_root: Option<crate::sample_sources::db::BoundDatabaseRoot>,
+    #[cfg(all(test, unix))]
+    _current_after_root_drop: Option<current_source_custody_tests::AfterRootDrop>,
     allocation_unit: Option<u64>,
     readiness: SourceVolumeBindingReadiness,
     registrations: BTreeSet<crate::sample_sources::db::SourceRegistrationId>,
@@ -3370,7 +3374,11 @@ impl OwnerRuntime {
                 .or_insert_with(|| SourceVolumeBinding {
                     reserve: None,
                     owner: None,
+                    #[cfg(all(test, unix))]
+                    _current_before_root_drop: None,
                     _current_root: None,
+                    #[cfg(all(test, unix))]
+                    _current_after_root_drop: None,
                     _current_volume_failure: Default::default(),
                     _current_reserve_failure: Default::default(),
                     allocation_unit: None,
@@ -7596,7 +7604,11 @@ mod tests {
                         volume.clone(),
                         SourceVolumeBinding {
                             _current_input: None,
+                            #[cfg(all(test, unix))]
+                            _current_before_root_drop: None,
                             _current_root: None,
+                            #[cfg(all(test, unix))]
+                            _current_after_root_drop: None,
                             _current_volume_failure: Default::default(),
                             _current_reserve_failure: Default::default(),
                             owner: None,
@@ -8272,7 +8284,11 @@ mod tests {
             invalid_volume,
             SourceVolumeBinding {
                 _current_input: None,
+                #[cfg(all(test, unix))]
+                _current_before_root_drop: None,
                 _current_root: None,
+                #[cfg(all(test, unix))]
+                _current_after_root_drop: None,
                 _current_volume_failure: Default::default(),
                 _current_reserve_failure: Default::default(),
                 owner: None,
@@ -8648,7 +8664,11 @@ mod tests {
             profile_volume,
             SourceVolumeBinding {
                 _current_input: None,
+                #[cfg(all(test, unix))]
+                _current_before_root_drop: None,
                 _current_root: None,
+                #[cfg(all(test, unix))]
+                _current_after_root_drop: None,
                 _current_volume_failure: Default::default(),
                 _current_reserve_failure: Default::default(),
                 owner: None,
