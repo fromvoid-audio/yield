@@ -2941,6 +2941,11 @@ impl WorkerState {
         result_tx: SyncSender<Arc<FileOperationResult>>,
         shared: &Arc<OwnerShared>,
     ) {
+        if primary {
+            if let Some(grant) = &grant {
+                grant.original_worker_started();
+            }
+        }
         if let Some(existing) = self.receipts.get_mut(&key) {
             if existing.canonical.as_ref() == canonical.as_ref() {
                 let result = existing.result.clone();
@@ -2977,6 +2982,11 @@ impl WorkerState {
                     reason: String::from("unacknowledged effect receipt capacity is full"),
                 },
             ));
+            if primary {
+                if let Some(grant) = &grant {
+                    grant.retain_worker_completion(&result, shared.owner);
+                }
+            }
             let _ = result_tx.send(result);
             drop(input);
             return;
@@ -3066,6 +3076,11 @@ impl WorkerState {
         };
         drop(input);
         let result = Arc::new(rejection_result(&command, fingerprint, outcome));
+        if primary {
+            if let Some(grant) = &grant {
+                grant.retain_worker_completion(&result, shared.owner);
+            }
+        }
         shared.complete_admission(key);
         let aliases = usize::from(result_tx.send(Arc::clone(&result)).is_ok());
         let retained_outcome = telemetry::FileOwnerRetainedOutcome::from_outcome(result.outcome());

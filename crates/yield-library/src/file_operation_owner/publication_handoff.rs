@@ -6,6 +6,20 @@ pub(super) enum QueuedGrant {
     Publication(StagingPublicationGrant),
 }
 impl QueuedGrant {
+    pub(super) fn original_worker_started(&self) {
+        if let Self::Publication(grant) = self {
+            grant.original_worker_started();
+        }
+    }
+    pub(super) fn retain_worker_completion(
+        &self,
+        result: &FileOperationResult,
+        worker: OwnerIdentity,
+    ) {
+        if let Self::Publication(grant) = self {
+            grant.retain_worker_completion(result, worker);
+        }
+    }
     pub(super) fn into_chunk(self) -> Option<LiveChunkEffectGrant> {
         match self {
             Self::Chunk(grant) => Some(grant),
