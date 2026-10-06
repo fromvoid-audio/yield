@@ -104,14 +104,14 @@ pub(super) fn input_bytes(
 pub(super) struct CurrentInput(Option<Arc<CurrentInputBacking>>);
 struct CurrentInputBacking {
     // Test probes observe a separate allocation, never pin the funded Arc header.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     probe: Arc<()>,
     input: InputPermit,
 }
 impl CurrentInput {
     pub(super) fn new(input: InputPermit) -> Self {
         Self(Some(Arc::new(CurrentInputBacking {
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             probe: Arc::new(()),
             input,
         })))
