@@ -1672,5 +1672,63 @@ mod integration {
             .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
             .unwrap();
     }
+    #[test]
+    fn original_catalog_idle_checkpoint_excludes_genuinely_parked_other_source() {
+        let f = Fixture::new();
+        let (service, revisions, _) = f.start(None);
+        let source = f.external(&revisions[0]);
+        let pressured = f.external(&revisions[1]);
+        pressured
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        pressured
+            .execute_batch(
+                "CREATE TABLE idle_payload(value BLOB);
+             INSERT INTO idle_payload VALUES(zeroblob(34603008));",
+            )
+            .unwrap();
+        let main = std::path::PathBuf::from(pressured.path().unwrap());
+        let before = std::fs::metadata(&main).unwrap().len();
+        assert!(before < 34603008);
+        let started = Instant::now();
+        // Use the unchanged real 15-second worker interval and original 2-second preparation
+        // deadline. Park shortly before idle admission, without extending any reservation.
+        while started.elapsed() < Duration::from_secs(14) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut request = service
+            .prepare_source_wal(revisions[0].clone(), correlation(), deadline())
+            .unwrap();
+        let held = prepared(&mut request);
+        busy(&source);
+        assert_eq!(credits(&service).0, 1);
+        while started.elapsed() < Duration::from_millis(15500) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let after = std::fs::metadata(&main).unwrap().len();
+        let still_parked = matches!(request.status(), CatalogSourceWalStatus::Prepared(_));
+        drop(held);
+        wait(&request, |status| {
+            matches!(status, CatalogSourceWalStatus::Aborted)
+        });
+        service.shutdown();
+        assert!(
+            still_parked,
+            "original bounded preparation did not span idle admission"
+        );
+        assert!(
+            after < 34603008,
+            "idle checkpoint crossed another source's parked preparation: {before} -> {after}"
+        );
+        source.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert_eq!(
+            pressured
+                .query_row("SELECT length(value) FROM idle_payload", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            34603008
+        );
+    }
+
     mod lease;
 }

@@ -67,6 +67,7 @@ pub use source_wal_preparation::{
 };
 mod command_metrics;
 mod shutdown;
+mod idle_maintenance;
 #[cfg(test)]
 #[path = "tests/idle_wal_maintenance.rs"]
 mod idle_wal_maintenance_tests;
@@ -4100,6 +4101,7 @@ fn run_worker_with_sources(
     let mut preparations = source_wal_preparation::WorkerReservations::new(control);
     let mut deferred = VecDeque::<QueuedCatalogCommand>::new();
     let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
+    let mut idle = idle_maintenance::Pacing::new(Instant::now());
     loop {
         #[cfg(feature = "test-support")]
         test_support::original_worker_failure(&admission);
@@ -4111,6 +4113,7 @@ fn run_worker_with_sources(
         // Do not enter journal-facing commands or teardown while its original settlement
         // still owns any native reservation. Keep accepted packets/credits in existing bounds.
         if preparations.has_settling() {
+            idle.activity(Instant::now());
             std::thread::sleep(WORKER_IDLE_POLL);
             continue;
         }
@@ -4132,20 +4135,46 @@ fn run_worker_with_sources(
                 match command_rx.recv_timeout(WORKER_IDLE_POLL) {
                     Ok(command) => Some(command),
                     Err(RecvTimeoutError::Timeout) => {
-                        // No callback may rediscover a parked SQL owner. Defer native watcher
-                        // idle scanning while any preparation is held; other-source commands
-                        // continue through the finite normal queue.
-                        if !preparations.has_slots() {
-                            run_watcher_idle_work(
-                                &profile_guard,
-                                &events,
-                                &admission,
-                                &mut sources,
-                                test_gate.as_ref(),
-                                watcher_mode,
-                            );
+                        match idle.poll(
+                            Instant::now(),
+                            &command_rx,
+                            &admission,
+                            &sources,
+                            preparations.has_slots(),
+                        ) {
+                            idle_maintenance::Poll::Command(command) => Some(command),
+                            idle_maintenance::Poll::Source(index) => {
+                                let (_, source) =
+                                    sources.iter().nth(index).expect("original idle source");
+                                // Best-effort only: ownership refusal skips this opportunity,
+                                // without reporting a write failure or retiring held evidence.
+                                let _ = source.database.writer.maintain_idle_wal();
+                                idle.activity(Instant::now());
+                                continue;
+                            }
+                            idle_maintenance::Poll::Disconnected => {
+                                let mut state = admission.lock().unwrap_or_else(|p| p.into_inner());
+                                state.shutdown = true;
+                                state.invalidate_all();
+                                continue;
+                            }
+                            idle_maintenance::Poll::Wait => {
+                                // No callback may rediscover a parked SQL owner. Defer native watcher
+                                // idle scanning while any preparation is held; other-source commands
+                                // continue through the finite normal queue.
+                                if !preparations.has_slots() {
+                                    run_watcher_idle_work(
+                                        &profile_guard,
+                                        &events,
+                                        &admission,
+                                        &mut sources,
+                                        test_gate.as_ref(),
+                                        watcher_mode,
+                                    );
+                                }
+                                continue;
+                            }
                         }
-                        continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => {
                         let mut state = admission.lock().unwrap_or_else(|p| p.into_inner());
@@ -4159,6 +4188,7 @@ fn run_worker_with_sources(
         let Some(packet) = packet else {
             break;
         };
+        idle.activity(Instant::now());
         if source_wal_preparation::lifecycle(&packet.command) {
             // Existing drain/finalization may await the journal. No successful pre-intent
             // reservation may remain held across that wait.
@@ -4248,6 +4278,7 @@ fn run_worker_with_sources(
             break;
         }
         reservation.finish();
+        idle.activity(Instant::now());
     }
     preparations.close(&mut sources);
     preparations.retire_failed(journal.as_ref(), &mut pending_finalizations);
