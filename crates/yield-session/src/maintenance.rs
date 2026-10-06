@@ -380,6 +380,7 @@ struct MaintenanceJob {
 pub(crate) struct MaintenanceService {
     admission: Arc<MaintenanceAdmission>,
     active: Option<MaintenanceJob>,
+    worker_panicked: bool,
     #[cfg(test)]
     completion_gate_for_test: Option<Arc<CompletionGateForTest>>,
 }
@@ -389,6 +390,7 @@ impl MaintenanceService {
         Self {
             admission,
             active: None,
+            worker_panicked: false,
             #[cfg(test)]
             completion_gate_for_test: None,
         }
@@ -404,7 +406,12 @@ impl MaintenanceService {
         reservation: MaintenanceReservation,
         result: SyncSender<Result<GlobalStorageUsage, MaintenanceError>>,
     ) {
-        self.reap_finished();
+        // A successor may be admitted after the old operation finishes but before its
+        // original thread exits. Join that exact predecessor before replacing its handle.
+        if !self.join_original_worker() {
+            let _ = result.send(Err(MaintenanceError::WorkerPanicked));
+            return;
+        }
         let parts = reservation.into_parts();
         let Some(profile) = profile else {
             let _ = result.send(Err(MaintenanceError::ProfileUnavailable(String::from(
@@ -466,7 +473,12 @@ impl MaintenanceService {
         reservation: MaintenanceReservation,
         result: SyncSender<Result<CacheClearOutcome, MaintenanceError>>,
     ) {
-        self.reap_finished();
+        // A successor may be admitted after the old operation finishes but before its
+        // original thread exits. Join that exact predecessor before replacing its handle.
+        if !self.join_original_worker() {
+            let _ = result.send(Err(MaintenanceError::WorkerPanicked));
+            return;
+        }
         let Some(profile) = profile else {
             let _ = result.send(Err(MaintenanceError::ProfileUnavailable(String::from(
                 "writable profile guard is unavailable",
@@ -531,26 +543,23 @@ impl MaintenanceService {
         self.active = Some(MaintenanceJob { id, cancel, thread });
     }
 
-    pub(crate) fn shutdown(&mut self) {
-        if let Some(job) = self.active.take() {
+    /// Join original retained custody and report actual thread completion only.
+    pub(crate) fn shutdown(&mut self) -> bool {
+        if let Some(job) = self.active.as_ref() {
             job.cancel.store(true, Ordering::Release);
-            let _ = job.thread.join();
-            self.admission.release(job.id);
         }
+        self.join_original_worker()
     }
 
-    fn reap_finished(&mut self) {
-        let finished = self
-            .active
-            .as_ref()
-            .is_some_and(|job| job.thread.is_finished());
-        if !finished {
-            return;
-        }
+    fn join_original_worker(&mut self) -> bool {
         if let Some(job) = self.active.take() {
-            let _ = job.thread.join();
+            // Retain a genuine join panic even after later requests or repeated shutdown.
+            // Caught operation failures remain ordinary request results, not thread failures.
+            self.worker_panicked |= job.thread.join().is_err();
+            // Only the exact predecessor ID is released; a successor can already be reserved.
             self.admission.release(job.id);
         }
+        !self.worker_panicked
     }
 }
 
