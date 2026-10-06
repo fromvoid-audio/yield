@@ -58,8 +58,11 @@ Rust 1.93.0, amortized byte-Vec backing is at most twice the wire ceiling; durin
 reallocation the old backing is less than one ceiling while the new backing is
 at most two. Raw 64 KiB plus this 192 KiB transient fits256 KiB. The existing
 factory budget's RAW_AND_SCRATCH category grows192→256 KiB, consuming its prior
-64 KiB headroom exactly; compile-time category equality requires the unchanged
-3,604,480-byte command debit. Pool ceilings and retained-route credits do not grow.
+64 KiB record/rebuild headroom exactly; compile-time category equality preserves
+the 3,604,480-byte record/rebuild subtotal. OPT-2392 adds 499,712 bytes of separately
+derived database-claim audit backing to the command debit within the original pool;
+see [the database-claim boundary](RECORDING_PRESTART_DATABASE_CLAIMS.md). Pool ceilings
+and retained-route credits do not grow.
 Scanner scratch and errors drop before the original owned decoder begins.
 
 Public proposal scanning has a separate 128 KiB ceiling: scratch old/new overlap
