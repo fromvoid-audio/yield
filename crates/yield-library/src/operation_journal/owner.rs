@@ -4279,7 +4279,7 @@ impl OwnerRuntime {
         self.refresh_live_descriptor_capacity_inner(Some(facts_reader), false)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn rebuild_capacity(&mut self) -> Result<(), String> {
         self.rebuild_capacity_with_funding(None)
     }
