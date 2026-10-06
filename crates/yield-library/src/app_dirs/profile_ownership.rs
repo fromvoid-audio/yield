@@ -150,6 +150,21 @@ pub(crate) struct ProfileChildLease {
     identity: String,
 }
 
+impl ProfileChildLease {
+    /// Immutable identity backing retained by this lease and its original registry entry.
+    /// The shared, mutable registry allocation is owned by the profile and is not counted here.
+    pub(crate) fn current_metadata_bytes(&self) -> Option<usize> {
+        let registry = self.registry.lock().ok()?;
+        let entry = registry.get(&self.identity)?;
+        if self.identity.capacity() > 256 || entry.capacity() > 256 {
+            return None;
+        }
+        std::mem::size_of::<(usize, usize, Self)>()
+            .checked_add(self.identity.capacity())?
+            .checked_add(entry.capacity())
+    }
+}
+
 impl Drop for ProfileChildLease {
     fn drop(&mut self) {
         let mut registry = self

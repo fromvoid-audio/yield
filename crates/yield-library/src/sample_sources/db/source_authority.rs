@@ -30,6 +30,7 @@ mod registration_generation;
 #[cfg(test)]
 #[path = "source_authority/registration_generation/native_tests.rs"]
 mod registration_generation_native_tests;
+mod metadata;
 mod reserve_use;
 pub(crate) use reserve_use::CurrentReserveUseProof;
 

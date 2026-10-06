@@ -1316,6 +1316,30 @@ impl BoundDatabaseRoot {
         })
     }
 
+    /// Retained Current request backing, including a catalog child lease when present.
+    /// This is explicit metadata accounting, not a bound on the OS descriptor or profile registry.
+    pub(crate) fn current_metadata_bytes(&self) -> Option<usize> {
+        let mut bytes =
+            std::mem::size_of::<Self>()
+                .checked_add(std::mem::size_of::<(usize, usize, fs::File)>())?;
+        for path in std::iter::once(&self.path).chain(self.named_path.iter()) {
+            if path.capacity() > 8192 || path.as_os_str().as_encoded_bytes().len() > 4096 {
+                return None;
+            }
+            bytes = bytes.checked_add(path.capacity())?;
+        }
+        for identity in [&self.identity, &self.profile_identity] {
+            if identity.capacity() > 256 {
+                return None;
+            }
+            bytes = bytes.checked_add(identity.capacity())?;
+        }
+        if let Some(lease) = &self._lease {
+            bytes = bytes.checked_add(lease.current_metadata_bytes()?)?;
+        }
+        Some(bytes)
+    }
+
     pub(crate) fn identity(&self) -> &str {
         &self.identity
     }
