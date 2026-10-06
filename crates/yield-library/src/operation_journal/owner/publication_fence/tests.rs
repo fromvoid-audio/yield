@@ -82,7 +82,7 @@ fn original_fence_exhaustion_and_poison_never_remint_or_cancel_uncertain_entry()
     let mut registry = Registry::new();
     let operation = OperationId::new();
     let mut pending = registry.issue(operation, &shared).unwrap();
-    let fence = Arc::clone(&pending.fence);
+    let fence = pending.fence.clone();
     assert!(
         std::panic::catch_unwind(|| {
             let _locked = fence.state.lock().unwrap();
@@ -281,17 +281,18 @@ fn original_completion_worker_panic_and_zero_generation_never_become_closed_or_r
     let shared = shared();
     let mut registry = Registry::new();
     let pending = registry.issue(OperationId::new(), &shared).unwrap();
-    let fence = Arc::clone(&pending.fence);
+    let fence = pending.fence.clone();
     pending.original_worker_started();
     drop(pending); // Original worker unwind without a completion.
     assert_eq!(*fence.state.lock().unwrap(), State::Unknown);
     assert!(registry.issue(OperationId::new(), &shared).is_err());
     let invalid = PendingFence {
-        fence: Arc::new(Fence {
+        fence: Custody::new(Fence {
             operation: OperationId::new(),
             source: SourceRegistrationId::model_key_for_tests(0),
             generation: 0,
             state: Mutex::new(State::Pending),
+            _backing: registry.input.as_ref().unwrap().clone(),
         }),
         entered: false,
     };
@@ -386,4 +387,121 @@ fn issuance_identity_observes_only_original_retained_slot_and_incarnation() {
     assert_ne!(a.0, c.0);
     assert!(original.issuance_observation(&other).is_none());
     assert!(foreign.issuance_observation(&first).is_none());
+}
+
+#[test]
+fn publication_fence_custody_registry_drop_keeps_original_debit_until_last_worker() {
+    let shared = shared();
+    let mut registry = Registry::new();
+    let mut workers: Vec<_> = (0..MAX_FENCES)
+        .map(|_| registry.issue(OperationId::new(), &shared).unwrap())
+        .collect();
+    workers[0].original_worker_started();
+    workers[0].complete_before_effect([7; 32], true);
+    drop(registry);
+    let charged = super::super::PUBLICATION_INPUT_BYTES - HEADER_BYTES;
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().publication_remaining,
+        charged
+    );
+    while workers.len() > 1 {
+        drop(workers.pop());
+        assert_eq!(
+            shared.input_bytes.lock().unwrap().publication_remaining,
+            charged
+        );
+    }
+    drop(workers);
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().publication_remaining,
+        super::super::PUBLICATION_INPUT_BYTES
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_fence_custody_completion_observer_retains_original_allocation_debit() {
+    let shared = shared();
+    let mut registry = Registry::new();
+    let pending = registry.issue(OperationId::new(), &shared).unwrap();
+    let observe = pending.completion_observer();
+    pending.original_worker_started();
+    pending.complete_before_effect([9; 32], true);
+    registry.poll_completions();
+    drop(pending);
+    drop(registry);
+    assert!(observe());
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().publication_remaining,
+        super::super::PUBLICATION_INPUT_BYTES - HEADER_BYTES
+    );
+    drop(observe);
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().publication_remaining,
+        super::super::PUBLICATION_INPUT_BYTES
+    );
+}
+
+#[test]
+fn publication_fence_custody_concurrent_last_worker_aliases_refund_exactly_once() {
+    for _ in 0..64 {
+        let shared = shared();
+        let mut registry = Registry::new();
+        let pending = registry.issue(OperationId::new(), &shared).unwrap();
+        let first = pending.fence.clone();
+        let second = pending.fence.clone();
+        pending.original_worker_started();
+        drop(pending); // Unknown worker termination remains uncertain, not reusable.
+        drop(registry);
+        assert_eq!(
+            shared.input_bytes.lock().unwrap().publication_remaining,
+            super::super::PUBLICATION_INPUT_BYTES - HEADER_BYTES
+        );
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let first_drop = scope.spawn(|| {
+                barrier.wait();
+                drop(first);
+            });
+            barrier.wait();
+            drop(second);
+            first_drop.join().unwrap();
+        });
+        assert_eq!(
+            shared.input_bytes.lock().unwrap().publication_remaining,
+            super::super::PUBLICATION_INPUT_BYTES
+        );
+    }
+}
+
+#[test]
+fn publication_fence_custody_backpressure_precedes_header_and_slot_allocation() {
+    let shared = shared();
+    let all = shared
+        .reserve_publication_input(super::super::PUBLICATION_INPUT_BYTES)
+        .unwrap();
+    let mut registry = Registry::new();
+    assert!(registry.issue(OperationId::new(), &shared).is_err());
+    assert!(registry.input.is_none());
+    assert!(registry.slots.iter().all(Option::is_none));
+    assert_eq!(registry.next, 0);
+    drop(all);
+    let pending = registry.issue(OperationId::new(), &shared).unwrap();
+    drop(pending);
+    let replacement = registry.issue(OperationId::new(), &shared).unwrap();
+    assert_eq!(registry.slots.iter().flatten().count(), 1);
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().publication_remaining,
+        super::super::PUBLICATION_INPUT_BYTES - HEADER_BYTES
+    );
+    drop(registry);
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().publication_remaining,
+        super::super::PUBLICATION_INPUT_BYTES - HEADER_BYTES
+    );
+    drop(replacement);
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().publication_remaining,
+        super::super::PUBLICATION_INPUT_BYTES
+    );
 }
