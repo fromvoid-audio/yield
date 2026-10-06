@@ -22,7 +22,7 @@ impl HandshakeBudget {
     pub(crate) fn used(&self) -> usize {
         *self.bytes.lock().unwrap()
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn test_accounting_guard(&self) -> std::sync::MutexGuard<'_, usize> {
         self.bytes.lock().unwrap()
     }
