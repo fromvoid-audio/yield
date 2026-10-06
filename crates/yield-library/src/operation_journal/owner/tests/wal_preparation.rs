@@ -1801,7 +1801,7 @@ mod integration {
                 .is_err()
         );
         let (mut base_plan, mut base_claims, main, side) = plan(&fixture);
-        if outcome == 0 || outcome == 5 {
+        if outcome == 0 || outcome == 5 || outcome >= 13 {
             // An actual original worker supplies planning ceilings before freezing the
             // envelope. Its later retirement scope must independently match all of them.
             // This observation does not qualify physical capacity or issue an ACK.
@@ -2308,7 +2308,17 @@ mod integration {
                     thread::sleep(Duration::from_millis(1));
                 }
             }
-            collector.begin_decision(digest).unwrap();
+            loop {
+                match collector.begin_decision(digest) {
+                    Ok(()) => break,
+                    Err(WalPreparationError::Busy) => {
+                        assert!(Instant::now() < deadline);
+                        assert!(collector.decision_nonce().is_none());
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("original Ready comparison refused: {error:?}"),
+                }
+            }
             let nonce = collector.decision_nonce().unwrap();
             let mut foreign_custody = None;
             if outcome == 10 {
