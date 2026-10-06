@@ -22,7 +22,9 @@ use std::{
 pub(super) mod journal_input;
 mod retirement_inventory;
 mod retirement_policy;
+mod shared_custody;
 use journal_input::JournalInput;
+use shared_custody::SharedCustody;
 
 /// Copied historical scope from one original owner. It contains no live acknowledgement.
 #[derive(Clone, Debug)]
@@ -113,6 +115,9 @@ struct Shared {
     retirement_for_tests: Mutex<Option<retirement_inventory::Observation>>,
     #[cfg(all(test, target_os = "linux"))]
     retirement_hook_for_tests: Mutex<Option<Box<dyn FnOnce(uuid::Uuid) + Send>>>,
+    // All status/cache payload and the Shared allocation disappear before this
+    // final original journal input keeper can return the command's backing.
+    _journal_input: JournalInput,
 }
 /// Sole non-Clone cancellation handle. Only the original journal actor can publish outcomes.
 /// A copied observation cannot preserve current custody or acknowledge settlement.
@@ -130,7 +135,7 @@ struct Shared {
 ///     handle.acknowledge_settlement();
 /// }
 /// ```
-pub struct WalPreparationHandle(Arc<Shared>);
+pub struct WalPreparationHandle(SharedCustody<Shared>);
 impl WalPreparationHandle {
     #[cfg(test)]
     pub(in crate::operation_journal) fn retirement_inventory_for_tests(
@@ -190,7 +195,7 @@ enum Releasing {
 pub(in crate::operation_journal) struct Collector {
     input: WalPreparationInput,
     profile_acquisition: uuid::Uuid,
-    shared: Arc<Shared>,
+    shared: SharedCustody<Shared>,
     decision: Option<super::OriginalDecision>,
     held: Vec<HeldOwner>,
     awaiting: Option<PendingOwner>,
@@ -246,13 +251,14 @@ impl Collector {
     ) -> Result<(Self, WalPreparationHandle), WalPreparationError> {
         let journal_input = JournalInput::new(journal_input);
         input.budget.bind_journal_input(journal_input.clone())?;
-        let shared = Arc::new(Shared {
+        let shared = SharedCustody::new(Shared {
             canceled: AtomicBool::new(false),
             status: Mutex::new(WalPreparationStatus::Preparing),
             #[cfg(test)]
             retirement_for_tests: Mutex::new(None),
             #[cfg(all(test, target_os = "linux"))]
             retirement_hook_for_tests: Mutex::new(None),
+            _journal_input: journal_input.clone(),
         });
         let capacity = input.sources.len() + usize::from(input.global.is_some());
         let held = Vec::with_capacity(capacity);
@@ -260,7 +266,7 @@ impl Collector {
             Self {
                 input,
                 profile_acquisition,
-                shared: Arc::clone(&shared),
+                shared: shared.clone(),
                 decision: None,
                 held,
                 awaiting: None,

@@ -3437,6 +3437,60 @@ mod integration {
         }
     }
     #[test]
+    fn all_owner_terminal_handle_retains_original_journal_input_after_joins() {
+        for explicit_abort in [false, true] {
+            let mut rig = Rig::new("all-owner-terminal-handle");
+            let input = rig.input(Instant::now() + Duration::from_secs(2));
+            let budget = input.budget_for_test();
+            let handle = rig.submit(input);
+            let WalPreparationStatus::Ready(view) = wait(&handle, |status| {
+                matches!(status, WalPreparationStatus::Ready(_)) || terminal(status)
+            }) else {
+                panic!("original workers did not become ready")
+            };
+            assert_eq!(view.databases().len(), 3);
+            let pool = rig.journal.shared.input_bytes.clone();
+            if explicit_abort {
+                handle.abort();
+                assert!(matches!(
+                    wait(&handle, terminal),
+                    WalPreparationStatus::Aborted
+                ));
+            }
+            assert!(rig.journal.shutdown());
+            assert!(matches!(handle.status(), WalPreparationStatus::Aborted));
+            assert_eq!(
+                rig.journal
+                    .prepared_admission_id_allocations
+                    .load(Ordering::Relaxed),
+                0
+            );
+            for index in 0..2 {
+                rig.outside_source(index)
+                    .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+                    .unwrap();
+            }
+            drop(view);
+            drop(rig.actor.take());
+            assert!(rig.global.shutdown());
+            assert_eq!(budget.used(), 0);
+            // The diagnostic budget is a real funded alias. Only the public
+            // terminal handle may retain the original command backing below.
+            drop(budget);
+            let baseline = InputBudget::shared_initial();
+            assert_eq!(
+                baseline.remaining[0] - pool.lock().unwrap().remaining[0],
+                64 * 1024,
+                "terminal original handle allocation must retain original journal input after joins"
+            );
+            // A terminal read/cancellation does not supply fresh authority or an effect.
+            handle.abort();
+            assert!(matches!(handle.status(), WalPreparationStatus::Aborted));
+            drop(handle);
+            assert_eq!(*pool.lock().unwrap(), baseline);
+        }
+    }
+    #[test]
     fn all_owner_journal_shutdown_drains_real_custody_before_original_resources() {
         let mut rig = Rig::new("all-owner-shutdown");
         let handle = rig.submit(rig.input(Instant::now() + Duration::from_secs(2)));
