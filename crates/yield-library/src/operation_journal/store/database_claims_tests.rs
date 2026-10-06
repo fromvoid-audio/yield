@@ -5,6 +5,7 @@ mod exact_database_claim_persistence {
     include!("database_attempts_tests.rs");
     include!("source_lease_binding_tests.rs");
     include!("recording_prestart_database_claims_tests.rs");
+    include!("database_claim_scalar_projection_tests.rs");
     use super::*;
     use crate::operation_journal::database_claims::{
         ClaimDirection, DatabaseBinding, DatabaseClaimInventory, DatabaseClaimSlice,
