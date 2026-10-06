@@ -32,7 +32,17 @@ readback rather than blindly rerunning.
 
 `SourceWriter::read_receipt_observation` is the bounded production readback entrypoint
 for historical reconciliation. It returns an observation only and never constructs a
-new live fence. SQLite source revisions are bounded by `i64::MAX`; lifecycle generations
+new live fence. Historical recovery uses the retained connection's deferred read snapshot,
+without mutation preparation, CONTROL renewal, `BEGIN IMMEDIATE`, or checkpoint SQL.
+One existing two-second SQLite progress budget spans original owner validation,
+revision pinning, bounded receipt capture, and final owner validation. The snapshot
+ends before receipt decoding; the captured revision must still equal the full
+original owner revision before either a receipt or a missing result is published.
+Expired ownership and malformed retained evidence remain refusals. This is an
+elapsed/SQL budget, not a strict response bound on stalled native identity checks;
+ordinary SQLite reads can create or update SHM. It does not qualify a no-effect VFS,
+power-loss durability, physical capacity, retry, settlement, or history cleanup.
+SQLite source revisions are bounded by `i64::MAX`; lifecycle generations
 are stored and checked across their full `u64` domain. The 256-row and 16 MiB retained
 receipt budget has no eviction path, and retirement or history cleanup is deferred until
 a later owner/coordinator contract can preserve duplicate and uncertainty evidence.
