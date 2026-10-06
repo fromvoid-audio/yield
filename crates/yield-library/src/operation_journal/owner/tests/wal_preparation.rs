@@ -2606,9 +2606,12 @@ mod integration {
                 drop(local_collector.take());
                 drop(view);
                 drop(handle);
-                assert_eq!(budget.used(), 0);
+                // Terminal status precedes the producer's final body/round Drop.
+                // NoAttempt is already proven; join the original workers before
+                // asserting destruction of every remaining backing holder.
                 drop(actor);
                 assert!(global.shutdown());
+                assert_eq!(budget.used(), 0);
                 assert!(journal.shutdown());
                 return;
             }
