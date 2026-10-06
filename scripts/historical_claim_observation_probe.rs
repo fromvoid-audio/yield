@@ -96,14 +96,9 @@ fn main() {
         };
         let wire = envelope.replace("PAYLOAD", &payload);
         assert!(wire.len() <= MAX_RECORD_BYTES);
-        let sql = rusqlite::Connection::open(&database).unwrap();
-        sql.execute("DELETE FROM operation_journal", []).unwrap();
-        sql.execute(
-            "INSERT INTO operation_journal VALUES (?1,1,?2)",
-            rusqlite::params![id.to_string(), wire.as_bytes()],
-        )
-        .unwrap();
-        drop(sql);
+        store
+            .replace_historical_row_fixture_for_test(id, 1, wire.as_bytes())
+            .unwrap();
         let before = std::fs::read(&database).unwrap();
         // Public get retains the payload and shares the unchanged old claim read_row path.
         let old = measure(|| store.get(id).unwrap().is_some());

@@ -44,7 +44,7 @@ impl<'a> Statement<'a> {
         Ok(statement)
     }
     pub(super) fn bind_text(
-        &self,
+        &mut self,
         index: i32,
         text: &str,
     ) -> Result<(), OperationJournalStoreError> {
@@ -63,7 +63,7 @@ impl<'a> Statement<'a> {
         })
     }
     pub(super) fn bind_integer(
-        &self,
+        &mut self,
         index: i32,
         value: i64,
     ) -> Result<(), OperationJournalStoreError> {

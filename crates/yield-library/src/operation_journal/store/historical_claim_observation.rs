@@ -7,8 +7,24 @@ mod borrowed_sql;
 use borrowed_sql::Statement;
 
 impl OperationJournalStore {
+    #[cfg(any(test, feature = "test-support"))]
+    /// Replace one raw historical-row fixture on this original Store connection.
+    /// No worker, capacity, effect or physical backend authority is installed.
+    pub fn replace_historical_row_fixture_for_test(
+        &self,
+        operation: OperationId,
+        sequence: i64,
+        wire: &[u8],
+    ) -> Result<(), OperationJournalStoreError> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO operation_journal VALUES (?1,?2,?3)",
+            params![operation.to_string(), sequence, wire],
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
-    pub(super) fn install_historical_claim_fixture(
+    pub(in crate::operation_journal) fn install_historical_claim_fixture(
         &self,
         operation: OperationId,
         sequence: i64,
@@ -17,10 +33,7 @@ impl OperationJournalStore {
     ) -> Result<(), OperationJournalStoreError> {
         // Test corruption uses the SAME genuine Store connection, never a competing
         // opener or relaxed locking mode. This grants no production effect authority.
-        self.connection.execute(
-            "INSERT INTO operation_journal VALUES (?1,?2,?3)",
-            params![operation.to_string(), sequence, wire],
-        )?;
+        self.replace_historical_row_fixture_for_test(operation, sequence, wire)?;
         self.connection.execute("INSERT INTO operation_journal_ordinary_claim VALUES (?1,?2,'1','DestinationStaging',1)", params![claim.to_string(), operation.to_string()])?;
         Ok(())
     }
