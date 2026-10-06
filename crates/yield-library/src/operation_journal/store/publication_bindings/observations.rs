@@ -2,7 +2,6 @@
 use super::super::staging_checkpoints::{StoredRootRef, StoredStagingSourceFence};
 use crate::operation_journal::{OperationId, ParticipantId};
 use serde::{Deserialize, Serialize};
-use std::path::{Component, Path};
 use uuid::Uuid;
 
 // These are explicitly data-only mirrors of the authority-free command wire shape.
@@ -37,18 +36,10 @@ pub(super) struct RootObservation {
 impl RootObservation {
     pub(super) fn validate(&self) -> Result<(), String> {
         self.registration.validate()?;
-        if self.locator.is_empty()
-            || self.locator.len() > 1024
-            || self.locator.contains('\0')
-            || Path::new(&self.locator).is_absolute()
-            || Path::new(&self.locator).components().any(|component| {
-                matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
-            })
-            || self.locator == "."
-            || self.locator.split(['/', '\\']).any(|component| component.is_empty() || component == ".")
-        {
-            return Err("publication root locator is invalid".into());
-        }
+        // Reuse the original platform-sensitive grammar. This bounded temporary
+        // is data only and drops here; it cannot supply a live root or grant.
+        crate::file_operation_owner::BoundedRelativeLocator::new(self.locator.clone())
+            .map_err(|_| "publication root locator is invalid".to_owned())?;
         match &self.authority {
             AuthorityObservation::Source(source) => source.validate()?,
             AuthorityObservation::Profile(profile) => {

@@ -38,7 +38,10 @@ bytes and one source element ≤ 256 bytes); a typed staging projection fits 4 K
 Two issuance projections and three staging projections use at most 28 KiB.
 Encoding and parsing/error formatting occur in separate phases; a conservative
 32 KiB temporary allowance for either phase keeps the total within 60 KiB. Parser
-scratch drops before successful canonical encoding. Insert encoding drops before
+scratch and original locator validation's at-most-1-KiB temporary clone drop before
+successful canonical encoding. Destination locators retain the original relative
+locator grammar, including nested entries; staging still compares its exact stored
+basename. Insert encoding drops before
 commit/readback, and original command bytes drop before checkpoint work. The
 original target and native capsule retain their separate existing backing.
 
