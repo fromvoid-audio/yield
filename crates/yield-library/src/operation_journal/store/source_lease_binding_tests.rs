@@ -298,6 +298,7 @@ mod source_lease_binding_storage {
         codec_and_domain_refusals();
         actual_atomic_storage_attempts_and_legacy_reopen();
         retirement_forward_codec_and_storage();
+        expected_decoder_preserves_retained_retirement_refusals();
     }
     fn codec_and_domain_refusals() {
         let f = fixture();
@@ -738,4 +739,60 @@ mod source_lease_binding_storage {
         }
     }
     include!("retirement_forward_storage_tests.rs");
+    fn expected_decoder_preserves_retained_retirement_refusals() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        for field in ["row_identity", "unknown"] {
+            let f = fixture();
+            let store = OperationJournalStore::open(&f.owner).unwrap();
+            let (record, claims, inventory) = input(&store, &f.owner);
+            let provider = logical_provider(&record);
+            assert!(
+                settle_fixture(&store, &record, &claims, &inventory, &provider)
+                    .outcome()
+                    .receipt()
+                    .is_some()
+            );
+            let mut raw: Value =
+                serde_json::from_slice(&crate::operation_journal::encode(&record).unwrap())
+                    .unwrap();
+            let encoded =
+                &mut raw["universal_command_args"]["SourceRegistryRetirement"]["draining"];
+            let bytes = URL_SAFE_NO_PAD.decode(encoded.as_str().unwrap()).unwrap();
+            let mut proposal: Value = serde_json::from_slice(&bytes).unwrap();
+            proposal["expected"] =
+                json!({"status":"present", "state":"enrolled", field:vec![0u8;6000]});
+            let proposal = serde_json::to_vec(&proposal).unwrap();
+            assert!(
+                proposal.len() < crate::sample_sources::db::SOURCE_REGISTRY_REFERENCE_MAX_BYTES
+            );
+            *encoded = json!(URL_SAFE_NO_PAD.encode(&proposal));
+            let bytes = serde_json::to_vec(&raw).unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE operation_journal SET record=?1 WHERE operation_id=?2",
+                    params![bytes, record.operation_id.to_string()],
+                )
+                .unwrap();
+            let retained: (String,i64,Vec<u8>) = store.connection.query_row("SELECT operation_id,sequence,record FROM operation_journal WHERE operation_id=?1", [record.operation_id.to_string()], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            let durable = integration::durable_image(&store);
+            assert!(store.get(record.operation_id).is_err(), "{field}");
+            assert!(store.connection.is_autocommit());
+            assert_eq!(integration::durable_image(&store), durable);
+            // Typed claim readback validates its parent record and must also refuse.
+            // The full raw durable image above proves inventory/charge rows remain exact.
+            assert!(
+                store
+                    .read_database_claim_inventory(record.operation_id)
+                    .is_err()
+            );
+            drop(store);
+            let reopened = OperationJournalStore::open(&f.owner).unwrap();
+            let after: (String,i64,Vec<u8>) = reopened.connection.query_row("SELECT operation_id,sequence,record FROM operation_journal WHERE operation_id=?1", [record.operation_id.to_string()], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(after, retained);
+            assert!(reopened.get(record.operation_id).is_err());
+            assert!(reopened.connection.is_autocommit());
+            assert_eq!(integration::durable_image(&reopened), durable);
+        }
+    }
 }
