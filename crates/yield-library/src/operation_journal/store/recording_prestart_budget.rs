@@ -55,7 +55,10 @@ const _: () = assert!(
         == RECORD_INPUT_BYTES
 );
 // Original ordinary pool: four MiB minus its disjoint 64-KiB control reservation.
-const _: () = assert!(COMMAND_INPUT_BYTES <= 4 * 1024 * 1024 - 64 * 1024);
+const _: () = assert!(
+    COMMAND_INPUT_BYTES
+        <= super::super::owner::OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES - 64 * 1024
+);
 
 impl OperationJournalStore {
     pub(crate) fn begin_recording_prestart_read(&self) -> Result<(), OperationJournalStoreError> {

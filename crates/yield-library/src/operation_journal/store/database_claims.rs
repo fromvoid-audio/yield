@@ -9,6 +9,10 @@ use uuid::Uuid;
 
 pub(super) const BINDING_TABLE: &str = "operation_journal_database_binding";
 pub(super) const SLICE_TABLE: &str = "operation_journal_database_claim_slice";
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static INVENTORY_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 pub(super) const CREATE_BINDING: &str = "CREATE TABLE operation_journal_database_binding (
     binding_id TEXT NOT NULL PRIMARY KEY,
     operation_id TEXT NOT NULL REFERENCES operation_journal(operation_id),
@@ -122,9 +126,10 @@ pub(super) fn read(
         // Old operations stay inspectable, but no binding/required exception is reconstructed.
         return Ok(None);
     };
-    let inventory =
-        DatabaseClaimInventory::decode(&bytes.ok_or_else(|| error("root encoding type/length"))?)
-            .map_err(error)?;
+    let bytes = bytes.ok_or_else(|| error("root encoding type/length"))?;
+    #[cfg(test)]
+    INVENTORY_COPIED_BYTES.with(|counter| counter.set(counter.get().saturating_add(bytes.len())));
+    let inventory = DatabaseClaimInventory::decode(&bytes).map_err(error)?;
     verify(connection, operation, &inventory)?;
     Ok(Some(inventory))
 }
