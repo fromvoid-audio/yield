@@ -115,7 +115,15 @@ mod publication_issuance {
                 .execute_batch("DROP TABLE operation_journal_publication_issuance")
                 .unwrap();
             store.connection.execute_batch(malformed).unwrap();
-            assert!(store.validate_namespace().is_err());
+            // Exercise the exact layout validator used by actual open/migration.
+            assert!(
+                validate_existing_schema(
+                    &store.connection,
+                    &store.database_path,
+                    JOURNAL_SCHEMA_VERSION
+                )
+                .is_err()
+            );
             drop(store);
             assert!(OperationJournalStore::open(&fixture.owner).is_err());
         }
