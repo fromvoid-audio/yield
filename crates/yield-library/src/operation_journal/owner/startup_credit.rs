@@ -4,8 +4,18 @@
 use super::*;
 
 pub(super) const REFUSAL: &str = "ordinary-claim startup resource envelope exceeded";
-pub(super) const POOL_BYTES: usize = std::mem::size_of::<Mutex<InputBudget>>()
-    + 2 * std::mem::size_of::<usize>()
+pub(super) const fn arc_bytes<T>() -> usize {
+    let align = if std::mem::align_of::<T>() > std::mem::align_of::<usize>() {
+        std::mem::align_of::<T>()
+    } else {
+        std::mem::align_of::<usize>()
+    };
+    let header = (2 * std::mem::size_of::<usize>() + align - 1) / align * align;
+    header + (std::mem::size_of::<T>() + align - 1) / align * align
+}
+pub(super) const POOL_BYTES: usize = arc_bytes::<Mutex<InputBudget>>()
+    + arc_bytes::<AtomicU8>()
+    + arc_bytes::<ResourceAdmission>()
     + 2 * std::mem::size_of::<String>()
     + 4 * REFUSAL.len();
 
@@ -18,8 +28,11 @@ impl InputBudget {
 }
 
 pub(in crate::operation_journal) struct StartupCredit {
-    pool: Arc<Mutex<InputBudget>>,
+    lifecycle: Option<Arc<AtomicU8>>,
+    resource: Option<Arc<ResourceAdmission>>,
     bytes: usize,
+    // Last field: gates and their allocation headers disappear before the pool.
+    pool: Arc<Mutex<InputBudget>>,
 }
 impl InputPermit {
     pub(in crate::operation_journal) fn into_startup_credit(mut self) -> StartupCredit {
@@ -31,6 +44,8 @@ impl InputPermit {
         let credit = StartupCredit {
             pool: self.shared.input_bytes.clone(),
             bytes: self.bytes,
+            lifecycle: Some(self.shared.lifecycle.clone()),
+            resource: Some(self.shared.resource_admission.clone()),
         };
         self.refund = false;
         credit
@@ -43,10 +58,25 @@ impl std::fmt::Debug for StartupCredit {
             .finish_non_exhaustive()
     }
 }
+impl StartupCredit {
+    fn fail_closed(&self) {
+        if let Some(resource) = self.resource.as_ref() {
+            resource.invalidate();
+        }
+        if let Some(lifecycle) = self.lifecycle.as_ref() {
+            lifecycle.store(OwnerLifecycle::Unavailable as u8, Ordering::Release);
+        }
+    }
+}
 impl Drop for StartupCredit {
     fn drop(&mut self) {
-        let Ok(mut budget) = self.pool.lock() else {
-            return;
+        let mut budget = match self.pool.lock() {
+            Ok(budget) => budget,
+            Err(error) => {
+                drop(error);
+                self.fail_closed();
+                return;
+            }
         };
         let after = budget.remaining[0].checked_add(self.bytes);
         if !budget.valid()
@@ -54,8 +84,13 @@ impl Drop for StartupCredit {
             || after.is_none_or(|n| n > ORDINARY_INPUT_BYTES - POOL_BYTES)
         {
             budget.unavailable = true;
+            drop(budget);
+            self.fail_closed();
             return;
         }
+        // These original gate allocations must disappear before their last pool holder.
+        self.resource.take();
+        self.lifecycle.take();
         budget.remaining[0] = after.unwrap();
     }
 }
@@ -121,3 +156,6 @@ pub(super) fn display_bytes(value: &impl std::fmt::Display) -> Option<usize> {
         .checked_mul(2)?
         .checked_add(std::mem::size_of::<String>())
 }
+
+#[cfg(test)]
+mod tests;

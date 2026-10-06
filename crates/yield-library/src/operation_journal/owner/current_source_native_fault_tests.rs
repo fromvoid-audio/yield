@@ -304,7 +304,7 @@ fn native_case(selected: CurrentReserveBoundary, clean: bool, lost_reply: bool) 
     }
     assert_eq!(
         client.shared.input_bytes.lock().unwrap().remaining[0],
-        ORDINARY_INPUT_BYTES - resource_custody::HEADER_BYTES - bytes
+        InputBudget::shared_initial().remaining[0] - resource_custody::HEADER_BYTES - bytes
     );
     let mut duplicate = client.register_source_authority(replay).unwrap();
     assert!(matches!(
@@ -316,7 +316,7 @@ fn native_case(selected: CurrentReserveBoundary, clean: bool, lost_reply: bool) 
     current_source_custody_tests::assert_native_reserve_closed_in_order(&snapshot.custody);
     assert_eq!(
         client.shared.input_bytes.lock().unwrap().remaining[0],
-        ORDINARY_INPUT_BYTES
+        InputBudget::shared_initial().remaining[0]
     );
     let metadata = fs::metadata(root.join("media/recovery-reserve.bin")).unwrap();
     assert_eq!(

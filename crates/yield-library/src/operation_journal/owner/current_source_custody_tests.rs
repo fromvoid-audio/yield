@@ -339,7 +339,7 @@ fn current_original_worker_lost_reply_replay_and_shutdown_retain_dirty_backing_a
     drop(drops);
     assert_eq!(
         client.shared.input_bytes.lock().unwrap().remaining[0],
-        ORDINARY_INPUT_BYTES
+        InputBudget::shared_initial().remaining[0]
     );
     contender.try_lock().unwrap();
     assert_eq!(std::fs::read(&marker).unwrap(), original);
@@ -394,7 +394,7 @@ fn current_original_worker_panic_closes_native_capsule_before_releasing_metadata
     drop(drops);
     assert_eq!(
         client.shared.input_bytes.lock().unwrap().remaining[0],
-        ORDINARY_INPUT_BYTES
+        InputBudget::shared_initial().remaining[0]
     );
     let path = std::fs::read_dir(app_override.path().join("volume-ownership"))
         .unwrap()
@@ -435,7 +435,7 @@ fn current_original_registry_carrier_bound_refuses_before_confirmation_and_relea
     }
     assert_eq!(
         shared.input_bytes.lock().unwrap().remaining[0],
-        ORDINARY_INPUT_BYTES - bound * minimum
+        InputBudget::shared_initial().remaining[0] - bound * minimum
     );
     assert!(
         matches!(shared.reserve_input(InputClass::Ordinary, minimum),
@@ -469,7 +469,7 @@ fn current_original_registry_carrier_bound_refuses_before_confirmation_and_relea
     assert!(retained.upgrade().is_none());
     assert_eq!(
         shared.input_bytes.lock().unwrap().remaining[0],
-        ORDINARY_INPUT_BYTES
+        InputBudget::shared_initial().remaining[0]
     );
 }
 
@@ -539,7 +539,7 @@ fn current_original_credit_concurrent_final_aliases_release_exact_original_pool(
         drop(credit);
         assert_eq!(
             shared.input_bytes.lock().unwrap().remaining[0],
-            ORDINARY_INPUT_BYTES - bytes
+            InputBudget::shared_initial().remaining[0] - bytes
         );
         let workers: Vec<_> = aliases
             .into_iter()
@@ -557,7 +557,7 @@ fn current_original_credit_concurrent_final_aliases_release_exact_original_pool(
         assert!(probe.upgrade().is_none());
         assert_eq!(
             shared.input_bytes.lock().unwrap().remaining[0],
-            ORDINARY_INPUT_BYTES
+            InputBudget::shared_initial().remaining[0]
         );
     }
 }

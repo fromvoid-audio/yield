@@ -26,7 +26,7 @@ impl Fixture {
         let root = AppRootGuard::set(profile.path().to_owned()).unwrap();
         let guard = WritableProfileGuard::acquire_current().unwrap();
         let mut f = Self {
-            baseline: InputBudget::new(),
+            baseline: InputBudget::shared_initial(),
             owner: None,
             source: None,
             guard,
@@ -214,7 +214,7 @@ fn legacy_custody_reply_loss_retains_original_lock_and_metadata_credit_until_shu
     f.close();
     file.try_lock().unwrap();
     assert!(sidecar.exists());
-    assert_eq!(budget(&client), InputBudget::new());
+    assert_eq!(budget(&client), InputBudget::shared_initial());
 }
 
 #[test]
