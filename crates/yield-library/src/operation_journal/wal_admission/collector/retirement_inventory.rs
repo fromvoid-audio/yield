@@ -322,6 +322,12 @@ impl Collector {
         {
             return Err(invalid());
         }
+        #[cfg(test)]
+        eprintln!(
+            "actual retirement projection peak={projection_peak} retained={} shared_used={}",
+            sum(&[FIXED, roots, retained])?,
+            self.input.budget.used()
+        );
         let observation = Observation(Some(Arc::new(Backing {
             inventory,
             encoded,
