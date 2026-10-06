@@ -353,6 +353,12 @@ mod tests {
 
         #[test]
         fn current_original_bootstrap_retains_real_dirty_prefix_and_lock_until_capsule_drop() {
+            #[cfg(target_os = "linux")]
+            if crate::operation_journal::capacity_volume_owner::tests::process_isolation::run_in_child(
+                "current_original_bootstrap_retains_real_dirty_prefix_and_lock_until_capsule_drop",
+            ) {
+                return;
+            }
             let _test = TestRuntimeGuard::acquire();
             let app_root = tempfile::tempdir().unwrap();
             let _app_root = AppRootGuard::set(app_root.path().to_owned()).unwrap();
