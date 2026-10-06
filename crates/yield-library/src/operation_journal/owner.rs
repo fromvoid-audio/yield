@@ -5941,6 +5941,10 @@ impl InputPermit {
         self.shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()]
     }
 
+    pub(super) fn has_historical_error_consumer(&self) -> bool {
+        self.historical_reply.is_some()
+    }
+
     pub(super) fn retain_historical_error(
         &self,
         sql: InputPermit,

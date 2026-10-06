@@ -173,7 +173,7 @@ impl Drop for Statement<'_> {
         }
     }
 }
-pub(super) fn copy_error_message(
+pub(in crate::operation_journal::store) fn copy_error_message(
     input: &InputPermit,
     message: &CStr,
 ) -> Result<(String, InputPermit), OperationJournalStoreError> {
