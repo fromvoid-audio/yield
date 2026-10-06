@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 mod harvest_authored;
+mod idle;
 mod operation_link;
 mod ownership;
 mod registry;

@@ -86,7 +86,7 @@ impl CheckpointPolicy {
     }
 
     fn observe(&self, connection: &Connection, now: Instant, threshold: u64) -> Observation {
-        // Maintenance is post-commit only. Never checkpoint through an active reader/writer txn.
+        // Postcommit and idle owner entrypoints both exclude active reader/writer transactions.
         if !connection.is_autocommit() {
             return Observation::ActiveTransaction;
         }

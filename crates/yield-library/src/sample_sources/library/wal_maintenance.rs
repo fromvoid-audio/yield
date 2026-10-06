@@ -46,7 +46,7 @@ impl LibraryDatabase {
         self.ordinary_wal_maintenance.committed.get()
     }
 
-    /// Consume the marker on the same worker after its post-command ownership check.
+    /// Consume the marker on the same worker, validating ownership before maintenance.
     /// Failure is best effort and cannot turn an already committed write into an SQL failure.
     pub(super) fn maintain_after_ordinary_commit(&self, guard: &WritableProfileGuard) {
         if !self.ordinary_wal_maintenance.committed.replace(false) {
@@ -59,6 +59,20 @@ impl LibraryDatabase {
                 "global_writer",
             );
         }
+    }
+
+    /// Independently paced by the sole owner; never consumes or invents a commit marker.
+    pub(super) fn maintain_while_idle(
+        &self,
+        guard: &WritableProfileGuard,
+    ) -> Result<(), crate::app_dirs::ProfileOwnershipError> {
+        self.validate_profile_guard(guard)?;
+        self.ordinary_wal_maintenance.policy.maybe_checkpoint(
+            &self.connection,
+            "library_db",
+            "global_writer",
+        );
+        self.validate_profile_guard(guard)
     }
 }
 
