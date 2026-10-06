@@ -118,3 +118,19 @@ profile/root/file/SQLite/sidecar sequence. A real retained-WAL regression on tha
 same nested reader verifies full unfunded/funded error parity, no collection
 allocation, exact retained namespace debit, original rollback/autocommit and
 unchanged durable evidence, followed by exact final consumer refund.
+
+Funded startup/admission also explicitly threads the same borrowed input through
+chunk validation, attempt audit/context, original journal-claim metadata and
+metadata-volume guards. The two reached precommit namespace guards use the original
+selected-error keeper. Prepared Recording binding threads the same input through
+its original policy prefix and tail namespace guard. Existing unfunded entry points
+delegate `None` and retain their original validation order and results; no ambient
+Store pointer, thread-local funder or long-lived input borrow is introduced. A real
+WAL regression verifies that the Recording policy prefix retains its exact namespace
+debit before any original policy SQL and preserves all original pager settings.
+
+These namespace guards do not fund the other-family audit graphs, row/JSON decoding,
+metadata SQL/native descriptor facts, physical reserve proof or future ledger growth.
+Those remain genuine separate implementation and qualification prerequisites on the
+tracking parents. Supported native descriptor facts can make later metadata guards
+reachable where Linux refuses earlier; full native execution is still separate.

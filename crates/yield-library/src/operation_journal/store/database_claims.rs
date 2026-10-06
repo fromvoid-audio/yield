@@ -290,6 +290,14 @@ impl OperationJournalStore {
         &self,
         record: &crate::operation_journal::StoredOperationRecord,
     ) -> Result<(), OperationJournalStoreError> {
+        self.validate_database_claim_metadata_volume_with_input(record, None)
+    }
+
+    pub(super) fn validate_database_claim_metadata_volume_with_input(
+        &self,
+        record: &crate::operation_journal::StoredOperationRecord,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
         let opened = crate::sample_sources::db::sqlite_identity::open_existing_database_file(
             &self.database_root,
             std::path::Path::new(super::JOURNAL_DATABASE_FILE_NAME),
@@ -309,7 +317,7 @@ impl OperationJournalStore {
                 "complete journal/rollback peak not covered on actual descriptor volume",
             ));
         }
-        self.validate_namespace_for_precommit()?;
+        self.validate_namespace_with_input(input, true)?;
         Ok(())
     }
     pub(crate) fn read_database_claim_inventory(

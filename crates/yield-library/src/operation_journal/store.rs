@@ -1815,20 +1815,22 @@ impl OperationJournalStore {
         self.connection.execute_batch("BEGIN")?;
         // Original transaction/validation order; credit precedes all working backing.
         let mut collection = None;
-        let snapshot =
-            match self.rebuild_ordinary_claim_snapshot_with_funding(input, &mut collection) {
-                Ok(snapshot) => {
-                    if let Err(error) = self.validate_chunk_claims_inside_transaction() {
-                        let _ = self.connection.execute_batch("ROLLBACK");
-                        return Err(error);
-                    }
-                    snapshot
-                }
-                Err(error) => {
+        let snapshot = match self
+            .rebuild_ordinary_claim_snapshot_with_funding(input, &mut collection)
+        {
+            Ok(snapshot) => {
+                if let Err(error) = self.validate_chunk_claims_inside_transaction_with_input(input)
+                {
                     let _ = self.connection.execute_batch("ROLLBACK");
                     return Err(error);
                 }
-            };
+                snapshot
+            }
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        };
         if let Err(error) = self.validate_namespace_with_input(input, true) {
             let _ = self.connection.execute_batch("ROLLBACK");
             return Err(error);
@@ -1870,7 +1872,7 @@ impl OperationJournalStore {
         let result = (|| {
             let snapshot =
                 self.rebuild_ordinary_claim_snapshot_with_funding(input, &mut collection)?;
-            self.validate_chunk_claims_inside_transaction()?;
+            self.validate_chunk_claims_inside_transaction_with_input(input)?;
             match input {
                 Some(input) => recovery_reserve::prove_no_active_charges_for_input(
                     &self.connection,
@@ -7476,9 +7478,16 @@ impl OperationJournalStore {
     }
 
     fn validate_chunk_claims_inside_transaction(&self) -> Result<(), OperationJournalStoreError> {
+        self.validate_chunk_claims_inside_transaction_with_input(None)
+    }
+
+    fn validate_chunk_claims_inside_transaction_with_input(
+        &self,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
         self.validate_recording_inventory_inside_transaction()?;
         self.validate_database_claims_inside_transaction()?;
-        self.validate_database_attempts_inside_transaction()?;
+        self.validate_database_attempts_inside_transaction_with_input(input)?;
         if chunk_claims::exceeds_row_limit(&self.connection, ordinary_claims::MAX_PAGE_ROWS)
             .map_err(|error| OperationJournalStoreError::ChunkClaim {
                 reason: error.to_string(),

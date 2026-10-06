@@ -45,7 +45,15 @@ impl OperationJournalStore {
         &self,
         record: &crate::operation_journal::StoredOperationRecord,
     ) -> Result<(), OperationJournalStoreError> {
-        self.validate_database_claim_metadata_volume(record)?;
+        self.validate_database_attempt_journal_claims_with_input(record, None)
+    }
+
+    pub(super) fn validate_database_attempt_journal_claims_with_input(
+        &self,
+        record: &crate::operation_journal::StoredOperationRecord,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.validate_database_claim_metadata_volume_with_input(record, input)?;
         let operation = record.operation_id;
         let plan = super::full_capacity_plan_for_record(&record)?;
         let expected: Vec<_> = plan
@@ -95,7 +103,7 @@ impl OperationJournalStore {
                 ));
             }
         }
-        self.validate_namespace_for_precommit()?;
+        self.validate_namespace_with_input(input, true)?;
         Ok(())
     }
 }

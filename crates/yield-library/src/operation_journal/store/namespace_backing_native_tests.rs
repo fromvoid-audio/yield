@@ -158,3 +158,67 @@ fn namespace_backing_nested_original_ordinary_reader_retains_precommit_failure()
     drop(funding);
     assert_eq!(observe_pool().0, baseline);
 }
+
+#[test]
+fn namespace_backing_recording_policy_refuses_before_original_policy_sql() {
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let path = store.retained_namespace_path_for_test();
+    let original = fs::read(&path).unwrap();
+    let policy = |sql: &str| {
+        store
+            .connection
+            .query_row(sql, [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = [
+        policy("PRAGMA max_page_count"),
+        policy("PRAGMA cache_spill"),
+        policy("PRAGMA temp_store"),
+    ];
+    let wal = path.with_file_name("journal.sqlite3-wal");
+    fs::write(&wal, b"original recording policy namespace evidence").unwrap();
+    let unfunded = store.configure_recording_metadata_policy().unwrap_err();
+    assert!(matches!(
+        unfunded,
+        OperationJournalStoreError::RequiresAudit { .. }
+    ));
+    let expected = unfunded.to_string();
+    drop(unfunded);
+    let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+    let observe_pool = funding.pool_bytes_observer_for_test();
+    let (available, baseline) = observe_pool();
+    let error = store
+        .configure_recording_metadata_policy_with_input(Some(&funding.input))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OperationJournalStoreError::RequiresAudit { .. }
+    ));
+    assert_eq!(error.to_string(), expected);
+    assert_eq!(
+        observe_pool().0,
+        available - store.retained_namespace_working_bytes_for_test()
+    );
+    drop(error);
+    assert_eq!(
+        observe_pool().0,
+        available - store.retained_namespace_working_bytes_for_test()
+    );
+    assert_eq!(
+        [
+            policy("PRAGMA max_page_count"),
+            policy("PRAGMA cache_spill"),
+            policy("PRAGMA temp_store")
+        ],
+        before
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        fs::read(&wal).unwrap(),
+        b"original recording policy namespace evidence"
+    );
+    fs::remove_file(wal).unwrap();
+    drop(funding);
+    assert_eq!(observe_pool().0, baseline);
+}

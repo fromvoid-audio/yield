@@ -1965,7 +1965,7 @@ impl OwnerRuntime {
             .map_err(OperationJournalOwnerError::from)?;
         if let UniversalCommandArgs::Recording(proposal) = &prepared.args {
             self.store()
-                .validate_recording_capacity_binding(proposal, &prepared.plan)?;
+                .validate_recording_capacity_binding_with_input(proposal, &prepared.plan, input)?;
         }
 
         // Re-read the durable ordinary-claim image for every request. Startup readiness is only
