@@ -4278,8 +4278,10 @@ impl OperationJournalOwner {
         (owner, ready, release)
     }
 
-    #[cfg(test)]
-    fn start_with_worker_panic_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    /// Start an isolated real worker that panics on its first gated command.
+    /// No physical capacity or effect authority is installed by this fixture.
+    pub fn start_with_worker_panic_for_test(
         store: OperationJournalStore,
     ) -> (Self, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
         let ready = Arc::new(std::sync::Barrier::new(2));

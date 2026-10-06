@@ -2970,6 +2970,8 @@ fn drain_shutdown(
 
 #[cfg(test)]
 mod tests {
+    mod journal_shutdown;
+
     mod harvest_catalog_tests {
         use super::*;
         include!("harvest_catalog_tests.rs");
