@@ -594,6 +594,36 @@
       "retirement": "Remove with portable test seam; never enable it as production bootstrap."
     },
     {
+      "path": "crates/yield-session/src/tests/journal_shutdown.rs",
+      "function": "original_failure",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2366",
+      "reason": "Automated cfg(test) regression opens the original isolated profile journal after joining its initial worker, then reopens after actual Catalog/Global/journal teardown and profile reacquisition to prove child-lease release. No physical capacity, effect, retry, refund or settlement authority is installed.",
+      "retirement": "Remove these exact entries with the isolated original-owner final-join regression; never use fixture opens to bypass normal production bootstrap."
+    },
+    {
+      "path": "crates/yield-session/src/tests/journal_shutdown.rs",
+      "function": "original_failure",
+      "operation": "journal::start_with_worker_panic_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2366",
+      "reason": "Automated cfg(test) regression invokes the existing narrowly gated test-support constructor on the genuine retained journal Store. The real accepted worker command panics only after actual Closing; it grants no Native/capacity/effect authority or successful receipt.",
+      "retirement": "Remove with the original-worker final-join fixture or its test-support API; default production starts remain unchanged and fail closed."
+    },
+    {
+      "path": "crates/yield-session/src/tests/journal_shutdown.rs",
+      "function": "session_healthy_journal_shutdown_retains_repeat_success",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2366",
+      "reason": "Automated cfg(test) regression reopens the isolated original profile journal only after genuine public session shutdown and repeated success, proving release of its original child lease. It is in-process teardown evidence, not physical qualification or durable participant settlement.",
+      "retirement": "Remove this exact entry with the healthy repeated-shutdown regression; no runtime bootstrap exemption or permission is granted."
+    },
+    {
       "path": "crates/yield/src/logging.rs",
       "function": "new",
       "operation": "OpenOptions::create_new",

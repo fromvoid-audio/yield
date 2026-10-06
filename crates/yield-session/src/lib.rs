@@ -1426,11 +1426,23 @@ impl Persistence {
         // The journal worker owns a cloned profile guard and child lease. Stop it after all
         // ordinary writers and catalog/maintenance workers have stopped, but before the session's
         // final profile guard is dropped.
-        if let Some(mut journal) = self.journal.take() {
-            let _ = journal.shutdown();
-        }
+        let journal_result = if let Some(mut journal) = self.journal.take() {
+            if journal.shutdown() {
+                Ok(())
+            } else {
+                let reason = match journal.status() {
+                    OperationJournalOwnerStatus::Unavailable { reason } => reason,
+                    status => format!("final drain was unconfirmed ({status:?})"),
+                };
+                Err(SessionError::Persistence(format!(
+                    "operation journal shutdown was unconfirmed: {reason}"
+                )))
+            }
+        } else {
+            Ok(())
+        };
         self.writable.take();
-        global_result
+        global_result.and(journal_result)
     }
 }
 
@@ -2970,6 +2982,8 @@ fn drain_shutdown(
 
 #[cfg(test)]
 mod tests {
+    mod journal_shutdown;
+
     mod harvest_catalog_tests {
         use super::*;
         include!("harvest_catalog_tests.rs");
