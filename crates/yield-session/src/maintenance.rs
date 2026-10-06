@@ -380,6 +380,8 @@ struct MaintenanceJob {
 pub(crate) struct MaintenanceService {
     admission: Arc<MaintenanceAdmission>,
     active: Option<MaintenanceJob>,
+    #[cfg(test)]
+    completion_gate_for_test: Option<Arc<CompletionGateForTest>>,
 }
 
 impl MaintenanceService {
@@ -387,6 +389,8 @@ impl MaintenanceService {
         Self {
             admission,
             active: None,
+            #[cfg(test)]
+            completion_gate_for_test: None,
         }
     }
 
@@ -422,6 +426,8 @@ impl MaintenanceService {
         let thread_parts = parts.clone();
         let thread_result = result.clone();
         let id = parts.id;
+        #[cfg(test)]
+        let completion_gate = self.completion_gate_for_test.take();
         let thread = match thread::Builder::new()
             .name(String::from("yield-storage-maintenance"))
             .spawn(move || {
@@ -437,6 +443,10 @@ impl MaintenanceService {
                 };
                 let _ = thread_result.send(operation);
                 thread_parts.finish();
+                #[cfg(test)]
+                if let Some(gate) = completion_gate {
+                    gate.after_finish();
+                }
             }) {
             Ok(thread) => thread,
             Err(error) => {
@@ -492,6 +502,8 @@ impl MaintenanceService {
         let thread_parts = parts.clone();
         let thread_result = result.clone();
         let id = parts.id;
+        #[cfg(test)]
+        let completion_gate = self.completion_gate_for_test.take();
         let thread = match thread::Builder::new()
             .name(String::from("yield-cache-maintenance"))
             .spawn(move || {
@@ -504,6 +516,10 @@ impl MaintenanceService {
                 };
                 let _ = thread_result.send(operation);
                 thread_parts.finish();
+                #[cfg(test)]
+                if let Some(gate) = completion_gate {
+                    gate.after_finish();
+                }
             }) {
             Ok(thread) => thread,
             Err(error) => {
@@ -625,7 +641,88 @@ impl From<CacheMaintenanceError> for MaintenanceError {
 }
 
 #[cfg(test)]
+#[derive(Default)]
+struct CompletionGateStateForTest {
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+struct CompletionGateForTest {
+    state: Mutex<CompletionGateStateForTest>,
+    changed: std::sync::Condvar,
+    panic_after: bool,
+}
+
+#[cfg(test)]
+impl CompletionGateForTest {
+    fn after_finish(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.entered = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+        drop(state);
+        assert!(
+            !self.panic_after,
+            "original maintenance post-finish panic fixture"
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct CompletionControllerForTest {
+    gate: Arc<CompletionGateForTest>,
+}
+
+#[cfg(test)]
+impl CompletionControllerForTest {
+    pub(crate) fn wait_entered(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.gate.state.lock().unwrap();
+        while !state.entered {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            state = self.gate.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+        true
+    }
+
+    pub(crate) fn release(&self) {
+        self.gate.state.lock().unwrap().released = true;
+        self.gate.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for CompletionControllerForTest {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(test)]
+impl MaintenanceService {
+    pub(crate) fn arm_completion_for_test(
+        &mut self,
+        panic_after: bool,
+    ) -> CompletionControllerForTest {
+        assert!(self.completion_gate_for_test.is_none());
+        let gate = Arc::new(CompletionGateForTest {
+            state: Mutex::new(CompletionGateStateForTest::default()),
+            changed: std::sync::Condvar::new(),
+            panic_after,
+        });
+        self.completion_gate_for_test = Some(Arc::clone(&gate));
+        CompletionControllerForTest { gate }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    mod worker_custody;
     use super::*;
     use std::sync::mpsc;
 
