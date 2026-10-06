@@ -186,6 +186,9 @@ const CREATE_FULL_PROGRESS_TABLE: &str = "CREATE TABLE operation_journal_full_pr
 /// Errors returned by the profile-owned operation journal store.
 #[derive(Debug, Error)]
 pub enum OperationJournalStoreError {
+    /// Complete ordinary claim/release backing cannot fit the original queued pool.
+    #[error("ordinary claim rebuild resource envelope exceeded")]
+    OrdinaryRebuildResourceBound,
     /// Historical claim observation cannot fit the original queued command's pool.
     #[error("historical claim observation resource envelope exceeded")]
     HistoricalClaimResourceBound,
@@ -9803,6 +9806,7 @@ impl From<EncodeError> for OperationJournalStoreError {
 mod tests {
     include!("store/historical_claim_observation_tests.rs");
     include!("store/current_reserve_binding_bounds_tests.rs");
+    include!("store/ordinary_rebuild_backing_tests.rs");
     include!("store/database_claims_tests.rs");
     include!("store/recording_retention_tests.rs");
     include!("store/record_materialization_tests.rs");

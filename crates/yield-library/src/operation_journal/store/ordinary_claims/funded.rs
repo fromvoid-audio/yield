@@ -55,6 +55,9 @@ impl From<OperationJournalStoreError> for FailureKind {
             OperationJournalStoreError::Sql(error) => {
                 Self::Original(OrdinaryClaimReadError::Sql(error))
             }
+            OperationJournalStoreError::HistoricalClaimResourceBound => {
+                Self::Refused(OperationJournalStoreError::OrdinaryRebuildResourceBound)
+            }
             error => Self::Refused(error),
         }
     }

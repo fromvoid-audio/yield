@@ -54,7 +54,9 @@ impl Collection {
             + 3 * size_of::<InputPermit>()
             + 2 * size_of::<String>()
             + 2 * "ordinary claim rebuild count is not a nonnegative SQLite integer".len();
-        let sql = input.reserve_historical_scratch(sql_bytes)?;
+        let sql = input
+            .reserve_historical_scratch(sql_bytes)
+            .map_err(resource_error)?;
         let native_error = RefCell::new(None);
         let result = (|| {
             let claims = count(
@@ -81,8 +83,10 @@ impl Collection {
         // A full pinned internal BTree node per entry covers sparse occupancy,
         // with all claim/release/conflict maps live alongside input/output Vecs.
         let bytes = collection_bytes(claims, releases)
-            .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
-        let credit = input.reserve_historical_scratch(bytes)?;
+            .ok_or(OperationJournalStoreError::OrdinaryRebuildResourceBound)?;
+        let credit = input
+            .reserve_historical_scratch(bytes)
+            .map_err(resource_error)?;
         Ok(Self {
             claims,
             _credit: credit,
@@ -107,7 +111,7 @@ fn count(
             reason: "ordinary claim rebuild count is not a nonnegative SQLite integer".into(),
         });
     };
-    usize::try_from(value).map_err(|_| OperationJournalStoreError::HistoricalClaimResourceBound)
+    usize::try_from(value).map_err(|_| OperationJournalStoreError::OrdinaryRebuildResourceBound)
 }
 fn node<K, V>() -> usize {
     12 * size_of::<(K, V)>() + 12 * size_of::<usize>() + 4 * size_of::<usize>()
@@ -148,4 +152,13 @@ fn collection_bytes(claims: usize, releases: usize) -> Option<usize> {
         .checked_add(headers)?
         .checked_add(page_headers)?
         .checked_add(text)
+}
+
+fn resource_error(error: OperationJournalStoreError) -> OperationJournalStoreError {
+    match error {
+        OperationJournalStoreError::HistoricalClaimResourceBound => {
+            OperationJournalStoreError::OrdinaryRebuildResourceBound
+        }
+        other => other,
+    }
 }
