@@ -199,8 +199,8 @@ mod exact_database_claim_persistence {
     // synthetic observations, not live all-owner reservations or physical permission.
     #[test]
     fn recording_controls_and_database_inventory_share_one_atomic_initial_settlement() {
-        use crate::operation_journal::recording_commands::{
-            controls::{ControlRole, RecordingControlReservation},
+        use crate::operation_journal::recording_commands::controls::{
+            ControlRole, RecordingControlReservation,
         };
         for fault in 0..5 {
             let f = fixture();

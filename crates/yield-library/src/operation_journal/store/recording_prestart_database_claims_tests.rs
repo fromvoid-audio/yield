@@ -105,7 +105,16 @@ fn recording_database_image(store: &OperationJournalStore) -> Vec<String> {
         "SELECT slice_id || ':' || operation_id || ':' || binding_id || ':' || claim_id || ':' || participant_id || ':' || direction || ':' || class || ':' || ceiling || ':' || wal_ceiling || ':' || shm_ceiling FROM operation_journal_database_claim_slice ORDER BY slice_id",
         "SELECT chunk_id || ':' || operation_id || ':' || slot || ':' || hex(record) FROM operation_journal_recording_chunks ORDER BY chunk_id",
     ] {
-        image.extend(store.connection.prepare(query).unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap());
+        image.extend(
+            store
+                .connection
+                .prepare(query)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
     }
     image
 }
@@ -132,15 +141,30 @@ fn recording_prestart_database_claims_shape_refuses_before_original_inventory_co
         let f = fixture();
         let store = OperationJournalStore::open(&f.owner).unwrap();
         persist_recording_database_fixture(&store, &f.owner);
-        store.connection.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
         match corrupt {
-            "oversized" => { store.connection.execute("UPDATE operation_journal_database_binding SET inventory=zeroblob(65537) WHERE ordinal=0", []).unwrap(); },
-            "lease_version" => { store.connection.execute("UPDATE operation_journal_database_binding SET inventory=CAST(X'595743420200' || substr(inventory,7) AS BLOB) WHERE ordinal=0", []).unwrap(); },
-            _ => { store.connection.execute("UPDATE operation_journal_database_binding SET inventory='retained unsupported text' WHERE ordinal=0", []).unwrap(); },
+            "oversized" => {
+                store.connection.execute("UPDATE operation_journal_database_binding SET inventory=zeroblob(65537) WHERE ordinal=0", []).unwrap();
+            }
+            "lease_version" => {
+                store.connection.execute("UPDATE operation_journal_database_binding SET inventory=CAST(X'595743420200' || substr(inventory,7) AS BLOB) WHERE ordinal=0", []).unwrap();
+            }
+            _ => {
+                store.connection.execute("UPDATE operation_journal_database_binding SET inventory='retained unsupported text' WHERE ordinal=0", []).unwrap();
+            }
         }
         let before = recording_database_image(&store);
         database_claims::INVENTORY_COPIED_BYTES.with(|n| n.set(0));
-        assert!(matches!(store.begin_recording_prestart_read(), Err(OperationJournalStoreError::RecordingPrestartResourceBound)), "{corrupt}");
+        assert!(
+            matches!(
+                store.begin_recording_prestart_read(),
+                Err(OperationJournalStoreError::RecordingPrestartResourceBound)
+            ),
+            "{corrupt}"
+        );
         database_claims::INVENTORY_COPIED_BYTES.with(|n| assert_eq!(n.get(), 0, "{corrupt}"));
         assert!(store.connection.is_autocommit());
         assert_eq!(recording_database_image(&store), before);
@@ -149,26 +173,54 @@ fn recording_prestart_database_claims_shape_refuses_before_original_inventory_co
 
 #[test]
 fn recording_prestart_database_claims_semantic_refusal_preserves_all_evidence() {
-    for corrupt in ["missing_slice", "changed_slice", "wrong_digest", "released_claim", "cross_operation"] {
+    for corrupt in [
+        "missing_slice",
+        "changed_slice",
+        "wrong_digest",
+        "released_claim",
+        "cross_operation",
+    ] {
         let f = fixture();
         let store = OperationJournalStore::open(&f.owner).unwrap();
         persist_recording_database_fixture(&store, &f.owner);
         match corrupt {
-            "missing_slice" => { store.connection.execute("DELETE FROM operation_journal_database_claim_slice WHERE slice_id=(SELECT slice_id FROM operation_journal_database_claim_slice LIMIT 1)", []).unwrap(); },
-            "changed_slice" => { store.connection.execute("UPDATE operation_journal_database_claim_slice SET slice_id=?1 WHERE slice_id=(SELECT slice_id FROM operation_journal_database_claim_slice LIMIT 1)", [Uuid::new_v4().to_string()]).unwrap(); },
-            "wrong_digest" => { store.connection.execute("UPDATE operation_journal_database_binding SET inventory_digest=zeroblob(32)", []).unwrap(); },
-            "released_claim" => { store.connection.execute("INSERT INTO operation_journal_ordinary_claim_release(claim_id,operation_id,release_id) SELECT claim_id,operation_id,?1 FROM operation_journal_database_claim_slice LIMIT 1", [Uuid::new_v4().to_string()]).unwrap(); },
+            "missing_slice" => {
+                store.connection.execute("DELETE FROM operation_journal_database_claim_slice WHERE slice_id=(SELECT slice_id FROM operation_journal_database_claim_slice LIMIT 1)", []).unwrap();
+            }
+            "changed_slice" => {
+                store.connection.execute("UPDATE operation_journal_database_claim_slice SET slice_id=?1 WHERE slice_id=(SELECT slice_id FROM operation_journal_database_claim_slice LIMIT 1)", [Uuid::new_v4().to_string()]).unwrap();
+            }
+            "wrong_digest" => {
+                store.connection.execute("UPDATE operation_journal_database_binding SET inventory_digest=zeroblob(32)", []).unwrap();
+            }
+            "released_claim" => {
+                store.connection.execute("INSERT INTO operation_journal_ordinary_claim_release(claim_id,operation_id,release_id) SELECT claim_id,operation_id,?1 FROM operation_journal_database_claim_slice LIMIT 1", [Uuid::new_v4().to_string()]).unwrap();
+            }
             _ => {
-                let proposal = crate::operation_journal::recording_commands::recording_proposal_for_test(2,100);
-                store.insert_intent(&finite_recording_record(&proposal)).unwrap();
-                store.connection.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+                let proposal =
+                    crate::operation_journal::recording_commands::recording_proposal_for_test(
+                        2, 100,
+                    );
+                store
+                    .insert_intent(&finite_recording_record(&proposal))
+                    .unwrap();
+                store
+                    .connection
+                    .execute_batch("PRAGMA foreign_keys=OFF")
+                    .unwrap();
                 store.connection.execute("UPDATE operation_journal_database_claim_slice SET operation_id=?1 WHERE slice_id=(SELECT slice_id FROM operation_journal_database_claim_slice LIMIT 1)", [proposal.operation_id().to_string()]).unwrap();
-                store.connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
-            },
+                store
+                    .connection
+                    .execute_batch("PRAGMA foreign_keys=ON")
+                    .unwrap();
+            }
         }
         let before = recording_database_image(&store);
         store.begin_recording_prestart_read().unwrap();
-        assert!(store.rebuild_recording_prestart_snapshot().is_err(), "{corrupt}");
+        assert!(
+            store.rebuild_recording_prestart_snapshot().is_err(),
+            "{corrupt}"
+        );
         store.finish_recording_prestart_read().unwrap();
         assert_eq!(recording_database_image(&store), before, "{corrupt}");
     }
