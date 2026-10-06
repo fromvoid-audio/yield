@@ -67,6 +67,9 @@ pub use source_wal_preparation::{
 };
 mod command_metrics;
 mod shutdown;
+#[cfg(test)]
+#[path = "tests/idle_wal_maintenance.rs"]
+mod idle_wal_maintenance_tests;
 pub use command_metrics::{CatalogCommandMetrics, CatalogDurationMetrics};
 use shutdown::WorkerJoinState;
 pub use shutdown::{CatalogThreadJoinOutcome, CatalogThreadShutdownReport};
