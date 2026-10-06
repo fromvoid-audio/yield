@@ -259,6 +259,16 @@ pub(crate) fn close(slot: &Arc<Mutex<CatalogSlot>>) {
     slot.status = CatalogStatus::Closed;
 }
 
+#[cfg(test)]
+pub(crate) fn original_service_for_test(
+    slot: &Arc<Mutex<CatalogSlot>>,
+) -> Option<Arc<CatalogService>> {
+    slot.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .service
+        .clone()
+}
+
 pub(crate) fn mark_unavailable(slot: &Arc<Mutex<CatalogSlot>>, reason: String) {
     let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if !matches!(slot.status, CatalogStatus::Closed) {

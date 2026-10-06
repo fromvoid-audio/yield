@@ -5,6 +5,111 @@ use crate::{AdmissionState, CatalogError, CatalogService, SourceId};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+/// Refusal to arm the single original-worker panic fixture.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum WorkerPanicError {
+    /// The original service is closing or closed.
+    #[error("original catalog worker is closing")]
+    Closed,
+    /// The service already retains a panic fixture.
+    #[error("original catalog worker panic slot is occupied")]
+    Occupied,
+}
+
+#[derive(Default)]
+struct WorkerPanicFlags {
+    entered: bool,
+    released: bool,
+}
+
+pub(crate) struct WorkerPanicState {
+    flags: Mutex<WorkerPanicFlags>,
+    wake: std::sync::Condvar,
+}
+
+/// A bounded gate for one panic on the original worker, outside its control locks.
+/// Dropping the gate releases the worker even when the fixture assertion fails.
+pub struct OriginalWorkerPanic {
+    state: Arc<WorkerPanicState>,
+    admission: Arc<Mutex<AdmissionState>>,
+}
+
+impl OriginalWorkerPanic {
+    /// Wait a bounded time for the original worker to enter the gate.
+    pub fn wait_entered(&self, timeout: std::time::Duration) -> bool {
+        let flags = self.state.flags.lock().unwrap_or_else(|e| e.into_inner());
+        let (flags, _) = self
+            .state
+            .wake
+            .wait_timeout_while(flags, timeout, |s| !s.entered)
+            .unwrap_or_else(|e| e.into_inner());
+        flags.entered
+    }
+
+    /// Observe real original admission cancellation, without changing it.
+    pub fn shutdown_requested(&self) -> bool {
+        let state = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        state.shutdown || state.closed
+    }
+
+    /// Release the original worker to panic; this operation is idempotent.
+    pub fn release(&self) {
+        self.state
+            .flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .released = true;
+        self.state.wake.notify_all();
+    }
+}
+
+impl Drop for OriginalWorkerPanic {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl CatalogService {
+    /// Arm one panic at the next original worker loop boundary, before ordinary work.
+    /// This fixture neither supplies ownership nor bypasses production admission.
+    pub fn arm_original_worker_panic(&self) -> Result<OriginalWorkerPanic, WorkerPanicError> {
+        let mut admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if admission.shutdown || admission.closed {
+            return Err(WorkerPanicError::Closed);
+        }
+        if admission.worker_panic.is_some() {
+            return Err(WorkerPanicError::Occupied);
+        }
+        let state = Arc::new(WorkerPanicState {
+            flags: Mutex::new(WorkerPanicFlags::default()),
+            wake: std::sync::Condvar::new(),
+        });
+        admission.worker_panic = Some(Arc::clone(&state));
+        Ok(OriginalWorkerPanic {
+            state,
+            admission: Arc::clone(&self.admission),
+        })
+    }
+}
+
+pub(crate) fn original_worker_failure(admission: &Arc<Mutex<AdmissionState>>) {
+    let fault = admission
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .worker_panic
+        .clone();
+    if let Some(fault) = fault {
+        let mut flags = fault.flags.lock().unwrap_or_else(|e| e.into_inner());
+        flags.entered = true;
+        fault.wake.notify_all();
+        while !flags.released {
+            flags = fault.wake.wait(flags).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(flags);
+        panic!("test-support: original catalog worker panicked");
+    }
+}
+
 /// Maximum retained UTF-8 source identity bytes in the single service-local fault slot.
 pub const MAX_COMPOUND_FAULT_SOURCE_BYTES: usize = 256;
 

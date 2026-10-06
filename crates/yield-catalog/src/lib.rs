@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -66,7 +66,10 @@ pub use source_wal_preparation::{
     CatalogSourceWalRequest, CatalogSourceWalStatus,
 };
 mod command_metrics;
+mod shutdown;
 pub use command_metrics::{CatalogCommandMetrics, CatalogDurationMetrics};
+use shutdown::WorkerJoinState;
+pub use shutdown::{CatalogThreadJoinOutcome, CatalogThreadShutdownReport};
 
 mod curation;
 mod curation_tag_facts;
@@ -230,6 +233,7 @@ impl CatalogTestGate {
         }
         state.at_boundary = false;
     }
+    #[cfg(target_os = "linux")]
     fn arm_feature_terminal(&self) -> CatalogTestFeatureTerminalPause<'_> {
         self.feature_terminal_state
             .lock()
@@ -401,11 +405,11 @@ impl CatalogTestGate {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 struct CatalogTestFeatureTerminalPause<'a> {
     gate: &'a CatalogTestGate,
 }
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl CatalogTestFeatureTerminalPause<'_> {
     fn wait_until_entered(&self) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -429,7 +433,7 @@ impl CatalogTestFeatureTerminalPause<'_> {
         }
     }
 }
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for CatalogTestFeatureTerminalPause<'_> {
     fn drop(&mut self) {
         self.gate
@@ -2214,6 +2218,8 @@ struct AdmissionState {
     queued_commands: usize,
     #[cfg(feature = "test-support")]
     compound_batch_fault: Option<test_support::CompoundBatchFault>,
+    #[cfg(feature = "test-support")]
+    worker_panic: Option<Arc<test_support::WorkerPanicState>>,
     feature_analysis_metrics: FeatureAnalysisMetrics,
     command_metrics: command_metrics::CommandMetrics,
     shutdown: bool,
@@ -2235,6 +2241,8 @@ impl AdmissionState {
         Self {
             #[cfg(feature = "test-support")]
             compound_batch_fault: None,
+            #[cfg(feature = "test-support")]
+            worker_panic: None,
             retained_harvest: Default::default(),
             source_wal,
             source_wal_inbox: Some(source_wal_inbox),
@@ -3650,7 +3658,7 @@ pub struct CatalogService {
     commands: SyncSender<QueuedCatalogCommand>,
     events: Arc<EventHub>,
     admission: Arc<Mutex<AdmissionState>>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<WorkerJoinState>,
 }
 
 impl CatalogService {
@@ -3758,7 +3766,7 @@ impl CatalogService {
             commands,
             events,
             admission,
-            worker: Mutex::new(Some(worker)),
+            worker: Mutex::new(WorkerJoinState::new(Some(worker))),
         })
     }
 
@@ -4038,25 +4046,6 @@ impl CatalogService {
             .tag_read_payload_bytes
             .saturating_sub(tag_read_payload_bytes);
     }
-
-    /// Request cancellation and synchronously join the worker.
-    pub fn shutdown(&self) {
-        {
-            let mut admission = self
-                .admission
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !admission.shutdown && !admission.closed {
-                admission.shutdown = true;
-                admission.invalidate_all();
-            }
-        }
-        if let Ok(mut worker) = self.worker.lock()
-            && let Some(worker) = worker.take()
-        {
-            let _ = worker.join();
-        }
-    }
 }
 
 impl Drop for CatalogService {
@@ -4109,6 +4098,8 @@ fn run_worker_with_sources(
     let mut deferred = VecDeque::<QueuedCatalogCommand>::new();
     let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
     loop {
+        #[cfg(feature = "test-support")]
+        test_support::original_worker_failure(&admission);
         preparations.poll(&admission, &mut sources);
         let closing = admission_state(&admission, |state| state.shutdown || state.closed);
         if closing {
@@ -8408,6 +8399,7 @@ mod tests {
     }
 
     include!("index_pages_tests.rs");
+    #[cfg(target_os = "linux")]
     include!("index_reveal_tests.rs");
 
     #[test]
@@ -10830,7 +10822,7 @@ mod tests {
             commands,
             events: Arc::clone(&hub),
             admission: Arc::clone(&admission),
-            worker: Mutex::new(None),
+            worker: Mutex::new(WorkerJoinState::new(None)),
         };
         let terminal_credits = (17, 3, 11);
         {
@@ -11025,7 +11017,7 @@ mod tests {
             commands,
             events: Arc::clone(&hub),
             admission: Arc::clone(&admission),
-            worker: Mutex::new(None),
+            worker: Mutex::new(WorkerJoinState::new(None)),
         };
         assert!(matches!(
             service.recv_event_timeout(Duration::ZERO),

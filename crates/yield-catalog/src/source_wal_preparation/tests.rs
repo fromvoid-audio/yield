@@ -239,7 +239,7 @@ mod integration {
                     commands,
                     events,
                     admission,
-                    worker: Mutex::new(Some(worker)),
+                    worker: Mutex::new(crate::shutdown::WorkerJoinState::new(Some(worker))),
                 },
                 revisions,
                 lease_inputs,

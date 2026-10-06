@@ -634,6 +634,36 @@
       "retirement": "Remove with portable test seam; never enable it as production bootstrap."
     },
     {
+      "path": "crates/yield-session/src/tests/catalog_shutdown.rs",
+      "function": "original_failure",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2370",
+      "reason": "Automated cfg(test) regression uses only its isolated temporary original profile journal. It opens the genuine original worker for the simultaneous Journal/Catalog failure case and reopens after all real owner joins to verify child-lease release. No production effect or settlement authority.",
+      "retirement": "Remove this exact entry with the original-thread shutdown regression; no runtime bootstrap exemption or permission is granted."
+    },
+    {
+      "path": "crates/yield-session/src/tests/catalog_shutdown.rs",
+      "function": "original_failure",
+      "operation": "journal::start_with_worker_panic_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2370",
+      "reason": "Automated cfg(test) simultaneous failure regression starts the genuine original journal worker on its isolated temporary profile store, parks an accepted command and releases only after real Closing. Original worker panic grants no successful receipt or physical capacity.",
+      "retirement": "Remove this exact entry with the original-thread shutdown regression; no runtime bootstrap exemption or permission is granted."
+    },
+    {
+      "path": "crates/yield-session/src/tests/catalog_shutdown.rs",
+      "function": "public_session_caches_original_catalog_failure_after_join",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2370",
+      "reason": "Automated cfg(test) public session Catalog failure/repeated-error regression reopens its isolated original journal only after genuine remaining owner joins, proving original child-lease release. No physical qualification or durable Source settlement.",
+      "retirement": "Remove this exact entry with the original-thread shutdown regression; no runtime bootstrap exemption or permission is granted."
+    },
+    {
       "path": "crates/yield-session/src/tests/journal_shutdown.rs",
       "function": "original_failure",
       "operation": "journal::open",
