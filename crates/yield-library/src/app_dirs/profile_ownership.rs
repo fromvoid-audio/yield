@@ -528,6 +528,14 @@ impl LegacyAppRootBacking {
 pub(crate) fn open_legacy_canonical_app_root(
     proof: &crate::sample_sources::db::LegacyReserveUseProof<'_>,
 ) -> Result<(PathBuf, Dir), LegacyAppRootBacking> {
+    open_source_canonical_app_root(&crate::operation_journal::ReserveBootstrapUseProof::Legacy(
+        proof,
+    ))
+}
+
+pub(crate) fn open_source_canonical_app_root(
+    proof: &crate::operation_journal::ReserveBootstrapUseProof<'_, '_>,
+) -> Result<(PathBuf, Dir), LegacyAppRootBacking> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = proof;
@@ -563,7 +571,7 @@ pub(crate) fn open_legacy_canonical_app_root(
             let app = match parent.open_dir_nofollow(super::APP_DIR_NAME) {
                 Ok(app) => app,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    proof.validate_for_bootstrap().map_err(|_| ())?;
+                    let effect = proof.begin_effect()?;
                     parent
                         .create_dir(super::APP_DIR_NAME)
                         .or_else(|e| {
@@ -579,8 +587,10 @@ pub(crate) fn open_legacy_canonical_app_root(
                         .open_dir_nofollow(super::APP_DIR_NAME)
                         .map_err(|_| ())?;
                     backing.child = Some(app);
-                    proof.validate_for_bootstrap().map_err(|_| ())?;
+                    drop(effect);
+                    let effect = proof.begin_effect()?;
                     sync_directory(parent, &support_path).map_err(|_| ())?;
+                    drop(effect);
                     backing.child.take().unwrap()
                 }
                 Err(_) => return Err(()),

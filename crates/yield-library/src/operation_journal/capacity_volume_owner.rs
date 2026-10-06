@@ -44,8 +44,12 @@ mod current_source;
 mod windows_lock;
 pub(super) use current_source::validate_current_source_scope;
 
+mod bootstrap_use;
+pub(crate) use bootstrap_use::ReserveBootstrapUseProof;
 mod legacy_bootstrap;
-pub(super) use legacy_bootstrap::{LegacyVolumeFailureBacking, acquire_legacy_for_descriptor};
+pub(super) use legacy_bootstrap::{
+    LegacyVolumeFailureBacking, acquire_current_for_scope, acquire_legacy_for_descriptor,
+};
 
 /// This capability can only be used for recovery coordination in this milestone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

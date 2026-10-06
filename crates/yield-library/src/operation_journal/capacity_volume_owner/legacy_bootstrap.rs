@@ -1,6 +1,10 @@
 //! Sealed pre-lease bootstrap; failure backing cannot become an ownership capability.
+use super::bootstrap_use::ReserveBootstrapUseProof;
 use super::*;
-use crate::app_dirs::{LegacyAppRootBacking, open_legacy_canonical_app_root};
+use crate::app_dirs::{
+    LegacyAppRootBacking, open_legacy_canonical_app_root, open_source_canonical_app_root,
+};
+use crate::sample_sources::db::CurrentReserveUseProof;
 use crate::sample_sources::db::LegacyReserveUseProof;
 
 #[derive(Default)]
@@ -72,6 +76,44 @@ fn acquire_legacy_inner(
     #[cfg(test)] fault: Option<TestFault>,
 ) -> Result<VolumeOwnershipCapability, LegacyVolumeFailureBacking> {
     let mut backing = LegacyVolumeFailureBacking::default();
+    acquire_bootstrap_inner(
+        descriptor,
+        profile,
+        &ReserveBootstrapUseProof::Legacy(proof),
+        &mut backing,
+        #[cfg(test)]
+        fixture_app,
+        #[cfg(test)]
+        fault,
+    )
+    .map_err(|()| backing)
+}
+
+/// Current callers supply only a sealed internally-derived scope and preinstalled actor backing.
+pub(super) fn acquire_current_for_scope(
+    scope: &CurrentReserveUseProof<'_>,
+    backing: &mut LegacyVolumeFailureBacking,
+) -> Result<VolumeOwnershipCapability, ()> {
+    acquire_bootstrap_inner(
+        scope.descriptor(),
+        scope.profile(),
+        &ReserveBootstrapUseProof::Current(scope),
+        backing,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn acquire_bootstrap_inner(
+    descriptor: &File,
+    profile: &WritableProfileGuard,
+    proof: &ReserveBootstrapUseProof<'_, '_>,
+    backing: &mut LegacyVolumeFailureBacking,
+    #[cfg(test)] fixture_app: Option<(PathBuf, Dir)>,
+    #[cfg(test)] fault: Option<TestFault>,
+) -> Result<VolumeOwnershipCapability, ()> {
     let result = (|| {
         proof.validate_for_bootstrap().map_err(|_| ())?;
         profile.validate_current().map_err(|_| ())?;
@@ -82,10 +124,14 @@ fn acquire_legacy_inner(
             backing.binding =
                 Some(MacVolumeBinding::acquire(descriptor, &facts.identity).map_err(|_| ())?);
         }
+        let open_app = || match proof {
+            ReserveBootstrapUseProof::Legacy(source) => open_legacy_canonical_app_root(source),
+            ReserveBootstrapUseProof::Current(_) => open_source_canonical_app_root(proof),
+        };
         #[cfg(test)]
-        let opened = fixture_app.map_or_else(|| open_legacy_canonical_app_root(proof), Ok);
+        let opened = fixture_app.map_or_else(open_app, Ok);
         #[cfg(not(test))]
-        let opened = open_legacy_canonical_app_root(proof);
+        let opened = open_app();
         let (app_path, app) = match opened {
             Ok(app) => app,
             Err(failure) => {
@@ -104,7 +150,7 @@ fn acquire_legacy_inner(
         let registry = match app.open_dir_nofollow(REGISTRY_DIRECTORY_NAME) {
             Ok(dir) => dir,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                proof.validate_for_bootstrap().map_err(|_| ())?;
+                let effect = proof.begin_effect()?;
                 app.create_dir(REGISTRY_DIRECTORY_NAME)
                     .or_else(|e| {
                         if e.kind() == io::ErrorKind::AlreadyExists {
@@ -114,8 +160,11 @@ fn acquire_legacy_inner(
                         }
                     })
                     .map_err(|_| ())?;
-                app.open_dir_nofollow(REGISTRY_DIRECTORY_NAME)
-                    .map_err(|_| ())?
+                let opened = app
+                    .open_dir_nofollow(REGISTRY_DIRECTORY_NAME)
+                    .map_err(|_| ())?;
+                drop(effect);
+                opened
             }
             Err(_) => return Err(()),
         };
@@ -130,8 +179,9 @@ fn acquire_legacy_inner(
         if registry.identity.capacity() > MAX_IDENTITY_BYTES {
             return Err(());
         }
-        proof.validate_for_bootstrap().map_err(|_| ())?;
+        let effect = proof.begin_effect()?;
         sync_directory(app, &app_path).map_err(|_| ())?;
+        drop(effect);
         registry.validate().map_err(|_| ())?;
         let name = lock_file_name(&facts.identity).map_err(|_| ())?;
         let lock_path = registry.path.join(&name);
@@ -144,7 +194,7 @@ fn acquire_legacy_inner(
             .write(true)
             .create(true)
             .follow(FollowSymlinks::No);
-        proof.validate_for_bootstrap().map_err(|_| ())?;
+        let effect = proof.begin_effect()?;
         backing.lock = Some(
             registry
                 .capability
@@ -152,19 +202,23 @@ fn acquire_legacy_inner(
                 .map_err(|_| ())?
                 .into_std(),
         );
+        drop(effect);
         #[cfg(test)]
         if fault == Some(TestFault::AfterLock) {
             return Err(());
         }
         let lock = backing.lock.as_ref().unwrap();
         validate_lock_file(lock, &lock_path).map_err(|_| ())?;
-        proof.validate_for_bootstrap().map_err(|_| ())?;
+        let effect = proof.begin_effect()?;
         sync_directory(&registry.capability, &registry.path).map_err(|_| ())?;
+        drop(effect);
         let lock_identity = identity_from_file(lock).ok_or(())?;
         if lock_identity.capacity() > MAX_IDENTITY_BYTES {
             return Err(());
         }
+        let effect = proof.begin_effect()?;
         try_exclusive_lock(lock, &lock_path).map_err(|_| ())?;
+        drop(effect);
         #[cfg(target_os = "macos")]
         backing
             .binding
@@ -220,13 +274,13 @@ fn acquire_legacy_inner(
         }
         Ok(capability)
     })();
-    result.map_err(|()| backing)
+    result
 }
 
 fn write_sealed_marker(
     file: &mut File,
     marker: &OwnershipMarker,
-    proof: &LegacyReserveUseProof<'_>,
+    proof: &ReserveBootstrapUseProof<'_, '_>,
 ) -> Result<(), ()> {
     let contents = format!(
         "version={MARKER_VERSION}\nstate=dirty\nowner_profile_identity={}\ngeneration={}\n",
@@ -235,20 +289,24 @@ fn write_sealed_marker(
     if contents.len() > MAX_MARKER_BYTES {
         return Err(());
     }
-    proof.validate_for_bootstrap().map_err(|_| ())?;
+    let effect = proof.begin_effect()?;
     file.set_len(0).map_err(|_| ())?;
+    drop(effect);
     file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
     let mut pending = contents.as_bytes();
     while !pending.is_empty() {
-        proof.validate_for_bootstrap().map_err(|_| ())?;
+        let effect = proof.begin_effect()?;
         let n = file.write(pending).map_err(|_| ())?;
+        drop(effect);
         if n == 0 {
             return Err(());
         }
         pending = &pending[n..];
     }
-    proof.validate_for_bootstrap().map_err(|_| ())?;
-    file.sync_all().map_err(|_| ())
+    let effect = proof.begin_effect()?;
+    file.sync_all().map_err(|_| ())?;
+    drop(effect);
+    proof.validate_for_bootstrap()
 }
 
 #[cfg(test)]
@@ -262,6 +320,83 @@ mod tests {
             test_runtime::TestRuntimeGuard,
         };
         use std::time::{Duration, Instant};
+
+        #[test]
+        fn current_original_bootstrap_retains_real_dirty_prefix_and_lock_until_capsule_drop() {
+            let _test = TestRuntimeGuard::acquire();
+            let app_root = tempfile::tempdir().unwrap();
+            let _app_root = AppRootGuard::set(app_root.path().to_owned()).unwrap();
+            let profile = WritableProfileGuard::acquire_current().unwrap();
+            let media = tempfile::tempdir().unwrap();
+            let db = tempfile::tempdir().unwrap();
+            let source = SourceDatabase::open_for_source_write_with_profile_guard(
+                media.path(),
+                &profile,
+                db.path(),
+            )
+            .unwrap();
+            let (request, guard) = source.prepare_source_authority().unwrap().split();
+            let proof = request
+                .accept_confirmation(guard.confirm().unwrap())
+                .unwrap();
+            let scope = request
+                .reserve_use(request.media_root(), &proof, &profile)
+                .unwrap();
+            let volume = descriptor_capacity_facts(scope.descriptor())
+                .unwrap()
+                .identity;
+            let name = lock_file_name(&volume).unwrap();
+            for fault in [
+                TestFault::AfterLock,
+                TestFault::AfterMarker,
+                TestFault::FinalValidation,
+            ] {
+                let app = tempfile::tempdir().unwrap();
+                let dir = open_no_follow_directory(app.path()).unwrap();
+                let mut backing = LegacyVolumeFailureBacking::default();
+                assert!(
+                    acquire_bootstrap_inner(
+                        scope.descriptor(),
+                        &profile,
+                        &ReserveBootstrapUseProof::Current(&scope),
+                        &mut backing,
+                        Some((app.path().to_owned(), dir)),
+                        Some(fault)
+                    )
+                    .is_err()
+                );
+                let path = app.path().join(REGISTRY_DIRECTORY_NAME).join(&name);
+                let original = std::fs::read(&path).unwrap();
+                let held = backing
+                    .lock
+                    .as_ref()
+                    .or_else(|| backing.failed_owner.as_ref().map(|owner| &owner.lock_file))
+                    .unwrap();
+                assert_eq!(
+                    identity_from_file(held),
+                    identity_from_file(&File::open(&path).unwrap())
+                );
+                assert!(
+                    backing.metadata_bytes() > std::mem::size_of::<LegacyVolumeFailureBacking>()
+                );
+                if fault != TestFault::AfterLock {
+                    assert!(String::from_utf8_lossy(&original).contains("state=dirty"));
+                    let contender = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&path)
+                        .unwrap();
+                    assert!(contender.try_lock().is_err());
+                    drop(backing);
+                    contender.try_lock().unwrap();
+                } else {
+                    assert!(original.is_empty());
+                    drop(backing);
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                scope.validate_for_bootstrap().unwrap();
+            }
+        }
 
         #[test]
         fn original_sealed_bootstrap_retains_exact_lock_and_registry_at_each_refused_prefix() {

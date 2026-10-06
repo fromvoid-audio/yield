@@ -25,6 +25,7 @@ pub use profile::{PersistenceMode, PersistenceProfileGuard, ResolvedPersistence}
 pub(crate) use profile_ownership::{
     LegacyAppRootBacking, PROFILE_OWNER_LOCK_FILE_NAME, ProfileChildLease,
     open_canonical_global_app_root, open_legacy_canonical_app_root, open_no_follow_directory,
+    open_source_canonical_app_root,
 };
 pub use profile_ownership::{ProfileOwnershipError, WritableProfileGuard};
 pub use resolution::{

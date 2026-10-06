@@ -17,6 +17,7 @@ use historical_reply::HistoricalReply;
 mod queue_metrics;
 pub use queue_metrics::{JournalQueueClassMetrics, JournalQueueMetricsSnapshot};
 use queue_metrics::{QueueMetrics, QueueTicket};
+mod current_source_metadata;
 mod legacy_adoption_custody;
 mod legacy_adoption_volumes;
 mod recording_binding;
@@ -1077,10 +1078,12 @@ fn record_owner_runtime_drop_observation(
 }
 
 struct SourceVolumeBinding {
+    _current_reserve_failure: super::store::LegacyReserveFailureSink,
     #[allow(dead_code)]
     reserve: Option<OwnedReserveAllocation>,
     #[allow(dead_code)]
     owner: Option<VolumeOwnershipCapability>,
+    _current_volume_failure: super::capacity_volume_owner::LegacyVolumeFailureBacking,
     // Original selected source ancestor closes after all native children and ownership backing.
     _current_root: Option<crate::sample_sources::db::BoundDatabaseRoot>,
     allocation_unit: Option<u64>,
@@ -3366,6 +3369,8 @@ impl OwnerRuntime {
                     reserve: None,
                     owner: None,
                     _current_root: None,
+                    _current_volume_failure: Default::default(),
+                    _current_reserve_failure: Default::default(),
                     allocation_unit: None,
                     readiness: SourceVolumeBindingReadiness::Incomplete,
                     registrations: BTreeSet::new(),
@@ -3462,21 +3467,26 @@ impl OwnerRuntime {
                     proof.take(),
                 );
             }
-            let owner =
-                match super::capacity_volume_owner::acquire_for_descriptor_after_clean_handoff(
-                    scope.descriptor(),
-                    &profile_guard,
-                ) {
-                    Ok(owner) => owner,
-                    Err(error) => {
-                        return self.retain_source_recovery(
-                            registration_id,
-                            "volume-ownership",
-                            error.to_string(),
-                            proof.take(),
-                        );
-                    }
-                };
+            let owner = match super::capacity_volume_owner::acquire_current_for_scope(
+                &scope,
+                &mut self
+                    .source_volumes
+                    .get_mut(&volume)
+                    .expect("source volume placeholder was inserted")
+                    ._current_volume_failure,
+            ) {
+                Ok(owner) => owner,
+                Err(()) => {
+                    return self.retain_source_recovery(
+                        registration_id,
+                        "volume-ownership",
+                        String::from(
+                            "original source volume acquisition retained affected native backing",
+                        ),
+                        proof.take(),
+                    );
+                }
+            };
             self.source_volumes
                 .get_mut(&volume)
                 .expect("source volume placeholder was inserted")
@@ -3510,14 +3520,15 @@ impl OwnerRuntime {
                     );
                 }
             };
-            match self.store().acquire_owned_source_reserve(
-                owner,
-                root,
-                &profile_guard,
-                proof
-                    .as_ref()
-                    .expect("registration proof remains until installation completes"),
-            ) {
+            let reserve_failure = &self
+                .source_volumes
+                .get(&volume)
+                .expect("source volume placeholder was inserted")
+                ._current_reserve_failure;
+            match self
+                .store()
+                .acquire_owned_current_reserve(owner, &scope, reserve_failure)
+            {
                 Ok(reserve) => {
                     let binding = self
                         .source_volumes
@@ -4685,6 +4696,7 @@ impl OperationJournalClient {
             .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<SourceVolumeBinding>()))
             .and_then(|bytes| bytes.checked_add(6 * std::mem::size_of::<VolumeIdentity>()))
             .and_then(|bytes| bytes.checked_add(512))
+            .and_then(|bytes| bytes.checked_add(current_source_metadata::NATIVE_BACKING_BYTES))
             .and_then(|bytes| {
                 bytes.checked_add(std::mem::size_of::<
                     crate::sample_sources::db::CurrentReserveUseProof<'static>,
@@ -7551,6 +7563,8 @@ mod tests {
                         SourceVolumeBinding {
                             _current_input: None,
                             _current_root: None,
+                            _current_volume_failure: Default::default(),
+                            _current_reserve_failure: Default::default(),
                             owner: None,
                             reserve: None,
                             allocation_unit: Some(1),
@@ -8225,6 +8239,8 @@ mod tests {
             SourceVolumeBinding {
                 _current_input: None,
                 _current_root: None,
+                _current_volume_failure: Default::default(),
+                _current_reserve_failure: Default::default(),
                 owner: None,
                 reserve: None,
                 allocation_unit: Some(4096),
@@ -8599,6 +8615,8 @@ mod tests {
             SourceVolumeBinding {
                 _current_input: None,
                 _current_root: None,
+                _current_volume_failure: Default::default(),
+                _current_reserve_failure: Default::default(),
                 owner: None,
                 reserve: None,
                 allocation_unit: Some(facts.allocation_unit),

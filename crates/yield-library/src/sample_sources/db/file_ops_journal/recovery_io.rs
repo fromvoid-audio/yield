@@ -1121,6 +1121,57 @@ impl BoundDatabaseRoot {
         }
     }
 
+    /// Each Current namespace flush retains the original source gate while native I/O runs.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn sync_current_namespace(
+        &self,
+        profile_guard: &WritableProfileGuard,
+        proof: &crate::sample_sources::db::CurrentReserveUseProof<'_>,
+        #[cfg(test)] after_sync: Option<fn(u8)>,
+    ) -> Result<(), String> {
+        // Current physical creation is gated to macOS; never pretend a Windows directory
+        // flush succeeded. The original parent descriptor derives from the scoped profile.
+        #[cfg(windows)]
+        {
+            let _ = (profile_guard, proof, after_sync);
+            Err("Current namespace flush unsupported".into())
+        }
+        #[cfg(not(windows))]
+        {
+            let profile_root = proof
+                .profile()
+                .profile_root_dir()
+                .map_err(|e| e.to_string())?;
+            self.validate_profile_guard(profile_guard)
+                .map_err(|e| e.to_string())?;
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())?;
+            let effect = proof.begin_bootstrap_effect().map_err(|e| e.to_string())?;
+            sync_retained_directory(&profile_root.into_std_file()).map_err(|e| e.to_string())?;
+            drop(effect);
+            #[cfg(test)]
+            if let Some(observe) = after_sync {
+                observe(1);
+            }
+            self.validate_profile_guard(profile_guard)
+                .map_err(|e| e.to_string())?;
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())?;
+            let effect = proof.begin_bootstrap_effect().map_err(|e| e.to_string())?;
+            sync_retained_directory(&self._capability).map_err(|e| e.to_string())?;
+            drop(effect);
+            #[cfg(test)]
+            if let Some(observe) = after_sync {
+                observe(2);
+            }
+            proof
+                .validate_root_for_bootstrap(self)
+                .map_err(|e| e.to_string())
+        }
+    }
+
     /// Flush the retained profile and child directory entries before a durable child-file write.
     pub(crate) fn sync_namespace(
         &self,

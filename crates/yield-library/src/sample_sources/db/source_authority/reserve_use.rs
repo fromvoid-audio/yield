@@ -200,6 +200,40 @@ impl CurrentReserveUseProof<'_> {
         ]
     }
 
+    pub(crate) fn profile(&self) -> &WritableProfileGuard {
+        self.profile
+    }
+
+    pub(crate) fn root(&self) -> &BoundDatabaseRoot {
+        self.root
+    }
+
+    pub(crate) fn validate_root_for_bootstrap(
+        &self,
+        root: &BoundDatabaseRoot,
+    ) -> Result<(), SourceAuthorityError> {
+        // The supplied root is the original request member, never an equivalent caller root.
+        if !std::ptr::eq(root, self.root) {
+            return Err(SourceAuthorityError::RegistrationMismatch);
+        }
+        crate::operation_journal::ReserveBootstrapUseProof::Current(self)
+            .validate_for_bootstrap()
+            .map_err(|_| SourceAuthorityError::RegistrationMismatch)
+    }
+
+    pub(crate) fn begin_bootstrap_effect(
+        &self,
+    ) -> Result<SourceEffectPermit, SourceAuthorityError> {
+        self.validate_root_for_bootstrap(self.root)?;
+        let pin = self
+            .request
+            .state
+            .effect_gate
+            .begin(|| self.proof.validate_for_physical_use())?;
+        self.validate_root_for_bootstrap(self.root)?;
+        Ok(pin)
+    }
+
     pub(crate) fn descriptor(&self) -> &File {
         &self.descriptor
     }

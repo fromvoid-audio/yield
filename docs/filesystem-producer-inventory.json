@@ -225,12 +225,12 @@
     },
     {
       "path": "crates/yield-library/src/app_dirs/profile_ownership.rs",
-      "function": "open_legacy_canonical_app_root",
+      "function": "open_source_canonical_app_root",
       "operation": "method::create_dir",
       "count": 1,
       "classification": "owner",
       "issue": "OPT-2349",
-      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "reason": "Closed original Current or Legacy source proof revalidates before this exact shared bootstrap effect. Current holds its original SourceEffectPermit across native work with descriptor validation outside the gate mutex; Legacy preserves its frozen pre-lease seal. Exact refused-prefix backing remains on the original charged worker. No ordinary grant, retry/refund or physical qualification is supplied.",
       "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
     },
     {
@@ -355,32 +355,32 @@
     },
     {
       "path": "crates/yield-library/src/operation_journal/capacity_volume_owner/legacy_bootstrap.rs",
-      "function": "acquire_legacy_inner",
+      "function": "acquire_bootstrap_inner",
       "operation": "OpenOptions::create",
       "count": 1,
       "classification": "owner",
       "issue": "OPT-2349",
-      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "reason": "Closed original Current or Legacy source proof revalidates before this exact shared bootstrap effect. Current holds its original SourceEffectPermit across native work with descriptor validation outside the gate mutex; Legacy preserves its frozen pre-lease seal. Exact refused-prefix backing remains on the original charged worker. No ordinary grant, retry/refund or physical qualification is supplied.",
       "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
     },
     {
       "path": "crates/yield-library/src/operation_journal/capacity_volume_owner/legacy_bootstrap.rs",
-      "function": "acquire_legacy_inner",
+      "function": "acquire_bootstrap_inner",
       "operation": "OpenOptions::write",
       "count": 1,
       "classification": "owner",
       "issue": "OPT-2349",
-      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "reason": "Closed original Current or Legacy source proof revalidates before this exact shared bootstrap effect. Current holds its original SourceEffectPermit across native work with descriptor validation outside the gate mutex; Legacy preserves its frozen pre-lease seal. Exact refused-prefix backing remains on the original charged worker. No ordinary grant, retry/refund or physical qualification is supplied.",
       "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
     },
     {
       "path": "crates/yield-library/src/operation_journal/capacity_volume_owner/legacy_bootstrap.rs",
-      "function": "acquire_legacy_inner",
+      "function": "acquire_bootstrap_inner",
       "operation": "method::create_dir",
       "count": 1,
       "classification": "owner",
       "issue": "OPT-2349",
-      "reason": "Sealed original pre-lease source/profile/reservation proof freezes the source pager/image and revalidates before this exact bootstrap effect; bounded refused-prefix backing remains on the original charged worker. No current lease, capacity claim, ordinary grant, retry/refund or physical qualification is supplied.",
+      "reason": "Closed original Current or Legacy source proof revalidates before this exact shared bootstrap effect. Current holds its original SourceEffectPermit across native work with descriptor validation outside the gate mutex; Legacy preserves its frozen pre-lease seal. Exact refused-prefix backing remains on the original charged worker. No ordinary grant, retry/refund or physical qualification is supplied.",
       "retirement": "Remove only with this exact original-owner bootstrap route; review any new effect separately and preserve current-lease ownership gates."
     },
     {

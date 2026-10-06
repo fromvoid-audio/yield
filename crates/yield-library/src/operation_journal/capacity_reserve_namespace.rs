@@ -26,7 +26,9 @@ use super::capacity_reserve::{
 };
 use super::reserve_telemetry::{ReserveAttempt, observe};
 
+mod current;
 mod legacy;
+pub(super) use current::create_owned_current_reserve;
 pub(super) use legacy::create_owned_legacy_reserve;
 
 /// Reserved direct child name for the owner-created recovery-reserve namespace.
@@ -356,8 +358,8 @@ pub(crate) struct BoundReserve<'a> {
 /// descriptor and the protected file handle, while [`BoundReserveView`] supplies the short-lived
 /// borrowed view needed for descriptor validation or a recovery command.
 pub(crate) struct OwnedReserveAllocation {
-    root: BoundDatabaseRoot,
     reserve: ProtectedReserve,
+    root: BoundDatabaseRoot,
     observation: ReserveNamespaceObservation,
 }
 

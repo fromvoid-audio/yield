@@ -22,6 +22,7 @@ mod capacity_reserve_namespace;
 pub mod capacity_retention_telemetry;
 #[allow(dead_code)]
 mod capacity_volume_owner;
+pub(crate) use capacity_volume_owner::ReserveBootstrapUseProof;
 pub mod codec;
 pub mod coordinator;
 pub(crate) mod database_attempts;

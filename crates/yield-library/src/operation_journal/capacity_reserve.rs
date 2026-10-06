@@ -15,8 +15,12 @@ use crate::durable_capacity::{
 };
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 
+#[cfg(target_os = "macos")]
+mod current;
 #[cfg(any(target_os = "macos", test))]
 mod legacy;
+#[cfg(target_os = "macos")]
+pub(super) use current::allocate_current_protected_reserve;
 #[cfg(target_os = "macos")]
 pub(super) use legacy::allocate_legacy_protected_reserve;
 
@@ -403,6 +407,8 @@ pub(super) enum ReserveFailureReason {
     #[cfg(any(target_os = "macos", test))]
     #[error("original legacy bootstrap custody is no longer current")]
     LegacyCustodyClosed,
+    #[error("original current source bootstrap custody is no longer current")]
+    CurrentCustodyClosed,
     #[error("protected reserve allocation is unsupported on this target")]
     Unsupported,
     #[error("reserve descriptor is not a regular file")]
