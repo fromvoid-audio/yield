@@ -321,3 +321,37 @@ fn original_actual_second_stage_token_exhaustion_preserves_image_and_exact_refun
     assert_eq!(normalized_ledger_image(&funded.ledger.borrow()), original);
     assert_eq!(input.historical_test_remaining(), baseline);
 }
+
+#[test]
+fn original_retained_pressure_refuses_before_second_stage_and_preserves_exact_image() {
+    let input = InputPermit::historical_test_input(1);
+    let funded = CapacityProvider::unavailable_for_input(&input).unwrap();
+    let image = rebuild_snapshot(vec![rebuild_claim(
+        OperationId::new(),
+        AdmissionClaimId::new(),
+        VolumeIdentity { device: 121 },
+        FullCapacityAllocationClass::DestinationStaging,
+        4096,
+        None,
+        false,
+    )]);
+    let baseline = input.historical_test_remaining();
+    let scratch = scratch_bytes(image.claims(), &funded.ledger.borrow()).unwrap();
+    let retained = retained_bytes(image.claims()).unwrap();
+    let original = normalized_ledger_image(&funded.ledger.borrow());
+    let token = funded.ledger.borrow().next_token;
+    let hold = input
+        .reserve_historical_scratch(baseline - scratch - retained + 1)
+        .unwrap();
+    SECOND_STAGE_UNWIND.with(|probe| probe.set((false, usize::MAX)));
+    assert!(matches!(
+        funded.install_rebuilt_claims_for_input(&image, &input),
+        Err(CapacityProviderError::RebuildResourceBound)
+    ));
+    assert_eq!(SECOND_STAGE_UNWIND.with(|probe| probe.get().1), usize::MAX);
+    assert_eq!(normalized_ledger_image(&funded.ledger.borrow()), original);
+    assert_eq!(funded.ledger.borrow().next_token, token);
+    assert_eq!(input.historical_test_remaining(), scratch + retained - 1);
+    drop(hold);
+    assert_eq!(input.historical_test_remaining(), baseline);
+}
