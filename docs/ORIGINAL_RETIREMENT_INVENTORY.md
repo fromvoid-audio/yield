@@ -79,3 +79,8 @@ Serializer-only variants exercise escaped/non-ASCII strings, optional registrati
 and every closed registration/audit variant; they confer no producer provenance.
 Both default and preserve_order configurations require exact existing codec bytes
 and digest parity. Native platform qualification remains separate.
+
+Native full-factory execution is tracked by OPT-2393. Its shared whole-journal
+image helper also runs on all five portable genuine producer cases, checking
+the actual journal subdirectory, five table counts, global sequence, fresh
+prepared validation identity and original ID counter across refusal.

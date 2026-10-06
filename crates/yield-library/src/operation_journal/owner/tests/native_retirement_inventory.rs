@@ -17,9 +17,10 @@ use crate::sample_sources::wal_transport::{SourceWalProducerOwner, SourceWalTran
 use crate::sample_sources::{SourceDatabase, SourceWriter};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
-fn whole_journal_image(root: &std::path::Path) -> ([u64; 5], Option<i64>) {
+pub(super) fn whole_journal_image(root: &std::path::Path) -> ([u64; 5], Option<i64>) {
     let connection = rusqlite::Connection::open_with_flags(
-        root.join(crate::operation_journal::store::JOURNAL_DATABASE_FILE_NAME),
+        root.join(crate::operation_journal::store::JOURNAL_DATABASE_ROOT_NAME)
+            .join(crate::operation_journal::store::JOURNAL_DATABASE_FILE_NAME),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();

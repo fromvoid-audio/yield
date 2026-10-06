@@ -2868,6 +2868,15 @@ mod integration {
                 *full_credit.lock().unwrap() = Some(credit);
             });
         }
+        let inventory_no_effects = (inventory_case != 0).then(|| {
+            (
+                prepared.validation_operation_id(),
+                native_retirement_inventory::whole_journal_image(fixture.owner.profile_root()),
+                journal
+                    .prepared_admission_id_allocations
+                    .load(Ordering::Relaxed),
+            )
+        });
         let mut admitted = journal.client().admit_prepared(prepared).unwrap();
         if outcome >= 13 {
             let early = admitted.recv_timeout(Duration::from_millis(50));
@@ -2941,6 +2950,28 @@ mod integration {
             assert!(
                 matches!(&result, Err(OperationJournalOwnerError::PreparedAdmission(PreparedAdmissionError::Unsupported { reason })) if reason.contains("original owners acknowledged")),
                 "original retirement acknowledgement result: {result:?}"
+            );
+        }
+        if let Some((validation_id, whole_before, ids_before)) = inventory_no_effects {
+            assert_eq!(
+                native_retirement_inventory::whole_journal_image(fixture.owner.profile_root()),
+                whole_before
+            );
+            assert_eq!(
+                journal
+                    .prepared_admission_id_allocations
+                    .load(Ordering::Relaxed),
+                ids_before
+            );
+            assert!(
+                journal
+                    .client()
+                    .get(validation_id)
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
             );
         }
         let inventory_native_context = observe_inventory.then(|| view.clone());
