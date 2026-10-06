@@ -100,9 +100,15 @@ impl Collector {
         claims: &AdmissionClaimInventory,
     ) -> Result<Observation, WalPreparationError> {
         #[cfg(all(test, target_os = "linux"))]
-        if let Some(hook) = self.shared.retirement_hook_for_tests.lock().unwrap().take() {
-            hook(nonce);
-        }
+        // Keep injected pressure through the real inventory debit, but release it
+        // before the owner starts genuine refusal cleanup after this call returns.
+        let _inventory_pressure = self
+            .shared
+            .retirement_hook_for_tests
+            .lock()
+            .unwrap()
+            .take()
+            .and_then(|hook| hook(nonce));
         let (global, source) = self.inventory_context(nonce)?;
         let fence = source.original_binding().stored_fence();
         let encoding = fence.existing_encoding_bound().ok_or_else(full)?;

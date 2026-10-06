@@ -114,7 +114,8 @@ struct Shared {
     #[cfg(test)]
     retirement_for_tests: Mutex<Option<retirement_inventory::Observation>>,
     #[cfg(all(test, target_os = "linux"))]
-    retirement_hook_for_tests: Mutex<Option<Box<dyn FnOnce(uuid::Uuid) + Send>>>,
+    retirement_hook_for_tests:
+        Mutex<Option<Box<dyn FnOnce(uuid::Uuid) -> Option<HandshakeCredit> + Send>>>,
     // All status/cache payload and the Shared allocation disappear before this
     // final original journal input keeper can return the command's backing.
     _journal_input: JournalInput,
@@ -148,7 +149,19 @@ impl WalPreparationHandle {
         &self,
         hook: impl FnOnce(uuid::Uuid) + Send + 'static,
     ) {
-        *self.0.retirement_hook_for_tests.lock().unwrap() = Some(Box::new(hook));
+        *self.0.retirement_hook_for_tests.lock().unwrap() = Some(Box::new(move |nonce| {
+            hook(nonce);
+            None
+        }));
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::operation_journal) fn retirement_pressure_hook_for_tests(
+        &self,
+        hook: impl FnOnce(uuid::Uuid) -> HandshakeCredit + Send + 'static,
+    ) {
+        *self.0.retirement_hook_for_tests.lock().unwrap() =
+            Some(Box::new(move |nonce| Some(hook(nonce))));
     }
 
     /// Observe bounded collection/cleanup without waiting for SQLite or another owner.
