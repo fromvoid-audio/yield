@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod failures;
+mod historical;
 mod replay;
 struct Fixture {
     global: Option<GlobalLibraryWriter>,

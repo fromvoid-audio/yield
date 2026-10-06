@@ -20,9 +20,16 @@ pub(super) fn read(
     request: &HarvestAuthoredRequest,
 ) -> Result<Option<HarvestAuthoredReceipt>, LibraryError> {
     let key = request.payload.key()?;
+    read_stored(c, &key, Some(&request.bytes)).map(|stored| stored.map(|(receipt, _)| receipt))
+}
+pub(super) fn read_stored(
+    c: &Connection,
+    key: &str,
+    expected: Option<&[u8]>,
+) -> Result<Option<(HarvestAuthoredReceipt, Vec<u8>)>, LibraryError> {
     let count: i64 = c.query_row(
         "SELECT COUNT(*) FROM (SELECT 1 FROM harvest_authored_receipts WHERE command_key=?1 LIMIT 2)",
-        [&key],
+        [key],
         |r| r.get(0),
     )?;
     if count == 0 {
@@ -33,14 +40,14 @@ pub(super) fn read(
     }
     let valid: bool = c.query_row(
         &format!("SELECT ({SHAPE}) FROM harvest_authored_receipts WHERE command_key=?1"),
-        [&key],
+        [key],
         |r| r.get(0),
     )?;
     if !valid {
         return Err(malformed());
     }
     // The transaction holds the single writer; preflight and readback share one snapshot.
-    let (sequence,payload,result,identity,owner):(i64,Vec<u8>,Vec<u8>,Vec<u8>,String)=c.query_row("SELECT sequence,payload,result,identity,owner FROM harvest_authored_receipts WHERE command_key=?1",[&key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    let (sequence,payload,result,identity,owner):(i64,Vec<u8>,Vec<u8>,Vec<u8>,String)=c.query_row("SELECT sequence,payload,result,identity,owner FROM harvest_authored_receipts WHERE command_key=?1",[key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     let unique: i64 = c.query_row(
         "SELECT COUNT(*) FROM (SELECT 1 FROM harvest_authored_receipts WHERE sequence=?1 LIMIT 2)",
         [sequence],
@@ -52,11 +59,13 @@ pub(super) fn read(
     if identity != digest(&payload, &result, &owner) {
         return Err(malformed());
     }
-    if Payload::decode(&payload).is_err() {
-        return Err(malformed());
-    }
-    if payload != request.bytes {
+    let decoded = Payload::decode(&payload).map_err(|_| malformed())?;
+    // Original replay classifies valid changed intent before historical key correlation.
+    if expected.is_some_and(|bytes| payload != bytes) {
         return Err(LibraryError::HarvestAuthoredReplayConflict);
+    }
+    if decoded.key().map_err(|_| malformed())? != key {
+        return Err(malformed());
     }
     let owner = Uuid::parse_str(&owner)
         .ok()
@@ -66,12 +75,15 @@ pub(super) fn read(
     if outcome.version != 1 || outcome.created < 0 || bounded(&outcome)? != result {
         return Err(malformed());
     }
-    Ok(Some(HarvestAuthoredReceipt {
-        payload: request.payload.clone(),
-        outcome,
-        sequence: sequence as u64,
-        owner,
-    }))
+    Ok(Some((
+        HarvestAuthoredReceipt {
+            payload: decoded,
+            outcome,
+            sequence: sequence as u64,
+            owner,
+        },
+        payload,
+    )))
 }
 pub(super) fn capacity(
     c: &Connection,
