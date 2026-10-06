@@ -2358,6 +2358,7 @@ mod integration {
                 0
             );
             drop(local_collector.take());
+            drop(round);
             drop(view);
             drop(handle);
             assert_eq!(budget.used(), 0);
