@@ -3,6 +3,66 @@
 use super::*;
 use crate::operation_journal::owner::InputPermit;
 
+impl OperationJournalStore {
+    /// Fund the same original namespace at the startup/admission boundary.
+    /// Existing unfunded callers retain their original entry points.
+    pub(super) fn validate_namespace_for_input(
+        &self,
+        input: &InputPermit,
+        precommit: bool,
+    ) -> Result<(), OperationJournalStoreError> {
+        let bytes = working_bytes(
+            &self.database_root,
+            &self.profile_guard,
+            &self.database_path,
+        )
+        .ok_or(OperationJournalStoreError::OrdinaryRebuildResourceBound)?;
+        let mut loan = NamespaceLoan::new(input, bytes)?;
+        let result = (|| {
+            if !precommit && !self.connection.is_autocommit() {
+                return Err(audit_error(
+                    &self.database_path,
+                    "operation journal connection has an active transaction",
+                ));
+            }
+            self.database_root
+                .validate_profile_guard(&self.profile_guard)?;
+            validate_database_file_identity(
+                &self.database_root,
+                &self.database_path,
+                &self.database_identity,
+            )?;
+            // The first callback is the path already prepaid by working_bytes.
+            // The second, when present, identifies the full actual selected reason.
+            let mut path_copy = true;
+            sqlite_identity::validate_connection_identity_with_funding(
+                &self.connection,
+                &self.database_path,
+                &self.database_identity,
+                |bytes| {
+                    if path_copy {
+                        path_copy = false;
+                        if bytes != self.database_path.as_os_str().as_encoded_bytes().len() {
+                            return Err(OperationJournalStoreError::OrdinaryRebuildResourceBound);
+                        }
+                        Ok(())
+                    } else {
+                        loan.reserve_native_message(bytes)
+                    }
+                },
+            )
+            .map_err(|error| match error {
+                sqlite_identity::ConnectionIdentityFailure::Observed(error) => {
+                    map_identity_error(error)
+                }
+                sqlite_identity::ConnectionIdentityFailure::Funding(error) => error,
+            })?;
+            reject_unexpected_sidecars(&self.database_root, &self.database_path, true)
+        })();
+        loan.finish(result)
+    }
+}
+
 pub(super) struct NamespaceLoan<'a> {
     input: &'a InputPermit,
     working: Option<InputPermit>,
