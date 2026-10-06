@@ -9,8 +9,13 @@ mod fixtures {
     use yield_library::sample_sources::{SourceDatabaseConnectionRole, SourceWriter};
 
     fn setup() -> (Fixture, SourceWriter, ReadinessTarget) {
+        setup_relative(Path::new("tone.wav"))
+    }
+
+    fn setup_relative(relative: &Path) -> (Fixture, SourceWriter, ReadinessTarget) {
         let fixture = Fixture::new("feature-job-tests");
-        let file = fixture.root.path().join("tone.wav");
+        let file = fixture.root.path().join(relative);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
         let mut wav = hound::WavWriter::create(
             &file,
             hound::WavSpec {
@@ -50,11 +55,9 @@ mod fixtures {
         let db = writer.into_catalog_database();
         let mut batch = db.write_batch().unwrap();
         batch
-            .upsert_file_with_hash(Path::new("tone.wav"), meta.len(), modified, &content)
+            .upsert_file_with_hash(relative, meta.len(), modified, &content)
             .unwrap();
-        batch
-            .set_file_identity(Path::new("tone.wav"), Some(&identity))
-            .unwrap();
+        batch.set_file_identity(relative, Some(&identity)).unwrap();
         batch.commit().unwrap();
         let revision = db.get_revision().unwrap();
         db.begin_source_directory_truth_generation(1, 0).unwrap();
@@ -66,12 +69,7 @@ mod fixtures {
             SourceWriter::new(db, SourceId::from_string("feature-job-source"), 1).unwrap();
         let revision = writer.current_revision().unwrap();
         let target = writer
-            .prepare_feature_readiness_target(
-                &revision,
-                Path::new("tone.wav"),
-                1,
-                &AtomicBool::new(false),
-            )
+            .prepare_feature_readiness_target(&revision, relative, 1, &AtomicBool::new(false))
             .unwrap();
         writer
             .enqueue_readiness_jobs(
@@ -242,7 +240,14 @@ mod fixtures {
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("outside.wav"), b"external").unwrap();
         fs::remove_file(fixture.root.path().join("tone.wav")).unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(
+            outside.path().join("outside.wav"),
+            fixture.root.path().join("tone.wav"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(
             outside.path().join("outside.wav"),
             fixture.root.path().join("tone.wav"),
         )
@@ -339,5 +344,51 @@ mod fixtures {
         inputs.pop();
         assert!(writer.prepare_feature_input(&revision, &claim).is_ok());
         assert_eq!(artifact_count(&fixture), 0);
+    }
+
+    #[test]
+    fn feature_job_nested_original_input_computes_before_atomic_readiness() {
+        let (fixture, mut writer, target) = setup_relative(Path::new("nested/tone.wav"));
+        let job = prepare_feature_job(&mut writer, &target, 10, 100)
+            .unwrap()
+            .unwrap();
+        let computed = thread::spawn(move || job.compute(&AtomicBool::new(false)))
+            .join()
+            .unwrap();
+        assert_eq!(status(&fixture), "running");
+        assert_eq!(artifact_count(&fixture), 0);
+        assert!(matches!(
+            computed
+                .finish(&mut writer, 11, &AtomicBool::new(false))
+                .unwrap(),
+            FeatureJobOutcome::Published(_)
+        ));
+        assert_eq!(status(&fixture), "done");
+        assert_eq!(artifact_count(&fixture), 1);
+    }
+
+    #[test]
+    fn feature_job_nested_parent_relocation_refuses_original_input_without_readiness() {
+        let (fixture, mut writer, target) = setup_relative(Path::new("nested/tone.wav"));
+        let job = prepare_feature_job(&mut writer, &target, 10, 100)
+            .unwrap()
+            .unwrap();
+        let nested = fixture.root.path().join("nested");
+        let parked = fixture.root.path().join("parked");
+        let original = fs::read(nested.join("tone.wav")).unwrap();
+        fs::rename(&nested, &parked).unwrap();
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("tone.wav"), &original).unwrap();
+        let computed = job.compute(&AtomicBool::new(false));
+        assert!(matches!(
+            computed
+                .finish(&mut writer, 11, &AtomicBool::new(false))
+                .unwrap(),
+            FeatureJobOutcome::Failed(FeatureJobFailure::Input(SourceFeatureInputError::Changed))
+        ));
+        assert_eq!(artifact_count(&fixture), 0);
+        assert_eq!(status(&fixture), "failed");
+        assert_eq!(fs::read(parked.join("tone.wav")).unwrap(), original);
+        assert_eq!(fs::read(nested.join("tone.wav")).unwrap(), original);
     }
 }
