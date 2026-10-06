@@ -71,7 +71,9 @@ impl OwnerRuntime {
             .try_clone()
             .unwrap();
         request.validate_consuming_boundary(&profile)?;
+        self.validate_current_registry_credit(Some(&credit))?;
         let proof = request.accept_confirmation(envelope.confirmation)?;
+        self.source_registry_credits.push(Arc::clone(&credit));
         let root = request.media_root();
         let scope = request.reserve_use(root, &proof, &profile)?;
         let volume = descriptor_capacity_facts(scope.descriptor())
@@ -409,4 +411,62 @@ fn current_original_worker_panic_closes_native_capsule_before_releasing_metadata
         .unwrap();
     contender.try_lock().unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn current_original_registry_carrier_bound_refuses_before_confirmation_and_releases_real_pool() {
+    let app = tempfile::tempdir().unwrap();
+    let _app = crate::app_dirs::AppRootGuard::set(app.path().to_owned()).unwrap();
+    let profile = WritableProfileGuard::acquire_current().unwrap();
+    let store = OperationJournalStore::open(&profile).unwrap();
+    let mut runtime = OwnerRuntime::new(store).unwrap();
+    let (commands, _receiver) = OwnerCommandReceivers::channel();
+    let shared = Arc::new(OwnerShared::new(commands));
+    let minimum = current_source_metadata::MIN_RETAINED_CURRENT_BYTES;
+    let bound = current_source_metadata::MAX_CURRENT_CREDITS;
+    for _ in 0..bound {
+        let credit = Arc::new(shared.reserve_input(InputClass::Ordinary, minimum).unwrap());
+        runtime
+            .validate_current_registry_credit(Some(&credit))
+            .unwrap();
+        runtime.source_registry_credits.push(credit);
+    }
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().remaining[0],
+        ORDINARY_INPUT_BYTES - bound * minimum
+    );
+    assert!(
+        matches!(shared.reserve_input(InputClass::Ordinary, minimum),
+        Err(OperationJournalOwnerQueueError::InputBytesFull { requested, .. }) if requested == minimum)
+    );
+    let retained = Arc::downgrade(&runtime.source_registry_credits[0]);
+    let existing_credit = Arc::clone(&runtime.source_registry_credits[0]);
+    let media = tempfile::tempdir().unwrap();
+    let database_root = tempfile::tempdir().unwrap();
+    let source = crate::sample_sources::SourceDatabase::open_for_source_write_with_profile_guard(
+        media.path(),
+        &profile,
+        database_root.path(),
+    )
+    .unwrap();
+    let authority = source.prepare_source_authority().unwrap();
+    let envelope = authority.journal_request().unwrap();
+    let request = Arc::clone(&envelope.request);
+    let confirmation = envelope.confirmation.clone();
+    assert!(
+        matches!(runtime.register_source_authority_funded(Some(existing_credit), envelope),
+        Err(OperationJournalOwnerError::SourceAuthorityConflict { reason })
+            if reason == "original Current registry metadata credit is unavailable")
+    );
+    // Actual entry-point refusal did not consume the genuine one-shot confirmation or issue
+    // a namespace/native effect. No additional source-count restriction or lease is invented.
+    request.accept_confirmation(confirmation).unwrap();
+    assert!(runtime.source_registrations.is_empty() && runtime.source_volumes.is_empty());
+    assert!(!media.path().join("recovery-reserve.bin").exists());
+    drop(runtime);
+    assert!(retained.upgrade().is_none());
+    assert_eq!(
+        shared.input_bytes.lock().unwrap().remaining[0],
+        ORDINARY_INPUT_BYTES
+    );
 }

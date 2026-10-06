@@ -1764,6 +1764,7 @@ struct OwnerRuntime {
     reserve: Option<OwnedReserveAllocation>,
     volume_owner: Option<VolumeOwnershipCapability>,
     final_profile_guard: Option<WritableProfileGuard>,
+    source_registry_credits: Vec<Arc<InputPermit>>,
     source_volumes: BTreeMap<VolumeIdentity, SourceVolumeBinding>,
     source_registrations:
         HashMap<crate::sample_sources::db::SourceRegistrationId, SourceAuthorityRecord>,
@@ -1807,6 +1808,7 @@ impl OwnerRuntime {
             reserve: None,
             volume_owner: None,
             final_profile_guard: Some(final_profile_guard),
+            source_registry_credits: Vec::new(),
             source_volumes: BTreeMap::new(),
             source_registrations: HashMap::new(),
             retired_source_registrations: HashMap::new(),
@@ -3172,6 +3174,25 @@ impl OwnerRuntime {
         self.register_source_authority_funded(None, input)
     }
 
+    fn validate_current_registry_credit(
+        &self,
+        credit: Option<&Arc<InputPermit>>,
+    ) -> Result<(), OperationJournalOwnerError> {
+        let Some(credit) = credit else {
+            return Ok(());
+        };
+        if credit.class != InputClass::Ordinary
+            || credit.publication
+            || credit.bytes < current_source_metadata::MIN_RETAINED_CURRENT_BYTES
+            || self.source_registry_credits.len() >= current_source_metadata::MAX_CURRENT_CREDITS
+        {
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: "original Current registry metadata credit is unavailable".into(),
+            });
+        }
+        Ok(())
+    }
+
     fn register_source_authority_funded(
         &mut self,
         // Parameters drop in reverse order: the original request/confirmation must drop first.
@@ -3229,6 +3250,8 @@ impl OwnerRuntime {
                 reason: String::from("source authority carrier retention limit reached"),
             });
         }
+
+        self.validate_current_registry_credit(current_input.as_ref())?;
 
         let profile_guard = self
             .final_profile_guard
@@ -3361,6 +3384,9 @@ impl OwnerRuntime {
         // persisting a binding. Every later physical effect revalidates this same deadline-bound
         // proof and converts it to a drain marker on partial failure.
         let mut proof = Some(request.accept_confirmation(input.confirmation)?);
+        if let Some(credit) = current_input.as_ref() {
+            self.source_registry_credits.push(Arc::clone(credit));
+        }
         let volume_identities = volume_ids.iter().cloned().collect::<Vec<_>>();
         let receipt = SourceAuthorityRegistrationReceipt::new(
             registration_id,
@@ -4377,8 +4403,17 @@ impl Drop for OwnerRuntime {
         // bindings. Release these maps before the journal/profile core so a global shutdown is
         // visibly conservative and never mistaken for a successful per-source retirement.
         drop(std::mem::take(&mut self.source_volumes));
-        self.source_registrations.clear();
-        self.retired_source_registrations.clear();
+        // HashMap.clear would retain bucket allocations. Destroy all registry nodes before
+        // the original credits that paid them, including during real worker unwind.
+        drop(std::mem::take(&mut self.source_registrations));
+        drop(std::mem::take(&mut self.retired_source_registrations));
+        let mut credit_heap = std::mem::take(&mut self.source_registry_credits).into_iter();
+        let current_registry_credits: [Option<Arc<InputPermit>>;
+            current_source_metadata::MAX_CURRENT_CREDITS] =
+            std::array::from_fn(|_| credit_heap.next());
+        // The bound is checked before every actual retention; free the keeper heap first.
+        drop(credit_heap);
+        drop(current_registry_credits);
         self.issued_chunk_tickets.clear();
         self.pending_chunk_releases.clear();
         // Keep this order explicit. The reserve root/descriptor must go first, then SQLite and

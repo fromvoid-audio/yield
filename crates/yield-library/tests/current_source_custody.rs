@@ -51,8 +51,9 @@ fn run_original_queue(
     physical: bool,
     lost_reply: bool,
 ) {
-    let source = open_source(profile, root);
-    let mut authority = source.prepare_source_authority().unwrap();
+    // The unsupported negative still holds a genuine source. Positive startup prepares
+    // its lease only after journal bootstrap, so bootstrap cannot consume its deadline.
+    let initial_source = (!physical).then(|| open_source(profile, root));
     let reserve_path = root.join("media/recovery-reserve.bin");
     let store = OperationJournalStore::open(profile).unwrap();
     let mut owner = match OperationJournalOwner::start(store) {
@@ -83,6 +84,8 @@ fn run_original_queue(
         physical,
         "unsupported target must not bootstrap physical ownership"
     );
+    let source = initial_source.unwrap_or_else(|| open_source(profile, root));
+    let mut authority = source.prepare_source_authority().unwrap();
     let client = owner.client();
     let reply = client
         .register_source_authority(authority.journal_request().unwrap())
@@ -119,8 +122,6 @@ fn run_original_queue(
     assert!(owner.shutdown());
     // Actual clean owner restart consumes the existing durable binding and genuine new source
     // seal; source reserve bytes/object remain unchanged. No synthetic generation is supplied.
-    let source = open_source(profile, root);
-    let mut authority = source.prepare_source_authority().unwrap();
     let store = OperationJournalStore::open(profile).unwrap();
     let mut owner = OperationJournalOwner::start(store).unwrap();
     let deadline = std::time::Instant::now() + WAIT;
@@ -134,6 +135,8 @@ fn run_original_queue(
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+    let source = open_source(profile, root);
+    let mut authority = source.prepare_source_authority().unwrap();
     let mut reply = owner
         .client()
         .register_source_authority(authority.journal_request().unwrap())

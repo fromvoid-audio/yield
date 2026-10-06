@@ -32,23 +32,64 @@ pub(super) const NATIVE_BACKING_BYTES: usize = 2 * VOLUME_DYNAMIC + PRODUCER_SCR
 
 use super::*;
 
+// Every retained Current permit includes this strictly positive mandatory debit. The fixed
+// teardown carrier therefore follows the original pool capacity, not a new source-count limit.
+pub(super) const MIN_RETAINED_CURRENT_BYTES: usize =
+    NATIVE_BACKING_BYTES + REGISTRY_NODE_BYTES + FIXED_INPUT_HEADERS;
+pub(super) const MAX_CURRENT_CREDITS: usize = ORDINARY_INPUT_BYTES / MIN_RETAINED_CURRENT_BYTES;
+const _: () = assert!(MIN_RETAINED_CURRENT_BYTES > 0 && MAX_CURRENT_CREDITS > 0);
+const CREDIT_TEARDOWN_SCRATCH: usize =
+    std::mem::size_of::<[Option<Arc<InputPermit>>; MAX_CURRENT_CREDITS]>();
+
+// Rust 1.93 std/hashbrown: power-of-two bucket storage, >=7/8 load, one control byte per
+// bucket plus a <=16-byte control group. Eight buckets per lifetime entry covers initial
+// small tables and overlapping old/new growth tables. Both live and retired tables are
+// retained until actor teardown, even after all their values have moved out.
+const fn hash_entry<K, V>() -> usize {
+    8 * (std::mem::size_of::<(K, V)>() + 1) + 32
+}
+// Rust 1.93 alloc/src/collections/btree/node.rs: B=6, <=11 key/value slots,
+// <=12 child pointers, parent pointer and two u16 indices. Counting these indices as
+// full pointer-sized words plus a padding word bounds the aligned node prefix.
+// For height, use the weaker binary-tree minimum (rather than six-way branching):
+// <=8192 keys implies <=14 occupied levels; one split per level plus two root nodes.
+const fn split_nodes(mut keys: usize) -> usize {
+    let mut levels = 0;
+    while keys != 0 {
+        levels += 1;
+        keys >>= 1;
+    }
+    levels + 2
+}
+const MAX_VOLUME_KEYS: usize =
+    2 * crate::sample_sources::db::source_registry_handoff::MAX_SOURCE_REGISTRY_CARRIERS;
+const fn tree_insert<K, V>() -> usize {
+    split_nodes(MAX_VOLUME_KEYS)
+        * (11 * std::mem::size_of::<(K, V)>() + (4 + 12) * std::mem::size_of::<usize>())
+}
+const REGISTRY_NODE_BYTES: usize = hash_entry::<crate::sample_sources::db::SourceRegistrationId, SourceAuthorityRecord>()
+    + hash_entry::<crate::sample_sources::db::SourceRegistrationId, RetiredSourceAuthorityRecord>()
+    + 2 * tree_insert::<VolumeIdentity, SourceVolumeBinding>()
+    + 2 * tree_insert::<crate::sample_sources::db::SourceRegistrationId, ()>()
+    // Temporary deduplicated volume set before installing the two entries.
+    + tree_insert::<VolumeIdentity, ()>()
+    // Vec initial/growing capacity is <=4 slots per lifetime credit; no permit is created.
+    + 4 * std::mem::size_of::<Arc<InputPermit>>();
+const FIXED_INPUT_HEADERS: usize = std::mem::size_of::<(usize, usize, InputPermit)>()
+    + std::mem::size_of::<SourceAuthorityRecord>()
+    + std::mem::size_of::<RetiredSourceAuthorityRecord>()
+    + 2 * std::mem::size_of::<SourceVolumeBinding>()
+    + 6 * std::mem::size_of::<VolumeIdentity>()
+    + 512
+    + std::mem::size_of::<crate::sample_sources::db::CurrentReserveUseProof<'static>>();
+
 pub(super) fn input_bytes(
     request: &SourceAuthorityRegistrationRequest,
 ) -> Result<usize, OperationJournalOwnerQueueError> {
     let input_bytes = request
         .current_metadata_bytes()
-        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<(usize, usize, InputPermit)>()))
-        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<SourceAuthorityRecord>()))
-        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<RetiredSourceAuthorityRecord>()))
-        .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<SourceVolumeBinding>()))
-        .and_then(|bytes| bytes.checked_add(6 * std::mem::size_of::<VolumeIdentity>()))
-        .and_then(|bytes| bytes.checked_add(512))
-        .and_then(|bytes| bytes.checked_add(NATIVE_BACKING_BYTES))
-        .and_then(|bytes| {
-            bytes.checked_add(std::mem::size_of::<
-                crate::sample_sources::db::CurrentReserveUseProof<'static>,
-            >())
-        })
+        .and_then(|bytes| bytes.checked_add(MIN_RETAINED_CURRENT_BYTES))
+        .and_then(|bytes| bytes.checked_add(CREDIT_TEARDOWN_SCRATCH))
         .ok_or_else(|| OperationJournalOwnerQueueError::InvalidRecord {
             reason: String::from(
                 "Current source registration metadata exceeds its bounded field inventory",

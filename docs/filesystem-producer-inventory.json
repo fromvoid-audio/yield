@@ -872,6 +872,16 @@
       "issue": "OPT-2352",
       "reason": "Cfg(test,unix)-only disposable profile and original worker refused-prefix custody test. The shared real Current producer retains an actual dirty lock under genuine source custody; the special test command never returns usable physical ownership or a reserve. Read/write contender checks only the existing dirty fixture lock. No production filesystem or physical qualification authority.",
       "retirement": "Remove this exact row when its named refused-prefix worker test/call is removed; never reuse its fixture command or temporary canonical-root override in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/current_source_custody_tests.rs",
+      "function": "current_original_registry_carrier_bound_refuses_before_confirmation_and_releases_real_pool",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2352",
+      "reason": "Cfg(test,unix)-only disposable genuine profile Store/Source fixture validates the actual Current actor entry-point refusal at the original pool-derived metadata carrier bound. Original pool permits remain funded through real runtime teardown; confirmation remains unspent and no source reserve or physical authority is created.",
+      "retirement": "Remove this exact row with its named metadata carrier test; never reuse fixture Store ownership or pool-only permits as physical qualification."
     }
   ]
 }
