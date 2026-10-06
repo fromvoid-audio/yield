@@ -51,14 +51,20 @@ pub(super) fn retain_result_error<T>(
 ) -> Result<T, OperationJournalOwnerError> {
     match (result, reply) {
         (Err(error), Some(reply)) => {
-            let selected = reply
+            let namespace_selected = reply
                 .namespace
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .is_some();
-            if selected {
-                // NamespaceLoan prepays this exact Box size before the original
-                // namespace producer. The live reply retains that debit here.
+            // Separate statements drop the namespace guard before the control lock.
+            let control_selected = reply
+                .control
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_some();
+            if namespace_selected || control_selected {
+                // The selected namespace or control producer prepays this exact
+                // Box size before its original observation. The live reply retains that debit here.
                 Err(OperationJournalOwnerError::RetainedBacking(
                     RetainedCommandError {
                         error: Some(Box::new(error)),

@@ -11,6 +11,7 @@ pub use super::wal_admission::{
     WalPreparationError, WalPreparationHandle, WalPreparationInput, WalPreparationObservation,
     WalPreparationStatus, WalPreparedDatabase,
 };
+mod control_credit;
 mod frozen_copy;
 mod historical_reply;
 mod namespace_credit;
@@ -5643,6 +5644,7 @@ impl OperationJournalClient {
                 consumer: Mutex::new(None),
                 observer: Mutex::new(None),
                 namespace: Mutex::new(None),
+                control: Mutex::new(None),
                 #[cfg(test)]
                 consumer_refused: std::sync::atomic::AtomicBool::new(false),
             });
@@ -6085,6 +6087,7 @@ struct HistoricalReplyBacking {
     consumer: Mutex<Option<InputPermit>>,
     observer: Mutex<Option<HistoricalObserverCredits>>,
     namespace: Mutex<Option<namespace_credit::NamespaceCredits>>,
+    control: Mutex<Option<control_credit::ControlCredits>>,
     #[cfg(test)]
     consumer_refused: std::sync::atomic::AtomicBool,
     // Release working/consumer storage first; the private wrapper already freed the Arc.
@@ -6128,6 +6131,7 @@ impl InputPermit {
             consumer: Mutex::new(None),
             observer: Mutex::new(None),
             namespace: Mutex::new(None),
+            control: Mutex::new(None),
             #[cfg(test)]
             consumer_refused: std::sync::atomic::AtomicBool::new(false),
             _header: header,
@@ -7620,6 +7624,7 @@ mod tests {
         include!("owner/tests/queue_metrics_integration.rs");
     }
     mod capacity_startup_tests;
+    mod control_backing_tests;
     mod historical_claim_admission_tests;
     mod namespace_backing_tests;
     mod provider_reconciliation_tests;

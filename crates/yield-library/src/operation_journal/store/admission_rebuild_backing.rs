@@ -223,7 +223,10 @@ impl OperationJournalStore {
     ) -> Result<usize, OperationJournalStoreError> {
         let required = self
             .retained_namespace_working_bytes_for_test()
-            .checked_add(2)
+            // Funded reader controls retain their outgoing error Box loan while
+            // this same original nested namespace guard runs.
+            .checked_add(transaction_control::WORKING_BYTES)
+            .and_then(|bytes| bytes.checked_add(2))
             .ok_or(OperationJournalStoreError::OrdinaryRebuildResourceBound)?;
         let mut rows = 32usize;
         loop {
