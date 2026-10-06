@@ -2039,6 +2039,17 @@ mod integration {
         );
         assert_eq!(policy.family_digest(), &expected_digest);
 
+        let WalPreparedDatabase::Lease(original_source) = &view.databases()[1] else {
+            unreachable!();
+        };
+        assert!(
+            original_source
+                .original_binding()
+                .retirement_forward_policy()
+                .is_some(),
+            "the actual Source producer must retain the frozen lease RELEASE policy"
+        );
+
         if let Some(collector) = local_collector.as_mut() {
             collector.begin_decision(digest).unwrap();
             let nonce = collector.decision_nonce().unwrap();

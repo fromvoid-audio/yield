@@ -522,6 +522,7 @@ impl SourceLeaseMaintenancePreparationFailure {
 
 mod binding_capture;
 pub use binding_capture::SourceLeaseMaintenanceBinding;
+pub(super) mod retirement_policy;
 
 #[cfg(test)]
 mod tests;

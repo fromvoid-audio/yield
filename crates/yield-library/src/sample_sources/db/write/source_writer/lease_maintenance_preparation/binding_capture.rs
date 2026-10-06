@@ -14,11 +14,17 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub struct SourceLeaseMaintenanceBinding {
     stored: StoredSourceLeaseFence,
+    retirement: Option<super::retirement_policy::SourceRetirementForwardPolicy>,
     issuer: Weak<()>,
     nonce: Uuid,
     deadline: Instant,
 }
 impl SourceLeaseMaintenanceBinding {
+    pub(crate) fn retirement_forward_policy(
+        &self,
+    ) -> Option<&super::retirement_policy::SourceRetirementForwardPolicy> {
+        self.retirement.as_ref()
+    }
     pub(crate) fn retained_memory_bytes(&self) -> Option<usize> {
         std::mem::size_of::<Self>().checked_add(self.stored.retained_heap_bytes()?)
     }
@@ -69,6 +75,7 @@ impl SourceLeaseMaintenancePreparation {
         }
         Ok(SourceLeaseMaintenanceBinding {
             stored,
+            retirement: None,
             issuer: Arc::downgrade(&writer.reference_liveness),
             nonce: self.nonce(),
             deadline: self.deadline(),
