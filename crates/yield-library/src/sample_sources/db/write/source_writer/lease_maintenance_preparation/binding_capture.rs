@@ -14,12 +14,23 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub struct SourceLeaseMaintenanceBinding {
     stored: StoredSourceLeaseFence,
+    registration_generation: u64,
     retirement: Option<super::retirement_policy::SourceRetirementForwardPolicy>,
     issuer: Weak<()>,
     nonce: Uuid,
     deadline: Instant,
 }
 impl SourceLeaseMaintenanceBinding {
+    /// Captured from the genuine original request; not decoded from a historical fence.
+    pub(crate) fn registration_generation(&self) -> u64 {
+        self.registration_generation
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_registration_generation_for_tests(&mut self, generation: u64) {
+        self.registration_generation = generation;
+    }
+
     pub(crate) fn retirement_forward_policy(
         &self,
     ) -> Option<&super::retirement_policy::SourceRetirementForwardPolicy> {
@@ -104,6 +115,7 @@ impl SourceLeaseMaintenancePreparation {
         }
         Ok(SourceLeaseMaintenanceBinding {
             stored,
+            registration_generation: registration.registration_generation(),
             retirement: None,
             issuer: Arc::downgrade(&writer.reference_liveness),
             nonce: self.nonce(),
@@ -117,7 +129,8 @@ impl SourceLeaseMaintenancePreparation {
         binding: &SourceLeaseMaintenanceBinding,
         registration: &SourceAuthorityRegistration,
     ) -> Result<(), SourceLeaseMaintenancePreparationError> {
-        if binding.nonce != self.nonce()
+        if binding.registration_generation != registration.registration_generation()
+            || binding.nonce != self.nonce()
             || binding.deadline != self.deadline()
             || !Weak::ptr_eq(
                 &binding.issuer,
@@ -146,6 +159,9 @@ impl SourceLeaseMaintenancePreparation {
     ) -> Result<(), SourceLeaseMaintenancePreparationError> {
         self.validate_lease_binding(binding, registration)?;
         if let Some(custody) = self.custody.registered.as_ref() {
+            if custody.registration_generation() != binding.registration_generation {
+                return Err(LifecycleAllocationError::Unknown.into());
+            }
             custody
                 .validate(&self.custody.writer().database, registration)
                 .map_err(|_| LifecycleAllocationError::Unknown)?;

@@ -34,6 +34,11 @@ impl SourceAuthorityRegistration {
     }
 }
 impl RegisteredDatabaseCustody {
+    /// The unchanged original request observation, never current authority by itself.
+    pub(crate) fn registration_generation(&self) -> u64 {
+        self.request.registration_generation()
+    }
+
     pub(crate) fn validate(
         &self,
         database: &SourceDatabase,

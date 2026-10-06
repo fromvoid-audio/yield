@@ -1,5 +1,7 @@
 //! Actual never-audited source/SQLite lifecycle tests; no capacity provider is installed.
 #![cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[path = "registration_generation_tests.rs"]
+mod registration_generation_tests;
 #[path = "retirement_policy/registered_tests.rs"]
 mod retirement_policy_tests;
 use super::*;

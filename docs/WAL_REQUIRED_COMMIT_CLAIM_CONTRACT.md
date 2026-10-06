@@ -121,6 +121,13 @@ process may reuse a numeric serial with a different acquisition UUID. A stored
 serial cannot reconstruct current ownership or a decision latch. The actual
 OPT-2136 inventory consumer must compare all original context at its joint decision;
 the producer alone does not construct or qualify an inventory header.
+The original Source request also issues a checked process-local registration
+serial after native validation (OPT-2383), described in
+[original Source registration generations](SOURCE_REGISTRATION_GENERATIONS.md).
+It remains separate from lease epoch and lifecycle, and is retained unchanged by
+original Registered custody and lease-binding capture. It is meaningful only with
+the original UUID/acquisition/native ownership; copied or decoded numbers cannot
+construct the still-required original inventory factory or header authority.
 Validate SQLite storage ranges before identity allocation: persisted generations,
 revisions and byte ceilings must fit positive/nonnegative i64 fields as applicable.
 Volume IDs retain the existing canonical u64-text storage, not a lossy i64 cast.
