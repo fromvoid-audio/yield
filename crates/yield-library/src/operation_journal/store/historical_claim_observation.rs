@@ -57,38 +57,38 @@ impl OperationJournalStore {
         {
             return Err(retained_error(
                 Some(operation_id),
-                "stored operation key, sequence or record has the wrong SQLite type".into(),
+                "stored operation key, sequence or record has the wrong SQLite type",
             ));
         }
         let ValueRef::Integer(sequence) = row.get_ref(2)? else {
             return Err(retained_error(
                 Some(operation_id),
-                "stored sequence is not an integer".into(),
+                "stored sequence is not an integer",
             ));
         };
         if sequence <= 0 {
             return Err(retained_error(
                 Some(operation_id),
-                "stored sequence is not positive".into(),
+                "stored sequence is not positive",
             ));
         }
         self.ensure_sequence_unique(sequence)?;
         let ValueRef::Integer(length) = row.get_ref(4)? else {
             return Err(retained_error(
                 Some(operation_id),
-                "stored record length is unavailable".into(),
+                "stored record length is unavailable",
             ));
         };
         let ValueRef::Blob(bytes) = row.get_ref(5)? else {
             return Err(retained_error(
                 Some(operation_id),
-                "stored record is not a bounded SQLite BLOB".into(),
+                "stored record is not a bounded SQLite BLOB",
             ));
         };
         if !(0..=MAX_RECORD_BYTES as i64).contains(&length) || length as usize != bytes.len() {
             return Err(retained_error(
                 Some(operation_id),
-                "stored record length changed or exceeds its bound".into(),
+                "stored record length changed or exceeds its bound",
             ));
         }
         scratch = historical_observation::Scratch::new(input, bytes.len())?;
@@ -106,14 +106,14 @@ impl OperationJournalStore {
         if record.operation_id != operation_id {
             return Err(retained_error(
                 Some(operation_id),
-                "record identity does not match its SQLite key".into(),
+                "record identity does not match its SQLite key",
             ));
         }
         match classify_record(record) {
             RecordConsistency::Consistent => Ok(true),
             RecordConsistency::LegacyMissingPublicationEvidence => Err(retained_error(
                 Some(operation_id),
-                "legacy record is retained without publication evidence".into(),
+                "legacy record is retained without publication evidence",
             )),
             RecordConsistency::Invalid(reason) => Err(retained_error(Some(operation_id), reason)),
         }
