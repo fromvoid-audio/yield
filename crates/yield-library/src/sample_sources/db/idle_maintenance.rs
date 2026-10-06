@@ -28,10 +28,10 @@ impl SourceDatabase {
         // Existing in-flight custody prevents release while this admitted maintenance pass runs.
         // It is not a journal-issued mutation grant. Native validation is readonly: never call
         // prepare_for_mutation, which can renew through the separate CONTROL writer.
-        let _custody = lease.effect_gate().begin(|| {
-            self.validate_profile_owned_open(profile)?;
-            Ok(())
-        })?;
+        // Count this original use under the short gate, then validate while its RAII pin is
+        // retained. Native/SQLite validation must not hold the gate mutex needed by closing.
+        let _custody = lease.effect_gate().begin(|| Ok(()))?;
+        self.validate_profile_owned_open(profile)?;
         self.checkpoint_policy.maybe_checkpoint(
             &self.connection,
             "source_db",

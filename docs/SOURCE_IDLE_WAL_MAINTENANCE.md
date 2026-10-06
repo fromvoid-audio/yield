@@ -22,9 +22,10 @@ The SourceWriter entrypoint requires genuine retained profile, root, MAIN and So
 lease custody even in test-support builds. It skips active SQLite transactions and
 refuses an entered or poisoned metadata policy. The original lease effect gate counts
 the admitted maintenance use until ownership validation after the checkpoint finishes.
-This existing in-flight pin is not a journal-issued effect grant. Original root/MAIN
-identity and the unexpired durable lease are checked before and after through readonly
-validation. The idle path never calls `prepare_for_mutation` or writes/renews through
+This existing in-flight pin is not a journal-issued effect grant. After releasing the
+original effect gate mutex, readonly validation checks original root/MAIN identity and
+the unexpired durable lease before and after the checkpoint with that pin retained.
+The idle path never calls `prepare_for_mutation` or writes/renews through
 the separate CONTROL writer. Lease expiry, replacement or a closed gate skips work.
 
 The retained connection's unchanged CheckpointPolicy observes its original WAL and
