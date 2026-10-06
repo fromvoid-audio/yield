@@ -1,7 +1,9 @@
 //! Bounded scalar observations of the original actor ledger, never entry authority.
 use super::retained_backing::RetainedWeak;
 use super::*;
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::Mutex;
 
 pub(super) const MAX_VOLUMES: usize = 32;
 #[derive(Debug)]
