@@ -25,7 +25,7 @@ mod integration {
         static HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         HIT.store(false, std::sync::atomic::Ordering::Release);
         fixture(|writer, guard, _| {
-            let pending = writer
+            let mut pending = writer
                 .submit_preparation(
                     request(writer, Duration::from_millis(150))
                         .with_wal_binding()
