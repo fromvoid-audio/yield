@@ -4,7 +4,7 @@ use super::*;
 use crate::operation_journal::owner::InputPermit;
 
 impl OperationJournalStore {
-    pub(super) fn validate_namespace_with_input(
+    pub(in crate::operation_journal) fn validate_namespace_with_input(
         &self,
         input: Option<&InputPermit>,
         precommit: bool,
