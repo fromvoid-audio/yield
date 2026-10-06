@@ -820,6 +820,7 @@ mod integration {
         drop(another_copy);
         drop(handle);
         assert_eq!(budget.used(), 0);
+        drop(budget);
         assert_eq!(
             client.shared.input_bytes.lock().unwrap().remaining[0],
             InputBudget::shared_initial().remaining[0]
@@ -2188,7 +2189,8 @@ mod integration {
                 .unwrap();
             let acquisition = Uuid::parse_str(fixture.owner.owner_identity()).unwrap();
             let (mut collector, handle) =
-                crate::operation_journal::wal_admission::Collector::new(input, permit, acquisition);
+                crate::operation_journal::wal_admission::Collector::new(input, permit, acquisition)
+                    .unwrap();
             if outcome == 12 {
                 let round = loop {
                     if let Some(round) = collector.preparing_round_for_tests() {
@@ -2413,6 +2415,7 @@ mod integration {
             drop(actor);
             assert!(global.shutdown());
             assert!(journal.shutdown());
+            drop(budget);
             assert_eq!(
                 *journal.shared.input_bytes.lock().unwrap(),
                 InputBudget::shared_initial()
@@ -2478,6 +2481,7 @@ mod integration {
             drop(actor);
             assert!(global.shutdown());
             assert!(journal.shutdown());
+            drop(budget);
             assert_eq!(
                 *journal.shared.input_bytes.lock().unwrap(),
                 InputBudget::shared_initial()
@@ -2860,7 +2864,7 @@ mod integration {
             });
             projection_gate = Some(release_tx);
         } else if inventory_case == 3 {
-            let budget = Arc::clone(&budget);
+            let budget = budget.clone();
             let full_credit = Arc::clone(&full_credit);
             handle.retirement_hook_for_tests(move |_| {
                 let mut credit = budget.credit();
@@ -3043,9 +3047,10 @@ mod integration {
             },
             "{aborted:?}"
         );
+        let detached_report = (inventory_case == 6).then(|| view.databases()[1].clone());
         drop(view);
         drop(handle);
-        if inventory_alias.is_some() {
+        if inventory_alias.is_some() || detached_report.is_some() {
             assert!(budget.used() > 0);
         } else {
             assert_eq!(budget.used(), 0);
@@ -3062,24 +3067,6 @@ mod integration {
                     .any(|event| event == "reuse:retiring-pre-audit"),
                 "original Source writer was not restored"
             );
-            // The original resource header remains deliberately charged until shutdown.
-            // Every WAL preparation/command debit must be gone independently of it.
-            let mut live_header = InputBudget::shared_initial();
-            live_header.remaining[InputClass::Ordinary.index()] -= resource_custody::HEADER_BYTES;
-            live_header.publication_remaining -= resource_custody::HEADER_BYTES;
-            let released = Instant::now() + Duration::from_secs(1);
-            loop {
-                let observed = *journal.shared.input_bytes.lock().unwrap();
-                if observed == live_header {
-                    break;
-                }
-                assert!(
-                    Instant::now() < released,
-                    "original journal input debit remains held: observed={observed:?}, expected={:?}",
-                    live_header
-                );
-                thread::sleep(Duration::from_millis(1));
-            }
             // The same actual Global writer must have completed its earlier abort before
             // it can accept another bounded observation; no physical effect is requested.
             let request = crate::sample_sources::library::GlobalPreparationRequest::new(
@@ -3101,20 +3088,56 @@ mod integration {
                 .unwrap()
                 .unwrap();
             drop(pending);
+            drop(actor);
+            assert!(global.shutdown());
+            // The original resource header remains deliberately charged until shutdown.
+            // Every WAL preparation/command debit must be gone independently of it.
+            let mut live_header = InputBudget::shared_initial();
+            live_header.remaining[InputClass::Ordinary.index()] -= resource_custody::HEADER_BYTES;
+            live_header.publication_remaining -= resource_custody::HEADER_BYTES;
             assert_eq!(budget.used(), 0);
-        }
-        drop(actor);
-        assert!(global.shutdown());
-        if outcome == 16 {
-            // OwnerLost conservatively denies clean handoff, even when NoAttempt
-            // backing has been destroyed. Memory release does not waive that refusal.
+            drop(budget);
+            let released = Instant::now() + Duration::from_secs(1);
+            loop {
+                let observed = *journal.shared.input_bytes.lock().unwrap();
+                if observed == live_header {
+                    break;
+                }
+                assert!(
+                    Instant::now() < released,
+                    "original journal input debit remains held: observed={observed:?}, expected={:?}",
+                    live_header
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
             assert!(!journal.shutdown());
             assert_eq!(
                 *journal.shared.input_bytes.lock().unwrap(),
                 InputBudget::shared_initial()
             );
-        } else {
-            assert!(journal.shutdown());
+            return;
+        }
+        drop(actor);
+        assert!(global.shutdown());
+        assert!(journal.shutdown());
+        if let Some(detached_report) = detached_report {
+            assert!(matches!(detached_report, WalPreparedDatabase::Lease(_)));
+            assert!(budget.used() > 0);
+            // A diagnostic budget alias must not be the holder that funds this proof.
+            drop(budget);
+            assert_eq!(
+                InputBudget::shared_initial().remaining[0]
+                    - journal.shared.input_bytes.lock().unwrap().remaining[0],
+                64 * 1024,
+                "detached genuine lease report must retain original journal input after joins"
+            );
+            let alias = detached_report.clone();
+            concurrent_inventory_drop(detached_report, alias);
+            assert_eq!(
+                *journal.shared.input_bytes.lock().unwrap(),
+                InputBudget::shared_initial()
+            );
+            return;
         }
         if let Some(alias) = inventory_alias {
             let context = inventory_native_context.unwrap();
@@ -3359,6 +3382,55 @@ mod integration {
             drop(handle);
             drop(actor);
             assert!(journal.shutdown());
+        }
+    }
+    #[test]
+    fn all_owner_detached_reports_retain_original_journal_input_after_joins() {
+        for detached_index in 0..3 {
+            let mut rig = Rig::new("all-owner-detached-reports");
+            let input = rig.input(Instant::now() + Duration::from_secs(2));
+            let budget = input.budget_for_test();
+            let handle = rig.submit(input);
+            let WalPreparationStatus::Ready(view) = wait(&handle, |s| {
+                matches!(s, WalPreparationStatus::Ready(_)) || terminal(s)
+            }) else {
+                panic!("not ready")
+            };
+            let detached = view.databases()[detached_index].clone();
+            if detached_index == 0 {
+                assert!(matches!(detached, WalPreparedDatabase::Global(_)));
+            } else {
+                assert!(matches!(detached, WalPreparedDatabase::Source(_)));
+            }
+            let client = rig.journal.client();
+            assert!(rig.journal.shutdown());
+            assert!(matches!(handle.status(), WalPreparationStatus::Aborted));
+            for i in 0..2 {
+                rig.outside_source(i)
+                    .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+                    .unwrap();
+            }
+            drop(view);
+            drop(handle);
+            drop(rig.actor.take());
+            assert!(rig.global.shutdown());
+            assert!(
+                budget.used() > 0,
+                "detached original report backing remains live"
+            );
+            drop(budget);
+            assert_eq!(
+                InputBudget::shared_initial().remaining[0]
+                    - client.shared.input_bytes.lock().unwrap().remaining[0],
+                64 * 1024,
+                "detached original reports must retain the original journal backing debit"
+            );
+            let alias = detached.clone();
+            concurrent_inventory_drop(detached, alias);
+            assert_eq!(
+                client.shared.input_bytes.lock().unwrap().remaining[0],
+                InputBudget::shared_initial().remaining[0]
+            );
         }
     }
     #[test]

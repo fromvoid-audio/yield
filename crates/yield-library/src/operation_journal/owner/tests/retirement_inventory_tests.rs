@@ -16,6 +16,10 @@ fn retirement_inventory_actual_original_consumer_uses_restarted_global_lifetime(
     original_retirement_custody_with_inventory(0, None, 4);
 }
 #[test]
+fn retirement_inventory_actual_detached_lease_report_retains_journal_input() {
+    original_retirement_custody_with_inventory(0, None, 6);
+}
+#[test]
 fn retirement_inventory_actual_original_consumer_preserves_completed_audit_codec() {
     original_retirement_custody_with_inventory(0, None, 5);
 }

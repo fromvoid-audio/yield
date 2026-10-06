@@ -126,9 +126,23 @@ pub enum SourceWalTransportRejection {
 /// use yield_library::sample_sources::wal_transport::SourceWalTransportObservation;
 /// let forged = SourceWalTransportObservation {};
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SourceWalTransportObservation {
-    data: Arc<ObservationData>,
+    data: Option<Arc<ObservationData>>,
+}
+impl Drop for SourceWalTransportObservation {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take().and_then(Arc::into_inner) {
+            drop(data);
+        }
+    }
+}
+impl std::fmt::Debug for SourceWalTransportObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceWalTransportObservation")
+            .field("data", self.data())
+            .finish()
+    }
 }
 #[derive(Debug)]
 struct ObservationData {
@@ -143,54 +157,59 @@ struct ObservationData {
 }
 impl PartialEq for SourceWalTransportObservation {
     fn eq(&self, other: &Self) -> bool {
-        self.data.registered_custody_retained == other.data.registered_custody_retained
-            && self.data.revision == other.data.revision
-            && self.data.correlation == other.data.correlation
-            && self.data.nonce == other.data.nonce
-            && self.data.wal_bytes == other.data.wal_bytes
-            && self.data.scope == other.data.scope
-            && self.data.policy_family == other.data.policy_family
+        self.data().registered_custody_retained == other.data().registered_custody_retained
+            && self.data().revision == other.data().revision
+            && self.data().correlation == other.data().correlation
+            && self.data().nonce == other.data().nonce
+            && self.data().wal_bytes == other.data().wal_bytes
+            && self.data().scope == other.data().scope
+            && self.data().policy_family == other.data().policy_family
     }
 }
 impl Eq for SourceWalTransportObservation {}
 impl SourceWalTransportObservation {
+    fn data(&self) -> &ObservationData {
+        self.data
+            .as_deref()
+            .expect("live original Source observation")
+    }
     // Historical original-producer marker only; never current authority or a decision latch.
     pub(crate) fn registered_custody_was_retained(&self) -> bool {
-        self.data.registered_custody_retained
+        self.data().registered_custody_retained
     }
 
     /// Historical family marker issued only after the actual owned policy entered successfully.
     /// This never proves current journal registration, physical allocation or settlement.
     pub fn policy_family(&self) -> Option<SourceWalPolicyFamily> {
-        self.data.policy_family
+        self.data().policy_family
     }
 
     /// Borrow typed historical original scope. It cannot recreate live owner custody or a latch.
     pub fn original_binding(&self) -> Option<&crate::sample_sources::db::write::SourceWalBinding> {
-        self.data.scope.as_ref().map(ScopeView::binding)
+        self.data().scope.as_ref().map(ScopeView::binding)
     }
 
     /// Shared historical original owner descriptor, when explicitly requested.
     /// This never proves current journal registration or issues settlement authority.
     /// Clones share the buffer and retain its byte credit until the last view is dropped.
     pub fn scope_descriptor_bytes(&self) -> Option<&[u8]> {
-        self.data.scope.as_ref().map(ScopeView::bytes)
+        self.data().scope.as_ref().map(ScopeView::bytes)
     }
     /// Complete source revision observed by the original retained writer.
     pub fn revision(&self) -> &SourceRevision {
-        &self.data.revision
+        &self.data().revision
     }
     /// Retained VFS WAL byte observation, not a current watermark permission.
     pub fn wal_bytes(&self) -> u64 {
-        self.data.wal_bytes
+        self.data().wal_bytes
     }
     /// Original command/participant/claim observations, not allocated claims.
     pub fn correlation(&self) -> &SourceWalTransportCorrelation {
-        &self.data.correlation
+        &self.data().correlation
     }
     /// Opaque local preparation nonce, not an OperationId.
     pub fn nonce(&self) -> &str {
-        &self.data.nonce
+        &self.data().nonce
     }
 }
 
@@ -328,7 +347,7 @@ struct PrepareRequest {
     require_binding: bool,
     policy: Option<RequestPolicy>,
     lease: Option<crate::sample_sources::db::write::SourceLeaseMaintenanceAllocation>,
-    handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
+    handshake: Option<crate::operation_journal::wal_admission::HandshakeBudget>,
 }
 impl PrepareRequest {
     fn finish(self, status: SourceWalTransportStatus) {
@@ -479,7 +498,7 @@ impl SourceWalTransport {
         input: crate::operation_journal::wal_admission::SourceInput,
         correlation: SourceWalTransportCorrelation,
         deadline: Instant,
-        handshake: Arc<crate::operation_journal::wal_admission::HandshakeBudget>,
+        handshake: crate::operation_journal::wal_admission::HandshakeBudget,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
         use crate::operation_journal::wal_admission::SourceInput;
         match input {
@@ -522,7 +541,7 @@ impl SourceWalTransport {
         deadline: Instant,
         require_binding: bool,
         policy: Option<RequestPolicy>,
-        handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
+        handshake: Option<crate::operation_journal::wal_admission::HandshakeBudget>,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
         let now = Instant::now();
         if deadline <= now || deadline.duration_since(now) > MAX_DEADLINE {
@@ -579,7 +598,7 @@ impl SourceWalTransport {
         policy: Option<RequestPolicy>,
         lease: Option<crate::sample_sources::db::write::SourceLeaseMaintenanceAllocation>,
         size: usize,
-        handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
+        handshake: Option<crate::operation_journal::wal_admission::HandshakeBudget>,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
         if size > SOURCE_WAL_TRANSPORT_MAX_CONTEXT_BYTES {
             return Err(SourceWalTransportRejection::InvalidContext);

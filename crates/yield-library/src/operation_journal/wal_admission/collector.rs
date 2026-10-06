@@ -19,7 +19,7 @@ use std::{
     },
     time::Instant,
 };
-mod journal_input;
+pub(super) mod journal_input;
 mod retirement_inventory;
 mod retirement_policy;
 use journal_input::JournalInput;
@@ -203,12 +203,49 @@ pub(in crate::operation_journal) struct Collector {
     done: bool,
     _journal_input: JournalInput,
 }
+// Fixed headers that coexist after original journal reservation. Snapshot and
+// CurrentRound have separate concrete credits; source/held Vec backing is charged
+// separately by WalPreparationInput. Including the whole Collector conservatively
+// counts its inline input again within the unchanged fixed allowance.
+pub(super) const FIXED_COLLECTOR_ALLOWANCE: usize = 2048;
+const INPUT_ARC_BYTES: usize = std::mem::size_of::<super::super::owner::InputPermit>() + 64;
+const SHARED_ARC_BYTES: usize = std::mem::size_of::<Shared>() + 64;
+const FIXED_COLLECTOR_HEADERS: usize = std::mem::size_of::<Collector>()
+    + SHARED_ARC_BYTES
+    + INPUT_ARC_BYTES
+    + super::credit::BACKING_BYTES;
+// The 64-byte slack covers two Arc counters plus payload alignment on supported
+// targets. This gate makes that target-layout assumption explicit.
+const _: () = assert!(std::mem::size_of::<usize>() <= 8);
+const _: () = assert!(std::mem::align_of::<Shared>() <= 64);
+const _: () = assert!(std::mem::align_of::<super::super::owner::InputPermit>() <= 64);
+const _: () = assert!(FIXED_COLLECTOR_HEADERS <= FIXED_COLLECTOR_ALLOWANCE);
+
+#[cfg(test)]
+mod fixed_headers {
+    use super::*;
+    #[test]
+    fn original_wal_fixed_collector_headers_fit_preexisting_allowance() {
+        eprintln!(
+            "active fixed headers: collector={} shared_with_arc_slack={} original_input_with_arc_slack={} budget_with_arc_slack={} total={} allowance={}; snapshot and current round separately charged",
+            std::mem::size_of::<Collector>(),
+            SHARED_ARC_BYTES,
+            INPUT_ARC_BYTES,
+            super::super::credit::BACKING_BYTES,
+            FIXED_COLLECTOR_HEADERS,
+            FIXED_COLLECTOR_ALLOWANCE
+        );
+        assert!(FIXED_COLLECTOR_HEADERS <= FIXED_COLLECTOR_ALLOWANCE);
+    }
+}
 impl Collector {
     pub(in crate::operation_journal) fn new(
         input: WalPreparationInput,
         journal_input: super::super::owner::InputPermit,
         profile_acquisition: uuid::Uuid,
-    ) -> (Self, WalPreparationHandle) {
+    ) -> Result<(Self, WalPreparationHandle), WalPreparationError> {
+        let journal_input = JournalInput::new(journal_input);
+        input.budget.bind_journal_input(journal_input.clone())?;
         let shared = Arc::new(Shared {
             canceled: AtomicBool::new(false),
             status: Mutex::new(WalPreparationStatus::Preparing),
@@ -219,7 +256,7 @@ impl Collector {
         });
         let capacity = input.sources.len() + usize::from(input.global.is_some());
         let held = Vec::with_capacity(capacity);
-        (
+        Ok((
             Self {
                 input,
                 profile_acquisition,
@@ -234,10 +271,10 @@ impl Collector {
                 ready_cohort: None,
                 current: None,
                 done: false,
-                _journal_input: JournalInput::new(journal_input),
+                _journal_input: journal_input,
             },
             WalPreparationHandle(shared),
-        )
+        ))
     }
     fn bind_source_round(&self, round: &super::CurrentRound) -> Result<(), WalPreparationError> {
         for (index, owner) in self.held.iter().enumerate() {
@@ -656,7 +693,7 @@ impl Collector {
                 source.input,
                 correlation.clone(),
                 self.input.deadline,
-                Arc::clone(&self.input.budget),
+                self.input.budget.clone(),
             ) {
                 Ok(request) => {
                     let Some(bytes) = self.input.retained_bytes() else {

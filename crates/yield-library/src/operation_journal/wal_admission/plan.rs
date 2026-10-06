@@ -9,7 +9,6 @@ use crate::sample_sources::library::{GlobalPreparationRequest, GlobalWalPreparat
 use blake3::Hasher;
 use std::{
     io::{self, Write},
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -54,7 +53,7 @@ pub struct WalPreparationInput {
     pub(super) digest: [u8; 32],
     pub(super) global_storage: Option<ClaimStorage>,
     pub(super) deadline: Instant,
-    pub(super) budget: Arc<HandshakeBudget>,
+    pub(super) budget: HandshakeBudget,
     pub(super) credit: HandshakeCredit,
     pub(super) header_bytes: usize,
 }
@@ -62,6 +61,14 @@ struct HashWriter {
     hash: Hasher,
     bytes: usize,
 }
+const FACTORY_FIXED_BYTES: usize = 4096;
+const FIXED_FACTORY_HEADERS: usize = super::credit::BACKING_BYTES
+    + std::mem::size_of::<HashWriter>()
+    + std::mem::size_of::<WalPreparationInput>()
+    + std::mem::size_of::<GlobalPreparationRequest>();
+// All four coexist during the factory prepass. Source vector/field backing and
+// typed validation/topology scratch have their existing separate checked charges.
+const _: () = assert!(FIXED_FACTORY_HEADERS <= FACTORY_FIXED_BYTES);
 impl Write for HashWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let next = self
@@ -102,13 +109,13 @@ fn digest(value: &impl serde::Serialize) -> Result<[u8; 32], WalPreparationError
 // These are memory refusals, never reservations or physical capacity authority.
 fn factory_credit(
     sources: &Vec<SourcePreparation>,
-) -> Result<(Arc<HandshakeBudget>, HandshakeCredit, usize), WalPreparationError> {
+) -> Result<(HandshakeBudget, HandshakeCredit, usize), WalPreparationError> {
     // The retained vector capacity is checked again by finish. At this prepass the
     // slice covers live elements and the fixed streaming hash/validation headers.
     let base = sources
         .capacity()
         .checked_mul(std::mem::size_of::<SourcePreparation>())
-        .and_then(|n| n.checked_add(4096))
+        .and_then(|n| n.checked_add(FACTORY_FIXED_BYTES))
         .ok_or(WalPreparationError::Full)?;
     let base = sources
         .iter()
@@ -121,11 +128,11 @@ fn factory_credit(
 }
 fn factory_credit_one(
     source: &SourcePreparation,
-) -> Result<(Arc<HandshakeBudget>, HandshakeCredit, usize), WalPreparationError> {
+) -> Result<(HandshakeBudget, HandshakeCredit, usize), WalPreparationError> {
     let base = source
         .input
         .retained_bytes()
-        .and_then(|n| n.checked_add(std::mem::size_of::<SourcePreparation>() + 4096))
+        .and_then(|n| n.checked_add(std::mem::size_of::<SourcePreparation>() + FACTORY_FIXED_BYTES))
         .ok_or(WalPreparationError::Full)?;
     let budget = HandshakeBudget::new();
     let mut credit = budget.credit();
@@ -548,7 +555,7 @@ impl WalPreparationInput {
         digest: [u8; 32],
         deadline: Instant,
         lifecycle: bool,
-        funded: Option<(Arc<HandshakeBudget>, HandshakeCredit)>,
+        funded: Option<(HandshakeBudget, HandshakeCredit)>,
     ) -> Result<Self, WalPreparationError> {
         let deadline = sources
             .iter()
@@ -569,7 +576,7 @@ impl WalPreparationInput {
         // Move the original caller vector, with its entire actual capacity. No option
         // vector, stable-sort scratch or second backing is allocated during transfer.
         let header_bytes = std::mem::size_of::<Self>()
-            .checked_add(2048)
+            .checked_add(super::collector::FIXED_COLLECTOR_ALLOWANCE)
             .and_then(|n| {
                 n.checked_add(
                     sources
@@ -607,7 +614,7 @@ impl WalPreparationInput {
                 if lifecycle {
                     request = request.with_lifecycle_policy();
                 }
-                Ok((client, request.in_handshake(Arc::clone(&budget))))
+                Ok((client, request.in_handshake(budget.clone())))
             })
             .transpose()?;
         Ok(Self {
@@ -634,8 +641,8 @@ impl WalPreparationInput {
     }
 
     #[cfg(test)]
-    pub(in crate::operation_journal) fn budget_for_test(&self) -> Arc<HandshakeBudget> {
-        Arc::clone(&self.budget)
+    pub(in crate::operation_journal) fn budget_for_test(&self) -> HandshakeBudget {
+        self.budget.clone()
     }
     pub(in crate::operation_journal) fn retained_bytes(&self) -> Option<usize> {
         self.sources
@@ -643,5 +650,23 @@ impl WalPreparationInput {
             .try_fold(self.header_bytes, |n, source| {
                 n.checked_add(source.input.retained_bytes()?)
             })
+    }
+}
+
+#[cfg(test)]
+mod fixed_factory_headers {
+    use super::*;
+    #[test]
+    fn original_wal_fixed_factory_headers_fit_preexisting_allowance() {
+        eprintln!(
+            "factory fixed headers: budget_with_arc_slack={} hash_writer={} input={} global_request={} total={} allowance={}",
+            super::super::credit::BACKING_BYTES,
+            std::mem::size_of::<HashWriter>(),
+            std::mem::size_of::<WalPreparationInput>(),
+            std::mem::size_of::<GlobalPreparationRequest>(),
+            FIXED_FACTORY_HEADERS,
+            FACTORY_FIXED_BYTES
+        );
+        assert!(FIXED_FACTORY_HEADERS <= FACTORY_FIXED_BYTES);
     }
 }

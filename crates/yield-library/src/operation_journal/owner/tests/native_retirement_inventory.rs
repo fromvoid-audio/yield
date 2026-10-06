@@ -444,6 +444,7 @@ fn native_retirement_inventory_genuine_registered_original_consumer() {
     let alias = inventory.clone();
     native_concurrent_drop(inventory, alias);
     assert_eq!(budget.used(), 0);
+    drop(budget);
     assert_eq!(
         *journal.shared.input_bytes.lock().unwrap(),
         InputBudget::new()

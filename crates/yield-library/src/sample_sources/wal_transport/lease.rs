@@ -104,7 +104,7 @@ impl SourceWalTransport {
         input: SourceLeaseMaintenanceAllocation,
         correlation: SourceWalTransportCorrelation,
         deadline: Instant,
-        handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
+        handshake: Option<crate::operation_journal::wal_admission::HandshakeBudget>,
     ) -> Result<SourceWalTransportRequest, SourceWalTransportRejection> {
         let deadline = deadline.min(input.deadline());
         let now = Instant::now();
