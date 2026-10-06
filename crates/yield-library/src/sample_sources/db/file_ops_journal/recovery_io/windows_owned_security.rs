@@ -3,6 +3,15 @@
 const SECURITY_BYTES: usize = 16 * 1024;
 const TOKEN_BYTES: usize = 512;
 const MAX_ACES: usize = 64;
+
+#[repr(C, align(16))]
+struct SnapshotBuffers {
+    token: [u8; TOKEN_BYTES],
+    security: [u8; SECURITY_BYTES],
+}
+
+pub(super) const BUFFER_BYTES: usize = std::mem::size_of::<SnapshotBuffers>();
+const _: () = assert!(BUFFER_BYTES == TOKEN_BYTES + SECURITY_BYTES);
 // FILE_ALL_ACCESS plus the four generic access bits. Native SDK parity is below.
 const KNOWN_RIGHTS: u32 = 0xf01f01ff;
 // ADD_FILE, ADD_SUBDIRECTORY, WRITE_EA, DELETE_CHILD, WRITE_ATTRIBUTES;
@@ -128,7 +137,10 @@ fn snapshot(bytes: &[u8], account: &[u8]) -> Result<(), SnapshotError> {
 #[cfg(windows)]
 mod native {
     use super::*;
-    use std::{fs::File, os::windows::io::AsRawHandle};
+    use std::{
+        fs::File,
+        os::windows::io::{AsRawHandle, FromRawHandle},
+    };
     use windows::Win32::{
         Foundation::{
             CloseHandle, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE,
@@ -143,8 +155,10 @@ mod native {
         },
         Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
-            FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
-            GetFileInformationByHandle, GetFileType, WRITE_DAC, WRITE_OWNER,
+            FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+            FILE_WRITE_DATA, FILE_WRITE_EA, GetFileInformationByHandle, GetFileType, READ_CONTROL,
+            ReOpenFile, WRITE_DAC, WRITE_OWNER,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
@@ -192,8 +206,6 @@ mod native {
         );
     };
 
-    #[repr(C, align(16))]
-    struct Buffer<const N: usize>([u8; N]);
     struct Token(HANDLE);
     impl Drop for Token {
         fn drop(&mut self) {
@@ -233,19 +245,47 @@ mod native {
         })
     }
 
-    pub(crate) fn validate(file: &File) -> Result<(), SnapshotError> {
+    pub(in crate::sample_sources::db::file_ops_journal::recovery_io) fn validate(
+        file: &File,
+    ) -> Result<(), SnapshotError> {
         let original = identity(file)?;
+        // The original production root was opened for attributes only. Acquire
+        // READ_CONTROL on that exact held object, never by a pathname. Both this
+        // read-only handle and the still-live original preserve the delete barrier.
+        let reopened = unsafe {
+            ReOpenFile(
+                HANDLE(file.as_raw_handle()),
+                (READ_CONTROL | FILE_READ_ATTRIBUTES).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        }
+        .map_err(|_| SnapshotError::Unavailable)?;
+        // SAFETY: successful ReOpenFile transfers this owned handle; File closes
+        // it on all returns, including token/security/identity refusal.
+        let security_file = unsafe { File::from_raw_handle(reopened.0) };
+        if identity(&security_file)? != original || identity(file)? != original {
+            return Err(SnapshotError::Changed);
+        }
         let mut raw = HANDLE::default();
         unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) }
             .map_err(|_| SnapshotError::Unavailable)?;
         let token = Token(raw);
-        let mut token_buffer = Buffer([0; TOKEN_BYTES]);
+        // Fixed-size original profile backing is reserved before production
+        // construction. Initialize this aligned heap object in place, avoiding
+        // a descriptor-sized stack temporary and hint-sized allocation.
+        let mut allocation = Box::<SnapshotBuffers>::new_uninit();
+        // SAFETY: SnapshotBuffers contains only byte arrays; all-zero initializes
+        // every byte, including any padding, before constructing a reference.
+        unsafe { allocation.as_mut_ptr().write_bytes(0, 1) };
+        let mut allocation = unsafe { allocation.assume_init() };
+        let buffers = &mut *allocation;
         let mut token_length = 0u32;
         unsafe {
             GetTokenInformation(
                 token.0,
                 TokenUser,
-                Some(token_buffer.0.as_mut_ptr().cast()),
+                Some(buffers.token.as_mut_ptr().cast()),
                 TOKEN_BYTES as u32,
                 &mut token_length,
             )
@@ -257,33 +297,32 @@ mod native {
         }
         // The aligned, complete native header is copied; its SID pointer is then
         // checked against the returned span before any SID bytes are interpreted.
-        let user = unsafe { std::ptr::read(token_buffer.0.as_ptr().cast::<TOKEN_USER>()) };
+        let user = unsafe { std::ptr::read(buffers.token.as_ptr().cast::<TOKEN_USER>()) };
         let offset = token_sid_offset(
-            token_buffer.0.as_ptr() as usize,
+            buffers.token.as_ptr() as usize,
             length,
             user.User.Sid.0 as usize,
             std::mem::size_of::<TOKEN_USER>(),
         )
         .ok_or(SnapshotError::Malformed)?;
-        let account = sid(&token_buffer.0[..length], offset).ok_or(SnapshotError::Malformed)?;
-        let mut security = Buffer([0; SECURITY_BYTES]);
+        let account = sid(&buffers.token[..length], offset).ok_or(SnapshotError::Malformed)?;
         let mut security_length = 0u32;
         unsafe {
             GetKernelObjectSecurity(
-                HANDLE(file.as_raw_handle()),
+                HANDLE(security_file.as_raw_handle()),
                 (OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION).0,
-                Some(PSECURITY_DESCRIPTOR(security.0.as_mut_ptr().cast())),
+                Some(PSECURITY_DESCRIPTOR(buffers.security.as_mut_ptr().cast())),
                 SECURITY_BYTES as u32,
                 &mut security_length,
             )
         }
         .map_err(|_| SnapshotError::Unavailable)?;
-        let bytes = security
-            .0
+        let bytes = buffers
+            .security
             .get(..security_length as usize)
             .ok_or(SnapshotError::Malformed)?;
         snapshot(bytes, account)?;
-        if identity(file)? != original {
+        if identity(&security_file)? != original || identity(file)? != original {
             return Err(SnapshotError::Changed);
         }
         Ok(())
