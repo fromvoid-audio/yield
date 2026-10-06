@@ -136,3 +136,79 @@ fn historical_claim_projection_keeps_maximum_scalar_wire_boundary() {
     let new = projected(&padded).unwrap().unwrap();
     assert_eq!(classify_record(&old), classify_record(&new));
 }
+
+#[test]
+fn historical_claim_projection_matches_all_legacy_status_and_existing_v2_evidence_combinations() {
+    let phases = [
+        "IntentDurable",
+        "Prepared",
+        "FilesystemStaged",
+        "FilesystemPublished",
+        "SourceReconciled",
+        "GlobalReconciled",
+        "ProjectionPublished",
+        "ReadinessScheduled",
+        "Terminal",
+    ];
+    let dispositions = [
+        "None",
+        "RetryPending",
+        "PartialNeedsRetry",
+        "AuditRequired",
+        "CancelRequestedBeforePublish",
+        "CancelRequestedAfterPublish",
+        "Succeeded",
+        "SucceededWithDeferredArtifacts",
+        "CancelledBeforePublish",
+        "CancelledAfterPublish",
+        "RolledBack",
+        "BlockedByUser",
+        "FailedPreservingData",
+        "FailedDataLossRisk",
+    ];
+    let mut complete: Value =
+        serde_json::from_str(include_str!("existing_v2_fixture.json")).unwrap();
+    if cfg!(windows) {
+        for field in ["source_root", "target_root", "backup_root"] {
+            complete["prepared"]["ExistingExpectedIdentity"][field]["path"] =
+                Value::from(format!(r"C:\yield\{field}"));
+        }
+    }
+    assert_eq!(
+        classify_record(&decode(&serde_json::to_vec(&complete).unwrap()).unwrap()),
+        RecordConsistency::Consistent
+    );
+    for phase in phases {
+        for disposition in dispositions {
+            for mask in 0..8 {
+                let mut value = complete.clone();
+                value["phase"] = Value::from(phase);
+                value["disposition"] = Value::from(disposition);
+                for (bit, field) in ["prepared", "staged", "published"].into_iter().enumerate() {
+                    if mask & (1 << bit) == 0 {
+                        value[field] = Value::Null;
+                    }
+                }
+                let bytes = serde_json::to_vec(&value).unwrap();
+                let old = decode(&bytes).unwrap();
+                let new = projected(&bytes).unwrap().unwrap();
+                assert_eq!(
+                    classify_record(&old),
+                    classify_record(&new),
+                    "{phase}/{disposition}/evidence={mask}"
+                );
+            }
+            let bytes = String::from_utf8(wire("null", 1))
+                .unwrap()
+                .replace("IntentDurable", phase)
+                .replace("\"None\"", &format!("\"{disposition}\""));
+            let old = decode(bytes.as_bytes()).unwrap();
+            let new = projected(bytes.as_bytes()).unwrap().unwrap();
+            assert_eq!(
+                classify_record(&old),
+                classify_record(&new),
+                "v1 {phase}/{disposition}"
+            );
+        }
+    }
+}

@@ -74,11 +74,11 @@ fn historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pres
             >= 2 * wire.len()
     );
     assert_eq!(owner.prepared_admission_id_allocations(), 0);
+    assert!(owner.shutdown());
     assert_eq!(
         owner.shared.input_bytes.lock().unwrap().remaining[0],
         pool_before
     );
-    assert!(owner.shutdown());
     let sql = rusqlite::Connection::open(&database).unwrap();
     assert_eq!(
         sql.query_row("SELECT count(*) FROM operation_journal", [], |row| row
@@ -87,13 +87,7 @@ fn historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pres
         1
     );
     assert_eq!(
-        sql.query_row("SELECT count(*) FROM operation_journal", [], |row| row
-            .get::<_, i64>(0))
-            .unwrap(),
-        2
-    );
-    assert_eq!(
-        sql.query_row("SELECT record FROM operation_journal LIMIT 1", [], |row| {
+        sql.query_row("SELECT record FROM operation_journal", [], |row| {
             row.get::<_, Vec<u8>>(0)
         })
         .unwrap(),
@@ -180,7 +174,7 @@ fn historical_claim_unconsumed_actor_error_hands_off_to_funded_diagnostics_until
     assert!(owner.shutdown());
     assert_eq!(
         pool_before - owner.shared.input_bytes.lock().unwrap().remaining[0],
-        super::super::store::HISTORICAL_DIAGNOSTIC_BYTES
+        crate::operation_journal::store::HISTORICAL_DIAGNOSTIC_BYTES
             + std::mem::size_of::<HistoricalReplyBacking>()
             + 2 * std::mem::size_of::<usize>()
     );
@@ -192,9 +186,16 @@ fn historical_claim_unconsumed_actor_error_hands_off_to_funded_diagnostics_until
     );
     let sql = rusqlite::Connection::open(&database).unwrap();
     assert_eq!(
-        sql.query_row("SELECT record FROM operation_journal", [], |row| row
-            .get::<_, Vec<u8>>(0))
+        sql.query_row("SELECT count(*) FROM operation_journal", [], |row| row
+            .get::<_, i64>(0))
             .unwrap(),
+        2
+    );
+    assert_eq!(
+        sql.query_row("SELECT record FROM operation_journal LIMIT 1", [], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .unwrap(),
         wire.as_bytes()
     );
 }
