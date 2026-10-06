@@ -43,7 +43,10 @@ impl Fixture {
             .lifecycle
             .store(OwnerLifecycle::Available as u8, Ordering::Release);
         let input = shared
-            .reserve_input(InputClass::Ordinary, 64 * 1024)
+            .reserve_input(
+                InputClass::Ordinary,
+                64 * 1024 + crate::sample_sources::db::LEGACY_CAPTURE_SCRATCH_BYTES,
+            )
             .unwrap();
         runtime
             .prepare_legacy_custody(
