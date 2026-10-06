@@ -31,6 +31,11 @@ fn authorize_read(context: AuthContext<'_>) -> Authorization {
         | AuthAction::Transaction { .. }
         | AuthAction::Function { .. }
         | AuthAction::Recursive => Authorization::Allow,
+        AuthAction::Pragma { pragma_name, .. }
+            if pragma_name.eq_ignore_ascii_case("table_info") =>
+        {
+            Authorization::Allow
+        }
         _ => Authorization::Deny,
     }
 }
@@ -74,6 +79,9 @@ fn receipt_read_only_near_expiry_preserves_original_lease_and_persistent_bytes()
             .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
             .is_err()
     );
+    writer
+        .current_revision()
+        .expect("ordinary original-owner validation is read-only");
     let observed = writer.read_receipt_observation(receipt.identity());
     assert_eq!(observed.unwrap(), Some(receipt));
     let expiry: i64 = connection
