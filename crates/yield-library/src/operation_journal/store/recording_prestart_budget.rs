@@ -34,7 +34,7 @@ const _: () = {
 // exist and are not created or enlarged by this preparation.
 const RECORD_INPUT_BYTES: usize = 3 * 1024 * 1024 + 512 * 1024 - 64 * 1024;
 pub(crate) const COMMAND_INPUT_BYTES: usize = RECORD_INPUT_BYTES;
-const TREE_BYTES: usize = 448 * 1536 + 32 * 1024;
+pub(super) const TREE_BYTES: usize = 448 * 1536 + 32 * 1024;
 const TYPED_BYTES: usize = 448 * 1024 + 32 * 1024 + 64 * 1024;
 const LOCAL_PROPOSAL_BYTES: usize = 192 * 1024;
 // Borrowed participant preflight: raw 64 KiB plus up to 192 KiB while

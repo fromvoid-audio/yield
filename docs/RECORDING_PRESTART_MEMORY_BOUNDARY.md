@@ -126,8 +126,8 @@ journal admission or native physical qualification.
 | Auxiliary bounded keys, errors and original context | 65,536 |
 | Original record/rebuild subtotal | 3,604,480 |
 | Database phase: released tree category | -720,896 |
-| Database phase: complete database-claim backing | 499,712 |
-| Database phase conservative total | 3,383,296 |
+| Database phase: complete database-claim backing | 528,088 |
+| Database phase conservative total | 3,411,672 |
 | Maximum stage and unchanged command debit | 3,604,480 |
 
 The OPT-2361 borrowed participant preflight consumes the prior 64 KiB category

@@ -1022,6 +1022,46 @@
       "retirement": "Retain only as this native original-provider refusal verification harness; never replace native production/bootstrap resources with a portable permission fixture.",
       "operation": "journal::start_with_capacity_fixture_for_test",
       "count": 1
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/recording_prestart_database_claims_tests.rs",
+      "function": "recording_prestart_database_claims_complete_original_audit_is_read_only",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2392",
+      "reason": "Cfg(test)-only disposable SQLite journal exercises the original bounded read-only recording database-claim audit and refusal. Synthetic persisted observations issue no live Source admission, recording producer, permit, retry, terminal or settlement authority.",
+      "retirement": "Remove this exact row when the named test/open is removed; never reuse synthetic journal observations as production authority or native qualification."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/recording_prestart_database_claims_tests.rs",
+      "function": "recording_prestart_database_claims_complete_multiple_inventory_is_not_truncated",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2392",
+      "reason": "Cfg(test)-only disposable SQLite journal exercises the original bounded read-only recording database-claim audit and refusal. Synthetic persisted observations issue no live Source admission, recording producer, permit, retry, terminal or settlement authority.",
+      "retirement": "Remove this exact row when the named test/open is removed; never reuse synthetic journal observations as production authority or native qualification."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/recording_prestart_database_claims_tests.rs",
+      "function": "recording_prestart_database_claims_shape_refuses_before_original_inventory_copy",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2392",
+      "reason": "Cfg(test)-only disposable SQLite journal exercises the original bounded read-only recording database-claim audit and refusal. Synthetic persisted observations issue no live Source admission, recording producer, permit, retry, terminal or settlement authority.",
+      "retirement": "Remove this exact row when the named test/open is removed; never reuse synthetic journal observations as production authority or native qualification."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/recording_prestart_database_claims_tests.rs",
+      "function": "recording_prestart_database_claims_semantic_refusal_preserves_all_evidence",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2392",
+      "reason": "Cfg(test)-only disposable SQLite journal exercises the original bounded read-only recording database-claim audit and refusal. Synthetic persisted observations issue no live Source admission, recording producer, permit, retry, terminal or settlement authority.",
+      "retirement": "Remove this exact row when the named test/open is removed; never reuse synthetic journal observations as production authority or native qualification."
     }
   ]
 }

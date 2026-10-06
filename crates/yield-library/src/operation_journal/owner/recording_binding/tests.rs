@@ -175,10 +175,17 @@ fn recording_custody_revalidation_queues_while_original_retained_debit_is_held()
             RecordingProducerCustodyError::Changed
         ))
     ));
-    assert_eq!(
-        client.shared.input_bytes.lock().unwrap().remaining[0],
-        before.remaining[0] - INPUT_BYTES
-    );
+    // The worker may send its reply just before dropping temporary input custody.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while client.shared.input_bytes.lock().unwrap().remaining[0]
+        != before.remaining[0] - INPUT_BYTES
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "temporary command input was not released"
+        );
+        std::thread::yield_now();
+    }
     drop(retained);
     assert_eq!(*client.shared.input_bytes.lock().unwrap(), before);
     assert!(f.owner.shutdown());

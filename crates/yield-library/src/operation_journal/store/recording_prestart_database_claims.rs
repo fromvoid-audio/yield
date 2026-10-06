@@ -3,7 +3,7 @@
 use super::*;
 use crate::operation_journal::database_claims::{
     DatabaseBinding, DatabaseClaimSlice, DatabaseParticipant, MAX_DATABASES, MAX_INVENTORY_BYTES,
-    MAX_RELATION_ROWS, MAX_SLICES,
+    MAX_RELATION_ROWS, MAX_SLICES, READ_PAGE_ROWS,
 };
 use crate::operation_journal::participants::MAX_PARTICIPANTS;
 
@@ -14,15 +14,22 @@ const INVENTORY_TYPED_BYTES: usize =
 // validate() simultaneously retains binding IDs, physical keys, participant IDs and
 // slice IDs. 512 bytes per entry covers a complete B-tree node even at first insertion.
 const VALIDATION_SET_BYTES: usize = (2 * MAX_DATABASES + MAX_PARTICIPANTS + MAX_SLICES) * 512;
-// Complete fixed-size SQL pages, readback columns, query strings and temporary keys.
-const SQL_CONTEXT_BYTES: usize = 64 * 1024;
+// Both outer operation-key and inner claim-ID pages remain live. SQLite's 36
+// code-point UUID check can copy up to 144 UTF-8 bytes before parsing refuses.
+// Vec growth conservatively retains old/new headers at three String widths.
+const SQL_KEY_PAGE_BYTES: usize = (READ_PAGE_ROWS + MAX_SLICES + 1) * (36 * 4 + 3 * 24);
+// Charge physical-key/readback payloads separately from B-tree node headers,
+// even though the V1 physical validation set currently borrows main_file.
+const PHYSICAL_KEY_BYTES: usize = MAX_DATABASES * 256;
+const SQL_CONTEXT_BYTES: usize = SQL_KEY_PAGE_BYTES + PHYSICAL_KEY_BYTES + 8 * 1024;
 pub(super) const ADDITIONAL_INPUT_BYTES: usize =
     INVENTORY_TYPED_BYTES + VALIDATION_SET_BYTES + SQL_CONTEXT_BYTES;
 const _: () = {
     assert!(std::mem::size_of::<DatabaseBinding>() <= 1024);
     assert!(std::mem::size_of::<DatabaseClaimSlice>() <= 256);
     assert!(std::mem::size_of::<DatabaseParticipant>() <= 128);
-    assert!(ADDITIONAL_INPUT_BYTES <= 512 * 1024);
+    assert!(std::mem::size_of::<String>() <= 24);
+    assert!(ADDITIONAL_INPUT_BYTES <= recording_prestart_budget::TREE_BYTES);
 };
 
 impl OperationJournalStore {
