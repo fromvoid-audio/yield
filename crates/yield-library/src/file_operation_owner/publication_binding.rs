@@ -1,5 +1,7 @@
 //! Original-worker read-only target preparation; no namespace, capacity or journal grant.
 use super::*;
+#[cfg(windows)]
+mod windows_staging_share;
 const MAX_BINDINGS: usize = 32;
 const BACKING: usize = 64 * 1024;
 const HEADER: usize = 16 * 1024;
@@ -700,7 +702,7 @@ impl WorkerState {
             Err(_) => return Err(BindingError::Unknown),
         }
         // Nonblocking no-follow regular-file observation, including FIFO substitution refusal.
-        let mut file = stage_cap
+        let file = stage_cap
             .root
             .open_observation_file_nofollow(Path::new(staging.locator.as_str()))
             .map_err(|_| BindingError::Unknown)?;
@@ -716,6 +718,13 @@ impl WorkerState {
         if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 {
             return Err(BindingError::Conflict);
         }
+        // Restrict only the object already matched to the original durable observation.
+        // Retain data-write/append/delete sharing exclusion through every live binding;
+        // attribute-only handles and surviving writable mappings remain outside this lease.
+        #[cfg(windows)]
+        let mut file = windows_staging_share::retain(file).map_err(|_| BindingError::Unknown)?;
+        #[cfg(not(windows))]
+        let mut file = file;
         let mut hasher = blake3::Hasher::new();
         let mut scratch = [0u8; 8192];
         let mut bytes = 0u64;
