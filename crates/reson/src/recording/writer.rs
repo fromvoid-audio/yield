@@ -23,13 +23,18 @@ const RUNNING: u8 = 0;
 pub(super) const STOPPED: u8 = 1;
 pub(super) const CANCELLED: u8 = 2;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static PREPARED_RING_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Already retained byte transport. This interface grants no filesystem authority.
 /// Yield must supply its admitted owner channel; arbitrary transports are useful for codecs/tests.
 pub trait RecordingSink: Write + Seek + Send {}
 impl<T: Write + Seek + Send> RecordingSink for T {}
 
 /// Validated finite float32 WAV and callback-ring bounds.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecordingLimits {
     sample_rate: u32,
     channels: u16,
@@ -157,6 +162,8 @@ impl RecorderWriter {
         health: Arc<RecordingHealthState>,
     ) -> (RecorderCapture, ringbuf::HeapCons<f32>) {
         let (producer, consumer) = HeapRb::<f32>::new(limits.ring_samples).split();
+        #[cfg(test)]
+        PREPARED_RING_BYTES.with(|bytes| bytes.set(limits.ring_samples * size_of::<f32>()));
         (
             RecorderCapture {
                 producer,
@@ -190,6 +197,9 @@ impl RecorderWriter {
         health: Arc<RecordingHealthState>,
         settlement: Option<ProducerSettlement>,
     ) -> Result<Self, AudioInputError> {
+        if let Some(producer) = &settlement {
+            producer.validate_limits(limits)?;
+        }
         let (barrier, joined_issuer) = match settlement {
             Some(producer) => {
                 let (barrier, joined) = producer.start(mode.clone(), health.clone());

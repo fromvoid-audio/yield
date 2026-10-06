@@ -16,7 +16,8 @@ pub const RECORDING_TRANSPORT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Factory for an original sink, bounded byte receiver and its genuine settlement route.
 pub struct RecordingTransport;
 impl RecordingTransport {
-    /// Construct byte plumbing within validated limits; this grants no effect permission.
+    /// Construct byte plumbing within exact validated format/frame limits; startup must
+    /// preserve those limits. This grants no effect permission.
     /// The receiving owner must run before startup, which synchronously emits the initial
     /// WAV header. It must separately admit and retain each exact request before acknowledging it.
     pub fn bind(
@@ -34,7 +35,7 @@ impl RecordingTransport {
             failed: false,
             timeout: RECORDING_TRANSPORT_ACK_TIMEOUT,
         };
-        let (binding, settlements) = RecordingSinkBinding::bind(Box::new(sink));
+        let (binding, settlements) = RecordingSinkBinding::bind_with_limits(Box::new(sink), limits);
         (binding, RecordingTransportReceiver { rx }, settlements)
     }
 }
