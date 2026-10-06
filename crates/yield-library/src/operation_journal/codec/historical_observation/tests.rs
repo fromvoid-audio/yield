@@ -212,3 +212,99 @@ fn historical_claim_projection_matches_all_legacy_status_and_existing_v2_evidenc
         }
     }
 }
+
+#[test]
+fn historical_claim_projection_matches_all_v2_absent_final_evidence_presence_categories() {
+    // Stored evidence fixtures compare codec/classifier behavior only; they do not
+    // install a physical capability or prove an absent-final publication backend.
+    let mut complete: Value =
+        serde_json::from_str(include_str!("existing_v2_fixture.json")).unwrap();
+    let existing = complete["prepared"]["ExistingExpectedIdentity"].clone();
+    let mut source_root = existing["source_root"].clone();
+    let mut parent = existing["target_root"].clone();
+    if cfg!(windows) {
+        source_root["path"] = Value::from(r"C:\yield\Source");
+        parent["path"] = Value::from(r"C:\yield\Target");
+    }
+    let content = complete["staged"]["participant"]["CopyValidated"]["evidence"].clone();
+    complete["prepared"] = serde_json::json!({"AbsentFinalNoReplace": {
+        "direction": "Undo", "source_id": "source-1", "source_root": source_root,
+        "target_parent": parent, "final_leaf": "final.wav", "staging": existing["staging"],
+        "final_observation": "ObservedAbsent", "copy_validated_evidence": content,
+    }});
+    complete["published"]["final_claim"] = serde_json::json!({"AbsentFinalNoReplace": {
+        "primitive": "QualifiedAbsentFinalNoReplace", "result": "AbsentFinalInstalled",
+        "capability_scope": {"TargetParentDescriptor": {
+            "target_parent_identity": parent["identity"], "root_path_continuity": "NotClaimed",
+        }},
+    }});
+    let evidence = serde_json::json!({
+        "target_parent_stable_id": parent["identity"]["stable_id"],
+        "final_stable_id": complete["published"]["reopened_final"]["identity"]["stable_id"],
+        "final_len": complete["published"]["reopened_final"]["identity"]["len"],
+        "final_content": content,
+    });
+    let base = decode(&serde_json::to_vec(&complete).unwrap()).unwrap();
+    assert_eq!(classify_record(&base), RecordConsistency::Consistent);
+    for phase in [
+        "IntentDurable",
+        "Prepared",
+        "FilesystemStaged",
+        "FilesystemPublished",
+        "SourceReconciled",
+        "GlobalReconciled",
+        "ProjectionPublished",
+        "ReadinessScheduled",
+        "Terminal",
+    ] {
+        for disposition in [
+            "None",
+            "RetryPending",
+            "PartialNeedsRetry",
+            "AuditRequired",
+            "CancelRequestedBeforePublish",
+            "CancelRequestedAfterPublish",
+            "Succeeded",
+            "SucceededWithDeferredArtifacts",
+            "CancelledBeforePublish",
+            "CancelledAfterPublish",
+            "RolledBack",
+            "BlockedByUser",
+            "FailedPreservingData",
+            "FailedDataLossRisk",
+        ] {
+            for mask in 0..64 {
+                let mut value = complete.clone();
+                value["phase"] = Value::from(phase);
+                value["disposition"] = Value::from(disposition);
+                for (bit, field) in [
+                    "prepared",
+                    "staged",
+                    "published",
+                    "absent_final_recovery_observation",
+                    "absent_final_transaction_owned_proof",
+                    "absent_final_adoption_evidence",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    value[field] = if mask & (1 << bit) == 0 {
+                        Value::Null
+                    } else if bit < 3 {
+                        complete[field].clone()
+                    } else {
+                        evidence.clone()
+                    };
+                }
+                let bytes = serde_json::to_vec(&value).unwrap();
+                let old = decode(&bytes).unwrap();
+                let new = projected(&bytes).unwrap().unwrap();
+                assert_eq!(
+                    classify_record(&old),
+                    classify_record(&new),
+                    "{phase}/{disposition}/six-evidence={mask}"
+                );
+            }
+        }
+    }
+}
