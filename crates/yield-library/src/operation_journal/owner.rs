@@ -7313,7 +7313,7 @@ mod tests {
         // The result is sent before the registration closure is destroyed. A second real
         // worker command runs only after that closure has dropped. This test-only control
         // routing of a readonly point lookup leaves the measured ordinary credit unchanged.
-        let barrier = client
+        let mut barrier = client
             .submit_control(CONTROL_INPUT_BYTES, |input, result| JournalCommand::Get {
                 operation_id: OperationId::new(),
                 input,
