@@ -15518,6 +15518,10 @@ mod tests {
                     String::from("table")
                 ),
                 (
+                    String::from(publication_bindings::TABLE_NAME),
+                    String::from("table")
+                ),
+                (
                     String::from(recording_chunks::TABLE_NAME),
                     String::from("table")
                 ),

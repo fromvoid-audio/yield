@@ -104,6 +104,24 @@ mod publication_issuance {
     }
 
     #[test]
+    fn publication_issuance_current_namespace_requires_exact_binding_shape() {
+        for malformed in [
+            "CREATE TABLE operation_journal_publication_issuance(output_id TEXT NOT NULL PRIMARY KEY, publication_effect_id TEXT NOT NULL UNIQUE, record TEXT NOT NULL)",
+            "CREATE TABLE operation_journal_publication_issuance(output_id TEXT NOT NULL PRIMARY KEY, publication_effect_id TEXT NOT NULL, record BLOB NOT NULL)",
+        ] {
+            let (fixture, store, _staging, _binding, _sequence) = prepared();
+            store
+                .connection
+                .execute_batch("DROP TABLE operation_journal_publication_issuance")
+                .unwrap();
+            store.connection.execute_batch(malformed).unwrap();
+            assert!(store.validate_namespace().is_err());
+            drop(store);
+            assert!(OperationJournalStore::open(&fixture.owner).is_err());
+        }
+    }
+
+    #[test]
     fn publication_issuance_preserves_original_nested_target_locator_contract() {
         let (_fixture, store, staging, binding, sequence) = prepared();
         let value = serde_json::to_value(&binding).unwrap();

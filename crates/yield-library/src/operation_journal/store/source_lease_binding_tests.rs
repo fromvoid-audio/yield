@@ -724,7 +724,7 @@ mod source_lease_binding_storage {
                     .connection
                     .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                     .unwrap(),
-                12
+                JOURNAL_SCHEMA_VERSION
             );
             // Corruption retains the evidence and fails actual restart readback; no owner restored.
             let mut bad = start.clone();
