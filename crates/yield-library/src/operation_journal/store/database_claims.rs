@@ -7,11 +7,14 @@ use crate::operation_journal::{AdmissionClaimInventory, OperationId};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+mod scalar_projection;
+
 pub(super) const BINDING_TABLE: &str = "operation_journal_database_binding";
 pub(super) const SLICE_TABLE: &str = "operation_journal_database_claim_slice";
 #[cfg(test)]
 std::thread_local! {
     pub(super) static INVENTORY_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static SCALAR_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 pub(super) const CREATE_BINDING: &str = "CREATE TABLE operation_journal_database_binding (
     binding_id TEXT NOT NULL PRIMARY KEY,
@@ -145,13 +148,16 @@ pub(super) fn verify(
     let mut rows = statement.query([operation.to_string()])?;
     for (ordinal, b) in inventory.bindings().iter().enumerate() {
         let row = rows.next()?.ok_or_else(|| error("missing binding row"))?;
-        if row.get::<_, Option<String>>(0)?.as_deref() != Some(&b.id.to_string())
+        if !scalar_projection::matches_text(row, 0, &b.id.to_string())?
             || row.get::<_, i64>(1)? != ordinal as i64
             || row.get::<_, i64>(2)? != b.role as i64
-            || row.get::<_, Option<String>>(3)?.as_deref() != Some(&b.volume.to_string())
-            || row.get::<_, Option<String>>(4)?.as_deref() != Some(b.main_file.as_str())
-            || row.get::<_, Option<String>>(5)?.as_deref()
-                != Some(&inventory.header().decision_nonce.to_string())
+            || !scalar_projection::matches_text(row, 3, &b.volume.to_string())?
+            || !scalar_projection::matches_text(row, 4, b.main_file.as_str())?
+            || !scalar_projection::matches_text(
+                row,
+                5,
+                &inventory.header().decision_nonce.to_string(),
+            )?
             || row.get::<_, Option<Vec<u8>>>(6)?.as_deref() != Some(digest.as_slice())
             || row.get::<_, Option<Vec<u8>>>(7)?.as_deref()
                 != if ordinal == 0 {
@@ -174,7 +180,7 @@ pub(super) fn verify(
             .into_iter()
             .enumerate()
         {
-            if row.get::<_, Option<String>>(index)?.as_deref() != Some(&id.to_string()) {
+            if !scalar_projection::matches_text(row, index, &id.to_string())? {
                 return Err(error("slice identity conflict"));
             }
         }
@@ -218,9 +224,9 @@ impl OperationJournalStore {
         // Read the first retained row for the nonce, not only ordinal zero. A missing
         // root with later rows is partial durable evidence, never confirmed absence.
         // The unique nonce/ordinal index bounds this to one row in the original query.
-        let first: Option<(Option<String>, i64)> = self.connection.query_row(
+        let first: Option<(Option<scalar_projection::UuidProjection>, i64)> = self.connection.query_row(
             "SELECT CASE WHEN typeof(operation_id)='text' AND length(operation_id)=36 THEN operation_id END,ordinal FROM operation_journal_database_binding WHERE decision_nonce=?1 ORDER BY ordinal LIMIT 1",
-            [nonce.to_string()], |row| Ok((row.get(0)?, row.get(1)?)),
+            [nonce.to_string()], |row| Ok((scalar_projection::uuid(row, 0)?, row.get(1)?)),
         ).optional()?;
         let Some((text, ordinal)) = first else {
             self.validate_namespace()?;
@@ -230,8 +236,8 @@ impl OperationJournalStore {
             return Err(error("nonce retains binding evidence without its root"));
         }
         let text = text.ok_or_else(|| error("nonce operation identity bound"))?;
-        let id = Uuid::parse_str(&text).map_err(error)?;
-        if id.is_nil() || id.to_string() != text {
+        let id = text.id.map_err(error)?;
+        if id.is_nil() || !text.canonical {
             return Err(error("nonce operation identity"));
         }
         let operation = OperationId::from_uuid(id);
@@ -357,17 +363,15 @@ impl OperationJournalStore {
         // the immutable initial DB classes; unrelated chunk rows remain separately audited.
         let mut query=self.connection.prepare("SELECT CASE WHEN length(claim_id)=36 THEN claim_id END FROM operation_journal_ordinary_claim WHERE operation_id=?1 AND allocation_class IN('SourceDatabaseCommit','SourceWalShm','GlobalDatabaseCommit','GlobalWalShm') ORDER BY claim_id LIMIT 257")?;
         let ids = query
-            .query_map([operation.to_string()], |r| r.get::<_, Option<String>>(0))?
+            .query_map([operation.to_string()], |r| scalar_projection::uuid(r, 0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         if ids.len() > 256 {
             return Err(error("operation database claim bound"));
         }
         for text in ids {
             let text = text.ok_or_else(|| error("ordinary claim identity bound"))?;
-            let id = crate::operation_journal::AdmissionClaimId::from_uuid(
-                Uuid::parse_str(&text).map_err(error)?,
-            )
-            .map_err(error)?;
+            let id = crate::operation_journal::AdmissionClaimId::from_uuid(text.id.map_err(error)?)
+                .map_err(error)?;
             let claim = super::ordinary_claims::read_claim(&self.connection, id)
                 .map_err(error)?
                 .ok_or_else(|| error("missing ordinary claim"))?;
@@ -410,7 +414,7 @@ impl OperationJournalStore {
                 let mut statement=self.connection.prepare(&format!("SELECT DISTINCT operation_id FROM {table} WHERE operation_id>?1 ORDER BY operation_id LIMIT ?2"))?;
                 let page = statement
                     .query_map(params![after, READ_PAGE_ROWS as i64], |r| {
-                        r.get::<_, Option<String>>(0)
+                        scalar_projection::uuid(r, 0)
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 if page.is_empty() {
@@ -418,8 +422,8 @@ impl OperationJournalStore {
                 }
                 for text in page {
                     let text = text.ok_or_else(|| error("restart operation identity bound"))?;
-                    let id = Uuid::parse_str(&text).map_err(error)?;
-                    if id.is_nil() || id.to_string() != text {
+                    let id = text.id.map_err(error)?;
+                    if id.is_nil() || !text.canonical {
                         return Err(error("restart noncanonical operation identity"));
                     }
                     let operation = OperationId::from_uuid(id);
@@ -439,7 +443,7 @@ impl OperationJournalStore {
                             .ok_or_else(|| error("missing restart inventory"))?;
                         self.validate_database_claim_operation(operation, &inventory)?;
                     }
-                    after = text;
+                    after = id.to_string();
                 }
             }
         }

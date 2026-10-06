@@ -1092,6 +1092,36 @@
       "issue": "OPT-2392",
       "reason": "Cfg(test)-only disposable SQLite journal exercises the original bounded read-only recording database-claim audit and refusal. Synthetic persisted observations issue no live Source admission, recording producer, permit, retry, terminal or settlement authority.",
       "retirement": "Remove this exact row when the named test/open is removed; never reuse synthetic journal observations as production authority or native qualification."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_claim_scalar_projection_tests.rs",
+      "function": "database_claim_scalar_projection_original_large_nul_rows_do_not_copy_or_mutate",
+      "operation": "OperationJournalStore::open",
+      "count": 1,
+      "classification": "test-only",
+      "issue": "OPT-2403",
+      "reason": "Automated real SQLite test opens only its isolated writable-profile fixture. Scalar corruption and raw retained evidence comparisons issue no live permit or physical qualification.",
+      "retirement": "Keep as isolated original database-claim scalar projection regression coverage."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_claim_scalar_projection_tests.rs",
+      "function": "database_claim_scalar_projection_original_restart_utf8_error_precedes_uuid_error",
+      "operation": "OperationJournalStore::open",
+      "count": 1,
+      "classification": "test-only",
+      "issue": "OPT-2403",
+      "reason": "Automated real SQLite test opens only its isolated writable-profile fixture. Scalar corruption and raw retained evidence comparisons issue no live permit or physical qualification.",
+      "retirement": "Keep as isolated original database-claim scalar projection regression coverage."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_claim_scalar_projection_tests.rs",
+      "function": "database_claim_scalar_projection_complete_original_inventory_and_nonce_still_read",
+      "operation": "OperationJournalStore::open",
+      "count": 1,
+      "classification": "test-only",
+      "issue": "OPT-2403",
+      "reason": "Automated real SQLite test opens only its isolated writable-profile fixture. Scalar corruption and raw retained evidence comparisons issue no live permit or physical qualification.",
+      "retirement": "Keep as isolated original database-claim scalar projection regression coverage."
     }
   ]
 }
