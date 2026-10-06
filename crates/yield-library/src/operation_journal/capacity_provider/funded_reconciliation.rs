@@ -16,7 +16,7 @@ pub(super) fn reserve(
 
 // A full pinned internal node per entry covers sparse/root/split occupancy. The
 // key/value pair stride is at least the separate arrays' combined stride.
-fn node<K, V>() -> usize {
+pub(super) fn node<K, V>() -> usize {
     12 * size_of::<(K, V)>() + 12 * size_of::<usize>() + 4 * size_of::<usize>()
 }
 fn add(total: &mut usize, count: usize, each: usize) -> Option<()> {
@@ -24,7 +24,7 @@ fn add(total: &mut usize, count: usize, each: usize) -> Option<()> {
     Some(())
 }
 
-fn normalized(
+pub(super) fn normalized(
     operations: usize,
     claims: usize,
     charges: usize,

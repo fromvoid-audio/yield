@@ -1,6 +1,7 @@
 //! Bounded scalar observations of the original actor ledger, never entry authority.
+use super::retained_backing::RetainedWeak;
 use super::*;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 const MAX_VOLUMES: usize = 32;
 #[derive(Debug)]
@@ -17,14 +18,14 @@ struct State {
 }
 #[derive(Debug)]
 struct BoundVolume {
-    observer: Weak<ChargeObserver>,
+    observer: RetainedWeak<ChargeObserver>,
     total: u64,
 }
 /// Only the original provider can bind this scalar observer to an actual charged volume.
 /// It contains no ledger, native resource, capacity qualification or effect permission.
 #[derive(Debug)]
 pub(crate) struct ChargeObserver {
-    mirror: Arc<ChargeMirror>,
+    mirror: RetainedArc<ChargeMirror>,
     volume: VolumeIdentity,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,7 +40,7 @@ pub(crate) struct ChargeObservation {
 pub(crate) struct PublicationChargeBinding {
     operation: OperationId,
     claim: AdmissionClaim,
-    observer: Arc<ChargeObserver>,
+    observer: RetainedArc<ChargeObserver>,
     observation: ChargeObservation,
 }
 // The future slot/input producer must debit this retained header on its original credit.
@@ -48,7 +49,7 @@ impl PublicationChargeBinding {
     pub(super) fn new(
         operation: OperationId,
         claim: AdmissionClaim,
-        observer: Arc<ChargeObserver>,
+        observer: RetainedArc<ChargeObserver>,
         observation: ChargeObservation,
     ) -> Self {
         Self {
@@ -58,8 +59,8 @@ impl PublicationChargeBinding {
             observation,
         }
     }
-    pub(super) fn belongs_to(&self, mirror: &Arc<ChargeMirror>) -> bool {
-        Arc::ptr_eq(&self.observer.mirror, mirror)
+    pub(super) fn belongs_to(&self, mirror: &RetainedArc<ChargeMirror>) -> bool {
+        RetainedArc::ptr_eq(&self.observer.mirror, mirror)
     }
     pub(super) fn operation(&self) -> OperationId {
         self.operation
@@ -118,11 +119,11 @@ impl ChargeMirror {
         state.closed = true;
     }
     pub(super) fn bind(
-        self: &Arc<Self>,
+        mirror: &RetainedArc<Self>,
         ledger: &ProvisionalLedger,
         volume: &VolumeIdentity,
-    ) -> Result<Arc<ChargeObserver>, CapacityProviderError> {
-        let mut state = self
+    ) -> Result<RetainedArc<ChargeObserver>, CapacityProviderError> {
+        let mut state = mirror
             .0
             .lock()
             .map_err(|_| CapacityProviderError::Unavailable)?;
@@ -154,12 +155,15 @@ impl ChargeMirror {
             state.closed = true;
             return Err(CapacityProviderError::ArithmeticOverflow);
         };
-        let observer = Arc::new(ChargeObserver {
-            mirror: self.clone(),
-            volume: volume.clone(),
-        });
+        let observer = RetainedArc::new(
+            ChargeObserver {
+                mirror: mirror.clone(),
+                volume: volume.clone(),
+            },
+            mirror.credit(),
+        );
         state.volumes[index] = Some(BoundVolume {
-            observer: Arc::downgrade(&observer),
+            observer: observer.downgrade(),
             total,
         });
         Ok(observer)
@@ -201,7 +205,7 @@ impl ChargeObserver {
 /// Pending begins before any ledger write. Unconfirmed completion or unwind is sticky closed.
 #[must_use]
 pub(super) struct ChargeMutation {
-    mirror: Arc<ChargeMirror>,
+    mirror: RetainedArc<ChargeMirror>,
     completed: bool,
 }
 impl ChargeMutation {

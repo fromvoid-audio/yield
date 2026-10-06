@@ -11,7 +11,7 @@ mod integration {
         *shared.input_bytes.lock().unwrap()
     }
     fn full(shared: &Arc<OwnerShared>) {
-        assert_eq!(snapshot(shared), InputBudget::new());
+        assert_eq!(snapshot(shared), InputBudget::shared_initial());
     }
     fn shared() -> (Arc<OwnerShared>, OwnerCommandReceivers) {
         let (tx, rx) = OwnerCommandReceivers::channel();

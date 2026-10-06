@@ -7,7 +7,6 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
 
 use thiserror::Error;
 
@@ -26,12 +25,14 @@ use uuid::Uuid;
 
 mod charge_observer;
 mod funded_reconciliation;
+mod funded_startup;
+mod retained_backing;
 pub(crate) use charge_observer::PublicationChargeBinding;
 #[cfg(any(test, feature = "test-support"))]
 pub use funded_reconciliation::ProviderReconciliationProbe;
+use retained_backing::{RetainedArc, RetainedRc};
 pub(crate) const PUBLICATION_MIRROR_BYTES: usize = 4096;
 use charge_observer::{ChargeMirror, ChargeMutation, ChargeObserver};
-use std::sync::Arc;
 const INITIAL_LEASE_TOKEN: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,7 +71,7 @@ impl PartialOrd for ChargeKey {
 
 #[derive(Debug)]
 struct ProvisionalLedger {
-    mirror: Arc<ChargeMirror>,
+    mirror: RetainedArc<ChargeMirror>,
     next_token: u64,
     charges_by_token: BTreeMap<u64, LedgerCharge>,
     aggregate_charges: BTreeMap<ChargeKey, u64>,
@@ -79,6 +80,7 @@ struct ProvisionalLedger {
     fail_release: bool,
     #[cfg(test)]
     fail_disposition: bool,
+    _rebuild_credit: Option<super::owner::StartupCredit>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,8 +148,13 @@ impl CapacityRebuildReadiness {
 
 impl Default for ProvisionalLedger {
     fn default() -> Self {
+        Self::default_without_mirror(RetainedArc::new(ChargeMirror::default(), None))
+    }
+}
+impl ProvisionalLedger {
+    fn default_without_mirror(mirror: RetainedArc<ChargeMirror>) -> Self {
         Self {
-            mirror: Arc::new(ChargeMirror::default()),
+            mirror,
             next_token: INITIAL_LEASE_TOKEN,
             charges_by_token: BTreeMap::new(),
             aggregate_charges: BTreeMap::new(),
@@ -156,6 +163,7 @@ impl Default for ProvisionalLedger {
             fail_release: false,
             #[cfg(test)]
             fail_disposition: false,
+            _rebuild_credit: None,
         }
     }
 }
@@ -177,8 +185,8 @@ impl CapacityFacts {
 pub(crate) struct CapacityProvider {
     qualification: ProviderQualification,
     facts: Option<CapacityFacts>,
-    ledger: Rc<RefCell<ProvisionalLedger>>,
-    mirror: Arc<ChargeMirror>,
+    ledger: RetainedRc<RefCell<ProvisionalLedger>>,
+    mirror: RetainedArc<ChargeMirror>,
 }
 
 impl CapacityProvider {
@@ -186,7 +194,7 @@ impl CapacityProvider {
         qualification: ProviderQualification,
         facts: Option<CapacityFacts>,
     ) -> Self {
-        let ledger = Rc::new(RefCell::new(ProvisionalLedger::default()));
+        let ledger = RetainedRc::new(RefCell::new(ProvisionalLedger::default()), None);
         let mirror = ledger.borrow().mirror.clone();
         Self {
             qualification,
@@ -203,12 +211,12 @@ impl CapacityProvider {
     pub(crate) fn publication_charge_observer(
         &self,
         volume: &VolumeIdentity,
-    ) -> Result<Arc<ChargeObserver>, CapacityProviderError> {
+    ) -> Result<RetainedArc<ChargeObserver>, CapacityProviderError> {
         let ledger = self
             .ledger
             .try_borrow()
             .map_err(|_| CapacityProviderError::LedgerBusy)?;
-        ledger.mirror.bind(&ledger, volume)
+        ChargeMirror::bind(&ledger.mirror, &ledger, volume)
     }
 
     /// Bind ordinary or chunk claim data to its exact confirmed durable original charge.
@@ -223,7 +231,7 @@ impl CapacityProvider {
             .try_borrow()
             .map_err(|_| CapacityProviderError::LedgerBusy)?;
         validate_publication_claim(&ledger, operation, claim)?;
-        let observer = ledger.mirror.bind(&ledger, claim.volume())?;
+        let observer = ChargeMirror::bind(&ledger.mirror, &ledger, claim.volume())?;
         let observation = observer
             .observation()
             .ok_or(CapacityProviderError::Unavailable)?;
@@ -725,7 +733,7 @@ impl CapacityProvider {
 
         mutation.finish(&ledger);
         Ok(ProvisionalCapacityLease {
-            ledger: Rc::clone(&self.ledger),
+            ledger: self.ledger.clone(),
             token: next_token - 1,
             charges: charge_by_key,
             claim_ids,
@@ -1108,7 +1116,7 @@ fn stage_rebuilt_ledger(
     }
 
     let mut staged = ProvisionalLedger {
-        mirror: Arc::new(ChargeMirror::default()),
+        mirror: RetainedArc::new(ChargeMirror::default(), None),
         next_token: initial_next_token,
         charges_by_token: BTreeMap::new(),
         aggregate_charges: BTreeMap::new(),
@@ -1117,6 +1125,7 @@ fn stage_rebuilt_ledger(
         fail_release: false,
         #[cfg(test)]
         fail_disposition: false,
+        _rebuild_credit: None,
     };
 
     for (operation_id, operation_claims) in by_operation {
@@ -1321,7 +1330,7 @@ pub(crate) fn production_admission_gate() -> Result<(), ()> {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct ProvisionalCapacityLease {
-    ledger: Rc<RefCell<ProvisionalLedger>>,
+    ledger: RetainedRc<RefCell<ProvisionalLedger>>,
     token: u64,
     charges: BTreeMap<ChargeKey, u64>,
     claim_ids: Vec<AdmissionClaimId>,
@@ -1360,7 +1369,7 @@ impl ProvisionalCapacityLease {
         plan: &FullCapacityPlan,
         claims: &AdmissionClaimInventory,
     ) -> Result<(), CapacityProviderError> {
-        if !Rc::ptr_eq(&self.ledger, &provider.ledger) {
+        if !RetainedRc::ptr_eq(&self.ledger, &provider.ledger) {
             return Err(CapacityProviderError::LeaseDispositionConflict);
         }
         if !matches!(self.disposition, ProvisionalLeaseDisposition::Provisional) {

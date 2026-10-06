@@ -51,12 +51,25 @@ impl FundedSnapshot {
             None => provider.validate_rebuilt_claims(&self.snapshot),
         }
     }
+    pub(in crate::operation_journal) fn install_provider_for_input(
+        &self,
+        provider: &super::super::capacity_provider::CapacityProvider,
+        input: &InputPermit,
+    ) -> Result<(), super::super::capacity_provider::CapacityProviderError> {
+        provider.install_rebuilt_claims_for_input(&self.snapshot, input)
+    }
     #[cfg(test)]
     pub(super) fn matches_original(&self, original: &OrdinaryClaimRebuildSnapshot) -> bool {
         self.snapshot == *original
     }
     #[cfg(test)]
     pub(in crate::operation_journal) fn install_provider_component(
+        &self,
+        provider: &super::super::capacity_provider::CapacityProvider,
+    ) -> Result<(), super::super::capacity_provider::CapacityProviderError> {
+        self.install_provider_component_compatibility(provider)
+    }
+    pub(in crate::operation_journal) fn install_provider_component_compatibility(
         &self,
         provider: &super::super::capacity_provider::CapacityProvider,
     ) -> Result<(), super::super::capacity_provider::CapacityProviderError> {

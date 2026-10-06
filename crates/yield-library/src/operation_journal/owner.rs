@@ -13,7 +13,9 @@ pub use super::wal_admission::{
 };
 mod frozen_copy;
 mod historical_reply;
+mod startup_credit;
 use historical_reply::HistoricalReply;
+pub(super) use startup_credit::StartupCredit;
 mod queue_metrics;
 pub use queue_metrics::{JournalQueueClassMetrics, JournalQueueMetricsSnapshot};
 use queue_metrics::{QueueMetrics, QueueTicket};
@@ -139,7 +141,7 @@ impl InputBudget {
     }
     fn valid(&self) -> bool {
         !self.unavailable
-            && self.remaining[0] <= ORDINARY_INPUT_BYTES
+            && self.remaining[0] <= ORDINARY_INPUT_BYTES - startup_credit::POOL_BYTES
             && self.remaining[1] <= CONTROL_INPUT_RESERVED_BYTES
             && self.publication_remaining <= PUBLICATION_INPUT_BYTES
             && PUBLICATION_INPUT_BYTES - self.publication_remaining
@@ -1781,6 +1783,8 @@ struct OwnerRuntime {
     store: Option<OperationJournalStore>,
     capacity_provider: Option<CapacityProvider>,
     capacity_rebuild_readiness: CapacityRebuildReadiness,
+    capacity_readiness_credit: Option<StartupCredit>,
+    startup_error_credit: Option<StartupCredit>,
     reserve: Option<OwnedReserveAllocation>,
     volume_owner: Option<VolumeOwnershipCapability>,
     final_profile_guard: Option<WritableProfileGuard>,
@@ -1825,6 +1829,8 @@ impl OwnerRuntime {
             capacity_rebuild_readiness: CapacityRebuildReadiness::reconciliation_required(vec![
                 String::from("capacity rebuild has not run"),
             ]),
+            capacity_readiness_credit: None,
+            startup_error_credit: None,
             reserve: None,
             volume_owner: None,
             final_profile_guard: Some(final_profile_guard),
@@ -4273,26 +4279,109 @@ impl OwnerRuntime {
         self.refresh_live_descriptor_capacity_inner(Some(facts_reader), false)
     }
 
+    #[cfg(test)]
     fn rebuild_capacity(&mut self) -> Result<(), String> {
+        self.rebuild_capacity_with_funding(None)
+    }
+
+    fn rebuild_capacity_with_funding(&mut self, input: Option<&InputPermit>) -> Result<(), String> {
         let _proof = self.revalidate_capacity_boundary()?;
         let _descriptor_observation = self.refresh_live_descriptor_capacity()?;
         let provider = self
             .capacity_provider
             .take()
-            .unwrap_or_else(CapacityProvider::unavailable);
-        let snapshot = match self.store().rebuild_ordinary_claim_snapshot() {
+            .map(Ok)
+            .unwrap_or_else(|| match input {
+                Some(input) => CapacityProvider::unavailable_for_input(input),
+                None => Ok(CapacityProvider::unavailable()),
+            })
+            .map_err(|_| String::from(startup_credit::REFUSAL))?;
+        let snapshot = match match input {
+            Some(input) => self
+                .store()
+                .rebuild_ordinary_startup_snapshot_for_input(input),
+            None => self
+                .store()
+                .rebuild_ordinary_claim_snapshot()
+                .map(super::store::FundedSnapshot::unfunded),
+        } {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.capacity_provider = Some(provider);
+                if let Some(input) = input {
+                    let bytes = startup_credit::display_bytes(&error)
+                        .ok_or_else(|| String::from(startup_credit::REFUSAL))?;
+                    self.startup_error_credit = Some(
+                        input
+                            .reserve_historical_scratch(bytes)
+                            .map_err(|_| {
+                                String::from(
+                                    "ordinary startup diagnostic resource envelope exceeded",
+                                )
+                            })?
+                            .into_startup_credit(),
+                    );
+                }
                 return Err(error.to_string());
             }
         };
+        let mut readiness_credit = match input {
+            Some(input) => {
+                let bytes = snapshot
+                    .readiness()
+                    .diagnostics()
+                    .iter()
+                    .try_fold(
+                        std::mem::size_of::<CapacityRebuildReadiness>(),
+                        |total, text| {
+                            total
+                                .checked_add(std::mem::size_of::<String>())?
+                                .checked_add(text.len().checked_mul(2)?)
+                        },
+                    )
+                    .ok_or_else(|| String::from(startup_credit::REFUSAL))?;
+                Some(
+                    input
+                        .reserve_historical_scratch(bytes)
+                        .map_err(|_| String::from(startup_credit::REFUSAL))?
+                        .into_startup_credit(),
+                )
+            }
+            None => None,
+        };
         let mut readiness = snapshot.readiness().clone();
         if readiness.can_install() {
-            if let Err(error) = provider.install_rebuilt_claims(&snapshot) {
+            if let Err(error) = match input {
+                Some(input) => snapshot.install_provider_for_input(&provider, input),
+                None => snapshot.install_provider_component_compatibility(&provider),
+            } {
+                let replacement_credit = if let Some(input) = input {
+                    let message =
+                        format_args!("ordinary-claim provider rebuild was rejected: {error}");
+                    let bytes = startup_credit::display_bytes(&message)
+                        .and_then(|n| {
+                            n.checked_add(
+                                std::mem::size_of::<Vec<String>>() + std::mem::size_of::<String>(),
+                            )
+                        })
+                        .ok_or_else(|| String::from(startup_credit::REFUSAL))?;
+                    Some(
+                        input
+                            .reserve_historical_scratch(bytes)
+                            .map_err(|_| {
+                                String::from(
+                                    "ordinary startup readiness resource envelope exceeded",
+                                )
+                            })?
+                            .into_startup_credit(),
+                    )
+                } else {
+                    None
+                };
                 readiness = CapacityRebuildReadiness::reconciliation_required(vec![format!(
                     "ordinary-claim provider rebuild was rejected: {error}"
                 )]);
+                readiness_credit = replacement_credit;
             }
         }
         if !readiness.diagnostics().is_empty() {
@@ -4303,6 +4392,7 @@ impl OwnerRuntime {
         }
         self.capacity_provider = Some(provider);
         self.capacity_rebuild_readiness = readiness;
+        self.capacity_readiness_credit = readiness_credit;
         Ok(())
     }
 
@@ -5695,7 +5785,8 @@ struct OwnerShared {
     admission_gate: Mutex<()>,
     lifecycle: AtomicU8,
     unavailable: Mutex<Option<String>>,
-    input_bytes: Mutex<InputBudget>,
+    unavailable_startup_credit: Mutex<Option<StartupCredit>>,
+    input_bytes: Arc<Mutex<InputBudget>>,
     #[cfg(test)]
     historical_scratch_maximum: AtomicUsize,
     #[cfg(test)]
@@ -5718,7 +5809,8 @@ impl OwnerShared {
             admission_gate: Mutex::new(()),
             lifecycle: AtomicU8::new(OwnerLifecycle::Initializing as u8),
             unavailable: Mutex::new(None),
-            input_bytes: Mutex::new(InputBudget::new()),
+            unavailable_startup_credit: Mutex::new(None),
+            input_bytes: Arc::new(Mutex::new(InputBudget::shared_initial())),
             #[cfg(test)]
             historical_scratch_maximum: AtomicUsize::new(0),
             #[cfg(test)]
@@ -5849,6 +5941,7 @@ impl OwnerShared {
             class,
             publication,
             historical_reply: None,
+            refund: true,
         })
     }
 
@@ -5946,6 +6039,7 @@ impl OwnerShared {
 }
 
 pub(super) struct InputPermit {
+    refund: bool,
     shared: Arc<OwnerShared>,
     bytes: usize,
     class: InputClass,
@@ -6091,8 +6185,10 @@ impl InputPermit {
 
 impl Drop for InputPermit {
     fn drop(&mut self) {
-        self.shared
-            .release_input(self.class, self.bytes, self.publication);
+        if self.refund {
+            self.shared
+                .release_input(self.class, self.bytes, self.publication);
+        }
     }
 }
 
@@ -6524,20 +6620,38 @@ fn run_owner(
 
     #[cfg(any(test, feature = "test-support"))]
     if bootstrap_capacity {
-        if let Err(error) = runtime.rebuild_capacity() {
-            shared.mark_unavailable(&format!(
-                "ordinary-claim capacity rebuild bootstrap failed: {error}"
-            ));
+        let input = match shared.startup_input() {
+            Ok(input) => input,
+            Err(_) => {
+                shared.mark_unavailable(startup_credit::REFUSAL);
+                return;
+            }
+        };
+        if let Err(error) = runtime.rebuild_capacity_with_funding(Some(&input)) {
+            shared.mark_startup_unavailable(
+                &format_args!("ordinary-claim capacity rebuild bootstrap failed: {error}"),
+                &input,
+            );
             return;
         }
     }
 
     #[cfg(not(any(test, feature = "test-support")))]
-    if let Err(error) = runtime.rebuild_capacity() {
-        shared.mark_unavailable(&format!(
-            "ordinary-claim capacity rebuild bootstrap failed: {error}"
-        ));
-        return;
+    {
+        let input = match shared.startup_input() {
+            Ok(input) => input,
+            Err(_) => {
+                shared.mark_unavailable(startup_credit::REFUSAL);
+                return;
+            }
+        };
+        if let Err(error) = runtime.rebuild_capacity_with_funding(Some(&input)) {
+            shared.mark_startup_unavailable(
+                &format_args!("ordinary-claim capacity rebuild bootstrap failed: {error}"),
+                &input,
+            );
+            return;
+        }
     }
 
     let mut starting = Err(shared.lifecycle.load(Ordering::Acquire));
