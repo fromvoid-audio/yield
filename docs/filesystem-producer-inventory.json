@@ -1352,6 +1352,36 @@
       "issue": "OPT-2409",
       "reason": "Windows cfg(test)-only controlled external ACL fixture descendants and unchanged-byte sentinels; no production namespace producer or ACL setter. Held-original name substitution and metadata-first reparse refusal require genuine native execution in OPT-2410.",
       "retirement": "Retain as native regression fixture while the read-only exact-held-directory snapshot exists; fixture execution cannot qualify publication or canonical bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/capacity_startup_tests.rs",
+      "function": "capacity_startup_actual_worker_component_preserves_original_bytes_and_exact_refunds",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2400",
+      "reason": "cfg(test) original worker/store/provider startup component and exact original-pool header pressure. Hook always ends explicit Unsupported before activation/IDs/effects; full original durable image and post-join exact pool refill checked. No physical proof or qualification supplied.",
+      "retirement": "Retain only this explicit original-startup verification harness; no portable hook or fixture rows may activate admission or waive native original production resource acceptance."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/capacity_startup_tests.rs",
+      "function": "capacity_startup_native_production_rebuilds_original_descriptor_bound_image",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2400",
+      "reason": "cfg(macos,test) original production registry/bootstrap and actual descriptor facts; component hook OFF. Historical seeded claim is a fixture observation, not qualified issuance or physical qualification. Genuine native execution separately required.",
+      "retirement": "Retain only this explicit original-startup verification harness; no portable hook or fixture rows may activate admission or waive native original production resource acceptance."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/capacity_startup_tests.rs",
+      "function": "capacity_startup_native_production_rebuilds_original_descriptor_bound_image",
+      "operation": "journal::start",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2400",
+      "reason": "cfg(macos,test) original production registry/bootstrap and actual descriptor facts; component hook OFF. Historical seeded claim is a fixture observation, not qualified issuance or physical qualification. Genuine native execution separately required.",
+      "retirement": "Retain only this explicit original-startup verification harness; no portable hook or fixture rows may activate admission or waive native original production resource acceptance."
     }
   ]
 }
