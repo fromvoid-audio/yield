@@ -88,6 +88,8 @@ impl CatalogService {
             },
             None => CatalogThreadJoinOutcome::MissingWorker,
         };
+        // The worker may have poisoned admission after cancellation but before its join.
+        control_poisoned |= self.admission.is_poisoned();
         let report = CatalogThreadShutdownReport {
             outcome,
             control_poisoned,
