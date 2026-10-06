@@ -3043,9 +3043,10 @@ mod integration {
             },
             "{aborted:?}"
         );
+        let detached_report = (inventory_case == 6).then(|| view.databases()[1].clone());
         drop(view);
         drop(handle);
-        if inventory_alias.is_some() {
+        if inventory_alias.is_some() || detached_report.is_some() {
             assert!(budget.used() > 0);
         } else {
             assert_eq!(budget.used(), 0);
@@ -3115,6 +3116,24 @@ mod integration {
             );
         } else {
             assert!(journal.shutdown());
+        }
+        if let Some(detached_report) = detached_report {
+            assert!(matches!(detached_report, WalPreparedDatabase::Lease(_)));
+            assert!(budget.used() > 0);
+            // A diagnostic budget alias must not be the holder that funds this proof.
+            drop(budget);
+            assert_eq!(
+                ORDINARY_INPUT_BYTES - journal.shared.input_bytes.lock().unwrap().remaining[0],
+                64 * 1024,
+                "detached genuine lease report must retain original journal input after joins"
+            );
+            let alias = detached_report.clone();
+            concurrent_inventory_drop(detached_report, alias);
+            assert_eq!(
+                *journal.shared.input_bytes.lock().unwrap(),
+                InputBudget::new()
+            );
+            return;
         }
         if let Some(alias) = inventory_alias {
             let context = inventory_native_context.unwrap();
@@ -3391,13 +3410,13 @@ mod integration {
             budget.used() > 0,
             "detached original report backing remains live"
         );
+        drop(budget);
         assert_eq!(
             ORDINARY_INPUT_BYTES - client.shared.input_bytes.lock().unwrap().remaining[0],
             64 * 1024,
             "detached original reports must retain the original journal backing debit"
         );
         drop(detached);
-        assert_eq!(budget.used(), 0);
         assert_eq!(
             client.shared.input_bytes.lock().unwrap().remaining[0],
             ORDINARY_INPUT_BYTES
