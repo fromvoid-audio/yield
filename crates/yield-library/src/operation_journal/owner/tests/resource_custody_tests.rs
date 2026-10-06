@@ -21,7 +21,7 @@ mod integration {
         let admission = shared.resource_admission.clone();
         assert_eq!(
             shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()],
-            InputClass::Ordinary.limit() - HEADER_BYTES
+            InputBudget::shared_initial().remaining[InputClass::Ordinary.index()] - HEADER_BYTES
         );
         thread::scope(|scope| {
             let read = admission.begin_read(|| true).unwrap();
@@ -38,7 +38,8 @@ mod integration {
             assert!(OperationJournalStore::open(&fixture.owner).is_err());
             assert_eq!(
                 shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()],
-                InputClass::Ordinary.limit() - HEADER_BYTES
+                InputBudget::shared_initial().remaining[InputClass::Ordinary.index()]
+                    - HEADER_BYTES
             );
             drop(read);
             assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
@@ -46,7 +47,7 @@ mod integration {
         assert!(OperationJournalStore::open(&fixture.owner).is_ok());
         assert_eq!(
             shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()],
-            InputClass::Ordinary.limit()
+            InputBudget::shared_initial().remaining[InputClass::Ordinary.index()]
         );
     }
     #[test]

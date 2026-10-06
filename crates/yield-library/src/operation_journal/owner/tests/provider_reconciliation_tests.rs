@@ -100,7 +100,7 @@ fn provider_reconciliation_actual_queued_component_funds_before_graph_and_never_
         assert!(owner.shutdown());
         assert_eq!(
             owner.shared.input_bytes.lock().unwrap().remaining[0],
-            InputClass::Ordinary.limit()
+            InputBudget::shared_initial().remaining[InputClass::Ordinary.index()]
         );
         let store = OperationJournalStore::open(&fixture.owner).unwrap();
         assert_eq!(store.scan_recovery_page(None).unwrap().entries().len(), 1);
@@ -186,7 +186,7 @@ fn native_original_queue_pressure(production_bootstrap: bool) {
     assert!(owner.shutdown());
     assert_eq!(
         owner.shared.input_bytes.lock().unwrap().remaining[0],
-        InputClass::Ordinary.limit()
+        InputBudget::shared_initial().remaining[InputClass::Ordinary.index()]
     );
     let store = OperationJournalStore::open(&fixture.owner).unwrap();
     assert_eq!(store.scan_recovery_page(None).unwrap().entries().len(), 1);
