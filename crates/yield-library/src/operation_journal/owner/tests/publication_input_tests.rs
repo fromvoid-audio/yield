@@ -28,7 +28,7 @@ mod integration {
         assert_eq!(saturated.publication_remaining, 0);
         assert_eq!(
             saturated.remaining[0],
-            ORDINARY_INPUT_BYTES - PUBLICATION_INPUT_BYTES
+            InputBudget::shared_initial().remaining[0] - PUBLICATION_INPUT_BYTES
         );
         assert_eq!(saturated.remaining[1], CONTROL_INPUT_RESERVED_BYTES);
         assert!(matches!(
@@ -56,13 +56,13 @@ mod integration {
         );
         drop(control);
         drop(ordinary);
-        assert_eq!(budget(&shared), InputBudget::new());
+        assert_eq!(budget(&shared), InputBudget::shared_initial());
     }
     #[test]
     fn publication_input_ordinary_saturation_refuses_without_a_partial_publication_debit() {
         let shared = shared();
         let ordinary = shared
-            .reserve_input(InputClass::Ordinary, ORDINARY_INPUT_BYTES)
+            .reserve_input(InputClass::Ordinary, budget(&shared).remaining[0])
             .unwrap();
         let before = budget(&shared);
         assert!(shared.reserve_publication_input(4096).is_err());
@@ -78,7 +78,7 @@ mod integration {
         drop(ordinary);
         let publication = shared.reserve_publication_input(4096).unwrap();
         drop(publication);
-        assert_eq!(budget(&shared), InputBudget::new());
+        assert_eq!(budget(&shared), InputBudget::shared_initial());
     }
     #[test]
     fn publication_input_actual_runtime_header_and_reader_staging_share_the_ceiling() {
@@ -117,7 +117,7 @@ mod integration {
         drop(retained);
         assert_eq!(budget(&shared), initial);
         drop(runtime);
-        assert_eq!(budget(&shared), InputBudget::new());
+        assert_eq!(budget(&shared), InputBudget::shared_initial());
         assert!(OperationJournalStore::open(&f.owner).is_ok());
     }
     #[test]
@@ -146,7 +146,7 @@ mod integration {
         drop(replacement);
         drop(readers);
         drop(headers);
-        assert_eq!(budget(&shared), InputBudget::new());
+        assert_eq!(budget(&shared), InputBudget::shared_initial());
         // This proves input accounting, not thirty-one qualified native volume capabilities.
     }
     #[test]
@@ -172,7 +172,7 @@ mod integration {
         assert_eq!(budget(&shared).publication_remaining, 0);
         assert!(shared.reserve_publication_input(1).is_err());
         drop(permits);
-        assert_eq!(budget(&shared), InputBudget::new());
+        assert_eq!(budget(&shared), InputBudget::shared_initial());
     }
     #[test]
     fn publication_input_corrupt_subset_or_overflow_fences_the_original_owner_without_reset() {
@@ -241,7 +241,10 @@ mod integration {
             poisoned.publication_remaining,
             PUBLICATION_INPUT_BYTES - 4096
         );
-        assert_eq!(poisoned.remaining[0], ORDINARY_INPUT_BYTES - 4096);
+        assert_eq!(
+            poisoned.remaining[0],
+            InputBudget::shared_initial().remaining[0] - 4096
+        );
     }
     #[test]
     fn publication_input_last_backing_alias_survives_actual_reply_loss_and_runtime_join() {
@@ -278,12 +281,12 @@ mod integration {
         );
         assert_eq!(
             budget(&shared).remaining[0],
-            ORDINARY_INPUT_BYTES - remaining
+            InputBudget::shared_initial().remaining[0] - remaining
         );
         assert_eq!(budget(&shared).remaining[1], CONTROL_INPUT_RESERVED_BYTES);
         let reopened = OperationJournalStore::open(&f.owner).unwrap();
         assert!(reopened.get(id).unwrap().is_some());
         drop(alias);
-        assert_eq!(budget(&shared), InputBudget::new());
+        assert_eq!(budget(&shared), InputBudget::shared_initial());
     }
 }

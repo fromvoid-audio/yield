@@ -39,7 +39,7 @@ fn actual_admission_drop_pin_and_confirmed_rollback_advance_current_totals() {
     let copy = provider
         .publication_charge_observer(&VolumeIdentity { device: 1 })
         .unwrap();
-    assert!(Arc::ptr_eq(&observer, &copy));
+    assert!(RetainedArc::ptr_eq(&observer, &copy));
     let initial = observer.observation().unwrap();
     assert_eq!(initial.incremental_bytes, 4096);
     let existing = admit(
@@ -150,7 +150,7 @@ fn actual_owner_admission_is_pending_before_write_and_invalidates_reader_generat
         );
         barrier.wait();
         let same = rx.recv().unwrap();
-        assert!(Arc::ptr_eq(&same, &observer));
+        assert!(RetainedArc::ptr_eq(&same, &observer));
         assert_eq!(observer.observation().unwrap().incremental_bytes, 8192);
         assert!(
             observer
