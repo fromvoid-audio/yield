@@ -29,6 +29,7 @@ pub(super) struct PendingFence {
 }
 pub(super) struct Registry {
     slots: [Option<Arc<Fence>>; MAX_FENCES],
+    incarnation: uuid::Uuid,
     next: u64,
     exhausted: bool,
     input: Option<InputPermit>,
@@ -56,6 +57,7 @@ impl Registry {
     pub(super) fn new() -> Self {
         Self {
             slots: std::array::from_fn(|_| None),
+            incarnation: uuid::Uuid::new_v4(),
             next: 0,
             exhausted: false,
             input: None,
@@ -158,6 +160,14 @@ impl Registry {
             entered: false,
         })
     }
+    /// Historical issuer identity only; it cannot acquire or reconstruct a fence.
+    pub(super) fn issuance_observation(&self, fence: &PendingFence) -> Option<(uuid::Uuid, u64)> {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|original| Arc::ptr_eq(original, &fence.fence))
+            .then_some((self.incarnation, fence.fence.generation))
+    }
     // Bounded original actor scan. Observation is deliberately not settlement.
     pub(super) fn poll_completions(&self) {
         for fence in self.slots.iter().flatten() {
@@ -254,6 +264,11 @@ fn close_pending(fence: &Fence) -> bool {
     }
 }
 impl PendingFence {
+    #[cfg(all(test, unix))]
+    pub(super) fn generation_observation_for_test(&self) -> u64 {
+        self.fence.generation
+    }
+
     pub(super) fn original_worker_started(&self) {
         match self.fence.state.lock() {
             Ok(mut state) if *state == State::Pending => *state = State::WorkerActive,

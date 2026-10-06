@@ -558,7 +558,7 @@ fn recording_schema9_migrates_preserving_existing_intent_and_capped_policy_rejec
     store.insert_intent(&legacy).unwrap();
     store
         .connection
-        .execute_batch("DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; DROP TABLE operation_journal_recording_chunks; PRAGMA user_version=9;")
+        .execute_batch("DROP TABLE operation_journal_publication_issuance; DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; DROP TABLE operation_journal_recording_chunks; PRAGMA user_version=9;")
         .unwrap();
     drop(store);
     let store = OperationJournalStore::open(&fixture.owner).unwrap();

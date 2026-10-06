@@ -1144,7 +1144,7 @@ mod exact_database_claim_persistence {
                 .receipt()
                 .is_some()
         );
-        store.connection.execute_batch("DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; PRAGMA user_version=10").unwrap();
+        store.connection.execute_batch("DROP TABLE operation_journal_publication_issuance; DROP TABLE operation_journal_database_attempt_outcome; DROP TABLE operation_journal_database_attempt; DROP TABLE operation_journal_database_claim_slice; DROP TABLE operation_journal_database_binding; PRAGMA user_version=10").unwrap();
         drop(store);
         let store = OperationJournalStore::open(&f.owner).unwrap();
         assert_eq!(

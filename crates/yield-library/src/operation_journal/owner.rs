@@ -2613,20 +2613,6 @@ impl OwnerRuntime {
         .ok_or_else(|| OperationJournalOwnerError::StagingGrant {
             reason: "original publication target lacks validated staging bytes".into(),
         })?;
-        let completion_command =
-            target
-                .publication_command()
-                .map_err(|_| OperationJournalOwnerError::StagingGrant {
-                    reason: "original completion command is invalid".into(),
-                })?;
-        let completion_bytes = completion_command.canonical_bytes().map_err(|_| {
-            OperationJournalOwnerError::StagingGrant {
-                reason: "original completion command is invalid".into(),
-            }
-        })?;
-        let completion_fingerprint = *blake3::hash(&completion_bytes).as_bytes();
-        drop(completion_bytes);
-        drop(completion_command);
         let fence = self.publication_fences.issue_for_source(
             validation.operation_id(),
             registration.registration_id,
@@ -2640,6 +2626,39 @@ impl OwnerRuntime {
             target.volume(),
             bytes,
         )?;
+        let issuer = self
+            .publication_fences
+            .issuance_observation(&fence)
+            .ok_or_else(|| OperationJournalOwnerError::StagingGrant {
+                reason: "original publication issuer observation is unavailable".into(),
+            })?;
+        let completion_command =
+            target
+                .publication_command()
+                .map_err(|_| OperationJournalOwnerError::StagingGrant {
+                    reason: "original completion command is invalid".into(),
+                })?;
+        let completion_bytes = completion_command.canonical_bytes().map_err(|_| {
+            OperationJournalOwnerError::StagingGrant {
+                reason: "original completion command is invalid".into(),
+            }
+        })?;
+        let completion_fingerprint = *blake3::hash(&completion_bytes).as_bytes();
+        let chunk = match charge_selector {
+            publication_charge::Selector::Ordinary(_) => None,
+            publication_charge::Selector::Chunk(chunk) => Some(chunk),
+        };
+        let binding =
+            self.store()
+                .capture_publication_binding(super::store::PublicationBindingCapture {
+                    canonical_command: &completion_bytes,
+                    validation,
+                    charge: &charge,
+                    chunk,
+                    issuer,
+                })?;
+        drop(completion_bytes);
+        drop(completion_command);
         let checkpoint_result = self.store().checkpoint_staging_result(validation);
         let checkpoint: StagingCheckpointAck = self
             .publication_write_result(checkpoint_result)?
@@ -2648,7 +2667,9 @@ impl OwnerRuntime {
             })?;
         source_pin.validate_for_issuance(&source.request, profile_guard)?;
         validate_publication_target(&target)?;
-        let grant_result = self.store().reserve_staging_grant(checkpoint, validation);
+        let grant_result = self
+            .store()
+            .reserve_staging_grant(checkpoint, validation, binding);
         self.publication_write_result(grant_result)?;
         validate_publication_target(&target)?;
         provider
@@ -10989,6 +11010,7 @@ mod tests {
             .expect("checkpoint issue result")
             .expect("checkpoint issue worker");
         let publication_charge_selector = checkpoint_grant.publication_charge_selector();
+        let original_publication_issue = checkpoint_grant.issue_id();
         let mut wrong_chunk_checkpoint = client
             .checkpoint_live_chunk_staging(
                 checkpoint_claim.chunk_id(),
@@ -11320,6 +11342,18 @@ mod tests {
             return;
         }
         if publication_handoff {
+            let original_command_bytes = publication
+                .original_target()
+                .publication_command()
+                .unwrap()
+                .canonical_bytes()
+                .unwrap();
+            let original_command: serde_json::Value =
+                serde_json::from_slice(&original_command_bytes).unwrap();
+            let original_charge = serde_json::to_value(publication.charge.claim()).unwrap();
+            let original_command_fingerprint = *blake3::hash(&original_command_bytes).as_bytes();
+            let original_slot_generation = publication.fence.generation_observation_for_test();
+            drop(original_command_bytes);
             let original_fingerprint = publication.original_target().fingerprint();
             let foreign = crate::file_operation_owner::FileOperationOwner::start().unwrap();
             let publication = match foreign.submit_publication(publication) {
@@ -11386,6 +11420,35 @@ mod tests {
             let _ = file_owner.shutdown();
             drop(database);
             let _ = owner.shutdown();
+            let restarted =
+                OperationJournalStore::open(&fixture.owner).expect("original handoff restart");
+            let binding =
+                restarted.publication_binding_observation_for_test(staged_output.as_uuid());
+            assert_eq!(binding["command"], original_command);
+            assert_eq!(binding["charge"], original_charge);
+            assert_eq!(
+                binding["command_fingerprint"],
+                serde_json::json!(original_command_fingerprint)
+            );
+            assert_eq!(
+                binding["chunk"]["chunk_id"],
+                serde_json::json!(checkpoint_claim.chunk_id().as_uuid())
+            );
+            assert_eq!(
+                binding["chunk"]["issue_id"],
+                serde_json::json!(original_publication_issue)
+            );
+            assert_eq!(
+                binding["slot_generation"],
+                serde_json::json!(original_slot_generation)
+            );
+            assert!(
+                !Uuid::parse_str(binding["issuer_incarnation"].as_str().unwrap())
+                    .unwrap()
+                    .is_nil()
+            );
+            assert!(binding["checkpoint_sequence"].as_i64().unwrap() > 0);
+            assert!(restarted.prove_clean_handoff_durable().is_err());
             return;
         }
         let permit = publication

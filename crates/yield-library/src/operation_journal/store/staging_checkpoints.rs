@@ -11,7 +11,6 @@ use uuid::Uuid;
 use crate::file_operation_owner::{
     AuthorityFence, EffectOutcome, FileOperationResult, RootRegistrationRef, RootRole,
 };
-use crate::operation_journal::codec::parse_unique_value;
 use crate::operation_journal::model::OperationId;
 use crate::operation_journal::participants::{ParticipantId, ParticipantKind};
 
@@ -31,6 +30,9 @@ pub(super) const CREATE_TABLE: &str = "CREATE TABLE operation_journal_staging_ch
 const RECORD_SCHEMA_VERSION: u32 = 1;
 pub(super) const MAX_RECORD_BYTES: usize = 64 * 1024;
 pub(super) const MAX_ROWS: i64 = 8192;
+// Preserve the historical 64KiB wire allowance, including whitespace/key ordering.
+// Every accepted text is <=1024 bytes; maximum JSON escaping is six bytes per byte.
+const MAX_STRING_TOKEN_BYTES: usize = 6 * 1024;
 
 /// A serialized root observation, intentionally separate from the live registration type.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,6 +44,9 @@ pub(super) struct StoredRootRef {
 }
 
 impl StoredRootRef {
+    pub(super) fn owner(&self) -> Uuid {
+        self.owner
+    }
     fn from_live(reference: RootRegistrationRef) -> Self {
         Self {
             owner: reference.owner_identity().as_uuid(),
@@ -50,7 +55,7 @@ impl StoredRootRef {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), String> {
         if self.owner.is_nil() || self.registration_id.is_nil() || self.generation == 0 {
             return Err(String::from("staging root observation is invalid"));
         }
@@ -62,8 +67,11 @@ impl StoredRootRef {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StoredStagingSourceFence {
+    #[serde(deserialize_with = "text_256")]
     source_id: String,
+    #[serde(deserialize_with = "text_256")]
     root_identity: String,
+    #[serde(deserialize_with = "text_256")]
     database_identity: String,
     lifecycle_generation: u64,
     source_revision: Option<u64>,
@@ -82,7 +90,7 @@ impl StoredStagingSourceFence {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), String> {
         if self.source_id.is_empty()
             || self.source_id.len() > 256
             || self.root_identity.is_empty()
@@ -121,14 +129,17 @@ pub(super) struct StagingCheckpointRecord {
     staging_root: StoredRootRef,
     source_root: Option<StoredRootRef>,
     source_fence: Option<StoredStagingSourceFence>,
+    #[serde(deserialize_with = "text_1024")]
     locator: String,
     logical_object_id: Uuid,
+    #[serde(deserialize_with = "text_256")]
     physical_object_id: String,
     bytes: u64,
     content_hash: [u8; 32],
     request_fingerprint: [u8; 32],
 }
 
+const _: () = assert!(std::mem::size_of::<StagingCheckpointRecord>() <= 2048);
 impl StagingCheckpointRecord {
     /// Capture one successful, exact file-owner validation without treating it as authority.
     pub(super) fn from_file_result(result: &FileOperationResult) -> Result<Self, String> {
@@ -204,6 +215,22 @@ impl StagingCheckpointRecord {
         self.output_id
     }
 
+    pub(super) fn effect_id(&self) -> Uuid {
+        self.effect_id
+    }
+    pub(super) fn request_fingerprint(&self) -> [u8; 32] {
+        self.request_fingerprint
+    }
+    pub(super) fn staging_root(&self) -> &StoredRootRef {
+        &self.staging_root
+    }
+    pub(super) fn locator(&self) -> &str {
+        &self.locator
+    }
+    pub(super) fn logical_object_id(&self) -> Uuid {
+        self.logical_object_id
+    }
+
     pub(super) fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -254,11 +281,117 @@ impl StagingCheckpointRecord {
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(String::from("staging checkpoint exceeds its record bound"));
         }
-        let value = parse_unique_value(bytes).map_err(|error| error.to_string())?;
-        let record: Self = serde_json::from_value(value).map_err(|error| error.to_string())?;
+        bounded_string_tokens(bytes)?;
+        // Typed fields reject duplicates/unknown keys without an owned JSON Value graph.
+        let record: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
         record.validate()?;
         Ok(record)
     }
+}
+
+// Scan decoded byte counts without allocating, including UTF-8 Unicode escapes.
+// All accepted text fields are <=1024 bytes; malformed strings cannot inflate serde scratch
+// or its diagnostic projection. This preserves64KiB whitespace and arbitrary key ordering.
+pub(super) fn bounded_string_tokens(bytes: &[u8]) -> Result<(), String> {
+    fn invalid() -> String {
+        "staging checkpoint string token bounds/shape".into()
+    }
+    fn hex(bytes: &[u8], start: usize) -> Option<u16> {
+        bytes
+            .get(start..start.checked_add(4)?)?
+            .iter()
+            .try_fold(0u16, |v, b| {
+                let digit = match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    b'A'..=b'F' => b - b'A' + 10,
+                    _ => return None,
+                };
+                Some(v * 16 + u16::from(digit))
+            })
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let (start, mut decoded) = (i, 0usize);
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] == b'\\' {
+                let escape = *bytes.get(i + 1).ok_or_else(invalid)?;
+                if escape == b'u' {
+                    let code = hex(bytes, i + 2).ok_or_else(invalid)?;
+                    i += 6;
+                    decoded += if (0xd800..=0xdbff).contains(&code) {
+                        if bytes.get(i..i + 2) != Some(b"\\u") {
+                            return Err(invalid());
+                        }
+                        let low = hex(bytes, i + 2).ok_or_else(invalid)?;
+                        if !(0xdc00..=0xdfff).contains(&low) {
+                            return Err(invalid());
+                        }
+                        i += 6;
+                        4
+                    } else if (0xdc00..=0xdfff).contains(&code) {
+                        return Err(invalid());
+                    } else if code < 0x80 {
+                        1
+                    } else if code < 0x800 {
+                        2
+                    } else {
+                        3
+                    };
+                } else {
+                    if !matches!(
+                        escape,
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
+                    ) {
+                        return Err(invalid());
+                    }
+                    i += 2;
+                    decoded += 1;
+                }
+            } else {
+                i += 1;
+                decoded += 1;
+            }
+            if decoded > 1024 || i - start > MAX_STRING_TOKEN_BYTES {
+                return Err(invalid());
+            }
+        }
+        if i == bytes.len() {
+            return Err(invalid());
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn bounded_text<'de, D: serde::Deserializer<'de>, const N: usize>(
+    decoder: D,
+) -> Result<String, D::Error> {
+    struct Text<const N: usize>;
+    impl<'de, const N: usize> serde::de::Visitor<'de> for Text<N> {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "nonempty text of at most {N} bytes")
+        }
+        fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<String, E> {
+            if text.is_empty() || text.len() > N {
+                return Err(E::custom("staging text bounds"));
+            }
+            Ok(text.to_owned())
+        }
+    }
+    decoder.deserialize_str(Text::<N>)
+}
+pub(super) fn text_256<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<String, D::Error> {
+    bounded_text::<D, 256>(decoder)
+}
+pub(super) fn text_1024<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<String, D::Error> {
+    bounded_text::<D, 1024>(decoder)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -473,6 +606,7 @@ impl OperationJournalStore {
         &self,
         acknowledgement: StagingCheckpointAck,
         result: &FileOperationResult,
+        mut binding: super::PublicationBindingDraft,
     ) -> Result<(), OperationJournalStoreError> {
         let record = StagingCheckpointRecord::from_file_result(result).map_err(checkpoint_error)?;
         if record != acknowledgement.record {
@@ -480,13 +614,25 @@ impl OperationJournalStore {
                 "grant validation differs from acknowledged checkpoint",
             ));
         }
-        self.reserve_staging_grant_record(&record, acknowledgement.sequence)
+        binding.finish(acknowledgement.sequence);
+        self.reserve_staging_grant_record_bound(&record, acknowledgement.sequence, Some(&binding))
     }
 
+    // Exact old-schema reservation fixture only. Production issuance always binds its record.
+    #[cfg(test)]
     pub(super) fn reserve_staging_grant_record(
         &self,
         record: &StagingCheckpointRecord,
         acknowledged_sequence: i64,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.reserve_staging_grant_record_bound(record, acknowledged_sequence, None)
+    }
+
+    fn reserve_staging_grant_record_bound(
+        &self,
+        record: &StagingCheckpointRecord,
+        acknowledged_sequence: i64,
+        binding: Option<&super::PublicationBindingDraft>,
     ) -> Result<(), OperationJournalStoreError> {
         self.validate_namespace()?;
         self.connection.execute_batch("BEGIN EXCLUSIVE")?;
@@ -519,6 +665,9 @@ impl OperationJournalStore {
                 return Err(checkpoint_error(
                     "grant reservation lost its single-use transition",
                 ));
+            }
+            if let Some(binding) = binding {
+                self.insert_publication_binding_inside_transaction(record, binding)?;
             }
             #[cfg(test)]
             if let Some(InsertTestDirective::Fail(error)) =
@@ -568,68 +717,63 @@ impl OperationJournalStore {
                 "grant reservation readback differs from exact checkpoint",
             ));
         }
+        if let Some(binding) = binding {
+            let readback = self
+                .read_publication_binding(record.output_id())
+                .map_err(|_| {
+                    uncertain_outcome("publication binding readback failed after reservation")
+                })?
+                .ok_or_else(|| {
+                    uncertain_outcome("publication binding disappeared after reservation")
+                })?;
+            if readback != *binding {
+                return Err(uncertain_outcome(
+                    "publication binding readback differs from exact original issuance",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserve_publication_binding_fixture(
+        &self,
+        record: &StagingCheckpointRecord,
+        sequence: i64,
+        mut binding: super::PublicationBindingDraft,
+    ) -> Result<(), OperationJournalStoreError> {
+        binding.finish(sequence);
+        self.reserve_staging_grant_record_bound(record, sequence, Some(&binding))
     }
 
     pub(super) fn read_staging_checkpoint_row(
         &self,
         output_id: Uuid,
     ) -> Result<Option<(i64, StagingCheckpointRecord, bool)>, OperationJournalStoreError> {
-        let raw = self.connection.query_row(
-            "SELECT typeof(output_id), typeof(sequence), sequence, typeof(record), length(record), record, typeof(grant_reserved), grant_reserved FROM operation_journal_staging_checkpoints WHERE output_id = ?1",
-            params![output_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?, row.get::<_, String>(1)?,
-                    match row.get_ref(2)? { ValueRef::Integer(value) => Some(value), _ => None },
-                    row.get::<_, String>(3)?,
-                    match row.get_ref(4)? { ValueRef::Integer(value) => Some(value), _ => None },
-                    match row.get_ref(5)? { ValueRef::Blob(value) => Some(value.to_vec()), _ => None },
-                    row.get::<_, String>(6)?,
-                    match row.get_ref(7)? { ValueRef::Integer(value) => Some(value), _ => None },
-                ))
-            },
-        ).optional()?;
-        let Some((
-            key_type,
-            sequence_type,
-            sequence,
-            record_type,
-            length,
-            blob,
-            reserved_type,
-            reserved,
-        )) = raw
-        else {
+        let found = self.connection.query_row(
+            "SELECT output_id, sequence, record, grant_reserved FROM operation_journal_staging_checkpoints WHERE output_id = ?1",
+            params![output_id.to_string()], |row| {
+                let (ValueRef::Text(key), ValueRef::Integer(sequence), ValueRef::Blob(bytes), ValueRef::Integer(reserved)) =
+                    (row.get_ref(0)?, row.get_ref(1)?, row.get_ref(2)?, row.get_ref(3)?) else {
+                    return Ok(Err(checkpoint_error("staging checkpoint has malformed SQLite cells")));
+                };
+                if key != output_id.to_string().as_bytes() || sequence <= 0
+                    || bytes.len() > MAX_RECORD_BYTES || !matches!(reserved, 0 | 1) {
+                    return Ok(Err(checkpoint_error("staging checkpoint has malformed SQLite cells")));
+                }
+                let record = match StagingCheckpointRecord::decode(bytes) {
+                    Ok(record) => record,
+                    Err(error) => return Ok(Err(checkpoint_error(error))),
+                };
+                if record.output_id() != output_id {
+                    return Ok(Err(checkpoint_error("staging checkpoint key differs from its record")));
+                }
+                Ok(Ok((sequence, record, reserved == 1)))
+            }).optional()?.transpose()?;
+        let Some((sequence, record, reserved)) = found else {
             return Ok(None);
         };
-        let sequence = sequence
-            .ok_or_else(|| checkpoint_error("staging checkpoint sequence is not an integer"))?;
-        let length = length
-            .ok_or_else(|| checkpoint_error("staging checkpoint length is not an integer"))?;
-        let blob =
-            blob.ok_or_else(|| checkpoint_error("staging checkpoint record is not a blob"))?;
-        if key_type != "text"
-            || sequence_type != "integer"
-            || sequence <= 0
-            || record_type != "blob"
-            || length < 0
-            || length as usize != blob.len()
-            || blob.len() > MAX_RECORD_BYTES
-            || reserved_type != "integer"
-            || !matches!(reserved, Some(0 | 1))
-        {
-            return Err(checkpoint_error(
-                "staging checkpoint has malformed SQLite cells",
-            ));
-        }
-        let record = StagingCheckpointRecord::decode(&blob).map_err(checkpoint_error)?;
-        if record.output_id() != output_id {
-            return Err(checkpoint_error(
-                "staging checkpoint key differs from its record",
-            ));
-        }
         self.ensure_sequence_unique(sequence)?;
-        Ok(Some((sequence, record, reserved == Some(1))))
+        Ok(Some((sequence, record, reserved)))
     }
 }
