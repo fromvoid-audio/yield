@@ -932,6 +932,46 @@
       "issue": "OPT-2352",
       "reason": "Cfg(test,unix)-only ignored native-resource harness creates dedicated Source subdirectories and starts the genuine original journal owner, including a prior clean retirement where required. Positive cases require an isolated ordinary macOS account and physically distinct APFS volume. Pause/inspection hooks supply no physical qualification, retry, permit, or settlement authority; dirty profile and Source paths are preserved.",
       "retirement": "Remove this exact row when native_case or its named call is removed; never reuse its private fixture hooks in production."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "recovery_funded_actual_queued_admission_error_lost_reply_and_teardown",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2391",
+      "reason": "cfg(test) genuine original journal worker/Store connection and ordinary pool for complete recovery audit error, exact pressure, lost reply and teardown. No provider, Native qualification, identity allocation or claim effects.",
+      "retirement": "Keep only for this original audit custody regression; never activate the no-capacity fixture as production bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "recovery_funded_actual_queued_admission_error_lost_reply_and_teardown",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2391",
+      "reason": "cfg(test) genuine original journal worker/Store connection and ordinary pool for complete recovery audit error, exact pressure, lost reply and teardown. No provider, Native qualification, identity allocation or claim effects.",
+      "retirement": "Keep only for this original audit custody regression; never activate the no-capacity fixture as production bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "recovery_funded_actual_queued_exact_audit_pressure_refuses_without_effects",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2391",
+      "reason": "cfg(test) genuine original journal worker/Store connection and ordinary pool for complete recovery audit error, exact pressure, lost reply and teardown. No provider, Native qualification, identity allocation or claim effects.",
+      "retirement": "Keep only for this original audit custody regression; never activate the no-capacity fixture as production bootstrap."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/historical_claim_admission_tests.rs",
+      "function": "recovery_funded_actual_queued_exact_audit_pressure_refuses_without_effects",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2391",
+      "reason": "cfg(test) genuine original journal worker/Store connection and ordinary pool for complete recovery audit error, exact pressure, lost reply and teardown. No provider, Native qualification, identity allocation or claim effects.",
+      "retirement": "Keep only for this original audit custody regression; never activate the no-capacity fixture as production bootstrap."
     }
   ]
 }

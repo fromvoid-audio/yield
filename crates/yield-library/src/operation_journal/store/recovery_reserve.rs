@@ -3,6 +3,9 @@
 //! This module only decodes and reports persisted rows. It does not expose charge, spend, release,
 //! reconstitution, lock, admission, or physical-reserve authority.
 
+mod funded_audit;
+pub(super) use funded_audit::prove_no_active_charges_for_input;
+
 use rusqlite::OptionalExtension;
 use rusqlite::{Connection, params};
 use thiserror::Error;
@@ -366,15 +369,51 @@ fn validate_transitions(
             ))
         })
         .map_err(|error| error.to_string())?;
-    let mut expected_sequence = 1_i64;
-    let mut count = 0_u64;
-    let mut previous_remaining = 0_u64;
-    let mut previous_state: Option<String> = None;
+    let mut history = TransitionValidation::new(
+        budget_bytes,
+        final_remaining_bytes,
+        final_state,
+        final_sequence,
+    );
     for row in rows {
-        let (transition_id, sequence, kind, amount_bytes, remaining_bytes, state) =
-            row.map_err(|error| error.to_string())?;
+        history.push(row.map_err(|error| error.to_string())?)?;
+    }
+    history.finish()
+}
+
+type TransitionRow = (String, i64, String, i64, i64, String);
+struct TransitionValidation<'a> {
+    budget_bytes: u64,
+    final_remaining_bytes: u64,
+    final_state: &'a str,
+    final_sequence: i64,
+    expected_sequence: i64,
+    count: u64,
+    previous_remaining: u64,
+    previous_state: Option<String>,
+}
+impl<'a> TransitionValidation<'a> {
+    fn new(
+        budget_bytes: u64,
+        final_remaining_bytes: u64,
+        final_state: &'a str,
+        final_sequence: i64,
+    ) -> Self {
+        Self {
+            budget_bytes,
+            final_remaining_bytes,
+            final_state,
+            final_sequence,
+            expected_sequence: 1,
+            count: 0,
+            previous_remaining: 0,
+            previous_state: None,
+        }
+    }
+    fn push(&mut self, row: TransitionRow) -> Result<(), String> {
+        let (transition_id, sequence, kind, amount_bytes, remaining_bytes, state) = row;
         let _ = parse_uuid(transition_id, "transition_id")?;
-        if sequence != expected_sequence {
+        if sequence != self.expected_sequence {
             return Err(corrupt("transition sequence is not contiguous"));
         }
         if !CHARGE_KINDS.contains(&kind.as_str()) || kind != state {
@@ -386,16 +425,19 @@ fn validate_transitions(
             u64::try_from(amount_bytes).map_err(|_| corrupt("transition amount is negative"))?;
         let remaining_bytes = u64::try_from(remaining_bytes)
             .map_err(|_| corrupt("transition remaining budget is negative"))?;
-        if remaining_bytes > budget_bytes {
+        if remaining_bytes > self.budget_bytes {
             return Err(corrupt("transition remaining budget exceeds charge budget"));
         }
         if sequence == 1 {
-            if kind != "Charged" || amount_bytes != budget_bytes || remaining_bytes != budget_bytes
+            if kind != "Charged"
+                || amount_bytes != self.budget_bytes
+                || remaining_bytes != self.budget_bytes
             {
                 return Err(corrupt("first transition is not the complete charge"));
             }
         } else {
-            let prior_state = previous_state
+            let prior_state = self
+                .previous_state
                 .as_deref()
                 .ok_or_else(|| corrupt("transition history has no prior state"))?;
             match kind.as_str() {
@@ -405,7 +447,8 @@ fn validate_transitions(
                             "spent transition follows an unavailable state or has zero amount",
                         ));
                     }
-                    let expected_remaining = previous_remaining
+                    let expected_remaining = self
+                        .previous_remaining
                         .checked_sub(amount_bytes)
                         .ok_or_else(|| corrupt("spent transition exceeds remaining budget"))?;
                     if remaining_bytes != expected_remaining {
@@ -420,10 +463,11 @@ fn validate_transitions(
                             "release observation follows an unavailable state or has zero amount",
                         ));
                     }
-                    let spent_bytes = budget_bytes
-                        .checked_sub(previous_remaining)
+                    let spent_bytes = self
+                        .budget_bytes
+                        .checked_sub(self.previous_remaining)
                         .ok_or_else(|| corrupt("release observation has invalid prior budget"))?;
-                    if amount_bytes > spent_bytes || remaining_bytes != previous_remaining {
+                    if amount_bytes > spent_bytes || remaining_bytes != self.previous_remaining {
                         return Err(corrupt(
                             "release observation exceeds unreleased spend or increases budget",
                         ));
@@ -445,22 +489,26 @@ fn validate_transitions(
                 _ => unreachable!("kind was checked above"),
             }
         }
-        expected_sequence = expected_sequence
+        self.expected_sequence = self
+            .expected_sequence
             .checked_add(1)
             .ok_or_else(|| corrupt("transition sequence overflowed"))?;
-        count += 1;
-        previous_remaining = remaining_bytes;
-        previous_state = Some(kind);
-        if sequence == final_sequence
-            && (remaining_bytes != final_remaining_bytes || state != final_state)
+        self.count += 1;
+        self.previous_remaining = remaining_bytes;
+        self.previous_state = Some(kind);
+        if sequence == self.final_sequence
+            && (remaining_bytes != self.final_remaining_bytes || state != self.final_state)
         {
             return Err(corrupt("charge row disagrees with its final transition"));
         }
+        Ok(())
     }
-    if count == 0 || final_sequence != expected_sequence - 1 {
-        return Err(corrupt("charge has incomplete transition history"));
+    fn finish(self) -> Result<(), String> {
+        if self.count == 0 || self.final_sequence != self.expected_sequence - 1 {
+            return Err(corrupt("charge has incomplete transition history"));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn read_charge(

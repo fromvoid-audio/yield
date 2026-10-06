@@ -389,3 +389,222 @@ fn historical_claim_concurrent_last_reply_aliases_refund_exact_original_pool() {
         assert_eq!(shared.input_bytes.lock().unwrap().remaining[0], before);
     }
 }
+
+#[test]
+fn recovery_funded_actual_queued_admission_error_lost_reply_and_teardown() {
+    for lost in [false, true] {
+        let fixture = fixture("recovery-audit-original-queued-error");
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        let database = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal/journal.sqlite3");
+        let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+        wait_until_available(&owner);
+        let operation = OperationId::new();
+        let wire = format!(r#"{{"schema_version":1,"operation_id":"{operation}","intent":{{"actor":"User","kind":"FileHistory","label":"recovery-audit"}},"phase":"IntentDurable","disposition":"None","payload":null,"created_unix_ms":1,"updated_unix_ms":1}}"#).into_bytes();
+        let mut install = owner
+            .client()
+            .submit(
+                wire.len() + std::mem::size_of::<JournalCommand>(),
+                move |input, result| JournalCommand::InstallRecoveryAuditFixture {
+                    operation,
+                    wire,
+                    corrupt_text_bytes: MAX_RECORD_BYTES,
+                    input,
+                    result,
+                },
+            )
+            .unwrap();
+        install
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        drop(install);
+        let mut request = owner
+            .client()
+            .admit_prepared(prepared_copy_input(
+                FullCapacityAllocationClass::DestinationStaging,
+                VolumeIdentity { device: 1 },
+                1,
+            ))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while request
+            .historical_reply
+            .as_ref()
+            .unwrap()
+            .consumer
+            .lock()
+            .unwrap()
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "original recovery error was never retained"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(owner.prepared_admission_id_allocations(), 0);
+        if lost {
+            drop(request);
+            assert!(owner.shutdown());
+        } else {
+            assert!(owner.shutdown());
+            let Err(OperationJournalOwnerError::PreparedAdmission(
+                PreparedAdmissionError::RecoveryRequired { reason },
+            )) = request.recv_timeout(Duration::from_secs(5)).unwrap()
+            else {
+                panic!("original recovery error changed");
+            };
+            assert!(
+                reason.contains("recovery audit closed field is invalid"),
+                "{reason}"
+            );
+            drop(reason);
+            drop(request);
+        }
+        assert_eq!(
+            owner.shared.input_bytes.lock().unwrap().remaining[0],
+            InputClass::Ordinary.limit()
+        );
+        let connection = rusqlite::Connection::open(database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM operation_journal", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_journal_ordinary_claim",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT length(purpose) FROM operation_journal_recovery_reserve",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            MAX_RECORD_BYTES as i64
+        );
+    }
+}
+
+#[test]
+fn recovery_funded_actual_queued_exact_audit_pressure_refuses_without_effects() {
+    let fixture = fixture("recovery-audit-exact-pressure");
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let database = fixture
+        .owner
+        .profile_root()
+        .join("operation_journal/journal.sqlite3");
+    let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+    wait_until_available(&owner);
+    let operation = OperationId::new();
+    let wire=format!(r#"{{"schema_version":1,"operation_id":"{operation}","intent":{{"actor":"User","kind":"FileHistory","label":"recovery-audit"}},"phase":"IntentDurable","disposition":"None","payload":null,"created_unix_ms":1,"updated_unix_ms":1}}"#).into_bytes();
+    let mut install = owner
+        .client()
+        .submit(
+            wire.len() + std::mem::size_of::<JournalCommand>(),
+            move |input, result| JournalCommand::InstallRecoveryAuditFixture {
+                operation,
+                wire,
+                corrupt_text_bytes: 0,
+                input,
+                result,
+            },
+        )
+        .unwrap();
+    install
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    drop(install);
+    owner
+        .shared
+        .recovery_audit_pause
+        .store(true, Ordering::Release);
+    let mut request = owner
+        .client()
+        .admit_prepared(prepared_copy_input(
+            FullCapacityAllocationClass::DestinationStaging,
+            VolumeIdentity { device: 1 },
+            1,
+        ))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !owner.shared.recovery_audit_entered.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "original admission never reached recovery audit"
+        );
+        std::thread::yield_now();
+    }
+    // Previous ordinary reconstruction and consumer headers are already live.
+    // Exhaust the SAME original ordinary pool only at this audit boundary.
+    let remaining = owner.shared.input_bytes.lock().unwrap().remaining[0];
+    let retained = owner
+        .shared
+        .reserve_input(InputClass::Ordinary, remaining - 1)
+        .unwrap();
+    owner
+        .shared
+        .recovery_audit_pause
+        .store(false, Ordering::Release);
+    let Err(OperationJournalOwnerError::PreparedAdmission(
+        PreparedAdmissionError::RecoveryRequired { reason },
+    )) = request.recv_timeout(Duration::from_secs(5)).unwrap()
+    else {
+        panic!("audit pressure did not refuse");
+    };
+    assert!(
+        reason.contains("historical claim observation resource envelope exceeded"),
+        "{reason}"
+    );
+    drop(reason);
+    drop(request);
+    drop(retained);
+    assert!(owner.shutdown());
+    assert_eq!(owner.prepared_admission_id_allocations(), 0);
+    assert_eq!(
+        owner.shared.input_bytes.lock().unwrap().remaining[0],
+        InputClass::Ordinary.limit()
+    );
+    let connection = rusqlite::Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM operation_journal", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM operation_journal_ordinary_claim",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM operation_journal_recovery_reserve_transition",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        4
+    );
+}

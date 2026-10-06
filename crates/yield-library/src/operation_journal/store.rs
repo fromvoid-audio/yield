@@ -1843,12 +1843,21 @@ impl OperationJournalStore {
             let snapshot =
                 self.rebuild_ordinary_claim_snapshot_with_funding(input, &mut collection)?;
             self.validate_chunk_claims_inside_transaction()?;
-            recovery_reserve::prove_no_active_charges(&self.connection).map_err(|error| {
-                audit_error(
+            match input {
+                Some(input) => recovery_reserve::prove_no_active_charges_for_input(
+                    &self.connection,
                     &self.database_path,
-                    format!("recovery reserve admission audit failed: {error}"),
-                )
-            })?;
+                    input,
+                )?,
+                None => recovery_reserve::prove_no_active_charges(&self.connection).map_err(
+                    |error| {
+                        audit_error(
+                            &self.database_path,
+                            format!("recovery reserve admission audit failed: {error}"),
+                        )
+                    },
+                )?,
+            }
             self.validate_namespace_for_precommit()?;
             Ok(snapshot)
         })();
