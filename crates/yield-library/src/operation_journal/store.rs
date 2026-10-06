@@ -69,6 +69,8 @@ use super::selection_output_commands::{
 use super::validation::{RecordConsistency, classify_record};
 
 mod admission_rebuild_backing;
+#[cfg(any(test, feature = "test-support"))]
+mod namespace_backing_probe;
 mod chunk_claims;
 mod chunk_staging;
 pub(super) use admission_rebuild_backing::FundedSnapshot;
