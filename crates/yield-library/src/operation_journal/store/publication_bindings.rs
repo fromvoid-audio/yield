@@ -344,7 +344,7 @@ impl OperationJournalStore {
             params![binding.output_id.to_string(), binding.publication_effect().to_string(), encoded])?;
         Ok(())
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn publication_binding_observation_for_test(
         &self,
         output: Uuid,
