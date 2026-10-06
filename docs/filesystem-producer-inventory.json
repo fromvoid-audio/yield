@@ -1212,6 +1212,86 @@
       "issue": "OPT-2402",
       "reason": "Isolated actual retained journal/profile fixture creates and removes only controlled WAL evidence to test original namespace refusal, unchanged durable bytes, exact pool pressure and original request/error lifetime. No production filesystem effect, grant, retry or settlement is issued.",
       "retirement": "Keep as same-original namespace backing regression; genuine platform and physical qualification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_same_original_store_preserves_outcome_and_selected_debit",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_exact_pressure_precedes_original_path_error",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_last_original_reply_alias_and_no_overwrite",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_missing_consumer_refuses_before_original_namespace",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_error_outlives_request_and_original_worker_join",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_error_outlives_request_and_original_worker_join",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_lost_reply_refunds_only_after_worker_join",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
+      "function": "namespace_backing_actual_queued_lost_reply_refunds_only_after_worker_join",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2402",
+      "reason": "Isolated original profile-owned SQLite/worker component fixture. Controlled namespace corruption is rejected by production namespace dispatch before operation IDs or effects; test-only no-capacity worker creates no qualified physical admission and cannot substitute a positive native issuer.",
+      "retirement": "Retain same-original namespace/error custody coverage; production qualified startup and native runtime verification remain separate."
     }
   ]
 }
