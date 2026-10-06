@@ -569,6 +569,20 @@ fn recording_original_destination_refuses_unrelated_matching_source() {
     }
     // A second required SourceDatabase A matches the genuine request. Destination B
     // has a different valid source/root/database/epoch: A must not authorize B.
+    let media_b = tempfile::tempdir().unwrap();
+    let source_b = crate::sample_sources::SourceDatabase::open_for_catalog_with_profile_guard(
+        media_b.path(),
+        &guard,
+        "recording-held-destination-b",
+    )
+    .unwrap();
+    let authority_b = source_b.prepare_source_authority().unwrap();
+    let envelope_b = authority_b.journal_request().unwrap();
+    let request_b = envelope_b.request;
+    let _confirmation_b = request_b
+        .accept_confirmation(envelope_b.confirmation)
+        .unwrap();
+    let epoch_b = u64::try_from(request_b.lease_identity().epoch()).unwrap();
     let mut two_sources = wire.clone();
     let mut source_a = two_sources["participants"]["descriptors"][0].clone();
     let source_a_id = ParticipantId::new();
@@ -587,12 +601,12 @@ fn recording_original_destination_refuses_unrelated_matching_source() {
         .push(serde_json::to_value(checkpoint).unwrap());
     let destination_b = &mut two_sources["participants"]["descriptors"][0]["source_fence"];
     destination_b["source_id"] = Value::from("source-b");
-    destination_b["root_identity"] = Value::from("source-b-root");
-    destination_b["database_identity"] = Value::from("source-b-database");
-    destination_b["lease_epoch"] = Value::from(epoch.checked_add(1).unwrap());
+    destination_b["root_identity"] = request_b.media_root().identity().into();
+    destination_b["database_identity"] = request_b.database_file_identity().into();
+    destination_b["lease_epoch"] = Value::from(epoch_b);
     two_sources["destination"]["parent"]["source_id"] = Value::from("source-b");
     two_sources["destination"]["parent"]["expectation"]["filesystem_identity"] =
-        Value::from("source-b-root");
+        request_b.media_root().identity().into();
     let two_sources =
         RecordingProposal::decode(&serde_json::to_vec(&two_sources).unwrap()).unwrap();
     assert!(two_sources.participants().descriptors().iter().any(|d| {
@@ -605,5 +619,6 @@ fn recording_original_destination_refuses_unrelated_matching_source() {
             })
     }));
     assert!(!two_sources.matches_original_destination(&request, epoch));
+    assert!(two_sources.matches_original_destination(&request_b, epoch_b));
     assert!(!valid.matches_original_destination(&request, epoch.checked_add(1).unwrap()));
 }
