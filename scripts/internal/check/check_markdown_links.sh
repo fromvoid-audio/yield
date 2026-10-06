@@ -28,6 +28,7 @@ fi
 
 BASE_REF=""
 HEAD_REF="HEAD"
+HEAD_EXPLICIT=0
 
 usage() {
   cat <<'EOF'
@@ -40,9 +41,15 @@ EOF
 while (( $# > 0 )); do
   case "$1" in
     --base)
-      BASE_REF="${2:-}"; shift 2 ;;
+      if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
+        echo "[md_links] --base requires a commit reference" >&2; exit 2
+      fi
+      BASE_REF="$2"; shift 2 ;;
     --head)
-      HEAD_REF="${2:-}"; shift 2 ;;
+      if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
+        echo "[md_links] --head requires a commit reference" >&2; exit 2
+      fi
+      HEAD_REF="$2"; HEAD_EXPLICIT=1; shift 2 ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -56,105 +63,26 @@ git_has_commit() {
   yield_git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1
 }
 
+if [[ -n "$BASE_REF" ]] && ! git_has_commit "$BASE_REF"; then
+  echo "[md_links] Invalid base commit: $BASE_REF" >&2; exit 2
+fi
+if (( HEAD_EXPLICIT )) && ! git_has_commit "$HEAD_REF"; then
+  echo "[md_links] Invalid head commit: $HEAD_REF" >&2; exit 2
+fi
+
 collect_markdown_files() {
   local base="$1"
   local head="$2"
-
-  local out=()
-  local staged=()
-  local unstaged=()
+  # NUL delimiters preserve actual Git paths, including spaces and Unicode.
   if [[ -n "$base" ]] && git_has_commit "$base" && git_has_commit "$head"; then
-    while IFS= read -r path; do
-      out+=("$path")
-    done < <(yield_git diff --name-only --diff-filter=AM "$base...$head" -- '*.md' || true)
+    yield_git diff --name-only -z --diff-filter=AM "$base...$head" -- '*.md'
   elif git_has_commit "$head"; then
-    while IFS= read -r path; do
-      out+=("$path")
-    done < <(yield_git show --name-only --pretty=format: "$head" -- '*.md' || true)
+    yield_git show --name-only -z --pretty=format: "$head" -- '*.md'
   fi
-
-  while IFS= read -r path; do
-    staged+=("$path")
-  done < <(yield_git diff --name-only --diff-filter=AM --cached -- '*.md' || true)
-  while IFS= read -r path; do
-    unstaged+=("$path")
-  done < <(yield_git diff --name-only --diff-filter=AM -- '*.md' || true)
-
-  printf "%s\n" ${out[@]+"${out[@]}"} ${staged[@]+"${staged[@]}"} ${unstaged[@]+"${unstaged[@]}"} \
-    | sed 's#^\\./##' \
-    | sort -u || true
+  yield_git diff --name-only -z --diff-filter=AM --cached -- '*.md'
+  yield_git diff --name-only -z --diff-filter=AM -- '*.md'
 }
 
-files="$(collect_markdown_files "$BASE_REF" "$HEAD_REF")"
-if [[ -z "${files:-}" ]]; then
-  echo "[md_links] No changed Markdown files detected."
-  exit 0
-fi
-
-printf "%s\n" "$files" | python3 - <<'PY'
-import os
-import re
-import sys
-from pathlib import Path
-
-ROOT = Path.cwd()
-
-def is_ignored(dest: str) -> bool:
-    dest = dest.strip()
-    if not dest:
-        return True
-    lower = dest.lower()
-    if lower.startswith(("http://", "https://", "mailto:", "tel:")):
-        return True
-    if dest.startswith("#"):
-        return True
-    if dest.startswith("/"):
-        return True
-    return False
-
-def strip_anchor_and_query(dest: str) -> str:
-    # Keep it simple: split off query/fragment.
-    dest = dest.split("#", 1)[0]
-    dest = dest.split("?", 1)[0]
-    return dest.strip()
-
-link_re = re.compile(r"!?\\[[^\\]]*\\]\\(([^)]+)\\)")
-
-violations = []
-
-for line in sys.stdin:
-    file_path = line.strip()
-    if not file_path:
-        continue
-    path = ROOT / file_path
-    if not path.is_file():
-        continue
-    text = path.read_text(encoding="utf-8", errors="replace")
-    for match in link_re.finditer(text):
-        dest_raw = match.group(1).strip()
-        if is_ignored(dest_raw):
-            continue
-        dest = strip_anchor_and_query(dest_raw)
-        if not dest or is_ignored(dest):
-            continue
-        # Ignore templated or variable links.
-        if "${" in dest or "{{" in dest:
-            continue
-        resolved = (path.parent / dest).resolve()
-        try:
-            # Ensure we don't escape repo root inadvertently; still allow links outside docs
-            # if they exist (repo-relative paths like `../README.md`).
-            pass
-        except Exception:
-            pass
-        if not resolved.exists():
-            violations.append((file_path, dest_raw))
-
-if violations:
-    print("[md_links] Broken local file links detected:", file=sys.stderr)
-    for file_path, dest in violations:
-        print(f" - {file_path}: ({dest})", file=sys.stderr)
-    sys.exit(1)
-
-print("[md_links] OK")
-PY
+# The Python source is a file: its stdin is exclusively the actual selected paths.
+collect_markdown_files "$BASE_REF" "$HEAD_REF" \
+  | python3 "$ROOT_DIR/scripts/internal/check/check_markdown_links.py"
