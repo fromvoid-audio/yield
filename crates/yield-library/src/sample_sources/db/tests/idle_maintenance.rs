@@ -33,6 +33,36 @@ fn expiry(db: &SourceDatabase) -> i64 {
 }
 
 #[test]
+fn idle_source_wal_below_threshold_does_not_consume_original_checkpoint_attempt() {
+    database(|db, _, _| {
+        let control = db
+            .source_lease_control_total_changes_for_tests()
+            .unwrap()
+            .unwrap();
+        let expires = expiry(db);
+        let changes = db.connection.total_changes();
+        assert!(
+            crate::sqlite_wal::retained_wal_bytes(&db.connection).unwrap()
+                < crate::sqlite_wal::WAL_SOFT_WATERMARK_BYTES
+        );
+        db.maintain_idle_wal().unwrap();
+        assert!(!db.checkpoint_policy.has_attempted());
+        assert_eq!(expiry(db), expires);
+        assert_eq!(db.connection.total_changes(), changes);
+        assert_eq!(
+            db.source_lease_control_total_changes_for_tests()
+                .unwrap()
+                .unwrap(),
+            control
+        );
+        pressure(db);
+        // The below-threshold observation did not spend the shared policy's attempt window.
+        db.maintain_idle_wal().unwrap();
+        assert!(db.checkpoint_policy.has_attempted());
+    });
+}
+
+#[test]
 fn idle_source_wal_near_expiry_never_renews_original_control_writer() {
     database(|db, _, _| {
         pressure(db);
