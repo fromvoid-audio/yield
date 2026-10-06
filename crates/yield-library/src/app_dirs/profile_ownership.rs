@@ -13,11 +13,16 @@ use cap_std::fs::{Dir, OpenOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod generation;
+
 pub(crate) const PROFILE_OWNER_LOCK_FILE_NAME: &str = "profile-owner.lock";
 
 /// Errors returned while acquiring writable ownership of the current profile.
 #[derive(Debug, Error)]
 pub enum ProfileOwnershipError {
+    /// This process exhausted the checked profile-acquisition serial range.
+    #[error("profile ownership generation exhausted")]
+    OwnershipGenerationExhausted,
     /// Another process currently holds the profile ownership lock.
     #[error("profile is owned by another process: {path}")]
     ProfileOwnedByAnotherProcess {
@@ -129,6 +134,7 @@ pub struct WritableProfileGuard {
     lock_path: PathBuf,
     lock_identity: String,
     owner_identity: String,
+    ownership_generation: u64,
     root_dir: Dir,
     _lock_file: File,
     catalog_leases: Arc<Mutex<HashSet<String>>>,
@@ -157,6 +163,12 @@ impl Drop for ProfileChildLease {
 impl WritableProfileGuard {
     /// Resolve the current profile and acquire its nonblocking writable-owner lock.
     pub fn acquire_current() -> Result<Self, ProfileOwnershipError> {
+        Self::acquire_with_generation_counter(&generation::NEXT_GENERATION)
+    }
+
+    fn acquire_with_generation_counter(
+        counter: &std::sync::atomic::AtomicU64,
+    ) -> Result<Self, ProfileOwnershipError> {
         let profile_root = super::resolution::resolve_persistence()
             .map_err(|error| ProfileOwnershipError::AppDirectory(error.to_string()))?
             .app_root;
@@ -171,6 +183,7 @@ impl WritableProfileGuard {
             })?;
         let profile_identity = identity_for_root(&profile_root, &root_dir)?;
         let lock_file = acquire_lock(&root_dir, &lock_path)?;
+        let ownership_generation = generation::issue_from(counter)?;
         // Generate this only after the OS lock has been acquired. The diagnostic is never used
         // as an ownership authority; the live descriptor lock remains the sole authority.
         let owner_identity = Uuid::new_v4().to_string();
@@ -182,6 +195,7 @@ impl WritableProfileGuard {
             lock_path,
             lock_identity,
             owner_identity,
+            ownership_generation,
             root_dir,
             _lock_file: lock_file,
             catalog_leases: Arc::new(Mutex::new(HashSet::new())),
@@ -202,6 +216,12 @@ impl WritableProfileGuard {
     /// for future owner/coordinator fences; it is never used to decide ownership.
     pub fn owner_identity(&self) -> &str {
         &self.owner_identity
+    }
+
+    /// Acquisition-local serial, meaningful only with this original live guard and UUID.
+    /// It is not durable, cross-process monotonic, or permission to mutate a database.
+    pub(crate) fn ownership_generation(&self) -> u64 {
+        self.ownership_generation
     }
 
     /// Return the identity captured from the retained profile-root capability.
@@ -264,6 +284,7 @@ impl WritableProfileGuard {
             lock_path: self.lock_path.clone(),
             lock_identity: self.lock_identity.clone(),
             owner_identity: self.owner_identity.clone(),
+            ownership_generation: self.ownership_generation,
             root_dir,
             _lock_file: lock_file,
             catalog_leases: Arc::clone(&self.catalog_leases),
@@ -313,6 +334,7 @@ impl WritableProfileGuard {
                 path: self.lock_path.clone(),
             });
         }
+        generation::validate(self.ownership_generation())?;
         Ok(())
     }
 
@@ -1053,15 +1075,52 @@ mod tests {
         let _profile_guard = PersistenceProfileGuard::named("ownership-generation");
         let holder = WritableProfileGuard::acquire_current().expect("profile holder");
         let owner_identity = holder.owner_identity().to_owned();
+        let generation = holder.ownership_generation();
+        assert!((1..=i64::MAX as u64).contains(&generation));
         assert!(Uuid::parse_str(&owner_identity).is_ok());
         let clone = holder.try_clone().expect("profile clone");
         assert_eq!(clone.owner_identity(), owner_identity);
-        drop(clone);
+        assert_eq!(clone.ownership_generation(), generation);
         drop(holder);
+        assert!(clone.validate_current().is_ok());
+        assert!(matches!(
+            WritableProfileGuard::acquire_current(),
+            Err(ProfileOwnershipError::ProfileOwnedByAnotherProcess { .. })
+        ));
+        drop(clone);
 
         let reopened = WritableProfileGuard::acquire_current().expect("reopen profile");
         assert!(Uuid::parse_str(reopened.owner_identity()).is_ok());
         assert_ne!(reopened.owner_identity(), owner_identity);
+        assert!(reopened.ownership_generation() > generation);
+    }
+
+    #[test]
+    fn profile_generation_exhaustion_releases_actual_lock_without_changing_diagnostic() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _runtime = test_runtime();
+        let base = profile_base();
+        let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile_guard = PersistenceProfileGuard::named("ownership-serial-exhaustion");
+        let holder = WritableProfileGuard::acquire_current().unwrap();
+        let lock_path = holder.lock_path.clone();
+        let diagnostic = fs::read(&lock_path).unwrap();
+        let counter = AtomicU64::new(i64::MAX as u64 + 1);
+        // Native lock conflict wins before the counter is consulted.
+        assert!(matches!(
+            WritableProfileGuard::acquire_with_generation_counter(&counter),
+            Err(ProfileOwnershipError::ProfileOwnedByAnotherProcess { .. })
+        ));
+        assert_eq!(counter.load(Ordering::Relaxed), i64::MAX as u64 + 1);
+        drop(holder);
+        assert!(matches!(
+            WritableProfileGuard::acquire_with_generation_counter(&counter),
+            Err(ProfileOwnershipError::OwnershipGenerationExhausted)
+        ));
+        assert_eq!(fs::read(&lock_path).unwrap(), diagnostic);
+        let reopened = WritableProfileGuard::acquire_current().unwrap();
+        assert!(reopened.validate_current().is_ok());
     }
 
     #[test]
@@ -1085,6 +1144,7 @@ mod tests {
         wait_for_owner_helper(&mut helper, true);
         let reopened = WritableProfileGuard::acquire_current().expect("reopen after release");
         assert_eq!(reopened.profile_root(), profile_root(base.path(), profile));
+        assert!((1..=i64::MAX as u64).contains(&reopened.ownership_generation()));
     }
 
     #[test]
@@ -1108,6 +1168,7 @@ mod tests {
         wait_for_owner_helper(&mut helper, false);
         let reopened = WritableProfileGuard::acquire_current().expect("reopen after crash");
         assert_eq!(reopened.profile_root(), profile_root(base.path(), profile));
+        assert!((1..=i64::MAX as u64).contains(&reopened.ownership_generation()));
     }
 
     #[test]
