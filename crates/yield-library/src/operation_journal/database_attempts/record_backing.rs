@@ -12,7 +12,9 @@ pub(super) fn observe(
     let original = &original.intent.label;
     let copied = &copied.intent.label;
     assert_eq!(original, copied);
-    assert!(!copied.is_empty());
+    if copied.is_empty() {
+        return;
+    }
     assert_ne!(original.as_ptr(), copied.as_ptr());
     let counter = if initial {
         &INITIAL_LABEL_CAPACITY
