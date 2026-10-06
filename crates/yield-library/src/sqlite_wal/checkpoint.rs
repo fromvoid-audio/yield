@@ -12,6 +12,8 @@ const MIN_INTERVAL: Duration = Duration::from_secs(15);
 #[derive(Default)]
 pub(crate) struct CheckpointPolicy {
     last_attempt: Cell<Option<Instant>>,
+    #[cfg(any(test, feature = "test-support"))]
+    observer: std::cell::RefCell<Option<std::sync::mpsc::SyncSender<(bool, i64, i64)>>>,
 }
 
 #[derive(Debug)]
@@ -36,6 +38,14 @@ struct Frames {
 }
 
 impl CheckpointPolicy {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn observe_results_for_tests(
+        &self,
+        observer: std::sync::mpsc::SyncSender<(bool, i64, i64)>,
+    ) {
+        *self.observer.borrow_mut() = Some(observer);
+    }
+
     #[cfg(test)]
     pub(crate) fn has_attempted(&self) -> bool {
         self.last_attempt.get().is_some()
@@ -57,7 +67,14 @@ impl CheckpointPolicy {
                 let after_bytes = after.as_ref().ok().copied();
                 let after_unavailable = after.err().map(|error| error.to_string());
                 match frames {
-                    Ok(frames) => tracing::info!(
+                    Ok(frames) => {
+                        #[cfg(any(test, feature = "test-support"))]
+                        if let Some(observer) = self.observer.borrow().as_ref() {
+                            // The fixture's bounded receiver never delays original maintenance.
+                            let _ =
+                                observer.try_send((frames.busy, frames.log, frames.checkpointed));
+                        }
+                        tracing::info!(
                         target: "perf::source_db", action = "wal_checkpoint",
                         database_kind, role, mode = "passive", wal_bytes_before = before,
                         wal_bytes_after = ?after_bytes, observation_unavailable = ?after_unavailable,
@@ -66,7 +83,8 @@ impl CheckpointPolicy {
                         complete = !frames.busy && frames.log >= 0 && frames.log == frames.checkpointed,
                         elapsed_ms = elapsed.as_millis() as u64,
                         "Observed passive WAL checkpoint"
-                    ),
+                        );
+                    }
                     Err(error) => tracing::warn!(
                         target: "perf::source_db", action = "wal_checkpoint",
                         database_kind, role, mode = "passive", wal_bytes_before = before,
