@@ -633,7 +633,7 @@ impl WalPreparationInput {
         input.replace_retirement_policy_for_test(args).unwrap();
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(in crate::operation_journal) fn budget_for_test(&self) -> Arc<HandshakeBudget> {
         Arc::clone(&self.budget)
     }
