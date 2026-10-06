@@ -129,6 +129,7 @@ fn main() {
     // Rust allocation coefficients only, not native SQLite or physical qualification.
     for (case, bytes) in [
         ("small_ascii", b"fixture SQLite error".to_vec()),
+        ("tiny_invalid_utf8", vec![0xff; 1]),
         ("small_invalid_utf8", vec![0xff; 16]),
         ("large_invalid_utf8", vec![0xff; 256 * 1024]),
     ] {

@@ -178,8 +178,11 @@ pub(super) fn copy_error_message(
     let prefix = "operation journal SQLite error: ".len()
         + "ordinary claim  operation  requires audit: ".len()
         + 2 * 36;
+    // Pinned Rust RawVec<u8> uses an eight-byte minimum non-zero growth
+    // allocation. Name it independently of geometric growth for tiny lossy input.
     let bytes = length
         .checked_mul(2)
+        .and_then(|n| n.checked_add(8))
         .and_then(|original| {
             length
                 .checked_add(prefix)

@@ -55,13 +55,15 @@ No handle, row or alternate connection escapes. Every observer query uses this
 path, including family presence and unique-sequence checks. SQLite itself keeps
 its native allocations. Its borrowed error message is counted before making the
 same owned, UTF-8-lossy `rusqlite::SqliteFailure` message. The debit names lossy
-String growth and the complete Store/ordinary-claim display prefixes and two
+String growth (including the pinned eight-byte minimum) and the complete
+Store/ordinary-claim display prefixes and two
 UUIDs, with overlapping error and formatted diagnostic buffers. Original path
 clones use native byte counts (UTF-16 on Windows), with separate worst-case lossy
 path-display and diagnostic formatting overlap.
 
 The generic, non-retirement request also funds a private reply Arc header before
-allocation. Named observer credits retain SQL, parser, envelope and SQLite error
+allocation, including the exact static refusal reason backing before any
+fallible consumer debit. Named observer credits retain SQL, parser, envelope and SQLite error
 backing until the real rebuild consumer drops the original owned error after
 copying it into a separately funded capped diagnostic graph. The next claim can
 then reuse its original scratch allowance. The consumer debit includes all 32
