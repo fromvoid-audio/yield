@@ -586,7 +586,7 @@ mod publication_issuance {
         assert_eq!(version, 12);
         let created:i64 = raw.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='operation_journal_publication_issuance'",[],|row|row.get(0)).unwrap();
         assert_eq!(created, 0);
-        let reserved:bool = raw.query_row("SELECT grant_reserved FROM operation_journal_staging_checkpoint WHERE output_id=?1",params![staging.output_id().to_string()],|row|row.get(0)).unwrap();
+        let reserved:bool = raw.query_row("SELECT grant_reserved FROM operation_journal_staging_checkpoints WHERE output_id=?1",params![staging.output_id().to_string()],|row|row.get(0)).unwrap();
         assert!(!reserved);
     }
 }

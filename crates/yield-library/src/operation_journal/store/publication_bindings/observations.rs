@@ -37,6 +37,7 @@ impl RootObservation {
         self.registration.validate()?;
         if self.locator.is_empty()
             || self.locator.len() > 1024
+            || self.locator.contains('\0')
             || self.locator.contains('/')
             || self.locator.contains('\\')
             || matches!(self.locator.as_str(), "." | "..")
