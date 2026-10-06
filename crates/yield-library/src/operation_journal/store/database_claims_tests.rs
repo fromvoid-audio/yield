@@ -886,7 +886,20 @@ mod exact_database_claim_persistence {
         ));
         drop(settled);
         drop(store);
-        let store = OperationJournalStore::open(&f.owner).unwrap();
+        drop(f.owner);
+        let owner = WritableProfileGuard::acquire_current().unwrap();
+        assert_ne!(owner.owner_identity(), inventory.header().acquisition);
+        assert!(owner.ownership_generation() > inventory.header().ownership_generation);
+        let store = OperationJournalStore::open(&owner).unwrap();
+        assert_eq!(
+            store
+                .read_database_claim_inventory_for_nonce(
+                    inventory.header().decision_nonce,
+                    inventory.digest().unwrap(),
+                )
+                .unwrap(),
+            Some((record.operation_id, inventory.clone()))
+        );
         assert_eq!(
             store.get(record.operation_id).unwrap(),
             Some(record.clone())
