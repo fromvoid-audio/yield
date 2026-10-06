@@ -2798,7 +2798,27 @@ impl OperationJournalStore {
         proof: &crate::sample_sources::db::CurrentReserveUseProof<'_>,
         failure: &LegacyReserveFailureSink,
     ) -> Result<OwnedReserveAllocation, SourceReserveBindingFailure> {
-        self.acquire_owned_source_reserve_inner(
+        let _custody = match proof.begin_bootstrap_effect() {
+            Ok(custody) => custody,
+            Err(error) => {
+                return Err(SourceReserveBindingFailure {
+                    error: RecoveryReserveContextError::Reserve(error.to_string()),
+                    reserve: None,
+                    volume_owner,
+                });
+            }
+        };
+        let retained_owner = match volume_owner.try_clone_for_context() {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Err(SourceReserveBindingFailure {
+                    error: error.into(),
+                    reserve: None,
+                    volume_owner,
+                });
+            }
+        };
+        let reserve = self.acquire_owned_source_reserve_inner(
             volume_owner,
             proof.root(),
             proof.profile(),
@@ -2807,7 +2827,17 @@ impl OperationJournalStore {
                 failure,
             },
             &mut None,
-        )
+        )?;
+        if let Err(error) = proof.validate_root_for_bootstrap(proof.root()) {
+            // The worker still owns the original volume capability; returning this reserve in
+            // the failure transfers its exact opened descriptor into its preinstalled slot.
+            return Err(SourceReserveBindingFailure {
+                error: RecoveryReserveContextError::Reserve(error.to_string()),
+                reserve: Some(reserve),
+                volume_owner: retained_owner,
+            });
+        }
+        Ok(reserve)
     }
 
     #[cfg(test)]

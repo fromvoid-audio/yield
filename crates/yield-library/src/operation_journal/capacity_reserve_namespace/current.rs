@@ -168,7 +168,33 @@ fn finish_current_created_reserve_inner<'a>(
     }
     #[cfg(target_os = "macos")]
     {
-        bind_after_sync(root, profile, reserve, observation)
+        let _custody = match proof.begin_bootstrap_effect() {
+            Ok(custody) => custody,
+            Err(_) => {
+                return Err(ReserveNamespaceFailure::new(
+                    ReserveNamespaceFailureStage::Binding,
+                    ReserveNamespaceFailureReason::Allocation(
+                        ReserveFailureReason::CurrentCustodyClosed,
+                    ),
+                    Some(OwnedFailureFile::Protected(reserve)),
+                    Some(observation),
+                    None,
+                ));
+            }
+        };
+        let bound = bind_after_sync(root, profile, reserve, observation)?;
+        if proof.validate_root_for_bootstrap(root).is_err() {
+            return Err(ReserveNamespaceFailure::new(
+                ReserveNamespaceFailureStage::Binding,
+                ReserveNamespaceFailureReason::Allocation(
+                    ReserveFailureReason::CurrentCustodyClosed,
+                ),
+                Some(OwnedFailureFile::Protected(bound.reserve)),
+                Some(bound.observation),
+                None,
+            ));
+        }
+        Ok(bound)
     }
     #[cfg(not(target_os = "macos"))]
     {

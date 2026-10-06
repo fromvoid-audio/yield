@@ -33,7 +33,11 @@ impl<B: ReserveBackend> ReserveBackend for CurrentBackend<'_, '_, B> {
             .proof
             .begin_bootstrap_effect()
             .map_err(|_| ReserveFailureReason::CurrentCustodyClosed)?;
-        self.backend.final_observation(file)
+        let observation = self.backend.final_observation(file)?;
+        self.proof
+            .validate_root_for_bootstrap(self.proof.root())
+            .map_err(|_| ReserveFailureReason::CurrentCustodyClosed)?;
+        Ok(observation)
     }
 }
 
@@ -42,11 +46,32 @@ pub(in super::super) fn allocate_current_protected_reserve(
     file: File,
     proof: &CurrentReserveUseProof<'_>,
 ) -> Result<ProtectedReserve, ReserveFailure> {
-    reserve_with_backend(
+    let _custody = match proof.begin_bootstrap_effect() {
+        Ok(custody) => custody,
+        Err(_) => {
+            return Err(ReserveFailure::new(
+                file,
+                ReserveFailureStage::InitialValidation,
+                ReserveFailureReason::CurrentCustodyClosed,
+                None,
+            ));
+        }
+    };
+    let reserve = reserve_with_backend(
         file,
         CurrentBackend {
             proof,
             backend: MacReserveBackend,
         },
-    )
+    )?;
+    if proof.validate_root_for_bootstrap(proof.root()).is_err() {
+        let allocation = reserve.observation().allocated_bytes;
+        return Err(ReserveFailure::new(
+            reserve.into_file(),
+            ReserveFailureStage::Verification,
+            ReserveFailureReason::CurrentCustodyClosed,
+            Some(allocation),
+        ));
+    }
+    Ok(reserve)
 }

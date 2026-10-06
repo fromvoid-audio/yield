@@ -77,6 +77,37 @@ mod tests {
         assert!(scope.validate_for_bootstrap().is_err());
     }
 
+    #[test]
+    fn current_original_custody_pin_revocation_stops_next_effect_without_releasing_first() {
+        let app = tempfile::tempdir().unwrap();
+        let _app = AppRootGuard::set(app.path().to_owned()).unwrap();
+        let profile = WritableProfileGuard::acquire_current().unwrap();
+        let media = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let source = SourceDatabase::open_for_source_write_with_profile_guard(
+            media.path(),
+            &profile,
+            db.path(),
+        )
+        .unwrap();
+        let (request, guard) = source.prepare_source_authority().unwrap().split();
+        let proof = request
+            .accept_confirmation(guard.confirm().unwrap())
+            .unwrap();
+        let scope = request
+            .reserve_use(request.media_root(), &proof, &profile)
+            .unwrap();
+        let custody = scope.begin_bootstrap_effect().unwrap();
+        assert_eq!(request.registered_uses_for_tests(), 1);
+        drop(guard);
+        assert!(scope.begin_bootstrap_effect().is_err());
+        assert!(scope.validate_root_for_bootstrap(scope.root()).is_err());
+        assert_eq!(request.registered_uses_for_tests(), 1);
+        assert_eq!(std::fs::read_dir(media.path()).unwrap().count(), 0);
+        drop(custody);
+        assert_eq!(request.registered_uses_for_tests(), 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn current_reserve_scope_refuses_replaced_original_root_without_substitute_effects() {

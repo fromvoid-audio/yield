@@ -94,6 +94,7 @@ pub(super) fn acquire_current_for_scope(
     scope: &CurrentReserveUseProof<'_>,
     backing: &mut LegacyVolumeFailureBacking,
 ) -> Result<VolumeOwnershipCapability, ()> {
+    let _custody = ReserveBootstrapUseProof::Current(scope).begin_effect()?;
     acquire_bootstrap_inner(
         scope.descriptor(),
         scope.profile(),
@@ -246,6 +247,7 @@ fn acquire_bootstrap_inner(
         if fault == Some(TestFault::AfterMarker) {
             return Err(());
         }
+        let _terminal_custody = proof.begin_effect()?;
         let capability = VolumeOwnershipCapability {
             registry: backing.registry.take().unwrap(),
             volume: facts.identity,
@@ -267,6 +269,7 @@ fn acquire_bootstrap_inner(
             || proof.validate_for_bootstrap().is_err()
             || capability.revalidate().is_err()
             || capability.legacy_metadata_bytes().is_none()
+            || proof.validate_for_bootstrap().is_err()
         {
             capability.handoff_fenced.set(true);
             backing.failed_owner = Some(capability);
