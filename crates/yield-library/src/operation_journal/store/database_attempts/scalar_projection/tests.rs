@@ -104,10 +104,10 @@ fn attempt_scalar_projection_keeps_image_before_column_semantics() {
     assert_eq!(format!("{image_error:?}"), format!("{malformed:?}"));
     c.execute(
         "UPDATE operation_journal_database_attempt SET binding_id=CAST(?1 AS TEXT)",
-        params![[vec![b'z'; 36], vec![0xff]].concat()],
+        params![[vec![b'z'; 35], vec![0xff]].concat()],
     )
     .unwrap();
-    let original=c.query_row("SELECT CASE WHEN length(binding_id)=36 THEN binding_id END FROM operation_journal_database_attempt",[],|r|r.get::<_,String>(0)).unwrap_err();
+    let original=c.query_row("SELECT CASE WHEN length(operation_id)=36 THEN operation_id END, CASE WHEN length(binding_id)=36 THEN binding_id END FROM operation_journal_database_attempt",[],|r|r.get::<_,String>(0)).unwrap_err();
     let actual = super::super::read_start(&c, id).unwrap_err();
     assert!(
         format!("{actual:?}").contains(&format!("{original:?}")),
