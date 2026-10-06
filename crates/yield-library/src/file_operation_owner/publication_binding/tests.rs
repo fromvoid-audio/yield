@@ -837,7 +837,8 @@ mod integration {
     }
     #[cfg(windows)]
     #[test]
-    fn windows_staging_share_original_worker_reply_loss_and_existing_writer_preserve_bytes() {
+    fn windows_staging_share_original_worker_discarded_duplicate_and_existing_writer_preserve_bytes()
+     {
         use std::os::windows::fs::OpenOptionsExt;
         let f = Fixture::new();
         let (mut validation, original) = f.validation();
@@ -852,19 +853,16 @@ mod integration {
         drop(foreign);
         let mut delivered = f.prepare(original.clone(), EffectId::new(), "final.wav");
         let target = wait(&mut delivered).unwrap();
-        // A duplicate keeps the same worker-owned binding; lost observation reply cannot
-        // release sharing custody while the original delivered binding remains live.
+        // Receive and discard the exact original worker reply without constructing a
+        // PreparedPublicationTarget. This is an ignored observation, not delivery loss.
         let duplicate = f.prepare(original.clone(), target.publication_effect(), "final.wav");
-        let end = Instant::now() + Duration::from_secs(3);
-        while Arc::strong_count(&target.data) == 1 {
-            assert!(
-                Instant::now() < end,
-                "original duplicate response was not retained"
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
-        // Arc count proves the original worker prepared a reply before actual reply loss.
-        drop(duplicate);
+        let response = duplicate
+            .receiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&response, &target.data));
+        drop((response, duplicate));
         assert!(
             std::fs::OpenOptions::new()
                 .write(true)

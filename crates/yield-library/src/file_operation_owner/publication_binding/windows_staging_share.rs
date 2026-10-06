@@ -46,9 +46,10 @@ fn identity(file: &File) -> io::Result<Identity> {
     Ok(id)
 }
 
-/// Consume only the original readonly observation handle. Existing write/delete handles
+/// Consume only the original readonly observation handle. Existing data-write/append/delete handles
 /// conflict under Windows' symmetric sharing checks; subsequent such opens conflict until
-/// this returned handle closes. Mappings can outlive handles and are outside that guarantee.
+/// this returned handle closes. Attribute-only access and mappings that outlive handles
+/// are outside that guarantee.
 pub(super) fn retain(original: File) -> io::Result<File> {
     let expected = identity(&original)?;
     // SAFETY: validated live disk/regular/nonreparse original, readonly desired access,
@@ -75,7 +76,9 @@ mod tests {
     use super::*;
     use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt, sync::Arc};
-    use windows::Win32::Storage::FileSystem::{DELETE, FILE_SHARE_DELETE, FILE_SHARE_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_SHARE_DELETE, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    };
     const ALL_SHARING: u32 = FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0;
     fn readonly(path: &std::path::Path) -> File {
         OpenOptions::new()
@@ -99,6 +102,14 @@ mod tests {
         );
         let reader = readonly(&path);
         drop(reader);
+        // Windows share checking excludes attribute-only rights; do not claim their denial.
+        drop(
+            OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES.0)
+                .share_mode(ALL_SHARING)
+                .open(&path)
+                .unwrap(),
+        );
         assert!(
             OpenOptions::new()
                 .write(true)

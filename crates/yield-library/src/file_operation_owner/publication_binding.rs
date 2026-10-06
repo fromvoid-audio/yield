@@ -706,12 +706,6 @@ impl WorkerState {
             .root
             .open_observation_file_nofollow(Path::new(staging.locator.as_str()))
             .map_err(|_| BindingError::Unknown)?;
-        // Keep the original-object read/share lease through hashing and every live binding.
-        // This refuses file-handle write/delete aliases, not surviving writable mappings.
-        #[cfg(windows)]
-        let mut file = windows_staging_share::retain(file).map_err(|_| BindingError::Unknown)?;
-        #[cfg(not(windows))]
-        let mut file = file;
         let metadata = file.metadata().map_err(|_| BindingError::Unknown)?;
         if !metadata.is_file()
             || metadata.len() != proof.bytes
@@ -724,6 +718,13 @@ impl WorkerState {
         if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 {
             return Err(BindingError::Conflict);
         }
+        // Restrict only the object already matched to the original durable observation.
+        // Retain data-write/append/delete sharing exclusion through every live binding;
+        // attribute-only handles and surviving writable mappings remain outside this lease.
+        #[cfg(windows)]
+        let mut file = windows_staging_share::retain(file).map_err(|_| BindingError::Unknown)?;
+        #[cfg(not(windows))]
+        let mut file = file;
         let mut hasher = blake3::Hasher::new();
         let mut scratch = [0u8; 8192];
         let mut bytes = 0u64;
