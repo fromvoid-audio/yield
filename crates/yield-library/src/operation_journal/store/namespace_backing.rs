@@ -234,6 +234,11 @@ pub(super) fn working_bytes(
     // representation is at most unix: +20+1+20+1+39 = 86 UTF-8 bytes.
     let identities = format_bytes(5 + 20 + 1 + 20 + 1 + 39)?.checked_mul(6)?;
     let headers = std::mem::size_of::<OperationJournalStoreError>()
+        // Selected queued error's non-Clone carrier frees this Box before its
+        // reply keeper. It is constructed only after the original error is sent.
+        .checked_add(std::mem::size_of::<
+            super::super::owner::OperationJournalOwnerError,
+        >())?
         .checked_add(std::mem::size_of::<DatabaseIdentityError>())?
         .checked_add(std::mem::size_of::<ProfileOwnershipError>())?
         .checked_add(std::mem::size_of::<(String, io::ErrorKind, [usize; 4])>())?

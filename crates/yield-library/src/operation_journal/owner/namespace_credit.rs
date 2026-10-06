@@ -2,6 +2,77 @@
 //! Wiring requires the original detached StartupCredit implementation (OPT-2400).
 use super::*;
 
+/// Original command failure and its namespace backing after request consumption.
+/// This owns no authority and cannot be cloned or expose its backing keeper.
+pub struct NamespaceCommandError {
+    error: Option<Box<OperationJournalOwnerError>>,
+    reply: Option<HistoricalReply>,
+}
+
+impl NamespaceCommandError {
+    /// Borrow the original typed command failure without detaching its backing.
+    pub fn original_error(&self) -> &OperationJournalOwnerError {
+        self.error
+            .as_deref()
+            .expect("live original namespace failure")
+    }
+}
+
+impl std::fmt::Debug for NamespaceCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.original_error(), f)
+    }
+}
+
+impl std::fmt::Display for NamespaceCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.original_error(), f)
+    }
+}
+
+impl std::error::Error for NamespaceCommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.original_error())
+    }
+}
+
+impl Drop for NamespaceCommandError {
+    fn drop(&mut self) {
+        // Destroy the original owned error and its Box allocation before releasing
+        // the original reply allocation or any selected namespace backing debit.
+        drop(self.error.take());
+        drop(self.reply.take());
+    }
+}
+
+pub(super) fn retain_result_error<T>(
+    result: Result<T, OperationJournalOwnerError>,
+    reply: Option<HistoricalReply>,
+) -> Result<T, OperationJournalOwnerError> {
+    match (result, reply) {
+        (Err(error), Some(reply)) => {
+            let selected = reply
+                .namespace
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_some();
+            if selected {
+                // NamespaceLoan prepays this exact Box size before the original
+                // namespace producer. The live reply retains that debit here.
+                Err(OperationJournalOwnerError::NamespaceBacked(
+                    NamespaceCommandError {
+                        error: Some(Box::new(error)),
+                        reply: Some(reply),
+                    },
+                ))
+            } else {
+                Err(error)
+            }
+        }
+        (result, _) => result,
+    }
+}
+
 /// Original pool/input for normal-build namespace allocation diagnostics only.
 /// Construction installs no capacity, admission, execution or settlement authority.
 #[cfg(any(test, feature = "test-support"))]
@@ -11,6 +82,7 @@ pub struct JournalNamespaceFundingProbe {
 
 #[cfg(any(test, feature = "test-support"))]
 impl JournalNamespaceFundingProbe {
+    /// Construct the original diagnostic input/reply outside the measured interval.
     pub fn new() -> Self {
         let (commands, _receivers) = OwnerCommandReceivers::channel();
         let shared = Arc::new(OwnerShared::new(commands));
@@ -21,8 +93,18 @@ impl JournalNamespaceFundingProbe {
         }
     }
 
+    /// Observe original ordinary-pool availability; this grants no capacity authority.
     pub fn remaining_bytes(&self) -> usize {
         self.input.shared.input_bytes.lock().unwrap().remaining[0]
+    }
+
+    /// Retain a same-Store selected failure through diagnostic caller destruction.
+    pub fn retain_command_error_for_test(
+        &self,
+        error: OperationJournalStoreError,
+    ) -> OperationJournalOwnerError {
+        retain_result_error::<()>(Err(error.into()), self.input.historical_reply.clone())
+            .expect_err("original selected diagnostic failure")
     }
 }
 

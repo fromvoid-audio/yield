@@ -154,3 +154,96 @@ fn namespace_backing_missing_consumer_refuses_before_original_namespace() {
         .retained_namespace_transaction_for_test(false)
         .unwrap();
 }
+
+#[test]
+fn namespace_backing_actual_queued_error_outlives_request_and_original_worker_join() {
+    for poll in [false, true] {
+        let fixture = fixture("namespace-backing-caller-error");
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        let path = store.retained_namespace_path_for_test();
+        let original_bytes = fs::read(&path).unwrap();
+        let bound = store.retained_namespace_working_bytes_for_test();
+        let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+        wait_until_available(&owner);
+        let baseline = *owner.shared.input_bytes.lock().unwrap();
+        let pool = owner.shared.input_bytes.clone();
+        let wal = path.with_file_name("journal.sqlite3-wal");
+        fs::write(&wal, b"original queued namespace sidecar evidence").unwrap();
+        let mut request = owner
+            .client()
+            .admit_prepared(prepared_copy_input(
+                crate::operation_journal::FullCapacityAllocationClass::DestinationStaging,
+                VolumeIdentity { device: 1 },
+                1,
+            ))
+            .unwrap();
+        let result = if poll {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match request.try_result() {
+                    Ok(result) => break result,
+                    Err(OperationJournalRequestError::Empty) => {
+                        assert!(std::time::Instant::now() < deadline);
+                        std::thread::yield_now();
+                    }
+                    other => panic!("original queued result disconnected: {other:?}"),
+                }
+            }
+        } else {
+            request.recv_timeout(Duration::from_secs(5)).unwrap()
+        };
+        let error = result.unwrap_err();
+        let OperationJournalOwnerError::NamespaceBacked(ref backed) = error else {
+            panic!("selected namespace error must retain original backing")
+        };
+        assert!(matches!(
+            backed.original_error(),
+            OperationJournalOwnerError::Store(OperationJournalStoreError::RequiresAudit { .. })
+        ));
+        assert!(error.to_string().contains("unexpected SQLite sidecar"));
+        drop(request);
+        assert!(owner.shutdown());
+        assert_eq!(owner.prepared_admission_id_allocations(), 0);
+        assert_eq!(
+            baseline.remaining[0] - pool.lock().unwrap().remaining[0],
+            bound + HISTORICAL_REPLY_BYTES,
+            "caller-held error retains exact original namespace and reply backing"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(
+            fs::read(&wal).unwrap(),
+            b"original queued namespace sidecar evidence"
+        );
+        drop(error); // Payload and Box allocation disappear before final credit.
+        assert_eq!(*pool.lock().unwrap(), baseline);
+        fs::remove_file(&wal).unwrap();
+    }
+}
+
+#[test]
+fn namespace_backing_actual_queued_lost_reply_refunds_only_after_worker_join() {
+    let fixture = fixture("namespace-backing-original-lost-reply");
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let path = store.retained_namespace_path_for_test();
+    let original_bytes = fs::read(&path).unwrap();
+    let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+    wait_until_available(&owner);
+    let baseline = *owner.shared.input_bytes.lock().unwrap();
+    let wal = path.with_file_name("journal.sqlite3-wal");
+    fs::write(&wal, b"lost reply namespace evidence").unwrap();
+    let request = owner
+        .client()
+        .admit_prepared(prepared_copy_input(
+            crate::operation_journal::FullCapacityAllocationClass::DestinationStaging,
+            VolumeIdentity { device: 1 },
+            1,
+        ))
+        .unwrap();
+    drop(request);
+    assert!(owner.shutdown());
+    assert_eq!(owner.prepared_admission_id_allocations(), 0);
+    assert_eq!(*owner.shared.input_bytes.lock().unwrap(), baseline);
+    assert_eq!(fs::read(&path).unwrap(), original_bytes);
+    assert_eq!(fs::read(&wal).unwrap(), b"lost reply namespace evidence");
+    fs::remove_file(wal).unwrap();
+}

@@ -14,6 +14,7 @@ pub use super::wal_admission::{
 mod frozen_copy;
 mod historical_reply;
 mod namespace_credit;
+pub use namespace_credit::NamespaceCommandError;
 mod startup_credit;
 use historical_reply::HistoricalReply;
 #[cfg(any(test, feature = "test-support"))]
@@ -600,6 +601,9 @@ impl From<CapacityProviderError> for PreparedAdmissionError {
 /// Failure returned by an admitted journal command.
 #[derive(Debug, Error)]
 pub enum OperationJournalOwnerError {
+    /// Original namespace failure retaining its pool backing through caller destruction.
+    #[error(transparent)]
+    NamespaceBacked(NamespaceCommandError),
     /// Original memory-only recording preparation could not be retained or revalidated.
     #[error(transparent)]
     RecordingProducerCustody(#[from] RecordingProducerCustodyError),
@@ -742,8 +746,10 @@ impl<T> OperationJournalRequest<T> {
         {
             Ok(result) => {
                 self.result_permit.take();
-                self.historical_reply.take();
-                Ok(result)
+                Ok(namespace_credit::retain_result_error(
+                    result,
+                    self.historical_reply.take(),
+                ))
             }
             Err(TryRecvError::Empty) => Err(OperationJournalRequestError::Empty),
             Err(TryRecvError::Disconnected) => {
@@ -767,8 +773,10 @@ impl<T> OperationJournalRequest<T> {
         {
             Ok(result) => {
                 self.result_permit.take();
-                self.historical_reply.take();
-                Ok(result)
+                Ok(namespace_credit::retain_result_error(
+                    result,
+                    self.historical_reply.take(),
+                ))
             }
             Err(RecvTimeoutError::Timeout) => Err(OperationJournalRequestError::Empty),
             Err(RecvTimeoutError::Disconnected) => {

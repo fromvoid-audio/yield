@@ -98,6 +98,7 @@ fn observe(store: &OperationJournalStore, expected_success: bool, name: &str) {
         match store.funded_retained_namespace_allocation_probe_for_test(&funding, false) {
             Ok(()) => true,
             Err(error) => {
+                let error = funding.retain_command_error_for_test(error);
                 let diagnostic = error.to_string();
                 assert!(!diagnostic.is_empty());
                 drop(diagnostic);

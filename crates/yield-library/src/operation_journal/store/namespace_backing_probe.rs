@@ -12,6 +12,7 @@ impl OperationJournalStore {
         self.validate_namespace_for_input(&funding.input, precommit)
     }
 
+    /// Derive the original namespace loan, including selected returned-error backing.
     pub fn retained_namespace_working_bytes_for_test(&self) -> usize {
         namespace_backing::working_bytes(
             &self.database_root,

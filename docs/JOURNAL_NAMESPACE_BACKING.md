@@ -8,9 +8,14 @@ interval. Successful validation, an active original transaction, a real retained
 WAL sidecar and a missing original pathname are distinct cases. The original
 database bytes and sidecar evidence must remain unchanged.
 
-This first checkpoint supplies a diagnostic only. Production namespace funding,
-derived allocation bounds and last-consumer credit custody are not implemented or
-verified yet. The probe does not grant a physical reserve, permit, retry, refund,
+Production startup and queued prepared-admission namespace checks now prepay an
+ordinary-pool working loan before entering the same original profile/root/file/
+SQLite/sidecar primitives. Successful guards remain local. Selected failures move
+their loans into a separate namespace slot on the original historical reply;
+observer consumption cannot refund that slot, and a second failure cannot replace
+it. Missing or poisoned consumers refuse before original error construction.
+This implementation is awaiting its first complete verification run. The probe
+does not grant a physical reserve, permit, retry, durable reservation refund,
 effect, cleanup confirmation or settlement. Native runtime verification and full
 tracking parents remain open.
 
@@ -18,7 +23,8 @@ Connection observations now borrow the same original SQLite connection and retur
 a fixed refusal before constructing its owned path or reason. The materializer
 calls the funding callback before each copy. Windows compares the original
 volume/index/creation-time triplet using a 60-byte stack buffer. This callback is
-not yet connected to the Store's original pool or a last-consumer keeper.
+connected to the Store's original pool and selected-error keeper. Original public
+unfunded identity consumers retain their entry points and error shapes.
 
 The Windows BOOL-error materializer captures the original full native message
 once, measures its exact UTF-8 representation without allocating a Rust String,
@@ -35,4 +41,30 @@ UTF-16 buffer and builds a Rust String before the enclosing formatter sees any
 output. These are implementation bounds on formatter scratch, not new limits on
 accepted paths or native errors. Root/profile validation, capability-library
 scratch, error-conversion overlap and actual consumer lifetimes remain part of
-the unfinished envelope.
+the working envelope. The checked formula derives every variable pathname term
+from the original retained metadata, prepays lossy rendering and pinned capability
+scratch, all sequential diagnostic alternatives and simultaneous consumer images.
+It introduces no pathname quota, truncation or replacement capability. The full
+captured SDK reason is measured separately and prepaid before its Rust copy,
+including its variable contribution to enclosing Store/worker/owner formatting.
+
+Consuming a queued namespace failure returns `OperationJournalOwnerError::NamespaceBacked`.
+Its non-Clone carrier exposes only a borrowed `original_error()` with the original
+typed cause, path, native source and diagnostic. The carrier holds the original
+reply while the caller owns the error; it explicitly destroys the owned error
+and its Box allocation before releasing the reply and selected credits. That exact
+Box size is included in prepayment before the original namespace producer. Other
+error results retain their existing variants. Startup's retained unavailable
+diagnostic has its separate original detached StartupCredit.
+
+The normal-build System probe runs both readers on the SAME retained Store/root/
+profile/connection, includes selected error formatting and the caller carrier,
+and requires exact scoped heap restoration and peak/requested allocation no larger
+than the derived debit. Original pool/input/reply setup, retained Store/SQLite
+backing, native allocator bookkeeping/rounding and RSS are excluded. Setup is not
+a substitute reserve or authority. Long Unicode and invalid-encoding root cases,
+real active transactions, WAL evidence, missing/replaced files and actual directory
+I/O refusals preserve original durable bytes. Linux memory-VFS contracts are
+separate from the genuine original file-VFS replacement regression and Windows
+native HRESULT parity harness. Cross-compilation does not execute Windows tests
+or qualify a physical backend. Parent1553/2373/2117 remain open.
