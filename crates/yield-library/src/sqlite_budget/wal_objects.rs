@@ -22,6 +22,11 @@ pub(crate) struct WalObjects {
     pub(crate) shm: WalObjectFacts,
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod deadline_probe;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use deadline_probe::arm_original_mapping_expiry;
+
 impl OwnedConnection {
     /// Capture only objects proven against this actual private forwarding VFS. The borrowed
     /// sole-owner connection keeps callback/mapping lifetimes fixed; filenames alone never
@@ -223,6 +228,8 @@ fn mapped_identity_stream(
     inode: u64,
     deadline: Instant,
 ) -> Option<bool> {
+    #[cfg(test)]
+    deadline_probe::wait_for_original_deadline();
     const MAX_MAP_BYTES: usize = 2 * 1024 * 1024;
     let mut chunk = [0u8; 512];
     let mut prefix = [0u8; 256];

@@ -130,8 +130,15 @@ pub struct GlobalPreparationRequest {
     retirement: Option<retirement_policy::Input>,
     wal_binding: bool,
     handshake: Option<Arc<crate::operation_journal::wal_admission::HandshakeBudget>>,
+    #[cfg(all(test, target_os = "linux"))]
+    observation_expiry_probe: Option<bool>,
 }
 impl GlobalPreparationRequest {
+    #[cfg(all(test, target_os = "linux"))]
+    fn with_original_observation_expiry_probe(mut self, parked: bool) -> Self {
+        self.observation_expiry_probe = Some(parked);
+        self
+    }
     pub(crate) fn retirement_policy_input(
         args: &crate::operation_journal::source_registry_retirement::SourceRegistryRetirementIntentArgs,
     ) -> Result<retirement_policy::Input, GlobalPreparationError> {
@@ -223,6 +230,8 @@ impl GlobalPreparationRequest {
             retirement: None,
             wal_binding: false,
             handshake: None,
+            #[cfg(all(test, target_os = "linux"))]
+            observation_expiry_probe: None,
         })
     }
 }
@@ -696,9 +705,19 @@ pub(super) fn run(
                 }
                 continue;
             }
-            if let Some(scope) = retained_observation.wal_scope()
-                && let Err(error) = binding::validate(database, scope, command.request.deadline)
-            {
+            #[cfg(all(test, target_os = "linux"))]
+            let _observation_probe =
+                (command.request.observation_expiry_probe == Some(true)).then(|| {
+                    crate::sqlite_budget::wal_objects::arm_original_mapping_expiry(
+                        command.request.deadline,
+                    )
+                });
+            let binding_result = retained_observation.wal_scope().map_or(Ok(()), |scope| {
+                binding::validate(database, scope, command.request.deadline)
+            });
+            #[cfg(all(test, target_os = "linux"))]
+            drop(_observation_probe);
+            if let Err(error) = binding_result {
                 if current_custody
                     .as_ref()
                     .is_none_or(|custody| custody.begin_cleanup())

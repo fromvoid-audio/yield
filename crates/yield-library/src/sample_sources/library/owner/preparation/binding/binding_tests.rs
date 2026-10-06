@@ -19,6 +19,63 @@ mod integration {
         *writer.preparation_binding_budget.0.lock().unwrap()
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn original_global_native_mapping_deadline_during_capture_preserves_deadline_refusal() {
+        fixture(|writer, guard, _| {
+            let pending = writer
+                .submit_preparation(
+                    request(writer, Duration::from_millis(150))
+                        .with_wal_binding()
+                        .with_original_observation_expiry_probe(false),
+                )
+                .unwrap();
+            let outcome = pending.recv_timeout(Duration::from_secs(3)).unwrap();
+            eprintln!("OPT2404 actual original Global capture result: {outcome:?}");
+            assert_eq!(outcome.err(), Some(GlobalPreparationError::Deadline));
+            empty(writer);
+            assert_eq!(charged(writer), 0);
+            external(guard)
+                .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+                .unwrap();
+            release(reserve_strict(writer, Duration::from_secs(1)));
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn original_global_native_mapping_deadline_while_parked_preserves_confirmed_cleanup() {
+        fixture(|writer, guard, _| {
+            let mut held = writer
+                .submit_preparation(
+                    request(writer, Duration::from_millis(150))
+                        .with_wal_binding()
+                        .with_original_observation_expiry_probe(true),
+                )
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            let observation = held.observation().clone();
+            let outcome = held
+                .released
+                .take()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            eprintln!("OPT2404 actual original Global parked release: {outcome:?}");
+            assert_eq!(outcome, Err(GlobalPreparationError::Deadline));
+            drop(held);
+            external(guard)
+                .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+                .unwrap();
+            empty(writer);
+            drop(observation);
+            assert_eq!(charged(writer), 0);
+            release(reserve_strict(writer, Duration::from_secs(1)));
+        });
+    }
+
     #[test]
     fn original_global_descriptor_seals_retained_database_root() {
         fixture(|writer, guard, _| {
