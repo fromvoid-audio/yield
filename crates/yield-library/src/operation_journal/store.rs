@@ -24,8 +24,10 @@ use uuid::Uuid;
 use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
 use crate::durable_capacity::VolumeIdentity;
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
+use crate::sample_sources::db::BoundDatabaseRoot;
+#[cfg(all(test, target_os = "macos"))]
+use crate::sample_sources::db::SourceAuthorityUseProof;
 use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
-use crate::sample_sources::db::{BoundDatabaseRoot, SourceAuthorityUseProof};
 
 use super::admission_claims::{
     AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimValidationError,
@@ -1074,7 +1076,7 @@ pub(super) struct LegacyReserveBindingFailure {
     pub(super) reopened_reserve: Option<OwnedReserveAllocation>,
 }
 enum ReserveBootstrapProof<'a, 'b> {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     Current(&'a SourceAuthorityUseProof),
     ScopedCurrent {
         source: &'a crate::sample_sources::db::CurrentReserveUseProof<'b>,
@@ -1088,7 +1090,7 @@ enum ReserveBootstrapProof<'a, 'b> {
 impl ReserveBootstrapProof<'_, '_> {
     fn validate_for_physical_use(&self) -> Result<(), String> {
         match self {
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "macos"))]
             Self::Current(proof) => proof.validate_for_physical_use().map_err(|e| e.to_string()),
             Self::ScopedCurrent { source, .. } => source
                 .validate_root_for_bootstrap(source.root())
@@ -1127,7 +1129,7 @@ impl ReserveBootstrapProof<'_, '_> {
                 *failure.namespace.borrow_mut() = Some(error.into_legacy_backing());
                 text
             }
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "macos"))]
             Self::Current(_) => error.to_string(),
         };
         RecoveryReserveContextError::Reserve(text)
@@ -1135,7 +1137,7 @@ impl ReserveBootstrapProof<'_, '_> {
     fn failure_sink(&self) -> Option<&LegacyReserveFailureSink> {
         match self {
             Self::Legacy { failure, .. } | Self::ScopedCurrent { failure, .. } => Some(failure),
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "macos"))]
             Self::Current(_) => None,
         }
     }
@@ -1164,7 +1166,7 @@ impl ReserveBootstrapProof<'_, '_> {
         super::capacity_reserve_namespace::ReserveNamespaceFailure,
     > {
         match self {
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "macos"))]
             Self::Current(_) => {
                 super::capacity_reserve_namespace::create_owned_reserve(root, profile)
             }
@@ -2847,7 +2849,7 @@ impl OperationJournalStore {
         Ok(reserve)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn acquire_owned_source_reserve(
         &self,
         volume_owner: VolumeOwnershipCapability,
