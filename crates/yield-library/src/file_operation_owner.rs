@@ -4425,6 +4425,22 @@ impl fmt::Display for OwnerIdentity {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn original_root_registration_retains_input_until_retirement() {
+        let owner = super::FileOperationOwner::start().expect("original owner");
+        let before = owner.input_bytes_remaining_for_test();
+        let root = owner
+            .register_root_for_test(profile_fence(owner.owner_identity()), "original root")
+            .expect("original registration");
+        assert!(
+            owner.input_bytes_remaining_for_test() < before,
+            "retained original root backing must remain charged"
+        );
+        owner
+            .retire_root(root)
+            .expect("retire original registration");
+        assert_eq!(owner.input_bytes_remaining_for_test(), before);
+    }
     mod telemetry_tests;
 
     use super::*;
