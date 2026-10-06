@@ -173,6 +173,10 @@ fn database_claim_scalar_projection_complete_original_inventory_and_nonce_still_
     let f = fixture();
     let store = OperationJournalStore::open(&f.owner).unwrap();
     let (_, record) = persist_recording_database_fixture(&store, &f.owner);
+    // Exercise the original 64-row operation page boundary without truncation.
+    for _ in 1..65 {
+        persist_recording_database_fixture(&store, &f.owner);
+    }
     let inventory = store
         .read_database_claim_inventory(record.operation_id)
         .unwrap()
