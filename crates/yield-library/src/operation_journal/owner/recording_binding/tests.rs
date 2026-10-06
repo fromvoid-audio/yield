@@ -156,18 +156,29 @@ fn recording_custody_revalidation_queues_while_original_retained_debit_is_held()
     let before = *client.shared.input_bytes.lock().unwrap();
     // Hold the actual original-pool debit for a producer lifetime. This test issues
     // no Source registration or producer slot: the unissued facade must still refuse.
-    let retained = client.shared.reserve_input(InputClass::Ordinary, INPUT_BYTES).unwrap();
+    let retained = client
+        .shared
+        .reserve_input(InputClass::Ordinary, INPUT_BYTES)
+        .unwrap();
     let forged = RecordingProducerCustody {
         operation: OperationId::new(),
         digest: [1; 32],
         owner: Arc::downgrade(&client.shared),
     };
     assert!(matches!(
-        forged.revalidate().expect("temporary command and retained producer credit must coexist")
-            .recv_timeout(Duration::from_secs(3)).unwrap(),
-        Err(OperationJournalOwnerError::RecordingProducerCustody(RecordingProducerCustodyError::Changed))
+        forged
+            .revalidate()
+            .expect("temporary command and retained producer credit must coexist")
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap(),
+        Err(OperationJournalOwnerError::RecordingProducerCustody(
+            RecordingProducerCustodyError::Changed
+        ))
     ));
-    assert_eq!(client.shared.input_bytes.lock().unwrap().remaining[0], before.remaining[0] - INPUT_BYTES);
+    assert_eq!(
+        client.shared.input_bytes.lock().unwrap().remaining[0],
+        before.remaining[0] - INPUT_BYTES
+    );
     drop(retained);
     assert_eq!(*client.shared.input_bytes.lock().unwrap(), before);
     assert!(f.owner.shutdown());
