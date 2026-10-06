@@ -68,8 +68,10 @@ use super::selection_output_commands::{
 };
 use super::validation::{RecordConsistency, classify_record};
 
+mod admission_rebuild_backing;
 mod chunk_claims;
 mod chunk_staging;
+pub(super) use admission_rebuild_backing::FundedSnapshot;
 mod historical_claim_observation;
 mod legacy_allocation_observation;
 mod recording_chunks;
@@ -1816,23 +1818,27 @@ impl OperationJournalStore {
         &self,
     ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
         self.rebuild_admission_snapshot_with_funding(None)
+            .map(FundedSnapshot::into_unfunded)
     }
 
     pub(super) fn rebuild_admission_snapshot_for_input(
         &self,
         input: &super::owner::InputPermit,
-    ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
+    ) -> Result<FundedSnapshot, OperationJournalStoreError> {
         self.rebuild_admission_snapshot_with_funding(Some(input))
     }
 
     fn rebuild_admission_snapshot_with_funding(
         &self,
         input: Option<&super::owner::InputPermit>,
-    ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
+    ) -> Result<FundedSnapshot, OperationJournalStoreError> {
         self.validate_namespace()?;
         self.connection.execute_batch("BEGIN")?;
+        // Declare credit before output/working backing so error/unwind drops backing first.
+        let mut collection = None;
         let result = (|| {
-            let snapshot = self.rebuild_ordinary_claim_snapshot_with_funding(input)?;
+            let snapshot =
+                self.rebuild_ordinary_claim_snapshot_with_funding(input, &mut collection)?;
             self.validate_chunk_claims_inside_transaction()?;
             recovery_reserve::prove_no_active_charges(&self.connection).map_err(|error| {
                 audit_error(
@@ -1847,7 +1853,10 @@ impl OperationJournalStore {
             Ok(snapshot) => {
                 self.connection.execute_batch("ROLLBACK")?;
                 self.validate_namespace()?;
-                Ok(snapshot)
+                Ok(FundedSnapshot::new(
+                    snapshot,
+                    collection.map(admission_rebuild_backing::Collection::into_credit),
+                ))
             }
             Err(error) => {
                 let _ = self.connection.execute_batch("ROLLBACK");
@@ -7140,26 +7149,45 @@ impl OperationJournalStore {
     fn rebuild_ordinary_claim_snapshot_inside_transaction(
         &self,
     ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
-        self.rebuild_ordinary_claim_snapshot_with_funding(None)
+        self.rebuild_ordinary_claim_snapshot_with_funding(None, &mut None)
     }
 
     fn rebuild_ordinary_claim_snapshot_with_funding(
         &self,
         input: Option<&super::owner::InputPermit>,
+        collection: &mut Option<admission_rebuild_backing::Collection>,
     ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
         self.validate_namespace_for_precommit()?;
-        let mut claim_rows = Vec::new();
+        if let Some(input) = input {
+            *collection = Some(admission_rebuild_backing::Collection::new(
+                &self.connection,
+                input,
+            )?);
+        }
+        let mut claim_rows = collection
+            .as_ref()
+            .map_or_else(Vec::new, |backing| Vec::with_capacity(backing.claims));
         let mut claim_cursor = None;
         let mut diagnostics = Vec::new();
         let mut fatal = false;
         loop {
-            let page = match ordinary_claims::read_page(
-                &self.connection,
-                claim_cursor,
-                ordinary_claims::MAX_PAGE_ROWS,
-            ) {
+            let page_result = match input {
+                Some(input) => {
+                    ordinary_claims::read_funded_page(&self.connection, input, claim_cursor)
+                }
+                None => ordinary_claims::read_page(
+                    &self.connection,
+                    claim_cursor,
+                    ordinary_claims::MAX_PAGE_ROWS,
+                )
+                .map_err(ordinary_claims::PageFailure::original),
+            };
+            let page = match page_result {
                 Ok(page) => page,
                 Err(error) => {
+                    if error.is_refusal() {
+                        return Err(error.into_refusal());
+                    }
                     push_rebuild_diagnostic(
                         &mut diagnostics,
                         format!(
@@ -7183,13 +7211,25 @@ impl OperationJournalStore {
         let mut release_cursor = None;
         if !fatal {
             loop {
-                let page = match ordinary_claims::read_release_page(
-                    &self.connection,
-                    release_cursor,
-                    ordinary_claims::MAX_PAGE_ROWS,
-                ) {
+                let page_result = match input {
+                    Some(input) => ordinary_claims::read_funded_release_page(
+                        &self.connection,
+                        input,
+                        release_cursor,
+                    ),
+                    None => ordinary_claims::read_release_page(
+                        &self.connection,
+                        release_cursor,
+                        ordinary_claims::MAX_PAGE_ROWS,
+                    )
+                    .map_err(ordinary_claims::PageFailure::original),
+                };
+                let page = match page_result {
                     Ok(page) => page,
                     Err(error) => {
+                        if error.is_refusal() {
+                            return Err(error.into_refusal());
+                        }
                         push_rebuild_diagnostic(
                             &mut diagnostics,
                             format!(

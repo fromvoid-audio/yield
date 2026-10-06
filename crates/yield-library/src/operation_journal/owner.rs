@@ -1941,7 +1941,10 @@ impl OwnerRuntime {
         }
         let snapshot = match input {
             Some(input) => self.store().rebuild_admission_snapshot_for_input(input),
-            None => self.store().rebuild_admission_snapshot(),
+            None => self
+                .store()
+                .rebuild_admission_snapshot()
+                .map(super::store::FundedSnapshot::unfunded),
         }
         .map_err(|error| PreparedAdmissionError::RecoveryRequired {
             reason: error.to_string(),

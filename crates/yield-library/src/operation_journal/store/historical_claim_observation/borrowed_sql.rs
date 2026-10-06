@@ -8,7 +8,7 @@ use std::ptr;
 
 /// The connection borrow prevents transfer/parallel access; no raw handle or row escapes.
 /// Every successful or failed prepare owns its statement until RAII finalization.
-pub(super) struct Statement<'a> {
+pub(in crate::operation_journal::store) struct Statement<'a> {
     connection: &'a Connection,
     input: &'a InputPermit,
     error_credit: &'a RefCell<Option<InputPermit>>,
@@ -16,7 +16,7 @@ pub(super) struct Statement<'a> {
     has_row: bool,
 }
 impl<'a> Statement<'a> {
-    pub(super) fn new(
+    pub(in crate::operation_journal::store) fn new(
         connection: &'a Connection,
         input: &'a InputPermit,
         error_credit: &'a RefCell<Option<InputPermit>>,
@@ -43,7 +43,7 @@ impl<'a> Statement<'a> {
         statement.check(code)?;
         Ok(statement)
     }
-    pub(super) fn bind_text(
+    pub(in crate::operation_journal::store) fn bind_text(
         &mut self,
         index: i32,
         text: &str,
@@ -62,7 +62,7 @@ impl<'a> Statement<'a> {
             )
         })
     }
-    pub(super) fn bind_integer(
+    pub(in crate::operation_journal::store) fn bind_integer(
         &mut self,
         index: i32,
         value: i64,
@@ -70,7 +70,9 @@ impl<'a> Statement<'a> {
         // SAFETY: live statement; the scalar has no backing lifetime.
         self.check(unsafe { ffi::sqlite3_bind_int64(self.raw, index, value) })
     }
-    pub(super) fn next(&mut self) -> Result<bool, OperationJournalStoreError> {
+    pub(in crate::operation_journal::store) fn next(
+        &mut self,
+    ) -> Result<bool, OperationJournalStoreError> {
         self.has_row = false;
         // SAFETY: exclusive mutable statement borrow invalidates any previous row borrow.
         let code = unsafe { ffi::sqlite3_step(self.raw) };
@@ -86,7 +88,10 @@ impl<'a> Statement<'a> {
             }
         }
     }
-    pub(super) fn get_ref(&self, index: i32) -> Result<ValueRef<'_>, OperationJournalStoreError> {
+    pub(in crate::operation_journal::store) fn get_ref(
+        &self,
+        index: i32,
+    ) -> Result<ValueRef<'_>, OperationJournalStoreError> {
         // SAFETY: statement remains live and a row is active. Bounds checked before access.
         if !self.has_row || index < 0 || index >= unsafe { ffi::sqlite3_column_count(self.raw) } {
             return Err(rusqlite::Error::InvalidColumnIndex(index as usize).into());

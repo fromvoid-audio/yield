@@ -34,7 +34,12 @@ fn historical_claim_sqlite_borrowed_observer_preserves_original_lookup_and_full_
     assert_eq!(input.historical_test_remaining(), available);
     let funded = store.rebuild_admission_snapshot_for_input(&input).unwrap();
     let old = store.rebuild_admission_snapshot().unwrap();
-    assert_eq!(funded, old);
+    assert_eq!(*funded, old);
+    assert!(
+        input.historical_test_remaining() < available,
+        "snapshot retains its original collection backing"
+    );
+    drop(funded);
     assert_eq!(input.historical_test_remaining(), available);
     assert!(
         store.get(operation_id).unwrap().unwrap().payload.is_array(),
