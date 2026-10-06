@@ -20,6 +20,8 @@ use queue_metrics::{QueueMetrics, QueueTicket};
 #[cfg(all(test, unix))]
 mod current_source_custody_tests;
 mod current_source_metadata;
+#[cfg(all(test, unix))]
+mod current_source_native_fault_tests;
 mod legacy_adoption_custody;
 mod legacy_adoption_volumes;
 mod recording_binding;
@@ -3572,6 +3574,19 @@ impl OwnerRuntime {
                         .expect("source volume placeholder was inserted");
                     binding.reserve = Some(reserve);
                     binding.readiness = SourceVolumeBindingReadiness::Complete;
+                    #[cfg(all(test, unix))]
+                    if self.store().current_reopen_fixture() {
+                        if let Err(reason) =
+                            self.current_same_generation_reopen_for_test(&volume, &scope)
+                        {
+                            return self.retain_source_recovery(
+                                registration_id,
+                                "test-only-existing-current-reopen",
+                                reason,
+                                proof.take(),
+                            );
+                        }
+                    }
                 }
                 Err(SourceReserveBindingFailure {
                     error,
@@ -6009,6 +6024,14 @@ enum JournalCommand {
         result: SyncSender<Result<(), OperationJournalOwnerError>>,
     },
     #[cfg(all(test, unix))]
+    InspectCurrentNativeReserve {
+        volume: VolumeIdentity,
+        input: InputPermit,
+        result: SyncSender<
+            Result<current_source_native_fault_tests::NativeSnapshot, OperationJournalOwnerError>,
+        >,
+    },
+    #[cfg(all(test, unix))]
     CurrentRefusedPrefix {
         request: SourceAuthorityRegistrationRequest,
         app: std::path::PathBuf,
@@ -6574,6 +6597,17 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             )
         }),
         #[cfg(all(test, unix))]
+        JournalCommand::InspectCurrentNativeReserve {
+            volume,
+            input,
+            result,
+        } => {
+            let _input = input;
+            execute_store_result(result, move || {
+                runtime.inspect_current_native_reserve(&volume)
+            })
+        }
+        #[cfg(all(test, unix))]
         JournalCommand::InspectCurrentRefusedPrefix {
             volume,
             input,
@@ -7078,6 +7112,10 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
         }
         #[cfg(all(test, unix))]
         JournalCommand::CurrentRefusedPrefix { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        #[cfg(all(test, unix))]
+        JournalCommand::InspectCurrentNativeReserve { result, .. } => {
             let _ = result.send(Err(error));
         }
         #[cfg(all(test, unix))]

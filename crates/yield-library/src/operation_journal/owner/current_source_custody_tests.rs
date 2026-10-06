@@ -470,3 +470,54 @@ fn current_original_registry_carrier_bound_refuses_before_confirmation_and_relea
         ORDINARY_INPUT_BYTES
     );
 }
+
+// Native fault cases use the same actual child-before-root and root-before-credit observers.
+pub(super) fn install_native_reserve_drop_probe(
+    binding: &mut SourceVolumeBinding,
+    fd: i32,
+    device: u64,
+    inode: u64,
+    length: u64,
+) -> Snapshot {
+    let root = binding
+        ._current_root
+        .as_ref()
+        .unwrap()
+        .current_drop_root_for_test();
+    let native_root = root.upgrade().unwrap().metadata().unwrap();
+    let credit = Arc::downgrade(binding._current_input.as_ref().unwrap());
+    let observations = Arc::new(Mutex::new(DropObservation::default()));
+    binding._current_before_root_drop = Some(BeforeRootDrop {
+        native_fd: fd,
+        native_device: device,
+        native_inode: inode,
+        root: root.clone(),
+        credit: credit.clone(),
+        observations: Arc::clone(&observations),
+    });
+    binding._current_after_root_drop = Some(AfterRootDrop {
+        root,
+        credit: credit.clone(),
+        observations: Arc::clone(&observations),
+    });
+    Snapshot {
+        fd,
+        device,
+        inode,
+        length,
+        root_device: native_root.dev(),
+        root_inode: native_root.ino(),
+        credit,
+        drops: observations,
+    }
+}
+pub(super) fn assert_native_reserve_retained(snapshot: &Snapshot) {
+    assert!(same_open_object(snapshot));
+    assert!(snapshot.credit.upgrade().is_some());
+}
+pub(super) fn assert_native_reserve_closed_in_order(snapshot: &Snapshot) {
+    assert!(!same_open_object(snapshot));
+    assert!(snapshot.credit.upgrade().is_none());
+    let drops = snapshot.drops.lock().unwrap();
+    assert!(drops.native_before_root && drops.root_before_credit);
+}

@@ -26,11 +26,11 @@ mod decision_boundary;
 pub(crate) use decision_boundary::{DecisionBoundaryRefusal, RegisteredDecisionBoundary};
 mod registered_custody;
 pub(crate) use registered_custody::RegisteredDatabaseCustody;
+mod metadata;
 mod registration_generation;
 #[cfg(test)]
 #[path = "source_authority/registration_generation/native_tests.rs"]
 mod registration_generation_native_tests;
-mod metadata;
 mod reserve_use;
 pub(crate) use reserve_use::CurrentReserveUseProof;
 
