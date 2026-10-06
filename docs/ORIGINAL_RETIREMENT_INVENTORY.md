@@ -15,16 +15,22 @@ Available status and mutation revision cannot substitute for a worker generation
 
 ## Original funding
 
-An independent HandshakeCredit pays before any new allocation, within the unchanged
+Independent retained and transient HandshakeCredits pay before any new allocation, within the unchanged
 combined 64 KiB original-owner ceiling. The previously prepaid 64 KiB journal input
 remains original custody, not an additional handshake allowance. Inventory aliases
-retain both debits until actual backing destruction.
+retain the stable backing debit and original journal input until actual destruction.
+Projection scratch has a separate debit that drops after every owned decoder,
+encoder and validation temporary is destroyed, before Source cleanup begins.
 
 The factory charges 8 KiB fixed scratch, twice the native profile-path length,
 concrete backing/Arc/database/participant/slice headers, three copies of the
 original fence heap, its bounded encoding, copied profile/acquisition/Global
-identities, and the larger of proposal validation scratch or two overlapping
-fence encodings. The reservation never shrinks based on allocator behavior.
+identities. A separate scoped credit charges the larger of proposal validation
+scratch or two overlapping fence encodings. Neither reservation shrinks based on
+allocator behavior. Releasing destroyed memory scratch neither refunds physical
+reservations nor authorizes settlement. The original producer regression observed
+56,680 charged bytes starving a 14,667-byte Source cleanup; retained projection
+scratch must not survive into that cleanup.
 
 Proposal validation scratch is five times the sum of the two base64 lengths, plus
 4096 bytes. For decoded length N and base64 length L, N is at most 3L/4; decoder

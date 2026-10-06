@@ -496,16 +496,6 @@ impl SourceLeaseWalTransportOwner {
             .expect("original lease custody")
             .cleanup_staging_bytes();
         if let Err(reason) = staging.resize_for_cleanup(bytes) {
-            #[cfg(test)]
-            if !matches!(
-                self.request.ticket.status(),
-                SourceWalTransportStatus::Unavailable(_)
-            ) {
-                eprintln!(
-                    "original lease cleanup refusal={reason:?} scratch={bytes} shared_used={:?}",
-                    self.request.handshake.as_ref().map(|budget| budget.used())
-                );
-            }
             self.mark_unavailable(reason);
             return Err(self);
         }
