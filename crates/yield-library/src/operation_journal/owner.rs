@@ -7230,9 +7230,10 @@ mod tests {
         let original = Arc::clone(&request.request);
         let confirmation = request.confirmation.clone();
         let client = owner.client();
+        let ordinary_before = client.shared.input_bytes.lock().expect("budget").remaining[0];
         let occupied = client
             .shared
-            .reserve_input(InputClass::Ordinary, ORDINARY_INPUT_BYTES)
+            .reserve_input(InputClass::Ordinary, ordinary_before)
             .expect("occupy original ordinary pool");
         assert!(matches!(client.register_source_authority(request),
             Err(OperationJournalOwnerQueueError::InputBytesFull { requested, .. })
@@ -7266,6 +7267,7 @@ mod tests {
         let request = authority.journal_request().expect("original confirmation");
         let original = Arc::clone(&request.request);
         let confirmation = request.confirmation.clone();
+        let ordinary_before = client.shared.input_bytes.lock().expect("budget").remaining[0];
         let response = client
             .register_source_authority(request)
             .expect("actual queue")
@@ -7277,7 +7279,7 @@ mod tests {
         ));
         assert_eq!(
             client.shared.input_bytes.lock().expect("budget").remaining[0],
-            ORDINARY_INPUT_BYTES
+            ordinary_before
         );
         drop(
             original
