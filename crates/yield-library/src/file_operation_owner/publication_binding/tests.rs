@@ -134,7 +134,7 @@ mod integration {
                 2 => foreign.effect_id = EffectId::new(),
                 3 => foreign.fingerprint = RequestFingerprint([5; 32]),
                 4 => foreign.target_registration = RootRegistrationRef::synthetic_for_test(),
-                5 => foreign.expected = ExpectedObject::Exact(test_object()),
+                5 => foreign.expected = ExpectedObject::Exact(OwnedObjectIdentity::new()),
                 6 => foreign.root_bindings.clear(),
                 7 => foreign.root_bindings.swap(0, 1),
                 8 => {
