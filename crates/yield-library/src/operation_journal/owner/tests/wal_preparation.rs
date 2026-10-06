@@ -2730,9 +2730,12 @@ mod integration {
             drop(local_collector.take());
             drop(view);
             drop(handle);
-            assert_eq!(budget.used(), 0);
             drop(actor);
             assert!(closing.join().unwrap());
+            // The release result acknowledges native cleanup before the Global
+            // worker drops its final retained observation. Join both actual
+            // producers before requiring every retained backing debit to return.
+            assert_eq!(budget.used(), 0);
             assert!(journal.shutdown());
             return;
         }
