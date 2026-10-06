@@ -332,7 +332,7 @@ impl CapacityProvider {
         }
     }
 
-    pub(crate) fn validate_rebuilt_claims_for_input(
+    pub(super) fn validate_rebuilt_claims_for_input(
         &self,
         snapshot: &OrdinaryClaimRebuildSnapshot,
         input: &super::owner::InputPermit,
