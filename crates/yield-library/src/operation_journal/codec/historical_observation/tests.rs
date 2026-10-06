@@ -238,6 +238,7 @@ fn historical_claim_projection_matches_all_v2_absent_final_evidence_presence_cat
             "target_parent_identity": parent["identity"], "root_path_continuity": "NotClaimed",
         }},
     }});
+    complete["published"]["synchronization"] = Value::from("SyncUnsupportedOrUnverified");
     let evidence = serde_json::json!({
         "target_parent_stable_id": parent["identity"]["stable_id"],
         "final_stable_id": complete["published"]["reopened_final"]["identity"]["stable_id"],
