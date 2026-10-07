@@ -1612,6 +1612,16 @@
       "issue": "OPT-2426",
       "reason": "Private actual Store on the genuine temporary profile, exercising original immutable SQLite inventory backing, refusal and selected-error custody. Arithmetic-only fixture metadata grants no physical qualification or effect authority.",
       "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_inventory_funding_tests.rs",
+      "function": "funded_recording_database_claim_record_uses_original_scoped_record_and_control_backing",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2427",
+      "reason": "Private actual Store on a genuine temporary profile exercises passive original recording control and complete-record observations, corruption and loan custody. Arithmetic metadata fixtures grant no native qualification or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
     }
   ]
 }

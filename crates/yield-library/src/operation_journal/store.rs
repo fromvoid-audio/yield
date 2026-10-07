@@ -7524,7 +7524,7 @@ impl OperationJournalStore {
         &self,
         input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
-        self.validate_recording_inventory_inside_transaction()?;
+        self.validate_recording_inventory_inside_transaction_with_input(input)?;
         self.validate_database_claims_inside_transaction_with_input(input)?;
         self.validate_database_attempts_inside_transaction_with_input(input)?;
         if chunk_claims::exceeds_row_limit(&self.connection, ordinary_claims::MAX_PAGE_ROWS)
@@ -10078,6 +10078,7 @@ mod tests {
     include!("store/record_materialization_tests.rs");
     include!("store/recording_prestart_budget_tests.rs");
     include!("store/recording_control_tests.rs");
+    include!("store/recording_control_funding_tests.rs");
     include!("store/json_materialization_tests.rs");
     use std::collections::BTreeMap;
     use std::fs;

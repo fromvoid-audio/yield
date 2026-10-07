@@ -73,3 +73,25 @@ fn funded_binary_inventory_missing_root_matches_original_fail_closed_reader() {
     assert!(database_claims::read(&store.connection, record.operation_id).is_err());
     assert!(database_claims::read_with_input(&store.connection, record.operation_id, Some(&funding.input)).is_err());
 }
+
+#[test]
+fn funded_recording_database_claim_record_uses_original_scoped_record_and_control_backing() {
+    use crate::operation_journal::owner::JournalNamespaceFundingProbe;
+    let f = fixture();
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    let (_proposal, record) = persist_recording_database_fixture(&store, &f.owner);
+    let funding = JournalNamespaceFundingProbe::new();
+    let before = funding.remaining_bytes();
+    super::super::POINT_ROW_MATERIALIZED_BYTES.with(|n| n.set(0));
+    store.validate_database_claims_inside_transaction_with_input(Some(&funding.input)).unwrap();
+    super::super::POINT_ROW_MATERIALIZED_BYTES.with(|n| assert_eq!(n.get(), 0));
+    assert_eq!(funding.remaining_bytes(), before);
+    let observe = funding.pool_bytes_observer_for_test();
+    store.connection.execute("UPDATE operation_journal_recording_chunks SET record=?1 WHERE operation_id=?2 AND slot=20000", params![b"{}".as_slice(), record.operation_id.to_string()]).unwrap();
+    let error = store.validate_database_claims_inside_transaction_with_input(Some(&funding.input)).unwrap_err();
+    let error = funding.retain_command_error_for_test(error);
+    drop(funding);
+    assert!(observe().0 < observe().1);
+    drop(error);
+    assert_eq!(observe().0, observe().1);
+}

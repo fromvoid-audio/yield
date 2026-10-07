@@ -345,19 +345,49 @@ impl OperationJournalStore {
         operation: OperationId,
         inventory: &DatabaseClaimInventory,
     ) -> Result<(), OperationJournalStoreError> {
-        let record = self
-            .read_row(operation)?
-            .ok_or_else(|| error("orphan inventory"))?
-            .record;
-        self.validate_database_claim_record(&record, inventory)
+        self.validate_database_claim_operation_with_input(operation, inventory, None)
     }
+
+    pub(super) fn validate_database_claim_operation_with_input(
+        &self,
+        operation: OperationId,
+        inventory: &DatabaseClaimInventory,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
+        if let Some(input) = input {
+            let present =
+                self.inspect_complete_claim_operation(operation, input, |record, _| {
+                    self.validate_database_claim_record_with_input(record, inventory, Some(input))
+                })?;
+            if !present {
+                return Err(error("orphan inventory"));
+            }
+            Ok(())
+        } else {
+            let record = self
+                .read_row(operation)?
+                .ok_or_else(|| error("orphan inventory"))?
+                .record;
+            self.validate_database_claim_record(&record, inventory)
+        }
+    }
+
     fn validate_database_claim_record(
         &self,
         record: &crate::operation_journal::StoredOperationRecord,
         inventory: &DatabaseClaimInventory,
     ) -> Result<(), OperationJournalStoreError> {
+        self.validate_database_claim_record_with_input(record, inventory, None)
+    }
+
+    fn validate_database_claim_record_with_input(
+        &self,
+        record: &crate::operation_journal::StoredOperationRecord,
+        inventory: &DatabaseClaimInventory,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
         let operation = record.operation_id;
-        self.verify_recording_initial_readback(record)?;
+        self.verify_recording_initial_readback_with_input(record, input)?;
         inventory.validate_record(record).map_err(error)?;
         let plan = super::full_capacity_plan_for_record(record)?;
         let plan = crate::operation_journal::full_capacity::FullCapacityPlan::new(
@@ -445,7 +475,13 @@ impl OperationJournalStore {
                         return Err(error("restart noncanonical operation identity"));
                     }
                     let operation = OperationId::from_uuid(id);
-                    if self.recording_prestart_scope.get() {
+                    if input.is_some() {
+                        let inventory = read_with_input(&self.connection, operation, input)?
+                            .ok_or_else(|| error("missing restart inventory"))?;
+                        self.validate_database_claim_operation_with_input(
+                            operation, &inventory, input,
+                        )?;
+                    } else if self.recording_prestart_scope.get() {
                         // Finish the two-tree operation decoder before owning the binary
                         // inventory. Subsequent comparisons reuse this exact decoded row;
                         // command digest construction owns only one JSON tree at a time.
