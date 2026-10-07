@@ -1907,7 +1907,7 @@ impl OwnerRuntime {
     fn begin_wal_preparation(
         &mut self,
         input: WalPreparationInput,
-        debit: InputPermit,
+        debit: super::wal_admission::JournalInput,
     ) -> Result<WalPreparationHandle, OperationJournalOwnerError> {
         if self.wal_preparation.is_some() || self.wal_preparation_unconfirmed {
             return Err(WalPreparationError::Busy.into());
@@ -4903,6 +4903,12 @@ impl Drop for OperationJournalOwner {
 }
 
 impl OperationJournalClient {
+    pub(in crate::operation_journal) fn owns_wal_input(&self, input: &InputPermit) -> bool {
+        Arc::ptr_eq(&self.shared, &input.shared)
+            && input.class == InputClass::Ordinary
+            && input.bytes == super::wal_admission::HANDSHAKE_MAX_BYTES
+            && !input.publication
+    }
     /// Fixed per-owner queue observations. Returns None while accounting is contended.
     /// Backlog ends at accounted dequeue; it is not instantaneous channel length or success.
     pub fn queue_metrics_snapshot(&self) -> Option<JournalQueueMetricsSnapshot> {
@@ -5096,12 +5102,33 @@ impl OperationJournalClient {
         })
     }
 
+    /// Prepay the complete finite WAL factory/collector envelope on this owner's
+    /// ordinary input pool before serialization, validation or topology scratch.
+    /// The token is consumed by an original factory and transferred at queueing;
+    /// an unused token returns only memory credit. No SQLite or native work runs.
+    pub fn reserve_wal_preparation(
+        &self,
+    ) -> Result<WalPreparationFunding, OperationJournalOwnerQueueError> {
+        let _admission = self
+            .shared
+            .admission_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.shared.ensure_available()?;
+        Ok(WalPreparationFunding {
+            input: super::wal_admission::JournalInput::new(self.shared.reserve_input(
+                InputClass::Ordinary,
+                super::wal_admission::HANDSHAKE_MAX_BYTES,
+            )?),
+        })
+    }
+
     /// Collect complete ordered original-owner WAL scope asynchronously on this journal actor.
     /// Queue/Ready observations provide no current registration acknowledgement, decision latch,
     /// capacity grant or durable intent. Abort/Drop requests original-owner cleanup only.
     pub fn prepare_wal_owners(
         &self,
-        input: WalPreparationInput,
+        mut input: WalPreparationInput,
     ) -> Result<OperationJournalRequest<WalPreparationHandle>, OperationJournalOwnerQueueError>
     {
         input
@@ -5109,17 +5136,27 @@ impl OperationJournalClient {
             .ok_or_else(|| OperationJournalOwnerQueueError::InvalidInput {
                 reason: "bounded original WAL preparation input".into(),
             })?;
-        // Reserve its full finite backing on the original four-MiB pool before
-        // async native replies grow. Collector and copied inventory share this sole
-        // original debit until cleanup and the last observation backing drop.
-        self.submit(
-            super::wal_admission::HANDSHAKE_MAX_BYTES,
-            move |debit, result| JournalCommand::PrepareWalOwners {
+        // The original factory already prepaid the full envelope. Never debit a
+        // second pool or release/reacquire between factory and collector.
+        if !input
+            .funding
+            .as_ref()
+            .expect("funded WAL factory")
+            .input
+            .belongs_to(self)
+        {
+            return Err(OperationJournalOwnerQueueError::InvalidInput {
+                reason: "WAL preparation belongs to another journal owner".into(),
+            });
+        }
+        let debit = input.funding.take().expect("sole WAL factory debit").input;
+        self.submit_prepaid(InputClass::Ordinary, debit, move |debit, result| {
+            JournalCommand::PrepareWalOwners {
                 preparation: input,
                 input: debit,
                 result,
-            },
-        )
+            }
+        })
     }
 
     /// Queue one common prepared-admission request. The input is validated before queue
@@ -5653,6 +5690,49 @@ impl OperationJournalClient {
         } else {
             None
         };
+        self.enqueue_with_input(class, input, historical_reply, sender, build)
+    }
+
+    fn submit_prepaid<T, F>(
+        &self,
+        class: InputClass,
+        input: super::wal_admission::JournalInput,
+        build: F,
+    ) -> Result<OperationJournalRequest<T>, OperationJournalOwnerQueueError>
+    where
+        F: FnOnce(
+            super::wal_admission::JournalInput,
+            SyncSender<Result<T, OperationJournalOwnerError>>,
+        ) -> JournalCommand,
+    {
+        let _admission = self
+            .shared
+            .admission_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.shared.ensure_available()?;
+        let sender = self
+            .shared
+            .commands
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or(OperationJournalOwnerQueueError::Closed)?;
+        self.enqueue_with_input(class, input, None, sender, build)
+    }
+
+    fn enqueue_with_input<T, F, C>(
+        &self,
+        class: InputClass,
+        input: C,
+        historical_reply: Option<HistoricalReply>,
+        sender: OwnerCommandSenders,
+        build: F,
+    ) -> Result<OperationJournalRequest<T>, OperationJournalOwnerQueueError>
+    where
+        F: FnOnce(C, SyncSender<Result<T, OperationJournalOwnerError>>) -> JournalCommand,
+    {
         let result_permit = self.shared.reserve_result(class)?;
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let command = build(input, result_tx);
@@ -6074,6 +6154,23 @@ impl OwnerShared {
     }
 }
 
+/// Sole original journal memory debit for a WAL preparation factory. It is neither
+/// physical capacity nor permission to prepare owners or persist an intent.
+/// Obtain it with [`OperationJournalClient::reserve_wal_preparation`].
+/// ```compile_fail
+/// use yield_library::operation_journal::owner::WalPreparationFunding;
+/// let invented = WalPreparationFunding {};
+/// ```
+/// ```compile_fail
+/// fn copy(input: &yield_library::operation_journal::owner::WalPreparationFunding) {
+///     let _ = input.clone();
+///     let _: yield_library::operation_journal::owner::WalPreparationFunding = input.clone();
+/// }
+/// ```
+pub struct WalPreparationFunding {
+    pub(in crate::operation_journal) input: super::wal_admission::JournalInput,
+}
+
 pub(super) struct InputPermit {
     refund: bool,
     shared: Arc<OwnerShared>,
@@ -6388,7 +6485,7 @@ enum JournalCommand {
     },
     PrepareWalOwners {
         preparation: WalPreparationInput,
-        input: InputPermit,
+        input: super::wal_admission::JournalInput,
         result: SyncSender<Result<WalPreparationHandle, OperationJournalOwnerError>>,
     },
     RetainRecording {

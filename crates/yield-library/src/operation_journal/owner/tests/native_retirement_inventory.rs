@@ -299,6 +299,7 @@ fn native_retirement_inventory_genuine_registered_original_consumer() {
         .unwrap()
         .claim_id();
     let input = WalPreparationInput::from_universal(
+        journal.client().reserve_wal_preparation().unwrap(),
         &args,
         &participants,
         &plan,

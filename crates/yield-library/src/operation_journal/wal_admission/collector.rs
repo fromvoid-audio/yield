@@ -259,11 +259,9 @@ mod fixed_headers {
 impl Collector {
     pub(in crate::operation_journal) fn new(
         input: WalPreparationInput,
-        journal_input: super::super::owner::InputPermit,
+        journal_input: JournalInput,
         profile_acquisition: uuid::Uuid,
     ) -> Result<(Self, WalPreparationHandle), WalPreparationError> {
-        let journal_input = JournalInput::new(journal_input);
-        input.budget.bind_journal_input(journal_input.clone())?;
         let shared = SharedCustody::new(Shared {
             canceled: AtomicBool::new(false),
             status: Mutex::new(WalPreparationStatus::Preparing),
