@@ -1692,6 +1692,66 @@
       "issue": "OPT-2429",
       "reason": "Private actual Store on its genuine temporary profile checks original digest serialization, refusal without mutation and selected loan custody. Arithmetic fixtures grant no native qualification or effect authority.",
       "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_attempt_metadata_funding_tests.rs",
+      "function": "funded_attempt_metadata_matches_original_and_retains_selected_claim_failure",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2430",
+      "reason": "Private actual Store on its genuine temporary profile exercises passive descriptor and original journal claim observations, selected loan custody, corruption and native errors. Logical fixtures grant no native qualification or effect authority.",
+      "retirement": "Keep this precise test-only scope; remove its row if the fixture operation is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_attempt_metadata_funding_tests.rs",
+      "function": "funded_attempt_metadata_preserves_whole_page_utf8_before_cardinality_and_uuid",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2430",
+      "reason": "Private actual Store on its genuine temporary profile exercises passive descriptor and original journal claim observations, selected loan custody, corruption and native errors. Logical fixtures grant no native qualification or effect authority.",
+      "retirement": "Keep this precise test-only scope; remove its row if the fixture operation is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_attempt_metadata_funding_tests.rs",
+      "function": "funded_attempt_metadata_refuses_pressure_before_descriptor_and_keeps_rows",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2430",
+      "reason": "Private actual Store on its genuine temporary profile exercises passive descriptor and original journal claim observations, selected loan custody, corruption and native errors. Logical fixtures grant no native qualification or effect authority.",
+      "retirement": "Keep this precise test-only scope; remove its row if the fixture operation is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_attempt_metadata_funding_tests.rs",
+      "function": "funded_attempt_metadata_preserves_canonical_key_release_and_projection_bounds",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2430",
+      "reason": "Private actual Store on its genuine temporary profile exercises passive descriptor and original journal claim observations, selected loan custody, corruption and native errors. Logical fixtures grant no native qualification or effect authority.",
+      "retirement": "Keep this precise test-only scope; remove its row if the fixture operation is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_attempt_metadata_funding_tests.rs",
+      "function": "funded_attempt_metadata_retains_actual_descriptor_and_native_sql_failures",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2430",
+      "reason": "Private actual Store on its genuine temporary profile exercises passive descriptor and original journal claim observations, selected loan custody, corruption and native errors. Logical fixtures grant no native qualification or effect authority.",
+      "retirement": "Keep this precise test-only scope; remove its row if the fixture operation is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_attempt_metadata_funding_tests.rs",
+      "function": "funded_attempt_metadata_retains_actual_descriptor_and_native_sql_failures",
+      "operation": "fs::rename",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2430",
+      "reason": "Private actual Store on its genuine temporary profile exercises passive descriptor and original journal claim observations, selected loan custody, corruption and native errors. Logical fixtures grant no native qualification or effect authority.",
+      "retirement": "Keep this precise test-only scope; remove its row if the fixture operation is removed. No production authority is granted."
     }
   ]
 }

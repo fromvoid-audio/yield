@@ -239,6 +239,36 @@ pub fn descriptor_capacity_facts(file: &File) -> Result<VolumeFacts, CapacityGat
     descriptor_volume_facts(file).map_err(|error| CapacityGateError::Discovery(error.to_string()))
 }
 
+// Readonly original descriptor facts with selected native text funding. Callback
+// acceptance is accounting only and cannot issue admission or a physical witness.
+pub(crate) enum FundedDescriptorError<E> {
+    Observed(CapacityGateError, std::marker::PhantomData<E>),
+    #[cfg(windows)]
+    Funding(E),
+}
+
+pub(crate) fn descriptor_capacity_facts_with_funding<E>(
+    file: &File,
+    reserve: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<VolumeFacts, FundedDescriptorError<E>> {
+    #[cfg(windows)]
+    {
+        windows::observe(file, Some(reserve)).map_err(|error| match error {
+            windows::ObservationError::Observed(error) => FundedDescriptorError::Observed(
+                CapacityGateError::Discovery(error.to_string()),
+                std::marker::PhantomData,
+            ),
+            windows::ObservationError::Funding(error) => FundedDescriptorError::Funding(error),
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = reserve;
+        descriptor_capacity_facts(file)
+            .map_err(|error| FundedDescriptorError::Observed(error, std::marker::PhantomData))
+    }
+}
+
 #[cfg(unix)]
 fn statvfs_capacity_values(
     available_blocks: u64,

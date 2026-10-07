@@ -12,8 +12,18 @@ fn trimmed(mut wide: &[u16]) -> &[u16] {
     wide
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn reason<E>(
+    wide: &[u16],
+    code: i32,
+    reserve: impl FnOnce(usize) -> Result<(), E>,
+) -> Result<String, E> {
+    reason_with_prefix(PREFIX, wide, code, reserve)
+}
+
+#[cfg(any(windows, test))]
+fn reason_with_prefix<E>(
+    prefix: &str,
     wide: &[u16],
     code: i32,
     reserve: impl FnOnce(usize) -> Result<(), E>,
@@ -25,7 +35,7 @@ fn reason<E>(
         .sum();
     // UTF16 native length is u32. Its at-most-three UTF8 bytes per unit plus
     // these fixed literals fit usize on the supported 64-bit native targets.
-    let bytes = PREFIX.len()
+    let bytes = prefix.len()
         + if wide.is_empty() {
             10
         } else {
@@ -33,7 +43,7 @@ fn reason<E>(
         };
     reserve(bytes)?;
     let mut output = String::with_capacity(bytes);
-    output.push_str(PREFIX);
+    output.push_str(prefix);
     if !wide.is_empty() {
         for value in char::decode_utf16(wide.iter().copied()) {
             output.push(value.unwrap_or(char::REPLACEMENT_CHARACTER));
@@ -50,6 +60,25 @@ fn reason<E>(
 
 #[cfg(windows)]
 pub(super) fn win32_reason<E>(
+    code: i32,
+    reserve: impl FnOnce(usize) -> Result<(), E>,
+) -> Result<String, E> {
+    capture_reason(PREFIX, code, reserve)
+}
+
+// Pinned BOOL errors have no COM ErrorInfo. Preserve their complete original
+// SDK Display without letting Error::message allocate an uncharged Rust String.
+#[cfg(windows)]
+pub(crate) fn win32_display<E>(
+    code: i32,
+    reserve: impl FnOnce(usize) -> Result<(), E>,
+) -> Result<String, E> {
+    capture_reason("", code, reserve)
+}
+
+#[cfg(windows)]
+fn capture_reason<E>(
+    prefix: &str,
     code: i32,
     reserve: impl FnOnce(usize) -> Result<(), E>,
 ) -> Result<String, E> {
@@ -118,7 +147,7 @@ pub(super) fn win32_reason<E>(
         // message/query is repeated between exact measurement and materialization.
         unsafe { std::slice::from_raw_parts(capture.text, length as usize) }
     };
-    reason(wide, code, reserve)
+    reason_with_prefix(prefix, wide, code, reserve)
 }
 
 #[cfg(test)]
@@ -151,6 +180,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unprefixed_sdk_display_measures_full_variable_text_before_copy() {
+        let wide = vec![0xd800; 16384];
+        let text = reason_with_prefix("", &wide, -1, |bytes| {
+            assert_eq!(bytes, 16384 * 3 + 13);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(text, format!("{} (0xFFFFFFFF)", "�".repeat(16384)));
+        assert!(reason_with_prefix("", &wide, -1, |_| Err::<(), _>("refused")).is_err());
+    }
+
     #[cfg(windows)]
     #[test]
     fn actual_bool_file_information_error_preserves_complete_sdk_display() {
@@ -174,5 +215,11 @@ mod tests {
             "actual message must cross the pre-copy funding point"
         );
         assert_eq!(actual, expected);
+        let actual = win32_display(error.code().0, |bytes| {
+            assert_eq!(bytes, error.to_string().len());
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(actual, error.to_string());
     }
 }

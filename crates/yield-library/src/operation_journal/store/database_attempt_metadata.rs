@@ -5,6 +5,32 @@ use crate::operation_journal::{AdmissionClaimId, OperationId};
 use rusqlite::params;
 use uuid::Uuid;
 
+mod funded;
+
+pub(super) fn plan_backing(
+    record: &crate::operation_journal::StoredOperationRecord,
+) -> Result<usize, OperationJournalStoreError> {
+    use std::mem::size_of;
+    let rows = record
+        .full_capacity_plan
+        .as_ref()
+        .map_or(0, |p| p.allocations().len())
+        .checked_add(record.capacity_plan.as_ref().map_or(0, |p| p.volumes.len()))
+        .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+    let node = 12 * size_of::<(crate::durable_capacity::VolumeIdentity, (u64, u64, u64))>()
+        + 16 * size_of::<usize>();
+    rows.checked_mul(
+        node + 2 * size_of::<crate::operation_journal::full_capacity::FullCapacityAllocation>(),
+    )
+    .and_then(|n| {
+        n.checked_add(
+            crate::operation_journal::codec::historical_observation::FIXED_BYTES
+                + 4 * size_of::<crate::operation_journal::full_capacity::FullCapacityAllocation>(),
+        )
+    })
+    .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)
+}
+
 impl OperationJournalStore {
     /// Hold the process extension exclusion across the future attempt transaction. A successful
     /// check proves only bounded logical journal metadata and original durable claim retention;
@@ -54,6 +80,9 @@ impl OperationJournalStore {
         input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
         self.validate_database_claim_metadata_volume_with_input(record, input)?;
+        if let Some(input) = input {
+            return funded::validate(self, record, input);
+        }
         let operation = record.operation_id;
         let plan = super::full_capacity_plan_for_record(&record)?;
         let expected: Vec<_> = plan
