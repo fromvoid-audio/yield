@@ -7568,31 +7568,43 @@ impl OperationJournalStore {
                         ),
                     });
                 }
-                let Some(operation) = self.read_row(chunk.operation_id())? else {
+                let inspect_participant = |record: &StoredOperationRecord| {
+                    let present = record.universal_intent.as_ref().is_some_and(|intent| {
+                        intent
+                            .participants()
+                            .descriptors()
+                            .iter()
+                            .any(|participant| participant.id() == chunk.participant_id())
+                    });
+                    if !present {
+                        return Err(OperationJournalStoreError::ChunkClaim {
+                            reason: format!(
+                                "chunk {} references a participant outside operation {}",
+                                chunk.chunk_id(),
+                                chunk.operation_id()
+                            ),
+                        });
+                    }
+                    Ok(())
+                };
+                let operation_present = match input {
+                    Some(input) => self.inspect_complete_claim_operation(
+                        chunk.operation_id(),
+                        input,
+                        |record, _| inspect_participant(record),
+                    )?,
+                    None => match self.read_row(chunk.operation_id())? {
+                        Some(operation) => {
+                            inspect_participant(&operation.record)?;
+                            true
+                        }
+                        None => false,
+                    },
+                };
+                if !operation_present {
                     return Err(OperationJournalStoreError::ChunkClaim {
                         reason: format!(
                             "chunk {} references missing operation {}",
-                            chunk.chunk_id(),
-                            chunk.operation_id()
-                        ),
-                    });
-                };
-                let participant_present =
-                    operation
-                        .record
-                        .universal_intent
-                        .as_ref()
-                        .is_some_and(|intent| {
-                            intent
-                                .participants()
-                                .descriptors()
-                                .iter()
-                                .any(|participant| participant.id() == chunk.participant_id())
-                        });
-                if !participant_present {
-                    return Err(OperationJournalStoreError::ChunkClaim {
-                        reason: format!(
-                            "chunk {} references a participant outside operation {}",
                             chunk.chunk_id(),
                             chunk.operation_id()
                         ),

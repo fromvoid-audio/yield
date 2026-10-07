@@ -107,10 +107,52 @@ impl OperationJournalStore {
         self.observe_claim_operation(operation_id, &funding.input)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    /// Compare the exact original complete record while its producer loan remains
+    /// live. Only scalar comparison evidence escapes; no authority is installed.
+    pub fn complete_historical_matches_with_funding_for_test(
+        &self,
+        expected: &StoredOperationRecord,
+        expected_sequence: i64,
+        funding: &super::super::owner::JournalNamespaceFundingProbe,
+    ) -> Result<bool, OperationJournalStoreError> {
+        let mut matched = false;
+        let present = self.inspect_complete_claim_operation(
+            expected.operation_id,
+            &funding.input,
+            |record, sequence| {
+                matched = record == expected && sequence == expected_sequence;
+                Ok(())
+            },
+        )?;
+        Ok(present && matched)
+    }
+
     pub(super) fn observe_claim_operation(
         &self,
         operation_id: OperationId,
         input: &InputPermit,
+    ) -> Result<bool, OperationJournalStoreError> {
+        self.inspect_claim_operation(operation_id, input, false, |_, _| Ok(()))
+    }
+
+    /// Inspect the exact complete original record only while its own backing is
+    /// retained. The visitor returns no record, clone, lease or effect authority.
+    pub(super) fn inspect_complete_claim_operation(
+        &self,
+        operation_id: OperationId,
+        input: &InputPermit,
+        inspect: impl FnOnce(&StoredOperationRecord, i64) -> Result<(), OperationJournalStoreError>,
+    ) -> Result<bool, OperationJournalStoreError> {
+        self.inspect_claim_operation(operation_id, input, true, inspect)
+    }
+
+    fn inspect_claim_operation(
+        &self,
+        operation_id: OperationId,
+        input: &InputPermit,
+        complete: bool,
+        inspect: impl FnOnce(&StoredOperationRecord, i64) -> Result<(), OperationJournalStoreError>,
     ) -> Result<bool, OperationJournalStoreError> {
         // Fund fixed Rust statement/binding/error backing before preparing SQL. Native
         // SQLite allocations are not represented as a Rust allocator/RSS bound.
@@ -254,7 +296,10 @@ impl OperationJournalStore {
             scratch = Some(historical_observation::Scratch::new(input, bytes.len())?);
             let mut observation =
                 historical_observation::observe(bytes, scratch.as_mut().expect("funded scratch"))?;
-            if observation.is_none() {
+            if complete || observation.is_none() {
+                // A V1/V2 BOOL projection omits opaque payload. Its original
+                // graph must die before replacing its loan with complete backing.
+                drop(observation.take());
                 // The original general codec consumes this borrowed SQLite cell only after
                 // complete structure-derived backing. No second SQL read or owned BLOB copy.
                 #[cfg(test)]
@@ -300,7 +345,10 @@ impl OperationJournalStore {
                 ));
             }
             match classify_record(record) {
-                RecordConsistency::Consistent => Ok(true),
+                RecordConsistency::Consistent => {
+                    inspect(record, sequence)?;
+                    Ok(true)
+                }
                 RecordConsistency::LegacyMissingPublicationEvidence => Err(retained_error(
                     Some(operation_id),
                     "legacy record is retained without publication evidence",

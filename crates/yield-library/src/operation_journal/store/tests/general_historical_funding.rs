@@ -1,7 +1,7 @@
 //! Real retained Store/SQLite; all inputs are passive historical observations.
 use super::*;
 use crate::operation_journal::owner::JournalNamespaceFundingProbe;
-use crate::operation_journal::{ParticipantCheckpointState, ParticipantId};
+use crate::operation_journal::{ParticipantCheckpointState, ParticipantId, SCHEMA_V2};
 
 fn install(store: &OperationJournalStore, bytes: &[u8]) -> OperationId {
     let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
@@ -306,4 +306,169 @@ fn general_historical_recording_prestart_gate_remains_the_original_gate() {
     assert!(store.recording_prestart_resource_refused.get());
     store.recording_prestart_scope.set(false);
     assert!(store.get(operation).unwrap().is_some());
+}
+
+#[test]
+fn complete_historical_visitor_keeps_original_v1_v2_opaque_payload_and_exact_sequence() {
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    for version in [SCHEMA_V1, SCHEMA_V2] {
+        let mut record = intent_record(OperationId::new());
+        record.schema_version = version;
+        record.payload =
+            serde_json::json!({"opaque": {"escaped":"a\\b\"\n雪", "items":[1,2,3]}, "end":true});
+        let wire = encode(&record).unwrap();
+        install(&store, &wire);
+        let funding = JournalNamespaceFundingProbe::new();
+        let available = funding.remaining_bytes();
+        POINT_ROW_MATERIALIZED_BYTES.with(|n| n.set(0));
+        let mut visited = false;
+        assert!(
+            store
+                .inspect_complete_claim_operation(
+                    record.operation_id,
+                    &funding.input,
+                    |actual, sequence| {
+                        assert_eq!(actual, &record);
+                        assert_eq!(sequence, 1);
+                        assert!(funding.remaining_bytes() < available);
+                        visited = true;
+                        Ok(())
+                    }
+                )
+                .unwrap()
+        );
+        assert!(visited);
+        POINT_ROW_MATERIALIZED_BYTES.with(|n| assert_eq!(n.get(), 0));
+        assert_eq!(funding.remaining_bytes(), available);
+    }
+}
+
+#[test]
+fn complete_historical_visitor_matches_every_original_general_family_without_owned_blob() {
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let mut fixtures = super::super::super::codec::general_historical_fixture_bytes_for_test();
+    fixtures.push(
+        encode(&finite_recording_record(
+            &crate::operation_journal::recording_commands::recording_proposal_for_test(2, 10_000),
+        ))
+        .unwrap(),
+    );
+    fixtures.push(encode(&retirement_record()).unwrap());
+    for wire in fixtures {
+        let expected = decode(&wire).unwrap();
+        install(&store, &wire);
+        let funding = JournalNamespaceFundingProbe::new();
+        let available = funding.remaining_bytes();
+        POINT_ROW_MATERIALIZED_BYTES.with(|n| n.set(0));
+        assert!(
+            store
+                .inspect_complete_claim_operation(
+                    expected.operation_id,
+                    &funding.input,
+                    |actual, sequence| {
+                        assert_eq!(actual, &expected);
+                        assert_eq!(sequence, 1);
+                        Ok(())
+                    }
+                )
+                .unwrap()
+        );
+        POINT_ROW_MATERIALIZED_BYTES.with(|n| assert_eq!(n.get(), 0));
+        assert_eq!(funding.remaining_bytes(), available);
+    }
+}
+
+#[test]
+fn complete_historical_pressure_precedes_visitor_and_retains_original_refusal_backing() {
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let mut record = intent_record(OperationId::new());
+    record.payload = serde_json::json!({"opaque":vec!["wide"; 128]});
+    let wire = encode(&record).unwrap();
+    install(&store, &wire);
+    let funding = JournalNamespaceFundingProbe::new();
+    let observe = funding.pool_bytes_observer_for_test();
+    let pressure = funding
+        .input
+        .reserve_historical_scratch(funding.remaining_bytes() - 80 * 1024)
+        .unwrap();
+    let mut visited = false;
+    let error = store
+        .inspect_complete_claim_operation(record.operation_id, &funding.input, |_, _| {
+            visited = true;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(!visited);
+    assert!(matches!(
+        error,
+        OperationJournalStoreError::HistoricalClaimResourceBound
+    ));
+    let error = funding.retain_command_error_for_test(error);
+    drop(pressure);
+    drop(funding);
+    assert!(observe().0 < observe().1);
+    drop(error);
+    assert_eq!(observe().0, observe().1);
+    assert_eq!(store.get(record.operation_id).unwrap().unwrap(), record);
+}
+
+#[test]
+fn complete_historical_actual_funded_chunk_participant_audit_preserves_original_claim() {
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let record = universal_intent_record(OperationId::new());
+    let request = chunk_request_for_record(
+        &record,
+        ChunkId::new(),
+        AdmissionClaimId::new(),
+        "complete-participant",
+        0,
+    );
+    store.insert_intent_with_outcome(&record).receipt().unwrap();
+    // Arithmetic-only metadata setup never supplies a native witness or source effect grant.
+    let provider = provider_for_intent(&record);
+    let lease = provider
+        .admit(&request.plan().unwrap(), &request.inventory().unwrap())
+        .unwrap();
+    store
+        .persist_chunk_claim_with_lease(&request, &provider, lease)
+        .unwrap();
+    let funding = JournalNamespaceFundingProbe::new();
+    let available = funding.remaining_bytes();
+    let entered = enter_count();
+    POINT_ROW_MATERIALIZED_BYTES.with(|n| n.set(0));
+    store.connection.execute_batch("BEGIN").unwrap();
+    store
+        .validate_chunk_claims_inside_transaction_with_input(Some(&funding.input))
+        .unwrap();
+    store.connection.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(enter_count(), entered + 1);
+    POINT_ROW_MATERIALIZED_BYTES.with(|n| assert_eq!(n.get(), 0));
+    assert_eq!(funding.remaining_bytes(), available);
+    store
+        .connection
+        .execute(
+            "UPDATE operation_journal_chunk_claim SET participant_id=?1 WHERE chunk_id=?2",
+            params![Uuid::new_v4().to_string(), request.chunk_id().to_string()],
+        )
+        .unwrap();
+    let observe = funding.pool_bytes_observer_for_test();
+    store.connection.execute_batch("BEGIN").unwrap();
+    let error = store
+        .validate_chunk_claims_inside_transaction_with_input(Some(&funding.input))
+        .unwrap_err();
+    store.connection.execute_batch("ROLLBACK").unwrap();
+    assert!(
+        matches!(&error, OperationJournalStoreError::ChunkClaim { reason } if reason.contains("participant outside operation"))
+    );
+    let error = funding.retain_command_error_for_test(error);
+    assert_eq!(provider.claim_count(), 1);
+    assert_eq!(store.get(record.operation_id).unwrap().unwrap(), record);
+    drop(funding);
+    assert!(observe().0 < observe().1);
+    drop(error);
+    assert_eq!(observe().0, observe().1);
 }

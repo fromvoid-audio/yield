@@ -181,4 +181,48 @@ fn system_general_historical_rust_allocations_stay_prepaid_through_success_and_e
             totals.peak
         );
     }
+    complete_original_historical_graphs_keep_backing_through_scoped_validation(&store);
+}
+
+fn complete_original_historical_graphs_keep_backing_through_scoped_validation(
+    store: &OperationJournalStore,
+) {
+    let operation = OperationId::new();
+    for version in [1, 2] {
+        let value = serde_json::json!({
+            "schema_version":version, "operation_id":operation,
+            "intent":{"actor":"User","kind":"FileMutation","label":"complete historical"},
+            "phase":"IntentDurable", "disposition":"None",
+            "payload":{"opaque":vec!["escaped \\\"雪\n".repeat(64);32], "primitive":vec![7;128]},
+            "capacity_plan":{"volumes":[{"identity":{"device":1},"allocation_unit":1,"allocation_class":"DestinationStaging","logical_bytes":1,"allocated_bytes":1,"protected_free_bytes":268435456}]},
+            "prepared":null, "staged":null, "published":null, "replacement_qualification":null,
+            "created_unix_ms":1, "updated_unix_ms":1
+        });
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let expected = yield_library::operation_journal::decode(&bytes).unwrap();
+        store
+            .replace_historical_row_fixture_for_test(operation, 1, &bytes)
+            .unwrap();
+        let funding = JournalNamespaceFundingProbe::new();
+        let available = funding.remaining_bytes();
+        store.retained_namespace_transaction_for_test(true).unwrap();
+        let totals = measured(&funding, || {
+            assert!(
+                store
+                    .complete_historical_matches_with_funding_for_test(&expected, 1, &funding)
+                    .unwrap()
+            );
+        });
+        store
+            .retained_namespace_transaction_for_test(false)
+            .unwrap();
+        assert!(totals.peak > 0);
+        assert_eq!(
+            totals.violations, 0,
+            "version={version}, peak={}",
+            totals.peak
+        );
+        assert_eq!(totals.current, 0);
+        assert_eq!(funding.remaining_bytes(), available);
+    }
 }
