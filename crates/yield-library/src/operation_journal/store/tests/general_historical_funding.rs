@@ -472,3 +472,32 @@ fn complete_historical_actual_funded_chunk_participant_audit_preserves_original_
     drop(error);
     assert_eq!(observe().0, observe().1);
 }
+
+#[test]
+fn nested_original_producer_selection_never_refunds_the_earlier_record_failure() {
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(
+        &super::super::super::codec::general_historical_fixture_bytes_for_test()[0],
+    )
+    .unwrap();
+    value["schema_version"] = serde_json::json!(999);
+    let wire = serde_json::to_vec(&value).unwrap();
+    let operation = install(&store, &wire);
+    let funding = JournalNamespaceFundingProbe::new();
+    let observe = funding.pool_bytes_observer_for_test();
+    let error = store
+        .inspect_complete_claim_operation(operation, &funding.input, |_, _| Ok(()))
+        .unwrap_err();
+    let after_record = funding.remaining_bytes();
+    let additional = funding.input.reserve_historical_scratch(32 * 1024).unwrap();
+    funding
+        .input
+        .retain_historical_error(additional, None, None, None);
+    assert_eq!(funding.remaining_bytes(), after_record - 32 * 1024);
+    let error = funding.retain_command_error_for_test(error);
+    drop(funding);
+    assert!(observe().0 < observe().1);
+    drop(error);
+    assert_eq!(observe().0, observe().1);
+}

@@ -10,6 +10,17 @@ mod general_backing;
 mod keys;
 mod scan;
 mod syntax;
+
+/// Scalar shape of a closed streaming schema. The caller must already hold
+/// syntax scratch (two raw bytes per byte plus FIXED_BYTES); no Value graph or
+/// schema authority is constructed here. These counts include opaque fields.
+pub(in crate::operation_journal) fn closed_streaming_shape(
+    bytes: &[u8],
+) -> Option<(usize, usize, usize)> {
+    syntax::validate(bytes).ok()?;
+    let shape = scan::scan_full(bytes);
+    Some((shape.string_bytes, shape.array_entries, shape.arrays))
+}
 #[cfg(test)]
 mod tests;
 

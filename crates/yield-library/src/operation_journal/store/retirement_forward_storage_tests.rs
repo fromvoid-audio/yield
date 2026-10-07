@@ -225,6 +225,7 @@ fn registered_retirement_codec_and_storage() {
         } else {
             assert!(settled.outcome().receipt().is_some());
         }
+        assert_funded_inventory(&store, &record, &inventory);
         let nonce = inventory.header().decision_nonce;
         let digest = inventory.digest().unwrap();
         assert_eq!(
@@ -582,6 +583,7 @@ fn retirement_forward_codec_and_storage() {
         } else {
             assert!(settled.outcome().receipt().is_some());
         }
+        assert_funded_inventory(&store, &record, &inventory);
         let nonce = inventory.header().decision_nonce;
         let digest = inventory.digest().unwrap();
         assert_eq!(

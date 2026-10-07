@@ -6312,7 +6312,7 @@ impl InputPermit {
 
     pub(super) fn retain_historical_error(
         &self,
-        sql: InputPermit,
+        mut sql: InputPermit,
         parser: Option<InputPermit>,
         envelope: Option<InputPermit>,
         sqlite_error: Option<InputPermit>,
@@ -6320,14 +6320,40 @@ impl InputPermit {
         if let Some(backing) = &self.historical_reply {
             // Each named allocation is funded on the original pool. Terminal permits
             // contain no reply Arc; the retained backing cannot form a cycle.
-            *backing.observer.lock().unwrap_or_else(|p| p.into_inner()) =
-                Some(HistoricalObserverCredits {
-                    _sql: sql,
-                    _parser: parser,
-                    _envelope: envelope,
-                    _sqlite_error: sqlite_error,
-                });
+            let mut selected = backing.observer.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(previous) = selected.take() {
+                // Nested original producers can contribute distinct native and
+                // record loans to the same failure. Transfer all original debits
+                // without allocating a chain or replacing/refunding earlier loans.
+                sql.absorb_historical_scratch(previous._sql);
+                for credit in [previous._parser, previous._envelope, previous._sqlite_error]
+                    .into_iter()
+                    .flatten()
+                {
+                    sql.absorb_historical_scratch(credit);
+                }
+            }
+            *selected = Some(HistoricalObserverCredits {
+                _sql: sql,
+                _parser: parser,
+                _envelope: envelope,
+                _sqlite_error: sqlite_error,
+            });
         }
+    }
+
+    fn absorb_historical_scratch(&mut self, mut other: InputPermit) {
+        // Both values are privately reserved terminal scratch from this exact
+        // ordinary pool. No new credit, authority or allocation is constructed.
+        assert!(Arc::ptr_eq(&self.shared, &other.shared));
+        assert!(self.class == InputClass::Ordinary && other.class == self.class);
+        assert!(!self.publication && !other.publication && self.refund && other.refund);
+        assert!(self.historical_reply.is_none() && other.historical_reply.is_none());
+        self.bytes = self
+            .bytes
+            .checked_add(other.bytes)
+            .expect("existing original pool total");
+        other.refund = false;
     }
 
     pub(super) fn historical_error_consumed(&self) {

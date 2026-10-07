@@ -205,7 +205,10 @@ impl OperationJournalStore {
         &self,
         start: &DatabaseAttemptStart,
         new_start: bool,
-    ) -> Result<(StoredOperationRecord, DatabaseClaimInventory)> {
+    ) -> Result<(
+        StoredOperationRecord,
+        database_claims::RetainedDatabaseInventory,
+    )> {
         self.attempt_context_with_input(start, new_start, None)
     }
 
@@ -214,9 +217,12 @@ impl OperationJournalStore {
         start: &DatabaseAttemptStart,
         new_start: bool,
         input: Option<&crate::operation_journal::owner::InputPermit>,
-    ) -> Result<(StoredOperationRecord, DatabaseClaimInventory)> {
+    ) -> Result<(
+        StoredOperationRecord,
+        database_claims::RetainedDatabaseInventory,
+    )> {
         let operation = OperationId::from_uuid(start.operation);
-        let inventory = database_claims::read(&self.connection, operation)?
+        let inventory = database_claims::read_with_input(&self.connection, operation, input)?
             .ok_or_else(|| error("missing actual binding"))?;
         self.validate_database_claim_operation(operation, &inventory)?;
         let record = self
