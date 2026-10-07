@@ -23,7 +23,7 @@ impl Write for Count {
         Ok(())
     }
 }
-fn format_original(
+pub(in crate::operation_journal::store) fn format_original(
     original: impl fmt::Display,
     input: &InputPermit,
     formatted: &mut Option<InputPermit>,
@@ -50,7 +50,7 @@ fn format_original(
     }
 }
 
-fn scalar_claim(
+pub(in crate::operation_journal::store) fn scalar_claim(
     connection: &Connection,
     id: AdmissionClaimId,
     input: &InputPermit,
@@ -79,7 +79,7 @@ fn scalar_claim(
     })();
     map_native_scalar_error(result, input, formatted)
 }
-fn released(
+pub(in crate::operation_journal::store) fn released(
     connection: &Connection,
     id: AdmissionClaimId,
     input: &InputPermit,

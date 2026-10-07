@@ -49,6 +49,24 @@ fn capacity_values(record: &FullSizeInformation, returned: usize) -> io::Result<
 
 #[cfg(windows)]
 pub(super) fn descriptor_volume_facts(file: &std::fs::File) -> io::Result<super::VolumeFacts> {
+    match observe::<std::convert::Infallible>(file, None) {
+        Ok(facts) => Ok(facts),
+        Err(ObservationError::Observed(error)) => Err(error),
+        Err(ObservationError::Funding(never)) => match never {},
+    }
+}
+
+#[cfg(windows)]
+pub(super) enum ObservationError<E> {
+    Observed(io::Error),
+    Funding(E),
+}
+
+#[cfg(windows)]
+pub(super) fn observe<E>(
+    file: &std::fs::File,
+    mut reserve: Option<&mut dyn FnMut(usize) -> Result<(), E>>,
+) -> Result<super::VolumeFacts, ObservationError<E>> {
     use ::windows::Wdk::Storage::FileSystem::{
         FileFsFullSizeInformation, NtQueryVolumeInformationFile,
     };
@@ -60,25 +78,38 @@ pub(super) fn descriptor_volume_facts(file: &std::fs::File) -> io::Result<super:
     use ::windows::Win32::System::IO::IO_STATUS_BLOCK;
     use std::os::windows::io::AsRawHandle;
 
-    fn identity(handle: HANDLE) -> io::Result<(u32, u64, u64)> {
+    fn identity<E>(
+        handle: HANDLE,
+        reserve: &mut Option<&mut dyn FnMut(usize) -> Result<(), E>>,
+    ) -> Result<(u32, u64, u64), ObservationError<E>> {
         // Pipes, devices and opened reparse points do not identify a regular volume object.
         if unsafe { GetFileType(handle) } != FILE_TYPE_DISK {
-            return Err(io::Error::new(
+            return Err(ObservationError::Observed(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "not a disk handle",
-            ));
+            )));
         }
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(io::Error::other)?;
+        if let Err(error) = unsafe { GetFileInformationByHandle(handle, &mut info) } {
+            let error = match reserve.as_deref_mut() {
+                None => io::Error::other(error),
+                Some(reserve) => io::Error::other(
+                    crate::sample_sources::db::sqlite_identity::native_error_message::win32_display(
+                        error.code().0, reserve,
+                    ).map_err(ObservationError::Funding)?,
+                ),
+            };
+            return Err(ObservationError::Observed(error));
+        }
         let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
         if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
             || info.dwVolumeSerialNumber == 0
             || index == 0
         {
-            return Err(io::Error::new(
+            return Err(ObservationError::Observed(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "unknown disk object identity",
-            ));
+            )));
         }
         let created = (u64::from(info.ftCreationTime.dwHighDateTime) << 32)
             | u64::from(info.ftCreationTime.dwLowDateTime);
@@ -86,7 +117,7 @@ pub(super) fn descriptor_volume_facts(file: &std::fs::File) -> io::Result<super:
     }
 
     let handle = HANDLE(file.as_raw_handle());
-    let before = identity(handle)?;
+    let before = identity(handle, &mut reserve)?;
     let mut record = FullSizeInformation::default();
     let mut status = IO_STATUS_BLOCK::default();
     // NtQueryVolumeInformationFile is synchronous, including for asynchronous file
@@ -102,15 +133,16 @@ pub(super) fn descriptor_volume_facts(file: &std::fs::File) -> io::Result<super:
         )
     };
     if result.0 != 0 || unsafe { status.Anonymous.Status }.0 != 0 {
-        return Err(io::Error::other(format!(
+        return Err(ObservationError::Observed(io::Error::other(format!(
             "Windows volume query failed: {result:?}"
-        )));
+        ))));
     }
-    let (free_bytes, allocation_unit) = capacity_values(&record, status.Information)?;
-    if identity(handle)? != before {
-        return Err(io::Error::other(
+    let (free_bytes, allocation_unit) =
+        capacity_values(&record, status.Information).map_err(ObservationError::Observed)?;
+    if identity(handle, &mut reserve)? != before {
+        return Err(ObservationError::Observed(io::Error::other(
             "Windows disk object identity changed during capacity query",
-        ));
+        )));
     }
     Ok(super::VolumeFacts {
         identity: super::VolumeIdentity {

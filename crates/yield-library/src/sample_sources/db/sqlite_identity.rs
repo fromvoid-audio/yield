@@ -17,7 +17,7 @@ use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use super::BoundDatabaseRoot;
 
 mod connection_observation;
-mod native_error_message;
+pub(crate) mod native_error_message;
 
 /// Errors returned by a no-follow SQLite file or connection identity check.
 #[derive(Debug)]

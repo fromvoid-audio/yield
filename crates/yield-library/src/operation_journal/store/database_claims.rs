@@ -8,9 +8,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 pub(super) mod command_backing;
-mod comparison;
+pub(super) mod comparison;
 mod funded;
-mod scalar_projection;
+pub(super) mod scalar_projection;
 pub(super) use funded::{Inventory as RetainedDatabaseInventory, read_with_input};
 
 pub(super) const BINDING_TABLE: &str = "operation_journal_database_binding";
@@ -302,27 +302,90 @@ impl OperationJournalStore {
         record: &crate::operation_journal::StoredOperationRecord,
         input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
-        let opened = crate::sample_sources::db::sqlite_identity::open_existing_database_file(
-            &self.database_root,
-            std::path::Path::new(super::JOURNAL_DATABASE_FILE_NAME),
-            &self.database_path,
-        )
-        .map_err(super::map_identity_error)?;
-        if opened.identity != self.database_identity {
-            return Err(error("journal descriptor replaced"));
-        }
-        let facts =
-            crate::durable_capacity::descriptor_capacity_facts(&opened.file).map_err(error)?;
-        let plan = super::full_capacity_plan_for_record(record)?;
-        let charged=plan.allocations().iter().filter(|a|a.class()==crate::operation_journal::full_capacity::FullCapacityAllocationClass::JournalRecord && a.volume()==&facts.identity)
+        let working = input
+            .map(|input| {
+                let namespace = super::namespace_backing::working_bytes(
+                    &self.database_root,
+                    &self.profile_guard,
+                    &self.database_path,
+                )
+                .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+                const REASONS: &str = concat!(
+                    "not a disk handle",
+                    "unknown disk object identity",
+                    "Windows volume query failed: NTSTATUS(-2147483648)",
+                    "Windows disk object identity changed during capacity query",
+                    "invalid Windows volume capacity record",
+                    "filesystem allocation unit is zero",
+                    "free-space arithmetic overflow",
+                    "invalid free-space block count",
+                    "invalid filesystem fragment size",
+                    "invalid filesystem block size",
+                    "journal descriptor replaced",
+                    "journal peak overflow",
+                    "complete journal/rollback peak not covered on actual descriptor volume",
+                );
+                let bytes = super::database_attempt_metadata::plan_backing(record)?
+                    .checked_add(namespace)
+                    .and_then(|n| n.checked_add(6 * REASONS.len()))
+                    .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+                input.reserve_historical_scratch(bytes)
+            })
+            .transpose()?;
+        let mut native = None;
+        let result = (|| {
+            let opened = crate::sample_sources::db::sqlite_identity::open_existing_database_file(
+                &self.database_root,
+                std::path::Path::new(super::JOURNAL_DATABASE_FILE_NAME),
+                &self.database_path,
+            )
+            .map_err(super::map_identity_error)?;
+            if opened.identity != self.database_identity {
+                return Err(error("journal descriptor replaced"));
+            }
+            let facts = if let Some(input) = input {
+                crate::durable_capacity::descriptor_capacity_facts_with_funding(
+                    &opened.file,
+                    &mut |bytes| {
+                        // Original SDK text, discovery text, its Display scratch
+                        // and outer reason coexist: exact copy plus three
+                        // twofold String capacities, with fixed framing prepaid.
+                        let bytes = bytes
+                            .checked_mul(8)
+                            .and_then(|n| n.checked_add(128))
+                            .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+                        native = Some(input.reserve_historical_scratch(bytes)?);
+                        Ok::<_, OperationJournalStoreError>(())
+                    },
+                )
+                .map_err(|observed| match observed {
+                    crate::durable_capacity::FundedDescriptorError::Observed(observed, _) => {
+                        error(observed)
+                    }
+                    #[cfg(windows)]
+                    crate::durable_capacity::FundedDescriptorError::Funding(error) => error,
+                })?
+            } else {
+                crate::durable_capacity::descriptor_capacity_facts(&opened.file).map_err(error)?
+            };
+            let plan = super::full_capacity_plan_for_record(record)?;
+            let charged=plan.allocations().iter().filter(|a|a.class()==crate::operation_journal::full_capacity::FullCapacityAllocationClass::JournalRecord && a.volume()==&facts.identity)
             .try_fold(0u64,|sum,a|sum.checked_add(a.logical_bytes())).ok_or_else(||error("journal peak overflow"))?;
-        if charged < crate::operation_journal::recording_commands::RECORDING_JOURNAL_PEAK_BYTES {
-            return Err(error(
-                "complete journal/rollback peak not covered on actual descriptor volume",
-            ));
+            if charged < crate::operation_journal::recording_commands::RECORDING_JOURNAL_PEAK_BYTES
+            {
+                return Err(error(
+                    "complete journal/rollback peak not covered on actual descriptor volume",
+                ));
+            }
+            self.validate_namespace_with_input(input, true)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            if let (Some(input), Some(working)) = (input, working) {
+                input.retain_historical_error(working, native, None, None);
+            }
         }
-        self.validate_namespace_with_input(input, true)?;
-        Ok(())
+        result
     }
     pub(crate) fn read_database_claim_inventory(
         &self,

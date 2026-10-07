@@ -2,9 +2,9 @@
 use rusqlite::{Row, types::ValueRef};
 use uuid::Uuid;
 
-pub(super) struct UuidProjection {
-    pub(super) id: Result<Uuid, uuid::Error>,
-    pub(super) canonical: bool,
+pub(in crate::operation_journal::store) struct UuidProjection {
+    pub(in crate::operation_journal::store) id: Result<Uuid, uuid::Error>,
+    pub(in crate::operation_journal::store) canonical: bool,
 }
 // A complete fixed-size page cell, including malformed UUID diagnostics. This
 // fits the original SQL page allowance without any owned input-string payload.
@@ -21,7 +21,10 @@ impl UuidProjection {
     }
 }
 
-pub(super) fn uuid(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<UuidProjection>> {
+pub(in crate::operation_journal::store) fn uuid(
+    row: &Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<UuidProjection>> {
     if let ValueRef::Text(bytes) = row.get_ref(index)? {
         if let Ok(text) = std::str::from_utf8(bytes) {
             // Defer the result until the original caller's validation point. In
@@ -36,7 +39,7 @@ pub(super) fn uuid(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<UuidP
 
 /// Same original nullable String conversion on a funded borrowed statement.
 /// Valid TEXT remains borrowed; fallback can succeed only for NULL.
-pub(super) fn uuid_value(
+pub(in crate::operation_journal::store) fn uuid_value(
     value: ValueRef<'_>,
     index: usize,
     column: &str,
@@ -66,7 +69,11 @@ pub(super) fn uuid_value(
         })
 }
 
-pub(super) fn matches_text(row: &Row<'_>, index: usize, expected: &str) -> rusqlite::Result<bool> {
+pub(in crate::operation_journal::store) fn matches_text(
+    row: &Row<'_>,
+    index: usize,
+    expected: &str,
+) -> rusqlite::Result<bool> {
     if let ValueRef::Text(bytes) = row.get_ref(index)? {
         if let Ok(text) = std::str::from_utf8(bytes) {
             return Ok(text == expected);
@@ -77,7 +84,10 @@ pub(super) fn matches_text(row: &Row<'_>, index: usize, expected: &str) -> rusql
 
 // Keep the exact pinned driver's nullable String errors. This path can succeed
 // only for NULL: valid UTF-8 TEXT already returned through the borrowed branch.
-pub(super) fn copied_text(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
+pub(in crate::operation_journal::store) fn copied_text(
+    row: &Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<String>> {
     let text = row.get::<_, Option<String>>(index)?;
     #[cfg(test)]
     super::SCALAR_COPIED_BYTES.with(|bytes| {
