@@ -1562,6 +1562,56 @@
       "issue": "OPT-2425",
       "reason": "Private test opens the actual exclusive Store on its genuine temporary profile. Passive historical data and original-pool-backed scoped validators exercise complete decoding and metadata audits. The chunk setup uses the existing arithmetic-only provider seam; no native witness, source mutation or effect grant is supplied.",
       "retirement": "Retain only this precise test-only original reader scope. It grants no production opener, physical qualification, retry, refund or native settlement authority. Remove the inventory row if its opener is removed."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_inventory_funding_tests.rs",
+      "function": "funded_binary_inventory_retains_original_loans_until_decoded_inventory_dies",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2426",
+      "reason": "Private actual Store on the genuine temporary profile, exercising original immutable SQLite inventory backing, refusal and selected-error custody. Arithmetic-only fixture metadata grants no physical qualification or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_inventory_funding_tests.rs",
+      "function": "funded_binary_inventory_pressure_refuses_without_mutating_original_claims",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2426",
+      "reason": "Private actual Store on the genuine temporary profile, exercising original immutable SQLite inventory backing, refusal and selected-error custody. Arithmetic-only fixture metadata grants no physical qualification or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_inventory_funding_tests.rs",
+      "function": "funded_binary_inventory_canonical_conflict_retains_selected_original_failure",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2426",
+      "reason": "Private actual Store on the genuine temporary profile, exercising original immutable SQLite inventory backing, refusal and selected-error custody. Arithmetic-only fixture metadata grants no physical qualification or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_inventory_funding_tests.rs",
+      "function": "funded_binary_inventory_missing_root_matches_original_fail_closed_reader",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2426",
+      "reason": "Private actual Store on the genuine temporary profile, exercising original immutable SQLite inventory backing, refusal and selected-error custody. Arithmetic-only fixture metadata grants no physical qualification or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/tests/general_historical_funding.rs",
+      "function": "nested_original_producer_selection_never_refunds_the_earlier_record_failure",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2426",
+      "reason": "Private actual Store on the genuine temporary profile, exercising original immutable SQLite inventory backing, refusal and selected-error custody. Arithmetic-only fixture metadata grants no physical qualification or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
     }
   ]
 }

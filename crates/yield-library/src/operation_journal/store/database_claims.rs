@@ -7,7 +7,9 @@ use crate::operation_journal::{AdmissionClaimInventory, OperationId};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+mod funded;
 mod scalar_projection;
+pub(super) use funded::{Inventory as RetainedDatabaseInventory, read_with_input};
 
 pub(super) const BINDING_TABLE: &str = "operation_journal_database_binding";
 pub(super) const SLICE_TABLE: &str = "operation_journal_database_claim_slice";
@@ -406,8 +408,16 @@ impl OperationJournalStore {
         Ok(())
     }
     /// Bounded restart audit. Stored bytes never recreate a live nonce, reservation or permit.
+    #[cfg(test)]
     pub(super) fn validate_database_claims_inside_transaction(
         &self,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.validate_database_claims_inside_transaction_with_input(None)
+    }
+
+    pub(super) fn validate_database_claims_inside_transaction_with_input(
+        &self,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
         bounded_count(&self.connection, BINDING_TABLE)?;
         bounded_count(&self.connection, SLICE_TABLE)?;
@@ -443,11 +453,11 @@ impl OperationJournalStore {
                             .read_row(operation)?
                             .ok_or_else(|| error("orphan inventory"))?
                             .record;
-                        let inventory = read(&self.connection, operation)?
+                        let inventory = read_with_input(&self.connection, operation, input)?
                             .ok_or_else(|| error("missing restart inventory"))?;
                         self.validate_database_claim_record(&record, &inventory)?;
                     } else {
-                        let inventory = read(&self.connection, operation)?
+                        let inventory = read_with_input(&self.connection, operation, input)?
                             .ok_or_else(|| error("missing restart inventory"))?;
                         self.validate_database_claim_operation(operation, &inventory)?;
                     }

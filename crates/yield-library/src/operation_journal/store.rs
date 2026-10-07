@@ -7525,7 +7525,7 @@ impl OperationJournalStore {
         input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
         self.validate_recording_inventory_inside_transaction()?;
-        self.validate_database_claims_inside_transaction()?;
+        self.validate_database_claims_inside_transaction_with_input(input)?;
         self.validate_database_attempts_inside_transaction_with_input(input)?;
         if chunk_claims::exceeds_row_limit(&self.connection, ordinary_claims::MAX_PAGE_ROWS)
             .map_err(|error| OperationJournalStoreError::ChunkClaim {

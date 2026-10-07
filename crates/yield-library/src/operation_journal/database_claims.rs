@@ -7,7 +7,11 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod decode_backing;
 pub(crate) mod retirement_forward_policy;
+pub(in crate::operation_journal) use decode_backing::{
+    decode_backing_bytes, partial_decode_backing_bytes,
+};
 
 use super::admission_claims::AdmissionClaimInventory;
 use super::full_capacity::{FullCapacityAllocationClass, FullCapacityPlan};

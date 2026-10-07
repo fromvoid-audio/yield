@@ -582,6 +582,16 @@ mod source_lease_binding_storage {
             "inventory count"
         );
     }
+    fn assert_funded_inventory(store: &OperationJournalStore, record: &StoredOperationRecord, expected: &DatabaseClaimInventory) {
+        let funding = crate::operation_journal::owner::JournalNamespaceFundingProbe::new();
+        let before = funding.remaining_bytes();
+        let value = database_claims::read_with_input(&store.connection, record.operation_id, Some(&funding.input)).unwrap().unwrap();
+        assert_eq!(&*value, expected);
+        assert!(funding.remaining_bytes() < before);
+        drop(value);
+        assert_eq!(funding.remaining_bytes(), before);
+    }
+
     fn actual_atomic_storage_attempts_and_legacy_reopen() {
         for fault in 0..3 {
             let f = fixture();
@@ -644,6 +654,8 @@ mod source_lease_binding_storage {
                     .unwrap(),
                 old_inventory
             );
+            assert_funded_inventory(&store, &record, &inventory);
+            assert_funded_inventory(&store, &old, &old_inventory);
             let b = inventory
                 .bindings()
                 .iter()
