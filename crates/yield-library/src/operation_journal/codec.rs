@@ -1933,12 +1933,6 @@ pub(super) fn parse_unique_value(bytes: &[u8]) -> Result<Value, serde_json::Erro
     materialization::parse(bytes, None).map_err(|failure| failure.error)
 }
 
-/// Encode one stored record using its persisted schema and a capped writer.
-///
-/// Encoding preserves the exact V1/V2 field and enum representation and emits the explicit V3
-/// universal-intent envelope. The V3 branch accepts only the initial durable-intent shape, while
-/// V4 and V5 encode their explicitly bounded pre-publication observations; later transition and
-/// publication-policy validation belongs to the owner boundary.
 pub(in crate::operation_journal) fn validate_encoding_family(
     record: &StoredOperationRecord,
 ) -> Result<(), EncodeError> {
@@ -2013,6 +2007,12 @@ pub(in crate::operation_journal) fn validate_encoding_family(
     Ok(())
 }
 
+/// Encode one stored record using its persisted schema and a capped writer.
+///
+/// Encoding preserves the exact V1/V2 field and enum representation and emits the explicit V3
+/// universal-intent envelope. The V3 branch accepts only the initial durable-intent shape, while
+/// V4 and V5 encode their explicitly bounded pre-publication observations; later transition and
+/// publication-policy validation belongs to the owner boundary.
 pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
     validate_encoding_family(record)?;
     let mut writer = CappedWriter::new(MAX_RECORD_BYTES);
