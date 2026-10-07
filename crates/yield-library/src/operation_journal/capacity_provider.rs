@@ -24,6 +24,9 @@ use crate::operation_journal::model::OperationId;
 use uuid::Uuid;
 
 mod charge_observer;
+mod funded_admission;
+#[cfg(any(test, feature = "test-support"))]
+pub use funded_admission::AdmissionGrowthProbe;
 mod funded_reconciliation;
 mod funded_startup;
 mod retained_backing;
@@ -83,6 +86,8 @@ struct ProvisionalLedger {
     #[cfg(test)]
     fail_disposition: bool,
     _rebuild_credit: Option<super::owner::StartupCredit>,
+    // Last: original dynamic loans outlive every retained ledger graph.
+    _growth_credit: Option<funded_admission::GrowthCredit>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,6 +159,17 @@ impl Default for ProvisionalLedger {
     }
 }
 impl ProvisionalLedger {
+    fn return_unused_growth_credit(&mut self) {
+        // Existing genuine release rules have already removed the original graphs.
+        // An alias to the empty fixed ledger does not retain dynamic backing. Never
+        // refund growth while durable charge or release history allocations survive.
+        if self.charges_by_token.is_empty()
+            && self.aggregate_charges.is_empty()
+            && self.released_claims.is_empty()
+        {
+            drop(self._growth_credit.take());
+        }
+    }
     fn default_without_mirror(mirror: RetainedArc<ChargeMirror>) -> Self {
         Self {
             mirror,
@@ -166,6 +182,7 @@ impl ProvisionalLedger {
             #[cfg(test)]
             fail_disposition: false,
             _rebuild_credit: None,
+            _growth_credit: None,
         }
     }
 }
@@ -425,6 +442,18 @@ impl CapacityProvider {
     ) -> Result<ProvisionalCapacityLease, CapacityProviderError> {
         super::capacity_admission_telemetry::observe(|| {
             self.admit_with_facts(plan, claims, witness.facts())
+        })
+    }
+
+    pub(super) fn admit_with_live_witness_for_input(
+        &self,
+        plan: &FullCapacityPlan,
+        claims: &AdmissionClaimInventory,
+        witness: super::owner::LiveAdmissionWitness<'_>,
+        input: &super::owner::InputPermit,
+    ) -> Result<ProvisionalCapacityLease, CapacityProviderError> {
+        super::capacity_admission_telemetry::observe(|| {
+            funded_admission::admit(self, plan, claims, witness.facts(), input)
         })
     }
 
@@ -755,6 +784,7 @@ impl CapacityProvider {
             charges: charge_by_key,
             claim_ids,
             disposition: ProvisionalLeaseDisposition::Provisional,
+            _input_credit: None,
         })
     }
 
@@ -1148,6 +1178,7 @@ fn stage_rebuilt_ledger(
         #[cfg(test)]
         fail_disposition: false,
         _rebuild_credit: None,
+        _growth_credit: None,
     };
 
     for (operation_id, operation_claims) in by_operation {
@@ -1357,6 +1388,8 @@ pub(crate) struct ProvisionalCapacityLease {
     charges: BTreeMap<ChargeKey, u64>,
     claim_ids: Vec<AdmissionClaimId>,
     disposition: ProvisionalLeaseDisposition,
+    // Last: maps and all original/replacement claim-id vectors drop first.
+    _input_credit: Option<super::owner::StartupCredit>,
 }
 
 /// The owner-thread disposition of one provisional ledger token.
@@ -1515,6 +1548,7 @@ impl ProvisionalCapacityLease {
         ledger.charges_by_token.remove(&self.token);
         self.disposition = ProvisionalLeaseDisposition::Released;
         mutation.finish(&ledger);
+        ledger.return_unused_growth_credit();
         Ok(())
     }
 
@@ -1705,6 +1739,9 @@ impl ProvisionalCapacityLease {
         ledger.charges_by_token.remove(&self.token);
         self.disposition = ProvisionalLeaseDisposition::Released;
         mutation.finish(&ledger);
+        // The original temporary clone must die before the loan covering it.
+        drop(owned_charges);
+        ledger.return_unused_growth_credit();
         Ok(())
     }
 
