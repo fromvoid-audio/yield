@@ -197,6 +197,7 @@ pub(super) fn working_bytes(
         "operation journal cannot verify SQLite connection identity: ",
         "SQLite connection identity check failed for : ",
         "operation journal connection has an active transaction",
+        "checkpoint postcommit namespace: grant postcommit namespace: ; rollback unconfirmed: replay rollback unconfirmed: ",
         "journal database is not a regular file",
         "stable identity is unavailable for the open journal file",
         "SQLite sidecar  is a symlink",

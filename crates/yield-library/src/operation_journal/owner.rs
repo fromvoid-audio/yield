@@ -2679,7 +2679,9 @@ impl OwnerRuntime {
                 })?;
         drop(completion_bytes);
         drop(completion_command);
-        let checkpoint_result = self.store().checkpoint_staging_result(validation);
+        let checkpoint_result = self
+            .store()
+            .checkpoint_staging_result_funded(validation, &input);
         let checkpoint: StagingCheckpointAck = self
             .publication_write_result(checkpoint_result)?
             .ok_or_else(|| OperationJournalOwnerError::StagingGrant {
@@ -2689,7 +2691,7 @@ impl OwnerRuntime {
         validate_publication_target(&target)?;
         let grant_result = self
             .store()
-            .reserve_staging_grant(checkpoint, validation, binding);
+            .reserve_staging_grant(checkpoint, validation, binding, &input);
         self.publication_write_result(grant_result)?;
         validate_publication_target(&target)?;
         provider
@@ -2728,7 +2730,8 @@ impl OwnerRuntime {
     ) -> Result<T, OperationJournalOwnerError> {
         if matches!(
             &result,
-            Err(OperationJournalStoreError::StagingOutcomeUncertain { .. })
+            Err(OperationJournalStoreError::StagingOutcomeUncertain { .. }
+                | OperationJournalStoreError::StagingNamespaceOutcomeUncertain)
         ) {
             self.resource_admission.invalidate();
         }
@@ -5279,9 +5282,10 @@ impl OperationJournalClient {
         source_pin: SourceEffectPin,
     ) -> Result<OperationJournalRequest<StagingPublicationGrant>, OperationJournalOwnerQueueError>
     {
-        self.submit_funded(
+        self.submit_funded_with_reply(
             InputClass::Ordinary,
             64 * 1024,
+            true,
             true,
             move |input, result| JournalCommand::CheckpointStaging {
                 target,
@@ -7821,6 +7825,29 @@ mod tests {
         _config: ConfigBaseGuard,
         _base: tempfile::TempDir,
         _runtime: TestRuntimeGuard,
+    }
+
+    #[test]
+    fn publication_namespace_exhaustion_after_commit_quarantines_original_runtime() {
+        let fixture = fixture("publication-namespace-uncertain-original-runtime");
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        let runtime = OwnerRuntime::new(store).unwrap();
+        assert!(runtime.resource_admission.activate(|| true));
+        let result: Result<(), OperationJournalStoreError> =
+            Err(OperationJournalStoreError::StagingNamespaceOutcomeUncertain);
+        assert!(matches!(
+            runtime.publication_write_result(result),
+            Err(OperationJournalOwnerError::Store(
+                OperationJournalStoreError::StagingNamespaceOutcomeUncertain
+            ))
+        ));
+        assert!(matches!(
+            runtime.resource_admission.validate_open(),
+            Err(resource_custody::UseError::Unknown)
+        ));
+        runtime.publication_write_result(Ok(())).unwrap();
+        assert!(!runtime.resource_admission.activate(|| true));
+        assert!(!runtime.resource_admission.close_and_wait());
     }
 
     fn fixture(name: &str) -> Fixture {
