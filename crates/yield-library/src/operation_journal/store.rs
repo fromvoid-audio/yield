@@ -322,6 +322,12 @@ pub enum OperationJournalStoreError {
         /// Diagnostic for the unconfirmed commit, rollback or readback.
         reason: String,
     },
+    /// Namespace backing ran out after a staging commit; preserve its durable evidence.
+    /// This fixed refusal allocates no diagnostic under exhausted journal-pool pressure.
+    #[error(
+        "operation journal staging namespace backing unavailable after commit; recovery required"
+    )]
+    StagingNamespaceOutcomeUncertain,
     /// A capability-bound incomplete chunk checkpoint failed closed.
     #[error("operation journal chunk staging error: {reason}")]
     ChunkStaging {

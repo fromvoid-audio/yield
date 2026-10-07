@@ -12,6 +12,7 @@ use crate::file_operation_owner::{
     AuthorityFence, EffectOutcome, FileOperationResult, RootRegistrationRef, RootRole,
 };
 use crate::operation_journal::model::OperationId;
+use crate::operation_journal::owner::InputPermit;
 use crate::operation_journal::participants::{ParticipantId, ParticipantKind};
 
 #[cfg(test)]
@@ -419,6 +420,18 @@ fn uncertain_outcome(reason: impl Into<String>) -> OperationJournalStoreError {
     }
 }
 
+fn postcommit_namespace_error(
+    phase: &'static str,
+    error: OperationJournalStoreError,
+) -> OperationJournalStoreError {
+    match error {
+        OperationJournalStoreError::OrdinaryRebuildResourceBound => {
+            OperationJournalStoreError::StagingNamespaceOutcomeUncertain
+        }
+        error => uncertain_outcome(format!("{phase} postcommit namespace: {error}")),
+    }
+}
+
 impl OperationJournalStore {
     fn rollback_staging_error(
         &self,
@@ -440,6 +453,21 @@ impl OperationJournalStore {
             ))
         })
     }
+    pub(in crate::operation_journal) fn checkpoint_staging_result_funded(
+        &self,
+        result: &FileOperationResult,
+        input: &InputPermit,
+    ) -> Result<Option<StagingCheckpointAck>, OperationJournalStoreError> {
+        let record = StagingCheckpointRecord::from_file_result(result).map_err(checkpoint_error)?;
+        match self.checkpoint_staging_with_input(&record, Some(input))? {
+            StagingCheckpointReceipt::Committed { sequence } => {
+                Ok(Some(StagingCheckpointAck { record, sequence }))
+            }
+            StagingCheckpointReceipt::Replay { .. } => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn checkpoint_staging_result(
         &self,
         result: &FileOperationResult,
@@ -455,12 +483,21 @@ impl OperationJournalStore {
 
     /// Acknowledge the exact file-owner observation only after a durable write and readback.
     /// A replay is deliberately read-only and cannot issue a publication grant.
+    #[cfg(test)]
     pub(super) fn checkpoint_staging(
         &self,
         record: &StagingCheckpointRecord,
     ) -> Result<StagingCheckpointReceipt, OperationJournalStoreError> {
+        self.checkpoint_staging_with_input(record, None)
+    }
+
+    pub(super) fn checkpoint_staging_with_input(
+        &self,
+        record: &StagingCheckpointRecord,
+        input: Option<&InputPermit>,
+    ) -> Result<StagingCheckpointReceipt, OperationJournalStoreError> {
         let encoded = record.encode().map_err(checkpoint_error)?;
-        self.validate_namespace()?;
+        self.validate_namespace_with_input(input, false)?;
         self.connection.execute_batch("BEGIN EXCLUSIVE")?;
         let outcome = (|| {
             let operation = self
@@ -541,7 +578,7 @@ impl OperationJournalStore {
                     "checkpoint precommit failed: {error}"
                 )));
             }
-            self.validate_namespace_for_precommit()?;
+            self.validate_namespace_with_input(input, true)?;
             Ok(StagingCheckpointReceipt::Committed { sequence })
         })();
         let outcome = match outcome {
@@ -554,7 +591,7 @@ impl OperationJournalStore {
             self.connection.execute_batch("ROLLBACK").map_err(|error| {
                 uncertain_outcome(format!("replay rollback unconfirmed: {error}"))
             })?;
-            self.validate_namespace()?;
+            self.validate_namespace_with_input(input, false)?;
             return Ok(outcome);
         }
         #[cfg(test)]
@@ -582,9 +619,8 @@ impl OperationJournalStore {
                 "checkpoint committed without acknowledgement: {error}"
             )));
         }
-        self.validate_namespace().map_err(|error| {
-            uncertain_outcome(format!("checkpoint postcommit namespace: {error}"))
-        })?;
+        self.validate_namespace_with_input(input, false)
+            .map_err(|error| postcommit_namespace_error("checkpoint", error))?;
         let (sequence, readback, reserved) = self
             .read_staging_checkpoint_row(record.output_id())
             .map_err(|error| uncertain_outcome(format!("checkpoint readback failed: {error}")))?
@@ -602,11 +638,12 @@ impl OperationJournalStore {
 
     /// Consume an acknowledged checkpoint exactly once. A decoded row alone cannot call this:
     /// the caller must supply the fresh private file-owner result again.
-    pub(crate) fn reserve_staging_grant(
+    pub(in crate::operation_journal) fn reserve_staging_grant(
         &self,
         acknowledgement: StagingCheckpointAck,
         result: &FileOperationResult,
         mut binding: super::PublicationBindingDraft,
+        input: &InputPermit,
     ) -> Result<(), OperationJournalStoreError> {
         let record = StagingCheckpointRecord::from_file_result(result).map_err(checkpoint_error)?;
         if record != acknowledgement.record {
@@ -615,7 +652,12 @@ impl OperationJournalStore {
             ));
         }
         binding.finish(acknowledgement.sequence);
-        self.reserve_staging_grant_record_bound(&record, acknowledgement.sequence, Some(&binding))
+        self.reserve_staging_grant_record_bound(
+            &record,
+            acknowledgement.sequence,
+            Some(&binding),
+            Some(input),
+        )
     }
 
     // Exact old-schema reservation fixture only. Production issuance always binds its record.
@@ -625,7 +667,7 @@ impl OperationJournalStore {
         record: &StagingCheckpointRecord,
         acknowledged_sequence: i64,
     ) -> Result<(), OperationJournalStoreError> {
-        self.reserve_staging_grant_record_bound(record, acknowledged_sequence, None)
+        self.reserve_staging_grant_record_bound(record, acknowledged_sequence, None, None)
     }
 
     fn reserve_staging_grant_record_bound(
@@ -633,8 +675,9 @@ impl OperationJournalStore {
         record: &StagingCheckpointRecord,
         acknowledged_sequence: i64,
         binding: Option<&super::PublicationBindingDraft>,
+        input: Option<&InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
-        self.validate_namespace()?;
+        self.validate_namespace_with_input(input, false)?;
         self.connection.execute_batch("BEGIN EXCLUSIVE")?;
         let transition = (|| {
             let operation = self
@@ -675,7 +718,7 @@ impl OperationJournalStore {
             {
                 return Err(checkpoint_error(format!("grant precommit failed: {error}")));
             }
-            self.validate_namespace_for_precommit()?;
+            self.validate_namespace_with_input(input, true)?;
             Ok(())
         })();
         if let Err(error) = transition {
@@ -706,8 +749,8 @@ impl OperationJournalStore {
                 "grant committed without acknowledgement: {error}"
             )));
         }
-        self.validate_namespace()
-            .map_err(|error| uncertain_outcome(format!("grant postcommit namespace: {error}")))?;
+        self.validate_namespace_with_input(input, false)
+            .map_err(|error| postcommit_namespace_error("grant", error))?;
         let (_, retained, reserved) = self
             .read_staging_checkpoint_row(record.output_id())
             .map_err(|error| uncertain_outcome(format!("grant readback failed: {error}")))?
@@ -743,7 +786,19 @@ impl OperationJournalStore {
         mut binding: super::PublicationBindingDraft,
     ) -> Result<(), OperationJournalStoreError> {
         binding.finish(sequence);
-        self.reserve_staging_grant_record_bound(record, sequence, Some(&binding))
+        self.reserve_staging_grant_record_bound(record, sequence, Some(&binding), None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserve_publication_binding_funded_fixture(
+        &self,
+        record: &StagingCheckpointRecord,
+        sequence: i64,
+        mut binding: super::PublicationBindingDraft,
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
+        binding.finish(sequence);
+        self.reserve_staging_grant_record_bound(record, sequence, Some(&binding), Some(input))
     }
 
     pub(super) fn read_staging_checkpoint_row(

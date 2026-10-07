@@ -80,6 +80,157 @@ mod publication_issuance {
         };
         (fixture, store, staging, binding, sequence)
     }
+    #[test]
+    fn publication_namespace_pressure_refuses_checkpoint_and_grant_before_writes() {
+        let (_fixture, store, staging, binding, sequence) = prepared();
+        let funding = super::super::super::owner::JournalNamespaceFundingProbe::new();
+        let pressure = funding.input.reserve_historical_scratch(funding.remaining_bytes()).unwrap();
+        assert!(matches!(
+            store.reserve_publication_binding_funded_fixture(&staging, sequence, binding.clone(), &funding.input),
+            Err(OperationJournalStoreError::OrdinaryRebuildResourceBound)
+        ));
+        assert!(!store.read_staging_checkpoint_row(staging.output_id()).unwrap().unwrap().2);
+        assert!(store.read_publication_binding(staging.output_id()).unwrap().is_none());
+        store.connection.execute("DELETE FROM operation_journal_staging_checkpoints", []).unwrap();
+        assert!(matches!(
+            store.checkpoint_staging_with_input(&staging, Some(&funding.input)),
+            Err(OperationJournalStoreError::OrdinaryRebuildResourceBound)
+        ));
+        assert!(store.read_staging_checkpoint_row(staging.output_id()).unwrap().is_none());
+        drop(pressure);
+        assert!(matches!(
+            store.checkpoint_staging_with_input(&staging, Some(&funding.input)).unwrap(),
+            staging_checkpoints::StagingCheckpointReceipt::Committed { .. }
+        ));
+    }
+
+    #[test]
+    fn publication_namespace_success_and_replay_return_temporary_debits() {
+        let (_fixture, store, staging, binding, _) = prepared();
+        store.connection.execute("DELETE FROM operation_journal_staging_checkpoints", []).unwrap();
+        let funding = super::super::super::owner::JournalNamespaceFundingProbe::new();
+        let before = funding.remaining_bytes();
+        let sequence = match store.checkpoint_staging_with_input(&staging, Some(&funding.input)).unwrap() {
+            staging_checkpoints::StagingCheckpointReceipt::Committed { sequence } => sequence,
+            _ => panic!("fresh checkpoint"),
+        };
+        assert_eq!(funding.remaining_bytes(), before);
+        assert_eq!(store.checkpoint_staging_with_input(&staging, Some(&funding.input)).unwrap(),
+            staging_checkpoints::StagingCheckpointReceipt::Replay { sequence });
+        assert_eq!(funding.remaining_bytes(), before);
+        store.reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input).unwrap();
+        assert_eq!(funding.remaining_bytes(), before);
+        assert!(store.read_staging_checkpoint_row(staging.output_id()).unwrap().unwrap().2);
+        assert!(store.read_publication_binding(staging.output_id()).unwrap().is_some());
+    }
+
+    #[test]
+    fn publication_namespace_selected_failure_keeps_original_debit_after_input_drop() {
+        let (_fixture, store, staging, binding, sequence) = prepared();
+        let funding = super::super::super::owner::JournalNamespaceFundingProbe::new();
+        let observer = funding.pool_bytes_observer_for_test();
+        let sidecar = store.database_path.with_file_name(format!("{JOURNAL_DATABASE_FILE_NAME}{SQLITE_WAL_SUFFIX}"));
+        std::fs::write(sidecar, b"unexpected namespace evidence").unwrap();
+        let before = funding.remaining_bytes();
+        let error = store.reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input).unwrap_err();
+        assert!(funding.remaining_bytes() < before);
+        let error = funding.retain_command_error_for_test(error);
+        assert!(matches!(error, super::super::super::owner::OperationJournalOwnerError::RetainedBacking(_)));
+        drop(funding);
+        assert!(observer().0 < observer().1);
+        drop(error);
+        assert_eq!(observer().0, observer().1);
+        // The actual open SQLite connection remains unchanged; no reservation was written.
+        assert_eq!(store.connection.query_row("SELECT grant_reserved FROM operation_journal_staging_checkpoints", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn publication_namespace_postcommit_failure_retains_reserved_binding_and_error_debit() {
+        let (_fixture, store, staging, binding, sequence) = prepared();
+        let funding = super::super::super::owner::JournalNamespaceFundingProbe::new();
+        let observer = funding.pool_bytes_observer_for_test();
+        let path = store.database_path.clone();
+        store.set_insert_test_hook(move |boundary| {
+            if boundary == InsertTestBoundary::AfterCommit {
+                let sidecar = path.with_file_name(format!("{JOURNAL_DATABASE_FILE_NAME}{SQLITE_WAL_SUFFIX}"));
+                std::fs::write(sidecar, b"unexpected namespace evidence").unwrap();
+            }
+            InsertTestDirective::Continue
+        });
+        let error = store.reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input).unwrap_err();
+        assert!(matches!(error, OperationJournalStoreError::StagingOutcomeUncertain { .. }));
+        let error = funding.retain_command_error_for_test(error);
+        drop(funding);
+        assert!(observer().0 < observer().1);
+        assert_eq!(store.connection.query_row("SELECT grant_reserved FROM operation_journal_staging_checkpoints", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(store.connection.query_row("SELECT COUNT(*) FROM operation_journal_publication_issuance", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        drop(error);
+        assert_eq!(observer().0, observer().1);
+    }
+
+    #[test]
+    fn publication_namespace_precommit_pressure_rolls_back_both_original_transactions() {
+        for grant in [false, true] {
+            let (_fixture, store, staging, binding, sequence) = prepared();
+            if !grant {
+                store.connection.execute("DELETE FROM operation_journal_staging_checkpoints", []).unwrap();
+            }
+            let funding = std::sync::Arc::new(super::super::super::owner::JournalNamespaceFundingProbe::new());
+            let pressure = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let held = pressure.clone();
+            let original = funding.clone();
+            store.set_insert_test_hook(move |boundary| {
+                if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                    *held.lock().unwrap() = Some(original.input.reserve_historical_scratch(original.remaining_bytes()).unwrap());
+                }
+                InsertTestDirective::Continue
+            });
+            let result = if grant {
+                store.reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input)
+            } else {
+                store.checkpoint_staging_with_input(&staging, Some(&funding.input)).map(|_| ())
+            };
+            assert!(matches!(result, Err(OperationJournalStoreError::OrdinaryRebuildResourceBound)));
+            assert!(store.connection.is_autocommit());
+            assert!(store.read_publication_binding(staging.output_id()).unwrap().is_none());
+            let row = store.read_staging_checkpoint_row(staging.output_id()).unwrap();
+            assert_eq!(row.is_some(), grant);
+            assert!(row.is_none_or(|(_, _, reserved)| !reserved));
+            drop(pressure.lock().unwrap().take());
+        }
+    }
+
+    #[test]
+    fn publication_namespace_postcommit_pressure_preserves_commit_with_fixed_uncertainty() {
+        for grant in [false, true] {
+            let (_fixture, store, staging, binding, sequence) = prepared();
+            if !grant {
+                store.connection.execute("DELETE FROM operation_journal_staging_checkpoints", []).unwrap();
+            }
+            let funding = std::sync::Arc::new(super::super::super::owner::JournalNamespaceFundingProbe::new());
+            let pressure = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let held = pressure.clone();
+            let original = funding.clone();
+            store.set_insert_test_hook(move |boundary| {
+                if boundary == InsertTestBoundary::AfterCommit {
+                    *held.lock().unwrap() = Some(original.input.reserve_historical_scratch(original.remaining_bytes()).unwrap());
+                }
+                InsertTestDirective::Continue
+            });
+            let result = if grant {
+                store.reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input)
+            } else {
+                store.checkpoint_staging_with_input(&staging, Some(&funding.input)).map(|_| ())
+            };
+            assert!(matches!(result, Err(OperationJournalStoreError::StagingNamespaceOutcomeUncertain)));
+            assert!(store.connection.is_autocommit());
+            assert_eq!(store.read_staging_checkpoint_row(staging.output_id()).unwrap().unwrap().2, grant);
+            assert_eq!(store.read_publication_binding(staging.output_id()).unwrap().is_some(), grant);
+            assert_eq!(funding.remaining_bytes(), 0);
+            drop(pressure.lock().unwrap().take());
+        }
+    }
+
     fn command_bytes(
         staging: &staging_checkpoints::StagingCheckpointRecord,
         owner: Uuid,

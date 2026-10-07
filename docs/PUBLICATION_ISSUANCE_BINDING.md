@@ -47,8 +47,8 @@ original target and native capsule retain their separate existing backing.
 
 The 60 KiB calculation covers only the typed issuance/staging projections and
 their encoding, parsing and error-formatting phases described above. It does not
-cover the existing generic operation `read_row(operation)`, namespace validation,
-SQLite internal allocations or native machinery used by the reservation path.
+cover the existing generic operation `read_row(operation)`, SQLite internal allocations
+or native machinery used by the reservation path.
 Their complete admission backing remains an unresolved implementation contract
 under OPT-2215 and the related admission work; this decoder leaf does not qualify
 the whole issuer's memory usage or defer that implementation gap to native testing.
@@ -72,3 +72,32 @@ This leaf does not implement completion settlement or a positive namespace backe
 OPT-2215/2216/2217/2218, native qualification and database/physical settlement parents
 remain open. See [publication lifetime](PUBLICATION_LIFETIME_GATE.md) and
 [database-attempt limits](WAL_ATTEMPT_LEDGER.md).
+
+## Original namespace backing (OPT-2422)
+
+The original CheckpointStaging queue prepays the existing non-Clone reply keeper
+before constructing its command. Both original staging transactions borrow that
+same input for namespace checks at entry, precommit, postcommit and checkpoint
+replay. Each guard derives its working loan from the retained Store's actual
+root, profile and database paths and debits the original ordinary journal pool
+before traversal. Native diagnostic text is separately measured and prepaid
+before copying. These loans supplement the existing publication input allowance;
+they do not enlarge either pool or claim the complete issuer is funded.
+
+Successful guards free their temporary storage before returning their debit.
+A selected namespace failure transfers its original credits to the reply keeper;
+the returned non-Clone RetainedBacking error frees its error allocation before
+releasing the final keeper. Entry exhaustion refuses before a transaction;
+precommit exhaustion rolls back; postcommit exhaustion returns a fixed, allocation-free
+uncertain-outcome variant. Both that variant and observed namespace failure remain
+an uncertain outcome
+with the original reserved binding retained and admission quarantined. No grant
+is returned from an uncertain transaction. Historical authority-free Store tests
+use explicit unfunded fixture entry points; production issuance requires its
+original funded input.
+
+Real SQLite tests cover checkpoint and reservation pressure, successful commit
+and replay, actual unexpected namespace sidecars, and namespace loss after the
+reservation commit. Those fixtures issue no live publication authority or native
+positive effect. Generic operation decoding, other issuer validators and SQLite
+internal/native storage still need their complete original backing under OPT-2215.
