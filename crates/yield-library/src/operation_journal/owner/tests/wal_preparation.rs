@@ -650,6 +650,7 @@ mod integration {
             })
             .collect();
         let input = WalPreparationInput::from_universal(
+            journal.client().reserve_wal_preparation().unwrap(),
             &args,
             &participants,
             &plan,
@@ -880,6 +881,7 @@ mod integration {
                 })
                 .collect();
             WalPreparationInput::from_universal(
+                self.journal.client().reserve_wal_preparation().unwrap(),
                 &args,
                 &participants,
                 &plan,
@@ -1250,6 +1252,7 @@ mod integration {
                 Some(rig.global.wal_preparation_client())
             };
             let result = WalPreparationInput::from_universal(
+                rig.journal.client().reserve_wal_preparation().unwrap(),
                 &args,
                 &participants,
                 &plan,
@@ -1336,6 +1339,7 @@ mod integration {
                 })
                 .collect();
             let input = WalPreparationInput::from_universal(
+                rig.journal.client().reserve_wal_preparation().unwrap(),
                 &args,
                 &participants,
                 &plan,
@@ -1396,6 +1400,7 @@ mod integration {
             })
             .collect();
         let input = WalPreparationInput::from_universal(
+            rig.journal.client().reserve_wal_preparation().unwrap(),
             &args,
             &participants,
             &plan,
@@ -1479,6 +1484,7 @@ mod integration {
         };
 
         let input = WalPreparationInput::from_lease_scope(
+            journal.client().reserve_wal_preparation().unwrap(),
             &participants,
             &plan,
             &claims,
@@ -2017,6 +2023,7 @@ mod integration {
             assert!(
                 matches!(
                     WalPreparationInput::from_universal(
+                        journal.client().reserve_wal_preparation().unwrap(),
                         &UniversalCommandArgs::SourceRegistryRetirement(other),
                         &other_participants,
                         &plan,
@@ -2045,6 +2052,7 @@ mod integration {
             assert!(
                 matches!(
                     WalPreparationInput::from_lease_scope(
+                        journal.client().reserve_wal_preparation().unwrap(),
                         &lease_participants,
                         &plan,
                         &claims,
@@ -2058,6 +2066,7 @@ mod integration {
         }
         assert!(matches!(
             WalPreparationInput::from_universal(
+                journal.client().reserve_wal_preparation().unwrap(),
                 &args,
                 &participants,
                 &plan,
@@ -2070,6 +2079,7 @@ mod integration {
         ));
         assert!(matches!(
             WalPreparationInput::from_universal(
+                journal.client().reserve_wal_preparation().unwrap(),
                 &args,
                 &participants,
                 &plan,
@@ -2099,6 +2109,7 @@ mod integration {
         ] {
             assert!(matches!(
                 WalPreparationInput::from_universal(
+                    journal.client().reserve_wal_preparation().unwrap(),
                     &args,
                     &participants,
                     &plan,
@@ -2111,6 +2122,7 @@ mod integration {
             ));
         }
         let mut input = WalPreparationInput::from_universal(
+            journal.client().reserve_wal_preparation().unwrap(),
             &args,
             &participants,
             &plan,
@@ -2180,13 +2192,7 @@ mod integration {
                 .unwrap()
                 .unwrap()
         } else {
-            let permit = journal
-                .shared
-                .reserve_input(
-                    InputClass::Ordinary,
-                    crate::operation_journal::wal_admission::HANDSHAKE_MAX_BYTES,
-                )
-                .unwrap();
+            let permit = input.funding.take().expect("original factory debit").input;
             let acquisition = Uuid::parse_str(fixture.owner.owner_identity()).unwrap();
             let (mut collector, handle) =
                 crate::operation_journal::wal_admission::Collector::new(input, permit, acquisition)
@@ -3250,6 +3256,7 @@ mod integration {
                 .unwrap();
                 let participants = args.participant_observation().unwrap();
                 WalPreparationInput::from_universal(
+                    journal.client().reserve_wal_preparation().unwrap(),
                     &UniversalCommandArgs::SourceDerivedLayout(args),
                     &participants,
                     &plan,
@@ -3284,6 +3291,7 @@ mod integration {
                     .unwrap();
                 let args=crate::operation_journal::metadata_tag_commands::MetadataTagSourceIntentArgs::from_observation(&writer,&observation,participant,SourceCommandId::new()).unwrap();
                 WalPreparationInput::from_tag(
+                    journal.client().reserve_wal_preparation().unwrap(),
                     &writer,
                     &args,
                     &plan,
@@ -3627,5 +3635,244 @@ mod integration {
             0
         );
         assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn original_wal_factory_prepayment_refuses_pool_pressure_before_factory_work() {
+        let rig = Rig::new("wal-factory-pressure");
+        let client = rig.journal.client();
+        let baseline = *client.shared.input_bytes.lock().unwrap();
+        let pressure = client
+            .shared
+            .reserve_input(
+                InputClass::Ordinary,
+                baseline.remaining[0]
+                    - crate::operation_journal::wal_admission::HANDSHAKE_MAX_BYTES
+                    + 1,
+            )
+            .unwrap();
+        assert!(matches!(
+            client.reserve_wal_preparation(),
+            Err(OperationJournalOwnerQueueError::InputBytesFull { .. })
+        ));
+        assert!(
+            rig.actor
+                .as_ref()
+                .unwrap()
+                .events
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(rig.journal.prepared_admission_id_allocations(), 0);
+        assert_eq!(
+            client.shared.input_bytes.lock().unwrap().remaining[1],
+            baseline.remaining[1]
+        );
+        drop(pressure);
+        let token = client.reserve_wal_preparation().unwrap();
+        assert_eq!(
+            baseline.remaining[0] - client.shared.input_bytes.lock().unwrap().remaining[0],
+            64 * 1024
+        );
+        drop(token);
+        assert_eq!(*client.shared.input_bytes.lock().unwrap(), baseline);
+    }
+
+    #[test]
+    fn original_wal_factory_rejection_and_allocation_alias_keep_exact_prepaid_debit() {
+        let rig = Rig::new("wal-factory-rejection");
+        let client = rig.journal.client();
+        let baseline = *client.shared.input_bytes.lock().unwrap();
+        let (args, participants, _) = command(&rig.fixture, &rig.revisions);
+        let (plan, claims, _, _) = plan(&rig.fixture);
+        assert!(matches!(
+            WalPreparationInput::from_universal(
+                client.reserve_wal_preparation().unwrap(),
+                &args,
+                &participants,
+                &plan,
+                &claims,
+                Vec::new(),
+                Some(rig.global.wal_preparation_client()),
+                Instant::now(),
+            ),
+            Err(WalPreparationError::Deadline)
+        ));
+        assert_eq!(*client.shared.input_bytes.lock().unwrap(), baseline);
+        let input = rig.input(Instant::now() + Duration::from_secs(2));
+        let alias = input.budget_for_test();
+        assert_eq!(
+            baseline.remaining[0] - client.shared.input_bytes.lock().unwrap().remaining[0],
+            64 * 1024
+        );
+        drop(input);
+        assert_eq!(alias.used(), 0);
+        assert_eq!(
+            baseline.remaining[0] - client.shared.input_bytes.lock().unwrap().remaining[0],
+            64 * 1024,
+            "the factory budget allocation still has original backing before queueing"
+        );
+        drop(alias);
+        assert_eq!(*client.shared.input_bytes.lock().unwrap(), baseline);
+        assert!(
+            rig.actor
+                .as_ref()
+                .unwrap()
+                .events
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn original_wal_queue_transfers_prepaid_debit_when_no_ordinary_bytes_remain() {
+        let rig = Rig::new("wal-factory-single-debit");
+        let client = rig.journal.client();
+        let baseline = *client.shared.input_bytes.lock().unwrap();
+        let input = rig.input(Instant::now() + Duration::from_secs(2));
+        let remaining = client.shared.input_bytes.lock().unwrap().remaining[0];
+        let pressure = client
+            .shared
+            .reserve_input(InputClass::Ordinary, remaining)
+            .unwrap();
+        let handle = rig.submit(input);
+        assert!(matches!(
+            wait(&handle, |s| matches!(s, WalPreparationStatus::Ready(_))
+                || terminal(s)),
+            WalPreparationStatus::Ready(_)
+        ));
+        assert_eq!(client.shared.input_bytes.lock().unwrap().remaining[0], 0);
+        handle.abort();
+        assert!(matches!(
+            wait(&handle, terminal),
+            WalPreparationStatus::Aborted
+        ));
+        drop(handle);
+        drop(pressure);
+        assert_eq!(*client.shared.input_bytes.lock().unwrap(), baseline);
+    }
+
+    #[test]
+    fn original_wal_factory_drain_and_foreign_owner_reject_without_source_entry() {
+        let mut rig = Rig::new("wal-factory-owner-binding");
+        let client = rig.journal.client();
+        let input = rig.input(Instant::now() + Duration::from_secs(2));
+        let alias = input.budget_for_test();
+        assert!(rig.journal.begin_command_drain());
+        assert!(matches!(
+            client.reserve_wal_preparation(),
+            Err(OperationJournalOwnerQueueError::Closed)
+        ));
+        assert!(matches!(
+            client.prepare_wal_owners(input),
+            Err(OperationJournalOwnerQueueError::Closed)
+        ));
+        assert_eq!(alias.used(), 0);
+        // A stale allocation alias retains the debit through close, but grants no entry.
+        assert!(rig.journal.shutdown());
+        drop(alias);
+        assert_eq!(
+            *client.shared.input_bytes.lock().unwrap(),
+            InputBudget::shared_initial()
+        );
+        let store = OperationJournalStore::open(&rig.fixture.owner).unwrap();
+        rig.journal = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+        wait_until_available(&rig.journal);
+        let input = rig.input(Instant::now() + Duration::from_secs(2));
+        // Another actual journal incarnation is required; old client cannot consume the new debit.
+        assert!(matches!(
+            client.prepare_wal_owners(input),
+            Err(OperationJournalOwnerQueueError::InvalidInput { .. })
+        ));
+        assert!(
+            rig.actor
+                .as_ref()
+                .unwrap()
+                .events
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn original_wal_prepaid_result_saturation_retains_factory_alias_without_source_entry() {
+        let rig = Rig::new("wal-factory-result-full");
+        let client = rig.journal.client();
+        let baseline = *client.shared.input_bytes.lock().unwrap();
+        let results = (0..ORDINARY_RESULT_CAPACITY)
+            .map(|_| client.shared.reserve_result(InputClass::Ordinary).unwrap())
+            .collect::<Vec<_>>();
+        let input = rig.input(Instant::now() + Duration::from_secs(2));
+        let alias = input.budget_for_test();
+        assert!(matches!(
+            client.prepare_wal_owners(input),
+            Err(OperationJournalOwnerQueueError::ResultsFull)
+        ));
+        assert_eq!(alias.used(), 0);
+        assert_eq!(
+            baseline.remaining[0] - client.shared.input_bytes.lock().unwrap().remaining[0],
+            64 * 1024
+        );
+        drop(alias);
+        drop(results);
+        assert_eq!(*client.shared.input_bytes.lock().unwrap(), baseline);
+        assert!(
+            rig.actor
+                .as_ref()
+                .unwrap()
+                .events
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn original_wal_prepaid_queue_saturation_destroys_payload_before_final_alias_refund() {
+        let mut rig = Rig::new("wal-factory-queue-full");
+        assert!(rig.journal.shutdown());
+        let store = OperationJournalStore::open(&rig.fixture.owner).unwrap();
+        let (journal, ready, release) =
+            OperationJournalOwner::start_with_command_gate_for_test(store);
+        wait_until_available(&journal);
+        rig.journal = journal;
+        let client = rig.journal.client();
+        let input = rig.input(Instant::now() + Duration::from_secs(2));
+        let alias = input.budget_for_test();
+        let first = client.get(OperationId::new()).unwrap();
+        ready.wait();
+        let queued = (0..ORDINARY_COMMAND_CAPACITY)
+            .map(|_| client.get(OperationId::new()).unwrap())
+            .collect::<Vec<_>>();
+        let refused = client.prepare_wal_owners(input);
+        release.wait();
+        assert!(matches!(
+            refused,
+            Err(OperationJournalOwnerQueueError::Full)
+        ));
+        drop(first);
+        drop(queued);
+        assert!(rig.journal.shutdown());
+        assert_eq!(alias.used(), 0);
+        assert_eq!(
+            InputBudget::shared_initial().remaining[0]
+                - client.shared.input_bytes.lock().unwrap().remaining[0],
+            64 * 1024
+        );
+        drop(alias);
+        assert_eq!(
+            *client.shared.input_bytes.lock().unwrap(),
+            InputBudget::shared_initial()
+        );
+        assert!(
+            rig.actor
+                .as_ref()
+                .unwrap()
+                .events
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

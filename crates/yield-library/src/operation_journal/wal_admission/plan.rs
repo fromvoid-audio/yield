@@ -56,6 +56,9 @@ pub struct WalPreparationInput {
     pub(super) budget: HandshakeBudget,
     pub(super) credit: HandshakeCredit,
     pub(super) header_bytes: usize,
+    // Last: factory input/backing dies before memory credit returns. Collector
+    // transfers this sole debit; its budget already retains all-alias custody.
+    pub(in crate::operation_journal) funding: Option<super::super::owner::WalPreparationFunding>,
 }
 struct HashWriter {
     hash: Hasher,
@@ -108,6 +111,7 @@ fn digest(value: &impl serde::Serialize) -> Result<[u8; 32], WalPreparationError
 }
 // These are memory refusals, never reservations or physical capacity authority.
 fn factory_credit(
+    funding: &super::super::owner::WalPreparationFunding,
     sources: &Vec<SourcePreparation>,
 ) -> Result<(HandshakeBudget, HandshakeCredit, usize), WalPreparationError> {
     // The retained vector capacity is checked again by finish. At this prepass the
@@ -122,11 +126,13 @@ fn factory_credit(
         .try_fold(base, |n, s| n.checked_add(s.input.retained_bytes()?))
         .ok_or(WalPreparationError::Full)?;
     let budget = HandshakeBudget::new();
+    budget.bind_journal_input(funding.input.clone())?;
     let mut credit = budget.credit();
     credit.resize(base).map_err(|_| WalPreparationError::Full)?;
     Ok((budget, credit, base))
 }
 fn factory_credit_one(
+    funding: &super::super::owner::WalPreparationFunding,
     source: &SourcePreparation,
 ) -> Result<(HandshakeBudget, HandshakeCredit, usize), WalPreparationError> {
     let base = source
@@ -135,6 +141,7 @@ fn factory_credit_one(
         .and_then(|n| n.checked_add(std::mem::size_of::<SourcePreparation>() + FACTORY_FIXED_BYTES))
         .ok_or(WalPreparationError::Full)?;
     let budget = HandshakeBudget::new();
+    budget.bind_journal_input(funding.input.clone())?;
     let mut credit = budget.credit();
     credit.resize(base).map_err(|_| WalPreparationError::Full)?;
     Ok((budget, credit, base))
@@ -238,6 +245,7 @@ impl WalPreparationInput {
     /// Derive exact preparation coverage for one validated universal command. Original source
     /// observations and limited requesters remain inputs; aggregate claims are not DB permits.
     pub fn from_universal(
+        funding: super::super::owner::WalPreparationFunding,
         args: &UniversalCommandArgs,
         participants: &ParticipantSet,
         plan: &FullCapacityPlan,
@@ -258,7 +266,7 @@ impl WalPreparationInput {
         if deadline <= now || deadline.duration_since(now) > Duration::from_secs(2) {
             return Err(WalPreparationError::Deadline);
         }
-        let (budget, mut credit, base) = factory_credit(&sources)?;
+        let (budget, mut credit, base) = factory_credit(&funding, &sources)?;
         // Layout's existing Serialize validates/encodes its bounded binary generation
         // and base64 wire value. Fund that actual scratch before invoking Serialize;
         // a large original generation can legitimately exceed the combined ceiling.
@@ -438,7 +446,8 @@ impl WalPreparationInput {
             digest,
             deadline,
             matches!(args, UniversalCommandArgs::SourceRegistryRetirement(_)),
-            Some((budget, credit)),
+            funding,
+            (budget, credit),
         )?;
         if let Some(retirement) = retirement {
             let (client, request) = input.global.take().ok_or_else(bad)?;
@@ -450,6 +459,7 @@ impl WalPreparationInput {
     /// Prepare one source-only metadata assignment scope from its complete genuine original
     /// observation and frozen DTO. Dictionary/global finalization is a separate parent scope.
     pub fn from_tag(
+        funding: super::super::owner::WalPreparationFunding,
         writer: &crate::sample_sources::SourceWriter,
         args: &super::super::metadata_tag_commands::MetadataTagSourceIntentArgs,
         plan: &FullCapacityPlan,
@@ -460,7 +470,7 @@ impl WalPreparationInput {
         let SourceInput::Tag(_) = &source.input else {
             return Err(WalPreparationError::InvalidInput);
         };
-        let (budget, credit, _) = factory_credit_one(&source)?;
+        let (budget, credit, _) = factory_credit_one(&funding, &source)?;
         claims
             .validate_against(plan)
             .map_err(|_| WalPreparationError::InvalidInput)?;
@@ -475,7 +485,8 @@ impl WalPreparationInput {
             digest,
             deadline,
             false,
-            Some((budget, credit)),
+            funding,
+            (budget, credit),
         )?;
         // Full passive owner validation also shares this same ceiling, before its SQL
         // metadata decoding/subject temporaries allocate. It issues no readiness outcome.
@@ -497,6 +508,7 @@ impl WalPreparationInput {
     /// Prepare an explicit original lease scope without inventing an authoritative audit or
     /// treating its stored registration phase as current journal acknowledgement.
     pub fn from_lease_scope(
+        funding: super::super::owner::WalPreparationFunding,
         participants: &ParticipantSet,
         plan: &FullCapacityPlan,
         claims: &AdmissionClaimInventory,
@@ -508,7 +520,7 @@ impl WalPreparationInput {
         }
         // Stored lease-fence validation encodes its original bounded descriptor.
         // Fund that allocation and the future single-element vector before either.
-        let (budget, mut credit, base) = factory_credit_one(&source)?;
+        let (budget, mut credit, base) = factory_credit_one(&funding, &source)?;
         credit
             .resize(
                 base.checked_add(
@@ -546,7 +558,8 @@ impl WalPreparationInput {
             digest,
             deadline,
             false,
-            Some((budget, credit)),
+            funding,
+            (budget, credit),
         )
     }
     fn finish(
@@ -555,7 +568,8 @@ impl WalPreparationInput {
         digest: [u8; 32],
         deadline: Instant,
         lifecycle: bool,
-        funded: Option<(HandshakeBudget, HandshakeCredit)>,
+        funding: super::super::owner::WalPreparationFunding,
+        funded: (HandshakeBudget, HandshakeCredit),
     ) -> Result<Self, WalPreparationError> {
         let deadline = sources
             .iter()
@@ -568,11 +582,7 @@ impl WalPreparationInput {
         if sources.len() + usize::from(global.is_some()) > 64 {
             return Err(WalPreparationError::InvalidInput);
         }
-        let (budget, mut credit) = funded.unwrap_or_else(|| {
-            let budget = HandshakeBudget::new();
-            let credit = budget.credit();
-            (budget, credit)
-        });
+        let (budget, mut credit) = funded;
         // Move the original caller vector, with its entire actual capacity. No option
         // vector, stable-sort scratch or second backing is allocated during transfer.
         let header_bytes = std::mem::size_of::<Self>()
@@ -626,6 +636,7 @@ impl WalPreparationInput {
             budget,
             credit,
             header_bytes,
+            funding: Some(funding),
         })
     }
     #[cfg(all(test, unix))]

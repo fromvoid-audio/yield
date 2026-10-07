@@ -1,5 +1,6 @@
-//! Public original-owner factories on genuine normal-build Linux owners. No capacity fixture.
-#![cfg(all(target_os = "linux", not(feature = "test-support")))]
+//! Public factory paths on genuine SQLite workers with explicit memory-only journal startup.
+//! No fixture supplies physical capacity or effect qualification.
+#![cfg(all(target_os = "linux", feature = "test-support"))]
 use std::{
     fs,
     time::{Duration, Instant},
@@ -20,6 +21,7 @@ use yield_library::{
     },
 };
 struct Fixture {
+    journal: owner::OperationJournalOwner,
     owner: WritableProfileGuard,
     _root: AppRootGuard,
     _base: tempfile::TempDir,
@@ -29,7 +31,15 @@ impl Fixture {
         let base = tempfile::tempdir().unwrap();
         let root = AppRootGuard::set(base.path().join("profile")).unwrap();
         let owner = WritableProfileGuard::acquire_current().unwrap();
+        let store = OperationJournalStore::open(&owner).unwrap();
+        let journal = owner::OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while journal.status() != owner::OperationJournalOwnerStatus::Available {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
         Self {
+            journal,
             owner,
             _root: root,
             _base: base,
@@ -268,6 +278,7 @@ fn normal_public_two_source_factory_requires_actual_complete_coverage_without_pr
         })
         .collect();
     let input = WalPreparationInput::from_universal(
+        fixture.journal.client().reserve_wal_preparation().unwrap(),
         &args,
         &participants,
         &plan,
@@ -300,6 +311,7 @@ fn normal_public_two_source_factory_requires_actual_complete_coverage_without_pr
     )];
     assert!(matches!(
         WalPreparationInput::from_universal(
+            fixture.journal.client().reserve_wal_preparation().unwrap(),
             &args,
             &participants,
             &plan,
@@ -346,6 +358,7 @@ fn normal_public_tag_factory_borrows_exact_original_selection_and_queues_no_effe
     let (plan, claims, main, side) = plan(&fixture);
     let (requester, mut inbox) = SourceWalTransport::channel();
     let input = WalPreparationInput::from_tag(
+        fixture.journal.client().reserve_wal_preparation().unwrap(),
         &writer,
         &args,
         &plan,
@@ -419,6 +432,7 @@ fn normal_public_pre_audit_factory_compares_owner_scalars_without_registered_gra
     let (plan, claims, main, side) = plan(&fixture);
     let (requester, mut inbox) = SourceWalTransport::channel();
     let input = WalPreparationInput::from_lease_scope(
+        fixture.journal.client().reserve_wal_preparation().unwrap(),
         &participants,
         &plan,
         &claims,
