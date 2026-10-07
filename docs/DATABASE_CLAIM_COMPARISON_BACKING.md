@@ -1,0 +1,9 @@
+# Original database claim comparison backing
+
+The optional-input database comparator derives backing from the actual bounded ordinary-claim projection count and observed full/legacy plan row count before constructing owned projection, plan and claim vectors. It charges the pinned full internal BTreeMap node layout per possible plan volume, independent of dense occupancy. Original nullable UUID projections remain fixed-size and borrowed. The complete bounded page preserves SQL and UTF-8 conversion precedence before UUID and aggregate coverage errors; the existing 257-row observation and 256-row acceptance limits remain unchanged.
+
+Original borrowed statements invoke the unchanged claim and release decoders. Their capped UUID/device/class strings and fixed error/header scratch are prepaid. Before constructing an original formatted reason and its outer database comparison reason, the comparator streams Display into a scalar length counter and reserves geometric growth for both strings. Native message loans remain held independently. Selected working, comparison, formatting and native loans transfer into the existing original nested failure carrier; they are returned only after the selected error is destroyed.
+
+Real SQLite fixtures prove original/funded equality, malformed UTF-8 precedence, aggregate and release rejection, excess relation bounds, input pressure without mutation, native SQL failure and selected loan lifetime. Metadata fixtures provide no native capacity witness or source/settlement permission.
+
+This producer backing does not complete command-digest canonical serialization, journal metadata descriptor/claim validation, remaining audit pages/maps, recording chunks, write transactions or the retained Legacy worker consumer. Those remain requirements of OPT-2373.

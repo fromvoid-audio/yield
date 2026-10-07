@@ -1622,6 +1622,56 @@
       "issue": "OPT-2427",
       "reason": "Private actual Store on a genuine temporary profile exercises passive original recording control and complete-record observations, corruption and loan custody. Arithmetic metadata fixtures grant no native qualification or effect authority.",
       "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_claim_comparison_funding_tests.rs",
+      "function": "funded_database_claim_comparison_matches_original_and_retains_selected_coverage_failure",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2428",
+      "reason": "Private actual Store on its genuine temporary profile exercises original bounded claim comparisons, malformed/corrupt metadata and selected loan custody. Arithmetic fixtures grant no native qualification, release or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_claim_comparison_funding_tests.rs",
+      "function": "funded_database_claim_comparison_preserves_whole_page_utf8_before_uuid_error",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2428",
+      "reason": "Private actual Store on its genuine temporary profile exercises original bounded claim comparisons, malformed/corrupt metadata and selected loan custody. Arithmetic fixtures grant no native qualification, release or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_claim_comparison_funding_tests.rs",
+      "function": "funded_database_claim_comparison_preserves_original_release_and_budget_refusal",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2428",
+      "reason": "Private actual Store on its genuine temporary profile exercises original bounded claim comparisons, malformed/corrupt metadata and selected loan custody. Arithmetic fixtures grant no native qualification, release or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_claim_comparison_funding_tests.rs",
+      "function": "funded_database_claim_comparison_preserves_original_excess_projection_bound",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2428",
+      "reason": "Private actual Store on its genuine temporary profile exercises original bounded claim comparisons, malformed/corrupt metadata and selected loan custody. Arithmetic fixtures grant no native qualification, release or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_claim_comparison_funding_tests.rs",
+      "function": "funded_database_claim_comparison_retains_original_native_sql_error_and_record_loans",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2428",
+      "reason": "Private actual Store on its genuine temporary profile exercises original bounded claim comparisons, malformed/corrupt metadata and selected loan custody. Arithmetic fixtures grant no native qualification, release or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
     }
   ]
 }

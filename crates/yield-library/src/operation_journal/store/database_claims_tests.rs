@@ -3,6 +3,7 @@
 mod exact_database_claim_persistence {
     include!("database_attempt_metadata_tests.rs");
     include!("database_inventory_funding_tests.rs");
+    include!("database_claim_comparison_funding_tests.rs");
     include!("database_attempts_tests.rs");
     include!("source_lease_binding_tests.rs");
     include!("recording_prestart_database_claims_tests.rs");

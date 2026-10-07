@@ -7,6 +7,7 @@ use crate::operation_journal::{AdmissionClaimInventory, OperationId};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+mod comparison;
 mod funded;
 mod scalar_projection;
 pub(super) use funded::{Inventory as RetainedDatabaseInventory, read_with_input};
@@ -389,6 +390,9 @@ impl OperationJournalStore {
         let operation = record.operation_id;
         self.verify_recording_initial_readback_with_input(record, input)?;
         inventory.validate_record(record).map_err(error)?;
+        if let Some(input) = input {
+            return comparison::validate(self, record, inventory, input);
+        }
         let plan = super::full_capacity_plan_for_record(record)?;
         let plan = crate::operation_journal::full_capacity::FullCapacityPlan::new(
             plan.allocations()
