@@ -467,7 +467,7 @@ impl OperationJournalStore {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn checkpoint_staging_result(
         &self,
         result: &FileOperationResult,
