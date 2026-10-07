@@ -1614,48 +1614,8 @@
       "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
     },
     {
-      "path": "crates/yield-library/src/operation_journal/store/recording_control_funding_tests.rs",
-      "function": "funded_recording_controls_preserve_canonical_and_historical_acceptance_without_blob_copy",
-      "operation": "journal::open",
-      "count": 1,
-      "classification": "fixture",
-      "issue": "OPT-2427",
-      "reason": "Private actual Store on a genuine temporary profile exercises passive original recording control and complete-record observations, corruption and loan custody. Arithmetic metadata fixtures grant no native qualification or effect authority.",
-      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
-    },
-    {
-      "path": "crates/yield-library/src/operation_journal/store/recording_control_funding_tests.rs",
-      "function": "funded_recording_control_refusal_and_selected_failure_keep_original_evidence",
-      "operation": "journal::open",
-      "count": 1,
-      "classification": "fixture",
-      "issue": "OPT-2427",
-      "reason": "Private actual Store on a genuine temporary profile exercises passive original recording control and complete-record observations, corruption and loan custody. Arithmetic metadata fixtures grant no native qualification or effect authority.",
-      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
-    },
-    {
-      "path": "crates/yield-library/src/operation_journal/store/recording_control_funding_tests.rs",
-      "function": "funded_recording_inventory_borrows_complete_original_proposal_and_preserves_error_loans",
-      "operation": "journal::open",
-      "count": 1,
-      "classification": "fixture",
-      "issue": "OPT-2427",
-      "reason": "Private actual Store on a genuine temporary profile exercises passive original recording control and complete-record observations, corruption and loan custody. Arithmetic metadata fixtures grant no native qualification or effect authority.",
-      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
-    },
-    {
       "path": "crates/yield-library/src/operation_journal/store/database_inventory_funding_tests.rs",
       "function": "funded_recording_database_claim_record_uses_original_scoped_record_and_control_backing",
-      "operation": "journal::open",
-      "count": 1,
-      "classification": "fixture",
-      "issue": "OPT-2427",
-      "reason": "Private actual Store on a genuine temporary profile exercises passive original recording control and complete-record observations, corruption and loan custody. Arithmetic metadata fixtures grant no native qualification or effect authority.",
-      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
-    },
-    {
-      "path": "crates/yield-library/src/operation_journal/store/recording_control_funding_tests.rs",
-      "function": "funded_recording_control_second_payload_projection_rejects_changed_original_bound_without_copy",
       "operation": "journal::open",
       "count": 1,
       "classification": "fixture",
