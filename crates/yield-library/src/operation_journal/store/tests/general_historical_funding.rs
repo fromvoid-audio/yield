@@ -24,6 +24,54 @@ fn enter_count() -> usize {
     historical_claim_observation::GENERAL_DECODE_ENTRIES.with(|n| n.get())
 }
 
+#[test]
+fn general_historical_duplicate_deep_and_malformed_original_rows_stay_rejected() {
+    let fixture = fixture();
+    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+    let bytes = super::super::super::codec::general_historical_fixture_bytes_for_test()
+        .into_iter()
+        .find(|bytes| decode(bytes).unwrap().schema_version == 3)
+        .unwrap();
+    let mut duplicate = b"{\"schema_version\":3,".to_vec();
+    duplicate.extend_from_slice(&bytes[1..]);
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut nested = serde_json::Value::Null;
+    for _ in 0..96 {
+        nested = serde_json::json!([nested]);
+    }
+    value["payload"] = serde_json::json!({"nested":nested});
+    let deep = serde_json::to_vec(&value).unwrap();
+    let mut malformed = bytes.clone();
+    malformed.extend_from_slice(b" trailing");
+    for wire in [duplicate, deep, malformed] {
+        // Extract the identity from the unchanged base; corrupt rows need not parse.
+        let base: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let operation = serde_json::from_value(base["operation_id"].clone()).unwrap();
+        store
+            .connection
+            .execute("DELETE FROM operation_journal", [])
+            .unwrap();
+        store
+            .replace_historical_row_fixture_for_test(operation, 1, &wire)
+            .unwrap();
+        assert!(store.get(operation).is_err());
+        let funding = JournalNamespaceFundingProbe::new();
+        assert!(
+            store
+                .observe_claim_operation(operation, &funding.input)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT record FROM operation_journal", [], |row| row
+                    .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            wire
+        );
+    }
+}
+
 fn retirement_record() -> StoredOperationRecord {
     use crate::operation_journal::{
         source_lease_binding::StoredSourceLeaseFence,

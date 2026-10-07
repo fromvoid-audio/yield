@@ -93,7 +93,8 @@ impl Collection {
         input: &InputPermit,
     ) -> Result<Self, OperationJournalStoreError> {
         // Before count SQL: compiled statement/credit headers and bounded error formatting.
-        let sql_bytes = 2 * size_of::<Statement<'_>>()
+        let sql_bytes = size_of::<crate::operation_journal::owner::OperationJournalOwnerError>()
+            + 2 * size_of::<Statement<'_>>()
             + size_of::<RefCell<Option<InputPermit>>>()
             + 3 * size_of::<InputPermit>()
             + 2 * size_of::<String>()

@@ -39,6 +39,7 @@ const FIXED_BYTES: usize = 2 * COLUMN_NAME_BYTES
     + size_of::<TransitionRow>()
     + size_of::<TransitionValidation<'static>>()
     + 2 * size_of::<OperationJournalStoreError>()
+    + size_of::<crate::operation_journal::owner::OperationJournalOwnerError>()
     + size_of::<LedgerError>()
     + 3 * size_of::<InputPermit>()
     + size_of::<RefCell<Option<InputPermit>>>()
