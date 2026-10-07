@@ -159,6 +159,17 @@ impl Default for ProvisionalLedger {
     }
 }
 impl ProvisionalLedger {
+    fn return_unused_growth_credit(&mut self) {
+        // Existing genuine release rules have already removed the original graphs.
+        // An alias to the empty fixed ledger does not retain dynamic backing. Never
+        // refund growth while durable charge or release history allocations survive.
+        if self.charges_by_token.is_empty()
+            && self.aggregate_charges.is_empty()
+            && self.released_claims.is_empty()
+        {
+            drop(self._growth_credit.take());
+        }
+    }
     fn default_without_mirror(mirror: RetainedArc<ChargeMirror>) -> Self {
         Self {
             mirror,
@@ -1537,6 +1548,7 @@ impl ProvisionalCapacityLease {
         ledger.charges_by_token.remove(&self.token);
         self.disposition = ProvisionalLeaseDisposition::Released;
         mutation.finish(&ledger);
+        ledger.return_unused_growth_credit();
         Ok(())
     }
 
@@ -1727,6 +1739,9 @@ impl ProvisionalCapacityLease {
         ledger.charges_by_token.remove(&self.token);
         self.disposition = ProvisionalLeaseDisposition::Released;
         mutation.finish(&ledger);
+        // The original temporary clone must die before the loan covering it.
+        drop(owned_charges);
+        ledger.return_unused_growth_credit();
         Ok(())
     }
 

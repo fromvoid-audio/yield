@@ -143,20 +143,24 @@ mod tests {
         let (provider, plan, claims, facts) = fixture();
         let probe = JournalNamespaceFundingProbe::new();
         let available = probe.remaining_bytes();
-        let held = probe
-            .input
-            .reserve_historical_scratch(available - 1)
-            .unwrap();
-        let token = provider.next_token();
-        assert!(matches!(
-            admit(&provider, &plan, &claims, &facts, &probe.input),
-            Err(CapacityProviderError::RebuildResourceBound)
-        ));
-        assert_eq!(provider.next_token(), token);
-        assert_eq!(provider.claim_count(), 0);
-        assert_eq!(probe.remaining_bytes(), 1);
-        drop(held);
-        assert_eq!(probe.remaining_bytes(), available);
+        let [ledger, lease, scratch] = sizes(&plan, &claims).unwrap();
+        for left in [1, ledger, ledger + lease, ledger + lease + scratch - 1] {
+            let held = probe
+                .input
+                .reserve_historical_scratch(available - left)
+                .unwrap();
+            let token = provider.next_token();
+            assert!(matches!(
+                admit(&provider, &plan, &claims, &facts, &probe.input),
+                Err(CapacityProviderError::RebuildResourceBound)
+            ));
+            assert_eq!(provider.next_token(), token);
+            assert_eq!(provider.claim_count(), 0);
+            assert!(provider.ledger.borrow()._growth_credit.is_none());
+            assert_eq!(probe.remaining_bytes(), left);
+            drop(held);
+            assert_eq!(probe.remaining_bytes(), available);
+        }
     }
 
     #[test]
@@ -195,22 +199,73 @@ mod tests {
         assert_eq!(remaining, baseline - ledger_bytes - lease_bytes);
         assert_eq!(lease.release(), Err(CapacityProviderError::LeaseRetained));
         lease.release_after_confirmed_rollback(operation).unwrap();
-        assert_eq!(observe().0, remaining);
+        assert_eq!(observe().0, baseline - lease_bytes);
         drop(lease);
         assert_eq!(observe().0, baseline);
     }
 
     #[test]
-    fn original_provider_alias_retains_ledger_growth_after_provisional_release() {
+    fn original_provider_alias_retains_durable_ledger_growth_after_lease_drop() {
         let (provider, plan, claims, facts) = fixture();
         let probe = JournalNamespaceFundingProbe::new();
         let available = probe.remaining_bytes();
         let [ledger_bytes, _, _] = sizes(&plan, &claims).unwrap();
-        let lease = admit(&provider, &plan, &claims, &facts, &probe.input).unwrap();
+        let mut lease = admit(&provider, &plan, &claims, &facts, &probe.input).unwrap();
+        let operation = OperationId::new();
+        lease.pin_for_persistence(operation).unwrap();
+        lease.mark_durable(operation).unwrap();
         let alias = provider.ledger.clone();
         drop(lease);
-        assert_eq!(provider.claim_count(), 0);
+        assert_eq!(provider.claim_count(), 1);
         assert_eq!(probe.remaining_bytes(), available - ledger_bytes);
+        drop(provider);
+        assert_eq!(probe.remaining_bytes(), available - ledger_bytes);
+        drop(alias);
+        assert_eq!(probe.remaining_bytes(), available);
+    }
+
+    #[test]
+    fn repeated_confirmed_rollback_returns_growth_only_after_all_original_graphs_die() {
+        let (provider, plan, claims, facts) = fixture();
+        let probe = JournalNamespaceFundingProbe::new();
+        let available = probe.remaining_bytes();
+        let [_, lease_bytes, _] = sizes(&plan, &claims).unwrap();
+        for _ in 0..512 {
+            let mut lease = admit(&provider, &plan, &claims, &facts, &probe.input).unwrap();
+            let operation = OperationId::new();
+            lease.pin_for_persistence(operation).unwrap();
+            lease.release_after_confirmed_rollback(operation).unwrap();
+            assert_eq!(probe.remaining_bytes(), available - lease_bytes);
+            assert!(provider.ledger.borrow()._growth_credit.is_none());
+            drop(lease);
+            assert_eq!(probe.remaining_bytes(), available);
+        }
+    }
+
+    #[test]
+    fn released_history_keeps_original_ledger_growth_charged_until_final_alias_drop() {
+        let (provider, plan, claims, facts) = fixture();
+        let probe = JournalNamespaceFundingProbe::new();
+        let available = probe.remaining_bytes();
+        let [ledger_bytes, _, _] = sizes(&plan, &claims).unwrap();
+        let mut lease = admit(&provider, &plan, &claims, &facts, &probe.input).unwrap();
+        let operation = OperationId::new();
+        lease.pin_for_persistence(operation).unwrap();
+        lease.mark_durable(operation).unwrap();
+        let claim = &claims.claims()[0];
+        let receipt = OrdinaryClaimReleaseReceipt::for_test(
+            operation,
+            claim.claim_id(),
+            Uuid::new_v4(),
+            claim.volume().clone(),
+            claim.allocation_class(),
+            claim.allocated_bytes(),
+        );
+        provider.release_claim(&receipt).unwrap();
+        assert_eq!(provider.claim_count(), 0);
+        assert!(!provider.ledger.borrow().released_claims.is_empty());
+        drop(lease);
+        let alias = provider.ledger.clone();
         drop(provider);
         assert_eq!(probe.remaining_bytes(), available - ledger_bytes);
         drop(alias);

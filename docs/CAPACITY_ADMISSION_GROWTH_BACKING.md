@@ -22,9 +22,11 @@ alias lives, without retaining the worker or reply. The lease separately owns
 its own detached credit after all its backing fields. Ordinary admission errors
 remove only the newly installed chain node and preserve prior ledger loans.
 
-Ledger growth credit remains retained after a token release because aggregate
-nodes and release history can survive that release. It returns at final original
-ledger destruction. This conservatively retains metadata backing and never
+Ledger growth credit remains retained after a token release whenever aggregate
+nodes, other tokens or release history survive that release. Once all those
+original graphs have been freed, it returns even if a fixed ledger alias remains;
+otherwise it returns at final original ledger destruction. Repeated confirmed
+rollback does not accumulate dead growth loans. This never
 infers physical settlement from memory destruction. Pinned/uncertain leases
 still refuse ordinary release; only existing confirmed rollback rules release
 their original physical charge.
