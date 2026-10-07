@@ -1939,7 +1939,9 @@ pub(super) fn parse_unique_value(bytes: &[u8]) -> Result<Value, serde_json::Erro
 /// universal-intent envelope. The V3 branch accepts only the initial durable-intent shape, while
 /// V4 and V5 encode their explicitly bounded pre-publication observations; later transition and
 /// publication-policy validation belongs to the owner boundary.
-pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
+pub(in crate::operation_journal) fn validate_encoding_family(
+    record: &StoredOperationRecord,
+) -> Result<(), EncodeError> {
     if record.schema_version <= SCHEMA_V17
         && (record.intent.kind == OperationKind::SourceRegistryRetirement
             || matches!(
@@ -2008,76 +2010,13 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
             version: record.schema_version,
         });
     }
+    Ok(())
+}
+
+pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
+    validate_encoding_family(record)?;
     let mut writer = CappedWriter::new(MAX_RECORD_BYTES);
-    let result = match record.schema_version {
-        SCHEMA_V1 => {
-            let persisted = persisted_v1_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V2 => {
-            let persisted = persisted_v2_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V3 => {
-            let persisted = persisted_v3_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V4 => {
-            let persisted = persisted_v4_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V5 => {
-            let persisted = persisted_v5_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V6 => {
-            let persisted = persisted_v6_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V7 => {
-            let persisted = persisted_v7_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V8 => {
-            let persisted = persisted_v8_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V9 => {
-            let persisted = persisted_v9_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V10 => {
-            let persisted = persisted_v10_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V11 => {
-            let persisted = persisted_v11_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V12 => {
-            let persisted = persisted_v12_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V13 => {
-            let persisted = persisted_v13_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V14 => {
-            let persisted = persisted_v14_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V15 => {
-            let persisted = persisted_v15_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18 => {
-            let persisted = persisted_v16_from_record(record)?;
-            serde_json::to_writer_pretty(&mut writer, &persisted)
-        }
-        version => {
-            return Err(EncodeError::UnsupportedSchemaVersion { version });
-        }
-    };
+    let result = serialize_record(record, &mut writer)?;
     match result {
         Ok(()) => Ok(writer.finish()),
         Err(_error) if writer.exceeded => Err(EncodeError::Oversize {
@@ -2086,6 +2025,84 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
         }),
         Err(error) => Err(EncodeError::Serialization(error.to_string())),
     }
+}
+
+// Original version dispatch shared with allocation-free output inventory. Borrowed
+// persisted views preserve field order and avoid a replacement record/Value graph.
+pub(in crate::operation_journal) fn serialize_record(
+    record: &StoredOperationRecord,
+    writer: &mut impl Write,
+) -> Result<Result<(), serde_json::Error>, EncodeError> {
+    let result = match record.schema_version {
+        SCHEMA_V1 => {
+            let persisted = persisted_v1_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V2 => {
+            let persisted = persisted_v2_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V3 => {
+            let persisted = persisted_v3_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V4 => {
+            let persisted = persisted_v4_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V5 => {
+            let persisted = persisted_v5_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V6 => {
+            let persisted = persisted_v6_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V7 => {
+            let persisted = persisted_v7_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V8 => {
+            let persisted = persisted_v8_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V9 => {
+            let persisted = persisted_v9_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V10 => {
+            let persisted = persisted_v10_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V11 => {
+            let persisted = persisted_v11_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V12 => {
+            let persisted = persisted_v12_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V13 => {
+            let persisted = persisted_v13_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V14 => {
+            let persisted = persisted_v14_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V15 => {
+            let persisted = persisted_v15_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18 => {
+            let persisted = persisted_v16_from_record(record)?;
+            serde_json::to_writer_pretty(&mut *writer, &persisted)
+        }
+        version => {
+            return Err(EncodeError::UnsupportedSchemaVersion { version });
+        }
+    };
+    Ok(result)
 }
 
 pub(crate) struct CappedWriter {
