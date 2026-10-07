@@ -6,6 +6,12 @@ use std::cell::RefCell;
 pub(super) mod borrowed_sql;
 use borrowed_sql::Statement;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static GENERAL_FUND_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static GENERAL_DECODE_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl OperationJournalStore {
     #[cfg(any(test, feature = "test-support"))]
     /// Replace one raw historical-row fixture on this original Store connection.
@@ -88,6 +94,17 @@ impl OperationJournalStore {
         let result = self.observe_claim_operation(operation_id, &input);
         self.connection.execute_batch("ROLLBACK")?;
         result
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Borrow this exact original diagnostic pool for allocation/lifetime observation.
+    /// The caller owns the read transaction; this creates no pool, authority or grant.
+    pub fn observe_historical_claim_with_funding_for_test(
+        &self,
+        operation_id: OperationId,
+        funding: &super::super::owner::JournalNamespaceFundingProbe,
+    ) -> Result<bool, OperationJournalStoreError> {
+        self.observe_claim_operation(operation_id, &funding.input)
     }
 
     pub(super) fn observe_claim_operation(
@@ -235,17 +252,47 @@ impl OperationJournalStore {
                 ));
             }
             scratch = Some(historical_observation::Scratch::new(input, bytes.len())?);
-            let observed =
-                historical_observation::observe(bytes, scratch.as_mut().expect("funded scratch"));
-            // End the SQLite borrow before releasing its per-row scratch or falling through
-            // to the unchanged other-family reader. No historical payload is copied here.
+            let mut observation =
+                historical_observation::observe(bytes, scratch.as_mut().expect("funded scratch"))?;
+            if observation.is_none() {
+                // The original general codec consumes this borrowed SQLite cell only after
+                // complete structure-derived backing. No second SQL read or owned BLOB copy.
+                #[cfg(test)]
+                GENERAL_FUND_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+                scratch
+                    .as_mut()
+                    .expect("funded scratch")
+                    .fund_general(bytes)?;
+                #[cfg(test)]
+                GENERAL_DECODE_ENTRIES.with(|entries| entries.set(entries.get() + 1));
+                let record = if self.recording_prestart_scope.get() {
+                    super::super::codec::decode_prestart_recording(
+                        bytes,
+                        recording_prestart_budget::JSON_LIMITS,
+                    )
+                    .map_err(|error| match error {
+                        super::super::codec::BoundedDecodeError::LimitExceeded { .. } => {
+                            self.recording_prestart_resource_refused.set(true);
+                            OperationJournalStoreError::RecordingPrestartResourceBound
+                        }
+                        super::super::codec::BoundedDecodeError::Decode(error) => {
+                            retained_decode_error(operation_id, error)
+                        }
+                    })?
+                    .ok_or_else(|| {
+                        self.recording_prestart_resource_refused.set(true);
+                        OperationJournalStoreError::RecordingPrestartResourceBound
+                    })?
+                } else {
+                    decode(bytes).map_err(|error| retained_decode_error(operation_id, error))?
+                };
+                observation = Some(record);
+            }
+            // End the original cell borrow with the decoded observation still prepaid.
             drop(statement);
-            let observation = observed?;
-            let Some(record) = observation.as_ref() else {
-                drop(observation);
-                drop(scratch.take());
-                return self.read_row(operation_id).map(|row| row.is_some());
-            };
+            let record = observation
+                .as_ref()
+                .expect("projected or fully decoded record");
             if record.operation_id != operation_id {
                 return Err(retained_error(
                     Some(operation_id),

@@ -136,6 +136,11 @@ fn historical_claim_actual_admit_prepared_charges_original_pool_and_refuses_pres
     );
     assert_eq!(owner.prepared_admission_id_allocations(), 0);
     assert!(owner.shutdown());
+    assert!(
+        owner.shared.input_bytes.lock().unwrap().remaining[0] < pool_before,
+        "selected error must retain its original debit after shutdown"
+    );
+    drop(error);
     assert_eq!(
         owner.shared.input_bytes.lock().unwrap().remaining[0],
         pool_before
@@ -503,17 +508,27 @@ fn recovery_funded_actual_queued_admission_error_lost_reply_and_teardown() {
             assert!(owner.shutdown());
         } else {
             assert!(owner.shutdown());
-            let Err(OperationJournalOwnerError::PreparedAdmission(
-                PreparedAdmissionError::RecoveryRequired { reason },
-            )) = request.recv_timeout(Duration::from_secs(5)).unwrap()
+            let Err(OperationJournalOwnerError::RetainedBacking(error)) =
+                request.recv_timeout(Duration::from_secs(5)).unwrap()
             else {
-                panic!("original recovery error changed");
+                panic!("original recovery error lost its observer backing");
             };
+            let OperationJournalOwnerError::PreparedAdmission(
+                PreparedAdmissionError::RecoveryRequired { reason },
+            ) = error.original_error()
+            else {
+                panic!("original typed recovery error changed");
+            };
+            assert!(
+                owner.shared.input_bytes.lock().unwrap().remaining[0]
+                    < InputBudget::shared_initial().remaining[InputClass::Ordinary.index()],
+                "selected observer credit must survive request consumption and shutdown"
+            );
             assert!(
                 reason.contains("recovery audit closed field is invalid"),
                 "{reason}"
             );
-            drop(reason);
+            drop(error);
             drop(request);
         }
         assert_eq!(

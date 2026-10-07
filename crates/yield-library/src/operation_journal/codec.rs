@@ -4381,6 +4381,11 @@ pub(super) fn validate_json_depth(value: &Value, maximum: usize) -> Result<(), &
 }
 
 #[cfg(test)]
+pub(in crate::operation_journal) fn general_historical_fixture_bytes_for_test() -> Vec<Vec<u8>> {
+    tests::general_historical_fixture_bytes()
+}
+
+#[cfg(test)]
 mod tests {
     include!("codec/materialization_tests.rs");
     use super::*;
@@ -5272,6 +5277,28 @@ mod tests {
             }
         });
         fixture
+    }
+
+    pub(super) fn general_historical_fixture_bytes() -> Vec<Vec<u8>> {
+        let mut values = v6_v12_codec_golden_fixtures()
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect::<Vec<_>>();
+        values.extend([
+            value(V3_FIXTURE),
+            v4_cancel_fixture(),
+            v5_copy_fixture(),
+            v13_selection_output_fixture(false),
+            v13_selection_output_fixture(true),
+            v14_history_fixture("Undo"),
+            v14_history_fixture("Redo"),
+            v15_external_reconciliation_fixture(),
+            v16_full_capacity_fixture(),
+        ]);
+        values
+            .into_iter()
+            .map(|v| serde_json::to_vec(&v).unwrap())
+            .collect()
     }
 
     fn v6_v12_codec_golden_fixtures() -> Vec<(String, Value)> {

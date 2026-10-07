@@ -10054,6 +10054,7 @@ impl From<EncodeError> for OperationJournalStoreError {
 
 #[cfg(test)]
 mod tests {
+    mod general_historical_funding;
     include!("store/retry_telemetry_integration_tests.rs");
     include!("store/historical_claim_observation_tests.rs");
     include!("store/current_reserve_binding_bounds_tests.rs");
