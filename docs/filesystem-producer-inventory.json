@@ -1472,6 +1472,56 @@
       "issue": "OPT-2402",
       "reason": "cfg(macos,test) actual original production Store/root/profile/registry/reserve startup with component hook off. Retained real WAL evidence triggers original queued namespace refusal; both caller APIs retain exact namespace/reply backing through genuine worker join, with unchanged original database and zero IDs. Native SDK/runtime and supported filesystem execution is separate.",
       "retirement": "Retain only this exact original namespace consumer verification. This fixture does not supply physical qualification, permits, retry, reservation refund, effect, cleanup or settlement."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/tests/general_historical_funding.rs",
+      "function": "general_historical_duplicate_deep_and_malformed_original_rows_stay_rejected",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2423",
+      "reason": "Private unit fixture opens the actual exclusive journal Store through the genuine temporary profile guard. Passive historical rows exercise strict borrowed decoding, original-pool pressure and error custody; no worker, capacity witness, effect or native qualification is supplied.",
+      "retirement": "Keep this test-only scope explicit; it authorizes no production opener or filesystem effect. Remove the inventory entry if the fixture call is removed."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/tests/general_historical_funding.rs",
+      "function": "general_historical_original_sqlite_golden_families_match_without_blob_copy",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2423",
+      "reason": "Private unit fixture opens the actual exclusive journal Store through the genuine temporary profile guard. Passive historical rows exercise strict borrowed decoding, original-pool pressure and error custody; no worker, capacity witness, effect or native qualification is supplied.",
+      "retirement": "Keep this test-only scope explicit; it authorizes no production opener or filesystem effect. Remove the inventory entry if the fixture call is removed."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/tests/general_historical_funding.rs",
+      "function": "general_historical_pressure_refuses_before_original_decode_and_preserves_record",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2423",
+      "reason": "Private unit fixture opens the actual exclusive journal Store through the genuine temporary profile guard. Passive historical rows exercise strict borrowed decoding, original-pool pressure and error custody; no worker, capacity witness, effect or native qualification is supplied.",
+      "retirement": "Keep this test-only scope explicit; it authorizes no production opener or filesystem effect. Remove the inventory entry if the fixture call is removed."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/tests/general_historical_funding.rs",
+      "function": "general_historical_recording_prestart_gate_remains_the_original_gate",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2423",
+      "reason": "Private unit fixture opens the actual exclusive journal Store through the genuine temporary profile guard. Passive historical rows exercise strict borrowed decoding, original-pool pressure and error custody; no worker, capacity witness, effect or native qualification is supplied.",
+      "retirement": "Keep this test-only scope explicit; it authorizes no production opener or filesystem effect. Remove the inventory entry if the fixture call is removed."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/tests/general_historical_funding.rs",
+      "function": "general_historical_selected_decode_failure_keeps_original_reply_credit_after_input_drop",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2423",
+      "reason": "Private unit fixture opens the actual exclusive journal Store through the genuine temporary profile guard. Passive historical rows exercise strict borrowed decoding, original-pool pressure and error custody; no worker, capacity witness, effect or native qualification is supplied.",
+      "retirement": "Keep this test-only scope explicit; it authorizes no production opener or filesystem effect. Remove the inventory entry if the fixture call is removed."
     }
   ]
 }
