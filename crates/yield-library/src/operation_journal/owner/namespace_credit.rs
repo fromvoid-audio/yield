@@ -1,4 +1,4 @@
-//! Selected namespace backing on the original reply, separate from observer credits.
+//! Selected namespace/control/observer backing retained on the original reply.
 //! Wiring requires the original detached StartupCredit implementation (OPT-2400).
 use super::*;
 
@@ -62,8 +62,13 @@ pub(super) fn retain_result_error<T>(
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .is_some();
-            if namespace_selected || control_selected {
-                // The selected namespace or control producer prepays this exact
+            let observer_selected = reply
+                .observer
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_some();
+            if namespace_selected || control_selected || observer_selected {
+                // The selected namespace, control or historical observer prepays this exact
                 // Box size before its original observation. The live reply retains that debit here.
                 Err(OperationJournalOwnerError::RetainedBacking(
                     RetainedCommandError {

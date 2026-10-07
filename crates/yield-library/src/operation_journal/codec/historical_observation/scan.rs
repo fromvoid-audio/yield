@@ -13,12 +13,21 @@ pub(super) struct Inventory {
     pub(super) payload: Option<std::ops::Range<usize>>,
     pub(super) version: Option<u32>,
 }
-pub(super) fn scan(bytes: &[u8], mut key: impl FnMut(Key)) -> Inventory {
+pub(super) fn scan(bytes: &[u8], key: impl FnMut(Key)) -> Inventory {
+    scan_with_payload(bytes, key, false)
+}
+
+pub(super) fn scan_full(bytes: &[u8]) -> Inventory {
+    scan_with_payload(bytes, |_| {}, true)
+}
+
+fn scan_with_payload(bytes: &[u8], mut key: impl FnMut(Key), retain_payload: bool) -> Inventory {
     let mut scan = Scanner {
         bytes,
         offset: 0,
         inventory: Inventory::default(),
         key: &mut key,
+        retain_payload,
     };
     scan.value(true, true);
     scan.inventory
@@ -28,6 +37,7 @@ struct Scanner<'a, F> {
     offset: usize,
     inventory: Inventory,
     key: &'a mut F,
+    retain_payload: bool,
 }
 impl<F: FnMut(Key)> Scanner<'_, F> {
     fn whitespace(&mut self) {
@@ -87,7 +97,7 @@ impl<F: FnMut(Key)> Scanner<'_, F> {
                     self.whitespace();
                     let start = self.offset;
                     let payload = root && keys::matches(&key, self.bytes, b"payload");
-                    self.value(false, retained && !payload);
+                    self.value(false, retained && (!payload || self.retain_payload));
                     if payload {
                         self.inventory.payload = Some(start..self.offset);
                     }

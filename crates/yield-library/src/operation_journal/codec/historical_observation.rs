@@ -6,6 +6,7 @@ use super::{DecodeError, StoredOperationRecord, decode_value, parse_unique_value
 use serde_json::Value;
 use std::mem::size_of;
 
+mod general_backing;
 mod keys;
 mod scan;
 mod syntax;
@@ -35,6 +36,7 @@ pub(in crate::operation_journal) const FIXED_BYTES: usize =
         + 2 * size_of::<InputPermit>()
         + size_of::<rusqlite::Statement<'static>>()
         + size_of::<rusqlite::Rows<'static>>()
+        + size_of::<crate::operation_journal::owner::OperationJournalOwnerError>()
         + 36
         + ERROR_BYTES;
 
