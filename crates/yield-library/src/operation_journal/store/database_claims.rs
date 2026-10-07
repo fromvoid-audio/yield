@@ -7,6 +7,7 @@ use crate::operation_journal::{AdmissionClaimInventory, OperationId};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+pub(super) mod command_backing;
 mod comparison;
 mod funded;
 mod scalar_projection;
@@ -389,7 +390,10 @@ impl OperationJournalStore {
     ) -> Result<(), OperationJournalStoreError> {
         let operation = record.operation_id;
         self.verify_recording_initial_readback_with_input(record, input)?;
-        inventory.validate_record(record).map_err(error)?;
+        match input {
+            Some(input) => command_backing::validate_record(record, inventory, input)?,
+            None => inventory.validate_record(record).map_err(error)?,
+        }
         if let Some(input) = input {
             return comparison::validate(self, record, inventory, input);
         }

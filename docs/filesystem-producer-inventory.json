@@ -1672,6 +1672,26 @@
       "issue": "OPT-2428",
       "reason": "Private actual Store on its genuine temporary profile exercises original bounded claim comparisons, malformed/corrupt metadata and selected loan custody. Arithmetic fixtures grant no native qualification, release or effect authority.",
       "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_command_digest_funding_tests.rs",
+      "function": "database_command_digest_funding_matches_original_and_retains_selected_digest_failure",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2429",
+      "reason": "Private actual Store on its genuine temporary profile checks original digest serialization, refusal without mutation and selected loan custody. Arithmetic fixtures grant no native qualification or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_command_digest_funding_tests.rs",
+      "function": "database_command_digest_funding_refuses_output_pressure_and_preserves_codec_bytes",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2429",
+      "reason": "Private actual Store on its genuine temporary profile checks original digest serialization, refusal without mutation and selected loan custody. Arithmetic fixtures grant no native qualification or effect authority.",
+      "retirement": "Keep this precise test-only opener scope; remove its row if the opener is removed. No production authority is granted."
     }
   ]
 }
