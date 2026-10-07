@@ -2078,9 +2078,16 @@ impl OwnerRuntime {
         provider
             .validate_claim_identities_available(&prepared.claims)
             .map_err(PreparedAdmissionError::from)?;
-        let lease = provider
-            .admit_with_live_witness(&prepared.plan, &prepared.claims, witness)
-            .map_err(PreparedAdmissionError::from)?;
+        let lease = match input {
+            Some(input) => provider.admit_with_live_witness_for_input(
+                &prepared.plan,
+                &prepared.claims,
+                witness,
+                input,
+            ),
+            None => provider.admit_with_live_witness(&prepared.plan, &prepared.claims, witness),
+        }
+        .map_err(PreparedAdmissionError::from)?;
 
         // Ordinary commands allocate their identity here; recording retains its frozen
         // identity. Everything above validates or creates one provisional owner lease.
