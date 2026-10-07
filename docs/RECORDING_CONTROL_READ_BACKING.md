@@ -1,0 +1,9 @@
+# Original recording control read backing
+
+The optional-input control reader reserves fixed statement, scalar and error backing before SQL. It streams the original borrowed recording proposal through the same JSON serializer into a checked scalar byte counter. Before the original control constructor hashes an owned proposal encoding, it reserves twice that actual encoded length for vector growth and twice the existing reserved control output allowance. Counting owns no proposal clone, JSON graph, output vector or permission.
+
+The original scalar projection and distinct payload projection remain separate, including the existing mutation fault hook. The payload is borrowed from the original statement; before the unchanged closed streaming decoder runs, the reader funds escaped-string scratch and original error formatting (six debug escape bytes per byte, three simultaneous reasons and geometric growth). Canonical prestart still compares exact original bytes, while general historical readers preserve typed noncanonical acceptance. Slot, identity, sequence and capture ordering remain unchanged. Native SQLite errors are funded before copying, and nested selected loans remain on the original carrier through consumer destruction.
+
+Optional-input recording inventory inspection and database claim record comparison use the existing complete scoped historical visitor. The original decoded record/proposal remains borrowed while its record loan and control loans are live; no clone escapes. The separate compatibility paths retain their existing decoding behavior.
+
+This funds the control and complete-record producers. Remaining claim/page/map, recording chunk and write transaction backing, full Legacy worker integration, and native runtime qualification remain requirements of OPT-2373. Stored observations supply no source, recording terminal, cleanup or settlement permission.

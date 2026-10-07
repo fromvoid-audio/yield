@@ -261,8 +261,9 @@ impl OperationJournalStore {
     }
     /// Audit the actual retained relation in the existing consistent rebuild transaction.
     /// Decode one bounded chunk at a time; observations never authorize capture or release.
-    pub(super) fn validate_recording_inventory_inside_transaction(
+    pub(super) fn validate_recording_inventory_inside_transaction_with_input(
         &self,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
         self.recording_retained_totals()?;
         let mut after_operation = String::new();
@@ -284,9 +285,33 @@ impl OperationJournalStore {
                         "restart recording operation identity is not canonical",
                     ));
                 }
-                let proposal = self.recording_proposal(OperationId::from_uuid(id))?;
-                self.verify_recording_reservation(&proposal, false)?;
-                self.validate_recording_operation_inventory(&proposal)?;
+                let operation = OperationId::from_uuid(id);
+                if let Some(input) = input {
+                    let present =
+                        self.inspect_complete_claim_operation(operation, input, |record, _| {
+                            let Some(UniversalCommandArgs::Recording(proposal)) =
+                                record.universal_command_args()
+                            else {
+                                return Err(error("operation has no recording proposal"));
+                            };
+                            if record.schema_version != SCHEMA_V17 {
+                                return Err(error("recording schema mismatch"));
+                            }
+                            self.verify_recording_reservation_with_input(
+                                proposal,
+                                false,
+                                Some(input),
+                            )?;
+                            self.validate_recording_operation_inventory(proposal)
+                        })?;
+                    if !present {
+                        return Err(error("recording operation absent"));
+                    }
+                } else {
+                    let proposal = self.recording_proposal(operation)?;
+                    self.verify_recording_reservation(&proposal, false)?;
+                    self.validate_recording_operation_inventory(&proposal)?;
+                }
                 after_operation = text;
             }
         }

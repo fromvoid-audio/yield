@@ -224,7 +224,7 @@ impl OperationJournalStore {
         let operation = OperationId::from_uuid(start.operation);
         let inventory = database_claims::read_with_input(&self.connection, operation, input)?
             .ok_or_else(|| error("missing actual binding"))?;
-        self.validate_database_claim_operation(operation, &inventory)?;
+        self.validate_database_claim_operation_with_input(operation, &inventory, input)?;
         let record = self
             .read_row(operation)?
             .ok_or_else(|| error("orphan start"))?

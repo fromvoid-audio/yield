@@ -1,5 +1,6 @@
 //! Same-transaction reserved recording metadata. No closure, grant or retirement authority.
 use super::{OperationJournalStore, OperationJournalStoreError};
+mod funded;
 use crate::operation_journal::coordinator::UniversalCommandArgs;
 use crate::operation_journal::recording_commands::RecordingProposal;
 use crate::operation_journal::recording_commands::controls::{
@@ -55,6 +56,18 @@ impl OperationJournalStore {
 
     /// Four exact rows are required for new capture. Zero rows is permitted only for observing
     /// historical bytes; partial/unknown/future controls never become an empty reservation.
+    pub(super) fn verify_recording_reservation_with_input(
+        &self,
+        proposal: &RecordingProposal,
+        required: bool,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<bool, OperationJournalStoreError> {
+        match input {
+            Some(input) => funded::verify(self, proposal, required, input),
+            None => self.verify_recording_reservation(proposal, required),
+        }
+    }
+
     pub(super) fn verify_recording_reservation(
         &self,
         proposal: &RecordingProposal,
@@ -206,6 +219,14 @@ impl OperationJournalStore {
         &self,
         record: &super::StoredOperationRecord,
     ) -> Result<(), OperationJournalStoreError> {
+        self.verify_recording_initial_readback_with_input(record, None)
+    }
+
+    pub(super) fn verify_recording_initial_readback_with_input(
+        &self,
+        record: &super::StoredOperationRecord,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
         if let Some(UniversalCommandArgs::Recording(proposal)) = record.universal_command_args() {
             // Test the actual post-COMMIT acknowledgement boundary through the retained owner.
             // A second connection is correctly excluded by the production locking policy.
@@ -217,7 +238,7 @@ impl OperationJournalStore {
                     params![b"unknown control".as_slice(), id.to_string()],
                 )?;
             }
-            self.verify_recording_reservation(proposal, true)?;
+            self.verify_recording_reservation_with_input(proposal, true, input)?;
         }
         Ok(())
     }
