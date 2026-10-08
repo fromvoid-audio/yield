@@ -18,6 +18,11 @@ use crate::SourceWatchSpec;
 pub mod macos;
 
 mod batch;
+mod capture_request;
+pub use capture_request::{
+    CapturedNativeReplay, CapturedNativeReplayBatch, NativeReplayCaptureError,
+    NativeReplayCaptureRequest,
+};
 
 pub use batch::ReplayObservationBatch;
 
