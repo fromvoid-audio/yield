@@ -104,61 +104,110 @@ impl OperationJournalStore {
         &self,
         input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
-        use crate::operation_journal::recording_commands::MAX_RECORDING_JOURNAL_DATABASE_BYTES;
         self.validate_namespace_with_input(input, false)?;
-        if rusqlite::version_number() != 3_050_002 {
-            return Err(error(
-                "recording metadata bound requires bundled SQLite 3.50.2",
-            ));
+        let schema = input
+            .map(|input| {
+                super::schema_backing::Scope::new(&self.connection, &self.database_path, input)
+            })
+            .transpose()?;
+        let result = (|| {
+            use crate::operation_journal::recording_commands::MAX_RECORDING_JOURNAL_DATABASE_BYTES;
+            if rusqlite::version_number() != 3_050_002 {
+                return Err(error(
+                    "recording metadata bound requires bundled SQLite 3.50.2",
+                ));
+            }
+            super::validate_existing_schema_with_scope(
+                &self.connection,
+                &self.database_path,
+                super::JOURNAL_SCHEMA_VERSION,
+                schema.as_ref(),
+            )?;
+            let temporary: i64 = match schema.as_ref() {
+                Some(schema) => schema.integer(c"SELECT COUNT(*) FROM sqlite_temp_master")?,
+                None => self.connection.query_row(
+                    "SELECT COUNT(*) FROM sqlite_temp_master",
+                    [],
+                    |r| r.get(0),
+                )?,
+            };
+            if temporary != 0 {
+                return Err(error(
+                    "recording metadata policy forbids temporary schema objects",
+                ));
+            }
+            match schema.as_ref() {
+                Some(schema) => {
+                    schema.execute(c"PRAGMA cache_spill=OFF")?;
+                    schema.execute(c"PRAGMA temp_store=MEMORY")?;
+                }
+                None => self
+                    .connection
+                    .execute_batch("PRAGMA cache_spill=OFF; PRAGMA temp_store=MEMORY;")?,
+            }
+            let page_size: i64 = match schema.as_ref() {
+                Some(schema) => schema.integer(c"PRAGMA page_size")?,
+                None => self
+                    .connection
+                    .query_row("PRAGMA page_size", [], |r| r.get(0))?,
+            };
+            if !(512..=65536).contains(&page_size) || !(page_size as u64).is_power_of_two() {
+                return Err(error("unknown SQLite page size"));
+            }
+            let existing: i64 = match schema.as_ref() {
+                Some(schema) => schema.integer(c"PRAGMA max_page_count")?,
+                None => self
+                    .connection
+                    .query_row("PRAGMA max_page_count", [], |r| r.get(0))?,
+            };
+            if existing <= 0 {
+                return Err(error("unknown existing SQLite growth limit"));
+            }
+            // Recording may tighten the original owner's policy, never enlarge it.
+            let pages =
+                (MAX_RECORDING_JOURNAL_DATABASE_BYTES / page_size as u64).min(existing as u64);
+            let enforced: i64 = match schema.as_ref() {
+                Some(schema) => schema.dynamic_integer("PRAGMA max_page_count=", pages)?,
+                None => self.connection.query_row(
+                    &format!("PRAGMA max_page_count={pages}"),
+                    [],
+                    |r| r.get(0),
+                )?,
+            };
+            let current: i64 = match schema.as_ref() {
+                Some(schema) => schema.integer(c"PRAGMA page_count")?,
+                None => self
+                    .connection
+                    .query_row("PRAGMA page_count", [], |r| r.get(0))?,
+            };
+            let spill: i64 = match schema.as_ref() {
+                Some(schema) => schema.integer(c"PRAGMA cache_spill")?,
+                None => self
+                    .connection
+                    .query_row("PRAGMA cache_spill", [], |r| r.get(0))?,
+            };
+            let temp: i64 = match schema.as_ref() {
+                Some(schema) => schema.integer(c"PRAGMA temp_store")?,
+                None => self
+                    .connection
+                    .query_row("PRAGMA temp_store", [], |r| r.get(0))?,
+            };
+            if enforced != pages as i64
+                || current < 0
+                || current > enforced
+                || spill != 0
+                || temp != 2
+            {
+                return Err(error(
+                    "recording SQLite growth policy unavailable or exceeded",
+                ));
+            }
+            Ok(())
+        })();
+        if let Some(schema) = schema {
+            schema.finish(result.is_err());
         }
-        super::validate_existing_schema(
-            &self.connection,
-            &self.database_path,
-            super::JOURNAL_SCHEMA_VERSION,
-        )?;
-        let temporary: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM sqlite_temp_master", [], |r| r.get(0))?;
-        if temporary != 0 {
-            return Err(error(
-                "recording metadata policy forbids temporary schema objects",
-            ));
-        }
-        self.connection
-            .execute_batch("PRAGMA cache_spill=OFF; PRAGMA temp_store=MEMORY;")?;
-        let page_size: i64 = self
-            .connection
-            .query_row("PRAGMA page_size", [], |r| r.get(0))?;
-        if !(512..=65536).contains(&page_size) || !(page_size as u64).is_power_of_two() {
-            return Err(error("unknown SQLite page size"));
-        }
-        let existing: i64 = self
-            .connection
-            .query_row("PRAGMA max_page_count", [], |r| r.get(0))?;
-        if existing <= 0 {
-            return Err(error("unknown existing SQLite growth limit"));
-        }
-        // Recording may tighten the original owner's policy, never enlarge it.
-        let pages = (MAX_RECORDING_JOURNAL_DATABASE_BYTES / page_size as u64).min(existing as u64);
-        let enforced: i64 =
-            self.connection
-                .query_row(&format!("PRAGMA max_page_count={pages}"), [], |r| r.get(0))?;
-        let current: i64 = self
-            .connection
-            .query_row("PRAGMA page_count", [], |r| r.get(0))?;
-        let spill: i64 = self
-            .connection
-            .query_row("PRAGMA cache_spill", [], |r| r.get(0))?;
-        let temp: i64 = self
-            .connection
-            .query_row("PRAGMA temp_store", [], |r| r.get(0))?;
-        if enforced != pages as i64 || current < 0 || current > enforced || spill != 0 || temp != 2
-        {
-            return Err(error(
-                "recording SQLite growth policy unavailable or exceeded",
-            ));
-        }
-        Ok(())
+        result
     }
     #[allow(dead_code)] // Preserve the original unfunded entry point.
     pub(crate) fn validate_recording_capacity_binding(

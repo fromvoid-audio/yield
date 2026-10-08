@@ -76,10 +76,12 @@ mod namespace_backing;
 mod namespace_backing_probe;
 pub(super) use admission_rebuild_backing::FundedSnapshot;
 mod historical_claim_observation;
+mod initial_settlement_backing;
 mod legacy_allocation_observation;
 mod recording_chunks;
 mod recording_prestart_budget;
 mod recording_prestart_database_claims;
+mod schema_backing;
 mod transaction_control;
 pub use legacy_allocation_observation::{LegacyJournalObservation, LegacyJournalObservationError};
 pub(crate) use recording_prestart_budget::COMMAND_INPUT_BYTES as RECORDING_PRESTART_INPUT_BYTES;
@@ -586,6 +588,15 @@ impl InitialClaimSettlement {
     pub(crate) fn into_parts(self) -> (JournalInsertOutcome, Option<ProvisionalCapacityLease>) {
         (self.outcome, self.lease)
     }
+}
+
+// Original lease stays with its owner on every borrowed settlement outcome.
+enum BorrowedInitialClaimSettlementError {
+    Capacity(CapacityProviderError),
+    OutcomeRetained {
+        outcome: JournalInsertOutcome,
+        source: CapacityProviderError,
+    },
 }
 
 /// Validation or storage errors before an initial claim settlement can be acknowledged.
@@ -6345,7 +6356,50 @@ impl OperationJournalStore {
         provider: &CapacityProvider,
         lease: ProvisionalCapacityLease,
     ) -> Result<InitialClaimSettlement, InitialClaimSettlementError> {
-        self.settle_initial_claims_with_inventory(record, claims, provider, lease, None)
+        self.settle_initial_claims_with_lease_for_input(record, claims, provider, lease, None)
+    }
+
+    pub(in crate::operation_journal) fn prepay_initial_record_construction(
+        borrowed: &impl serde::Serialize,
+        input: &super::owner::InputPermit,
+    ) -> Result<super::owner::InputPermit, OperationJournalStoreError> {
+        let mut working = input.reserve_historical_scratch(
+            database_claims::command_backing::shape_working_bytes()
+                + std::mem::size_of::<super::owner::OperationJournalOwnerError>(),
+        )?;
+        let bytes = match database_claims::command_backing::construction_bytes(borrowed) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                input.retain_historical_error(working, None, None, None);
+                return Err(error);
+            }
+        };
+        working.absorb_historical_scratch(input.reserve_historical_scratch(bytes)?);
+        Ok(working)
+    }
+
+    pub(in crate::operation_journal) fn settle_initial_claims_with_lease_for_input(
+        &self,
+        record: &StoredOperationRecord,
+        claims: &AdmissionClaimInventory,
+        provider: &CapacityProvider,
+        lease: ProvisionalCapacityLease,
+        input: Option<&super::owner::InputPermit>,
+    ) -> Result<InitialClaimSettlement, InitialClaimSettlementError> {
+        let scope = input
+            .map(|input| initial_settlement_backing::Scope::new(self, record, claims, input))
+            .transpose()?;
+        let result = self.settle_initial_claims_with_inventory_for_input(
+            record, claims, provider, lease, None, input,
+        );
+        let selected = match &result {
+            Err(_) => true,
+            Ok(settlement) => matches!(settlement.outcome, JournalInsertOutcome::Failed(_)),
+        };
+        if let Some(scope) = scope {
+            scope.finish(selected);
+        }
+        result
     }
 
     fn settle_initial_claims_with_inventory(
@@ -6353,8 +6407,22 @@ impl OperationJournalStore {
         record: &StoredOperationRecord,
         claims: &AdmissionClaimInventory,
         provider: &CapacityProvider,
+        lease: ProvisionalCapacityLease,
+        inventory: Option<&super::database_claims::DatabaseClaimInventory>,
+    ) -> Result<InitialClaimSettlement, InitialClaimSettlementError> {
+        self.settle_initial_claims_with_inventory_for_input(
+            record, claims, provider, lease, inventory, None,
+        )
+    }
+
+    fn settle_initial_claims_with_inventory_for_input(
+        &self,
+        record: &StoredOperationRecord,
+        claims: &AdmissionClaimInventory,
+        provider: &CapacityProvider,
         mut lease: ProvisionalCapacityLease,
         inventory: Option<&super::database_claims::DatabaseClaimInventory>,
+        input: Option<&super::owner::InputPermit>,
     ) -> Result<InitialClaimSettlement, InitialClaimSettlementError> {
         validate_intent_record(record).map_err(InitialClaimSettlementError::Store)?;
         let full_plan =
@@ -6382,59 +6450,71 @@ impl OperationJournalStore {
         let encoded = encode(record)
             .map_err(OperationJournalStoreError::from)
             .map_err(InitialClaimSettlementError::Store)?;
+        match self.settle_frozen_initial_claims_borrowed(
+            record, &encoded, &full_plan, claims, provider, &mut lease, inventory, input,
+        ) {
+            Ok((outcome, retained)) => Ok(InitialClaimSettlement {
+                outcome,
+                lease: retained.then_some(lease),
+            }),
+            Err(BorrowedInitialClaimSettlementError::Capacity(source)) => {
+                Err(InitialClaimSettlementError::Capacity(source))
+            }
+            Err(BorrowedInitialClaimSettlementError::OutcomeRetained { outcome, source }) => {
+                Err(InitialClaimSettlementError::OutcomeRetained {
+                    outcome,
+                    lease,
+                    source,
+                })
+            }
+        }
+    }
+
+    // Called only after the original record/claims/encoding validation above.
+    // The eventual original Legacy slot lends this exact retained lease; it is
+    // never replaced or moved by pin/commit/rollback settlement.
+    fn settle_frozen_initial_claims_borrowed(
+        &self,
+        record: &StoredOperationRecord,
+        encoded: &[u8],
+        full_plan: &FullCapacityPlan,
+        claims: &AdmissionClaimInventory,
+        provider: &CapacityProvider,
+        lease: &mut ProvisionalCapacityLease,
+        inventory: Option<&super::database_claims::DatabaseClaimInventory>,
+        input: Option<&super::owner::InputPermit>,
+    ) -> Result<(JournalInsertOutcome, bool), BorrowedInitialClaimSettlementError> {
         lease
-            .validate_against(provider, &full_plan, claims)
-            .map_err(InitialClaimSettlementError::Capacity)?;
+            .validate_against(provider, full_plan, claims)
+            .map_err(BorrowedInitialClaimSettlementError::Capacity)?;
         lease
             .pin_for_persistence(record.operation_id)
-            .map_err(InitialClaimSettlementError::Capacity)?;
-
-        let outcome = self.persist_record_with_encoded_outcome_and_database_claims(
+            .map_err(BorrowedInitialClaimSettlementError::Capacity)?;
+        let outcome = self.persist_record_with_encoded_outcome_and_database_claims_for_input(
             record,
-            &encoded,
+            encoded,
             Some(claims),
             inventory,
+            input,
         );
-        let retain = match &outcome {
-            JournalInsertOutcome::Committed(_) => false,
-            JournalInsertOutcome::Failed(failure) => matches!(
-                failure.stage(),
-                JournalInsertWriteStage::RollbackNotConfirmed
-                    | JournalInsertWriteStage::CommitOutcomeUnknown
-                    | JournalInsertWriteStage::CommittedButNotAcknowledged
-            ),
-        };
         if matches!(&outcome, JournalInsertOutcome::Committed(_)) {
             if let Err(source) = lease.mark_durable(record.operation_id) {
-                return Err(InitialClaimSettlementError::OutcomeRetained {
+                return Err(BorrowedInitialClaimSettlementError::OutcomeRetained {
                     outcome,
-                    lease,
                     source,
                 });
             }
-            return Ok(InitialClaimSettlement {
-                outcome,
-                lease: Some(lease),
-            });
+            return Ok((outcome, true));
         }
-        if retain {
-            return Ok(InitialClaimSettlement {
-                outcome,
-                lease: Some(lease),
-            });
+        if matches!(&outcome, JournalInsertOutcome::Failed(failure) if matches!(failure.stage(),
+            JournalInsertWriteStage::RollbackNotConfirmed | JournalInsertWriteStage::CommitOutcomeUnknown | JournalInsertWriteStage::CommittedButNotAcknowledged))
+        {
+            return Ok((outcome, true));
         }
-
-        let lease = match lease.release_after_confirmed_rollback(record.operation_id) {
-            Ok(()) => None,
-            Err(source) => {
-                return Err(InitialClaimSettlementError::OutcomeRetained {
-                    outcome,
-                    lease,
-                    source,
-                });
-            }
-        };
-        Ok(InitialClaimSettlement { outcome, lease })
+        if let Err(source) = lease.release_after_confirmed_rollback(record.operation_id) {
+            return Err(BorrowedInitialClaimSettlementError::OutcomeRetained { outcome, source });
+        }
+        Ok((outcome, false))
     }
 
     /// Persist and reconcile one explicit owner-thread logical release. The immutable receipt is
@@ -6712,8 +6792,21 @@ impl OperationJournalStore {
         claims: Option<&AdmissionClaimInventory>,
         inventory: Option<&super::database_claims::DatabaseClaimInventory>,
     ) -> JournalInsertOutcome {
+        self.persist_record_with_encoded_outcome_and_database_claims_for_input(
+            record, encoded, claims, inventory, None,
+        )
+    }
+
+    fn persist_record_with_encoded_outcome_and_database_claims_for_input(
+        &self,
+        record: &StoredOperationRecord,
+        encoded: &[u8],
+        claims: Option<&AdmissionClaimInventory>,
+        inventory: Option<&super::database_claims::DatabaseClaimInventory>,
+        input: Option<&super::owner::InputPermit>,
+    ) -> JournalInsertOutcome {
         let operation_id = record.operation_id;
-        if let Err(error) = self.validate_namespace() {
+        if let Err(error) = self.validate_namespace_with_input(input, false) {
             return failed_insert(
                 operation_id,
                 JournalInsertWriteStage::NoMutationAttempted,
@@ -6723,7 +6816,11 @@ impl OperationJournalStore {
                 None,
             );
         }
-        if let Err(error) = self.prepare_recording_initial_policy(record) {
+        let recording_policy = match input {
+            Some(input) => self.prepare_recording_initial_policy_with_input(record, Some(input)),
+            None => self.prepare_recording_initial_policy(record),
+        };
+        if let Err(error) = recording_policy {
             return failed_insert(
                 operation_id,
                 JournalInsertWriteStage::NoMutationAttempted,
@@ -6746,7 +6843,9 @@ impl OperationJournalStore {
                 None,
             );
         }
-        if let Err(error) = self.connection.execute_batch("BEGIN EXCLUSIVE") {
+        if let Err(error) =
+            initial_settlement_backing::control(&self.connection, input, c"BEGIN EXCLUSIVE")
+        {
             return failed_insert(
                 operation_id,
                 JournalInsertWriteStage::NoMutationAttempted,
@@ -6757,49 +6856,78 @@ impl OperationJournalStore {
             );
         }
 
-        let receipt = match self.insert_inside_transaction(record, encoded) {
+        let receipt = match self.insert_inside_transaction(record, encoded, input) {
             Ok(receipt) => receipt,
             Err(error) => {
-                return self.rollback_insert_failure(operation_id, error, None, encoded.len());
+                return self.rollback_insert_failure_for_input(
+                    operation_id,
+                    error,
+                    None,
+                    encoded.len(),
+                    input,
+                );
             }
         };
-        if let Err(error) = self.reserve_recording_initial_inside_transaction(record) {
-            return self.rollback_insert_failure(
+        if let Err(error) =
+            self.reserve_recording_initial_inside_transaction_with_input(record, input)
+        {
+            return self.rollback_insert_failure_for_input(
                 operation_id,
                 error,
                 Some(receipt.sequence),
                 encoded.len(),
+                input,
             );
         }
         if let Some(claims) = claims {
-            if let Err(error) = ordinary_claims::insert_rows_inside_transaction(
-                &self.connection,
-                operation_id,
-                claims,
-            )
-            .and_then(|()| {
-                ordinary_claims::verify_rows_inside_transaction(
+            let claims_result = match input {
+                Some(input) => ordinary_claims::initial_funded::insert(
+                    &self.connection,
+                    operation_id,
+                    claims,
+                    input,
+                )
+                .and_then(|()| {
+                    ordinary_claims::initial_funded::verify(
+                        &self.connection,
+                        operation_id,
+                        claims,
+                        input,
+                    )
+                }),
+                None => ordinary_claims::insert_rows_inside_transaction(
                     &self.connection,
                     operation_id,
                     claims,
                 )
-            }) {
-                return self.rollback_insert_failure(
+                .and_then(|()| {
+                    ordinary_claims::verify_rows_inside_transaction(
+                        &self.connection,
+                        operation_id,
+                        claims,
+                    )
+                })
+                .map_err(ordinary_claim_write_error),
+            };
+            if let Err(error) = claims_result {
+                return self.rollback_insert_failure_for_input(
                     operation_id,
-                    ordinary_claim_write_error(error),
+                    error,
                     Some(receipt.sequence),
                     encoded.len(),
+                    input,
                 );
             }
         }
 
         if let Some(inventory) = inventory {
             if let Err(error) = database_claims::insert(&self.connection, operation_id, inventory) {
-                return self.rollback_insert_failure(
+                return self.rollback_insert_failure_for_input(
                     operation_id,
                     error,
                     Some(receipt.sequence),
                     encoded.len(),
+                    input,
                 );
             }
         }
@@ -6811,22 +6939,24 @@ impl OperationJournalStore {
             match directive {
                 InsertTestDirective::Fail(error)
                 | InsertTestDirective::FailAndLeaveForRollback(error) => {
-                    return self.rollback_insert_failure(
+                    return self.rollback_insert_failure_for_input(
                         operation_id,
                         error,
                         Some(receipt.sequence),
                         encoded.len(),
+                        input,
                     );
                 }
                 InsertTestDirective::Continue | InsertTestDirective::ExecuteThenFail(_) => {}
             }
         }
-        if let Err(error) = self.validate_namespace_without_sidecars() {
-            return self.rollback_insert_failure(
+        if let Err(error) = self.validate_namespace_with_input(input, true) {
+            return self.rollback_insert_failure_for_input(
                 operation_id,
                 error,
                 Some(receipt.sequence),
                 encoded.len(),
+                input,
             );
         }
 
@@ -6834,7 +6964,7 @@ impl OperationJournalStore {
         let commit_directive = self.insert_test_directive(InsertTestBoundary::Commit);
         #[cfg(test)]
         if let Some(InsertTestDirective::Fail(error)) = commit_directive {
-            let rollback_error = self.rollback_insert_transaction();
+            let rollback_error = self.rollback_insert_transaction_for_input(input);
             return failed_insert(
                 operation_id,
                 JournalInsertWriteStage::CommitOutcomeUnknown,
@@ -6846,8 +6976,9 @@ impl OperationJournalStore {
         }
         #[cfg(test)]
         if let Some(InsertTestDirective::ExecuteThenFail(error)) = commit_directive {
-            let commit_result = self.connection.execute_batch("COMMIT");
-            let rollback_error = self.rollback_insert_transaction();
+            let commit_result =
+                initial_settlement_backing::control(&self.connection, input, c"COMMIT");
+            let rollback_error = self.rollback_insert_transaction_for_input(input);
             if let Err(commit_error) = commit_result {
                 return failed_insert(
                     operation_id,
@@ -6867,8 +6998,9 @@ impl OperationJournalStore {
                 rollback_error,
             );
         }
-        if let Err(error) = self.connection.execute_batch("COMMIT") {
-            let rollback_error = self.rollback_insert_transaction();
+        if let Err(error) = initial_settlement_backing::control(&self.connection, input, c"COMMIT")
+        {
+            let rollback_error = self.rollback_insert_transaction_for_input(input);
             return failed_insert(
                 operation_id,
                 JournalInsertWriteStage::CommitOutcomeUnknown,
@@ -6892,7 +7024,7 @@ impl OperationJournalStore {
                 None,
             );
         }
-        if let Err(error) = self.validate_namespace() {
+        if let Err(error) = self.validate_namespace_with_input(input, false) {
             return failed_insert(
                 operation_id,
                 JournalInsertWriteStage::CommittedButNotAcknowledged,
@@ -6902,8 +7034,14 @@ impl OperationJournalStore {
                 None,
             );
         }
-        let persisted = match self.get(operation_id) {
-            Ok(persisted) => persisted,
+        let readback = match input {
+            Some(input) => initial_settlement_backing::readback_matches(self, record, input),
+            None => self
+                .get(operation_id)
+                .map(|persisted| persisted.as_ref() == Some(record)),
+        };
+        let identical = match readback {
+            Ok(identical) => identical,
             Err(error) => {
                 return failed_insert(
                     operation_id,
@@ -6915,7 +7053,7 @@ impl OperationJournalStore {
                 );
             }
         };
-        if persisted.as_ref() != Some(record) {
+        if !identical {
             return failed_insert(
                 operation_id,
                 JournalInsertWriteStage::CommittedButNotAcknowledged,
@@ -6928,7 +7066,11 @@ impl OperationJournalStore {
                 None,
             );
         }
-        if let Err(error) = self.verify_recording_initial_readback(record) {
+        let recording_readback = match input {
+            Some(input) => self.verify_recording_initial_readback_with_input(record, Some(input)),
+            None => self.verify_recording_initial_readback(record),
+        };
+        if let Err(error) = recording_readback {
             return failed_insert(
                 operation_id,
                 JournalInsertWriteStage::CommittedButNotAcknowledged,
@@ -6939,15 +7081,25 @@ impl OperationJournalStore {
             );
         }
         if let Some(claims) = claims {
-            if let Err(error) = ordinary_claims::verify_rows_inside_transaction(
-                &self.connection,
-                operation_id,
-                claims,
-            ) {
+            let claims_result = match input {
+                Some(input) => ordinary_claims::initial_funded::verify(
+                    &self.connection,
+                    operation_id,
+                    claims,
+                    input,
+                ),
+                None => ordinary_claims::verify_rows_inside_transaction(
+                    &self.connection,
+                    operation_id,
+                    claims,
+                )
+                .map_err(ordinary_claim_write_error),
+            };
+            if let Err(error) = claims_result {
                 return failed_insert(
                     operation_id,
                     JournalInsertWriteStage::CommittedButNotAcknowledged,
-                    ordinary_claim_write_error(error),
+                    error,
                     Some(receipt.sequence),
                     encoded.len(),
                     None,
@@ -6969,14 +7121,15 @@ impl OperationJournalStore {
         JournalInsertOutcome::Committed(receipt)
     }
 
-    fn rollback_insert_failure(
+    fn rollback_insert_failure_for_input(
         &self,
         operation_id: OperationId,
         error: OperationJournalStoreError,
         attempted_sequence: Option<i64>,
         encoded_bytes: usize,
+        input: Option<&super::owner::InputPermit>,
     ) -> JournalInsertOutcome {
-        let rollback_error = self.rollback_insert_transaction();
+        let rollback_error = self.rollback_insert_transaction_for_input(input);
         let stage = if rollback_error.is_some() {
             JournalInsertWriteStage::RollbackNotConfirmed
         } else {
@@ -6993,6 +7146,13 @@ impl OperationJournalStore {
     }
 
     fn rollback_insert_transaction(&self) -> Option<Box<OperationJournalStoreError>> {
+        self.rollback_insert_transaction_for_input(None)
+    }
+
+    fn rollback_insert_transaction_for_input(
+        &self,
+        input: Option<&super::owner::InputPermit>,
+    ) -> Option<Box<OperationJournalStoreError>> {
         #[cfg(test)]
         if let Some(directive) = self.insert_test_directive(InsertTestBoundary::Rollback) {
             match directive {
@@ -7001,14 +7161,14 @@ impl OperationJournalStore {
                     return Some(Box::new(error));
                 }
                 InsertTestDirective::ExecuteThenFail(error) => {
-                    let _ = self.connection.execute_batch("ROLLBACK");
+                    let _ =
+                        initial_settlement_backing::control(&self.connection, input, c"ROLLBACK");
                     return Some(Box::new(error));
                 }
                 InsertTestDirective::Continue => {}
             }
         }
-        self.connection
-            .execute_batch("ROLLBACK")
+        initial_settlement_backing::control(&self.connection, input, c"ROLLBACK")
             .err()
             .map(|error| Box::new(OperationJournalStoreError::from(error)))
     }
@@ -7044,12 +7204,14 @@ impl OperationJournalStore {
         &self,
         record: &StoredOperationRecord,
         encoded: &[u8],
+        input: Option<&super::owner::InputPermit>,
     ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
-        self.validate_namespace_without_sidecars()?;
+        self.validate_namespace_with_input(input, true)?;
         let operation_id = record.operation_id;
-        let key = operation_id.to_string();
-        let (legacy_present, full_progress_present) =
-            self.operation_family_presence(operation_id)?;
+        let (legacy_present, full_progress_present) = match input {
+            Some(input) => initial_settlement_backing::family_presence(self, operation_id, input)?,
+            None => self.operation_family_presence(operation_id)?,
+        };
         if legacy_present && full_progress_present {
             return Err(audit_error(
                 &self.database_path,
@@ -7059,12 +7221,26 @@ impl OperationJournalStore {
         if legacy_present || full_progress_present {
             return Err(OperationJournalStoreError::DuplicateOperation { operation_id });
         }
-        let sequence = self.next_sequence_inside_transaction()?;
-        self.connection.execute(
-            "INSERT INTO operation_journal (operation_id, sequence, record)
+        let sequence = match input {
+            Some(input) => initial_settlement_backing::next_sequence(self, input)?,
+            None => self.next_sequence_inside_transaction()?,
+        };
+        match input {
+            Some(input) => initial_settlement_backing::insert_row(
+                self,
+                operation_id,
+                sequence,
+                encoded,
+                input,
+            )?,
+            None => {
+                self.connection.execute(
+                    "INSERT INTO operation_journal (operation_id, sequence, record)
              VALUES (?1, ?2, ?3)",
-            params![key, sequence, encoded],
-        )?;
+                    params![operation_id.to_string(), sequence, encoded],
+                )?;
+            }
+        }
         Ok(JournalInsertReceipt {
             operation_id,
             sequence,
@@ -8219,8 +8395,17 @@ fn read_sqlite_user_version(
     connection: &Connection,
     path: &Path,
 ) -> Result<u32, OperationJournalStoreError> {
-    let user_version: i64 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    read_sqlite_user_version_with_scope(connection, path, None)
+}
+fn read_sqlite_user_version_with_scope(
+    connection: &Connection,
+    path: &Path,
+    schema: Option<&schema_backing::Scope<'_>>,
+) -> Result<u32, OperationJournalStoreError> {
+    let user_version: i64 = match schema {
+        Some(schema) => schema.integer(c"PRAGMA user_version")?,
+        None => connection.pragma_query_value(None, "user_version", |row| row.get(0))?,
+    };
     let user_version = u32::try_from(user_version).map_err(|_| {
         audit_error(
             path,
@@ -8258,7 +8443,15 @@ fn validate_existing_schema(
     path: &Path,
     schema_version: u32,
 ) -> Result<(), OperationJournalStoreError> {
-    let actual_version = read_sqlite_user_version(connection, path)?;
+    validate_existing_schema_with_scope(connection, path, schema_version, None)
+}
+fn validate_existing_schema_with_scope(
+    connection: &Connection,
+    path: &Path,
+    schema_version: u32,
+    schema: Option<&schema_backing::Scope<'_>>,
+) -> Result<(), OperationJournalStoreError> {
+    let actual_version = read_sqlite_user_version_with_scope(connection, path, schema)?;
     if actual_version != schema_version {
         return Err(audit_error(
             path,
@@ -8267,15 +8460,18 @@ fn validate_existing_schema(
             ),
         ));
     }
-    let objects: Vec<(String, String)> = connection
-        .prepare(
-            "SELECT name, type FROM sqlite_master
+    let objects: Vec<(String, String)> = match schema {
+        Some(schema) => schema.objects()?,
+        None => connection
+            .prepare(
+                "SELECT name, type FROM sqlite_master
              WHERE name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?1",
-        )?
-        .query_map(params![MAX_SCHEMA_OBJECTS + 1], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+            )?
+            .query_map(params![MAX_SCHEMA_OBJECTS + 1], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     let expected_objects = match schema_version {
         LEGACY_JOURNAL_SCHEMA_VERSION => {
             vec![(String::from(JOURNAL_TABLE_NAME), String::from("table"))]
@@ -8476,7 +8672,13 @@ fn validate_existing_schema(
         ));
     }
 
-    validate_table_schema(connection, path, JOURNAL_TABLE_NAME, CREATE_JOURNAL_TABLE)?;
+    validate_table_schema_with_scope(
+        connection,
+        path,
+        JOURNAL_TABLE_NAME,
+        CREATE_JOURNAL_TABLE,
+        schema,
+    )?;
     if matches!(
         schema_version,
         PREVIOUS_JOURNAL_SCHEMA_VERSION
@@ -8492,11 +8694,12 @@ fn validate_existing_schema(
             | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             FULL_PROGRESS_TABLE_NAME,
             CREATE_FULL_PROGRESS_TABLE,
+            schema,
         )?;
     }
     if matches!(
@@ -8513,17 +8716,19 @@ fn validate_existing_schema(
             | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             recovery_reserve::CHARGE_TABLE_NAME,
             recovery_reserve::CREATE_CHARGE_TABLE,
+            schema,
         )?;
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             recovery_reserve::TRANSITION_TABLE_NAME,
             recovery_reserve::CREATE_TRANSITION_TABLE,
+            schema,
         )?;
     }
     if matches!(
@@ -8539,11 +8744,12 @@ fn validate_existing_schema(
             | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             recovery_reserve_binding::TABLE_NAME,
             recovery_reserve_binding::CREATE_TABLE,
+            schema,
         )?;
     }
     if matches!(
@@ -8558,11 +8764,12 @@ fn validate_existing_schema(
             | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             ordinary_claims::TABLE_NAME,
             ordinary_claims::CREATE_TABLE,
+            schema,
         )?;
     }
     if matches!(
@@ -8576,11 +8783,12 @@ fn validate_existing_schema(
             | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             ordinary_claims::RELEASE_TABLE_NAME,
             ordinary_claims::CREATE_RELEASE_TABLE,
+            schema,
         )?;
     }
     if matches!(
@@ -8593,11 +8801,12 @@ fn validate_existing_schema(
             | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             chunk_claims::TABLE_NAME,
             chunk_claims::CREATE_TABLE,
+            schema,
         )?;
     }
     if matches!(
@@ -8609,79 +8818,91 @@ fn validate_existing_schema(
             | DATABASE_ATTEMPTS_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             staging_checkpoints::TABLE_NAME,
             staging_checkpoints::CREATE_TABLE,
+            schema,
         )?;
     }
     if schema_version >= CHUNK_STAGING_SCHEMA_VERSION {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             chunk_staging::TABLE_NAME,
             chunk_staging::CREATE_TABLE,
+            schema,
         )?;
     }
     if schema_version >= RECORDING_CHUNKS_SCHEMA_VERSION {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             recording_chunks::TABLE_NAME,
             recording_chunks::CREATE_TABLE,
+            schema,
         )?;
     }
     if schema_version >= DATABASE_CLAIMS_SCHEMA_VERSION {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             database_claims::BINDING_TABLE,
             database_claims::CREATE_BINDING,
+            schema,
         )?;
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             database_claims::SLICE_TABLE,
             database_claims::CREATE_SLICE,
+            schema,
         )?;
     }
     if schema_version >= DATABASE_ATTEMPTS_SCHEMA_VERSION {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             database_attempts::START_TABLE,
             database_attempts::CREATE_START,
+            schema,
         )?;
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             database_attempts::OUTCOME_TABLE,
             database_attempts::CREATE_OUTCOME,
+            schema,
         )?;
     }
     if schema_version == JOURNAL_SCHEMA_VERSION {
-        validate_table_schema(
+        validate_table_schema_with_scope(
             connection,
             path,
             publication_bindings::TABLE_NAME,
             publication_bindings::CREATE_TABLE,
+            schema,
         )?;
     }
     Ok(())
 }
 
-fn validate_table_schema(
+fn validate_table_schema_with_scope(
     connection: &Connection,
     path: &Path,
     table_name: &str,
     expected_sql: &str,
+    schema: Option<&schema_backing::Scope<'_>>,
 ) -> Result<(), OperationJournalStoreError> {
-    let table_sql: String = connection.query_row(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        params![table_name],
-        |row| row.get(0),
-    )?;
+    let table_sql: String = match schema {
+        Some(schema) => schema.table_sql(table_name, expected_sql)?,
+        None => connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table_name],
+            |row| row.get(0),
+        )?,
+    };
     if normalize_sql(&table_sql) != normalize_sql(expected_sql) {
         return Err(audit_error(
             path,
@@ -8689,13 +8910,16 @@ fn validate_table_schema(
         ));
     }
 
-    let columns: Vec<(String, String, i64, i64)> = connection
-        .prepare(&format!("PRAGMA table_info({table_name})"))?
-        .query_map([], |row| {
-            Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(5)?))
-        })?
-        .take(MAX_SCHEMA_COLUMNS)
-        .collect::<Result<Vec<_>, _>>()?;
+    let columns: Vec<(String, String, i64, i64)> = match schema {
+        Some(schema) => schema.columns(table_name)?,
+        None => connection
+            .prepare(&format!("PRAGMA table_info({table_name})"))?
+            .query_map([], |row| {
+                Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(5)?))
+            })?
+            .take(MAX_SCHEMA_COLUMNS)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     let expected_columns = match table_name {
         database_attempts::START_TABLE => [
             ("attempt_id", "TEXT", 1, 1),
@@ -8942,19 +9166,22 @@ fn validate_table_schema(
         ));
     }
 
-    let indexes: Vec<(i64, String, i64, String, i64)> = connection
-        .prepare(&format!("PRAGMA index_list({table_name})"))?
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })?
-        .take(MAX_SCHEMA_INDEXES)
-        .collect::<Result<Vec<_>, _>>()?;
+    let indexes: Vec<(i64, String, i64, String, i64)> = match schema {
+        Some(schema) => schema.indexes(table_name)?,
+        None => connection
+            .prepare(&format!("PRAGMA index_list({table_name})"))?
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .take(MAX_SCHEMA_INDEXES)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     let mut origins: Vec<String> = indexes
         .iter()
         .filter(|(_, _, unique, _, partial)| *unique == 1 && *partial == 0)
@@ -9015,12 +9242,15 @@ fn validate_table_schema(
     ) {
         let mut actual = Vec::new();
         for (_, name, _, _, _) in &indexes {
-            let columns = connection
-                .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno LIMIT ?2")?
-                .query_map(params![name, MAX_SCHEMA_COLUMNS as i64], |r| {
-                    r.get::<_, String>(0)
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
+            let columns = match schema {
+                Some(schema) => schema.index_columns(name)?,
+                None => connection
+                    .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno LIMIT ?2")?
+                    .query_map(params![name, MAX_SCHEMA_COLUMNS as i64], |r| {
+                        r.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
             actual.push(columns);
         }
         let wanted = if table_name == database_attempts::START_TABLE {
@@ -10080,6 +10310,7 @@ mod tests {
     include!("store/recording_control_tests.rs");
     include!("store/recording_control_funding_tests.rs");
     include!("store/recording_restart_producer_funding_tests.rs");
+    include!("store/initial_settlement_funding_tests.rs");
     include!("store/json_materialization_tests.rs");
     use std::collections::BTreeMap;
     use std::fs;

@@ -9,6 +9,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, Row, params};
 use thiserror::Error;
 mod funded;
+pub(super) mod initial_funded;
 pub(super) use funded::{
     PageFailure, read_claim_page as read_funded_page, read_release_page as read_funded_release_page,
 };

@@ -22,7 +22,7 @@ impl<'a> Statement<'a> {
         connection: &'a Connection,
         input: &'a InputPermit,
         error_credit: &'a RefCell<Option<InputPermit>>,
-        sql: &'static CStr,
+        sql: &CStr,
     ) -> Result<Self, OperationJournalStoreError> {
         Self::new_with_message_copy(connection, input, error_credit, sql, copy_error_message)
     }
@@ -31,7 +31,7 @@ impl<'a> Statement<'a> {
         connection: &'a Connection,
         input: &'a InputPermit,
         error_credit: &'a RefCell<Option<InputPermit>>,
-        sql: &'static CStr,
+        sql: &CStr,
         copy_message: fn(
             &InputPermit,
             &CStr,
@@ -45,7 +45,7 @@ impl<'a> Statement<'a> {
             has_row: false,
             copy_message,
         };
-        // SAFETY: the original connection remains borrowed. Static SQL is NUL terminated;
+        // SAFETY: the original connection remains borrowed. The borrowed SQL is NUL terminated;
         // SQLite writes only the supplied statement pointer. No other thread can access it.
         let code = unsafe {
             ffi::sqlite3_prepare_v2(
@@ -73,6 +73,25 @@ impl<'a> Statement<'a> {
                 self.raw,
                 index,
                 text.as_ptr().cast(),
+                length,
+                ffi::SQLITE_TRANSIENT(),
+            )
+        })
+    }
+    pub(in crate::operation_journal::store) fn bind_blob(
+        &mut self,
+        index: i32,
+        bytes: &[u8],
+    ) -> Result<(), OperationJournalStoreError> {
+        let length = i32::try_from(bytes.len())
+            .map_err(|_| OperationJournalStoreError::HistoricalClaimResourceBound)?;
+        // SAFETY: the live statement borrows the original connection. TRANSIENT
+        // copies the bounded slice before returning and retains no Rust pointer.
+        self.check(unsafe {
+            ffi::sqlite3_bind_blob(
+                self.raw,
+                index,
+                bytes.as_ptr().cast(),
                 length,
                 ffi::SQLITE_TRANSIENT(),
             )

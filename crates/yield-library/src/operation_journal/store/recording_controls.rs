@@ -1,6 +1,7 @@
 //! Same-transaction reserved recording metadata. No closure, grant or retirement authority.
 use super::{OperationJournalStore, OperationJournalStoreError};
 mod funded;
+mod initial_funded;
 use crate::operation_journal::coordinator::UniversalCommandArgs;
 use crate::operation_journal::recording_commands::RecordingProposal;
 use crate::operation_journal::recording_commands::controls::{
@@ -20,9 +21,16 @@ impl OperationJournalStore {
         &self,
         record: &super::StoredOperationRecord,
     ) -> Result<(), OperationJournalStoreError> {
+        self.prepare_recording_initial_policy_with_input(record, None)
+    }
+    pub(super) fn prepare_recording_initial_policy_with_input(
+        &self,
+        record: &super::StoredOperationRecord,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
         if let Some(UniversalCommandArgs::Recording(proposal)) = record.universal_command_args() {
             reservation_metadata_bound(proposal).map_err(error)?;
-            self.configure_recording_metadata_policy()?;
+            self.configure_recording_metadata_policy_with_input(input)?;
         }
         Ok(())
     }
@@ -168,6 +176,16 @@ impl OperationJournalStore {
         Ok(true)
     }
 
+    pub(super) fn reserve_recording_initial_inside_transaction_with_input(
+        &self,
+        record: &super::StoredOperationRecord,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
+        match input {
+            Some(input) => initial_funded::reserve(self, record, input),
+            None => self.reserve_recording_initial_inside_transaction(record),
+        }
+    }
     pub(super) fn reserve_recording_initial_inside_transaction(
         &self,
         record: &super::StoredOperationRecord,
