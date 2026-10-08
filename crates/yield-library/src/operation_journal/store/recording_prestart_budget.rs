@@ -33,7 +33,7 @@ const _: () = {
 // This is incremental factory backing; the original connection/cache/runtime already
 // exist and are not created or enlarged by this preparation.
 const RECORD_INPUT_BYTES: usize = 3 * 1024 * 1024 + 512 * 1024 - 64 * 1024;
-pub(crate) const COMMAND_INPUT_BYTES: usize = RECORD_INPUT_BYTES;
+pub(crate) const COMMAND_INPUT_BYTES: usize = LOCAL_PROPOSAL_BYTES + RAW_AND_SCRATCH_BYTES;
 pub(super) const TREE_BYTES: usize = 448 * 1536 + 32 * 1024;
 const TYPED_BYTES: usize = 448 * 1024 + 32 * 1024 + 64 * 1024;
 const LOCAL_PROPOSAL_BYTES: usize = 192 * 1024;
@@ -48,7 +48,7 @@ const AUXILIARY_BYTES: usize = 64 * 1024;
 // available for complete inventory vectors, validation sets and SQL backing.
 const DATABASE_AUDIT_INPUT_BYTES: usize =
     RECORD_INPUT_BYTES - TREE_BYTES + recording_prestart_database_claims::ADDITIONAL_INPUT_BYTES;
-const _: () = assert!(DATABASE_AUDIT_INPUT_BYTES <= COMMAND_INPUT_BYTES);
+const _: () = assert!(DATABASE_AUDIT_INPUT_BYTES <= RECORD_INPUT_BYTES);
 const _: () = assert!(
     2 * TREE_BYTES
         + 2 * TYPED_BYTES
@@ -67,19 +67,95 @@ const _: () = assert!(
 
 impl OperationJournalStore {
     pub(crate) fn begin_recording_prestart_read(&self) -> Result<(), OperationJournalStoreError> {
+        self.begin_recording_prestart_read_with_input(None)
+            .map(drop)
+    }
+
+    pub(in crate::operation_journal) fn begin_recording_prestart_read_with_input(
+        &self,
+        input: Option<&super::super::owner::InputPermit>,
+    ) -> Result<Option<super::super::owner::InputPermit>, OperationJournalStoreError> {
         self.validate_namespace()?;
         self.connection.execute_batch("BEGIN")?;
         if let Err(error) = self.preflight_recording_prestart_resources() {
             let _ = self.connection.execute_batch("ROLLBACK");
             return Err(error);
         }
+        let working = match input
+            .map(|input| self.prepay_recording_prestart(input))
+            .transpose()
+        {
+            Ok(working) => working,
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        };
         self.recording_prestart_resource_refused.set(false);
         self.recording_prestart_scope.set(true);
         if let Err(error) = self.prestart_decode_complete_record_inventory() {
             let _ = self.finish_recording_prestart_read();
+            if let (Some(input), Some(working)) = (input, working) {
+                input.retain_historical_error(working, None, None, None);
+            }
             return Err(error);
         }
-        Ok(())
+        Ok(working)
+    }
+
+    /// Measure every original record in the same snapshot, before copying any
+    /// BLOB or constructing a Value/typed graph. Records decode sequentially,
+    /// so the largest complete record funds the peak, never a truncated sample.
+    fn prepay_recording_prestart(
+        &self,
+        input: &super::super::owner::InputPermit,
+    ) -> Result<super::super::owner::InputPermit, OperationJournalStoreError> {
+        use super::super::codec::historical_observation::recording_streaming_shape;
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM operation_journal")?;
+        let mut rows = statement.query([])?;
+        let mut peak = 0usize;
+        let mut database_peak = 0usize;
+        while let Some(row) = rows.next()? {
+            let bytes = row
+                .get_ref(0)?
+                .as_blob()
+                .map_err(|_| OperationJournalStoreError::RecordingPrestartResourceBound)?;
+            let (nodes, strings) = recording_streaming_shape(bytes)
+                .ok_or(OperationJournalStoreError::RecordingPrestartResourceBound)?;
+            if nodes > JSON_LIMITS.maximum_nodes {
+                return Err(OperationJournalStoreError::RecordingPrestartResourceBound);
+            }
+            // Preserve the original conservative per-node graph and typed
+            // layout envelopes, both simultaneous validation clones, string
+            // copies and fixed record headers. Only scalar inventory varies.
+            // Escaped wire strings can exceed decoded string length. The
+            // unchanged decoder refuses before exceeding its owned-byte quota.
+            let strings = strings.min(JSON_LIMITS.maximum_owned_string_bytes);
+            let record = 2 * nodes * (1536 + 1024) + 4 * strings + 2 * 64 * 1024;
+            peak = peak.max(record);
+            // The complete database audit runs after the two-tree decoder
+            // drops; retain one tree, and replace the other with its inventory.
+            database_peak = database_peak.max(
+                record - (nodes * 1536 + strings)
+                    + recording_prestart_database_claims::ADDITIONAL_INPUT_BYTES,
+            );
+        }
+        drop(rows);
+        drop(statement);
+        let databases: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operation_journal_database_binding)",
+            [],
+            |row| row.get(0),
+        )?;
+        let peak = if databases {
+            peak.max(database_peak)
+        } else {
+            peak
+        };
+        let bytes = peak + ENCODE_BYTES + REBUILD_BYTES + AUXILIARY_BYTES;
+        input.reserve_historical_scratch(bytes)
     }
 
     pub(crate) fn finish_recording_prestart_read(&self) -> Result<(), OperationJournalStoreError> {

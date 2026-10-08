@@ -28,6 +28,7 @@ jobs:
       - name: Install the repository-pinned Rust toolchain
         run: rustup show active-toolchain # reads rust-toolchain.toml
       - name: Reuse pinned native build dependencies
+        id: native-cache
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
@@ -47,3 +48,12 @@ jobs:
           path: artifacts/recording-native-custody/
           if-no-files-found: warn
           retention-days: 14
+      - name: Preserve pinned build cache after a failed native check
+        if: failure() && steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: recording-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}

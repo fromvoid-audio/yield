@@ -7173,8 +7173,7 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             input,
             result,
         } => execute_store_result(result, move || {
-            let _input = input;
-            runtime.validate_recording_custody(operation, digest)
+            runtime.validate_recording_custody(operation, digest, input)
         }),
         JournalCommand::PrepareLegacyCustody {
             source,

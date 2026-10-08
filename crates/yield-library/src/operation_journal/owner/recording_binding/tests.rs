@@ -70,12 +70,18 @@ fn recording_custody_original_unqualified_journal_refuses_unissued_source_receip
         .unwrap()
         .recv_timeout(Duration::from_secs(3))
         .unwrap();
+    let error = result.as_ref().err().expect("unissued receipt refuses");
+    let original = match error {
+        OperationJournalOwnerError::RetainedBacking(backing) => backing.original_error(),
+        error => error,
+    };
     assert!(matches!(
-        result,
-        Err(OperationJournalOwnerError::RecordingProducerCustody(
+        original,
+        OperationJournalOwnerError::RecordingProducerCustody(
             RecordingProducerCustodyError::Changed | RecordingProducerCustodyError::Closed
-        ))
+        )
     ));
+    drop(result);
     assert_eq!(FACTORIES.load(Ordering::Acquire), factories);
     assert_eq!(*client.shared.input_bytes.lock().unwrap(), before);
     assert!(

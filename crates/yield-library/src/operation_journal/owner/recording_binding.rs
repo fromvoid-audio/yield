@@ -37,10 +37,11 @@ pub(super) fn matches_original_destination(
 const ROUTE_BYTES: usize = 64 * 1024;
 const INPUT_BYTES: usize = 192 * 1024 + ROUTE_BYTES + 192 * 1024;
 // The command and retained slot are separate original-pool debits. All temporary read,
-// decode and complete rebuild backing is destroyed before shrinking the factory debit.
+// decode and complete rebuild backing is held by the original request reply.
 const COMMAND_INPUT_BYTES: usize = super::super::store::RECORDING_PRESTART_INPUT_BYTES;
 // Revalidation retains the original producer while its independent temporary read
 // runs. Both complete debits must fit without borrowing the reserved control pool.
+const _: () = assert!(COMMAND_INPUT_BYTES == INPUT_BYTES);
 const _: () = assert!(COMMAND_INPUT_BYTES + INPUT_BYTES <= super::ORDINARY_INPUT_BYTES);
 
 /// Refusal of original pre-start plumbing; no result authorizes capture or terminal SQL.
@@ -95,14 +96,18 @@ impl RecordingProducerCustody {
             .ok_or(OperationJournalOwnerQueueError::Closed)?;
         let operation = self.operation;
         let digest = self.digest;
-        OperationJournalClient { shared }.submit(COMMAND_INPUT_BYTES, move |input, result| {
-            JournalCommand::ValidateRecordingCustody {
+        OperationJournalClient { shared }.submit_funded_with_reply(
+            InputClass::Ordinary,
+            COMMAND_INPUT_BYTES,
+            false,
+            true,
+            move |input, result| JournalCommand::ValidateRecordingCustody {
                 operation,
                 digest,
                 input,
                 result,
-            }
-        })
+            },
+        )
     }
 }
 
@@ -139,15 +144,19 @@ impl OperationJournalClient {
                 .map_err(|error| OperationJournalOwnerQueueError::InvalidInput {
                     reason: error.to_string(),
                 })?;
-        self.submit(COMMAND_INPUT_BYTES, move |input, result| {
-            JournalCommand::PrepareRecordingCustody {
+        self.submit_funded_with_reply(
+            InputClass::Ordinary,
+            COMMAND_INPUT_BYTES,
+            false,
+            true,
+            move |input, result| JournalCommand::PrepareRecordingCustody {
                 operation,
                 registration,
                 source_pin,
                 input,
                 result,
-            }
-        })
+            },
+        )
     }
 }
 impl OwnerRuntime {
@@ -156,26 +165,37 @@ impl OwnerRuntime {
         operation: OperationId,
         registration: &SourceAuthorityRegistrationReceipt,
         pin: &SourceEffectPin,
+        input: &InputPermit,
     ) -> Result<RecordingProposal, OperationJournalOwnerError> {
-        self.store().begin_recording_prestart_read().map_err(
-            |error| -> OperationJournalOwnerError {
+        let working = self
+            .store()
+            .begin_recording_prestart_read_with_input(Some(input))
+            .map_err(|error| -> OperationJournalOwnerError {
                 match error {
                 super::super::store::OperationJournalStoreError::RecordingPrestartResourceBound => {
                     RecordingProducerCustodyError::Full.into()
                 }
                 error => error.into(),
             }
-            },
-        )?;
+            })?
+            .expect("funded recording read retains its working loan");
         let result = self.original_recording_prestart_inside(operation, registration, pin);
         // Always end the original read snapshot before producing any facade or factory parts.
-        self.store().finish_recording_prestart_read()?;
-        result.map_err(|error| match error {
+        let result = match self.store().finish_recording_prestart_read() {
+            Ok(()) => result,
+            Err(error) => Err(error.into()),
+        };
+        let result = result.map_err(|error| match error {
             OperationJournalOwnerError::Store(
                 OperationJournalStoreError::RecordingPrestartResourceBound,
             ) => RecordingProducerCustodyError::Full.into(),
             error => error,
-        })
+        });
+        // Keep working backing through proposal validation/encoding and any
+        // selected error. The original reply owns it until consumption; success
+        // detaches that reply from the independently funded retained slot.
+        input.retain_historical_error(working, None, None, None);
+        result
     }
 
     fn original_recording_prestart_inside(
@@ -237,7 +257,8 @@ impl OwnerRuntime {
         if input.shared.status() != OperationJournalOwnerStatus::Available {
             return Err(E::Closed.into());
         }
-        let proposal = self.original_recording_prestart(operation, &registration, &source_pin)?;
+        let proposal =
+            self.original_recording_prestart(operation, &registration, &source_pin, &input)?;
         super::super::recording_commands::controls::reservation_metadata_bound(&proposal)
             .map_err(|_| E::Changed)?;
         let encoded = proposal.encode().map_err(|_| E::Changed)?;
@@ -263,13 +284,11 @@ impl OwnerRuntime {
             owner: Arc::downgrade(&input.shared),
         };
         drop(encoded);
-        // Read snapshot, decoded outer records, audit maps and canonical scratch are gone.
-        // This releases memory credit only; it changes no durable reservation or settlement.
-        let transient_bytes = input.bytes.checked_sub(INPUT_BYTES).ok_or(E::Full)?;
-        input.bytes = INPUT_BYTES;
-        input
-            .shared
-            .release_input(input.class, transient_bytes, input.publication);
+        // Success retains exactly the original slot debit. Reply backing belongs
+        // to the request consumer, never to the retained producer.
+        input.historical_reply = None;
+        // The fixed command debit becomes the retained slot debit. Its
+        // independent reply releases only temporary read/decode working memory.
         self.recording_producer = Some(RetainedRecordingProducer {
             _binding: binding,
             _receiver: receiver,
@@ -288,6 +307,7 @@ impl OwnerRuntime {
         &mut self,
         operation: OperationId,
         digest: [u8; 32],
+        input: InputPermit,
     ) -> Result<(), OperationJournalOwnerError> {
         use RecordingProducerCustodyError as E;
         let mut retained = self.recording_producer.take().ok_or(E::Changed)?;
@@ -305,12 +325,14 @@ impl OwnerRuntime {
                 operation,
                 &retained.registration,
                 &retained.source_pin,
+                &input,
             )?;
             if current != retained.proposal
                 || *blake3::hash(&current.encode().map_err(|_| E::Changed)?).as_bytes() != digest
             {
                 return Err(E::Changed.into());
             }
+            drop(current);
             Ok(())
         })();
         if result.is_err() {
