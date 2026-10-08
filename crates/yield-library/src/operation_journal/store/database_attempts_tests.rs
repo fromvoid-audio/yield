@@ -26,6 +26,7 @@ mod attempt_integration {
     include!("database_attempt_initial_borrow_tests.rs");
     include!("database_attempt_context_funding_tests.rs");
     include!("database_attempt_image_funding_tests.rs");
+    include!("database_attempt_audit_funding_tests.rs");
 
     fn start(
         record: &StoredOperationRecord,
