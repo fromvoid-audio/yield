@@ -2078,6 +2078,20 @@ impl OwnerRuntime {
         provider
             .validate_claim_identities_available(&prepared.claims)
             .map_err(PreparedAdmissionError::from)?;
+        let construction_credit = input
+            .map(|input| {
+                OperationJournalStore::prepay_initial_record_construction(
+                    &(
+                        &prepared.intent,
+                        &prepared.universal_intent,
+                        &prepared.args,
+                        &prepared.plan,
+                        &prepared.claims,
+                    ),
+                    input,
+                )
+            })
+            .transpose()?;
         let lease = match input {
             Some(input) => provider.admit_with_live_witness_for_input(
                 &prepared.plan,
@@ -2089,43 +2103,59 @@ impl OwnerRuntime {
         }
         .map_err(PreparedAdmissionError::from)?;
 
-        // Ordinary commands allocate their identity here; recording retains its frozen
-        // identity. Everything above validates or creates one provisional owner lease.
-        #[cfg(test)]
-        self.prepared_admission_id_allocations
-            .fetch_add(1, Ordering::Relaxed);
-        let operation_id = if let UniversalCommandArgs::Recording(proposal) = &prepared.args {
-            proposal.operation_id()
-        } else {
-            OperationId::new()
-        };
-        let record = prepared_record(operation_id, &prepared)?;
-        let settlement = self
-            .store()
-            .settle_initial_claims_with_lease(&record, &prepared.claims, provider, lease)
-            .map_err(|error| map_initial_settlement_error(error, &prepared.claims))?;
-        let (outcome, retained_lease) = settlement.into_parts();
-        match outcome {
-            JournalInsertOutcome::Committed(_) => Ok(operation_id),
-            JournalInsertOutcome::Failed(failure) => {
-                let claim_ids = prepared
-                    .claims
-                    .claims()
-                    .iter()
-                    .map(|claim| claim.claim_id())
-                    .collect::<Vec<_>>();
-                if let Some(lease) = retained_lease {
-                    drop(lease);
-                    Err(PreparedAdmissionRetainedError::from_failure(failure, claim_ids).into())
-                } else {
-                    Err(PreparedAdmissionRolledBackError {
-                        operation_id,
-                        reason: failure.error().to_string(),
+        let result = (|| {
+            // Ordinary commands allocate their identity here; recording retains its frozen
+            // identity. Everything above validates or creates one provisional owner lease.
+            #[cfg(test)]
+            self.prepared_admission_id_allocations
+                .fetch_add(1, Ordering::Relaxed);
+            let operation_id = if let UniversalCommandArgs::Recording(proposal) = &prepared.args {
+                proposal.operation_id()
+            } else {
+                OperationId::new()
+            };
+            let record = prepared_record(operation_id, &prepared)?;
+            let settlement = self
+                .store()
+                .settle_initial_claims_with_lease_for_input(
+                    &record,
+                    &prepared.claims,
+                    provider,
+                    lease,
+                    input,
+                )
+                .map_err(|error| map_initial_settlement_error(error, &prepared.claims))?;
+            let (outcome, retained_lease) = settlement.into_parts();
+            match outcome {
+                JournalInsertOutcome::Committed(_) => Ok(operation_id),
+                JournalInsertOutcome::Failed(failure) => {
+                    let claim_ids = prepared
+                        .claims
+                        .claims()
+                        .iter()
+                        .map(|claim| claim.claim_id())
+                        .collect::<Vec<_>>();
+                    if let Some(lease) = retained_lease {
+                        drop(lease);
+                        Err(PreparedAdmissionRetainedError::from_failure(failure, claim_ids).into())
+                    } else {
+                        Err(PreparedAdmissionRolledBackError {
+                            operation_id,
+                            reason: failure.error().to_string(),
+                        }
+                        .into())
                     }
-                    .into())
                 }
             }
+        })();
+        if let Some(credit) = construction_credit {
+            if result.is_err() {
+                input
+                    .expect("funded construction")
+                    .retain_historical_error(credit, None, None, None);
+            }
         }
+        result
     }
 
     fn chunk_rebuild_snapshot(

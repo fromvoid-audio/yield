@@ -67,11 +67,11 @@ fn text<'a>(row: &'a Statement<'_>, index: i32) -> Result<&'a str, OperationJour
     scalar::<String>(row, index)
         .map(|_| unreachable!("valid TEXT returned through borrowed branch"))
 }
-fn totals(
+pub(in crate::operation_journal::store) fn totals(
     store: &OperationJournalStore,
     input: &InputPermit,
     native: &RefCell<Option<InputPermit>>,
-) -> Result<(), OperationJournalStoreError> {
+) -> Result<(i64, i64), OperationJournalStoreError> {
     let mut row=Statement::new(&store.connection,input,native,c"SELECT COUNT(*),COALESCE(SUM(CASE WHEN slot BETWEEN 20000 AND 20003 THEN 4096 ELSE length(record) END),0),
              COALESCE(MIN(CASE WHEN typeof(chunk_id)='text' AND length(chunk_id)=36
               AND typeof(operation_id)='text' AND length(operation_id)=36
@@ -92,7 +92,7 @@ fn totals(
             "unsupported/corrupt or over-limit retained recording inventory",
         ));
     }
-    Ok(())
+    Ok((rows, bytes))
 }
 fn sequence_unique(
     store: &OperationJournalStore,

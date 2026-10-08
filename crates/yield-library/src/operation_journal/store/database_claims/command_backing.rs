@@ -192,6 +192,20 @@ pub(in crate::operation_journal::store) fn reconstruction_shape(
     phase: crate::operation_journal::OperationPhase,
     disposition: crate::operation_journal::OperationDisposition,
 ) -> Result<ReconstructionShape, OperationJournalStoreError> {
+    reconstruction_shape_inner(record, phase, disposition, false)
+}
+
+pub(in crate::operation_journal::store) fn settlement_shape(
+    record: &StoredOperationRecord,
+) -> Result<ReconstructionShape, OperationJournalStoreError> {
+    reconstruction_shape_inner(record, record.phase, record.disposition, true)
+}
+fn reconstruction_shape_inner(
+    record: &StoredOperationRecord,
+    phase: crate::operation_journal::OperationPhase,
+    disposition: crate::operation_journal::OperationDisposition,
+    untyped: bool,
+) -> Result<ReconstructionShape, OperationJournalStoreError> {
     let mut original = Shape::new();
     codec::serialize_full_record_inventory(record, phase, disposition, &mut original)
         .map_err(|_| error("unsupported operation codec"))?
@@ -201,7 +215,7 @@ pub(in crate::operation_journal::store) fn reconstruction_shape(
         serde_json::to_writer(&mut args, value).map_err(|_| error("command encoding"))?;
     } else if let Some(value) = record.command_args() {
         serde_json::to_writer(&mut args, value).map_err(|_| error("command encoding"))?;
-    } else {
+    } else if !untyped {
         return Err(error("untyped legacy command cannot bind database claims"));
     }
     let slots = original
@@ -358,4 +372,25 @@ mod tests {
         shape.keys = usize::MAX;
         assert!(shape.graph().is_none());
     }
+}
+
+// Count the exact borrowed construction inputs before the owner clones them.
+// This inventories Rust metadata only; it supplies no operation or admission.
+pub(in crate::operation_journal::store) fn construction_bytes(
+    borrowed: &impl serde::Serialize,
+) -> Result<usize, OperationJournalStoreError> {
+    let mut shape = Shape::new();
+    serde_json::to_writer(&mut shape, borrowed)
+        .map_err(|_| OperationJournalStoreError::HistoricalClaimResourceBound)?;
+    let slots = shape
+        .entries
+        .checked_mul(2)
+        .and_then(|n| shape.arrays.checked_mul(4).and_then(|a| n.checked_add(a)))
+        .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+    slots
+        .checked_mul(codec::historical_observation::typed_array_slot())
+        .and_then(|n| shape.graph().and_then(|g| n.checked_add(g)))
+        .and_then(|n| shape.strings.checked_mul(2).and_then(|s| n.checked_add(s)))
+        .and_then(|n| n.checked_add(size_of::<StoredOperationRecord>()))
+        .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)
 }
