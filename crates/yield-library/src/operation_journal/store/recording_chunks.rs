@@ -11,6 +11,9 @@ use crate::operation_journal::recording_commands::{
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
+pub(super) mod funded;
+mod prefix;
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PayloadReader {
@@ -217,7 +220,7 @@ impl OperationJournalStore {
         }
         Ok(proposal.clone())
     }
-    fn read_recording_chunk_inside(
+    pub(super) fn read_recording_chunk_inside(
         &self,
         chunk_id: Uuid,
         proposal: &RecordingProposal,
@@ -265,6 +268,9 @@ impl OperationJournalStore {
         &self,
         input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
+        if let Some(input) = input {
+            return funded::validate(self, input);
+        }
         self.recording_retained_totals()?;
         let mut after_operation = String::new();
         loop {
@@ -286,28 +292,7 @@ impl OperationJournalStore {
                     ));
                 }
                 let operation = OperationId::from_uuid(id);
-                if let Some(input) = input {
-                    let present =
-                        self.inspect_complete_claim_operation(operation, input, |record, _| {
-                            let Some(UniversalCommandArgs::Recording(proposal)) =
-                                record.universal_command_args()
-                            else {
-                                return Err(error("operation has no recording proposal"));
-                            };
-                            if record.schema_version != SCHEMA_V17 {
-                                return Err(error("recording schema mismatch"));
-                            }
-                            self.verify_recording_reservation_with_input(
-                                proposal,
-                                false,
-                                Some(input),
-                            )?;
-                            self.validate_recording_operation_inventory(proposal)
-                        })?;
-                    if !present {
-                        return Err(error("recording operation absent"));
-                    }
-                } else {
+                {
                     let proposal = self.recording_proposal(operation)?;
                     self.verify_recording_reservation(&proposal, false)?;
                     self.validate_recording_operation_inventory(&proposal)?;
@@ -323,14 +308,7 @@ impl OperationJournalStore {
         proposal: &RecordingProposal,
     ) -> Result<(), OperationJournalStoreError> {
         let mut after_slot = -1i64;
-        let mut next_pcm = 0u32;
-        let mut next_header = 0u32;
-        let mut previous_pcm = None;
-        let mut previous_header = None;
-        let mut first_pcm_sequence = None;
-        let mut final_header_sequence = None;
-        let mut initial_header_sequence = None;
-        let mut previous_pcm_full = true;
+        let mut state = prefix::State::new();
         loop {
             // The private (operation_id,slot) index bounds both ordering and each key page.
             let mut statement = self.connection.prepare(
@@ -368,47 +346,10 @@ impl OperationJournalStore {
                 if read_sequence != sequence {
                     return Err(error("restart recording chunk sequence changed"));
                 }
-                match chunk.role() {
-                    RecordingChunkRole::Pcm { ordinal } => {
-                        if ordinal != next_pcm
-                            || !previous_pcm_full
-                            || previous_pcm.is_some_and(|n| sequence <= n)
-                        {
-                            return Err(error("restart recording PCM prefix has an ordering gap"));
-                        }
-                        first_pcm_sequence.get_or_insert(sequence);
-                        previous_pcm = Some(sequence);
-                        previous_pcm_full =
-                            chunk.bytes().len() as u64 == proposal.format().pcm_chunk_bytes();
-                        next_pcm += 1;
-                    }
-                    RecordingChunkRole::Header { revision } => {
-                        if revision != next_header || previous_header.is_some_and(|n| sequence <= n)
-                        {
-                            return Err(error(
-                                "restart recording header prefix has an ordering gap",
-                            ));
-                        }
-                        if revision == 0 {
-                            initial_header_sequence = Some(sequence);
-                        } else {
-                            final_header_sequence.get_or_insert(sequence);
-                        }
-                        previous_header = Some(sequence);
-                        next_header += 1;
-                    }
-                }
+                state.observe(sequence, &chunk, proposal)?;
             }
         }
-        if first_pcm_sequence
-            .is_some_and(|pcm| initial_header_sequence.is_none_or(|header| pcm <= header))
-            || previous_pcm
-                .is_some_and(|pcm| final_header_sequence.is_some_and(|header| pcm >= header))
-        {
-            return Err(error(
-                "restart recording capture crosses its header boundary",
-            ));
-        }
+        state.finish()?;
         Ok(())
     }
 
