@@ -2128,7 +2128,13 @@ impl OperationJournalStore {
             Ok::<(), OperationJournalStoreError>(())
         })();
         if let Err(error) = transaction_result {
-            let _ = self.connection.execute_batch("ROLLBACK");
+            if let Some(rollback_error) = self.rollback_insert_transaction() {
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: format!(
+                        "chunk claim rollback outcome is uncertain: {error}; rollback={rollback_error}"
+                    ),
+                });
+            }
             if let Err(release_error) =
                 lease.release_after_confirmed_rollback(request.operation_id())
             {
@@ -2143,8 +2149,11 @@ impl OperationJournalStore {
         #[cfg(test)]
         let commit_directive = self.insert_test_directive(InsertTestBoundary::Commit);
         #[cfg(test)]
-        if let Some(InsertTestDirective::Fail(error)) = commit_directive {
-            let rollback_error = self.connection.execute_batch("ROLLBACK").err();
+        if let Some(
+            InsertTestDirective::Fail(error) | InsertTestDirective::FailAndLeaveForRollback(error),
+        ) = commit_directive
+        {
+            let rollback_error = self.rollback_insert_transaction();
             if rollback_error.is_none() {
                 if let Err(release_error) =
                     lease.release_after_confirmed_rollback(request.operation_id())
@@ -2157,13 +2166,20 @@ impl OperationJournalStore {
                 }
             }
             return Err(OperationJournalStoreError::ChunkClaim {
-                reason: format!("chunk claim commit was rejected before acknowledgement: {error}"),
+                reason: match rollback_error {
+                    Some(rollback_error) => format!(
+                        "chunk claim commit was rejected and rollback outcome is uncertain: {error}; rollback={rollback_error}"
+                    ),
+                    None => {
+                        format!("chunk claim commit was rejected before acknowledgement: {error}")
+                    }
+                },
             });
         }
         #[cfg(test)]
         if let Some(InsertTestDirective::ExecuteThenFail(error)) = commit_directive {
             let commit_result = self.connection.execute_batch("COMMIT");
-            let rollback_error = self.connection.execute_batch("ROLLBACK").err();
+            let rollback_error = self.rollback_insert_transaction();
             return Err(OperationJournalStoreError::ChunkClaim {
                 reason: format!(
                     "chunk claim commit outcome is uncertain: {error}; commit={commit_result:?}; rollback={rollback_error:?}"
@@ -18793,6 +18809,100 @@ mod tests {
                 .expect("read guarded chunk state"),
             "Issued"
         );
+    }
+
+    #[test]
+    fn chunk_claim_rollback_acknowledgement_controls_original_charge_release() {
+        for failure_boundary in [
+            InsertTestBoundary::BeforePrecommitValidation,
+            InsertTestBoundary::Commit,
+        ] {
+            for rollback_mode in 0..3 {
+                let fixture = fixture();
+                let store = OperationJournalStore::open(&fixture.owner).unwrap();
+                let operation = OperationId::new();
+                let record = universal_intent_record(operation);
+                store.insert_intent_with_outcome(&record).receipt().unwrap();
+                let request = chunk_request_for_record(
+                    &record,
+                    ChunkId::new(),
+                    AdmissionClaimId::new(),
+                    "rollback-acknowledgement",
+                    0,
+                );
+                let provider = provider_for_intent(&record);
+                let lease = provider
+                    .admit(&request.plan().unwrap(), &request.inventory().unwrap())
+                    .unwrap();
+                store.set_insert_test_hook(move |boundary| {
+                    let failure = || OperationJournalStoreError::InconsistentRecord {
+                        reason: "original chunk transaction failure".into(),
+                    };
+                    if boundary == failure_boundary {
+                        InsertTestDirective::FailAndLeaveForRollback(failure())
+                    } else if boundary == InsertTestBoundary::Rollback {
+                        match rollback_mode {
+                            1 => InsertTestDirective::FailAndLeaveForRollback(failure()),
+                            2 => InsertTestDirective::ExecuteThenFail(failure()),
+                            _ => InsertTestDirective::Continue,
+                        }
+                    } else {
+                        InsertTestDirective::Continue
+                    }
+                });
+                let error = store
+                    .persist_chunk_claim_with_lease(&request, &provider, lease)
+                    .unwrap_err();
+                if rollback_mode == 0 {
+                    assert_eq!(provider.claim_count(), 0);
+                    assert!(!error.to_string().contains("outcome is uncertain"));
+                } else {
+                    assert_eq!(
+                        provider.claim_count(),
+                        1,
+                        "boundary={failure_boundary:?}, mode={rollback_mode}, error={error:?}"
+                    );
+                    assert!(error.to_string().contains("rollback outcome is uncertain"));
+                }
+                let count: i64 = store
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM operation_journal_chunk_claim",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, i64::from(rollback_mode == 1));
+                assert_eq!(store.connection.is_autocommit(), rollback_mode != 1);
+                if rollback_mode == 1 {
+                    assert!(matches!(
+                        store.get(operation),
+                        Err(OperationJournalStoreError::RequiresAudit { .. })
+                    ));
+                    assert!(matches!(
+                        store.validate_for_admission(),
+                        Err(OperationJournalStoreError::RequiresAudit { .. })
+                    ));
+                    // Physical cleanup here is fixture teardown only; it does
+                    // not create confirmed release evidence or refund capacity.
+                    store.set_insert_test_hook(|_| InsertTestDirective::Continue);
+                    assert!(store.rollback_insert_transaction().is_none());
+                    assert_eq!(
+                        provider.claim_count(),
+                        1,
+                        "boundary={failure_boundary:?}, mode={rollback_mode}, error={error:?}"
+                    );
+                } else {
+                    assert!(
+                        store
+                            .read_chunk_claim(request.chunk_id())
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(store.get(operation).unwrap(), Some(record));
+                }
+            }
+        }
     }
 
     #[test]
