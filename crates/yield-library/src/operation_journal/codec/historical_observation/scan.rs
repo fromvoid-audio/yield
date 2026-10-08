@@ -14,20 +14,30 @@ pub(super) struct Inventory {
     pub(super) version: Option<u32>,
 }
 pub(super) fn scan(bytes: &[u8], key: impl FnMut(Key)) -> Inventory {
-    scan_with_payload(bytes, key, false)
+    scan_with_payload(bytes, key, false, false)
 }
 
 pub(super) fn scan_full(bytes: &[u8]) -> Inventory {
-    scan_with_payload(bytes, |_| {}, true)
+    scan_with_payload(bytes, |_| {}, true, false)
 }
 
-fn scan_with_payload(bytes: &[u8], mut key: impl FnMut(Key), retain_payload: bool) -> Inventory {
+pub(super) fn scan_without_inventory(bytes: &[u8]) -> Inventory {
+    scan_with_payload(bytes, |_| {}, true, true)
+}
+
+fn scan_with_payload(
+    bytes: &[u8],
+    mut key: impl FnMut(Key),
+    retain_payload: bool,
+    skip_inventory: bool,
+) -> Inventory {
     let mut scan = Scanner {
         bytes,
         offset: 0,
         inventory: Inventory::default(),
         key: &mut key,
         retain_payload,
+        skip_inventory,
     };
     scan.value(true, true);
     scan.inventory
@@ -38,6 +48,7 @@ struct Scanner<'a, F> {
     inventory: Inventory,
     key: &'a mut F,
     retain_payload: bool,
+    skip_inventory: bool,
 }
 impl<F: FnMut(Key)> Scanner<'_, F> {
     fn whitespace(&mut self) {
@@ -97,7 +108,13 @@ impl<F: FnMut(Key)> Scanner<'_, F> {
                     self.whitespace();
                     let start = self.offset;
                     let payload = root && keys::matches(&key, self.bytes, b"payload");
-                    self.value(false, retained && (!payload || self.retain_payload));
+                    let inventory = root
+                        && self.skip_inventory
+                        && keys::matches(&key, self.bytes, b"inventory");
+                    self.value(
+                        false,
+                        retained && (!payload || self.retain_payload) && !inventory,
+                    );
                     if payload {
                         self.inventory.payload = Some(start..self.offset);
                     }

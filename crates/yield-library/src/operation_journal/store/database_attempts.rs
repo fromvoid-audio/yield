@@ -195,6 +195,7 @@ fn read_outcome(
 }
 
 pub(super) mod context_backing;
+pub(super) mod image_backing;
 
 #[derive(Default)]
 struct Audit {
@@ -283,10 +284,10 @@ impl OperationJournalStore {
                     if id.is_nil() || !text.canonical {
                         return Err(error("audit key identity"));
                     }
-                    let start =
-                        read_start(&self.connection, id)?.ok_or_else(|| error("orphan outcome"))?;
+                    let start = image_backing::read_start(&self.connection, id, input)?
+                        .ok_or_else(|| error("orphan outcome"))?;
                     let inventory = self.attempt_inventory_with_input(&start, false, input)?;
-                    read_outcome(&self.connection, &start)?;
+                    image_backing::read_outcome(&self.connection, &start, input)?;
                     if table == START_TABLE {
                         let binding = inventory
                             .bindings()
