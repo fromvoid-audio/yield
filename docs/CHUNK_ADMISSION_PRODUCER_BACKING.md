@@ -54,5 +54,17 @@ stale operation/chunk refusal, lost commit acknowledgement, fence refusal, recei
 ownership, permit-to-entry transfer and empty retained ticket buckets. Logical
 fixtures and lifetime projections supply no native effect qualification.
 Live-effect/source-pin entry, staging checkpoint, release and recording producer
-funding, whole-owner finite policy and native positive acceptance remain separate
-work.
+funding and whole-owner finite policy remain separate work.
+
+The new macOS positive harness shares the genuine production recording admission
+setup: original Owner::start, real registered Source and FileOwner root, original
+reserve descriptor facts and admit_prepared. It then queues an actual chunk claim
+and one-shot issuance, inspects the original permit identity and retained debit,
+refuses reissue, and returns the never-consumed permit through the existing release
+path before joined shutdown and durable reopen inspection. Initial intent/source
+registration evidence remains unsettled, so this case runs on its own fresh
+native account and preserves the original dirty volume marker. No capture or staging
+file is created. Its native execution is pending; the accompanying script requires
+exactly one executed passing test with zero failures/ignores, independently of the
+two original recording custody tests. Linux compiles the same helper and executes
+only its genuine refusal tests; this is no replacement for native execution.

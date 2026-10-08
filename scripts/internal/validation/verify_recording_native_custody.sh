@@ -53,7 +53,7 @@ PY
 # separate fresh native account, preserving the original dirty marker unchanged.
 SELECTED_CASE="${YIELD_NATIVE_CUSTODY_CASE:-}"
 case "$SELECTED_CASE" in
-  operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain|operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit)
+  operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain|operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit|operation_journal::owner::recording_binding::tests::chunk_issuance_native_production_original_claim_transition_and_retained_backing)
     cargo test --locked -p yield-library --lib "$SELECTED_CASE" \
       -- --exact --test-threads=1 --nocapture 2>&1 | tee "$OUTPUT_DIR/tests.log"
     ;;
@@ -77,6 +77,7 @@ if results != [(str(len(names)), '0', '0')]:
 for name in names:
     if not re.search(r'test ' + re.escape(name) + r' \.\.\. ok', text):
         raise SystemExit(f'Missing completed genuine test: {name}')
-print(f'OPT-2330: {len(names)} selected genuine production-bootstrap test(s) passed')
+issue = 'OPT-2440' if selected.endswith('chunk_issuance_native_production_original_claim_transition_and_retained_backing') else 'OPT-2330'
+print(f'{issue}: {len(names)} selected genuine production-bootstrap test(s) passed')
 PY_CHECK
 df -Pk "$HOME" "$ROOT_DIR" "$NATIVE_TEST_TEMP_ROOT" > "$OUTPUT_DIR/final-disk.txt"

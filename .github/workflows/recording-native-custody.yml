@@ -22,6 +22,8 @@ jobs:
             test: operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain
           - case: lost-reply
             test: operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit
+          - case: chunk-issuance
+            test: operation_journal::owner::recording_binding::tests::chunk_issuance_native_production_original_claim_transition_and_retained_backing
     runs-on: macos-15-intel
     timeout-minutes: 45
     env:
