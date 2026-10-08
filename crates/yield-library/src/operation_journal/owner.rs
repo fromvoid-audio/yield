@@ -2228,6 +2228,8 @@ impl OwnerRuntime {
                 reason: String::from("chunk identity is already bound to different metadata"),
             });
         }
+        self.publication_fences
+            .close_for_mutation(request.operation_id())?;
         self.validate_chunk_operation_state(request.operation_id(), "claim")?;
         self.store().validate_for_admission()?;
         let snapshot = self.chunk_rebuild_snapshot()?;
@@ -2316,6 +2318,7 @@ impl OwnerRuntime {
             }
             ChunkClaimState::Claimed => {}
         }
+        self.publication_fences.close_for_mutation(operation_id)?;
         self.store().validate_for_admission()?;
         let snapshot = self.chunk_rebuild_snapshot()?;
         #[cfg(all(test, target_os = "macos"))]
@@ -2468,6 +2471,8 @@ impl OwnerRuntime {
             .map_err(|e| OperationJournalOwnerError::ChunkClaim {
                 reason: e.to_string(),
             })?;
+        self.publication_fences
+            .close_for_mutation(chunk.operation_id())?;
         let receipt = self.store().retain_recording_chunk(chunk)?;
         source_pin.validate_for_issuance(&source.request, profile)?;
         Ok(receipt)
@@ -2850,6 +2855,8 @@ impl OwnerRuntime {
                 reason: String::from("chunk source fence differs from live registration"),
             });
         }
+        self.publication_fences
+            .close_for_mutation(validation.operation_id())?;
         let receipt = self
             .store()
             .checkpoint_chunk_staging(chunk_id, issue_id, &validation)?;
@@ -2887,6 +2894,8 @@ impl OwnerRuntime {
                 ),
             });
         }
+        self.publication_fences
+            .close_for_mutation(permit.operation_id())?;
         let record = self
             .store()
             .read_chunk_claim(permit.chunk_id())
@@ -7255,7 +7264,10 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             let _input = input;
             execute_store_result(result, move || {
                 let record = decode(&encoded)?;
-                Ok::<JournalInsertOutcome, DecodeError>(
+                runtime
+                    .publication_fences
+                    .close_for_mutation(record.operation_id)?;
+                Ok::<JournalInsertOutcome, OperationJournalOwnerError>(
                     runtime.store().insert_intent_with_outcome(&record),
                 )
             })
