@@ -94,7 +94,7 @@ impl FundedChunkClaimRecord {
     pub(in crate::operation_journal) fn matches_original(&self, record: &ChunkClaimRecord) -> bool {
         self.record == *record
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(in crate::operation_journal) fn state(&self) -> ChunkClaimState {
         self.record.state()
     }
