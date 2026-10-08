@@ -36,7 +36,7 @@ use super::model::{
     MAX_USER_STATUS_KEY_BYTES, OperationActor, OperationDisposition, OperationId, OperationIntent,
     OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
-    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, UniversalIntent,
+    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, UniversalIntent,
 };
 use super::namespace_commands::validate_persisted_namespace_command_args_value;
 use super::participants::MAX_PARTICIPANTS;
@@ -1747,7 +1747,7 @@ fn decode_value(value: Value) -> Result<StoredOperationRecord, DecodeError> {
     {
         return Err(malformed("source lease lifecycle requires schema-v18"));
     }
-    if version <= SCHEMA_V17
+    if version <= SCHEMA_V18
         && (value.pointer("/intent/kind").and_then(Value::as_str) == Some("SourceLegacyAdoption")
             || value
                 .pointer("/universal_intent/command_kind")
@@ -1910,7 +1910,7 @@ fn decode_value(value: Value) -> Result<StoredOperationRecord, DecodeError> {
             validate_v15_coordinator_shape(&record).map_err(malformed)?;
             Ok(record)
         }
-        SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18 => {
+        SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18 | SCHEMA_V19 => {
             validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
             validate_persisted_v16_object_boundaries(&value).map_err(malformed)?;
             let record = serde_json::from_value::<PersistedFullCapacityOperationRecord>(value)
@@ -1922,6 +1922,8 @@ fn decode_value(value: Value) -> Result<StoredOperationRecord, DecodeError> {
         version => Err(DecodeError::UnsupportedVersion { version }),
     }
 }
+
+mod legacy_initial;
 
 fn malformed(reason: impl Into<String>) -> DecodeError {
     DecodeError::Malformed {
@@ -1954,18 +1956,19 @@ pub(in crate::operation_journal) fn validate_encoding_family(
             reason: "source lease lifecycle requires schema-v18".into(),
         });
     }
-    if record.intent.kind == OperationKind::SourceLegacyAdoption
-        || matches!(
-            &record.universal_command_args,
-            Some(UniversalCommandArgs::SourceLegacyAdoption(_))
-        )
-        || record.universal_intent.as_ref().is_some_and(|i| {
-            i.command_kind() == super::model::UniversalCommandKind::SourceLegacyAdoption
-                || i.participants()
-                    .descriptors()
-                    .iter()
-                    .any(|d| d.kind() == super::ParticipantKind::LegacySource)
-        })
+    if record.schema_version != SCHEMA_V19
+        && (record.intent.kind == OperationKind::SourceLegacyAdoption
+            || matches!(
+                &record.universal_command_args,
+                Some(UniversalCommandArgs::SourceLegacyAdoption(_))
+            )
+            || record.universal_intent.as_ref().is_some_and(|i| {
+                i.command_kind() == super::model::UniversalCommandKind::SourceLegacyAdoption
+                    || i.participants()
+                        .descriptors()
+                        .iter()
+                        .any(|d| d.kind() == super::ParticipantKind::LegacySource)
+            }))
     {
         return Err(EncodeError::InvalidV16Record {
             reason: "legacy adoption requires a separately admitted durable codec".into(),
@@ -2094,7 +2097,7 @@ pub(in crate::operation_journal) fn serialize_record(
             let persisted = persisted_v15_from_record(record)?;
             serde_json::to_writer_pretty(&mut *writer, &persisted)
         }
-        SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18 => {
+        SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18 | SCHEMA_V19 => {
             let persisted = persisted_v16_from_record(record)?;
             serde_json::to_writer_pretty(&mut *writer, &persisted)
         }
@@ -3244,7 +3247,13 @@ fn validate_persisted_v16_object_boundaries(value: &Value) -> Result<(), &'stati
         true,
     )?;
     let args = required_field(object, "universal_command_args")?;
-    if required_field(object, "schema_version")?.as_u64() == Some(u64::from(SCHEMA_V18)) {
+    if required_field(object, "schema_version")?.as_u64() == Some(u64::from(SCHEMA_V19)) {
+        validate_persisted_tagged_command_args_value(
+            args,
+            &["SourceLegacyAdoption"],
+            "schema-v19",
+        )?;
+    } else if required_field(object, "schema_version")?.as_u64() == Some(u64::from(SCHEMA_V18)) {
         validate_persisted_tagged_command_args_value(
             args,
             &["SourceRegistryRetirement"],
@@ -3377,6 +3386,13 @@ fn validate_persisted_tagged_command_args_value(
         "Import" => validate_persisted_import_intent_value(arguments),
         "WaveformEdit" => validate_persisted_waveform_edit_value(arguments),
         "DecodedEdit" => validate_persisted_decoded_edit_value(arguments),
+        "SourceLegacyAdoption" => {
+            let args: super::legacy_adoption_commands::LegacyAdoptionIntentArgs =
+                serde_json::from_value(arguments.clone())
+                    .map_err(|_| "invalid bounded original legacy adoption arguments")?;
+            args.validate()
+                .map_err(|_| "invalid bounded original legacy adoption arguments")
+        }
         "SourceRegistryRetirement" => {
             let args: super::source_registry_retirement::SourceRegistryRetirementIntentArgs =
                 serde_json::from_value(arguments.clone())
@@ -3468,7 +3484,10 @@ pub(crate) fn validate_v3_initial_shape(record: &StoredOperationRecord) -> Resul
 }
 
 fn validate_universal_intent_envelope_shape(record: &StoredOperationRecord) -> Result<(), String> {
-    if matches!(record.schema_version, SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18) {
+    if matches!(
+        record.schema_version,
+        SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18 | SCHEMA_V19
+    ) {
         if record.capacity_plan.is_some() {
             return Err(String::from(
                 "schema-v16 universal intent records cannot carry a legacy capacity plan",
@@ -4092,6 +4111,9 @@ pub(crate) fn validate_v15_coordinator_shape(record: &StoredOperationRecord) -> 
 }
 
 pub(crate) fn validate_full_initial_shape(record: &StoredOperationRecord) -> Result<(), String> {
+    if record.schema_version == SCHEMA_V19 {
+        return legacy_initial::validate(record);
+    }
     if record.schema_version == SCHEMA_V18 {
         validate_tagged_coordinator_shape(
             record,

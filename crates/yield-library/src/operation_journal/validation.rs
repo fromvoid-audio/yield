@@ -27,7 +27,7 @@ use super::evidence::{
 use super::model::{
     OperationDisposition, OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
-    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18,
+    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19,
 };
 use crate::durable_capacity::{
     DurableCapacityPlan, PROTECTED_FREE_SPACE_FLOOR, round_up_allocation,
@@ -83,6 +83,7 @@ fn validate_record_inner(record: &StoredOperationRecord) -> Result<RecordValidat
             | SCHEMA_V16
             | SCHEMA_V17
             | SCHEMA_V18
+            | SCHEMA_V19
     ) {
         return Err(format!(
             "unsupported operation journal schema version: {}",
@@ -155,7 +156,10 @@ fn validate_record_inner(record: &StoredOperationRecord) -> Result<RecordValidat
         validate_capacity_plan_option(record.capacity_plan.as_ref())?;
         return Ok(RecordValidation::Consistent);
     }
-    if matches!(record.schema_version, SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18) {
+    if matches!(
+        record.schema_version,
+        SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18 | SCHEMA_V19
+    ) {
         super::codec::validate_full_initial_shape(record)?;
         validate_full_capacity_plan_option(record.full_capacity_plan.as_ref())?;
         return Ok(RecordValidation::Consistent);

@@ -11,6 +11,7 @@ use std::{
 };
 use thiserror::Error;
 
+mod admission_custody;
 mod allocation;
 mod common_allocation;
 pub use common_allocation::{

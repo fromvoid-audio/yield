@@ -107,8 +107,9 @@ An existing page cap limits database growth, not all physical allocation.
 
 The production consumer must extend the existing prepared metadata admission
 boundary with an explicit source-adoption input/work kind. The explicit `SourceLegacyAdoption` family now describes passive original-owner
-input and pre-lease topology, but its genuine capacity/admission adapter remains
-unimplemented. Do not relabel migration as CreateFile, ExternalReconciliation or
+input and pre-lease topology. Its dedicated initial adapter now retains the
+original V19 intent and ordinary claims on the issuing worker (OPT-2373 below);
+mutable migration and current lease bootstrap remain separate. Do not relabel migration as CreateFile, ExternalReconciliation or
 a tag edit. Reuse the existing journal and
 capacity owners, with a versioned frozen proposal and genuine descriptor-bound
 claim for every affected volume, before migration writes. The observer, fixture,
@@ -622,3 +623,62 @@ positive physical floor or two actual mounted volumes. Native APFS qualification
 and separately mounted MAIN/two-volume acceptance remain OPT-2354. Existing
 Current-source post-effect failure retention and equivalent effect-proof gaps
 remain OPT-2352; its APIs and existing gates are preserved here.
+
+
+## Original V19 initial claims consumer (OPT-2373)
+
+`LegacyAdoptionCustody::admit` queues only the privately issued source command,
+checkpoint digest and one deadline captured before enqueue. The worker requires
+complete retained volume custody, the original full checkpoint and permanent
+no-effect source fence. It rebuilds the funded durable claim image, reconciles
+the existing provider and consumes the existing genuine descriptor/live witness.
+Unknown physical bindings and incomplete reserves still refuse before intent.
+
+The eight original positive object allowances are independently rounded at their
+actual units, then grouped by volume/class: MAIN, rollback and reservation control
+use SourceDatabaseCommit; prospective WAL/SHM use SourceWalShm; journal MAIN,
+rollback and profile control use JournalRecord. MAIN appears once. The passive
+estimator reports these exact three classes without granting admission. No
+current SourceLeaseFence, WAL binding inventory or recovery-payload substitute
+is constructed.
+
+The retained slot owns one frozen V19 record, exact encoding, ordinary claims,
+original provisional lease, selected settlement outcome and original metadata
+credits before pin/SQL. Store revalidates record/claims and exact frozen bytes
+before borrowing that lease through the original atomic settlement. Claimless
+inserts and generic owned settlement reject V19. Outer V19 is limited to the
+initial User/SourceLegacyAdoption/None intent; V1–V18 family rules remain strict,
+future versions remain unsupported, and the existing SQL schema stays 13.
+
+Confirmed commit marks the original lease durable. Unknown commit, failure after
+commit, unconfirmed rollback and ledger failure preserve the slot and charge;
+confirmed rollback follows the existing exact release rule. A second request
+cannot recreate a failed or uncertain admission. A confirmed duplicate compares
+the same private command/digest, source-only original checkpoint and exact
+committed intent/claims and current durable/live provider image, and returns
+that same OperationId without readmission. Released/missing claims refuse.
+The source-only checkpoint excludes only changes to this worker's journal.
+Lost replies retain the same state until actual worker shutdown; frozen data
+and lease drop before source/reserve/profile custody and their credit.
+
+The original bounded source capture/closed eight-role headers are prepaid on the
+existing pool. Borrowed construction inventory funds actual command clones;
+counted original wire length funds geometric encoded output before encoding.
+Fresh observation maps use full pinned tree nodes per actual reserve and exact
+borrowed provenance lengths. Existing funded snapshot, initial settlement,
+complete-record readback and provider growth retain their own original credits.
+Legacy validation checks its eight roles on the stack; transport streams the
+same canonical binary header/JSON into base64 without temporary binary/base64
+buffers. A real original-owner System allocation test verifies zero allocations
+in that transport counter, in addition to the older historical reader regression.
+
+Real portable SQLite/queued-worker tests cover shape/role accounting, historic
+family rejection, source-only checkpoint and deadline, missing physical custody,
+changed private digest, frozen-byte mismatch, committed readback, confirmed
+rollback, unknown/after-commit outcomes and ledger failure. Logical provider
+fixtures qualify arithmetic only. Native macOS tests use actual original reserve
+bootstrap/live witnesses for commit, duplicate/lost reply and fault retention;
+these tests have not run in the Linux environment. Native qualification,
+including actual separately mounted roots, remains OPT-2354. No mutable source
+grant, schema migration, completion receipt or current lease bootstrap is issued;
+OPT-2117/2098 remain open for those consumers.

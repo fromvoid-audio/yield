@@ -591,7 +591,9 @@ impl InitialClaimSettlement {
 }
 
 // Original lease stays with its owner on every borrowed settlement outcome.
-enum BorrowedInitialClaimSettlementError {
+#[derive(Debug)]
+pub(in crate::operation_journal) enum BorrowedInitialClaimSettlementError {
+    Validation(OperationJournalStoreError),
     Capacity(CapacityProviderError),
     OutcomeRetained {
         outcome: JournalInsertOutcome,
@@ -6424,6 +6426,14 @@ impl OperationJournalStore {
         inventory: Option<&super::database_claims::DatabaseClaimInventory>,
         input: Option<&super::owner::InputPermit>,
     ) -> Result<InitialClaimSettlement, InitialClaimSettlementError> {
+        if record.schema_version == super::model::SCHEMA_V19 {
+            return Err(InitialClaimSettlementError::Store(
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: "legacy initial intent requires the dedicated frozen original consumer"
+                        .into(),
+                },
+            ));
+        }
         validate_intent_record(record).map_err(InitialClaimSettlementError::Store)?;
         let full_plan =
             full_capacity_plan_for_record(record).map_err(InitialClaimSettlementError::Store)?;
@@ -6457,6 +6467,9 @@ impl OperationJournalStore {
                 outcome,
                 lease: retained.then_some(lease),
             }),
+            Err(BorrowedInitialClaimSettlementError::Validation(source)) => {
+                Err(InitialClaimSettlementError::Store(source))
+            }
             Err(BorrowedInitialClaimSettlementError::Capacity(source)) => {
                 Err(InitialClaimSettlementError::Capacity(source))
             }
@@ -6468,6 +6481,121 @@ impl OperationJournalStore {
                 })
             }
         }
+    }
+
+    pub(in crate::operation_journal) fn prepay_initial_frozen_encoding(
+        record: &StoredOperationRecord,
+        input: &super::owner::InputPermit,
+    ) -> Result<super::owner::InputPermit, OperationJournalStoreError> {
+        let working = input
+            .reserve_historical_scratch(database_claims::command_backing::shape_working_bytes())?;
+        let measured = database_claims::command_backing::settlement_shape(record);
+        let measured = match measured {
+            Ok(shape) => shape,
+            Err(error) => {
+                input.retain_historical_error(working, None, None, None);
+                return Err(error);
+            }
+        };
+        // serde's original growing output starts at 4096 and doubles as needed.
+        let bytes = measured
+            .output
+            .max(4096)
+            .checked_mul(2)
+            .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+        match input.reserve_historical_scratch(bytes) {
+            Ok(mut output) => {
+                output.absorb_historical_scratch(working);
+                Ok(output)
+            }
+            Err(error) => {
+                input.retain_historical_error(working, None, None, None);
+                Err(error)
+            }
+        }
+    }
+
+    /// Dedicated V19 consumer borrows the frozen data and original retained lease.
+    pub(in crate::operation_journal) fn settle_legacy_initial_frozen(
+        &self,
+        record: &StoredOperationRecord,
+        encoded: &[u8],
+        claims: &AdmissionClaimInventory,
+        provider: &CapacityProvider,
+        lease: &mut ProvisionalCapacityLease,
+        input: &super::owner::InputPermit,
+    ) -> Result<(JournalInsertOutcome, bool), BorrowedInitialClaimSettlementError> {
+        use BorrowedInitialClaimSettlementError::Validation;
+        let scope = initial_settlement_backing::Scope::new(self, record, claims, input)
+            .map_err(Validation)?;
+        let result = (|| {
+            if record.schema_version != super::model::SCHEMA_V19 {
+                return Err(Validation(OperationJournalStoreError::InconsistentRecord {
+                    reason: "dedicated legacy consumer requires V19".into(),
+                }));
+            }
+            validate_intent_record(record).map_err(Validation)?;
+            let plan = record
+                .full_capacity_plan
+                .as_ref()
+                .ok_or_else(|| Validation(OperationJournalStoreError::MissingCapacityPlan))?;
+            claims.validate_against(plan).map_err(|error| {
+                Validation(OperationJournalStoreError::InconsistentRecord {
+                    reason: error.to_string(),
+                })
+            })?;
+            ordinary_claims::validate_storage_values(claims)
+                .map_err(|error| Validation(ordinary_claim_write_error(error)))?;
+            let checked = encode(record)
+                .map_err(OperationJournalStoreError::from)
+                .map_err(Validation)?;
+            if checked != encoded {
+                return Err(Validation(OperationJournalStoreError::InconsistentRecord {
+                    reason: "frozen legacy intent encoding differs".into(),
+                }));
+            }
+            self.settle_frozen_initial_claims_borrowed(
+                record,
+                encoded,
+                plan,
+                claims,
+                provider,
+                lease,
+                None,
+                Some(input),
+            )
+        })();
+        scope.finish(!matches!(
+            &result,
+            Ok((JournalInsertOutcome::Committed(_), _))
+        ));
+        result
+    }
+
+    pub(in crate::operation_journal) fn verify_legacy_initial_frozen(
+        &self,
+        record: &StoredOperationRecord,
+        claims: &AdmissionClaimInventory,
+        input: &super::owner::InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
+        let scope = initial_settlement_backing::Scope::new(self, record, claims, input)?;
+        let result = (|| {
+            self.validate_namespace_with_input(Some(input), false)?;
+            if !initial_settlement_backing::matches_inside(self, record, input)? {
+                return Err(OperationJournalStoreError::InconsistentRecord {
+                    reason: "original committed legacy intent differs".into(),
+                });
+            }
+            ordinary_claims::initial_funded::verify(
+                &self.connection,
+                record.operation_id,
+                claims,
+                input,
+            )?;
+            self.validate_namespace_with_input(Some(input), false)
+        })();
+        scope.finish(result.is_err());
+        result
     }
 
     // Called only after the original record/claims/encoding validation above.
@@ -6806,6 +6934,20 @@ impl OperationJournalStore {
         input: Option<&super::owner::InputPermit>,
     ) -> JournalInsertOutcome {
         let operation_id = record.operation_id;
+        if record.schema_version == super::model::SCHEMA_V19 && claims.is_none() {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: "legacy initial intent requires dedicated original claims settlement"
+                        .into(),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+
         if let Err(error) = self.validate_namespace_with_input(input, false) {
             return failed_insert(
                 operation_id,

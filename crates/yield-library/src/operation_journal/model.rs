@@ -55,6 +55,8 @@ pub const SCHEMA_V16: u32 = 16;
 pub const SCHEMA_V17: u32 = 17;
 /// Explicit pre-audit source registry retirement command/fence record version.
 pub const SCHEMA_V18: u32 = 18;
+/// Original pre-lease legacy source initial admission record version.
+pub const SCHEMA_V19: u32 = 19;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.
