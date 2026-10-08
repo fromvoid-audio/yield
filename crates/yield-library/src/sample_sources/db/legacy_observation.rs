@@ -12,6 +12,8 @@ use std::{
 use thiserror::Error;
 
 mod admission_custody;
+mod migration;
+pub(crate) use migration::LegacyMigrationSettlement;
 mod allocation;
 mod common_allocation;
 pub use common_allocation::{
@@ -154,6 +156,14 @@ impl LegacySourceReadOwner {
         owner.original_digest = Some(*owner.capture(profile)?.digest());
         Ok(owner)
     }
+    // Borrowed identity only; no connection or raw pointer escapes original custody.
+    pub(crate) fn matches_original_migration_connection(
+        &self,
+        connection: &crate::sqlite_budget::OwnedConnection,
+    ) -> bool {
+        std::ptr::eq(&self.connection, connection)
+    }
+
     /// Revalidate the original acquisition, roots, main-file and fresh locked sidecar.
     pub fn validate(&self, profile: &WritableProfileGuard) -> Result<()> {
         self.validate_connection(profile, &self.connection)

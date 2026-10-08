@@ -33,6 +33,7 @@ mod current_source_metadata;
 #[cfg(all(test, unix))]
 mod current_source_native_fault_tests;
 mod legacy_admission;
+pub(crate) use legacy_admission::OriginalLegacyMigrationAdmission;
 mod legacy_adoption_custody;
 mod legacy_adoption_volumes;
 mod recording_binding;
@@ -6803,6 +6804,13 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<OperationId, OperationJournalOwnerError>>,
     },
+    MigrateLegacySource {
+        command: crate::sample_sources::db::SourceCommandId,
+        digest: [u8; 32],
+        deadline: std::time::Instant,
+        input: InputPermit,
+        result: SyncSender<Result<OperationId, OperationJournalOwnerError>>,
+    },
     PrepareLegacyVolumes {
         command: crate::sample_sources::db::SourceCommandId,
         digest: [u8; 32],
@@ -7356,6 +7364,15 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             result,
         } => execute_store_result(result, move || {
             runtime.admit_legacy_initial(command, digest, deadline, input)
+        }),
+        JournalCommand::MigrateLegacySource {
+            command,
+            digest,
+            deadline,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            runtime.migrate_legacy_source(command, digest, deadline, input)
         }),
         JournalCommand::PrepareLegacyVolumes {
             command,
@@ -7921,7 +7938,8 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
         JournalCommand::PrepareLegacyCustody { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::AdmitLegacyInitial { result, .. } => {
+        JournalCommand::AdmitLegacyInitial { result, .. }
+        | JournalCommand::MigrateLegacySource { result, .. } => {
             let _ = result.send(Err(error));
         }
         JournalCommand::PrepareLegacyVolumes { result, .. } => {

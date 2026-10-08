@@ -46,6 +46,25 @@ pub(super) fn apply_current_stamp_repairs(connection: &Connection) -> Result<(),
 fn apply_structural_migrations(connection: &Connection) -> Result<(), SourceDbError> {
     ensure_wav_files_optional_columns(connection)?;
     ensure_source_index_schema(connection)?;
+    apply_structural_after_wav_and_index(connection)
+}
+
+// Known-11 adoption has only metadata/wav before base DDL. The new source-index
+// table has no historic paths to rekey; keep its DDL in the caller's one transaction.
+pub(super) fn apply_legacy_structural_inside_transaction(
+    connection: &Connection,
+) -> Result<(), SourceDbError> {
+    if connection.is_autocommit() {
+        return Err(SourceDbError::MaintenanceRequired);
+    }
+    ensure_wav_files_optional_columns(connection)?;
+    connection
+        .execute_batch(SOURCE_INDEX_SCHEMA_SQL)
+        .map_err(map_sql_error)?;
+    apply_structural_after_wav_and_index(connection)
+}
+
+fn apply_structural_after_wav_and_index(connection: &Connection) -> Result<(), SourceDbError> {
     ensure_pending_rename_optional_columns(connection)?;
     ensure_file_ops_journal_optional_columns(connection)?;
     ensure_analysis_jobs_optional_columns(connection)?;
@@ -188,10 +207,7 @@ fn ensure_directory_truth_schema(connection: &Connection) -> Result<(), SourceDb
     Ok(())
 }
 
-fn ensure_source_index_schema(connection: &Connection) -> Result<(), SourceDbError> {
-    let tx = connection.unchecked_transaction().map_err(map_sql_error)?;
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS source_index_entries (
+const SOURCE_INDEX_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS source_index_entries (
                 path TEXT PRIMARY KEY,
                 path_encoding INTEGER NOT NULL DEFAULT 0,
                 classification TEXT NOT NULL CHECK(classification IN (
@@ -207,9 +223,12 @@ fn ensure_source_index_schema(connection: &Connection) -> Result<(), SourceDbErr
                 format_policy_version INTEGER NOT NULL
             ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS idx_source_index_entries_classification_path
-                ON source_index_entries(classification, path);",
-    )
-    .map_err(map_sql_error)?;
+                ON source_index_entries(classification, path);";
+
+fn ensure_source_index_schema(connection: &Connection) -> Result<(), SourceDbError> {
+    let tx = connection.unchecked_transaction().map_err(map_sql_error)?;
+    tx.execute_batch(SOURCE_INDEX_SCHEMA_SQL)
+        .map_err(map_sql_error)?;
     if !table_columns(&tx, "source_index_entries")?.contains("path_encoding") {
         tx.execute(
             "ALTER TABLE source_index_entries

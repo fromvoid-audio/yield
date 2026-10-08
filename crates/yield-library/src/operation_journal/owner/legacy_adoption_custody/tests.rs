@@ -466,6 +466,32 @@ fn legacy_initial_actual_worker_refuses_missing_original_volume_custody_without_
 }
 
 #[test]
+fn legacy_migration_actual_worker_refuses_without_committed_original_admission_and_preserves_bytes()
+{
+    let mut f = Fixture::new();
+    let source = fs::read(f.path()).unwrap();
+    let journal = journal_bytes(&f);
+    let custody = f.prepare().unwrap();
+    let before = budget(&f.client());
+    for _ in 0..2 {
+        assert!(matches!(
+            custody
+                .migrate_source()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap(),
+            Err(OperationJournalOwnerError::LegacyAdoptionCustody(
+                LegacyAdoptionCustodyError::ReserveRecovery
+            ))
+        ));
+    }
+    assert_eq!(budget(&f.client()), before);
+    assert_eq!(fs::read(f.path()).unwrap(), source);
+    assert_eq!(journal_bytes(&f), journal);
+    validate(&custody).unwrap();
+}
+
+#[test]
 fn legacy_initial_actual_queued_deadline_and_foreign_digest_refuse_before_intent() {
     let mut f = Fixture::new();
     let custody = f.prepare().unwrap();
@@ -594,4 +620,96 @@ fn legacy_initial_native_actual_worker_commit_faults_keep_same_source_slot_and_r
         f.close();
         assert_eq!(fs::read(f.path()).unwrap(), original_source);
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_migration_native_actual_worker_commits_original_receipt_and_coalesces_lost_reply() {
+    use crate::operation_journal::legacy_adoption_commands::receipt::{
+        ADOPTION_METADATA_KEY, AdoptionReceiptEnvelope,
+    };
+    let mut f = Fixture::new_with_start(true, None);
+    let custody = f
+        .prepare()
+        .unwrap()
+        .prepare_volume_custody()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let operation = custody
+        .admit()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let capture = || {
+        let connection = rusqlite::Connection::open_with_flags(
+            f.path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        let metadata = connection.prepare("SELECT key,value FROM metadata WHERE key != 'source.legacy_adoption.v1' ORDER BY key").unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let audio = connection
+            .prepare("SELECT path,file_size,modified_ns FROM wav_files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        (metadata, audio)
+    };
+    let original_rows = capture();
+    drop(custody.migrate_source().unwrap()); // Lost reply is not permission to replay migration.
+    let confirmed = custody
+        .migrate_source()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    assert_eq!(confirmed, operation);
+    assert_eq!(capture(), original_rows);
+    let connection = rusqlite::Connection::open_with_flags(
+        f.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        13
+    );
+    let encoded: String = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [ADOPTION_METADATA_KEY],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        AdoptionReceiptEnvelope::decode(encoded.as_bytes())
+            .unwrap()
+            .matches_original(&custody.args, operation)
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='source_lease'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    f.close();
 }

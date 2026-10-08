@@ -5,7 +5,7 @@ impl OwnedConnection {
     pub(crate) fn has_no_effect_fence(&self) -> bool {
         self.registration
             .as_ref()
-            .is_some_and(|r| r.context.no_effect)
+            .is_some_and(|r| r.context.no_effect.load(Ordering::Acquire))
     }
 }
 
@@ -45,3 +45,194 @@ pub(super) fn control_result(op: c_int) -> Option<c_int> {
 
 #[cfg(test)]
 mod tests;
+
+// Mutation authority is supplied only by the original retained committed journal consumer.
+// Retain that borrow and the extension boundary until exact policy restoration or quarantine.
+pub(crate) struct OriginalLegacyMutationScope<'a, 'owner> {
+    connection: &'a OwnedConnection,
+    _admission: &'a crate::operation_journal::owner::OriginalLegacyMigrationAdmission<'owner>,
+    _extensions: std::sync::RwLockReadGuard<'static, ()>,
+    prior: [u64; 7],
+    finished: bool,
+}
+fn scalar(connection: &Connection, name: &str) -> rusqlite::Result<u64> {
+    connection.pragma_query_value(None, name, |row| row.get(0))
+}
+fn refused_scope() -> crate::sample_sources::db::LegacyObservationError {
+    crate::sample_sources::db::LegacyObservationError("original migration policy unavailable")
+}
+impl OwnedConnection {
+    pub(crate) fn enter_original_legacy_mutation<'a, 'owner>(
+        &'a self,
+        admission: &'a crate::operation_journal::owner::OriginalLegacyMigrationAdmission<'owner>,
+    ) -> Result<
+        OriginalLegacyMutationScope<'a, 'owner>,
+        crate::sample_sources::db::LegacyObservationError,
+    > {
+        let extensions =
+            crate::sqlite_ext::try_extension_free_metadata_scope().ok_or_else(refused_scope)?;
+        admission.validate_original_connection(self)?;
+        let registration = self.registration.as_ref().ok_or_else(refused_scope)?;
+        if !self.is_autocommit() || !self.has_no_effect_fence() {
+            return Err(refused_scope());
+        }
+        {
+            let state = registration
+                .context
+                .state
+                .lock()
+                .map_err(|_| refused_scope())?;
+            if state.attempt.is_some()
+                || state.open_auxiliary != 0
+                || state.mapped_database != 0
+                || state.mapped_shm_bytes != 0
+            {
+                return Err(refused_scope());
+            }
+        }
+        let (page_size, original_max, selected_max, sector) = admission.source_policy();
+        let mode: String = self
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .map_err(|_| refused_scope())?;
+        let names = [
+            "max_page_count",
+            "cache_spill",
+            "temp_store",
+            "mmap_size",
+            "wal_autocheckpoint",
+            "synchronous",
+            "fullfsync",
+        ];
+        let mut prior = [0; 7];
+        for (index, name) in names.iter().enumerate() {
+            prior[index] = scalar(self, name).map_err(|_| refused_scope())?;
+        }
+        if !mode.eq_ignore_ascii_case("delete")
+            || scalar(self, "page_size").map_err(|_| refused_scope())? != page_size
+            || self.known_delete_sector_size() != Some(sector)
+            || prior[0] != original_max
+            || prior[1] != 0
+            || prior[2] != 2
+            || prior[3] != 0
+            || scalar(self, "query_only").map_err(|_| refused_scope())? != 1
+            || selected_max > original_max
+            || selected_max < scalar(self, "page_count").map_err(|_| refused_scope())?
+            || selected_max
+                .checked_mul(page_size)
+                .is_none_or(|n| n > 64 * 1024 * 1024)
+        {
+            return Err(refused_scope());
+        }
+        let scope = OriginalLegacyMutationScope {
+            connection: self,
+            _admission: admission,
+            _extensions: extensions,
+            prior,
+            finished: false,
+        };
+        // Core policy setup cannot write through the still-closed original VFS fence.
+        self.pragma_update(None, "max_page_count", selected_max)
+            .map_err(|_| refused_scope())?;
+        self.execute_batch("PRAGMA cache_spill=OFF; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=0; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=EXTRA;")
+            .map_err(|_| refused_scope())?;
+        #[cfg(target_os = "macos")]
+        self.execute_batch("PRAGMA fullfsync=ON")
+            .map_err(|_| refused_scope())?;
+        if scalar(self, "max_page_count").map_err(|_| refused_scope())? != selected_max
+            || scalar(self, "cache_spill").map_err(|_| refused_scope())? != 0
+            || scalar(self, "temp_store").map_err(|_| refused_scope())? != 2
+            || scalar(self, "mmap_size").map_err(|_| refused_scope())? != 0
+            || scalar(self, "wal_autocheckpoint").map_err(|_| refused_scope())? != 0
+            || scalar(self, "synchronous").map_err(|_| refused_scope())? != 3
+            || (cfg!(target_os = "macos")
+                && scalar(self, "fullfsync").map_err(|_| refused_scope())? != 1)
+        {
+            return Err(refused_scope());
+        }
+        registration
+            .context
+            .no_effect
+            .store(false, Ordering::Release);
+        // This genuine original admission holds all physical claims. Disable inherited native
+        // preallocation before query_only is cleared or any source transaction starts.
+        let mut chunk: c_int = 0;
+        // SAFETY: original sole-owner connection and live registration; SQLite's integer control.
+        let rc = unsafe {
+            ffi::sqlite3_file_control(
+                self.handle(),
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_CHUNK_SIZE,
+                (&mut chunk as *mut c_int).cast(),
+            )
+        };
+        if rc != ffi::SQLITE_OK {
+            return Err(refused_scope());
+        }
+        self.execute_batch("PRAGMA query_only=OFF")
+            .map_err(|_| refused_scope())?;
+        if scalar(self, "query_only").map_err(|_| refused_scope())? != 0 {
+            return Err(refused_scope());
+        }
+        Ok(scope)
+    }
+}
+impl OriginalLegacyMutationScope<'_, '_> {
+    pub(crate) fn finish(
+        mut self,
+    ) -> Result<(), crate::sample_sources::db::LegacyObservationError> {
+        let result = self.restore();
+        self.finished = true;
+        result
+    }
+    fn restore(&self) -> Result<(), crate::sample_sources::db::LegacyObservationError> {
+        let registration = self
+            .connection
+            .registration
+            .as_ref()
+            .ok_or_else(refused_scope)?;
+        // Refence first: unconfirmed transactions must never perform rollback/cleanup in Drop.
+        registration
+            .context
+            .no_effect
+            .store(true, Ordering::Release);
+        let restored = (|| -> rusqlite::Result<()> {
+            if !self.connection.is_autocommit() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            self.connection.execute_batch("PRAGMA query_only=ON")?;
+            for (name, value) in [
+                "max_page_count",
+                "cache_spill",
+                "temp_store",
+                "mmap_size",
+                "wal_autocheckpoint",
+                "synchronous",
+                "fullfsync",
+            ]
+            .into_iter()
+            .zip(self.prior)
+            {
+                self.connection.pragma_update(None, name, value)?;
+                if scalar(self.connection, name)? != value {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+            }
+            if scalar(self.connection, "query_only")? != 1 {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok(())
+        })();
+        if restored.is_err() {
+            registration.context.quarantine();
+            return Err(refused_scope());
+        }
+        Ok(())
+    }
+}
+impl Drop for OriginalLegacyMutationScope<'_, '_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.restore();
+        }
+    }
+}

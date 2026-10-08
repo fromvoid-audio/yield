@@ -9,7 +9,7 @@ use std::ops::Deref;
 use std::ptr;
 use std::sync::{
     Mutex,
-    atomic::{AtomicPtr, Ordering},
+    atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
 mod io;
@@ -164,8 +164,8 @@ impl Drop for Registration {
 }
 
 struct Context {
-    // Immutable from before sqlite3_open until the final native close.
-    no_effect: bool,
+    // Fenced from before open; only original committed admission can enter a scoped mutation.
+    no_effect: AtomicBool,
     #[cfg(test)]
     native_effect_calls: std::sync::atomic::AtomicU64,
     native: *mut ffi::sqlite3_vfs,
@@ -461,7 +461,7 @@ pub(super) fn open_owned_mode(
         let name =
             CString::new(format!("{CLIENT_NAME}-{}", uuid::Uuid::new_v4())).expect("UUID name");
         let mut context = Box::new(Context {
-            no_effect,
+            no_effect: AtomicBool::new(no_effect),
             #[cfg(test)]
             native_effect_calls: std::sync::atomic::AtomicU64::new(0),
             native,

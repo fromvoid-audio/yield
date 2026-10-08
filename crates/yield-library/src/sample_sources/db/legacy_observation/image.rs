@@ -33,6 +33,12 @@ fn matches_compiled_sql(actual: &str, expected: &str) -> bool {
     }) && actual.next().is_none()
 }
 pub(super) fn capture(connection: &Connection) -> Result<[u8; 32]> {
+    capture_schema(connection, 1)
+}
+pub(super) fn capture_inside_migration(connection: &Connection) -> Result<[u8; 32]> {
+    capture_schema(connection, 0)
+}
+fn capture_schema(connection: &Connection, expected_query_only: u64) -> Result<[u8; 32]> {
     let version: u64 = connection
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(refused)?;
@@ -50,7 +56,7 @@ pub(super) fn capture(connection: &Connection) -> Result<[u8; 32]> {
         .map_err(refused)?;
     if version != 11
         || !mode.eq_ignore_ascii_case("delete")
-        || query_only != 1
+        || query_only != expected_query_only
         || temp != 2
         || spill != 0
     {

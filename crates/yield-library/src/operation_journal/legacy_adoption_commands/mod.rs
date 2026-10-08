@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 
 mod initial_capacity;
+pub(crate) mod receipt;
 mod source_checkpoint;
 mod transport;
 pub(crate) use source_checkpoint::OriginalSourceCheckpoint;
@@ -86,6 +87,15 @@ struct Object {
     conditional_logical_bytes: u64,
 }
 impl LegacyAdoptionIntentArgs {
+    pub(crate) fn original_migration_policy(&self) -> (u64, u64, u64, u64) {
+        let p = &self.data.source_policy;
+        (
+            p.page_size,
+            p.existing_max_pages,
+            p.selected_max_pages,
+            p.sector,
+        )
+    }
     pub(crate) fn legacy_metadata_bytes(&self) -> Option<usize> {
         let d = &self.data;
         let text = [

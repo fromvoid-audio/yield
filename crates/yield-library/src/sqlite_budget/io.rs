@@ -43,7 +43,7 @@ unsafe extern "C" fn open(
         if name.is_null() && role != 4 {
             return ffi::SQLITE_CANTOPEN;
         }
-        if ctx.no_effect
+        if ctx.no_effect.load(Ordering::Acquire)
             && (role != 0
                 || flags & (ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_DELETEONCLOSE) != 0
                 || flags & ffi::SQLITE_OPEN_READWRITE == 0)
@@ -161,7 +161,7 @@ unsafe extern "C" fn write(
     unsafe {
         let h = header(f);
         let ctx = &*h.context;
-        if ctx.no_effect {
+        if ctx.no_effect.load(Ordering::Acquire) {
             return ffi::SQLITE_READONLY;
         }
         if amount < 0 || offset < 0 || offset.checked_add(i64::from(amount)).is_none() {
@@ -224,7 +224,7 @@ unsafe extern "C" fn truncate(f: *mut ffi::sqlite3_file, size: i64) -> c_int {
         }
         let h = header(f);
         let ctx = &*h.context;
-        if ctx.no_effect {
+        if ctx.no_effect.load(Ordering::Acquire) {
             return ffi::SQLITE_READONLY;
         }
         let mut old = -1;
@@ -255,7 +255,7 @@ unsafe extern "C" fn control(f: *mut ffi::sqlite3_file, op: c_int, arg: *mut c_v
     unsafe {
         let h = header(f);
         let ctx = &*h.context;
-        if ctx.no_effect {
+        if ctx.no_effect.load(Ordering::Acquire) {
             if let Some(rc) = no_effect::control_result(op) {
                 return rc;
             }
@@ -336,7 +336,7 @@ unsafe extern "C" fn shm_map(
             return ffi::SQLITE_IOERR_SHMMAP;
         }
         *output = ptr::null_mut();
-        if ctx.no_effect {
+        if ctx.no_effect.load(Ordering::Acquire) {
             return ffi::SQLITE_READONLY;
         }
         if ctx.restricted() && (page >= 4096 || size != 32768) {
@@ -373,7 +373,7 @@ unsafe extern "C" fn shm_map(
 unsafe extern "C" fn shm_unmap(f: *mut ffi::sqlite3_file, delete: c_int) -> c_int {
     unsafe {
         let ctx = &*header(f).context;
-        if ctx.no_effect {
+        if ctx.no_effect.load(Ordering::Acquire) {
             return ffi::SQLITE_READONLY;
         }
         #[cfg(test)]
@@ -402,7 +402,7 @@ unsafe extern "C" fn fetch(
         }
         *output = ptr::null_mut();
         let ctx = &*header(f).context;
-        if ctx.no_effect || ctx.restricted() {
+        if ctx.no_effect.load(Ordering::Acquire) || ctx.restricted() {
             *output = ptr::null_mut();
             return ffi::SQLITE_OK;
         }
@@ -438,7 +438,7 @@ unsafe extern "C" fn unfetch(f: *mut ffi::sqlite3_file, offset: i64, data: *mut 
 unsafe extern "C" fn delete(v: *mut ffi::sqlite3_vfs, name: *const c_char, sync: c_int) -> c_int {
     unsafe {
         let ctx = context(v);
-        if ctx.no_effect {
+        if ctx.no_effect.load(Ordering::Acquire) {
             return ffi::SQLITE_READONLY;
         }
         if ctx.restricted() {
@@ -469,7 +469,7 @@ unsafe extern "C" fn sync(f: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
     unsafe {
         let h = header(f);
         let ctx = &*h.context;
-        if ctx.no_effect {
+        if ctx.no_effect.load(Ordering::Acquire) {
             return ffi::SQLITE_READONLY;
         }
         // Sync can allocate filesystem metadata even without growing the file.
@@ -536,7 +536,7 @@ unsafe extern "C" fn shm_lock(
     flags: c_int,
 ) -> c_int {
     unsafe {
-        if (&*header(f).context).no_effect {
+        if (&*header(f).context).no_effect.load(Ordering::Acquire) {
             return ffi::SQLITE_READONLY;
         }
         methods(f)
@@ -583,7 +583,7 @@ unsafe extern "C" fn full_path(
 }
 unsafe extern "C" fn dl_open(v: *mut ffi::sqlite3_vfs, name: *const c_char) -> *mut c_void {
     unsafe {
-        if context(v).no_effect {
+        if context(v).no_effect.load(Ordering::Acquire) {
             return ptr::null_mut();
         }
         let native = context(v).native;
@@ -658,7 +658,7 @@ unsafe extern "C" fn set_syscall(
     value: ffi::sqlite3_syscall_ptr,
 ) -> c_int {
     unsafe {
-        if context(v).no_effect {
+        if context(v).no_effect.load(Ordering::Acquire) {
             return ffi::SQLITE_READONLY;
         }
         let native = context(v).native;

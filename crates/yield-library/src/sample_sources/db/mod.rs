@@ -27,7 +27,7 @@ mod idle_maintenance;
 mod index_entries;
 mod index_inspection;
 mod legacy_observation;
-pub(crate) use legacy_observation::LEGACY_CAPTURE_SCRATCH_BYTES;
+pub(crate) use legacy_observation::{LEGACY_CAPTURE_SCRATCH_BYTES, LegacyMigrationSettlement};
 pub use legacy_observation::{
     LegacyAllocationObject, LegacyAllocationRole, LegacyAllocationVolume,
     LegacyCommonAllocationObservation, LegacyObservationError, LegacySourceImage,

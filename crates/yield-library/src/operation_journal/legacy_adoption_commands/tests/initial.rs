@@ -469,3 +469,38 @@ fn legacy_initial_typed_estimator_covers_exact_three_role_classes_without_relabe
         }
     }
 }
+
+#[test]
+fn legacy_adoption_source_receipt_is_bounded_canonical_and_matches_only_original_request() {
+    use super::super::receipt::{
+        ADOPTION_METADATA_KEY, AdoptionReceiptEnvelope, MAX_ADOPTION_RECEIPT_BYTES,
+    };
+    let fixture = Fixture::new();
+    let args = fixture.prepare();
+    let operation = OperationId::new();
+    // Passive codec observations only: these digest fixtures issue no source mutation grant.
+    let receipt =
+        AdoptionReceiptEnvelope::capture(&args, operation, [1; 32], [2; 32], [3; 32], 3, 0)
+            .unwrap();
+    let encoded = receipt.encode().unwrap();
+    assert_eq!(ADOPTION_METADATA_KEY, "source.legacy_adoption.v1");
+    assert!(encoded.len() <= MAX_ADOPTION_RECEIPT_BYTES);
+    let decoded = AdoptionReceiptEnvelope::decode(&encoded).unwrap();
+    assert_eq!(decoded, receipt);
+    assert!(decoded.matches_original(&args, operation));
+    assert!(!decoded.matches_original(&args, OperationId::new()));
+    let mut changed = args.clone();
+    changed.data.command = SourceCommandId::new();
+    assert!(!decoded.matches_original(&changed, operation));
+    let wire = std::str::from_utf8(&encoded).unwrap();
+    for malformed in [
+        wire.replacen("{", "{\"version\":1,", 1),
+        wire.replacen("{", "{\"unknown\":null,", 1),
+        wire.replace("\"after_version\":13", "\"after_version\":14"),
+        format!(" {wire}"),
+        format!("{wire} false"),
+        "x".repeat(MAX_ADOPTION_RECEIPT_BYTES + 1),
+    ] {
+        assert!(AdoptionReceiptEnvelope::decode(malformed.as_bytes()).is_err());
+    }
+}

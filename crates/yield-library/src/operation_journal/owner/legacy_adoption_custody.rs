@@ -82,6 +82,34 @@ impl LegacyAdoptionCustody {
             },
         )
     }
+    /// Commit the preserving source migration on the original admitted worker.
+    /// The result identifies only the confirmed migration receipt; current lease bootstrap,
+    /// source audit and catalog publication remain separately admitted effects.
+    /// Lost replies retain original custody. An uncertain attempt cannot replay its body.
+    pub fn migrate_source(
+        &self,
+    ) -> Result<OperationJournalRequest<OperationId>, OperationJournalOwnerQueueError> {
+        let shared = self
+            .owner
+            .upgrade()
+            .ok_or(OperationJournalOwnerQueueError::Closed)?;
+        let command = self.args.source_command_id();
+        let digest = self.digest;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        OperationJournalClient { shared }.submit_funded_with_reply(
+            InputClass::Ordinary,
+            super::legacy_admission::MIGRATION_INPUT_BYTES,
+            false,
+            true,
+            move |input, result| JournalCommand::MigrateLegacySource {
+                command,
+                digest,
+                deadline,
+                input,
+                result,
+            },
+        )
+    }
     /// Install original pre-lease reserve custody on the same worker and return a newly
     /// captured passive checkpoint. No ordinary claim, migration grant or lease is issued.
     /// A failed physical preparation retains its partial backing until actual shutdown.

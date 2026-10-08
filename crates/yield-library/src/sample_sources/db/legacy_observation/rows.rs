@@ -167,6 +167,13 @@ fn compare_text(
     Ok(order)
 }
 pub(super) fn capture(connection: &Connection, deadline: Instant) -> Result<Rows> {
+    capture_rows(connection, deadline, false)
+}
+// The only excluded row is the one exact immutable source-local adoption slot.
+pub(super) fn capture_preserved(connection: &Connection, deadline: Instant) -> Result<Rows> {
+    capture_rows(connection, deadline, true)
+}
+fn capture_rows(connection: &Connection, deadline: Instant, exclude_receipt: bool) -> Result<Rows> {
     check_deadline(deadline)?;
     // Caller proved exact compiled rowid v11 DDL in this SAME original read transaction.
     // BINARY index order differs across UTF-8/UTF-16: scan it, but canonicalize borrowed UTF-8
@@ -193,7 +200,11 @@ pub(super) fn capture(connection: &Connection, deadline: Instant) -> Result<Rows
     }
     let metadata_rows = count(
         connection,
-        "SELECT COUNT(*) FROM (SELECT 1 FROM metadata NOT INDEXED LIMIT 129)",
+        if exclude_receipt {
+            "SELECT COUNT(*) FROM (SELECT 1 FROM metadata NOT INDEXED WHERE key != 'source.legacy_adoption.v1' LIMIT 129)"
+        } else {
+            "SELECT COUNT(*) FROM (SELECT 1 FROM metadata NOT INDEXED LIMIT 129)"
+        },
         MAX_METADATA_ROWS,
     )?;
     let audio_rows = count(
@@ -204,7 +215,13 @@ pub(super) fn capture(connection: &Connection, deadline: Instant) -> Result<Rows
     let mut hash = blake3::Hasher::new();
     hash.update(b"legacy-metadata");
     hash.update(&(metadata_rows as u64).to_le_bytes());
-    let revision = metadata(connection, metadata_rows, deadline, &mut hash)?;
+    let revision = metadata(
+        connection,
+        metadata_rows,
+        deadline,
+        &mut hash,
+        exclude_receipt,
+    )?;
     hash.update(b"legacy-audio");
     hash.update(&(audio_rows as u64).to_le_bytes());
     audio(connection, audio_rows, deadline, &mut hash)?;
@@ -221,10 +238,13 @@ fn metadata(
     expected: usize,
     deadline: Instant,
     hash: &mut blake3::Hasher,
+    exclude_receipt: bool,
 ) -> Result<u64> {
     let mut references = Vec::with_capacity(MAX_METADATA_ROWS);
     {
-        let mut statement = connection.prepare(METADATA_SQL).map_err(refused)?;
+        let mut statement = connection.prepare(if exclude_receipt {
+            "SELECT rowid, CASE WHEN length(CAST(key AS BLOB))<=4096 THEN key END, CASE WHEN length(CAST(value AS BLOB))<=65536 THEN value END FROM metadata INDEXED BY sqlite_autoindex_metadata_1 WHERE key != 'source.legacy_adoption.v1' ORDER BY key COLLATE BINARY LIMIT 129"
+        } else { METADATA_SQL }).map_err(refused)?;
         let mut rows = statement.query([]).map_err(refused)?;
         let mut bytes = 0usize;
         while let Some(row) = rows.next().map_err(refused)? {
