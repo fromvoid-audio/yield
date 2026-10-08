@@ -55,7 +55,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -5191,6 +5191,18 @@ impl OperationJournalClient {
         self.shared.queue_metrics.snapshot()
     }
 
+    /// Return the original worker's profile acquisition without waiting or allocating.
+    ///
+    /// The worker publishes this equality observation after successful bootstrap,
+    /// before becoming Available. Clones and retained clients keep that original
+    /// identity after closure; a new acquisition cannot redirect an old client.
+    /// `None` means bootstrap has not published an identity. This UUID is no
+    /// writable capability or admission proof; callers must also check lifecycle
+    /// and the owner must revalidate its current guard before admitting work.
+    pub fn original_profile_acquisition(&self) -> Option<Uuid> {
+        self.shared.original_profile_acquisition.get().copied()
+    }
+
     /// Return the current worker lifecycle without waiting for storage I/O.
     pub fn status(&self) -> OperationJournalOwnerStatus {
         self.shared.status()
@@ -6162,6 +6174,7 @@ fn bounded_json_input<T: serde::Serialize>(
 }
 
 struct OwnerShared {
+    original_profile_acquisition: OnceLock<Uuid>,
     queue_metrics: Arc<QueueMetrics>,
     resource_admission: Arc<ResourceAdmission>,
     commands: Mutex<Option<OwnerCommandSenders>>,
@@ -6199,6 +6212,7 @@ impl OwnerShared {
         let lifecycle = Arc::new(AtomicU8::new(OwnerLifecycle::Initializing as u8));
         let resource_admission = ResourceAdmission::new();
         Self {
+            original_profile_acquisition: OnceLock::new(),
             queue_metrics: Arc::clone(&commands.ordinary.metrics),
             resource_admission,
             commands: Mutex::new(Some(commands)),
@@ -7200,6 +7214,26 @@ fn run_owner(
         }
     }
 
+    // Capture only the original retained guard, after every bootstrap check.
+    // No DTO, current global profile lookup, Source row, or UI request can supply
+    // this identity. The fixed OnceLock backing was prepaid on the original pool.
+    let acquisition = runtime
+        .final_profile_guard
+        .as_ref()
+        .and_then(|guard| Uuid::parse_str(guard.owner_identity()).ok());
+    let Some(acquisition) = acquisition else {
+        shared.mark_unavailable("original journal profile acquisition is invalid");
+        return;
+    };
+    if shared
+        .original_profile_acquisition
+        .set(acquisition)
+        .is_err()
+    {
+        shared.mark_unavailable("original journal profile acquisition already published");
+        return;
+    }
+
     let mut starting = Err(shared.lifecycle.load(Ordering::Acquire));
     shared.resource_admission.activate(|| {
         starting = shared.lifecycle.compare_exchange(
@@ -8061,6 +8095,7 @@ mod tests {
     mod publication_input_tests;
     mod publication_mutation_tests;
     mod publication_uncertainty_tests;
+    mod service_acquisition_tests;
     mod queue_metrics_integration {
         include!("owner/tests/queue_metrics_integration.rs");
     }
