@@ -133,7 +133,7 @@ impl OperationJournalStore {
         operation_id: OperationId,
         input: &InputPermit,
     ) -> Result<bool, OperationJournalStoreError> {
-        self.inspect_claim_operation(operation_id, input, false, |_, _| Ok(()))
+        self.inspect_claim_operation(operation_id, input, false, false, |_, _, _| Ok(()))
     }
 
     /// Inspect the exact complete original record only while its own backing is
@@ -144,7 +144,34 @@ impl OperationJournalStore {
         input: &InputPermit,
         inspect: impl FnOnce(&StoredOperationRecord, i64) -> Result<(), OperationJournalStoreError>,
     ) -> Result<bool, OperationJournalStoreError> {
-        self.inspect_claim_operation(operation_id, input, true, inspect)
+        self.inspect_claim_operation(operation_id, input, true, false, |record, sequence, _| {
+            inspect(record, sequence)
+        })
+    }
+
+    pub(super) fn inspect_bound_complete_claim_operation(
+        &self,
+        operation_id: OperationId,
+        input: &InputPermit,
+        inspect: impl FnOnce(
+            &StoredOperationRecord,
+            i64,
+            [u8; 32],
+        ) -> Result<(), OperationJournalStoreError>,
+    ) -> Result<bool, OperationJournalStoreError> {
+        self.inspect_claim_operation(
+            operation_id,
+            input,
+            true,
+            true,
+            |record, sequence, digest| {
+                inspect(
+                    record,
+                    sequence,
+                    digest.expect("bound observation hashes the original cell"),
+                )
+            },
+        )
     }
 
     fn inspect_claim_operation(
@@ -152,7 +179,12 @@ impl OperationJournalStore {
         operation_id: OperationId,
         input: &InputPermit,
         complete: bool,
-        inspect: impl FnOnce(&StoredOperationRecord, i64) -> Result<(), OperationJournalStoreError>,
+        bound: bool,
+        inspect: impl FnOnce(
+            &StoredOperationRecord,
+            i64,
+            Option<[u8; 32]>,
+        ) -> Result<(), OperationJournalStoreError>,
     ) -> Result<bool, OperationJournalStoreError> {
         // Fund fixed Rust statement/binding/error backing before preparing SQL. Native
         // SQLite allocations are not represented as a Rust allocator/RSS bound.
@@ -293,6 +325,7 @@ impl OperationJournalStore {
                     "stored record length changed or exceeds its bound",
                 ));
             }
+            let digest = bound.then(|| *blake3::hash(bytes).as_bytes());
             scratch = Some(historical_observation::Scratch::new(input, bytes.len())?);
             let mut observation =
                 historical_observation::observe(bytes, scratch.as_mut().expect("funded scratch"))?;
@@ -346,7 +379,7 @@ impl OperationJournalStore {
             }
             match classify_record(record) {
                 RecordConsistency::Consistent => {
-                    inspect(record, sequence)?;
+                    inspect(record, sequence, digest)?;
                     Ok(true)
                 }
                 RecordConsistency::LegacyMissingPublicationEvidence => Err(retained_error(

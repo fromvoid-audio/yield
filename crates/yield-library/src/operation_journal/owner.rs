@@ -17,6 +17,7 @@ mod historical_reply;
 mod namespace_credit;
 pub use namespace_credit::RetainedCommandError;
 mod startup_credit;
+use super::store::FundedChunkClaimRecord;
 use historical_reply::HistoricalReply;
 #[cfg(any(test, feature = "test-support"))]
 pub use namespace_credit::JournalNamespaceFundingProbe;
@@ -95,8 +96,8 @@ use super::store::recovery::{
     CoordinatorRecoveryPage, RecoveryCursor, RecoveryPage, RecoveryScanError,
 };
 use super::store::{
-    ChunkClaimRecord, ChunkClaimRequest, ChunkClaimState, ChunkId, ChunkIssueReceipt,
-    ChunkStagingReceipt, ChunkWriteIdentity, FullProgressWriteOutcome, InitialClaimSettlementError,
+    ChunkClaimRequest, ChunkClaimState, ChunkId, ChunkIssueReceipt, ChunkStagingReceipt,
+    ChunkWriteIdentity, FullProgressWriteOutcome, InitialClaimSettlementError,
     JournalCancelRequestReceipt, JournalInsertFailure, JournalInsertOutcome, JournalInsertReceipt,
     JournalInsertWriteStage, JournalRetryReceipt, OperationJournalStore,
     OperationJournalStoreError, OrdinaryClaimReleaseReceipt, RecordingChunkPage,
@@ -2207,20 +2208,35 @@ impl OwnerRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     fn claim_chunk(
         &mut self,
         request: ChunkClaimRequest,
-    ) -> Result<ChunkClaimRecord, OperationJournalOwnerError> {
+    ) -> Result<FundedChunkClaimRecord, OperationJournalOwnerError> {
+        self.claim_chunk_with_funding(request, None)
+    }
+
+    fn claim_chunk_with_funding(
+        &mut self,
+        request: ChunkClaimRequest,
+        input: Option<&InputPermit>,
+    ) -> Result<FundedChunkClaimRecord, OperationJournalOwnerError> {
         request
             .validate()
             .map_err(|error| OperationJournalOwnerError::ChunkClaim {
                 reason: error.to_string(),
             })?;
-        if let Some(existing) = self
-            .store()
-            .read_chunk_claim(request.chunk_id())
-            .map_err(OperationJournalOwnerError::from)?
-        {
+        let existing = match input {
+            Some(input) => self
+                .store()
+                .read_chunk_claim_for_input(request.chunk_id(), input),
+            None => self
+                .store()
+                .read_chunk_claim(request.chunk_id())
+                .map(|row| row.map(FundedChunkClaimRecord::unfunded)),
+        }
+        .map_err(OperationJournalOwnerError::from)?;
+        if let Some(existing) = existing {
             if existing.matches_request(&request) {
                 return Ok(existing);
             }
@@ -2230,9 +2246,39 @@ impl OwnerRuntime {
         }
         self.publication_fences
             .close_for_mutation(request.operation_id())?;
-        self.validate_chunk_operation_state(request.operation_id(), "claim")?;
-        self.store().validate_for_admission()?;
-        let snapshot = self.chunk_rebuild_snapshot()?;
+        match input {
+            Some(input) => self
+                .store()
+                .validate_chunk_operation_for_input(request.operation_id(), "claim", input)
+                .map_err(|error| match error {
+                    super::store::OperationJournalStoreError::ChunkClaim { reason } => {
+                        OperationJournalOwnerError::ChunkClaim { reason }
+                    }
+                    error => error.into(),
+                })?,
+            None => self.validate_chunk_operation_state(request.operation_id(), "claim")?,
+        }
+        let mut write_scope = match input {
+            Some(input) => Some(self.store().prepay_chunk_write(&request, input)?),
+            None => {
+                self.store().validate_for_admission()?;
+                None
+            }
+        };
+        let snapshot = match input {
+            Some(input) => self.store().rebuild_admission_snapshot_for_input(input)?,
+            None => super::store::FundedSnapshot::unfunded(self.chunk_rebuild_snapshot()?),
+        };
+        if let CapacityRebuildReadiness::ReconciliationRequired { diagnostics } =
+            snapshot.readiness()
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: format!(
+                    "durable chunk/claim image requires reconciliation: {}",
+                    bounded_diagnostics(diagnostics)
+                ),
+            });
+        }
         let claims =
             request
                 .inventory()
@@ -2244,6 +2290,9 @@ impl OwnerRuntime {
             .map_err(|error| OperationJournalOwnerError::ChunkClaim {
                 reason: error.to_string(),
             })?;
+        if let (Some(input), Some(scope)) = (input, write_scope.as_mut()) {
+            scope.retain_observation_credit(self.admission_observation_credit(input)?);
+        }
         #[cfg(all(test, target_os = "macos"))]
         let observation = self
             .refresh_live_descriptor_capacity_for_admission(None)
@@ -2260,8 +2309,8 @@ impl OwnerRuntime {
                 reason: String::from("capacity provider is not installed"),
             }
         })?;
-        provider
-            .validate_rebuilt_claims(&snapshot)
+        snapshot
+            .validate_provider(provider, input)
             .map_err(|error| OperationJournalOwnerError::ChunkClaim {
                 reason: format!("current durable/live capacity image differs: {error}"),
             })?;
@@ -2275,14 +2324,25 @@ impl OwnerRuntime {
             .map_err(|error| OperationJournalOwnerError::ChunkClaim {
                 reason: error.to_string(),
             })?;
-        let lease = provider
-            .admit_with_live_witness(&plan, &claims, witness)
-            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
-                reason: error.to_string(),
-            })?;
-        self.store()
-            .persist_chunk_claim_with_lease(&request, provider, lease)
-            .map_err(OperationJournalOwnerError::from)
+        let lease = match input {
+            Some(input) => {
+                provider.admit_with_live_witness_for_input(&plan, &claims, witness, input)
+            }
+            None => provider.admit_with_live_witness(&plan, &claims, witness),
+        }
+        .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+            reason: error.to_string(),
+        })?;
+        match write_scope {
+            Some(scope) => self
+                .store()
+                .persist_chunk_claim_with_lease_for_input(&request, provider, lease, scope),
+            None => self
+                .store()
+                .persist_chunk_claim_with_lease(&request, provider, lease)
+                .map(FundedChunkClaimRecord::unfunded),
+        }
+        .map_err(OperationJournalOwnerError::from)
     }
 
     fn issue_chunk(
@@ -5247,25 +5307,30 @@ impl OperationJournalClient {
     pub(crate) fn claim_chunk(
         &self,
         request: ChunkClaimRequest,
-    ) -> Result<OperationJournalRequest<ChunkClaimRecord>, OperationJournalOwnerQueueError> {
+    ) -> Result<OperationJournalRequest<FundedChunkClaimRecord>, OperationJournalOwnerQueueError>
+    {
         request
             .validate()
             .map_err(|error| OperationJournalOwnerQueueError::InvalidInput {
                 reason: error.to_string(),
             })?;
-        let input_bytes = CONTROL_INPUT_BYTES
+        let input_bytes = std::mem::size_of::<ChunkClaimRequest>()
             .checked_add(request.output_key().len())
             .ok_or(OperationJournalOwnerQueueError::RecordTooLarge {
                 actual: usize::MAX,
                 maximum: OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES,
             })?;
-        self.submit(input_bytes, move |input, result| {
-            JournalCommand::ClaimChunk {
+        self.submit_funded_with_reply(
+            InputClass::Ordinary,
+            input_bytes,
+            false,
+            true,
+            move |input, result| JournalCommand::ClaimChunk {
                 request,
                 input,
                 result,
-            }
-        })
+            },
+        )
     }
 
     /// Queue the one-shot Claimed-to-Issued transition. An already-issued row is never reissued;
@@ -6319,6 +6384,17 @@ impl InputPermit {
         }
     }
 
+    pub(in crate::operation_journal) fn covers_original_pool(
+        &self,
+        input: &Self,
+        bytes: usize,
+    ) -> bool {
+        self.bytes >= bytes
+            && self.class == input.class
+            && self.publication == input.publication
+            && Arc::ptr_eq(&self.shared.input_bytes, &input.shared.input_bytes)
+    }
+
     pub(super) fn has_historical_error_consumer(&self) -> bool {
         self.historical_reply.is_some()
     }
@@ -6660,7 +6736,7 @@ enum JournalCommand {
     ClaimChunk {
         request: ChunkClaimRequest,
         input: InputPermit,
-        result: SyncSender<Result<ChunkClaimRecord, OperationJournalOwnerError>>,
+        result: SyncSender<Result<FundedChunkClaimRecord, OperationJournalOwnerError>>,
     },
     IssueChunk {
         chunk_id: ChunkId,
@@ -7416,10 +7492,9 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             request,
             input,
             result,
-        } => {
-            let _input = input;
-            execute_store_result(result, move || runtime.claim_chunk(request))
-        }
+        } => execute_store_result(result, move || {
+            runtime.claim_chunk_with_funding(request, Some(&input))
+        }),
         JournalCommand::IssueChunk {
             chunk_id,
             operation_id,

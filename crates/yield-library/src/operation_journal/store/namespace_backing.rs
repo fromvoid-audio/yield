@@ -28,7 +28,48 @@ impl OperationJournalStore {
             &self.database_path,
         )
         .ok_or(OperationJournalStoreError::OrdinaryRebuildResourceBound)?;
-        let mut loan = NamespaceLoan::new(input, bytes)?;
+        let loan = NamespaceLoan::new(input, bytes)?;
+        self.validate_namespace_with_loan(precommit, loan)
+    }
+
+    pub(super) fn namespace_prepaid_bytes(&self) -> Result<usize, OperationJournalStoreError> {
+        working_bytes(
+            &self.database_root,
+            &self.profile_guard,
+            &self.database_path,
+        )
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<NamespaceLoan<'static>>()))
+        .ok_or(OperationJournalStoreError::OrdinaryRebuildResourceBound)
+    }
+
+    // The enclosing original chunk write scope retains this working debit on
+    // every failure. Variable native messages retain their independent loan.
+    pub(super) fn validate_namespace_prepaid(
+        &self,
+        input: &InputPermit,
+        prepaid: &InputPermit,
+        precommit: bool,
+    ) -> Result<(), OperationJournalStoreError> {
+        if !prepaid.covers_original_pool(input, self.namespace_prepaid_bytes()?)
+            || !input.can_retain_namespace_failure()
+        {
+            return Err(OperationJournalStoreError::OrdinaryRebuildResourceBound);
+        }
+        self.validate_namespace_with_loan(
+            precommit,
+            NamespaceLoan {
+                input,
+                working: None,
+                native: None,
+            },
+        )
+    }
+
+    fn validate_namespace_with_loan(
+        &self,
+        precommit: bool,
+        mut loan: NamespaceLoan<'_>,
+    ) -> Result<(), OperationJournalStoreError> {
         let result = (|| {
             if !precommit && !self.connection.is_autocommit() {
                 return Err(audit_error(
@@ -139,9 +180,10 @@ impl<'a> NamespaceLoan<'a> {
             Ok(()) => Ok(()),
             Err(error) => Err(self.input.retain_namespace_failure(
                 error,
-                self.working
-                    .take()
-                    .expect("original namespace working loan"),
+                match self.working.take() {
+                    Some(working) => working,
+                    None => self.input.reserve_historical_scratch(0)?,
+                },
                 self.native.take(),
             )),
         }
