@@ -843,3 +843,21 @@ replacement allocation. The original 2 MiB publication subset, 4 MiB input pool
 and control margin remain unchanged. Larger exact completion receipts and SQL
 snapshot/error overlap require separately proved prepaid backing before adoption;
 this scalar custody fix does not supply that future allowance.
+
+## Remaining original mutation routes (OPT-2437)
+
+The original actor now closes or rejects the operation's publication fence before
+new chunk claim admission, chunk issuance, chunk write start, live staging
+checkpoint persistence, recording chunk retention, and generic intent insertion.
+Exact existing chunk-claim duplicates remain readonly. Original ticket identity,
+write budget, chunk-state, source binding and proposal checks keep their existing
+ordering before their respective mutation boundaries. Entered or unsettled
+publication evidence returns `PublicationMutationPending` without changing
+capacity, durable rows or held tickets; a pending slot closes before mutation.
+
+Linux regressions exercise the original owner queue and SQLite rows for intent
+and chunk admission, exact duplicate reads, issuance and ticket preservation.
+Arithmetic-only fixture providers and scalar fences confer no native authority.
+Recording retention and live checkpoint guards retain the original source-pin
+validation and require the separately tracked genuine native harness. This
+coverage does not complete qualified publication entry or durable settlement.
