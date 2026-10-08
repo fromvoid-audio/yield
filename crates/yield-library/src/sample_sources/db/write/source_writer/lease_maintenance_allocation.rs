@@ -37,7 +37,7 @@ impl SourceLeaseMaintenanceAllocation {
         Ok(())
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn replace_retirement_policy_for_test(
         &mut self,
         args: Option<&crate::operation_journal::source_registry_retirement::SourceRegistryRetirementIntentArgs>,

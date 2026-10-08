@@ -639,7 +639,7 @@ impl WalPreparationInput {
             funding: Some(funding),
         })
     }
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(in crate::operation_journal) fn replace_source_retirement_policy_for_test(
         &mut self,
         args: Option<&super::super::source_registry_retirement::SourceRegistryRetirementIntentArgs>,
