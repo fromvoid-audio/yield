@@ -5920,7 +5920,9 @@ impl OperationJournalClient {
         };
         let historical_reply = if historical {
             // Fund the Arc allocation (including both reference counters) before allocating.
-            let header = self.shared.reserve_input(class, HISTORICAL_REPLY_BYTES)?;
+            let header =
+                self.shared
+                    .reserve_input_kind(class, HISTORICAL_REPLY_BYTES, publication)?;
             let backing = HistoricalReply::new(HistoricalReplyBacking {
                 _header: header,
                 consumer: Mutex::new(None),
@@ -6589,10 +6591,10 @@ impl InputPermit {
 
     pub(super) fn absorb_historical_scratch(&mut self, mut other: InputPermit) {
         // Both values are privately reserved terminal scratch from this exact
-        // ordinary pool. No new credit, authority or allocation is constructed.
+        // ordinary pool and matching publication subset. No new allowance or authority.
         assert!(Arc::ptr_eq(&self.shared, &other.shared));
         assert!(self.class == InputClass::Ordinary && other.class == self.class);
-        assert!(!self.publication && !other.publication && self.refund && other.refund);
+        assert!(self.publication == other.publication && self.refund && other.refund);
         assert!(self.historical_reply.is_none() && other.historical_reply.is_none());
         self.bytes = self
             .bytes
@@ -6629,17 +6631,17 @@ impl InputPermit {
         Ok(())
     }
 
-    /// Private scratch debit from this exact queued command's original pool.
+    /// Private scratch debit from this exact command's original pool and publication subset.
     pub(super) fn reserve_historical_scratch(
         &self,
         bytes: usize,
     ) -> Result<Self, OperationJournalStoreError> {
-        if self.class != InputClass::Ordinary || self.publication {
+        if self.class != InputClass::Ordinary {
             return Err(OperationJournalStoreError::HistoricalClaimResourceBound);
         }
         let permit = self
             .shared
-            .reserve_input(InputClass::Ordinary, bytes)
+            .reserve_input_kind(InputClass::Ordinary, bytes, self.publication)
             .map_err(|_| OperationJournalStoreError::HistoricalClaimResourceBound)?;
         #[cfg(test)]
         self.shared
