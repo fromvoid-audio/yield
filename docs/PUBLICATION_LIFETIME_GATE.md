@@ -861,3 +861,28 @@ Arithmetic-only fixture providers and scalar fences confer no native authority.
 Recording retention and live checkpoint guards retain the original source-pin
 validation and require the separately tracked genuine native harness. This
 coverage does not complete qualified publication entry or durable settlement.
+
+## Publication scratch and detached diagnostics
+
+The actual `checkpoint_and_grant_staging` queue reserves publication-class input.
+Its namespace scratch, historical diagnostics and reply allocation must debit the
+same ordinary input pool **and** its existing 2 MiB publication subset. Refusing
+all publication scratch prevents the original checkpoint route from reaching
+SQLite; funding it as ordinary-only scratch lets retained publication diagnostics
+escape the composed ceiling.
+
+Scratch preserves the original input's publication class. Transferring its debit
+to a detached keeper preserves that class, and final destruction atomically
+refunds both original counters after validating the complete restored budget.
+Combining scratch loans requires the same original owner, input class and
+publication class. A detached keeper retains the original pool and gates without
+a strong owner back-reference. Exhausted publication credit still refuses before
+the original namespace or SQL write even if ordinary credit remains.
+
+Real SQLite tests cover fresh checkpoint plus immutable reservation, unexpected
+namespace evidence before writes, and postcommit namespace failure with the
+reservation retained. Selected errors keep both debits after their original
+input is dropped; final error destruction refunds memory credit only. These
+checks use authority-free stored observations and do not issue a Source pin,
+physical grant, publication result or settlement. Full original completion,
+qualified backend and checkpoint acceptance remains in OPT-2215/2216/2217.

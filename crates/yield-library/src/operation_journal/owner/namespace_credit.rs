@@ -104,6 +104,28 @@ impl JournalNamespaceFundingProbe {
         }
     }
 
+    /// Exercise the exact publication debit class without issuing any live grant.
+    #[cfg(test)]
+    pub(in crate::operation_journal) fn new_publication() -> Self {
+        let (commands, _receivers) = OwnerCommandReceivers::channel();
+        let shared = Arc::new(OwnerShared::new(commands));
+        Self {
+            input: shared
+                .startup_input_with_publication(true)
+                .expect("original publication diagnostic input"),
+        }
+    }
+    /// Observe both original counters without retaining the original owner.
+    #[cfg(test)]
+    pub(in crate::operation_journal) fn publication_observer(
+        &self,
+    ) -> impl Fn() -> (usize, usize) + use<> {
+        let pool = self.input.shared.input_bytes.clone();
+        move || {
+            let budget = pool.lock().unwrap();
+            (budget.remaining[0], budget.publication_remaining)
+        }
+    }
     /// Observe original ordinary-pool availability; this grants no capacity authority.
     pub fn remaining_bytes(&self) -> usize {
         self.input.shared.input_bytes.lock().unwrap().remaining[0]

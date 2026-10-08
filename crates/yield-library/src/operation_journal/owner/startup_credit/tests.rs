@@ -107,3 +107,55 @@ fn permanent_startup_debit_cannot_mask_corrupt_publication_accounting() {
         Err(resource_custody::UseError::Unknown)
     );
 }
+
+#[test]
+fn original_publication_scratch_preserves_both_debits_through_detached_keeper() {
+    let (commands, _receivers) = OwnerCommandReceivers::channel();
+    let shared = Arc::new(OwnerShared::new(commands));
+    let before = {
+        let budget = shared.input_bytes.lock().unwrap();
+        (budget.remaining[0], budget.publication_remaining)
+    };
+    let root = shared.reserve_publication_input(64 * 1024).unwrap();
+    let scratch = root
+        .reserve_historical_scratch(4096)
+        .expect("original publication producer scratch");
+    let keeper = scratch.into_startup_credit();
+    drop(root);
+    let after_root = {
+        let budget = shared.input_bytes.lock().unwrap();
+        (budget.remaining[0], budget.publication_remaining)
+    };
+    assert_eq!(after_root, (before.0 - 4096, before.1 - 4096));
+    drop(keeper);
+    let after = {
+        let budget = shared.input_bytes.lock().unwrap();
+        (budget.remaining[0], budget.publication_remaining)
+    };
+    assert_eq!(after, before);
+    assert!(!matches!(
+        shared.status(),
+        OperationJournalOwnerStatus::Unavailable { .. }
+    ));
+}
+
+#[test]
+fn detached_publication_keeper_releases_original_owner_before_final_pool_refund() {
+    let shared = shared();
+    let baseline = *shared.input_bytes.lock().unwrap();
+    let weak = Arc::downgrade(&shared);
+    let pool = shared.input_bytes.clone();
+    let credit = shared
+        .reserve_publication_input(8192)
+        .unwrap()
+        .into_startup_credit();
+    drop(shared);
+    assert!(weak.upgrade().is_none());
+    drop(weak);
+    assert_eq!(
+        pool.lock().unwrap().publication_remaining,
+        baseline.publication_remaining - 8192
+    );
+    drop(credit);
+    assert_eq!(*pool.lock().unwrap(), baseline);
+}
