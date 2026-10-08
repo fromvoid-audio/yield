@@ -16,7 +16,10 @@ pub(crate) struct VerifiedLegacyMigration {
 pub(crate) enum LegacyMigrationSettlement {
     NotStarted,
     RollbackConfirmed,
-    Unknown,
+    Unknown {
+        candidate: Option<VerifiedLegacyMigration>,
+        restored: bool,
+    },
     Committed(VerifiedLegacyMigration),
 }
 impl LegacySourceReadOwner {
@@ -58,7 +61,10 @@ impl LegacySourceReadOwner {
             return if self.connection.is_autocommit() && scope.finish().is_ok() {
                 S::NotStarted
             } else {
-                S::Unknown
+                S::Unknown {
+                    candidate: None,
+                    restored: false,
+                }
             };
         }
         let progress = Progress::install(&self.connection, deadline);
@@ -91,37 +97,60 @@ impl LegacySourceReadOwner {
                 return if scope.finish().is_ok() && preserved {
                     S::RollbackConfirmed
                 } else {
-                    S::Unknown
+                    S::Unknown {
+                        candidate: None,
+                        restored: false,
+                    }
                 };
             }
         };
-        // A failed COMMIT acknowledges no outcome. Never automatically rerun the body or rollback.
+        // Retain the exact pre-COMMIT candidate under the original input loan. It is data,
+        // not a grant; only read-only committed readback may later confirm an unknown result.
+        let candidate = VerifiedLegacyMigration {
+            operation,
+            encoded,
+            expected,
+            rows_digest: before_rows.digest,
+        };
         if self.connection.execute_batch("COMMIT").is_err() {
-            let _ = scope.finish();
-            return S::Unknown;
+            let restored = scope.finish().is_ok();
+            return S::Unknown {
+                candidate: Some(candidate),
+                restored,
+            };
+        }
+        #[cfg(all(test, target_os = "macos"))]
+        if admission.lose_readback_once() {
+            // Fault after the real original COMMIT. Keep its candidate and restored-policy
+            // fact; recovery still must inspect the actual committed receipt and every claim.
+            let restored = scope.finish().is_ok();
+            return S::Unknown {
+                candidate: Some(candidate),
+                restored,
+            };
         }
         let verified = self
             .verify_committed_migration(
                 profile,
                 request,
-                operation,
-                &encoded,
-                &expected,
-                &expected,
-                before_rows.digest,
+                candidate.operation,
+                &candidate.encoded,
+                &candidate.expected,
+                &candidate.expected,
+                candidate.rows_digest,
                 deadline,
             )
             .is_ok();
-        if scope.finish().is_err() || !verified {
-            return S::Unknown;
+        let restored = scope.finish().is_ok();
+        if !restored || !verified {
+            return S::Unknown {
+                candidate: Some(candidate),
+                restored,
+            };
         }
-        S::Committed(VerifiedLegacyMigration {
-            operation,
-            encoded,
-            expected,
-            rows_digest: before_rows.digest,
-        })
+        S::Committed(candidate)
     }
+
     pub(super) fn verify_committed_migration(
         &self,
         profile: &WritableProfileGuard,
@@ -204,6 +233,35 @@ impl LegacySourceReadOwner {
         }
         Ok(())
     }
+    pub(super) fn validate_original_post_migration_policy(
+        &self,
+        request: &crate::operation_journal::legacy_adoption_commands::LegacyAdoptionIntentArgs,
+    ) -> Result<()> {
+        let (page_size, original_max, _, sector) = request.original_migration_policy();
+        let mode: String = self
+            .connection
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .map_err(refused)?;
+        let page: u64 = self
+            .connection
+            .pragma_query_value(None, "page_size", |r| r.get(0))
+            .map_err(refused)?;
+        let max: u64 = self
+            .connection
+            .pragma_query_value(None, "max_page_count", |r| r.get(0))
+            .map_err(refused)?;
+        if !self.connection.validate_original_legacy_read_fence()
+            || !mode.eq_ignore_ascii_case("delete")
+            || page != page_size
+            || max != original_max
+            || self.connection.known_delete_sector_size() != Some(sector)
+        {
+            return Err(LegacyObservationError(
+                "original committed source policy changed",
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn revalidate_committed_migration(
         &self,
         profile: &WritableProfileGuard,
@@ -211,9 +269,7 @@ impl LegacySourceReadOwner {
         committed: &VerifiedLegacyMigration,
         deadline: Instant,
     ) -> Result<()> {
-        if !self.connection.has_no_effect_fence() {
-            return Err(LegacyObservationError("committed source fence changed"));
-        }
+        self.validate_original_post_migration_policy(request)?;
         self.verify_committed_migration(
             profile,
             request,

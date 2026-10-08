@@ -338,10 +338,17 @@ pub(crate) struct OriginalLegacyMigrationAdmission<'a> {
     args: &'a LegacyAdoptionIntentArgs,
     operation: OperationId,
     deadline: Instant,
+    #[cfg(all(test, target_os = "macos"))]
+    readback_loss: &'a std::sync::atomic::AtomicBool,
     _claims: &'a AdmissionClaimInventory,
     _lease: &'a ProvisionalCapacityLease,
 }
 impl OriginalLegacyMigrationAdmission<'_> {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn lose_readback_once(&self) -> bool {
+        self.readback_loss
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
     pub(crate) fn migration_inputs(
         &self,
     ) -> (
@@ -439,6 +446,8 @@ impl OwnerRuntime {
             args: &retained.args,
             operation: admission.record.operation_id,
             deadline,
+            #[cfg(all(test, target_os = "macos"))]
+            readback_loss: &retained.input.shared.legacy_migration_readback_loss,
             _claims: &admission.claims,
             _lease: &admission.lease,
         })
@@ -471,6 +480,52 @@ impl OwnerRuntime {
             return Err(E::Changed.into());
         }
         let admission = retained.admission.as_ref().ok_or(E::ReserveRecovery)?;
+        if let Some(migration) = &admission.migration
+            && let S::Unknown {
+                candidate: Some(candidate),
+                restored: true,
+            } = &migration.settlement
+        {
+            // Recovery is observation only. The original committed intent/claims must still
+            // validate, and failed policy restoration can never take this path.
+            self.verify_original_legacy_claims(admission, &input)?;
+            retained
+                .source
+                .revalidate_committed_migration(
+                    self.final_profile_guard.as_ref().ok_or(E::Closed)?,
+                    &retained.args,
+                    candidate,
+                    deadline,
+                )
+                .map_err(|_| E::ReserveRecovery)?;
+            let migration = self
+                .legacy_adoption
+                .as_mut()
+                .ok_or(E::Closed)?
+                .admission
+                .as_mut()
+                .ok_or(E::Closed)?
+                .migration
+                .as_mut()
+                .ok_or(E::Closed)?;
+            let S::Unknown {
+                candidate: Some(candidate),
+                restored: true,
+            } = std::mem::replace(
+                &mut migration.settlement,
+                S::Unknown {
+                    candidate: None,
+                    restored: false,
+                },
+            )
+            else {
+                unreachable!("sole owner changed verified migration recovery");
+            };
+            let operation = candidate.operation;
+            migration.settlement = S::Committed(candidate);
+            migration.input.historical_reply = None;
+            return Ok(operation);
+        }
         if let Some(migration) = &admission.migration {
             let S::Committed(committed) = &migration.settlement else {
                 // An attempted/unknown migration is never silently replayed.
@@ -497,7 +552,7 @@ impl OwnerRuntime {
                         )
                         .map_err(|_| E::Changed)?;
                 }
-                Some(crate::sample_sources::db::LegacyBootstrapSettlement::Unknown) => {
+                Some(crate::sample_sources::db::LegacyBootstrapSettlement::Unknown { .. }) => {
                     return Err(E::ReserveRecovery.into());
                 }
                 // Known bootstrap refusals/rollback do not erase the committed migration.
@@ -517,7 +572,10 @@ impl OwnerRuntime {
             .as_mut()
             .ok_or(E::Closed)?
             .migration = Some(RetainedMigration {
-            settlement: S::Unknown,
+            settlement: S::Unknown {
+                candidate: None,
+                restored: false,
+            },
             input,
         });
         let settlement = {
@@ -569,10 +627,17 @@ pub(crate) struct OriginalLegacyBootstrapAdmission<'a> {
     args: &'a LegacyAdoptionIntentArgs,
     migration: &'a crate::sample_sources::db::VerifiedLegacyMigration,
     deadline: Instant,
+    #[cfg(all(test, target_os = "macos"))]
+    readback_loss: &'a std::sync::atomic::AtomicBool,
     _claims: &'a AdmissionClaimInventory,
     _lease: &'a ProvisionalCapacityLease,
 }
 impl OriginalLegacyBootstrapAdmission<'_> {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn lose_readback_once(&self) -> bool {
+        self.readback_loss
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
     pub(crate) fn bootstrap_inputs(
         &self,
     ) -> (
@@ -652,6 +717,8 @@ impl OwnerRuntime {
             args: &retained.args,
             migration,
             deadline,
+            #[cfg(all(test, target_os = "macos"))]
+            readback_loss: &retained.input.shared.legacy_bootstrap_readback_loss,
             _claims: &admission.claims,
             _lease: &admission.lease,
         };
@@ -718,6 +785,59 @@ impl OwnerRuntime {
             return Err(E::Changed.into());
         }
         let admission = retained.admission.as_ref().ok_or(E::ReserveRecovery)?;
+        if let Some(bootstrap) = &admission.bootstrap
+            && let B::Unknown {
+                candidate: Some(candidate),
+                restored: true,
+            } = &bootstrap.settlement
+        {
+            let M::Committed(migration) = &admission
+                .migration
+                .as_ref()
+                .ok_or(E::ReserveRecovery)?
+                .settlement
+            else {
+                return Err(E::ReserveRecovery.into());
+            };
+            self.verify_original_legacy_claims(admission, &input)?;
+            retained
+                .source
+                .revalidate_committed_bootstrap(
+                    self.final_profile_guard.as_ref().ok_or(E::Closed)?,
+                    &retained.args,
+                    migration,
+                    candidate,
+                    deadline,
+                )
+                .map_err(|_| E::ReserveRecovery)?;
+            let bootstrap = self
+                .legacy_adoption
+                .as_mut()
+                .ok_or(E::Closed)?
+                .admission
+                .as_mut()
+                .ok_or(E::Closed)?
+                .bootstrap
+                .as_mut()
+                .ok_or(E::Closed)?;
+            let B::Unknown {
+                candidate: Some(candidate),
+                restored: true,
+            } = std::mem::replace(
+                &mut bootstrap.settlement,
+                B::Unknown {
+                    candidate: None,
+                    restored: false,
+                },
+            )
+            else {
+                unreachable!("sole owner changed verified bootstrap recovery");
+            };
+            let operation = candidate.operation;
+            bootstrap.settlement = B::Committed(candidate);
+            bootstrap.input.historical_reply = None;
+            return Ok(operation);
+        }
         if let Some(bootstrap) = &admission.bootstrap {
             let B::Committed(bootstrap) = &bootstrap.settlement else {
                 return Err(E::ReserveRecovery.into());
@@ -751,7 +871,10 @@ impl OwnerRuntime {
             .as_mut()
             .ok_or(E::Closed)?
             .bootstrap = Some(RetainedBootstrap {
-            settlement: B::Unknown,
+            settlement: B::Unknown {
+                candidate: None,
+                restored: false,
+            },
             input,
         });
         let settlement = {

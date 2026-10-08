@@ -6175,6 +6175,11 @@ struct OwnerShared {
     input_bytes: Arc<Mutex<InputBudget>>,
     #[cfg(test)]
     historical_scratch_maximum: AtomicUsize,
+    #[cfg(all(test, target_os = "macos"))]
+    legacy_migration_readback_loss: std::sync::atomic::AtomicBool,
+    #[cfg(all(test, target_os = "macos"))]
+    legacy_bootstrap_readback_loss: std::sync::atomic::AtomicBool,
+
     #[cfg(test)]
     recovery_audit_pause: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -6212,6 +6217,11 @@ impl OwnerShared {
             input_bytes,
             #[cfg(test)]
             historical_scratch_maximum: AtomicUsize::new(0),
+            #[cfg(all(test, target_os = "macos"))]
+            legacy_migration_readback_loss: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, target_os = "macos"))]
+            legacy_bootstrap_readback_loss: std::sync::atomic::AtomicBool::new(false),
+
             #[cfg(test)]
             recovery_audit_pause: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

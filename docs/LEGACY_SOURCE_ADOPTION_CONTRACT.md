@@ -711,3 +711,14 @@ publication/audit grant. Current ownership transfer/reopen, bounded current13 re
 complete fault/restart acceptance and genuine native execution remain required before
 OPT-2117 can be completed. SQL/data-only row fixtures do not mint capacity authority;
 the genuine native worker test remains a separate platform check.
+
+A COMMIT/readback-uncertain migration or bootstrap retains its exact pre-COMMIT
+candidate and whether the actual original scope restored successfully. A later request
+may confirm that candidate using only readback, after fresh original frozen intent,
+claim/provider, binding, complete schema, immutable receipt and preserved-row checks.
+Bootstrap recovery also verifies the exact original owner/epoch row. This moves the
+same retained candidate to Committed and returns its original operation; it never
+reruns migration/lease SQL or generates another lease identity. Missing/conflicting
+readback, open transactions, changed read policy or a quarantined VFS remain uncertain.
+The native lost-readback hooks run after actual COMMIT and confer no grants. Restart
+in a new acquisition still needs its explicit bounded historical recovery route.

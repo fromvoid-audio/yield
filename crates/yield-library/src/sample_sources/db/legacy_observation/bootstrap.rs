@@ -13,7 +13,10 @@ pub(crate) struct VerifiedLegacyBootstrap {
 pub(crate) enum LegacyBootstrapSettlement {
     NotStarted,
     RollbackConfirmed,
-    Unknown,
+    Unknown {
+        candidate: Option<VerifiedLegacyBootstrap>,
+        restored: bool,
+    },
     Committed(VerifiedLegacyBootstrap),
 }
 impl LegacySourceReadOwner {
@@ -46,7 +49,10 @@ impl LegacySourceReadOwner {
             return if self.connection.is_autocommit() && scope.finish().is_ok() {
                 S::NotStarted
             } else {
-                S::Unknown
+                S::Unknown {
+                    candidate: None,
+                    restored: false,
+                }
             };
         }
         let progress = Progress::install(&self.connection, deadline);
@@ -98,27 +104,45 @@ impl LegacySourceReadOwner {
                 {
                     S::RollbackConfirmed
                 } else {
-                    S::Unknown
+                    S::Unknown {
+                        candidate: None,
+                        restored: false,
+                    }
                 };
             }
         };
-        if self.connection.execute_batch("COMMIT").is_err() {
-            let _ = scope.finish();
-            return S::Unknown;
-        }
-        let result = VerifiedLegacyBootstrap {
+        let candidate = VerifiedLegacyBootstrap {
             operation: committed.operation,
             owner_identity,
             epoch,
             expected,
         };
-        let verified = self
-            .verify_original_bootstrap(profile, request, committed, &result, deadline)
-            .is_ok();
-        if scope.finish().is_err() || !verified {
-            return S::Unknown;
+        if self.connection.execute_batch("COMMIT").is_err() {
+            let restored = scope.finish().is_ok();
+            return S::Unknown {
+                candidate: Some(candidate),
+                restored,
+            };
         }
-        S::Committed(result)
+        #[cfg(all(test, target_os = "macos"))]
+        if admission.lose_readback_once() {
+            let restored = scope.finish().is_ok();
+            return S::Unknown {
+                candidate: Some(candidate),
+                restored,
+            };
+        }
+        let verified = self
+            .verify_original_bootstrap(profile, request, committed, &candidate, deadline)
+            .is_ok();
+        let restored = scope.finish().is_ok();
+        if !restored || !verified {
+            return S::Unknown {
+                candidate: Some(candidate),
+                restored,
+            };
+        }
+        S::Committed(candidate)
     }
 
     // A transaction retains the exact original binding; only quiescence differs from ordinary
@@ -187,9 +211,7 @@ impl LegacySourceReadOwner {
         bootstrap: &VerifiedLegacyBootstrap,
         deadline: Instant,
     ) -> Result<()> {
-        if !self.connection.has_no_effect_fence() {
-            return Err(LegacyObservationError("bootstrapped source fence changed"));
-        }
+        self.validate_original_post_migration_policy(request)?;
         self.verify_original_bootstrap(profile, request, migration, bootstrap, deadline)
     }
 }

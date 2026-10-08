@@ -256,6 +256,18 @@ unsafe extern "C" fn control(f: *mut ffi::sqlite3_file, op: c_int, arg: *mut c_v
         let h = header(f);
         let ctx = &*h.context;
         if ctx.no_effect.load(Ordering::Acquire) {
+            // SQLite uses this native control for both mmap readback and zero-size setup.
+            // Returning NOTFOUND for the query yields no PRAGMA row and prevents the
+            // genuine admitted owner from verifying its policy. Never forward a request
+            // that enables mappings; native queries report actual policy, not a forged zero.
+            if op == ffi::SQLITE_FCNTL_MMAP_SIZE {
+                if arg.is_null() || *arg.cast::<i64>() > 0 {
+                    return ffi::SQLITE_NOTFOUND;
+                }
+                return methods(f)
+                    .xFileControl
+                    .map_or(ffi::SQLITE_NOTFOUND, |call| call(inner(f), op, arg));
+            }
             if let Some(rc) = no_effect::control_result(op) {
                 return rc;
             }

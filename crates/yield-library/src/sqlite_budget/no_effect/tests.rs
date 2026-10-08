@@ -174,3 +174,38 @@ fn no_effect_genuine_hot_rollback_cannot_replay_before_or_after_open() {
     drop(recovered);
     assert_eq!(std::fs::read(&path).unwrap(), committed);
 }
+
+#[test]
+fn original_legacy_read_fence_rejects_changed_policy_open_transaction_and_poison() {
+    let (_temp, path) = database();
+    let before = std::fs::read(&path).unwrap();
+    let owner = open(&path).unwrap();
+    assert!(!owner.validate_original_legacy_read_fence());
+    owner.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA mmap_size=0").unwrap();
+    assert!(owner.validate_original_legacy_read_fence());
+    assert_eq!(scalar(&owner, "mmap_size").unwrap(), 0);
+    owner.execute_batch("PRAGMA mmap_size=1048576").unwrap();
+    assert_eq!(scalar(&owner, "mmap_size").unwrap(), 0);
+    assert!(owner.validate_original_legacy_read_fence());
+    owner.execute_batch("BEGIN").unwrap();
+    assert!(!owner.validate_original_legacy_read_fence());
+    owner.execute_batch("ROLLBACK").unwrap();
+    assert!(owner.validate_original_legacy_read_fence());
+    for changed in [
+        "PRAGMA query_only=OFF",
+        "PRAGMA cache_spill=ON",
+        "PRAGMA temp_store=FILE",
+    ] {
+        owner.execute_batch(changed).unwrap();
+        assert!(!owner.validate_original_legacy_read_fence());
+        owner
+            .execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF")
+            .unwrap();
+        assert!(owner.validate_original_legacy_read_fence());
+    }
+    owner.registration.as_ref().unwrap().context.quarantine();
+    assert!(!owner.validate_original_legacy_read_fence());
+    assert!(owner.has_no_effect_fence());
+    assert!(owner.execute("INSERT INTO retained VALUES(8)", []).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}

@@ -2,6 +2,29 @@
 use super::*;
 
 impl OwnedConnection {
+    pub(crate) fn validate_original_legacy_read_fence(&self) -> bool {
+        if !self.is_autocommit() || !self.has_no_effect_fence() {
+            return false;
+        }
+        let Some(registration) = &self.registration else {
+            return false;
+        };
+        let Ok(state) = registration.context.state.lock() else {
+            return false;
+        };
+        if state.attempt.is_some()
+            || state.open_auxiliary != 0
+            || state.mapped_database != 0
+            || state.mapped_shm_bytes != 0
+        {
+            return false;
+        }
+        drop(state);
+        scalar(self, "query_only").ok() == Some(1)
+            && scalar(self, "cache_spill").ok() == Some(0)
+            && scalar(self, "temp_store").ok() == Some(2)
+            && scalar(self, "mmap_size").ok() == Some(0)
+    }
     pub(crate) fn has_no_effect_fence(&self) -> bool {
         self.registration
             .as_ref()

@@ -693,6 +693,10 @@ fn legacy_migration_native_actual_worker_commits_original_receipt_and_coalesces_
         (metadata, audio)
     };
     let original_rows = capture();
+    f.client()
+        .shared
+        .legacy_migration_readback_loss
+        .store(true, std::sync::atomic::Ordering::Release);
     drop(custody.migrate_source().unwrap()); // Lost reply is not permission to replay migration.
     let confirmed = custody
         .migrate_source()
@@ -736,6 +740,10 @@ fn legacy_migration_native_actual_worker_commits_original_receipt_and_coalesces_
         0
     );
     drop(connection);
+    f.client()
+        .shared
+        .legacy_bootstrap_readback_loss
+        .store(true, std::sync::atomic::Ordering::Release);
     drop(custody.bootstrap_source_row().unwrap());
     let bootstrapped = custody
         .bootstrap_source_row()
