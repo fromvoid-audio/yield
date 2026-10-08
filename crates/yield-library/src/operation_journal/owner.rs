@@ -37,6 +37,8 @@ pub(crate) use legacy_admission::{
     OriginalLegacyBootstrapAdmission, OriginalLegacyMigrationAdmission,
 };
 mod legacy_adoption_custody;
+mod legacy_recovery;
+pub use legacy_recovery::LegacyRecoveryCustody;
 mod legacy_adoption_volumes;
 mod recording_binding;
 pub use legacy_adoption_custody::{LegacyAdoptionCustody, LegacyAdoptionCustodyError};
@@ -1809,6 +1811,7 @@ struct OwnerRuntime {
     recording_producer: Option<recording_binding::RetainedRecordingProducer>,
     publication_fences: publication_fence::Registry,
     legacy_adoption: Option<legacy_adoption_custody::RetainedLegacyAdoption>,
+    legacy_recovery: Option<legacy_recovery::RetainedLegacyRecovery>,
     native_readers: BTreeMap<VolumeIdentity, std::sync::Weak<NativeCapsuleData>>,
     native_reader_registry_input: Option<InputPermit>,
     resource_admission: Arc<ResourceAdmission>,
@@ -1855,6 +1858,7 @@ impl OwnerRuntime {
             recording_producer: None,
             publication_fences: publication_fence::Registry::new(),
             legacy_adoption: None,
+            legacy_recovery: None,
             native_readers: BTreeMap::new(),
             native_reader_registry_input: None,
             resource_admission: ResourceAdmission::new(),
@@ -4870,6 +4874,7 @@ impl Drop for OwnerRuntime {
         drop(self.wal_preparation.take());
         // Original readonly SQLite closes before its pre-lease reservation/profile custody.
         self.legacy_adoption.take();
+        self.legacy_recovery.take();
         // Original pre-start channels/source pin are released before source/profile teardown.
         self.recording_producer.take();
         // Source registrations retain non-Send authority guards and external reserve/volume
@@ -6802,6 +6807,17 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<(), OperationJournalOwnerError>>,
     },
+    RecoverLegacyReadCustody {
+        source: crate::sample_sources::db::LegacySourceReadOwner,
+        input: InputPermit,
+        result: SyncSender<Result<LegacyRecoveryCustody, OperationJournalOwnerError>>,
+    },
+    ValidateLegacyRecovery {
+        operation: OperationId,
+        capacity: bool,
+        input: InputPermit,
+        result: SyncSender<Result<(), OperationJournalOwnerError>>,
+    },
     PrepareLegacyCustody {
         source: crate::sample_sources::db::LegacySourceReadOwner,
         participant: super::ParticipantId,
@@ -7365,6 +7381,21 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             result,
         } => execute_store_result(result, move || {
             runtime.validate_recording_custody(operation, digest, input)
+        }),
+        JournalCommand::RecoverLegacyReadCustody {
+            source,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            runtime.recover_legacy_read_custody(source, input)
+        }),
+        JournalCommand::ValidateLegacyRecovery {
+            operation,
+            capacity,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            runtime.validate_legacy_recovery(operation, capacity, input)
         }),
         JournalCommand::PrepareLegacyCustody {
             source,
@@ -7964,6 +7995,12 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             let _ = result.send(Err(error));
         }
         JournalCommand::PrepareLegacyCustody { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::RecoverLegacyReadCustody { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::ValidateLegacyRecovery { result, .. } => {
             let _ = result.send(Err(error));
         }
         JournalCommand::AdmitLegacyInitial { result, .. }

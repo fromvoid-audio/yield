@@ -750,11 +750,33 @@ The old profile acquisition string is historical; it cannot replace the actual c
 profile/sidecar lock. Missing/conflicting intent or receipt refuses without repairs.
 
 The returned operation/request/table-presence observation grants no writer, current
-lease, capacity admission, claim release, completed audit or SourceRevision. Original
-claim/provider recovery and accounted ownership transfer/current reopen still need their
-explicit journal-worker integration. Local tests use real read custody and SQL/data-only
+lease, capacity admission, claim release, completed audit or SourceRevision. Accounted
+ownership transfer/current reopen still need their explicit integration. Local
+tests use real read custody and SQL/data-only
 receipt fixtures, asserting missing intent/competing lock/wrong root/missing evidence
 refusal and byte preservation. The genuine native worker test additionally reacquires
 read custody after shutdown and checks its actual original committed V19 row; it remains
 unexecuted. Later ordinary current-source edits use ordinary current ownership, rather
 than this unfinished-adoption old-row reader.
+
+`recover_legacy_read_custody` queues the already-open no-effect recovery owner on the
+original journal worker. It installs a distinct retained slot before inspection, so
+failed inspection or a dropped reply retains the actual Source connection/reservation
+and refuses another initial adoption. Its complete journal-row decoder and namespace
+checks use that command's original funded visitor; no `Store.get` record escapes into
+the worker. The returned weak, non-clone custody contains only the original operation.
+Revalidation inspects the same actual immutable receipt, V19 intent and retained Source.
+Shutdown closes the Source before releasing its retained input credit and preserves the
+sidecar file. Queue refusal does not install a slot.
+
+`validate_claims` additionally reads the immutable initial ordinary-claim rows with
+separately prepaid bounded SQL/row backing. It requires exactly one original claim for
+each V19 plan allocation and exact operation/claim/volume/class/byte tuples in the
+complete unreleased, non-audit-pending rebuild image. The current worker's provider must
+already match that complete Ready image; this routine cannot install or replace a
+provider ledger. It returns read-only confirmation, never a reconstructed provisional
+lease, new capacity admission, physical allocation or writable Source grant. Local
+component tests cover missing initial rows, changed operation/bytes, released claims,
+audit pending, actual retained lock/credit through a lost reply, and shutdown release
+without source/journal byte changes. Full recovery/current ownership and genuine native
+acceptance remain open.

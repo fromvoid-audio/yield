@@ -4238,7 +4238,16 @@ impl OperationJournalStore {
         profile: &WritableProfileGuard,
         request: &super::legacy_adoption_commands::LegacyAdoptionIntentArgs,
     ) -> Result<(), OperationJournalStoreError> {
-        self.validate_namespace()?;
+        self.validate_legacy_recovery_namespace_for_input(profile, request, None)
+    }
+
+    pub(in crate::operation_journal) fn validate_legacy_recovery_namespace_for_input(
+        &self,
+        profile: &WritableProfileGuard,
+        request: &super::legacy_adoption_commands::LegacyAdoptionIntentArgs,
+        input: Option<&super::owner::InputPermit>,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.validate_namespace_with_input(input, false)?;
         if profile.owner_identity() != self.profile_guard.owner_identity()
             || !request.matches_recovery_journal_bindings(
                 self.profile_guard.profile_root_identity(),
@@ -4250,7 +4259,7 @@ impl OperationJournalStore {
                 reason: "historical adoption journal binding differs".into(),
             });
         }
-        self.validate_namespace()
+        self.validate_namespace_with_input(input, false)
     }
 
     /// Return one bounded operation record by id.

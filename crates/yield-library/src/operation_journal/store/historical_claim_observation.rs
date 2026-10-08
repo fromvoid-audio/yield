@@ -13,6 +13,108 @@ thread_local! {
 }
 
 impl OperationJournalStore {
+    // The complete decoder graph lives only inside the original funded visitor. This
+    // confirms historical intent bytes, not a provisional lease or capacity admission.
+    pub(in crate::operation_journal) fn inspect_legacy_recovery_intent(
+        &self,
+        profile: &crate::app_dirs::WritableProfileGuard,
+        operation: OperationId,
+        request: &super::super::legacy_adoption_commands::LegacyAdoptionIntentArgs,
+        input: &InputPermit,
+        snapshot: Option<&[RebuildClaim]>,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.validate_legacy_recovery_namespace_for_input(profile, request, Some(input))?;
+        let present = self.inspect_complete_claim_operation(operation, input, |record, _| {
+            if record.schema_version != 19
+                || record.operation_id != operation
+                || !matches!(record.universal_command_args(), Some(UniversalCommandArgs::SourceLegacyAdoption(args)) if args == request)
+            {
+                return Err(retained_error(Some(operation), "original legacy recovery intent differs"));
+            }
+            if let Some(snapshot) = snapshot {
+                self.validate_legacy_recovery_initial_claims(record, snapshot, input)?;
+            }
+            Ok(())
+        })?;
+        if !present {
+            return Err(retained_error(
+                Some(operation),
+                "original legacy recovery intent absent",
+            ));
+        }
+        self.validate_legacy_recovery_namespace_for_input(profile, request, Some(input))
+    }
+
+    pub(super) fn validate_legacy_recovery_initial_claims(
+        &self,
+        record: &StoredOperationRecord,
+        snapshot: &[RebuildClaim],
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
+        // Read immutable initial rows independently of the rebuilt active image.
+        // Prepay the row Vec, original SQL bindings and bounded decoder diagnostics.
+        // Dynamically copied native errors receive their own retained loan.
+        let credit = input.reserve_historical_scratch(
+            ordinary_claims::MAX_PAGE_ROWS
+                * std::mem::size_of::<ordinary_claims::OrdinaryClaimRecord>()
+                + historical_observation::FIXED_BYTES
+                + 4096,
+        )?;
+        let result = (|| {
+            let plan = record.full_capacity_plan.as_ref().ok_or_else(|| {
+                retained_error(Some(record.operation_id), "legacy recovery plan absent")
+            })?;
+            let initial = ordinary_claims::initial_funded::read(
+                &self.connection,
+                record.operation_id,
+                input,
+            )?;
+            if initial.len() != plan.allocations().len()
+                || snapshot
+                    .iter()
+                    .filter(|row| row.operation_id() == record.operation_id)
+                    .count()
+                    != initial.len()
+                || initial.iter().any(|row| {
+                    row.operation_id() != record.operation_id
+                        || !plan.allocations().iter().any(|allocation| {
+                            allocation.volume() == row.volume()
+                                && allocation.class() == row.allocation_class()
+                                && allocation.allocated_bytes() == row.allocated_bytes()
+                        })
+                        || !snapshot.iter().any(|active| {
+                            active.operation_id() == row.operation_id()
+                                && active.claim_id() == row.claim_id()
+                                && active.volume() == row.volume()
+                                && active.allocation_class() == row.allocation_class()
+                                && active.allocated_bytes() == row.allocated_bytes()
+                                && active.release_id().is_none()
+                                && !active.audit_pending()
+                        })
+                })
+                || plan.allocations().iter().any(|allocation| {
+                    initial
+                        .iter()
+                        .filter(|row| {
+                            allocation.volume() == row.volume()
+                                && allocation.class() == row.allocation_class()
+                        })
+                        .count()
+                        != 1
+                })
+            {
+                return Err(retained_error(
+                    Some(record.operation_id),
+                    "legacy recovery initial claims differ or are released/audit pending",
+                ));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            input.retain_historical_error(credit, None, None, None);
+        }
+        result
+    }
     #[cfg(any(test, feature = "test-support"))]
     /// Replace one raw historical-row fixture on this original Store connection.
     /// No worker, capacity, effect or physical backend authority is installed.

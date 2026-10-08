@@ -228,7 +228,7 @@ impl OwnerRuntime {
         input: InputPermit,
     ) -> Result<LegacyAdoptionCustody, OperationJournalOwnerError> {
         use LegacyAdoptionCustodyError as E;
-        if self.legacy_adoption.is_some() {
+        if self.legacy_adoption.is_some() || self.legacy_recovery.is_some() {
             return Err(E::Busy.into());
         }
         if input.shared.status() != OperationJournalOwnerStatus::Available {

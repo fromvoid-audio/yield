@@ -155,6 +155,33 @@ impl LegacySourceReadOwner {
         profile: &WritableProfileGuard,
         journal: &crate::operation_journal::store::OperationJournalStore,
     ) -> Result<LegacyAdoptionRecoveryImage> {
+        self.capture_recovery_inspected(profile, |operation, request| {
+            journal
+                .validate_legacy_recovery_namespace(profile, request)
+                .map_err(refused)?;
+            let record = journal
+                .get(operation)
+                .map_err(refused)?
+                .ok_or(LegacyObservationError("original recovery intent absent"))?;
+            if record.schema_version != 19
+                || record.operation_id != operation
+                || !matches!(record.universal_command_args(), Some(UniversalCommandArgs::SourceLegacyAdoption(args)) if args == request)
+            {
+                return Err(LegacyObservationError("original recovery intent differs"));
+            }
+            journal
+                .validate_legacy_recovery_namespace(profile, request)
+                .map_err(refused)
+        })
+    }
+
+    // The journal worker supplies its original funded complete-record visitor here. Its
+    // InputPermit and decoded graph stay inside the worker; neither crosses the Source API.
+    pub(crate) fn capture_recovery_inspected(
+        &self,
+        profile: &WritableProfileGuard,
+        inspect: impl FnOnce(OperationId, &LegacyAdoptionIntentArgs) -> Result<()>,
+    ) -> Result<LegacyAdoptionRecoveryImage> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let _extensions = crate::sqlite_ext::try_extension_free_metadata_scope()
             .ok_or(LegacyObservationError("SQLite extension runtime unknown"))?;
@@ -172,28 +199,12 @@ impl LegacySourceReadOwner {
         let progress = Progress::install(&self.connection, deadline);
         let observed = (|| -> Result<_> {
             let (receipt, lease) = self.read_recovery_receipt_core(profile)?;
-            journal
-                .validate_legacy_recovery_namespace(profile, receipt.historical_request())
-                .map_err(refused)?;
             let operation = receipt.historical_operation();
-            let record = journal
-                .get(operation)
-                .map_err(refused)?
-                .ok_or(LegacyObservationError("original recovery intent absent"))?;
-            if record.schema_version != 19
-                || record.operation_id != operation
-                || !matches!(record.universal_command_args(), Some(UniversalCommandArgs::SourceLegacyAdoption(args))
-                    if args == receipt.historical_request())
-            {
-                return Err(LegacyObservationError("original recovery intent differs"));
-            }
             let preserved = rows::capture_preserved(&transaction, deadline)?;
             if !receipt.matches_preserved_rows(preserved.digest) {
                 return Err(LegacyObservationError("unfinished adoption rows changed"));
             }
-            journal
-                .validate_legacy_recovery_namespace(profile, receipt.historical_request())
-                .map_err(refused)?;
+            inspect(operation, receipt.historical_request())?;
             Ok((receipt, lease, operation))
         })();
         // Remove deadline interruption before the original read transaction closes.

@@ -1,4 +1,43 @@
 #[test]
+fn legacy_recovery_initial_claim_reader_requires_exact_immutable_unreleased_inventory() {
+    // Actual SQL/accounting component fixture only. This constructs no Source recovery,
+    // physical capacity qualification, resumed provisional lease or writable grant.
+    let f = fixture();
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    let mut record = intent_record(OperationId::new());
+    let claims = claims_for_intent(&record);
+    let provider = provider_for_intent(&record);
+    let plan = full_capacity_plan_for_record(&record).unwrap();
+    let lease = provider.admit(&plan, &claims).unwrap();
+    let settled = store.settle_initial_claims_with_lease(&record, &claims, &provider, lease).unwrap();
+    assert!(matches!(settled.outcome(), JournalInsertOutcome::Committed(_)));
+    let input = super::super::owner::InputPermit::historical_test_namespace_input(1);
+    let snapshot = store.rebuild_admission_snapshot_for_input(&input).unwrap();
+    // The helper validates only immutable rows/plan. Production callers additionally
+    // require the actual funded complete V19 decoder and matching historical request.
+    record.full_capacity_plan = Some(plan);
+    let before = input.historical_test_remaining();
+    store.validate_legacy_recovery_initial_claims(&record, snapshot.claims(), &input).unwrap();
+    assert_eq!(input.historical_test_remaining(), before);
+    let claim = &snapshot.claims()[0];
+    for (release, audit, bytes, operation) in [
+        (Some(Uuid::new_v4()), false, claim.allocated_bytes(), record.operation_id),
+        (None, true, claim.allocated_bytes(), record.operation_id),
+        (None, false, claim.allocated_bytes() + 1, record.operation_id),
+        (None, false, claim.allocated_bytes(), OperationId::new()),
+    ] {
+        let changed = OrdinaryClaimRebuildSnapshot::for_test(vec![RebuildClaim::for_test(
+            operation, claim.claim_id(), claim.volume().clone(), claim.allocation_class(),
+            bytes, release, audit,
+        )], CapacityRebuildReadiness::Ready);
+        let input = super::super::owner::InputPermit::historical_test_namespace_input(1);
+        assert!(store.validate_legacy_recovery_initial_claims(&record, changed.claims(), &input).is_err());
+    }
+    store.connection.execute("DELETE FROM operation_journal_ordinary_claim WHERE operation_id=?1", [record.operation_id.to_string()]).unwrap();
+    assert!(store.validate_legacy_recovery_initial_claims(&record, snapshot.claims(), &input).is_err());
+}
+
+#[test]
 fn historical_claim_sqlite_borrowed_observer_preserves_original_lookup_and_full_rebuild() {
     let fixture = fixture();
     let store = OperationJournalStore::open(&fixture.owner).unwrap();

@@ -122,6 +122,52 @@ impl Drop for Fixture {
         self.close();
     }
 }
+
+#[test]
+fn legacy_recovery_actual_worker_retains_refused_reader_and_lost_reply_until_shutdown() {
+    let mut f = Fixture::new();
+    let client = f.client();
+    let source_bytes = fs::read(f.path()).unwrap();
+    let journal_before = journal_bytes(&f);
+    let request = client
+        .recover_legacy_read_custody(f.source.take().unwrap())
+        .unwrap();
+    // Known11 is deliberately not a current13 recovery image. Its actual reader is
+    // nevertheless retained before inspection, and dropping the reply is not cleanup.
+    drop(request);
+    let other = f.open_source("other-recovery-refusal");
+    let result = client
+        .prepare_legacy_adoption_custody(
+            other,
+            ParticipantId::from_uuid(Uuid::from_u128(21)),
+            SourceCommandId::from_uuid(Uuid::from_u128(22)),
+        )
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(OperationJournalOwnerError::LegacyAdoptionCustody(
+            LegacyAdoptionCustodyError::Busy
+        ))
+    ));
+    assert!(SourceDatabase::open_legacy_read_owner(f.media.path(), &f.guard, "legacy").is_err());
+    assert_eq!(fs::read(f.path()).unwrap(), source_bytes);
+    assert_eq!(journal_bytes(&f), journal_before);
+    assert!(budget(&client).remaining[0] < f.baseline.remaining[0]);
+    let sidecar = f.profile.path().join("legacy/.yield-source-lease.lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&sidecar)
+        .unwrap();
+    assert!(lock.try_lock().is_err());
+    f.close();
+    assert_eq!(budget(&client), InputBudget::shared_initial());
+    lock.try_lock().unwrap();
+    assert!(sidecar.exists());
+    assert_eq!(fs::read(f.path()).unwrap(), source_bytes);
+}
 fn budget(client: &OperationJournalClient) -> InputBudget {
     *client.shared.input_bytes.lock().unwrap()
 }
@@ -839,4 +885,35 @@ fn legacy_migration_native_actual_worker_commits_original_receipt_and_coalesces_
         SourceDatabase::open_legacy_recovery_read_owner(f.media.path(), &f.guard, "legacy")
             .is_err()
     );
+    f.owner =
+        Some(OperationJournalOwner::start_without_capacity_for_test(recovery_journal).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while f.owner.as_ref().unwrap().status() != OperationJournalOwnerStatus::Available {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    let recovered = f
+        .client()
+        .recover_legacy_read_custody(recovery)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.operation_id(), operation);
+    assert!(
+        recovered
+            .validate_claims()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .is_err(),
+        "a reader without the genuine provider cannot establish retained capacity"
+    );
+    recovered
+        .revalidate()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read(f.path()).unwrap(), before_recovery);
 }

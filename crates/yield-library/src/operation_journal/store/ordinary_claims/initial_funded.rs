@@ -42,7 +42,26 @@ pub(in crate::operation_journal::store) fn verify(
     input: &InputPermit,
 ) -> Result<(), OperationJournalStoreError> {
     let mut expected = expected_records(operation, claims);
-    let mut actual = initial_settlement_backing::statement(
+    let mut actual = read(connection, operation, input)?;
+    expected.sort_by_key(OrdinaryClaimRecord::claim_id);
+    actual.sort_by_key(OrdinaryClaimRecord::claim_id);
+    if actual != expected {
+        return Err(super::super::ordinary_claim_write_error(
+            OrdinaryClaimWriteError::ReadbackMismatch {
+                operation_id: operation,
+            },
+        ));
+    }
+    Ok(())
+}
+
+// Caller holds the original row/binding/error envelope until these observations die.
+pub(in crate::operation_journal::store) fn read(
+    connection: &Connection,
+    operation: OperationId,
+    input: &InputPermit,
+) -> Result<Vec<OrdinaryClaimRecord>, OperationJournalStoreError> {
+    initial_settlement_backing::statement(
         connection,
         input,
         c"SELECT claim_id, operation_id, volume_device, allocation_class, allocated_bytes
@@ -80,17 +99,7 @@ pub(in crate::operation_journal::store) fn verify(
             Ok(records)
         },
     )
-    .map_err(original_read_error)?;
-    expected.sort_by_key(OrdinaryClaimRecord::claim_id);
-    actual.sort_by_key(OrdinaryClaimRecord::claim_id);
-    if actual != expected {
-        return Err(super::super::ordinary_claim_write_error(
-            OrdinaryClaimWriteError::ReadbackMismatch {
-                operation_id: operation,
-            },
-        ));
-    }
-    Ok(())
+    .map_err(original_read_error)
 }
 fn original_sql_error(error: OperationJournalStoreError) -> OperationJournalStoreError {
     match error {
