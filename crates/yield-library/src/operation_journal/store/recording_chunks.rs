@@ -104,6 +104,7 @@ impl OperationJournalStore {
         &self,
         input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
+        self.validate_namespace_with_input(input, false)?;
         let schema = input
             .map(|input| {
                 super::schema_backing::Scope::new(&self.connection, &self.database_path, input)
@@ -111,7 +112,6 @@ impl OperationJournalStore {
             .transpose()?;
         let result = (|| {
             use crate::operation_journal::recording_commands::MAX_RECORDING_JOURNAL_DATABASE_BYTES;
-            self.validate_namespace_with_input(input, false)?;
             if rusqlite::version_number() != 3_050_002 {
                 return Err(error(
                     "recording metadata bound requires bundled SQLite 3.50.2",
