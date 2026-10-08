@@ -10079,6 +10079,7 @@ mod tests {
     include!("store/recording_prestart_budget_tests.rs");
     include!("store/recording_control_tests.rs");
     include!("store/recording_control_funding_tests.rs");
+    include!("store/recording_restart_producer_funding_tests.rs");
     include!("store/json_materialization_tests.rs");
     use std::collections::BTreeMap;
     use std::fs;
