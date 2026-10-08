@@ -1226,7 +1226,16 @@ mod tests {
         let _profile_guard = PersistenceProfileGuard::named("ownership-serial-exhaustion");
         let holder = WritableProfileGuard::acquire_current().unwrap();
         let lock_path = holder.lock_path.clone();
-        let diagnostic = fs::read(&lock_path).unwrap();
+        let diagnostic = {
+            // Windows byte-range locks deny I/O through a separately opened
+            // file. Read through a duplicate of the genuine held file object;
+            // drop that duplicate before testing the final original release.
+            let mut original = holder._lock_file.try_clone().unwrap();
+            original.seek(io::SeekFrom::Start(0)).unwrap();
+            let mut bytes = Vec::new();
+            original.read_to_end(&mut bytes).unwrap();
+            bytes
+        };
         let counter = AtomicU64::new(i64::MAX as u64 + 1);
         // Native lock conflict wins before the counter is consulted.
         assert!(matches!(

@@ -13785,12 +13785,19 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("recovery-blocked admission result")
             .expect_err("active recovery evidence must block admission");
-        assert!(matches!(
-            result,
-            OperationJournalOwnerError::PreparedAdmission(
-                PreparedAdmissionError::RecoveryRequired { .. }
-            )
-        ));
+        let original = match &result {
+            OperationJournalOwnerError::RetainedBacking(backing) => backing.original_error(),
+            error => error,
+        };
+        assert!(
+            matches!(
+                original,
+                OperationJournalOwnerError::PreparedAdmission(
+                    PreparedAdmissionError::RecoveryRequired { .. }
+                )
+            ),
+            "original recovery rejection: {result:?}"
+        );
         assert_eq!(
             owner.prepared_admission_id_allocations(),
             before_id,

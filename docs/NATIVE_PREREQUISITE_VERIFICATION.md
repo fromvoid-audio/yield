@@ -32,3 +32,14 @@ expected physical-family Unsupported refusal and original cleanup. Full Source
 allocation policy, joint WAL decisions, attempts, capture/terminal effects,
 publication/refund/cleanup/settlement and release application acceptance remain
 separate. Actual native results are pending until every required lane succeeds.
+
+The first run confirmed production startup on macOS and original Source policy
+execution on Windows/MSVC. It exposed test defects now corrected: canonical
+macOS temporary namespaces preserve no-follow checks; lock diagnostic reads use
+the same held Windows file object and drop the duplicate before release checks;
+recovery assertions borrow the original typed retained error. Startup control
+faults deny only BEGIN inside the original funded reader, after real reserve
+bootstrap transactions, without enabling the startup/provider component hook.
+A real SQLite regression checks that unrelated original transactions remain
+usable and the selected failure retains its backing through consumer destruction.
+Production startup also compares every field of the original claim tuple.
