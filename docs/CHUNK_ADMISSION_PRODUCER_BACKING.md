@@ -58,13 +58,15 @@ funding and whole-owner finite policy remain separate work.
 
 The new macOS positive harness shares the genuine production recording admission
 setup: original Owner::start, real registered Source and FileOwner root, original
-reserve descriptor facts and admit_prepared. It then queues an actual chunk claim
-and one-shot issuance, inspects the original permit identity and retained debit,
-refuses reissue, and returns the never-consumed permit through the existing release
-path before joined shutdown and durable reopen inspection. Initial intent/source
-registration evidence remains unsettled, so this case runs on its own fresh
-native account and preserves the original dirty volume marker. No capture or staging
-file is created. Its native execution is pending; the accompanying script requires
-exactly one executed passing test with zero failures/ignores, independently of the
-two original recording custody tests. Linux compiles the same helper and executes
-only its genuine refusal tests; this is no replacement for native execution.
+reserve descriptor facts and admit_prepared. It queues an actual chunk claim and
+one-shot issuance, inspects the original permit identity/debit, and refuses reissue.
+The permit remains backed after joined owner shutdown; only its later destruction
+refunds its memory loan. Reopen retains the exact Issued row and UUID, no release
+receipt, and refuses a clean durable handoff. No capture/staging file is created.
+The staging checkpoint rule remains enforced; dropping an unused permit cannot
+settle its charge. Each case runs on a fresh native account and preserves original
+dirty ownership evidence. Native execution of this revised lifetime assertion is
+pending. The script requires exactly one executed passing issuance test with no
+failures/ignores, independently of the two original recording custody cases.
+Linux compiles the same helper and executes genuine refusal tests; compilation is
+no replacement for native execution.

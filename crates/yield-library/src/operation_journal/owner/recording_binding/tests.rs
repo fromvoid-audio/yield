@@ -475,23 +475,22 @@ fn native_original_production(case: NativeProductionCase) {
         assert!(format!("{replay}").contains("already Issued"));
         drop(replay);
         assert_eq!(*client.shared.input_bytes.lock().unwrap(), debited);
-        // The original permit was never consumed or used for a file write.
-        // Return that exact original permit through its existing release path.
-        // Initial intent/source registration remain genuine durable evidence;
-        // worker join is not a clean volume handoff or terminal settlement.
-        let release_id = Uuid::new_v4();
-        let released = client
-            .release_chunk(permit, release_id)
-            .unwrap()
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap()
-            .unwrap();
-        assert_eq!(released.operation_id(), operation);
-        assert_eq!(released.release_id(), release_id);
+        // No entry or checkpoint exists, so this cannot release the durable
+        // staging charge. The exact issued permit independently keeps its data
+        // backing after joined owner teardown; dropping it is not settlement.
+        let issue_id = permit.issue_id();
         assert_eq!(FACTORIES.load(Ordering::Acquire), factories);
         assert!(!media.path().join("capture-staging.wav").exists());
         assert!(!media.path().join("capture.wav").exists());
         assert!(owner.shutdown());
+        let after_join = *client.shared.input_bytes.lock().unwrap();
+        assert!(after_join.remaining[0] < InputBudget::shared_initial().remaining[0]);
+        assert!(after_join.remaining[0] > debited.remaining[0]);
+        assert_eq!(
+            after_join.publication_remaining,
+            InputBudget::shared_initial().publication_remaining
+        );
+        drop(permit);
         assert_eq!(
             *client.shared.input_bytes.lock().unwrap(),
             InputBudget::shared_initial()
@@ -501,8 +500,10 @@ fn native_original_production(case: NativeProductionCase) {
             .read_chunk_claim(chunk.chunk_id())
             .unwrap()
             .unwrap();
-        assert_eq!(row.state(), ChunkClaimState::Released);
-        assert_eq!(row.release_id(), Some(release_id));
+        assert_eq!(row.state(), ChunkClaimState::Issued);
+        assert_eq!(row.issue_id(), Some(issue_id));
+        assert_eq!(row.release_id(), None);
+        assert!(reopened.prove_clean_handoff_durable().is_err());
         assert!(row.matches_request(&chunk));
         assert_eq!(
             reopened.get(operation).unwrap().unwrap().operation_id,
