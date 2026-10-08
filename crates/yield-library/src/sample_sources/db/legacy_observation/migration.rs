@@ -199,6 +199,34 @@ impl LegacySourceReadOwner {
     }
 }
 
+// The request is canonical base64 and the fixed receipt has only ASCII keys/scalars.
+// SQLite TEXT in a UTF-16 source consumes two encoded bytes per ASCII character.
+fn verify_receipt_storage_bound(connection: &rusqlite::Connection, encoded: &[u8]) -> Result<()> {
+    let encoding: String = connection
+        .pragma_query_value(None, "encoding", |r| r.get(0))
+        .map_err(refused)?;
+    let multiplier = if encoding.eq_ignore_ascii_case("UTF-8") {
+        1
+    } else if encoding.eq_ignore_ascii_case("UTF-16le") || encoding.eq_ignore_ascii_case("UTF-16be")
+    {
+        2
+    } else {
+        return Err(LegacyObservationError("unknown migration text encoding"));
+    };
+    if encoded.is_empty()
+        || !encoded.is_ascii()
+        || encoded
+            .len()
+            .checked_mul(multiplier)
+            .is_none_or(|n| n > MAX_ADOPTION_RECEIPT_BYTES)
+    {
+        return Err(LegacyObservationError(
+            "migration receipt encoded storage bound",
+        ));
+    }
+    Ok(())
+}
+
 // Private SQL/data body. Its sole production caller holds the original mutation scope.
 // Direct fixture calls test SQLite atomicity/data only and manufacture no owner capability.
 fn apply_atomic_migration_body(
@@ -244,6 +272,7 @@ fn apply_atomic_migration_body(
     )
     .map_err(refused)?;
     let encoded = receipt.encode().map_err(refused)?;
+    verify_receipt_storage_bound(connection, &encoded)?;
     let text = std::str::from_utf8(&encoded).map_err(refused)?;
     if connection
         .execute(
@@ -319,6 +348,46 @@ mod tests {
         connection.execute_batch(sql).unwrap();
         connection.execute_batch("PRAGMA max_page_count=16384; PRAGMA synchronous=EXTRA; PRAGMA fullfsync=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA query_only=ON").unwrap();
         test(&connection, &args);
+    }
+    #[test]
+    fn legacy_migration_receipt_storage_bound_accounts_for_original_utf16_without_changing_encoding()
+     {
+        for encoding in ["UTF-8", "UTF-16le", "UTF-16be"] {
+            let connection = rusqlite::Connection::open_in_memory().unwrap();
+            connection
+                .pragma_update(None, "encoding", encoding)
+                .unwrap();
+            connection
+                .execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .unwrap();
+            let limit = MAX_ADOPTION_RECEIPT_BYTES / if encoding == "UTF-8" { 1 } else { 2 };
+            assert!(verify_receipt_storage_bound(&connection, &vec![b'x'; limit]).is_ok());
+            assert!(verify_receipt_storage_bound(&connection, &vec![b'x'; limit + 1]).is_err());
+            assert!(verify_receipt_storage_bound(&connection, b"non-ascii:\xc3\xa9").is_err());
+            let text = "x".repeat(limit);
+            connection
+                .execute(
+                    "INSERT INTO metadata VALUES ('source.legacy_adoption.v1',?1)",
+                    [&text],
+                )
+                .unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT length(CAST(value AS BLOB)) FROM metadata",
+                        [],
+                        |r| r.get::<_, usize>(0)
+                    )
+                    .unwrap(),
+                MAX_ADOPTION_RECEIPT_BYTES
+            );
+            assert_eq!(
+                connection
+                    .pragma_query_value(None, "encoding", |r| r.get::<_, String>(0))
+                    .unwrap(),
+                encoding
+            );
+        }
     }
     #[test]
     fn legacy_migration_sql_data_commits_exact_schema_receipt_version_and_preserved_rows_together()
