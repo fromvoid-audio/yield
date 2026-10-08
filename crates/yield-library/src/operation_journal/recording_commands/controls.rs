@@ -121,3 +121,7 @@ impl RecordingControlReservation {
 
 #[cfg(test)]
 mod tests;
+
+// Actual owner integration consumes the original private producer barrier; never a decoded grant.
+mod terminal;
+pub(crate) use terminal::RecordingFinalizingInventory;
