@@ -233,9 +233,39 @@ pub fn estimate_capacity(
         UniversalCommandArgs::SourceRegistryRetirement(_) => Ok(unsupported_matrix(
             UniversalCommandKind::SourceRegistryRetirement,
         )),
-        UniversalCommandArgs::SourceLegacyAdoption(_) => Ok(unsupported_matrix(
-            UniversalCommandKind::SourceLegacyAdoption,
-        )),
+        UniversalCommandArgs::SourceLegacyAdoption(args) => {
+            let kind = UniversalCommandKind::SourceLegacyAdoption;
+            let plan = args.initial_capacity_plan().map_err(|_| {
+                CapacityEstimatorError::InvalidCommandShape {
+                    command_kind: kind,
+                    reason: "original legacy eight-object policy",
+                }
+            })?;
+            let mut matrix = matrix_with_reason(
+                kind,
+                CapacityEstimateDisposition::NotApplicable(CapacityEstimateReason::NoNewPayload),
+            );
+            for allocation in plan.allocations() {
+                let row = matrix
+                    .rows
+                    .iter_mut()
+                    .find(|row| row.class == allocation.class())
+                    .expect("complete class matrix");
+                let previous = match row.disposition {
+                    CapacityEstimateDisposition::Known(bytes) => bytes,
+                    CapacityEstimateDisposition::NotApplicable(_) => 0,
+                    _ => {
+                        unreachable!("original passive legacy matrix starts explicit nonallocating")
+                    }
+                };
+                row.disposition = CapacityEstimateDisposition::Known(
+                    previous
+                        .checked_add(allocation.logical_bytes())
+                        .ok_or(CapacityEstimatorError::ArithmeticOverflow { command_kind: kind })?,
+                );
+            }
+            Ok(matrix)
+        }
         UniversalCommandArgs::SourceDerivedLayout(_) => Ok(unsupported_matrix(
             UniversalCommandKind::SourceDerivedLayout,
         )),

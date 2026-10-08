@@ -226,3 +226,65 @@ fn complete_original_historical_graphs_keep_backing_through_scoped_validation(
         assert_eq!(funding.remaining_bytes(), available);
     }
 }
+
+#[test]
+fn legacy_original_transport_size_counter_uses_no_system_allocations() {
+    use std::{
+        io::{self, Write},
+        time::{Duration, Instant},
+    };
+    use yield_library::{
+        operation_journal::{ParticipantId, owner::OperationJournalOwner},
+        sample_sources::{DB_FILE_NAME, SourceDatabase, db::SourceCommandId},
+    };
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let base = tempfile::tempdir().unwrap();
+    let media = tempfile::tempdir().unwrap();
+    let _root = AppRootGuard::set(base.path().join("profile")).unwrap();
+    let guard = WritableProfileGuard::acquire_current().unwrap();
+    let child = guard.profile_root().join("legacy");
+    std::fs::create_dir(&child).unwrap();
+    rusqlite::Connection::open(child.join(DB_FILE_NAME))
+        .unwrap()
+        .execute_batch(include_str!("fixtures/profile-v11/source.sql"))
+        .unwrap();
+    let source = SourceDatabase::open_legacy_read_owner(media.path(), &guard, "legacy").unwrap();
+    let store = OperationJournalStore::open(&guard).unwrap();
+    let mut owner = OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while owner.status()
+        != yield_library::operation_journal::owner::OperationJournalOwnerStatus::Available
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let custody = owner
+        .client()
+        .prepare_legacy_adoption_custody(source, ParticipantId::new(), SourceCommandId::new())
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let expected = serde_json::to_vec(custody.input()).unwrap();
+    let funding = JournalNamespaceFundingProbe::new();
+    let mut output = Count(0);
+    let observed = measured(&funding, || {
+        serde_json::to_writer(&mut output, custody.input()).unwrap()
+    });
+    assert_eq!(output.0, expected.len());
+    assert_eq!(
+        observed.peak, 0,
+        "the actual original transport counter must not own binary/base64 scratch"
+    );
+    assert_eq!(observed.violations, 0);
+    assert!(owner.shutdown());
+}

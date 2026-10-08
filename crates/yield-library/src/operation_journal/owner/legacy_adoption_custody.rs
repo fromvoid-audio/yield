@@ -56,6 +56,32 @@ impl LegacyAdoptionCustody {
     pub fn input(&self) -> &LegacyAdoptionIntentArgs {
         &self.args
     }
+    /// Admit the original frozen checkpoint on its issuing worker. A duplicate
+    /// confirmed commit returns the same operation; lost replies retain custody.
+    pub fn admit(
+        &self,
+    ) -> Result<OperationJournalRequest<OperationId>, OperationJournalOwnerQueueError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let shared = self
+            .owner
+            .upgrade()
+            .ok_or(OperationJournalOwnerQueueError::Closed)?;
+        let command = self.args.source_command_id();
+        let digest = self.digest;
+        OperationJournalClient { shared }.submit_funded_with_reply(
+            InputClass::Ordinary,
+            super::legacy_admission::INPUT_BYTES,
+            false,
+            true,
+            move |input, result| JournalCommand::AdmitLegacyInitial {
+                command,
+                digest,
+                deadline,
+                input,
+                result,
+            },
+        )
+    }
     /// Install original pre-lease reserve custody on the same worker and return a newly
     /// captured passive checkpoint. No ordinary claim, migration grant or lease is issued.
     /// A failed physical preparation retains its partial backing until actual shutdown.
@@ -102,6 +128,7 @@ impl LegacyAdoptionCustody {
 }
 
 pub(super) struct RetainedLegacyAdoption {
+    pub(super) admission: Option<super::legacy_admission::Retained>,
     // Added reserve/failure/volume backing closes before the original source reservation.
     pub(super) volumes: Option<super::legacy_adoption_volumes::RetainedLegacyVolumes>,
     // Original SQLite closes before its own root/reservation, and all backing before credit.
@@ -211,6 +238,7 @@ impl OwnerRuntime {
             owner: Arc::downgrade(&input.shared),
         };
         self.legacy_adoption = Some(RetainedLegacyAdoption {
+            admission: None,
             source,
             args,
             digest,

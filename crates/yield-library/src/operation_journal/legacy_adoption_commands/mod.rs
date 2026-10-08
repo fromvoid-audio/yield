@@ -2,10 +2,12 @@
 use super::{ParticipantId, ParticipantKind, ParticipantRequirement, ParticipantSet};
 use crate::sample_sources::db::{LegacyCommonAllocationObservation, SourceCommandId};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-};
+use std::{collections::BTreeMap, fmt};
+
+mod initial_capacity;
+mod source_checkpoint;
+mod transport;
+pub(crate) use source_checkpoint::OriginalSourceCheckpoint;
 
 /// Independent passive request version, not a source/journal schema version.
 pub const LEGACY_ADOPTION_INPUT_VERSION: u64 = 1;
@@ -280,10 +282,11 @@ impl LegacyAdoptionIntentArgs {
         let expected = [
             source[0], source[1], source[2], source[3], 4096, journal[0], journal[1], 4096,
         ];
-        let mut identities = BTreeSet::new();
         for (i, o) in d.objects.iter().enumerate() {
             if !text(&o.identity)
-                || !identities.insert(&o.identity)
+                || d.objects[..i]
+                    .iter()
+                    .any(|prior| prior.identity == o.identity)
                 || o.unit == 0
                 || !o.unit.is_power_of_two()
                 || o.conditional_logical_bytes != expected[i]
@@ -295,14 +298,12 @@ impl LegacyAdoptionIntentArgs {
         }
         // Positively absent future sidecars are bound to the original direct-child namespace.
         for (i, suffix) in [(1, "-journal"), (2, "-wal"), (3, "-shm")] {
-            if d.objects[i].identity
-                != format!(
-                    "directory:{}/{}{}",
-                    d.source_directory,
-                    crate::sample_sources::DB_FILE_NAME,
-                    suffix
-                )
-                || d.objects[i].device != d.objects[1].device
+            if !directory_identity_matches(
+                &d.objects[i].identity,
+                &d.source_directory,
+                crate::sample_sources::DB_FILE_NAME,
+                suffix,
+            ) || d.objects[i].device != d.objects[1].device
                 || d.objects[i].unit != d.objects[1].unit
             {
                 return Err(E);
@@ -310,16 +311,26 @@ impl LegacyAdoptionIntentArgs {
         }
         if d.objects[6].identity.starts_with("directory:")
             && (d.objects[6].observed != 0
-                || d.objects[6].identity
-                    != format!(
-                        "directory:{}/{}-journal",
-                        d.journal_directory,
-                        super::store::JOURNAL_DATABASE_FILE_NAME
-                    ))
+                || !directory_identity_matches(
+                    &d.objects[6].identity,
+                    &d.journal_directory,
+                    super::store::JOURNAL_DATABASE_FILE_NAME,
+                    "-journal",
+                ))
         {
             return Err(E);
         }
-        self.totals()?;
+        // Validate the same device/unit/sum constraints on the fixed eight roles.
+        // No map or output Vec is needed just to check historical shape.
+        for object in &d.objects {
+            let mut total = 0u64;
+            for same in d.objects.iter().filter(|o| o.device == object.device) {
+                if same.unit != object.unit {
+                    return Err(E);
+                }
+                total = total.checked_add(same.conditional_logical_bytes).ok_or(E)?;
+            }
+        }
         Ok(())
     }
     /// Derive the one required pre-lease participant, without fabricating a current source fence.
@@ -366,6 +377,15 @@ impl LegacyAdoptionIntentArgs {
         Ok(bytes)
     }
 }
+fn directory_identity_matches(identity: &str, directory: &str, file: &str, suffix: &str) -> bool {
+    identity
+        .strip_prefix("directory:")
+        .and_then(|s| s.strip_prefix(directory))
+        .and_then(|s| s.strip_prefix('/'))
+        .and_then(|s| s.strip_prefix(file))
+        == Some(suffix)
+}
+
 fn policy_bounds(p: &Policy, cap: u64) -> Result<[u64; 4], LegacyAdoptionInputError> {
     use LegacyAdoptionInputError::Invalid as E;
     if !(512..=65536).contains(&p.page_size)
@@ -440,9 +460,8 @@ pub fn decode_legacy_adoption_input(
 }
 impl Serialize for LegacyAdoptionIntentArgs {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use base64::Engine;
-        let b = self.canonical_bytes().map_err(serde::ser::Error::custom)?;
-        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(b))
+        self.validate().map_err(serde::ser::Error::custom)?;
+        transport::serialize(&self.data, s)
     }
 }
 impl<'de> Deserialize<'de> for LegacyAdoptionIntentArgs {

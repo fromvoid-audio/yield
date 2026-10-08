@@ -31,7 +31,7 @@ impl OwnerRuntime {
         }
         Ok(args)
     }
-    pub(super) fn verify_legacy_prefix(
+    pub(in crate::operation_journal::owner) fn verify_legacy_prefix(
         &self,
         retained: &RetainedLegacyAdoption,
         profile: &WritableProfileGuard,

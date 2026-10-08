@@ -20,6 +20,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::new_with_start(false, None)
+    }
+    fn new_with_start(capacity: bool, fault: Option<u8>) -> Self {
         let runtime = TestRuntimeGuard::acquire();
         let profile = tempfile::tempdir().unwrap();
         let media = tempfile::tempdir().unwrap();
@@ -37,7 +40,39 @@ impl Fixture {
         };
         f.source = Some(f.open_source("legacy"));
         let store = OperationJournalStore::open(&f.guard).unwrap();
-        f.owner = Some(OperationJournalOwner::start_without_capacity_for_test(store).unwrap());
+        if let Some(case) = fault {
+            use super::super::super::store::{
+                InsertTestBoundary as B, InsertTestDirective as D, OperationJournalStoreError,
+            };
+            store.set_insert_test_hook(move |boundary| {
+                let selected = match case {
+                    0 => boundary == B::BeforePrecommitValidation,
+                    1 => boundary == B::Commit,
+                    2 => boundary == B::AfterCommit,
+                    _ => false,
+                };
+                if !selected {
+                    return D::Continue;
+                }
+                let error = OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: "original native legacy settlement fault".into(),
+                };
+                if case == 1 {
+                    D::ExecuteThenFail(error)
+                } else {
+                    D::Fail(error)
+                }
+            });
+        }
+        f.owner = Some(if capacity {
+            OperationJournalOwner::start_with_capacity_fixture_for_test(
+                store,
+                f.profile.path().join("native-volume-registry"),
+            )
+            .unwrap()
+        } else {
+            OperationJournalOwner::start_without_capacity_for_test(store).unwrap()
+        });
         let deadline = Instant::now() + Duration::from_secs(2);
         while f.owner.as_ref().unwrap().status() != OperationJournalOwnerStatus::Available {
             assert!(Instant::now() < deadline);
@@ -402,4 +437,161 @@ fn legacy_custody_queue_credit_refusal_preserves_source_and_does_not_install_slo
         .unwrap()
         .unwrap();
     validate(&custody).unwrap();
+}
+
+#[test]
+fn legacy_initial_actual_worker_refuses_missing_original_volume_custody_without_intent() {
+    let mut f = Fixture::new();
+    let source = fs::read(f.path()).unwrap();
+    let journal = journal_bytes(&f);
+    let custody = f.prepare().unwrap();
+    let before = budget(&f.client());
+    for _ in 0..2 {
+        let result = custody
+            .admit()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(OperationJournalOwnerError::LegacyAdoptionCustody(
+                LegacyAdoptionCustodyError::ReserveRecovery
+            ))
+        ));
+    }
+    assert_eq!(budget(&f.client()), before);
+    assert_eq!(fs::read(f.path()).unwrap(), source);
+    assert_eq!(journal_bytes(&f), journal);
+    validate(&custody).unwrap();
+}
+
+#[test]
+fn legacy_initial_actual_queued_deadline_and_foreign_digest_refuse_before_intent() {
+    let mut f = Fixture::new();
+    let custody = f.prepare().unwrap();
+    let journal = journal_bytes(&f);
+    for (digest, deadline) in [
+        (custody.digest, Instant::now() - Duration::from_millis(1)),
+        ([0; 32], Instant::now() + Duration::from_secs(2)),
+    ] {
+        let command = custody.args.source_command_id();
+        let mut request = f
+            .client()
+            .submit_funded_with_reply(
+                InputClass::Ordinary,
+                super::super::legacy_admission::INPUT_BYTES,
+                false,
+                true,
+                move |input, result| JournalCommand::AdmitLegacyInitial {
+                    command,
+                    digest,
+                    deadline,
+                    input,
+                    result,
+                },
+            )
+            .unwrap();
+        assert!(
+            request
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .is_err()
+        );
+    }
+    assert_eq!(journal_bytes(&f), journal);
+    validate(&custody).unwrap();
+}
+
+// Genuine APFS bootstrap and original live witness. Linux does not run this
+// qualification harness or substitute a logical provider for the live consumer.
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_initial_native_actual_worker_commit_duplicate_lost_reply_and_source_fence() {
+    let mut f = Fixture::new_with_start(true, None);
+    let original_source = fs::read(f.path()).unwrap();
+    let custody = f
+        .prepare()
+        .unwrap()
+        .prepare_volume_custody()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let request = custody.admit().unwrap();
+    drop(request); // The actual worker must retain a commit even without its reply.
+    let operation = custody
+        .admit()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let duplicate = custody
+        .admit()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    assert_eq!(duplicate, operation);
+    let record = f
+        .client()
+        .get(operation)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.schema_version,
+        super::super::super::model::SCHEMA_V19
+    );
+    assert_eq!(
+        record.universal_command_args(),
+        Some(&UniversalCommandArgs::SourceLegacyAdoption(
+            custody.args.clone()
+        ))
+    );
+    assert_eq!(
+        record.full_capacity_plan.as_ref().unwrap(),
+        &custody.args.initial_capacity_plan().unwrap()
+    );
+    assert_eq!(fs::read(f.path()).unwrap(), original_source);
+    f.close();
+    assert_eq!(fs::read(f.path()).unwrap(), original_source);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_initial_native_actual_worker_commit_faults_keep_same_source_slot_and_refuse_readmission()
+{
+    for case in 0..3 {
+        let mut f = Fixture::new_with_start(true, Some(case));
+        let original_source = fs::read(f.path()).unwrap();
+        let custody = f
+            .prepare()
+            .unwrap()
+            .prepare_volume_custody()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(
+            custody
+                .admit()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            custody
+                .admit()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(fs::read(f.path()).unwrap(), original_source);
+        f.close();
+        assert_eq!(fs::read(f.path()).unwrap(), original_source);
+    }
 }

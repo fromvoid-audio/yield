@@ -1510,7 +1510,11 @@ raw WAV selection arithmetic, decoded export arithmetic, render arithmetic, and 
 decoded-edit output arithmetic. Invalid zero values and checked arithmetic failures reject the
 matrix before a future executable plan can be built. Multi-output payloads remain `Unknown` until
 their per-output allocation boundaries can be represented without losing rounding or retained
-identity. `NotApplicable` is reserved for a future typed shape that proves the class is absent; it
+identity. `NotApplicable` is reserved for a typed shape that proves the class is absent; the
+V19 legacy initial shape now does so for its six nonallocating classes. Its exact eight
+original objects supply JournalRecord, SourceDatabaseCommit and prospective SourceWalShm,
+with each object independently rounded before grouping by actual device/class. These
+passive observations never qualify a volume, enter source WAL or grant migration; it
 is never inferred from a missing estimate.
 
 Cancellation rules:
