@@ -1,6 +1,6 @@
 //! Production scalar fences only; no source pin or native effect authority is constructed.
-use super::super::OwnerCommandReceivers;
 use super::super::resource_custody::ResourceAdmission;
+use super::super::OwnerCommandReceivers;
 use super::*;
 fn shared() -> Arc<OwnerShared> {
     let (commands, _receivers) = OwnerCommandReceivers::channel();
@@ -30,13 +30,11 @@ fn original_fence_registry_bounds_live_custody_and_reclaims_only_unentered_last_
         .map(|_| registry.issue(OperationId::new(), &shared).unwrap())
         .collect();
     assert!(registry.issue(OperationId::new(), &shared).is_err());
-    assert!(
-        registry
-            .slots
-            .iter()
-            .flatten()
-            .any(|f| f.operation == operation)
-    );
+    assert!(registry
+        .slots
+        .iter()
+        .flatten()
+        .any(|f| f.operation == operation));
     drop(next);
     drop(registry);
     assert_eq!(
@@ -83,13 +81,11 @@ fn original_fence_exhaustion_and_poison_never_remint_or_cancel_uncertain_entry()
     let operation = OperationId::new();
     let mut pending = registry.issue(operation, &shared).unwrap();
     let fence = pending.fence.clone();
-    assert!(
-        std::panic::catch_unwind(|| {
-            let _locked = fence.state.lock().unwrap();
-            panic!("original fence mutex poison");
-        })
-        .is_err()
-    );
+    assert!(std::panic::catch_unwind(|| {
+        let _locked = fence.state.lock().unwrap();
+        panic!("original fence mutex poison");
+    })
+    .is_err());
     assert!(!pending.enter());
     assert!(registry.close_for_cancellation(operation).is_err());
     assert!(matches!(registry.close_for_mutation(operation),
@@ -108,13 +104,11 @@ fn original_fence_unknown_entry_quarantines_original_admission_without_reverse_l
     let operation = OperationId::new();
     let mut pending = registry.issue(operation, &shared).unwrap();
     let fence = pending.fence.clone();
-    assert!(
-        std::panic::catch_unwind(|| {
-            let _lock = fence.state.lock().unwrap();
-            panic!("poison original fence");
-        })
-        .is_err()
-    );
+    assert!(std::panic::catch_unwind(|| {
+        let _lock = fence.state.lock().unwrap();
+        panic!("poison original fence");
+    })
+    .is_err());
     let mut runtime = admission.begin_read(|| true).unwrap();
     assert_eq!(
         runtime.enter_effect_checked(|| pending.enter_checked()),
@@ -141,11 +135,9 @@ fn publication_source_unknown_fence_refuses_only_its_original_registration() {
     *pending.fence.state.lock().unwrap() = State::Unknown;
     assert!(matches!(registry.close_for_source(source),
         Err(OperationJournalOwnerError::PublicationSourceRetirementPending { operation_id }) if operation_id == operation));
-    assert!(
-        registry
-            .close_for_source(SourceRegistrationId::model_key_for_tests(42))
-            .is_ok()
-    );
+    assert!(registry
+        .close_for_source(SourceRegistrationId::model_key_for_tests(42))
+        .is_ok());
     assert_eq!(*pending.fence.state.lock().unwrap(), State::Unknown);
 }
 
@@ -291,7 +283,10 @@ fn original_completion_worker_panic_and_zero_generation_never_become_closed_or_r
             operation: OperationId::new(),
             source: SourceRegistrationId::model_key_for_tests(0),
             generation: 0,
+            incarnation: registry.incarnation,
+            output: OnceLock::new(),
             state: Mutex::new(State::Pending),
+            detail: Mutex::new(None),
             _backing: registry.input.as_ref().unwrap().clone(),
         }),
         entered: false,
@@ -348,13 +343,11 @@ fn original_completion_poison_preserves_first_digest_and_never_settles() {
     let mut registry = Registry::new();
     let mut pending = registry.issue(OperationId::new(), &shared).unwrap();
     pending.complete_before_effect([7; 32], true);
-    assert!(
-        std::panic::catch_unwind(|| {
-            let _lock = pending.fence.state.lock().unwrap();
-            panic!("original completed slot poison");
-        })
-        .is_err()
-    );
+    assert!(std::panic::catch_unwind(|| {
+        let _lock = pending.fence.state.lock().unwrap();
+        panic!("original completed slot poison");
+    })
+    .is_err());
     registry.poll_completions();
     assert_eq!(
         *pending.fence.state.lock().unwrap_err().into_inner(),
@@ -504,4 +497,52 @@ fn publication_fence_custody_backpressure_precedes_header_and_slot_allocation() 
         shared.input_bytes.lock().unwrap().publication_remaining,
         super::super::PUBLICATION_INPUT_BYTES
     );
+}
+
+#[test]
+fn original_no_effect_slot_closes_only_after_exact_durable_callback_without_slot_lock() {
+    let shared = shared();
+    let mut registry = Registry::new();
+    let operation = OperationId::new();
+    let mut pending = registry.issue(operation, &shared).unwrap();
+    pending.bind_reserved_output(uuid::Uuid::new_v4()).unwrap();
+    pending.complete_before_effect([7; 32], true);
+    let mut calls = 0;
+    registry.settle_no_effects(|completion| {
+        calls += 1;
+        assert_eq!(completion.binding().0, operation);
+        // This must be available while the actual store callback runs.
+        assert!(pending.fence.state.try_lock().is_ok());
+        assert!(registry.close_for_cancellation(operation).is_err());
+        true
+    });
+    assert_eq!(calls, 1);
+    assert!(!registry.unresolved());
+    assert!(registry.close_for_cancellation(operation).is_ok());
+    assert!(!pending.enter());
+    pending.complete_before_effect([7; 32], true);
+    assert!(!registry.unresolved());
+    pending.complete_before_effect([8; 32], true);
+    assert!(registry.unresolved());
+    assert!(registry.close_for_mutation(operation).is_err());
+}
+
+#[test]
+fn original_no_effect_callback_failure_or_completion_race_stays_uncertain() {
+    for conflict in [false, true] {
+        let shared = shared();
+        let mut registry = Registry::new();
+        let mut pending = registry.issue(OperationId::new(), &shared).unwrap();
+        pending.bind_reserved_output(uuid::Uuid::new_v4()).unwrap();
+        pending.complete_before_effect([7; 32], true);
+        registry.settle_no_effects(|_| {
+            if conflict {
+                pending.complete_before_effect([8; 32], true);
+            }
+            conflict
+        });
+        assert!(registry.unresolved());
+        assert!(!pending.enter());
+        assert!(registry.issue(OperationId::new(), &shared).is_err());
+    }
 }

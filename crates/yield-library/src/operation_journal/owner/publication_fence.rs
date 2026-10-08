@@ -2,7 +2,7 @@
 use super::resource_custody::UseError;
 use super::{InputPermit, OperationId, OperationJournalOwnerError, OwnerShared};
 use crate::sample_sources::db::SourceRegistrationId;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod custody;
 use custody::Custody;
@@ -25,12 +25,16 @@ enum State {
     Unknown,
     CompletedNoEffect { digest: [u8; 32], observed: bool },
     UnknownCompletion { digest: [u8; 32] },
+    SettledNoEffect { digest: [u8; 32] },
 }
 struct Fence {
     operation: OperationId,
     source: SourceRegistrationId,
     generation: u64,
+    incarnation: uuid::Uuid,
+    output: OnceLock<uuid::Uuid>,
     state: Mutex<State>,
+    detail: Mutex<Option<NoEffectDetail>>,
     // Last: scalar state drops before the original shared header debit.
     _backing: Custody<InputPermit>,
 }
@@ -53,15 +57,25 @@ const REQUIRED_HEADER_BYTES: usize = std::mem::size_of::<Registry>()
     + 2 * std::mem::size_of::<usize>()
     + super::super::capacity_provider::PUBLICATION_MIRROR_BYTES;
 const _: () = assert!(REQUIRED_HEADER_BYTES <= HEADER_BYTES);
+// The single prepaid debit covers shared admission plus all fixed slot cells.
+// Per-slot completion bytes belong to slot backing, not shared admission state.
+const SHARED_ADMISSION_BYTES: usize = std::mem::size_of::<Registry>()
+    + std::mem::size_of::<InputPermit>()
+    + 2 * std::mem::size_of::<usize>()
+    + super::super::capacity_provider::PUBLICATION_MIRROR_BYTES;
+const _: () = assert!(SHARED_ADMISSION_BYTES <= 16 * 1024);
+const _: () = assert!(std::mem::size_of::<Fence>() + 2 * std::mem::size_of::<usize>() <= 64 * 1024);
+const _: () = assert!(HEADER_BYTES <= super::PUBLICATION_INPUT_BYTES);
+
 // Arc headers are two machine words; these private payload alignments need no extra pad.
 const _: () = assert!(std::mem::align_of::<Fence>() <= std::mem::align_of::<usize>());
 const _: () = assert!(std::mem::align_of::<InputPermit>() <= std::mem::align_of::<usize>());
 
 fn quarantine(state: &mut State) {
     *state = match *state {
-        State::CompletedNoEffect { digest, .. } | State::UnknownCompletion { digest } => {
-            State::UnknownCompletion { digest }
-        }
+        State::CompletedNoEffect { digest, .. }
+        | State::SettledNoEffect { digest }
+        | State::UnknownCompletion { digest } => State::UnknownCompletion { digest },
         _ => State::Unknown,
     };
 }
@@ -138,7 +152,7 @@ impl Registry {
                 fence.strong_count() == 1
                     && matches!(
                         fence.state.lock().map(|state| *state),
-                        Ok(State::Pending | State::Closed)
+                        Ok(State::Pending | State::Closed | State::SettledNoEffect { .. })
                     )
             });
             if reusable {
@@ -169,7 +183,10 @@ impl Registry {
             operation,
             source,
             generation,
+            incarnation: self.incarnation,
+            output: OnceLock::new(),
             state: Mutex::new(State::Pending),
+            detail: Mutex::new(None),
             _backing: self
                 .input
                 .as_ref()
@@ -203,11 +220,68 @@ impl Registry {
             }
         }
     }
+    pub(super) fn original_input(&self) -> Option<&InputPermit> {
+        self.input.as_deref()
+    }
+    /// SQLite runs outside the slot mutex; completion does not need queue admission.
+    pub(super) fn settle_no_effects(&self, mut persist: impl FnMut(&NoEffectCompletion) -> bool) {
+        for fence in self.slots.iter().flatten() {
+            let Some(output) = fence.output.get().copied() else {
+                continue;
+            };
+            let digest = match fence.state.lock().map(|state| *state) {
+                Ok(State::CompletedNoEffect { digest, .. }) => digest,
+                _ => continue,
+            };
+            // Release the detail guard (including a poisoned guard) before acquiring state.
+            // Worker completion always acquires state before detail.
+            let captured_detail = match fence.detail.lock() {
+                Ok(detail) => Ok(*detail),
+                Err(poisoned) => {
+                    drop(poisoned.into_inner());
+                    Err(())
+                }
+            };
+            let detail = match captured_detail {
+                Ok(Some(detail)) => detail,
+                Ok(None) => continue,
+                Err(()) => {
+                    match fence.state.lock() {
+                        Ok(mut state) => quarantine(&mut state),
+                        Err(poisoned) => quarantine(&mut poisoned.into_inner()),
+                    }
+                    continue;
+                }
+            };
+            let completion = NoEffectCompletion {
+                operation: fence.operation,
+                output,
+                incarnation: fence.incarnation,
+                generation: fence.generation,
+                digest,
+                detail,
+            };
+            let confirmed = persist(&completion);
+            match fence.state.lock() {
+                Ok(mut state) => {
+                    *state = match *state {
+                        State::CompletedNoEffect {
+                            digest: original, ..
+                        } if confirmed && original == digest => State::SettledNoEffect { digest },
+                        _ => State::UnknownCompletion { digest },
+                    };
+                }
+                Err(poisoned) => quarantine(&mut poisoned.into_inner()),
+            }
+        }
+    }
     pub(super) fn unresolved(&self) -> bool {
-        self.slots
-            .iter()
-            .flatten()
-            .any(|fence| !matches!(fence.state.lock().map(|s| *s), Ok(State::Closed)))
+        self.slots.iter().flatten().any(|fence| {
+            !matches!(
+                fence.state.lock().map(|s| *s),
+                Ok(State::Closed | State::SettledNoEffect { .. })
+            )
+        })
     }
     pub(super) fn close_for_source(
         &self,
@@ -273,6 +347,7 @@ fn close_pending(fence: &Fence) -> bool {
         return false;
     };
     match *state {
+        State::SettledNoEffect { .. } => true,
         State::Pending | State::Closed => {
             *state = State::Closed;
             true
@@ -285,7 +360,66 @@ fn close_pending(fence: &Fence) -> bool {
         | State::UnknownCompletion { .. } => false,
     }
 }
+/// Original live-latch observation; stored bytes cannot reconstruct this value.
+/// No public constructor, Clone or decoder exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NoEffectDetail {
+    kind: u8,
+    length: u16,
+    reason: [u8; crate::file_operation_owner::FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES],
+}
+impl NoEffectDetail {
+    fn capture(kind: u8, reason: &str) -> Option<Self> {
+        if !(1..=4).contains(&kind)
+            || reason.len() > crate::file_operation_owner::FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES
+        {
+            return None;
+        }
+        let mut bytes = [0; crate::file_operation_owner::FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES];
+        bytes[..reason.len()].copy_from_slice(reason.as_bytes());
+        Some(Self {
+            kind,
+            length: reason.len() as u16,
+            reason: bytes,
+        })
+    }
+    fn reason(&self) -> &str {
+        std::str::from_utf8(&self.reason[..usize::from(self.length)])
+            .expect("original bounded UTF-8 completion")
+    }
+}
+pub(crate) struct NoEffectCompletion {
+    operation: OperationId,
+    output: uuid::Uuid,
+    incarnation: uuid::Uuid,
+    generation: u64,
+    digest: [u8; 32],
+    detail: NoEffectDetail,
+}
+impl NoEffectCompletion {
+    pub(crate) fn evidence(&self) -> (u8, &str, [u8; 32]) {
+        (self.detail.kind, self.detail.reason(), self.digest)
+    }
+    pub(crate) fn binding(&self) -> (OperationId, uuid::Uuid, uuid::Uuid, u64, [u8; 32]) {
+        (
+            self.operation,
+            self.output,
+            self.incarnation,
+            self.generation,
+            self.digest,
+        )
+    }
+}
 impl PendingFence {
+    pub(super) fn bind_reserved_output(
+        &self,
+        output: uuid::Uuid,
+    ) -> Result<(), OperationJournalOwnerError> {
+        if output.is_nil() || self.fence.output.set(output).is_err() {
+            return Err(refused("original publication output binding changed"));
+        }
+        Ok(())
+    }
     #[cfg(all(test, unix))]
     pub(super) fn generation_observation_for_test(&self) -> u64 {
         self.fence.generation
@@ -305,7 +439,7 @@ impl PendingFence {
         move || {
             matches!(
                 fence.state.lock().map(|s| *s),
-                Ok(State::CompletedNoEffect { observed: true, .. })
+                Ok(State::CompletedNoEffect { observed: true, .. } | State::SettledNoEffect { .. })
             )
         }
     }
@@ -313,15 +447,38 @@ impl PendingFence {
     pub(super) fn completion_observed(&self) -> bool {
         matches!(
             self.fence.state.lock().map(|s| *s),
-            Ok(State::CompletedNoEffect { observed: true, .. })
+            Ok(State::CompletedNoEffect { observed: true, .. } | State::SettledNoEffect { .. })
         )
     }
     // Only the exact original grant can publish; caller-data correlation is checked
     // against its sealed target before reaching this original slot.
+    #[cfg(test)]
     pub(super) fn complete_before_effect(&self, digest: [u8; 32], exact: bool) {
-        let exact = exact && self.fence.generation != 0;
+        self.complete_before_effect_detail(digest, exact, 1, "");
+    }
+    pub(super) fn complete_before_effect_detail(
+        &self,
+        digest: [u8; 32],
+        exact: bool,
+        kind: u8,
+        reason: &str,
+    ) {
+        let captured = NoEffectDetail::capture(kind, reason);
+        let exact = exact && captured.is_some() && self.fence.generation != 0;
         match self.fence.state.lock() {
             Ok(mut state) => {
+                // state→detail only; actor persistence holds neither mutex.
+                let mut detail = match self.fence.detail.lock() {
+                    Ok(detail) => detail,
+                    Err(_) => {
+                        quarantine(&mut state);
+                        return;
+                    }
+                };
+                let exact = exact && detail.is_none_or(|original| Some(original) == captured);
+                if detail.is_none() {
+                    *detail = captured;
+                }
                 *state = match *state {
                     State::Pending | State::Closed | State::WorkerActive
                         if exact && !self.entered =>
@@ -338,7 +495,13 @@ impl PendingFence {
                         digest: original,
                         observed,
                     },
-                    State::CompletedNoEffect {
+                    State::SettledNoEffect { digest: original }
+                        if exact && original == digest && !self.entered =>
+                    {
+                        State::SettledNoEffect { digest: original }
+                    }
+                    State::SettledNoEffect { digest: original }
+                    | State::CompletedNoEffect {
                         digest: original, ..
                     }
                     | State::UnknownCompletion { digest: original } => {
@@ -387,6 +550,7 @@ impl Drop for PendingFence {
                     | State::Unsettled
                     | State::Unknown
                     | State::CompletedNoEffect { .. }
+                    | State::SettledNoEffect { .. }
                     | State::UnknownCompletion { .. },
                     _,
                 ) => {}

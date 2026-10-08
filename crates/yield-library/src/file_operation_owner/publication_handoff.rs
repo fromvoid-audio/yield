@@ -168,13 +168,8 @@ pub(crate) fn completion_observation(
         && result.expected() == ExpectedObject::Absent
         && fingerprint == result.fingerprint().as_bytes()
         && roots_exact;
-    let mut digest = blake3::Hasher::new();
-    digest.update(b"yield-original-publication-no-effect-v1");
-    digest.update(&[tag]);
-    digest.update(&result.fingerprint().as_bytes());
-    // The original worker bounds diagnostics before storing its receipt. A malformed
-    // private result still hashes at most that bound and becomes sticky unknown.
-    digest
-        .update(&reason.as_bytes()[..reason.len().min(FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES)]);
-    (*digest.finalize().as_bytes(), exact)
+    (
+        publication_no_effect_digest(tag, result.fingerprint().as_bytes(), reason),
+        exact,
+    )
 }

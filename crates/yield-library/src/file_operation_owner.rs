@@ -6524,3 +6524,27 @@ mod tests {
         }
     }
 }
+
+// Authority-free data hashing; only the original grant can submit a sealed completion.
+pub(crate) fn publication_no_effect_digest(
+    kind: u8,
+    fingerprint: [u8; 32],
+    reason: &str,
+) -> [u8; 32] {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"yield-original-publication-no-effect-v1");
+    digest.update(&[kind]);
+    digest.update(&fingerprint);
+    digest
+        .update(&reason.as_bytes()[..reason.len().min(FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES)]);
+    *digest.finalize().as_bytes()
+}
+pub(crate) fn publication_no_effect_detail(result: &FileOperationResult) -> Option<(u8, &str)> {
+    match result.outcome() {
+        EffectOutcome::Unsupported { reason } => Some((1, reason)),
+        EffectOutcome::SupersededBeforeEffect { reason } => Some((2, reason)),
+        EffectOutcome::RetryableBeforeEffect { reason } => Some((3, reason)),
+        EffectOutcome::Collision { reason } => Some((4, reason)),
+        _ => None,
+    }
+}
