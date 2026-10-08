@@ -1947,6 +1947,14 @@ impl OwnerRuntime {
         }
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    fn admit_prepared(
+        &mut self,
+        prepared: PreparedAdmissionInput,
+    ) -> Result<OperationId, OperationJournalOwnerError> {
+        self.admit_prepared_with_funding(prepared, None)
+    }
+
     fn admit_prepared_with_funding(
         &mut self,
         prepared: PreparedAdmissionInput,
@@ -7948,8 +7956,6 @@ mod tests {
     use crate::durable_capacity::{
         CapacityAllocationClass, DurableCapacityPlan, PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
     };
-    #[cfg(target_os = "macos")]
-    use crate::file_operation_owner::{EffectOutcome, FileOperationOwner};
     #[cfg(target_os = "macos")]
     use crate::operation_journal::capacity_provider::{CapacityProvider, CapacityRebuildReadiness};
     use crate::operation_journal::full_progress_codec::StoredFullProgressRecord;

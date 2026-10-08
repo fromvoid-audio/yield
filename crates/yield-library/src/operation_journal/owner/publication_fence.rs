@@ -8,7 +8,13 @@ mod custody;
 use custody::Custody;
 
 const MAX_FENCES: usize = 32;
-pub(super) const HEADER_BYTES: usize = 8192;
+// Preserve the original envelope where sufficient; fund any target-layout
+// excess from the same existing pool and publication ceiling before allocation.
+pub(super) const HEADER_BYTES: usize = if REQUIRED_HEADER_BYTES > 8192 {
+    REQUIRED_HEADER_BYTES
+} else {
+    8192
+};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Pending,
@@ -41,14 +47,12 @@ pub(super) struct Registry {
 }
 // Measure the nested optional-slot layout, plus32 retained cells and one
 // conservative construction transient. Old eligible cells actually drop first.
-const _: () = assert!(
-    std::mem::size_of::<Registry>()
-        + (MAX_FENCES + 1) * (std::mem::size_of::<Fence>() + 2 * std::mem::size_of::<usize>())
-        + std::mem::size_of::<InputPermit>()
-        + 2 * std::mem::size_of::<usize>()
-        + super::super::capacity_provider::PUBLICATION_MIRROR_BYTES
-        <= HEADER_BYTES
-);
+const REQUIRED_HEADER_BYTES: usize = std::mem::size_of::<Registry>()
+    + (MAX_FENCES + 1) * (std::mem::size_of::<Fence>() + 2 * std::mem::size_of::<usize>())
+    + std::mem::size_of::<InputPermit>()
+    + 2 * std::mem::size_of::<usize>()
+    + super::super::capacity_provider::PUBLICATION_MIRROR_BYTES;
+const _: () = assert!(REQUIRED_HEADER_BYTES <= HEADER_BYTES);
 // Arc headers are two machine words; these private payload alignments need no extra pad.
 const _: () = assert!(std::mem::align_of::<Fence>() <= std::mem::align_of::<usize>());
 const _: () = assert!(std::mem::align_of::<InputPermit>() <= std::mem::align_of::<usize>());

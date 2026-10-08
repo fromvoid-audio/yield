@@ -772,7 +772,7 @@ mod integration {
             let deadline = Instant::now() + Duration::from_secs(2);
             let correlation = SourceWalTransportCorrelation::new(
                 [74; 32],
-                ParticipantId::new(),
+                crate::operation_journal::ParticipantId::new(),
                 AdmissionClaimId::new(),
                 AdmissionClaimId::new(),
             )
