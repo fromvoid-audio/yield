@@ -1,6 +1,6 @@
 //! Production scalar fences only; no source pin or native effect authority is constructed.
-use super::super::resource_custody::ResourceAdmission;
 use super::super::OwnerCommandReceivers;
+use super::super::resource_custody::ResourceAdmission;
 use super::*;
 fn shared() -> Arc<OwnerShared> {
     let (commands, _receivers) = OwnerCommandReceivers::channel();
@@ -30,11 +30,13 @@ fn original_fence_registry_bounds_live_custody_and_reclaims_only_unentered_last_
         .map(|_| registry.issue(OperationId::new(), &shared).unwrap())
         .collect();
     assert!(registry.issue(OperationId::new(), &shared).is_err());
-    assert!(registry
-        .slots
-        .iter()
-        .flatten()
-        .any(|f| f.operation == operation));
+    assert!(
+        registry
+            .slots
+            .iter()
+            .flatten()
+            .any(|f| f.operation == operation)
+    );
     drop(next);
     drop(registry);
     assert_eq!(
@@ -81,11 +83,13 @@ fn original_fence_exhaustion_and_poison_never_remint_or_cancel_uncertain_entry()
     let operation = OperationId::new();
     let mut pending = registry.issue(operation, &shared).unwrap();
     let fence = pending.fence.clone();
-    assert!(std::panic::catch_unwind(|| {
-        let _locked = fence.state.lock().unwrap();
-        panic!("original fence mutex poison");
-    })
-    .is_err());
+    assert!(
+        std::panic::catch_unwind(|| {
+            let _locked = fence.state.lock().unwrap();
+            panic!("original fence mutex poison");
+        })
+        .is_err()
+    );
     assert!(!pending.enter());
     assert!(registry.close_for_cancellation(operation).is_err());
     assert!(matches!(registry.close_for_mutation(operation),
@@ -104,11 +108,13 @@ fn original_fence_unknown_entry_quarantines_original_admission_without_reverse_l
     let operation = OperationId::new();
     let mut pending = registry.issue(operation, &shared).unwrap();
     let fence = pending.fence.clone();
-    assert!(std::panic::catch_unwind(|| {
-        let _lock = fence.state.lock().unwrap();
-        panic!("poison original fence");
-    })
-    .is_err());
+    assert!(
+        std::panic::catch_unwind(|| {
+            let _lock = fence.state.lock().unwrap();
+            panic!("poison original fence");
+        })
+        .is_err()
+    );
     let mut runtime = admission.begin_read(|| true).unwrap();
     assert_eq!(
         runtime.enter_effect_checked(|| pending.enter_checked()),
@@ -135,9 +141,11 @@ fn publication_source_unknown_fence_refuses_only_its_original_registration() {
     *pending.fence.state.lock().unwrap() = State::Unknown;
     assert!(matches!(registry.close_for_source(source),
         Err(OperationJournalOwnerError::PublicationSourceRetirementPending { operation_id }) if operation_id == operation));
-    assert!(registry
-        .close_for_source(SourceRegistrationId::model_key_for_tests(42))
-        .is_ok());
+    assert!(
+        registry
+            .close_for_source(SourceRegistrationId::model_key_for_tests(42))
+            .is_ok()
+    );
     assert_eq!(*pending.fence.state.lock().unwrap(), State::Unknown);
 }
 
@@ -343,11 +351,13 @@ fn original_completion_poison_preserves_first_digest_and_never_settles() {
     let mut registry = Registry::new();
     let mut pending = registry.issue(OperationId::new(), &shared).unwrap();
     pending.complete_before_effect([7; 32], true);
-    assert!(std::panic::catch_unwind(|| {
-        let _lock = pending.fence.state.lock().unwrap();
-        panic!("original completed slot poison");
-    })
-    .is_err());
+    assert!(
+        std::panic::catch_unwind(|| {
+            let _lock = pending.fence.state.lock().unwrap();
+            panic!("original completed slot poison");
+        })
+        .is_err()
+    );
     registry.poll_completions();
     assert_eq!(
         *pending.fence.state.lock().unwrap_err().into_inner(),

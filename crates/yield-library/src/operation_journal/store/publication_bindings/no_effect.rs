@@ -12,6 +12,16 @@ use rusqlite::types::ValueRef;
 const WORKING_BYTES: usize =
     4 * MAX_RECORD_BYTES + 2 * super::super::staging_checkpoints::MAX_RECORD_BYTES + 32 * 1024;
 
+// One bounded error enum allocation fits the prepaid fixed working envelope. The
+// nested owned cause retains its separately charged original SQL/namespace backing.
+const _: () = assert!(std::mem::size_of::<OperationJournalStoreError>() <= 32 * 1024);
+fn uncertain(phase: &'static str, cause: OperationJournalStoreError) -> OperationJournalStoreError {
+    OperationJournalStoreError::PublicationCompletionOutcomeUncertain {
+        phase,
+        cause: Box::new(cause),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::operation_journal) enum NoEffectWriteOutcome {
     Committed,
@@ -119,9 +129,7 @@ impl OperationJournalStore {
         }
         match control(&self.connection, Some(input), c"ROLLBACK") {
             Ok(()) => error,
-            Err(_) => super::super::staging_checkpoints::uncertain_outcome(
-                "original no-effect rollback remains unconfirmed",
-            ),
+            Err(cause) => uncertain("rollback", cause),
         }
     }
 
@@ -191,11 +199,8 @@ impl OperationJournalStore {
             Err(error) => return Err(self.rollback_no_effect(input, error)),
         };
         if outcome == NoEffectWriteOutcome::Replay {
-            control(&self.connection, Some(input), c"ROLLBACK").map_err(|_| {
-                super::super::staging_checkpoints::uncertain_outcome(
-                    "original no-effect replay rollback remains unconfirmed",
-                )
-            })?;
+            control(&self.connection, Some(input), c"ROLLBACK")
+                .map_err(|cause| uncertain("replay rollback", cause))?;
         } else {
             #[cfg(test)]
             match self.insert_test_directive(super::super::InsertTestBoundary::Commit) {
@@ -211,11 +216,9 @@ impl OperationJournalStore {
                 }
                 _ => {}
             }
-            if control(&self.connection, Some(input), c"COMMIT").is_err() {
+            if let Err(cause) = control(&self.connection, Some(input), c"COMMIT") {
                 let _ = control(&self.connection, Some(input), c"ROLLBACK");
-                return Err(super::super::staging_checkpoints::uncertain_outcome(
-                    "original no-effect commit remains unconfirmed",
-                ));
+                return Err(uncertain("commit", cause));
             }
             #[cfg(test)]
             if matches!(
@@ -228,18 +231,15 @@ impl OperationJournalStore {
             }
         }
         self.validate_namespace_with_input(Some(input), false)
-            .map_err(|error| {
-                super::super::staging_checkpoints::postcommit_namespace_error(
-                    "original no-effect",
-                    error,
-                )
-            })?;
-        let readback = self.read_no_effect_binding(output, input).map_err(|_| {
-            super::super::staging_checkpoints::uncertain_outcome(
-                "original no-effect readback remains unconfirmed",
-            )
-        })?;
-        if readback.encode()? != expected {
+            .map_err(|cause| uncertain("postcommit namespace", cause))?;
+        let readback = self
+            .read_no_effect_binding(output, input)
+            .map_err(|cause| uncertain("readback", cause))?;
+        if readback
+            .encode()
+            .map_err(|cause| uncertain("readback encoding", cause))?
+            != expected
+        {
             return Err(super::super::staging_checkpoints::uncertain_outcome(
                 "original no-effect exact readback changed",
             ));
