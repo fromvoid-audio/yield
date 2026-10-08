@@ -51,6 +51,8 @@ run_replay_case yield-catalog canceled_native_initial_audit_leaves_no_replay_pri
 run_replay_case yield-catalog native_watcher_hint_commits_bounded_replay_delta 1 native-controller.log
 run_replay_case yield-catalog replay:: 19 catalog-replay.log
 run_replay_case yield-ui browser::catalog::tests::replay_projection 2 ui-delta.log
+run_replay_case yield-ui browser::catalog::tests::replay_capture 2 ui-shared-snapshot.log
+run_replay_case yield-ui browser::catalog::tests::prepared_display_mutations_preserve_retained_replay_rows 1 ui-prepared-view.log
 bash scripts/internal/agent/run_agent_preflight.sh 2>&1 | tee "$REPLAY_EVIDENCE_DIR/preflight.log"
 cargo check --locked -p yield-source-watcher -p yield-catalog -p yield-library -p yield-ui -p yield \
   2>&1 | tee "$REPLAY_EVIDENCE_DIR/native-sdk.log"
