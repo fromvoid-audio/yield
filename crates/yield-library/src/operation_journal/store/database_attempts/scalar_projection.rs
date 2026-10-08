@@ -8,7 +8,7 @@ pub(super) struct UuidProjection {
 }
 const _: () = assert!(std::mem::size_of::<Option<UuidProjection>>() <= 72);
 impl UuidProjection {
-    fn new(text: &str) -> Self {
+    pub(super) fn new(text: &str) -> Self {
         let id = Uuid::parse_str(text);
         let mut encoded = [0; 36];
         let canonical = id

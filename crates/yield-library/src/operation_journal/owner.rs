@@ -6342,7 +6342,7 @@ impl InputPermit {
         }
     }
 
-    fn absorb_historical_scratch(&mut self, mut other: InputPermit) {
+    pub(super) fn absorb_historical_scratch(&mut self, mut other: InputPermit) {
         // Both values are privately reserved terminal scratch from this exact
         // ordinary pool. No new credit, authority or allocation is constructed.
         assert!(Arc::ptr_eq(&self.shared, &other.shared));

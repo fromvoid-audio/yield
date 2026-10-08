@@ -21,6 +21,32 @@ pub(in crate::operation_journal) fn closed_streaming_shape(
     let shape = scan::scan_full(bytes);
     Some((shape.string_bytes, shape.array_entries, shape.arrays))
 }
+/// Borrowed attempt syntax inventory. The byte-array field is decoded by a
+/// bounded streaming Vec, never by Value. Caller prepays parser/error scratch.
+pub(in crate::operation_journal) fn attempt_graph_backing(
+    bytes: &[u8],
+) -> Option<(usize, usize, usize)> {
+    syntax::validate(bytes).ok()?;
+    let s = scan::scan_without_inventory(bytes);
+    let all_strings = scan::scan_full(bytes).string_bytes;
+    let tree = 12 * size_of::<(String, Value)>() + 16 * size_of::<usize>();
+    let index = 4 * (size_of::<(String, Value)>() + 2 * size_of::<usize>() + 1) + 32;
+    let graph = s
+        .retained_keys
+        .checked_add(s.objects)?
+        .checked_mul(tree.max(index))?
+        .checked_add(
+            s.array_entries
+                .checked_mul(2)?
+                .checked_add(s.arrays.checked_mul(4)?)?
+                .checked_mul(size_of::<Value>())?,
+        )?
+        .checked_add(s.nodes.checked_mul(size_of::<Value>())?)?
+        .checked_add(s.string_bytes.checked_mul(2)?)?;
+    // Original finite f64 spelling may expand exponent notation. String escaping
+    // and byte-array canonical tokens never exceed their original wire lengths.
+    Some((graph, all_strings, s.nodes.checked_mul(25)?))
+}
 // Actual widest closed owned array layout, shared with reconstruction accounting.
 pub(in crate::operation_journal) fn typed_array_slot() -> usize {
     general_backing::typed_slot()
