@@ -16,6 +16,8 @@ pub(super) const fn arc_bytes<T>() -> usize {
 pub(super) const POOL_BYTES: usize = arc_bytes::<Mutex<InputBudget>>()
     + arc_bytes::<AtomicU8>()
     + arc_bytes::<ResourceAdmission>()
+    + std::mem::size_of::<OnceLock<Uuid>>()
+    + std::mem::align_of::<OnceLock<Uuid>>()
     + 2 * std::mem::size_of::<String>()
     + 4 * REFUSAL.len();
 

@@ -1792,6 +1792,26 @@
       "issue": "OPT-2434",
       "reason": "Private original Store on its genuine temporary profile exercises passive binding/slice restart pages, whole-page diagnostics, pressure refusal and selected producer loan custody. Logical fixture leases grant no native qualification or live effect authority.",
       "retirement": "Keep this exact test-only Store opening; remove its row when the fixture operation is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/service_acquisition_tests.rs",
+      "function": "refused_actual_production_bootstrap_publishes_no_acquisition",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2442",
+      "reason": "Linux-only isolated real profile/journal production startup exercises the actual unsupported protected-reserve refusal. It verifies no original acquisition is published on refused bootstrap; no Source/effect/physical qualification is supplied.",
+      "retirement": "Keep this exact test-only scope and remove the inventory row if the fixture call is removed. Native qualified startup remains separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/service_acquisition_tests.rs",
+      "function": "refused_actual_production_bootstrap_publishes_no_acquisition",
+      "operation": "journal::start",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2442",
+      "reason": "Linux-only isolated real profile/journal production startup exercises the actual unsupported protected-reserve refusal. It verifies no original acquisition is published on refused bootstrap; no Source/effect/physical qualification is supplied.",
+      "retirement": "Keep this exact test-only scope and remove the inventory row if the fixture call is removed. Native qualified startup remains separate."
     }
   ]
 }
