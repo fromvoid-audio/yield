@@ -1,0 +1,37 @@
+# Original post-intent chunk admission backing
+
+ClaimChunk queues the actual request header and owned output key, with the original
+historical reply carrier. Duplicate reads use the original scalar codec through a
+borrowed SQLite statement. A successful owned row retains its own input-pool loan
+until its data is destroyed, including after the request/reply handle is consumed.
+The wrapper has no Clone, Deref or funded-record extraction API.
+
+Before provider admission, the owner funds complete operation/state decoding,
+restart reconciliation, one-row plan/claim construction, retained descriptor facts
+and provenance, source-boundary/volume/root validation scratch, provider comparison,
+transaction work, and both duplicate and committed-row lookups. The private write
+scope binds the full request and an owned prepaid operation observation to the
+original borrowed cell's exact digest and sequence. Fresh verification before lease
+pinning and inside the original transaction rejects changed bytes or sequence.
+These observations and memory loans supply no live authority.
+
+The same connection, provider and provisional lease execute the original write.
+The compatibility route retains its original driver codec and diagnostics. Funded
+controls and DML use the existing private borrowed statement bridge. Namespace
+checks borrow an adequate loan from the same original pool; variable native SQL
+and namespace messages are still measured and funded before ownership. Selected
+errors retain transaction and observation loans in the existing reply carrier.
+Only confirmed rollback releases the pinned charge. Unknown commit, unconfirmed
+rollback and committed-but-unreadable acknowledgement retain it.
+
+Real SQLite and arithmetic provider tests cover exact committed rows, changed
+bytes/sequence refusal, foreign/undersized loans, pressure before admission,
+success with no unreserved fixed working memory, confirmed/unconfirmed rollback,
+unknown commit and result/error lifetimes. Actual queue tests cover pressure and
+read-only duplicates during an entered publication fence. Arithmetic fixtures
+confer no native physical qualification. The System historical allocation tests
+measure their original historical and Legacy transport paths, not the entire
+new chunk producer. GNU Windows compilation is not native Windows acceptance.
+
+IssueChunk, write entry, staging checkpoint, release and recording producer funding,
+whole-owner finite policy and native positive acceptance remain separate work.

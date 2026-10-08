@@ -805,60 +805,82 @@ fn borrowed_optional_text<'row>(
     }
 }
 
+trait DecodeRow {
+    type Error: From<ChunkClaimReadError>;
+    fn text(&self, index: usize) -> Result<&str, Self::Error>;
+    fn optional_text(&self, index: usize) -> Result<Option<&str>, Self::Error>;
+    fn integer(&self, index: usize) -> Result<i64, Self::Error>;
+}
+impl DecodeRow for Row<'_> {
+    type Error = ChunkClaimReadError;
+    fn text(&self, index: usize) -> Result<&str, Self::Error> {
+        borrowed_text(self, index)
+    }
+    fn optional_text(&self, index: usize) -> Result<Option<&str>, Self::Error> {
+        borrowed_optional_text(self, index)
+    }
+    fn integer(&self, index: usize) -> Result<i64, Self::Error> {
+        self.get(index).map_err(Into::into)
+    }
+}
 fn decode_row(row: &Row<'_>) -> Result<ChunkClaimRecord, ChunkClaimReadError> {
-    let chunk_id = ChunkId::parse(borrowed_text(row, 0)?)
+    decode_view(row)
+}
+
+fn decode_view<R: DecodeRow>(row: &R) -> Result<ChunkClaimRecord, R::Error> {
+    let chunk_id = ChunkId::parse(row.text(0)?)
         .map_err(|error| ChunkClaimReadError::Malformed(error.to_string()))?;
-    let operation_id = OperationId::parse(borrowed_text(row, 1)?)
+    let operation_id = OperationId::parse(row.text(1)?)
         .map_err(|error| ChunkClaimReadError::Malformed(error.to_string()))?;
     let claim_id = AdmissionClaimId::from_uuid(
-        Uuid::parse_str(borrowed_text(row, 2)?)
+        Uuid::parse_str(row.text(2)?)
             .map_err(|error| ChunkClaimReadError::Malformed(error.to_string()))?,
     )
     .map_err(|error| ChunkClaimReadError::Malformed(error.to_string()))?;
-    let participant_id = ParticipantId::parse(borrowed_text(row, 3)?)
+    let participant_id = ParticipantId::parse(row.text(3)?)
         .map_err(|error| ChunkClaimReadError::Malformed(error.to_string()))?;
-    let output_key = borrowed_text(row, 4)?;
+    let output_key = row.text(4)?;
     if output_key.is_empty() || output_key.len() > MAX_OUTPUT_KEY_BYTES {
-        return Err(ChunkClaimReadError::Malformed(String::from(
-            "output key bounds",
-        )));
+        return Err(ChunkClaimReadError::Malformed(String::from("output key bounds")).into());
     }
-    let logical_offset = positive_u64(row.get::<_, i64>(5)?, "logical offset")?;
-    let logical_length = positive_u64(row.get::<_, i64>(6)?, "logical length")?;
-    let volume_device = borrowed_text(row, 7)?
+    let logical_offset = positive_u64(row.integer(5)?, "logical offset")?;
+    let logical_length = positive_u64(row.integer(6)?, "logical length")?;
+    let volume_device = row
+        .text(7)?
         .parse::<u64>()
         .map_err(|_| ChunkClaimReadError::Malformed(String::from("volume device bounds")))?;
     let volume = VolumeIdentity {
         device: volume_device as u64,
     };
-    let allocation_class = allocation_class(borrowed_text(row, 8)?)?;
+    let allocation_class = allocation_class(row.text(8)?)?;
     if !supports_chunk_output_class(allocation_class) {
         return Err(ChunkClaimReadError::Malformed(String::from(
             "chunk output allocation class is not incrementally chargeable",
-        )));
+        ))
+        .into());
     }
-    let allocated_bytes = positive_u64(row.get::<_, i64>(9)?, "allocated bytes")?;
-    let allocation_unit = positive_u64(row.get::<_, i64>(10)?, "allocation unit")?;
-    let protected_free_bytes = positive_u64(row.get::<_, i64>(11)?, "protected floor")?;
-    let state = match borrowed_text(row, 12)? {
+    let allocated_bytes = positive_u64(row.integer(9)?, "allocated bytes")?;
+    let allocation_unit = positive_u64(row.integer(10)?, "allocation unit")?;
+    let protected_free_bytes = positive_u64(row.integer(11)?, "protected floor")?;
+    let state = match row.text(12)? {
         "Claimed" => ChunkClaimState::Claimed,
         "Issued" => ChunkClaimState::Issued,
         "Released" => ChunkClaimState::Released,
         value => {
-            return Err(ChunkClaimReadError::Malformed(format!(
-                "unknown state {value:.64}"
-            )));
+            return Err(
+                ChunkClaimReadError::Malformed(format!("unknown state {value:.64}")).into(),
+            );
         }
     };
-    let issue_id = optional_uuid(borrowed_optional_text(row, 13)?)?;
-    let release_id = optional_uuid(borrowed_optional_text(row, 14)?)?;
+    let issue_id = optional_uuid(row.optional_text(13)?)?;
+    let release_id = optional_uuid(row.optional_text(14)?)?;
     if (state == ChunkClaimState::Claimed && (issue_id.is_some() || release_id.is_some()))
         || (state == ChunkClaimState::Issued && (issue_id.is_none() || release_id.is_some()))
         || (state == ChunkClaimState::Released && release_id.is_none())
     {
-        return Err(ChunkClaimReadError::Malformed(String::from(
-            "state transition identities",
-        )));
+        return Err(
+            ChunkClaimReadError::Malformed(String::from("state transition identities")).into(),
+        );
     }
     Ok(ChunkClaimRecord {
         chunk_id,
@@ -983,3 +1005,40 @@ mod original_scalar_probe;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "chunk_claims/scalar_probe_test.rs"]
 mod scalar_probe;
+
+mod funded;
+pub(in crate::operation_journal) use funded::FundedChunkClaimRecord;
+pub(super) fn read_for_input(
+    connection: &Connection,
+    chunk_id: ChunkId,
+    input: &crate::operation_journal::owner::InputPermit,
+) -> Result<Option<FundedChunkClaimRecord>, super::OperationJournalStoreError> {
+    funded::read(connection, chunk_id, input)
+}
+
+pub(super) fn exceeds_row_limit_for_input(
+    connection: &Connection,
+    limit: usize,
+    input: &crate::operation_journal::owner::InputPermit,
+) -> Result<bool, super::OperationJournalStoreError> {
+    funded::exceeds_row_limit(connection, limit, input)
+}
+pub(super) fn insert_claimed_for_input(
+    connection: &Connection,
+    request: &ChunkClaimRequest,
+    input: &crate::operation_journal::owner::InputPermit,
+) -> Result<(), super::OperationJournalStoreError> {
+    funded::insert(connection, request, input)
+}
+
+pub(super) const fn point_read_bytes() -> usize {
+    funded::point_read_bytes()
+}
+pub(super) fn read_for_input_prepaid(
+    connection: &Connection,
+    chunk_id: ChunkId,
+    input: &crate::operation_journal::owner::InputPermit,
+    credit: crate::operation_journal::owner::InputPermit,
+) -> Result<Option<FundedChunkClaimRecord>, super::OperationJournalStoreError> {
+    funded::read_prepaid(connection, chunk_id, input, credit)
+}

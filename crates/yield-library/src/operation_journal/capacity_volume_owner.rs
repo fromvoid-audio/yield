@@ -573,6 +573,20 @@ impl VolumeOwnershipCapability {
         })
     }
 
+    // Working metadata for the original readonly validator: bounded marker
+    // reader/parser, retained paths and complete displayed errors. No authority.
+    pub(super) fn revalidation_working_bytes(&self) -> Option<usize> {
+        self.registry
+            .path
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            .checked_add(self.lock_path.as_os_str().as_encoded_bytes().len())?
+            .checked_mul(24)?
+            .checked_add(16 * (MAX_MARKER_BYTES + 1))?
+            .checked_add(4096)
+    }
+
     /// Revalidate the retained registry root, lock entry, and dirty marker.
     pub(super) fn revalidate(&self) -> Result<(), VolumeOwnershipError> {
         if self.handoff_fenced.get() {

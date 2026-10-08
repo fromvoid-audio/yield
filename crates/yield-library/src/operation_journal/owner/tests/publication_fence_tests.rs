@@ -25,6 +25,74 @@ mod integration {
     }
 
     #[test]
+    fn funded_claim_original_queue_pressure_refuses_before_provider_or_sql_change() {
+        let fixture = fixture("funded-claim-queue-pressure");
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        let (record, _) = v5_copy_record(OperationId::new());
+        store.insert_intent_with_outcome(&record).receipt().unwrap();
+        let input = mutation_request(&record);
+        let mut runtime = OwnerRuntime::new(store).unwrap();
+        let (commands, receivers) = OwnerCommandReceivers::channel();
+        let shared = Arc::new(OwnerShared::new(commands));
+        shared
+            .lifecycle
+            .store(OwnerLifecycle::Available as u8, Ordering::Release);
+        runtime.attach_resource_custody(&shared).unwrap();
+        let client = OperationJournalClient {
+            shared: Arc::clone(&shared),
+        };
+        let baseline = shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()];
+        let before_claims = runtime
+            .capacity_provider
+            .as_ref()
+            .map(CapacityProvider::claim_count);
+        let mut request = client.claim_chunk(input.clone()).unwrap();
+        let remaining = shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()];
+        let held = shared
+            .reserve_input(InputClass::Ordinary, remaining - 1)
+            .unwrap();
+        assert!(!execute_command(
+            receivers.ordinary.try_recv().unwrap(),
+            &mut runtime
+        ));
+        let error = request
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OperationJournalOwnerError::Store(
+                OperationJournalStoreError::OrdinaryRebuildResourceBound
+            )
+        ));
+        assert_eq!(
+            runtime
+                .capacity_provider
+                .as_ref()
+                .map(CapacityProvider::claim_count),
+            before_claims
+        );
+        assert!(
+            runtime
+                .store()
+                .read_chunk_claim(input.chunk_id())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            runtime.store().get(record.operation_id).unwrap(),
+            Some(record)
+        );
+        drop(error);
+        drop(request);
+        drop(held);
+        assert_eq!(
+            shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()],
+            baseline
+        );
+    }
+
+    #[test]
     fn original_completion_actor_idle_poll_defers_real_cancellation_without_sql_change() {
         let fixture = fixture("publication-completion-actor");
         let store = OperationJournalStore::open(&fixture.owner).unwrap();
@@ -346,17 +414,41 @@ mod integration {
             .persist_chunk_claim_with_lease(&request, &provider, lease)
             .unwrap();
         let mut runtime = OwnerRuntime::new(store).unwrap();
-        let (commands, _) = OwnerCommandReceivers::channel();
+        let (commands, receivers) = OwnerCommandReceivers::channel();
         let shared = Arc::new(OwnerShared::new(commands));
         runtime.attach_resource_custody(&shared).unwrap();
+        shared
+            .lifecycle
+            .store(OwnerLifecycle::Available as u8, Ordering::Release);
+        let client = OperationJournalClient {
+            shared: Arc::clone(&shared),
+        };
         let mut fence = runtime
             .publication_fences
             .issue(operation, &shared)
             .unwrap();
         assert!(fence.enter());
         // An exact duplicate is a read, so it remains available during entry.
-        let duplicate = runtime.claim_chunk(request.clone()).unwrap();
+        let baseline = shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()];
+        let mut queued = client.claim_chunk(request.clone()).unwrap();
+        assert!(!execute_command(
+            receivers.ordinary.try_recv().unwrap(),
+            &mut runtime
+        ));
+        let duplicate = queued
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
         assert!(duplicate.matches_request(&request));
+        drop(queued);
+        assert!(
+            shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()] < baseline
+        );
+        drop(duplicate);
+        assert_eq!(
+            shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()],
+            baseline
+        );
         assert!(matches!(runtime.issue_chunk(request.chunk_id(), operation),
             Err(OperationJournalOwnerError::PublicationMutationPending { operation_id })
             if operation_id == operation));

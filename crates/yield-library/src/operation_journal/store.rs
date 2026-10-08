@@ -69,7 +69,10 @@ use super::selection_output_commands::{
 use super::validation::{RecordConsistency, classify_record};
 
 mod admission_rebuild_backing;
+mod chunk_admission_backing;
 mod chunk_claims;
+pub(super) use chunk_admission_backing::ChunkWriteScope;
+pub(super) use chunk_claims::FundedChunkClaimRecord;
 mod chunk_staging;
 mod namespace_backing;
 #[cfg(any(test, feature = "test-support"))]
@@ -1954,6 +1957,43 @@ impl OperationJournalStore {
         })
     }
 
+    pub(super) fn read_chunk_claim_for_input(
+        &self,
+        chunk_id: chunk_claims::ChunkId,
+        input: &super::owner::InputPermit,
+    ) -> Result<Option<chunk_claims::FundedChunkClaimRecord>, OperationJournalStoreError> {
+        self.validate_namespace_with_input(Some(input), false)?;
+        chunk_claims::read_for_input(&self.connection, chunk_id, input)
+    }
+
+    pub(super) fn validate_chunk_operation_for_input(
+        &self,
+        operation: OperationId,
+        action: &str,
+        input: &super::owner::InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.validate_namespace_with_input(Some(input), false)?;
+        let present = self.inspect_complete_claim_operation(operation, input, |record, _| {
+            if record.phase != OperationPhase::IntentDurable
+                || !matches!(
+                    record.disposition,
+                    OperationDisposition::None | OperationDisposition::RetryPending
+                )
+            {
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: format!("operation {operation} is not eligible for chunk {action}"),
+                });
+            }
+            Ok(())
+        })?;
+        if !present {
+            return Err(OperationJournalStoreError::ChunkClaim {
+                reason: format!("operation {operation} was not found for chunk {action}"),
+            });
+        }
+        self.validate_namespace_with_input(Some(input), false)
+    }
+
     /// Atomically append one ordinary claim and its post-intent chunk relation. Both the global
     /// chunk relation and each operation's ordinary claim image are bounded by
     /// [`ordinary_claims::MAX_PAGE_ROWS`], so restart validation never has to scan unbounded
@@ -1964,258 +2004,396 @@ impl OperationJournalStore {
         &self,
         request: &chunk_claims::ChunkClaimRequest,
         provider: &CapacityProvider,
-        mut lease: ProvisionalCapacityLease,
+        lease: ProvisionalCapacityLease,
     ) -> Result<chunk_claims::ChunkClaimRecord, OperationJournalStoreError> {
-        request
-            .validate()
-            .map_err(|error| OperationJournalStoreError::ChunkClaim {
-                reason: error.to_string(),
-            })?;
-        let Some(operation) = self.get(request.operation_id())? else {
-            return Err(OperationJournalStoreError::OperationNotFound {
-                operation_id: request.operation_id(),
-            });
-        };
-        if operation.phase != OperationPhase::IntentDurable
-            || !matches!(
-                operation.disposition,
-                OperationDisposition::None | OperationDisposition::RetryPending
-            )
-        {
-            return Err(OperationJournalStoreError::NotIntentDurable {
-                phase: operation.phase,
+        self.persist_chunk_claim_with_funding(request, provider, lease, None)
+            .map(FundedChunkClaimRecord::into_unfunded)
+    }
+    pub(super) fn persist_chunk_claim_with_lease_for_input(
+        &self,
+        request: &chunk_claims::ChunkClaimRequest,
+        provider: &CapacityProvider,
+        lease: ProvisionalCapacityLease,
+        scope: ChunkWriteScope<'_>,
+    ) -> Result<FundedChunkClaimRecord, OperationJournalStoreError> {
+        if !scope.matches(request) {
+            return Err(OperationJournalStoreError::ChunkClaim {
+                reason: "chunk write budget belongs to another request".into(),
             });
         }
-        let Some(universal) = operation.universal_intent.as_ref() else {
-            return Err(OperationJournalStoreError::ChunkClaim {
-                reason: String::from("chunk claim operation has no participant envelope"),
-            });
-        };
-        if !universal
-            .participants()
-            .descriptors()
-            .iter()
-            .any(|participant| participant.id() == request.participant_id())
-        {
-            return Err(OperationJournalStoreError::ChunkClaim {
-                reason: String::from("chunk claim participant is not in the operation envelope"),
-            });
-        }
-        let plan = request
-            .plan()
-            .map_err(|error| OperationJournalStoreError::ChunkClaim {
-                reason: error.to_string(),
-            })?;
-        let claims =
+        self.persist_chunk_claim_with_funding(request, provider, lease, Some(scope))
+    }
+    fn persist_chunk_claim_with_funding(
+        &self,
+        request: &chunk_claims::ChunkClaimRequest,
+        provider: &CapacityProvider,
+        mut lease: ProvisionalCapacityLease,
+        mut scope: Option<ChunkWriteScope<'_>>,
+    ) -> Result<FundedChunkClaimRecord, OperationJournalStoreError> {
+        let input = scope.as_ref().map(ChunkWriteScope::input);
+        let result = (|| {
             request
-                .inventory()
+                .validate()
                 .map_err(|error| OperationJournalStoreError::ChunkClaim {
                     reason: error.to_string(),
                 })?;
-        ordinary_claims::validate_storage_values(&claims).map_err(|error| {
-            OperationJournalStoreError::ChunkClaim {
-                reason: error.to_string(),
-            }
-        })?;
-        lease
-            .validate_against(provider, &plan, &claims)
-            .map_err(|error| OperationJournalStoreError::ChunkClaim {
-                reason: error.to_string(),
-            })?;
-        lease
-            .pin_for_persistence(request.operation_id())
-            .map_err(|error| OperationJournalStoreError::ChunkClaim {
-                reason: error.to_string(),
-            })?;
-
-        self.validate_namespace()?;
-        self.connection.execute_batch("BEGIN")?;
-        let transaction_result = (|| {
-            let operation = self
-                .read_row(request.operation_id())?
-                .ok_or(OperationJournalStoreError::OperationNotFound {
-                    operation_id: request.operation_id(),
-                })?
-                .record;
+            let owned_operation;
+            let operation = if let Some(scope) = &scope {
+                scope.record()
+            } else {
+                owned_operation = self.get(request.operation_id())?.ok_or(
+                    OperationJournalStoreError::OperationNotFound {
+                        operation_id: request.operation_id(),
+                    },
+                )?;
+                &owned_operation
+            };
             if operation.phase != OperationPhase::IntentDurable
                 || !matches!(
                     operation.disposition,
                     OperationDisposition::None | OperationDisposition::RetryPending
                 )
             {
+                return Err(OperationJournalStoreError::NotIntentDurable {
+                    phase: operation.phase,
+                });
+            }
+            let Some(universal) = operation.universal_intent.as_ref() else {
                 return Err(OperationJournalStoreError::ChunkClaim {
-                    reason: format!(
-                        "operation {} is not eligible for a post-intent chunk claim",
-                        request.operation_id()
+                    reason: String::from("chunk claim operation has no participant envelope"),
+                });
+            };
+            if !universal
+                .participants()
+                .descriptors()
+                .iter()
+                .any(|participant| participant.id() == request.participant_id())
+            {
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: String::from(
+                        "chunk claim participant is not in the operation envelope",
                     ),
                 });
             }
-            // A new relation row must leave the resulting image within the same bounded
-            // restart audit.  Asking whether the current image exceeds MAX-1 rejects both an
-            // already-over-limit image and the at-limit append, while still allowing the
-            // 256th row.
-            if chunk_claims::exceeds_row_limit(
-                &self.connection,
-                chunk_claims::MAX_PAGE_ROWS.saturating_sub(1),
-            )
-            .map_err(|error| OperationJournalStoreError::ChunkClaim {
-                reason: error.to_string(),
-            })? {
-                return Err(OperationJournalStoreError::ChunkClaim {
-                    reason: format!(
-                        "chunk-claim relation already has the bounded {} row limit",
-                        chunk_claims::MAX_PAGE_ROWS
-                    ),
-                });
-            }
-            let mut count_statement = self.connection.prepare(&format!(
-                "SELECT claim_id FROM {} WHERE operation_id = ?1 LIMIT ?2",
-                ordinary_claims::TABLE_NAME
-            ))?;
-            let mut count_rows = count_statement.query(params![
-                request.operation_id().to_string(),
-                i64::try_from(ordinary_claims::MAX_PAGE_ROWS).expect("bounded claim count"),
-            ])?;
-            let mut claim_count = 0usize;
-            while count_rows.next()?.is_some() {
-                claim_count = claim_count.saturating_add(1);
-                if claim_count >= ordinary_claims::MAX_PAGE_ROWS {
-                    break;
-                }
-            }
-            if claim_count >= ordinary_claims::MAX_PAGE_ROWS {
-                return Err(OperationJournalStoreError::ChunkClaim {
-                    reason: format!(
-                        "operation already has the maximum {} ordinary claims",
-                        ordinary_claims::MAX_PAGE_ROWS
-                    ),
-                });
-            }
-            if chunk_claims::read(&self.connection, request.chunk_id())
+            let plan = request
+                .plan()
                 .map_err(|error| OperationJournalStoreError::ChunkClaim {
                     reason: error.to_string(),
-                })?
-                .is_some()
-            {
-                return Err(OperationJournalStoreError::ChunkClaim {
-                    reason: String::from("chunk identity already exists"),
-                });
-            }
-            ordinary_claims::insert_rows_inside_transaction(
-                &self.connection,
-                request.operation_id(),
-                &claims,
-            )
-            .map_err(|error| OperationJournalStoreError::ChunkClaim {
-                reason: error.to_string(),
-            })?;
-            chunk_claims::insert_claimed_inside_transaction(&self.connection, request).map_err(
-                |error| OperationJournalStoreError::ChunkClaim {
+                })?;
+            let claims =
+                request
+                    .inventory()
+                    .map_err(|error| OperationJournalStoreError::ChunkClaim {
+                        reason: error.to_string(),
+                    })?;
+            ordinary_claims::validate_storage_values(&claims).map_err(|error| {
+                OperationJournalStoreError::ChunkClaim {
                     reason: error.to_string(),
-                },
-            )?;
-            #[cfg(test)]
-            if let Some(directive) =
-                self.insert_test_directive(InsertTestBoundary::BeforePrecommitValidation)
-            {
-                match directive {
-                    InsertTestDirective::Fail(error)
-                    | InsertTestDirective::FailAndLeaveForRollback(error) => return Err(error),
-                    InsertTestDirective::Continue | InsertTestDirective::ExecuteThenFail(_) => {}
                 }
+            })?;
+            lease
+                .validate_against(provider, &plan, &claims)
+                .map_err(|error| OperationJournalStoreError::ChunkClaim {
+                    reason: error.to_string(),
+                })?;
+            if let Some(scope) = &scope {
+                // All fixed backing was prepaid before the owner's provider admission.
+                scope.validate_namespace(self, false)?;
+                scope.verify_image(self)?;
             }
-            self.validate_namespace_for_precommit()?;
-            Ok::<(), OperationJournalStoreError>(())
-        })();
-        if let Err(error) = transaction_result {
-            if let Some(rollback_error) = self.rollback_insert_transaction() {
-                return Err(OperationJournalStoreError::ChunkClaim {
-                    reason: format!(
-                        "chunk claim rollback outcome is uncertain: {error}; rollback={rollback_error}"
+            lease
+                .pin_for_persistence(request.operation_id())
+                .map_err(|error| OperationJournalStoreError::ChunkClaim {
+                    reason: error.to_string(),
+                })?;
+
+            if scope.is_none() {
+                self.validate_namespace()?;
+            }
+            initial_settlement_backing::control(&self.connection, input, c"BEGIN")?;
+            let transaction_result = (|| {
+                let owned_current;
+                let operation = if let Some(scope) = &scope {
+                    scope.verify_image(self)?;
+                    scope.record()
+                } else {
+                    owned_current = self
+                        .read_row(request.operation_id())?
+                        .ok_or(OperationJournalStoreError::OperationNotFound {
+                            operation_id: request.operation_id(),
+                        })?
+                        .record;
+                    &owned_current
+                };
+                if operation.phase != OperationPhase::IntentDurable
+                    || !matches!(
+                        operation.disposition,
+                        OperationDisposition::None | OperationDisposition::RetryPending
+                    )
+                {
+                    return Err(OperationJournalStoreError::ChunkClaim {
+                        reason: format!(
+                            "operation {} is not eligible for a post-intent chunk claim",
+                            request.operation_id()
+                        ),
+                    });
+                }
+                // A new relation row must leave the resulting image within the same bounded
+                // restart audit.  Asking whether the current image exceeds MAX-1 rejects both an
+                // already-over-limit image and the at-limit append, while still allowing the
+                // 256th row.
+                let exceeds = match input {
+                    Some(input) => chunk_claims::exceeds_row_limit_for_input(
+                        &self.connection,
+                        chunk_claims::MAX_PAGE_ROWS.saturating_sub(1),
+                        input,
                     ),
-                });
-            }
-            if let Err(release_error) =
-                lease.release_after_confirmed_rollback(request.operation_id())
-            {
-                return Err(OperationJournalStoreError::ChunkClaim {
-                    reason: format!(
-                        "{error}; confirmed rollback could not release charge: {release_error}"
-                    ),
-                });
-            }
-            return Err(error);
-        }
-        #[cfg(test)]
-        let commit_directive = self.insert_test_directive(InsertTestBoundary::Commit);
-        #[cfg(test)]
-        if let Some(
-            InsertTestDirective::Fail(error) | InsertTestDirective::FailAndLeaveForRollback(error),
-        ) = commit_directive
-        {
-            let rollback_error = self.rollback_insert_transaction();
-            if rollback_error.is_none() {
+                    None => chunk_claims::exceeds_row_limit(
+                        &self.connection,
+                        chunk_claims::MAX_PAGE_ROWS.saturating_sub(1),
+                    )
+                    .map_err(|error| OperationJournalStoreError::ChunkClaim {
+                        reason: error.to_string(),
+                    }),
+                }?;
+                if exceeds {
+                    return Err(OperationJournalStoreError::ChunkClaim {
+                        reason: format!(
+                            "chunk-claim relation already has the bounded {} row limit",
+                            chunk_claims::MAX_PAGE_ROWS
+                        ),
+                    });
+                }
+                let claim_count = if let Some(input) = input {
+                    initial_settlement_backing::statement(&self.connection, input,
+                    c"SELECT claim_id FROM operation_journal_ordinary_claim WHERE operation_id = ?1 LIMIT ?2",
+                    |row| {
+                        row.bind_text(1, &request.operation_id().to_string())?;
+                        row.bind_integer(2, ordinary_claims::MAX_PAGE_ROWS as i64)?;
+                        let mut count = 0usize;
+                        while row.next()? {
+                            count += 1;
+                            if count >= ordinary_claims::MAX_PAGE_ROWS { break; }
+                        }
+                        Ok(count)
+                    })?
+                } else {
+                    let mut count_statement = self.connection.prepare(&format!(
+                        "SELECT claim_id FROM {} WHERE operation_id = ?1 LIMIT ?2",
+                        ordinary_claims::TABLE_NAME
+                    ))?;
+                    let mut count_rows = count_statement.query(params![
+                        request.operation_id().to_string(),
+                        i64::try_from(ordinary_claims::MAX_PAGE_ROWS).expect("bounded claim count"),
+                    ])?;
+                    let mut claim_count = 0usize;
+                    while count_rows.next()?.is_some() {
+                        claim_count = claim_count.saturating_add(1);
+                        if claim_count >= ordinary_claims::MAX_PAGE_ROWS {
+                            break;
+                        }
+                    }
+                    claim_count
+                };
+                if claim_count >= ordinary_claims::MAX_PAGE_ROWS {
+                    return Err(OperationJournalStoreError::ChunkClaim {
+                        reason: format!(
+                            "operation already has the maximum {} ordinary claims",
+                            ordinary_claims::MAX_PAGE_ROWS
+                        ),
+                    });
+                }
+                let existing = match input {
+                    Some(input) => chunk_claims::read_for_input_prepaid(
+                        &self.connection,
+                        request.chunk_id(),
+                        input,
+                        scope.as_mut().unwrap().take_duplicate(),
+                    )
+                    .map(|row| row.is_some()),
+                    None => chunk_claims::read(&self.connection, request.chunk_id())
+                        .map(|row| row.is_some())
+                        .map_err(|error| OperationJournalStoreError::ChunkClaim {
+                            reason: error.to_string(),
+                        }),
+                }?;
+                if existing {
+                    return Err(OperationJournalStoreError::ChunkClaim {
+                        reason: String::from("chunk identity already exists"),
+                    });
+                }
+                match input {
+                    Some(input) => {
+                        ordinary_claims::initial_funded::insert(
+                            &self.connection,
+                            request.operation_id(),
+                            &claims,
+                            input,
+                        )
+                        .map_err(|error| match error {
+                            OperationJournalStoreError::InconsistentRecord { reason } => {
+                                OperationJournalStoreError::ChunkClaim {
+                                    reason: reason
+                                        .strip_prefix("ordinary claim settlement failed: ")
+                                        .unwrap_or(&reason)
+                                        .to_owned(),
+                                }
+                            }
+                            error => error,
+                        })?;
+                        chunk_claims::insert_claimed_for_input(&self.connection, request, input)?;
+                    }
+                    None => {
+                        ordinary_claims::insert_rows_inside_transaction(
+                            &self.connection,
+                            request.operation_id(),
+                            &claims,
+                        )
+                        .map_err(|error| {
+                            OperationJournalStoreError::ChunkClaim {
+                                reason: error.to_string(),
+                            }
+                        })?;
+                        chunk_claims::insert_claimed_inside_transaction(&self.connection, request)
+                            .map_err(|error| OperationJournalStoreError::ChunkClaim {
+                                reason: error.to_string(),
+                            })?;
+                    }
+                }
+                #[cfg(test)]
+                if let Some(directive) =
+                    self.insert_test_directive(InsertTestBoundary::BeforePrecommitValidation)
+                {
+                    match directive {
+                        InsertTestDirective::Fail(error)
+                        | InsertTestDirective::FailAndLeaveForRollback(error) => return Err(error),
+                        InsertTestDirective::Continue | InsertTestDirective::ExecuteThenFail(_) => {
+                        }
+                    }
+                }
+                match &scope {
+                    Some(scope) => scope.validate_namespace(self, true)?,
+                    None => self.validate_namespace_for_precommit()?,
+                }
+                Ok::<(), OperationJournalStoreError>(())
+            })();
+            if let Err(error) = transaction_result {
+                if let Some(rollback_error) = self.rollback_insert_transaction_for_input(input) {
+                    return Err(OperationJournalStoreError::ChunkClaim {
+                        reason: format!(
+                            "chunk claim rollback outcome is uncertain: {error}; rollback={rollback_error}"
+                        ),
+                    });
+                }
                 if let Err(release_error) =
                     lease.release_after_confirmed_rollback(request.operation_id())
                 {
                     return Err(OperationJournalStoreError::ChunkClaim {
                         reason: format!(
-                            "{error}; confirmed chunk-claim rollback could not release charge: {release_error}"
+                            "{error}; confirmed rollback could not release charge: {release_error}"
                         ),
                     });
                 }
+                return Err(error);
             }
-            return Err(OperationJournalStoreError::ChunkClaim {
-                reason: match rollback_error {
-                    Some(rollback_error) => format!(
-                        "chunk claim commit was rejected and rollback outcome is uncertain: {error}; rollback={rollback_error}"
-                    ),
-                    None => {
-                        format!("chunk claim commit was rejected before acknowledgement: {error}")
+            #[cfg(test)]
+            let commit_directive = self.insert_test_directive(InsertTestBoundary::Commit);
+            #[cfg(test)]
+            if let Some(
+                InsertTestDirective::Fail(error)
+                | InsertTestDirective::FailAndLeaveForRollback(error),
+            ) = commit_directive
+            {
+                let rollback_error = self.rollback_insert_transaction_for_input(input);
+                if rollback_error.is_none() {
+                    if let Err(release_error) =
+                        lease.release_after_confirmed_rollback(request.operation_id())
+                    {
+                        return Err(OperationJournalStoreError::ChunkClaim {
+                            reason: format!(
+                                "{error}; confirmed chunk-claim rollback could not release charge: {release_error}"
+                            ),
+                        });
                     }
-                },
-            });
-        }
-        #[cfg(test)]
-        if let Some(InsertTestDirective::ExecuteThenFail(error)) = commit_directive {
-            let commit_result = self.connection.execute_batch("COMMIT");
-            let rollback_error = self.rollback_insert_transaction();
-            return Err(OperationJournalStoreError::ChunkClaim {
-                reason: format!(
-                    "chunk claim commit outcome is uncertain: {error}; commit={commit_result:?}; rollback={rollback_error:?}"
+                }
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: match rollback_error {
+                        Some(rollback_error) => format!(
+                            "chunk claim commit was rejected and rollback outcome is uncertain: {error}; rollback={rollback_error}"
+                        ),
+                        None => {
+                            format!(
+                                "chunk claim commit was rejected before acknowledgement: {error}"
+                            )
+                        }
+                    },
+                });
+            }
+            #[cfg(test)]
+            if let Some(InsertTestDirective::ExecuteThenFail(error)) = commit_directive {
+                let commit_result =
+                    initial_settlement_backing::control(&self.connection, input, c"COMMIT");
+                let rollback_error = self.rollback_insert_transaction_for_input(input);
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: format!(
+                        "chunk claim commit outcome is uncertain: {error}; commit={commit_result:?}; rollback={rollback_error:?}"
+                    ),
+                });
+            }
+            if let Err(error) =
+                initial_settlement_backing::control(&self.connection, input, c"COMMIT")
+            {
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: format!("chunk claim commit outcome is uncertain: {error}"),
+                });
+            }
+            #[cfg(test)]
+            if let Some(InsertTestDirective::Fail(error)) =
+                self.insert_test_directive(InsertTestBoundary::AfterCommit)
+            {
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: format!("chunk claim committed but acknowledgement failed: {error}"),
+                });
+            }
+            let namespace = match &scope {
+                Some(scope) => scope.validate_namespace(self, false),
+                None => self.validate_namespace(),
+            };
+            if let Err(error) = namespace {
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: format!(
+                        "chunk claim committed but namespace acknowledgement failed: {error}"
+                    ),
+                });
+            }
+            lease
+                .mark_durable(request.operation_id())
+                .map_err(|error| OperationJournalStoreError::ChunkClaim {
+                    reason: format!(
+                        "chunk claim committed but provider settlement failed: {error}"
+                    ),
+                })?;
+            let readback = match scope.as_mut() {
+                Some(scope) => chunk_claims::read_for_input_prepaid(
+                    &self.connection,
+                    request.chunk_id(),
+                    scope.input(),
+                    scope.take_output(),
                 ),
-            });
+                None => self
+                    .read_chunk_claim(request.chunk_id())
+                    .map(|row| row.map(FundedChunkClaimRecord::unfunded)),
+            }?;
+            readback
+                .filter(|record| record.matches_request(request))
+                .ok_or_else(|| OperationJournalStoreError::ChunkClaim {
+                    reason: String::from("chunk claim committed but exact readback failed"),
+                })
+        })();
+        if let Some(scope) = scope {
+            scope.finish(result.is_err());
         }
-        if let Err(error) = self.connection.execute_batch("COMMIT") {
-            return Err(OperationJournalStoreError::ChunkClaim {
-                reason: format!("chunk claim commit outcome is uncertain: {error}"),
-            });
-        }
-        #[cfg(test)]
-        if let Some(InsertTestDirective::Fail(error)) =
-            self.insert_test_directive(InsertTestBoundary::AfterCommit)
-        {
-            return Err(OperationJournalStoreError::ChunkClaim {
-                reason: format!("chunk claim committed but acknowledgement failed: {error}"),
-            });
-        }
-        if let Err(error) = self.validate_namespace() {
-            return Err(OperationJournalStoreError::ChunkClaim {
-                reason: format!(
-                    "chunk claim committed but namespace acknowledgement failed: {error}"
-                ),
-            });
-        }
-        lease
-            .mark_durable(request.operation_id())
-            .map_err(|error| OperationJournalStoreError::ChunkClaim {
-                reason: format!("chunk claim committed but provider settlement failed: {error}"),
-            })?;
-        self.read_chunk_claim(request.chunk_id())?
-            .filter(|record| record.matches_request(request))
-            .ok_or_else(|| OperationJournalStoreError::ChunkClaim {
-                reason: String::from("chunk claim committed but exact readback failed"),
-            })
+        result
     }
 
     /// Persist the Claimed-to-Issued transition and return the exact durable row. Replays of an
@@ -18812,94 +18990,431 @@ mod tests {
     }
 
     #[test]
-    fn chunk_claim_rollback_acknowledgement_controls_original_charge_release() {
-        for failure_boundary in [
-            InsertTestBoundary::BeforePrecommitValidation,
-            InsertTestBoundary::Commit,
+    fn funded_original_chunk_point_row_retains_its_debit_after_delivery() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        let operation = OperationId::new();
+        let record = universal_intent_record(operation);
+        store.insert_intent_with_outcome(&record).receipt().unwrap();
+        let request = chunk_request_for_record(
+            &record,
+            ChunkId::new(),
+            AdmissionClaimId::new(),
+            "funded-point-row",
+            0,
+        );
+        let provider = provider_for_intent(&record);
+        let lease = provider
+            .admit(&request.plan().unwrap(), &request.inventory().unwrap())
+            .unwrap();
+        let original = store
+            .persist_chunk_claim_with_lease(&request, &provider, lease)
+            .unwrap();
+        let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+        let pool = funding.pool_bytes_observer_for_test();
+        let before = funding.remaining_bytes();
+        let retained = store
+            .read_chunk_claim_for_input(request.chunk_id(), &funding.input)
+            .unwrap()
+            .unwrap();
+        assert!(retained.matches_original(&original));
+        assert!(retained.matches_request(&request));
+        let debited = before - funding.remaining_bytes();
+        assert!(debited >= request.output_key().len() + std::mem::size_of::<ChunkClaimRecord>());
+        let while_reply = pool().0;
+        drop(funding);
+        // The successful owned result, not a consumed request/reply handle,
+        // retains the original pool debit through its own data destruction.
+        assert!(pool().0 >= while_reply);
+        let with_row = pool().0;
+        drop(retained);
+        assert_eq!(pool().0 - with_row, debited);
+    }
+
+    #[test]
+    fn funded_original_chunk_point_pressure_and_corruption_preserve_original_errors() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        let operation = OperationId::new();
+        let record = universal_intent_record(operation);
+        store.insert_intent_with_outcome(&record).receipt().unwrap();
+        let request = chunk_request_for_record(
+            &record,
+            ChunkId::new(),
+            AdmissionClaimId::new(),
+            "funded-point-errors",
+            0,
+        );
+        let provider = provider_for_intent(&record);
+        let lease = provider
+            .admit(&request.plan().unwrap(), &request.inventory().unwrap())
+            .unwrap();
+        store
+            .persist_chunk_claim_with_lease(&request, &provider, lease)
+            .unwrap();
+        let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+        let held = funding
+            .input
+            .reserve_historical_scratch(funding.remaining_bytes() - 1)
+            .unwrap();
+        assert!(matches!(
+            store.read_chunk_claim_for_input(request.chunk_id(), &funding.input),
+            Err(OperationJournalStoreError::OrdinaryRebuildResourceBound)
+        ));
+        assert!(matches!(
+            chunk_claims::read_for_input(&store.connection, request.chunk_id(), &funding.input),
+            Err(OperationJournalStoreError::HistoricalClaimResourceBound)
+        ));
+        drop(held);
+        assert_eq!(provider.claim_count(), 1);
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        for corruption in [
+            "UPDATE operation_journal_chunk_claim SET logical_length = -1",
+            "UPDATE operation_journal_chunk_claim SET logical_length = 'foreign'",
+            "UPDATE operation_journal_chunk_claim SET output_key = x'ff'",
         ] {
-            for rollback_mode in 0..3 {
-                let fixture = fixture();
-                let store = OperationJournalStore::open(&fixture.owner).unwrap();
-                let operation = OperationId::new();
-                let record = universal_intent_record(operation);
-                store.insert_intent_with_outcome(&record).receipt().unwrap();
-                let request = chunk_request_for_record(
-                    &record,
-                    ChunkId::new(),
-                    AdmissionClaimId::new(),
-                    "rollback-acknowledgement",
-                    0,
-                );
-                let provider = provider_for_intent(&record);
-                let lease = provider
-                    .admit(&request.plan().unwrap(), &request.inventory().unwrap())
-                    .unwrap();
-                store.set_insert_test_hook(move |boundary| {
-                    let failure = || OperationJournalStoreError::InconsistentRecord {
-                        reason: "original chunk transaction failure".into(),
-                    };
-                    if boundary == failure_boundary {
-                        InsertTestDirective::FailAndLeaveForRollback(failure())
-                    } else if boundary == InsertTestBoundary::Rollback {
-                        match rollback_mode {
-                            1 => InsertTestDirective::FailAndLeaveForRollback(failure()),
-                            2 => InsertTestDirective::ExecuteThenFail(failure()),
-                            _ => InsertTestDirective::Continue,
-                        }
-                    } else {
-                        InsertTestDirective::Continue
-                    }
-                });
-                let error = store
-                    .persist_chunk_claim_with_lease(&request, &provider, lease)
-                    .unwrap_err();
-                if rollback_mode == 0 {
-                    assert_eq!(provider.claim_count(), 0);
-                    assert!(!error.to_string().contains("outcome is uncertain"));
-                } else {
-                    assert_eq!(
-                        provider.claim_count(),
-                        1,
-                        "boundary={failure_boundary:?}, mode={rollback_mode}, error={error:?}"
-                    );
-                    assert!(error.to_string().contains("rollback outcome is uncertain"));
-                }
-                let count: i64 = store
+            store.connection.execute_batch(corruption).unwrap();
+            let original = store.read_chunk_claim(request.chunk_id()).unwrap_err();
+            let funded = store
+                .read_chunk_claim_for_input(request.chunk_id(), &funding.input)
+                .unwrap_err();
+            assert_eq!(funded.to_string(), original.to_string());
+            store
+                .connection
+                .execute(
+                    "UPDATE operation_journal_chunk_claim SET logical_length = ?1, output_key = ?2",
+                    params![request.logical_length() as i64, request.output_key()],
+                )
+                .unwrap();
+        }
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints=OFF")
+            .unwrap();
+        assert!(
+            store
+                .read_chunk_claim(request.chunk_id())
+                .unwrap()
+                .unwrap()
+                .matches_request(&request)
+        );
+    }
+
+    #[test]
+    fn funded_chunk_write_commits_and_keeps_reply_credit_after_consumption() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        let record = universal_intent_record(OperationId::new());
+        store.insert_intent_with_outcome(&record).receipt().unwrap();
+        let request = chunk_request_for_record(
+            &record,
+            ChunkId::new(),
+            AdmissionClaimId::new(),
+            "funded-write",
+            0,
+        );
+        let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+        let pool = funding.pool_bytes_observer_for_test();
+        let before = funding.remaining_bytes();
+        POINT_ROW_MATERIALIZED_BYTES.with(|n| n.set(0));
+        let scope = store.prepay_chunk_write(&request, &funding.input).unwrap();
+        assert!(funding.remaining_bytes() < before);
+        let all_remaining = funding
+            .input
+            .reserve_historical_scratch(funding.remaining_bytes())
+            .unwrap();
+        assert_eq!(funding.remaining_bytes(), 0);
+        let provider = provider_for_intent(&record);
+        let lease = provider
+            .admit(&request.plan().unwrap(), &request.inventory().unwrap())
+            .unwrap();
+        let reply = store
+            .persist_chunk_claim_with_lease_for_input(&request, &provider, lease, scope)
+            .unwrap();
+        assert!(reply.matches_request(&request));
+        assert_eq!(provider.claim_count(), 1);
+        assert_eq!(POINT_ROW_MATERIALIZED_BYTES.with(|n| n.get()), 0);
+        drop(all_remaining);
+        let debit = before - funding.remaining_bytes();
+        assert_eq!(debit, chunk_claims::point_read_bytes());
+        drop(funding);
+        assert!(pool().0 < pool().1);
+        drop(reply);
+        assert_eq!(pool().0, pool().1);
+        assert_eq!(provider.claim_count(), 1);
+        assert_eq!(store.get(record.operation_id).unwrap(), Some(record));
+    }
+
+    #[test]
+    fn funded_chunk_write_refuses_changed_operation_before_pin_or_sql_mutation() {
+        for change_sequence in [false, true] {
+            let fixture = fixture();
+            let store = OperationJournalStore::open(&fixture.owner).unwrap();
+            let record = universal_intent_record(OperationId::new());
+            store.insert_intent_with_outcome(&record).receipt().unwrap();
+            let request = chunk_request_for_record(
+                &record,
+                ChunkId::new(),
+                AdmissionClaimId::new(),
+                "changed-funded-write",
+                0,
+            );
+            let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+            let scope = store.prepay_chunk_write(&request, &funding.input).unwrap();
+            if change_sequence {
+                store.connection.execute("UPDATE operation_journal SET sequence = sequence + 1 WHERE operation_id = ?1", [record.operation_id.to_string()]).unwrap();
+            } else {
+                let mut wire: Vec<u8> = store
                     .connection
                     .query_row(
-                        "SELECT COUNT(*) FROM operation_journal_chunk_claim",
-                        [],
+                        "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                        [record.operation_id.to_string()],
                         |row| row.get(0),
                     )
                     .unwrap();
-                assert_eq!(count, i64::from(rollback_mode == 1));
-                assert_eq!(store.connection.is_autocommit(), rollback_mode != 1);
-                if rollback_mode == 1 {
-                    assert!(matches!(
-                        store.get(operation),
-                        Err(OperationJournalStoreError::RequiresAudit { .. })
-                    ));
-                    assert!(matches!(
-                        store.validate_for_admission(),
-                        Err(OperationJournalStoreError::RequiresAudit { .. })
-                    ));
-                    // Physical cleanup here is fixture teardown only; it does
-                    // not create confirmed release evidence or refund capacity.
-                    store.set_insert_test_hook(|_| InsertTestDirective::Continue);
-                    assert!(store.rollback_insert_transaction().is_none());
-                    assert_eq!(
-                        provider.claim_count(),
-                        1,
-                        "boundary={failure_boundary:?}, mode={rollback_mode}, error={error:?}"
-                    );
+                wire.push(b' ');
+                store
+                    .connection
+                    .execute(
+                        "UPDATE operation_journal SET record = ?1 WHERE operation_id = ?2",
+                        params![wire, record.operation_id.to_string()],
+                    )
+                    .unwrap();
+            }
+            let provider = provider_for_intent(&record);
+            let lease = provider
+                .admit(&request.plan().unwrap(), &request.inventory().unwrap())
+                .unwrap();
+            let error = store
+                .persist_chunk_claim_with_lease_for_input(&request, &provider, lease, scope)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("operation changed after preparing chunk write")
+            );
+            assert_eq!(provider.claim_count(), 0);
+            assert!(store.connection.is_autocommit());
+            assert!(
+                store
+                    .read_chunk_claim(request.chunk_id())
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(ordinary_claim_count(&store), 0);
+        }
+    }
+
+    #[test]
+    fn funded_chunk_write_pressure_and_foreign_pool_refuse_before_admission() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        let record = universal_intent_record(OperationId::new());
+        store.insert_intent_with_outcome(&record).receipt().unwrap();
+        let request = chunk_request_for_record(
+            &record,
+            ChunkId::new(),
+            AdmissionClaimId::new(),
+            "pressure-funded-write",
+            0,
+        );
+        let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+        let held = funding
+            .input
+            .reserve_historical_scratch(funding.remaining_bytes() - 1)
+            .unwrap();
+        assert!(store.prepay_chunk_write(&request, &funding.input).is_err());
+        assert_eq!(funding.remaining_bytes(), 1);
+        drop(held);
+        let foreign = super::super::owner::JournalNamespaceFundingProbe::new();
+        let credit = foreign
+            .input
+            .reserve_historical_scratch(store.namespace_prepaid_bytes().unwrap())
+            .unwrap();
+        assert!(
+            store
+                .validate_namespace_prepaid(&funding.input, &credit, false)
+                .is_err()
+        );
+        let undersized = funding.input.reserve_historical_scratch(1).unwrap();
+        assert!(
+            store
+                .validate_namespace_prepaid(&funding.input, &undersized, false)
+                .is_err()
+        );
+        assert!(store.connection.is_autocommit());
+        assert_eq!(ordinary_claim_count(&store), 0);
+        assert!(
+            store
+                .read_chunk_claim(request.chunk_id())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn funded_chunk_write_unknown_commit_keeps_durable_charge_and_error_credit() {
+        for after_commit in [false, true] {
+            let fixture = fixture();
+            let store = OperationJournalStore::open(&fixture.owner).unwrap();
+            let record = universal_intent_record(OperationId::new());
+            store.insert_intent_with_outcome(&record).receipt().unwrap();
+            let request = chunk_request_for_record(
+                &record,
+                ChunkId::new(),
+                AdmissionClaimId::new(),
+                "uncertain-funded-write",
+                0,
+            );
+            let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+            let pool = funding.pool_bytes_observer_for_test();
+            let scope = store.prepay_chunk_write(&request, &funding.input).unwrap();
+            let provider = provider_for_intent(&record);
+            let lease = provider
+                .admit(&request.plan().unwrap(), &request.inventory().unwrap())
+                .unwrap();
+            store.set_insert_test_hook(move |boundary| {
+                let error = || OperationJournalStoreError::InconsistentRecord {
+                    reason: "lost actual commit acknowledgement".into(),
+                };
+                if !after_commit && boundary == InsertTestBoundary::Commit {
+                    InsertTestDirective::ExecuteThenFail(error())
+                } else if after_commit && boundary == InsertTestBoundary::AfterCommit {
+                    InsertTestDirective::Fail(error())
                 } else {
-                    assert!(
-                        store
-                            .read_chunk_claim(request.chunk_id())
-                            .unwrap()
-                            .is_none()
+                    InsertTestDirective::Continue
+                }
+            });
+            let error = store
+                .persist_chunk_claim_with_lease_for_input(&request, &provider, lease, scope)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("acknowledgement")
+                    || error.to_string().contains("outcome is uncertain")
+            );
+            assert!(store.connection.is_autocommit());
+            assert_eq!(provider.claim_count(), 1);
+            assert_eq!(ordinary_claim_count(&store), 1);
+            assert!(
+                store
+                    .read_chunk_claim(request.chunk_id())
+                    .unwrap()
+                    .unwrap()
+                    .matches_request(&request)
+            );
+            let retained = funding.retain_command_error_for_test(error);
+            drop(funding);
+            assert!(pool().0 < pool().1);
+            drop(retained);
+            assert_eq!(pool().0, pool().1);
+            assert_eq!(provider.claim_count(), 1);
+        }
+    }
+
+    #[test]
+    fn chunk_claim_rollback_acknowledgement_controls_original_charge_release() {
+        for funded in [false, true] {
+            for failure_boundary in [
+                InsertTestBoundary::BeforePrecommitValidation,
+                InsertTestBoundary::Commit,
+            ] {
+                for rollback_mode in 0..3 {
+                    let fixture = fixture();
+                    let store = OperationJournalStore::open(&fixture.owner).unwrap();
+                    let operation = OperationId::new();
+                    let record = universal_intent_record(operation);
+                    store.insert_intent_with_outcome(&record).receipt().unwrap();
+                    let request = chunk_request_for_record(
+                        &record,
+                        ChunkId::new(),
+                        AdmissionClaimId::new(),
+                        "rollback-acknowledgement",
+                        0,
                     );
-                    assert_eq!(store.get(operation).unwrap(), Some(record));
+                    let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+                    let scope =
+                        funded.then(|| store.prepay_chunk_write(&request, &funding.input).unwrap());
+                    let provider = provider_for_intent(&record);
+                    let lease = provider
+                        .admit(&request.plan().unwrap(), &request.inventory().unwrap())
+                        .unwrap();
+                    store.set_insert_test_hook(move |boundary| {
+                        let failure = || OperationJournalStoreError::InconsistentRecord {
+                            reason: "original chunk transaction failure".into(),
+                        };
+                        if boundary == failure_boundary {
+                            InsertTestDirective::FailAndLeaveForRollback(failure())
+                        } else if boundary == InsertTestBoundary::Rollback {
+                            match rollback_mode {
+                                1 => InsertTestDirective::FailAndLeaveForRollback(failure()),
+                                2 => InsertTestDirective::ExecuteThenFail(failure()),
+                                _ => InsertTestDirective::Continue,
+                            }
+                        } else {
+                            InsertTestDirective::Continue
+                        }
+                    });
+                    let error = match scope {
+                        Some(scope) => store
+                            .persist_chunk_claim_with_lease_for_input(
+                                &request, &provider, lease, scope,
+                            )
+                            .unwrap_err(),
+                        None => store
+                            .persist_chunk_claim_with_lease(&request, &provider, lease)
+                            .unwrap_err(),
+                    };
+                    if rollback_mode == 0 {
+                        assert_eq!(provider.claim_count(), 0);
+                        assert!(!error.to_string().contains("outcome is uncertain"));
+                    } else {
+                        assert_eq!(
+                            provider.claim_count(),
+                            1,
+                            "boundary={failure_boundary:?}, mode={rollback_mode}, error={error:?}"
+                        );
+                        assert!(error.to_string().contains("rollback outcome is uncertain"));
+                    }
+                    let count: i64 = store
+                        .connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM operation_journal_chunk_claim",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(count, i64::from(rollback_mode == 1));
+                    assert_eq!(store.connection.is_autocommit(), rollback_mode != 1);
+                    if rollback_mode == 1 {
+                        assert!(matches!(
+                            store.get(operation),
+                            Err(OperationJournalStoreError::RequiresAudit { .. })
+                        ));
+                        assert!(matches!(
+                            store.validate_for_admission(),
+                            Err(OperationJournalStoreError::RequiresAudit { .. })
+                        ));
+                        // Physical cleanup here is fixture teardown only; it does
+                        // not create confirmed release evidence or refund capacity.
+                        store.set_insert_test_hook(|_| InsertTestDirective::Continue);
+                        assert!(store.rollback_insert_transaction().is_none());
+                        assert_eq!(
+                            provider.claim_count(),
+                            1,
+                            "boundary={failure_boundary:?}, mode={rollback_mode}, error={error:?}"
+                        );
+                    } else {
+                        assert!(
+                            store
+                                .read_chunk_claim(request.chunk_id())
+                                .unwrap()
+                                .is_none()
+                        );
+                        assert_eq!(store.get(operation).unwrap(), Some(record));
+                    }
                 }
             }
         }

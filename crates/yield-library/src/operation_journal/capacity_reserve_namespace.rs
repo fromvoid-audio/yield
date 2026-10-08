@@ -737,6 +737,18 @@ impl ReadonlyReserveNamespace {
 }
 
 impl OwnedReserveAllocation {
+    // Existing descriptor/root revalidation only; no allocation or live grant.
+    pub(super) fn observation_working_bytes(
+        &self,
+        profile: &WritableProfileGuard,
+    ) -> Option<usize> {
+        self.root
+            .participant_clone_bytes()?
+            .checked_add(profile.participant_clone_bytes()?)?
+            .checked_mul(24)?
+            .checked_add(8192)
+    }
+
     #[cfg(test)]
     pub(super) fn file_for_custody_test(&self) -> &File {
         self.reserve.file()

@@ -140,7 +140,7 @@ impl OwnerRuntime {
         .map_err(|_| E::Changed)?;
         let encoding = OperationJournalStore::prepay_initial_frozen_encoding(&record, &input)?;
         let encoded = encode(&record).map_err(|_| E::Changed)?;
-        let observation_credit = self.legacy_admission_observation_credit(&input)?;
+        let observation_credit = self.admission_observation_credit(&input)?;
         #[cfg(all(test, target_os = "macos"))]
         let observation = self.refresh_live_descriptor_capacity_for_admission(None);
         #[cfg(not(all(test, target_os = "macos")))]
@@ -216,7 +216,7 @@ impl OwnerRuntime {
         }
     }
 
-    fn legacy_admission_observation_credit(
+    pub(super) fn admission_observation_credit(
         &self,
         input: &InputPermit,
     ) -> Result<InputPermit, OperationJournalOwnerError> {
@@ -231,8 +231,10 @@ impl OwnerRuntime {
             + 32 * size_of::<usize>();
         let mut rows = 0usize;
         let mut text = 0usize;
+        let mut validation = 0usize;
         let mut observe = |reserve: &OwnedReserveAllocation| -> Option<()> {
             rows = rows.checked_add(1)?;
+            validation = validation.checked_add(reserve.observation_working_bytes(profile)?)?;
             let observation = reserve.observation();
             text = text
                 .checked_add(profile.profile_root_identity().len())?
@@ -263,9 +265,61 @@ impl OwnerRuntime {
                 }
             }
         }
+        if let Some(owner) = &self.volume_owner {
+            validation = validation
+                .checked_add(
+                    owner
+                        .revalidation_working_bytes()
+                        .ok_or(LegacyAdoptionCustodyError::Changed)?,
+                )
+                .ok_or(LegacyAdoptionCustodyError::Changed)?;
+        }
+        for binding in self.source_volumes.values() {
+            if let Some(owner) = &binding.owner {
+                validation = validation
+                    .checked_add(
+                        owner
+                            .revalidation_working_bytes()
+                            .ok_or(LegacyAdoptionCustodyError::Changed)?,
+                    )
+                    .ok_or(LegacyAdoptionCustodyError::Changed)?;
+            }
+        }
+        if let Some(volumes) = self
+            .legacy_adoption
+            .as_ref()
+            .and_then(|s| s.volumes.as_ref())
+        {
+            for entry in &volumes.entries {
+                if let legacy_adoption_volumes::LegacyVolumeEntry::Owned {
+                    owner: Some(owner),
+                    ..
+                } = entry
+                {
+                    validation = validation
+                        .checked_add(
+                            owner
+                                .revalidation_working_bytes()
+                                .ok_or(LegacyAdoptionCustodyError::Changed)?,
+                        )
+                        .ok_or(LegacyAdoptionCustodyError::Changed)?;
+                }
+            }
+        }
+        for registration in self.source_registrations.values() {
+            validation = validation
+                .checked_add(
+                    registration
+                        .request
+                        .registered_boundary_working_bytes(profile)
+                        .ok_or(LegacyAdoptionCustodyError::Changed)?,
+                )
+                .ok_or(LegacyAdoptionCustodyError::Changed)?;
+        }
         let bytes = rows
             .checked_mul(node + 8 * size_of::<usize>())
             .and_then(|n| text.checked_mul(2).and_then(|s| n.checked_add(s)))
+            .and_then(|n| n.checked_add(validation))
             .ok_or(LegacyAdoptionCustodyError::Changed)?;
         input
             .reserve_historical_scratch(bytes)

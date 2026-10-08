@@ -11,6 +11,21 @@ fn identity_bytes(identity: &SourceLeaseIdentity) -> Option<usize> {
 }
 
 impl SourceAuthorityRequest {
+    /// Working backing for the original readonly registered-boundary checks.
+    /// This inventories retained paths and displayed errors, never a use grant.
+    pub(crate) fn registered_boundary_working_bytes(
+        &self,
+        profile: &crate::app_dirs::WritableProfileGuard,
+    ) -> Option<usize> {
+        self.media_root
+            .participant_clone_bytes()?
+            .checked_add(self.database_root.participant_clone_bytes()?)?
+            .checked_add(self.database_file_binding.current_metadata_bytes()?)?
+            .checked_add(profile.participant_clone_bytes()?)?
+            .checked_mul(24)?
+            .checked_add(8192)
+    }
+
     /// Conservative owned Rust graph backing for another original participant.
     /// A journal Current keeper does not automatically follow this raw request Arc.
     /// This comparison data cannot validate registration or grant any effect.
