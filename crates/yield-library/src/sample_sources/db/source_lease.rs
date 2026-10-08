@@ -502,6 +502,21 @@ impl SourcePublicationFence {
     }
 }
 
+// Private preparation result; neither decoded rows nor a scalar reconstruct this control.
+struct PreparedLeaseBootstrap {
+    control: crate::sqlite_budget::OwnedConnection,
+    database_file_binding: Arc<DatabaseFileBinding>,
+    owner_identity: String,
+    epoch: i64,
+    publication_liveness: Arc<PublicationLiveness>,
+    authority_liveness: Arc<AtomicBool>,
+    profile_guard: WritableProfileGuard,
+}
+struct LeaseBootstrapPreparationFailure {
+    error: SourceLeaseError,
+    // Retain the actual control through post-open and post-commit failures.
+    control: Option<crate::sqlite_budget::OwnedConnection>,
+}
 impl SourceLeaseReservation {
     /// Historical locked sidecar identity for the pre-lease observer; no ownership grant.
     pub(crate) fn observation_lock_identity(&self) -> &str {
@@ -585,63 +600,22 @@ impl SourceLeaseReservation {
         database_file_binding: Arc<DatabaseFileBinding>,
         created: bool,
     ) -> Result<Arc<SourceLease>, SourceLeaseError> {
-        self.validate_before_open(profile_guard, &database_file_binding)?;
-        let db_path = database_file_binding.path().to_path_buf();
-        let mut control = database_file_binding
-            .root()
-            .open_owned_sqlite(
-                database_file_binding.name(),
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )
-            .map_err(map_sql_error)?;
-        database_file_binding
-            .validate(&control)
-            .map_err(map_database_error)?;
-        self.validate_profile(profile_guard)?;
-        control
-            .busy_timeout(Duration::from_millis(250))
-            .map_err(map_sql_error)?;
-        control
-            .execute_batch("PRAGMA synchronous=EXTRA; PRAGMA foreign_keys=ON;")
-            .map_err(map_sql_error)?;
-        let synchronous = control
-            .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
-            .map_err(map_sql_error)?;
-        if synchronous != 3 {
-            return Err(SourceLeaseError::SynchronousUnavailable { path: db_path });
-        }
-        #[cfg(target_os = "macos")]
-        {
-            control
-                .execute_batch("PRAGMA fullfsync=ON;")
-                .map_err(map_sql_error)?;
-            let fullfsync = control
-                .query_row("PRAGMA fullfsync", [], |row| row.get::<_, i64>(0))
-                .map_err(map_sql_error)?;
-            if fullfsync != 1 {
-                return Err(SourceLeaseError::SynchronousUnavailable { path: db_path });
-            }
-        }
-        self.validate_profile(profile_guard)?;
-        database_file_binding
-            .validate(&control)
-            .map_err(map_database_error)?;
-        let owner_identity = Uuid::new_v4().to_string();
-        let epoch = bootstrap_lease_row(
-            &mut control,
-            &self,
-            &self.media_root,
+        let prepared = self
+            .prepare_bootstrap(profile_guard, database_file_binding, created)
+            .map_err(|failure| {
+                let LeaseBootstrapPreparationFailure { error, control } = failure;
+                drop(control);
+                error
+            })?;
+        let PreparedLeaseBootstrap {
+            control,
+            database_file_binding,
+            owner_identity,
+            epoch,
+            publication_liveness,
+            authority_liveness,
             profile_guard,
-            &database_file_binding,
-            created,
-            &owner_identity,
-        )?;
-        let profile_guard = profile_guard
-            .try_clone()
-            .map_err(SourceLeaseError::ProfileOwnership)?;
-        let publication_liveness =
-            Arc::new(PublicationLiveness::new(owner_identity.clone(), epoch));
-        let authority_liveness = Arc::new(AtomicBool::new(true));
+        } = prepared;
         Ok(Arc::new(SourceLease {
             control_connection: Mutex::new(control),
             database_root: self.database_root,
@@ -659,6 +633,143 @@ impl SourceLeaseReservation {
             authority_registration: Mutex::new(None),
             profile_guard,
         }))
+    }
+
+    // The reservation is borrowed through preparation. A future admitted adoption caller
+    // must keep the returned failure/control and this same original reservation together.
+    fn prepare_bootstrap(
+        &self,
+        profile_guard: &WritableProfileGuard,
+        database_file_binding: Arc<DatabaseFileBinding>,
+        created: bool,
+    ) -> Result<PreparedLeaseBootstrap, LeaseBootstrapPreparationFailure> {
+        if self.database_root.identity() != database_file_binding.root().identity() {
+            return Err(LeaseBootstrapPreparationFailure {
+                error: SourceLeaseError::ControlUnavailable,
+                control: None,
+            });
+        }
+        self.validate_before_open(profile_guard, &database_file_binding)
+            .map_err(|error| LeaseBootstrapPreparationFailure {
+                error,
+                control: None,
+            })?;
+        let db_path = database_file_binding.path().to_path_buf();
+        let mut control = database_file_binding
+            .root()
+            .open_owned_sqlite(
+                database_file_binding.name(),
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .map_err(|error| LeaseBootstrapPreparationFailure {
+                error: map_sql_error(error),
+                control: None,
+            })?;
+        let result = (|| -> Result<_, SourceLeaseError> {
+            database_file_binding
+                .validate(&control)
+                .map_err(map_database_error)?;
+            self.validate_profile(profile_guard)?;
+            control
+                .busy_timeout(Duration::from_millis(250))
+                .map_err(map_sql_error)?;
+            control
+                .execute_batch("PRAGMA synchronous=EXTRA; PRAGMA foreign_keys=ON;")
+                .map_err(map_sql_error)?;
+            let synchronous = control
+                .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .map_err(map_sql_error)?;
+            if synchronous != 3 {
+                return Err(SourceLeaseError::SynchronousUnavailable { path: db_path });
+            }
+            #[cfg(target_os = "macos")]
+            {
+                control
+                    .execute_batch("PRAGMA fullfsync=ON;")
+                    .map_err(map_sql_error)?;
+                let fullfsync = control
+                    .query_row("PRAGMA fullfsync", [], |row| row.get::<_, i64>(0))
+                    .map_err(map_sql_error)?;
+                if fullfsync != 1 {
+                    return Err(SourceLeaseError::SynchronousUnavailable { path: db_path });
+                }
+            }
+            self.validate_profile(profile_guard)?;
+            database_file_binding
+                .validate(&control)
+                .map_err(map_database_error)?;
+            let owner_identity = Uuid::new_v4().to_string();
+            let epoch = bootstrap_lease_row(
+                &mut control,
+                self,
+                &self.media_root,
+                profile_guard,
+                &database_file_binding,
+                created,
+                &owner_identity,
+            )?;
+            // Completion requires actual committed readback on the same retained control.
+            let row =
+                read_lease_row(&control, &db_path)?.ok_or(SourceLeaseError::SchemaUnavailable {
+                    path: db_path.clone(),
+                    reason: "source lease absent after bootstrap commit",
+                })?;
+            validate_lease_row(&row, &db_path)?;
+            if row.owner_identity != owner_identity
+                || row.lease_epoch != epoch
+                || row.state != "active"
+                || row.released_at.is_some()
+                || row.media_root_identity != self.media_root.identity()
+                || row.database_root_identity != self.database_root.identity()
+                || row.database_identity != database_file_binding.identity()
+                || row.source_lock_identity != self.lock_identity
+                || row.profile_root_identity != profile_guard.profile_root_identity()
+                || row.profile_lock_identity != profile_guard.profile_lock_identity()
+            {
+                return Err(SourceLeaseError::SchemaUnavailable {
+                    path: db_path.clone(),
+                    reason: "source lease committed readback changed",
+                });
+            }
+            self.validate_profile(profile_guard)?;
+            database_file_binding
+                .validate(&control)
+                .map_err(map_database_error)?;
+            let profile_guard = profile_guard
+                .try_clone()
+                .map_err(SourceLeaseError::ProfileOwnership)?;
+            let publication_liveness =
+                Arc::new(PublicationLiveness::new(owner_identity.clone(), epoch));
+            let authority_liveness = Arc::new(AtomicBool::new(true));
+            Ok((
+                owner_identity,
+                epoch,
+                publication_liveness,
+                authority_liveness,
+                profile_guard,
+            ))
+        })();
+        match result {
+            Ok((
+                owner_identity,
+                epoch,
+                publication_liveness,
+                authority_liveness,
+                profile_guard,
+            )) => Ok(PreparedLeaseBootstrap {
+                control,
+                database_file_binding,
+                owner_identity,
+                epoch,
+                publication_liveness,
+                authority_liveness,
+                profile_guard,
+            }),
+            Err(error) => Err(LeaseBootstrapPreparationFailure {
+                error,
+                control: Some(control),
+            }),
+        }
     }
 
     fn validate_profile(
@@ -2221,6 +2332,76 @@ pub(super) const LEASE_TABLE_SQL: &str = "CREATE TABLE source_lease (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_bootstrap_legacy_refusal_retains_original_reservation_and_native_control() {
+        let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
+        let profile_root = tempfile::tempdir().unwrap();
+        let media = tempfile::tempdir().unwrap();
+        let _app = crate::app_dirs::AppRootGuard::set(profile_root.path().to_path_buf()).unwrap();
+        std::fs::create_dir(profile_root.path().join("legacy")).unwrap();
+        let path = profile_root
+            .path()
+            .join("legacy")
+            .join(super::super::DB_FILE_NAME);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(include_str!(
+                "../../../tests/fixtures/profile-v11/source.sql"
+            ))
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let profile = WritableProfileGuard::acquire_current().unwrap();
+        let database_root =
+            Arc::new(BoundDatabaseRoot::for_profile_child(&profile, Path::new("legacy")).unwrap());
+        let media_root =
+            Arc::new(BoundDatabaseRoot::for_external_source_root(&profile, media.path()).unwrap());
+        let original = super::super::sqlite_identity::open_existing_database_file(
+            &database_root,
+            Path::new(super::super::DB_FILE_NAME),
+            &path,
+        )
+        .unwrap();
+        let binding = Arc::new(DatabaseFileBinding::new(
+            database_root.clone(),
+            Path::new(super::super::DB_FILE_NAME),
+            &path,
+            original.identity,
+        ));
+        let reservation =
+            SourceLeaseReservation::acquire(database_root.clone(), media_root.clone(), &profile)
+                .unwrap();
+        let failure = match reservation.prepare_bootstrap(&profile, binding.clone(), false) {
+            Err(failure) => failure,
+            Ok(_) => panic!("legacy stamp cannot bootstrap a current lease"),
+        };
+        assert!(matches!(
+            failure.error,
+            SourceLeaseError::MigrationRequired {
+                user_version: 11,
+                ..
+            }
+        ));
+        let control = failure
+            .control
+            .as_ref()
+            .expect("original opened control is retained with failure");
+        binding.validate(control).unwrap();
+        reservation
+            .validate_before_open(&profile, &binding)
+            .unwrap();
+        assert!(
+            SourceLeaseReservation::acquire(database_root, media_root, &profile).is_err(),
+            "a borrowed failure cannot release the original sidecar lock"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!table_exists(control).unwrap());
+        drop(failure);
+        reservation
+            .validate_before_open(&profile, &binding)
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 
     #[test]
     fn lease_row_validation_rejects_nonpositive_epoch_and_bad_state() {
