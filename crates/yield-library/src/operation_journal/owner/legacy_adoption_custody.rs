@@ -110,6 +110,33 @@ impl LegacyAdoptionCustody {
             },
         )
     }
+    /// Install and read back the first lease row on the original committed migration.
+    /// The original owner retains its reservation and claims; this result does not publish a
+    /// current Source lease, readiness, audit or catalog revision. Unknown outcomes refuse replay.
+    pub fn bootstrap_source_row(
+        &self,
+    ) -> Result<OperationJournalRequest<OperationId>, OperationJournalOwnerQueueError> {
+        let shared = self
+            .owner
+            .upgrade()
+            .ok_or(OperationJournalOwnerQueueError::Closed)?;
+        let command = self.args.source_command_id();
+        let digest = self.digest;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        OperationJournalClient { shared }.submit_funded_with_reply(
+            InputClass::Ordinary,
+            super::legacy_admission::MIGRATION_INPUT_BYTES,
+            false,
+            true,
+            move |input, result| JournalCommand::BootstrapLegacySource {
+                command,
+                digest,
+                deadline,
+                input,
+                result,
+            },
+        )
+    }
     /// Install original pre-lease reserve custody on the same worker and return a newly
     /// captured passive checkpoint. No ordinary claim, migration grant or lease is issued.
     /// A failed physical preparation retains its partial backing until actual shutdown.

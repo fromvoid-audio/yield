@@ -682,3 +682,32 @@ these tests have not run in the Linux environment. Native qualification,
 including actual separately mounted roots, remains OPT-2354. No mutable source
 grant, schema migration, completion receipt or current lease bootstrap is issued;
 OPT-2117/2098 remain open for those consumers.
+
+### Original committed migration and first lease-row consumer (OPT-2117 work in progress)
+
+The original journal slot now retains migration and bootstrap settlements separately.
+`migrate_source` enters the original no-effect connection only with a borrowed proof of
+its committed V19 intent, exact unreleased claims and retained provisional lease. It
+runs one preserving transaction, inserts the canonical bounded
+`source.legacy_adoption.v1` value and version 13 atomically, and requires exact committed
+schema/row/receipt readback. UTF-16 sources enforce the receipt's physical TEXT storage
+bound before insertion. Unknown commit/readback/policy restoration retains custody and
+cannot replay the body.
+
+`bootstrap_source_row` takes a separate ordinary input/reply loan and revalidates the
+original committed migration, frozen journal and every original claim/provider tuple.
+Its distinct borrowed proof opens a new mutation scope on the same retained connection,
+with the same bounded DELETE policy and disabled native chunking. The existing lease
+row body executes inside one explicit original-owner transaction. Completion requires
+exact compiled schema plus the first lease table, unchanged migration receipt and old
+rows, and actual owner/epoch/profile/root/main/sidecar row readback. Policy restoration
+refences the connection before success. Failed or unknown bootstrap retains the original
+reservation, claim lease and settlement; no new migration is attempted. Confirmed
+bootstrap duplicates verify the same row instead of advancing its epoch, and migration
+duplicates verify the original receipt against the exact bootstrapped schema.
+
+This stage retains the first lease row, not a transferable current `SourceLease` or
+publication/audit grant. Current ownership transfer/reopen, bounded current13 recovery,
+complete fault/restart acceptance and genuine native execution remain required before
+OPT-2117 can be completed. SQL/data-only row fixtures do not mint capacity authority;
+the genuine native worker test remains a separate platform check.

@@ -12,8 +12,10 @@ use std::{
 use thiserror::Error;
 
 mod admission_custody;
+mod bootstrap;
 mod migration;
-pub(crate) use migration::LegacyMigrationSettlement;
+pub(crate) use bootstrap::LegacyBootstrapSettlement;
+pub(crate) use migration::{LegacyMigrationSettlement, VerifiedLegacyMigration};
 mod allocation;
 mod common_allocation;
 pub use common_allocation::{

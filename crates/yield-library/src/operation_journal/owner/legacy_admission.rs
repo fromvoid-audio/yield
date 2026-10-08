@@ -24,6 +24,7 @@ pub(super) struct Retained {
     outcome: Option<JournalInsertOutcome>,
     failure: Option<BorrowedInitialClaimSettlementError>,
     migration: Option<RetainedMigration>,
+    bootstrap: Option<RetainedBootstrap>,
     // Frozen data and selected outcomes die before their original backing credit.
     _construction: InputPermit,
     _encoding: InputPermit,
@@ -175,6 +176,7 @@ impl OwnerRuntime {
             outcome: None,
             failure: None,
             migration: None,
+            bootstrap: None,
             _construction: construction,
             _encoding: encoding,
             _input: input,
@@ -474,43 +476,36 @@ impl OwnerRuntime {
                 // An attempted/unknown migration is never silently replayed.
                 return Err(E::ReserveRecovery.into());
             };
-            self.store().verify_legacy_initial_frozen(
-                &admission.record,
-                &admission.claims,
-                &input,
-            )?;
-            let snapshot = self.store().rebuild_admission_snapshot_for_input(&input)?;
-            let provider = self.capacity_provider.as_ref().ok_or(E::Closed)?;
-            snapshot
-                .validate_provider(provider, Some(&input))
-                .map_err(|_| E::ReserveRecovery)?;
-            provider
-                .validate_recovery_state()
-                .map_err(|_| E::ReserveRecovery)?;
-            if !matches!(snapshot.readiness(), CapacityRebuildReadiness::Ready)
-                || admission.claims.claims().iter().any(|claim| {
-                    !snapshot.claims().iter().any(|row| {
-                        row.claim_id() == claim.claim_id()
-                            && row.operation_id() == admission.record.operation_id
-                            && row.volume() == claim.volume()
-                            && row.allocation_class() == claim.allocation_class()
-                            && row.allocated_bytes() == claim.allocated_bytes()
-                            && row.release_id().is_none()
-                            && !row.audit_pending()
-                    })
-                })
+            self.verify_original_legacy_claims(admission, &input)?;
+            let profile = self.final_profile_guard.as_ref().ok_or(E::Closed)?;
+            match admission
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| &bootstrap.settlement)
             {
-                return Err(E::ReserveRecovery.into());
+                Some(crate::sample_sources::db::LegacyBootstrapSettlement::Committed(
+                    bootstrap,
+                )) => {
+                    retained
+                        .source
+                        .revalidate_committed_bootstrap(
+                            profile,
+                            &retained.args,
+                            committed,
+                            bootstrap,
+                            deadline,
+                        )
+                        .map_err(|_| E::Changed)?;
+                }
+                Some(crate::sample_sources::db::LegacyBootstrapSettlement::Unknown) => {
+                    return Err(E::ReserveRecovery.into());
+                }
+                // Known bootstrap refusals/rollback do not erase the committed migration.
+                _ => retained
+                    .source
+                    .revalidate_committed_migration(profile, &retained.args, committed, deadline)
+                    .map_err(|_| E::Changed)?,
             }
-            retained
-                .source
-                .revalidate_committed_migration(
-                    self.final_profile_guard.as_ref().ok_or(E::Closed)?,
-                    &retained.args,
-                    committed,
-                    deadline,
-                )
-                .map_err(|_| E::Changed)?;
             return Ok(committed.operation);
         }
         // Prove the genuine original committed admission before installing the attempted slot.
@@ -562,6 +557,238 @@ impl OwnerRuntime {
             migration.input.historical_reply = None;
         }
         migration.settlement = settlement;
+        result
+    }
+}
+
+// This distinct borrow is created only after committed migration readback and a fresh original
+// claim/provider settlement check. Receipt bytes cannot construct it.
+pub(crate) struct OriginalLegacyBootstrapAdmission<'a> {
+    source: &'a LegacySourceReadOwner,
+    profile: &'a WritableProfileGuard,
+    args: &'a LegacyAdoptionIntentArgs,
+    migration: &'a crate::sample_sources::db::VerifiedLegacyMigration,
+    deadline: Instant,
+    _claims: &'a AdmissionClaimInventory,
+    _lease: &'a ProvisionalCapacityLease,
+}
+impl OriginalLegacyBootstrapAdmission<'_> {
+    pub(crate) fn bootstrap_inputs(
+        &self,
+    ) -> (
+        &WritableProfileGuard,
+        &LegacyAdoptionIntentArgs,
+        &crate::sample_sources::db::VerifiedLegacyMigration,
+        Instant,
+    ) {
+        (self.profile, self.args, self.migration, self.deadline)
+    }
+    pub(crate) fn source_policy(&self) -> (u64, u64, u64, u64) {
+        self.args.original_migration_policy()
+    }
+    pub(crate) fn validate_original_connection(
+        &self,
+        connection: &crate::sqlite_budget::OwnedConnection,
+    ) -> Result<(), crate::sample_sources::db::LegacyObservationError> {
+        if !self
+            .source
+            .matches_original_migration_connection(connection)
+        {
+            return Err(crate::sample_sources::db::LegacyObservationError(
+                "foreign original bootstrap connection",
+            ));
+        }
+        self.source.revalidate_committed_migration(
+            self.profile,
+            self.args,
+            self.migration,
+            self.deadline,
+        )
+    }
+    fn bootstrap(&self) -> crate::sample_sources::db::LegacyBootstrapSettlement {
+        self.source.bootstrap_original_admitted(self)
+    }
+}
+struct RetainedBootstrap {
+    settlement: crate::sample_sources::db::LegacyBootstrapSettlement,
+    input: InputPermit,
+}
+impl OwnerRuntime {
+    fn original_legacy_bootstrap_admission<'a>(
+        &'a self,
+        command: SourceCommandId,
+        digest: [u8; 32],
+        deadline: Instant,
+        input: &InputPermit,
+    ) -> Result<OriginalLegacyBootstrapAdmission<'a>, OperationJournalOwnerError> {
+        use crate::sample_sources::db::LegacyMigrationSettlement as M;
+        use LegacyAdoptionCustodyError as E;
+        let retained = self.legacy_adoption.as_ref().ok_or(E::Closed)?;
+        if retained.args.source_command_id() != command
+            || retained.digest != digest
+            || Instant::now() >= deadline
+            || retained.input.shared.status() != OperationJournalOwnerStatus::Available
+        {
+            return Err(E::Changed.into());
+        }
+        let admission = retained.admission.as_ref().ok_or(E::ReserveRecovery)?;
+        if admission.failure.is_some()
+            || !matches!(admission.outcome, Some(JournalInsertOutcome::Committed(_)))
+        {
+            return Err(E::ReserveRecovery.into());
+        }
+        let M::Committed(migration) = &admission
+            .migration
+            .as_ref()
+            .ok_or(E::ReserveRecovery)?
+            .settlement
+        else {
+            return Err(E::ReserveRecovery.into());
+        };
+        self.verify_original_legacy_claims(admission, input)?;
+        let proof = OriginalLegacyBootstrapAdmission {
+            source: &retained.source,
+            profile: self.final_profile_guard.as_ref().ok_or(E::Closed)?,
+            args: &retained.args,
+            migration,
+            deadline,
+            _claims: &admission.claims,
+            _lease: &admission.lease,
+        };
+        // The actual Source validates the exact retained connection again when entering scope.
+        retained
+            .source
+            .revalidate_committed_migration(proof.profile, proof.args, migration, deadline)
+            .map_err(|_| E::Changed)?;
+        Ok(proof)
+    }
+
+    fn verify_original_legacy_claims(
+        &self,
+        admission: &Retained,
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalOwnerError> {
+        use LegacyAdoptionCustodyError as E;
+        input.fund_historical_consumer()?;
+        self.store()
+            .verify_legacy_initial_frozen(&admission.record, &admission.claims, input)?;
+        let snapshot = self.store().rebuild_admission_snapshot_for_input(input)?;
+        let provider = self.capacity_provider.as_ref().ok_or(E::Closed)?;
+        snapshot
+            .validate_provider(provider, Some(input))
+            .map_err(|_| E::ReserveRecovery)?;
+        provider
+            .validate_recovery_state()
+            .map_err(|_| E::ReserveRecovery)?;
+        if !matches!(snapshot.readiness(), CapacityRebuildReadiness::Ready)
+            || admission.claims.claims().iter().any(|claim| {
+                !snapshot.claims().iter().any(|row| {
+                    row.claim_id() == claim.claim_id()
+                        && row.operation_id() == admission.record.operation_id
+                        && row.volume() == claim.volume()
+                        && row.allocation_class() == claim.allocation_class()
+                        && row.allocated_bytes() == claim.allocated_bytes()
+                        && row.release_id().is_none()
+                        && !row.audit_pending()
+                })
+            })
+        {
+            return Err(E::ReserveRecovery.into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn bootstrap_legacy_source(
+        &mut self,
+        command: SourceCommandId,
+        digest: [u8; 32],
+        deadline: Instant,
+        input: InputPermit,
+    ) -> Result<OperationId, OperationJournalOwnerError> {
+        use crate::sample_sources::db::{
+            LegacyBootstrapSettlement as B, LegacyMigrationSettlement as M,
+        };
+        use LegacyAdoptionCustodyError as E;
+        let retained = self.legacy_adoption.as_ref().ok_or(E::Closed)?;
+        if retained.args.source_command_id() != command
+            || retained.digest != digest
+            || Instant::now() >= deadline
+            || retained.input.shared.status() != OperationJournalOwnerStatus::Available
+        {
+            return Err(E::Changed.into());
+        }
+        let admission = retained.admission.as_ref().ok_or(E::ReserveRecovery)?;
+        if let Some(bootstrap) = &admission.bootstrap {
+            let B::Committed(bootstrap) = &bootstrap.settlement else {
+                return Err(E::ReserveRecovery.into());
+            };
+            let M::Committed(migration) = &admission
+                .migration
+                .as_ref()
+                .ok_or(E::ReserveRecovery)?
+                .settlement
+            else {
+                return Err(E::ReserveRecovery.into());
+            };
+            self.verify_original_legacy_claims(admission, &input)?;
+            retained
+                .source
+                .revalidate_committed_bootstrap(
+                    self.final_profile_guard.as_ref().ok_or(E::Closed)?,
+                    &retained.args,
+                    migration,
+                    bootstrap,
+                    deadline,
+                )
+                .map_err(|_| E::Changed)?;
+            return Ok(bootstrap.operation);
+        }
+        self.original_legacy_bootstrap_admission(command, digest, deadline, &input)?;
+        self.legacy_adoption
+            .as_mut()
+            .ok_or(E::Closed)?
+            .admission
+            .as_mut()
+            .ok_or(E::Closed)?
+            .bootstrap = Some(RetainedBootstrap {
+            settlement: B::Unknown,
+            input,
+        });
+        let settlement = {
+            let input = &self
+                .legacy_adoption
+                .as_ref()
+                .ok_or(E::Closed)?
+                .admission
+                .as_ref()
+                .ok_or(E::Closed)?
+                .bootstrap
+                .as_ref()
+                .ok_or(E::Closed)?
+                .input;
+            match self.original_legacy_bootstrap_admission(command, digest, deadline, input) {
+                Ok(proof) => proof.bootstrap(),
+                Err(_) => B::NotStarted,
+            }
+        };
+        let result = match &settlement {
+            B::Committed(bootstrap) => Ok(bootstrap.operation),
+            _ => Err(E::ReserveRecovery.into()),
+        };
+        let bootstrap = self
+            .legacy_adoption
+            .as_mut()
+            .ok_or(E::Closed)?
+            .admission
+            .as_mut()
+            .ok_or(E::Closed)?
+            .bootstrap
+            .as_mut()
+            .ok_or(E::Closed)?;
+        if matches!(settlement, B::Committed(_)) {
+            bootstrap.input.historical_reply = None;
+        }
+        bootstrap.settlement = settlement;
         result
     }
 }

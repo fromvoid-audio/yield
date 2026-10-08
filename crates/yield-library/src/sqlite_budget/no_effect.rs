@@ -50,10 +50,31 @@ mod tests;
 // Retain that borrow and the extension boundary until exact policy restoration or quarantine.
 pub(crate) struct OriginalLegacyMutationScope<'a, 'owner> {
     connection: &'a OwnedConnection,
-    _admission: &'a crate::operation_journal::owner::OriginalLegacyMigrationAdmission<'owner>,
+    _admission: OriginalLegacyAdmission<'a, 'owner>,
     _extensions: std::sync::RwLockReadGuard<'static, ()>,
     prior: [u64; 7],
     finished: bool,
+}
+enum OriginalLegacyAdmission<'a, 'owner> {
+    Migration(&'a crate::operation_journal::owner::OriginalLegacyMigrationAdmission<'owner>),
+    Bootstrap(&'a crate::operation_journal::owner::OriginalLegacyBootstrapAdmission<'owner>),
+}
+impl OriginalLegacyAdmission<'_, '_> {
+    fn validate(
+        &self,
+        connection: &OwnedConnection,
+    ) -> Result<(), crate::sample_sources::db::LegacyObservationError> {
+        match self {
+            Self::Migration(proof) => proof.validate_original_connection(connection),
+            Self::Bootstrap(proof) => proof.validate_original_connection(connection),
+        }
+    }
+    fn policy(&self) -> (u64, u64, u64, u64) {
+        match self {
+            Self::Migration(proof) => proof.source_policy(),
+            Self::Bootstrap(proof) => proof.source_policy(),
+        }
+    }
 }
 fn scalar(connection: &Connection, name: &str) -> rusqlite::Result<u64> {
     connection.pragma_query_value(None, name, |row| row.get(0))
@@ -69,9 +90,27 @@ impl OwnedConnection {
         OriginalLegacyMutationScope<'a, 'owner>,
         crate::sample_sources::db::LegacyObservationError,
     > {
+        self.enter_original_legacy_scope(OriginalLegacyAdmission::Migration(admission))
+    }
+    pub(crate) fn enter_original_legacy_bootstrap<'a, 'owner>(
+        &'a self,
+        admission: &'a crate::operation_journal::owner::OriginalLegacyBootstrapAdmission<'owner>,
+    ) -> Result<
+        OriginalLegacyMutationScope<'a, 'owner>,
+        crate::sample_sources::db::LegacyObservationError,
+    > {
+        self.enter_original_legacy_scope(OriginalLegacyAdmission::Bootstrap(admission))
+    }
+    fn enter_original_legacy_scope<'a, 'owner>(
+        &'a self,
+        admission: OriginalLegacyAdmission<'a, 'owner>,
+    ) -> Result<
+        OriginalLegacyMutationScope<'a, 'owner>,
+        crate::sample_sources::db::LegacyObservationError,
+    > {
         let extensions =
             crate::sqlite_ext::try_extension_free_metadata_scope().ok_or_else(refused_scope)?;
-        admission.validate_original_connection(self)?;
+        admission.validate(self)?;
         let registration = self.registration.as_ref().ok_or_else(refused_scope)?;
         if !self.is_autocommit() || !self.has_no_effect_fence() {
             return Err(refused_scope());
@@ -90,7 +129,7 @@ impl OwnedConnection {
                 return Err(refused_scope());
             }
         }
-        let (page_size, original_max, selected_max, sector) = admission.source_policy();
+        let (page_size, original_max, selected_max, sector) = admission.policy();
         let mode: String = self
             .pragma_query_value(None, "journal_mode", |r| r.get(0))
             .map_err(|_| refused_scope())?;

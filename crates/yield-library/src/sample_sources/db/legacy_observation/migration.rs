@@ -9,9 +9,9 @@ use crate::operation_journal::{OperationId, owner::OriginalLegacyMigrationAdmiss
 // The caller retains the original input loan after these bounded allocations.
 pub(crate) struct VerifiedLegacyMigration {
     pub(crate) operation: OperationId,
-    encoded: Vec<u8>,
-    expected: schema::SchemaImage,
-    rows_digest: [u8; 32],
+    pub(super) encoded: Vec<u8>,
+    pub(super) expected: schema::SchemaImage,
+    pub(super) rows_digest: [u8; 32],
 }
 pub(crate) enum LegacyMigrationSettlement {
     NotStarted,
@@ -20,7 +20,7 @@ pub(crate) enum LegacyMigrationSettlement {
     Committed(VerifiedLegacyMigration),
 }
 impl LegacySourceReadOwner {
-    fn validate_migration_bindings(&self, profile: &WritableProfileGuard) -> Result<()> {
+    pub(super) fn validate_migration_bindings(&self, profile: &WritableProfileGuard) -> Result<()> {
         if profile.owner_identity() != self.profile.owner_identity() {
             return Err(LegacyObservationError("foreign migration profile"));
         }
@@ -107,6 +107,7 @@ impl LegacySourceReadOwner {
                 operation,
                 &encoded,
                 &expected,
+                &expected,
                 before_rows.digest,
                 deadline,
             )
@@ -121,13 +122,39 @@ impl LegacySourceReadOwner {
             rows_digest: before_rows.digest,
         })
     }
-    fn verify_committed_migration(
+    pub(super) fn verify_committed_migration(
         &self,
         profile: &WritableProfileGuard,
         request: &crate::operation_journal::legacy_adoption_commands::LegacyAdoptionIntentArgs,
         operation: OperationId,
         encoded: &[u8],
         expected: &schema::SchemaImage,
+        actual_expected: &schema::SchemaImage,
+        rows_digest: [u8; 32],
+        deadline: Instant,
+    ) -> Result<()> {
+        if !self.connection.is_autocommit() {
+            return Err(LegacyObservationError("migration commit is not quiescent"));
+        }
+        self.verify_migration_image(
+            profile,
+            request,
+            operation,
+            encoded,
+            expected,
+            actual_expected,
+            rows_digest,
+            deadline,
+        )
+    }
+    pub(super) fn verify_migration_image(
+        &self,
+        profile: &WritableProfileGuard,
+        request: &crate::operation_journal::legacy_adoption_commands::LegacyAdoptionIntentArgs,
+        operation: OperationId,
+        encoded: &[u8],
+        expected: &schema::SchemaImage,
+        actual_expected: &schema::SchemaImage,
         rows_digest: [u8; 32],
         deadline: Instant,
     ) -> Result<()> {
@@ -137,12 +164,12 @@ impl LegacySourceReadOwner {
             .connection
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .map_err(refused)?;
-        if version != schema::SOURCE_DB_SCHEMA_VERSION || !self.connection.is_autocommit() {
+        if version != schema::SOURCE_DB_SCHEMA_VERSION {
             return Err(LegacyObservationError(
                 "migration commit is not quiescent/current",
             ));
         }
-        schema::validate_bounded_schema(&self.connection, expected).map_err(refused)?;
+        schema::validate_bounded_schema(&self.connection, actual_expected).map_err(refused)?;
         let mut statement = self.connection.prepare(
             "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB)) BETWEEN 1 AND 65536 THEN value END FROM metadata WHERE key=?1"
         ).map_err(refused)?;
@@ -192,6 +219,7 @@ impl LegacySourceReadOwner {
             request,
             committed.operation,
             &committed.encoded,
+            &committed.expected,
             &committed.expected,
             committed.rows_digest,
             deadline,

@@ -492,6 +492,31 @@ fn legacy_migration_actual_worker_refuses_without_committed_original_admission_a
 }
 
 #[test]
+fn legacy_bootstrap_actual_worker_refuses_without_committed_migration_and_preserves_bytes() {
+    let mut f = Fixture::new();
+    let source = fs::read(f.path()).unwrap();
+    let journal = journal_bytes(&f);
+    let custody = f.prepare().unwrap();
+    let before = budget(&f.client());
+    for _ in 0..2 {
+        assert!(matches!(
+            custody
+                .bootstrap_source_row()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap(),
+            Err(OperationJournalOwnerError::LegacyAdoptionCustody(
+                LegacyAdoptionCustodyError::ReserveRecovery
+            ))
+        ));
+    }
+    assert_eq!(budget(&f.client()), before);
+    assert_eq!(fs::read(f.path()).unwrap(), source);
+    assert_eq!(journal_bytes(&f), journal);
+    validate(&custody).unwrap();
+}
+
+#[test]
 fn legacy_initial_actual_queued_deadline_and_foreign_digest_refuse_before_intent() {
     let mut f = Fixture::new();
     let custody = f.prepare().unwrap();
@@ -709,6 +734,84 @@ fn legacy_migration_native_actual_worker_commits_original_receipt_and_coalesces_
             )
             .unwrap(),
         0
+    );
+    drop(connection);
+    drop(custody.bootstrap_source_row().unwrap());
+    let bootstrapped = custody
+        .bootstrap_source_row()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    assert_eq!(bootstrapped, operation);
+    assert_eq!(
+        custody
+            .migrate_source()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap(),
+        operation
+    );
+    assert_eq!(capture(), original_rows);
+    let connection = rusqlite::Connection::open_with_flags(
+        f.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [ADOPTION_METADATA_KEY],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        encoded
+    );
+    let original_lease = connection
+        .query_row(
+            "SELECT owner_identity,lease_epoch,state FROM source_lease WHERE singleton=1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(original_lease.1, 1);
+    assert_eq!(original_lease.2, "active");
+    drop(connection);
+    assert_eq!(
+        custody
+            .bootstrap_source_row()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap(),
+        operation
+    );
+    let connection = rusqlite::Connection::open_with_flags(
+        f.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT owner_identity,lease_epoch,state FROM source_lease WHERE singleton=1",
+                [],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?
+                ))
+            )
+            .unwrap(),
+        original_lease
     );
     drop(connection);
     f.close();

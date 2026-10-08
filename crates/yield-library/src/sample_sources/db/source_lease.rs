@@ -772,6 +772,64 @@ impl SourceLeaseReservation {
         }
     }
 
+    pub(in crate::sample_sources::db) fn install_original_lease_row(
+        &self,
+        control: &Connection,
+        profile: &WritableProfileGuard,
+        binding: &DatabaseFileBinding,
+        owner_identity: &str,
+    ) -> Result<i64, SourceLeaseError> {
+        self.validate_before_open(profile, binding)?;
+        binding.validate(control).map_err(map_database_error)?;
+        preflight_database_schema(control, binding.path(), false)?;
+        if !self.is_fresh() || table_exists(control)? || control.is_autocommit() {
+            return Err(SourceLeaseError::ControlUnavailable);
+        }
+        validate_no_lease_triggers(control, binding.path())?;
+        write_bootstrap_lease_row(
+            control,
+            self,
+            &self.media_root,
+            profile,
+            binding,
+            false,
+            owner_identity,
+        )
+    }
+
+    pub(in crate::sample_sources::db) fn verify_original_lease_row(
+        &self,
+        control: &Connection,
+        profile: &WritableProfileGuard,
+        binding: &DatabaseFileBinding,
+        owner_identity: &str,
+        epoch: i64,
+    ) -> Result<(), SourceLeaseError> {
+        self.validate_before_open(profile, binding)?;
+        binding.validate(control).map_err(map_database_error)?;
+        validate_lease_table_schema(control, binding.path())?;
+        let row =
+            read_lease_row(control, binding.path())?.ok_or(SourceLeaseError::ControlUnavailable)?;
+        validate_lease_row(&row, binding.path())?;
+        if row.owner_identity != owner_identity
+            || row.lease_epoch != epoch
+            || row.state != "active"
+            || row.released_at.is_some()
+            || row.media_root_identity != self.media_root.identity()
+            || row.database_root_identity != self.database_root.identity()
+            || row.database_identity != binding.identity()
+            || row.source_lock_identity != self.lock_identity
+            || row.profile_root_identity != profile.profile_root_identity()
+            || row.profile_lock_identity != profile.profile_lock_identity()
+        {
+            return Err(SourceLeaseError::Superseded {
+                path: binding.path().to_path_buf(),
+            });
+        }
+        self.validate_before_open(profile, binding)?;
+        binding.validate(control).map_err(map_database_error)
+    }
+
     fn validate_profile(
         &self,
         profile_guard: &WritableProfileGuard,
@@ -1476,11 +1534,40 @@ fn bootstrap_lease_row(
     let tx = control
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_sql_error)?;
-    if !table_exists {
-        tx.execute_batch(LEASE_TABLE_SQL).map_err(map_sql_error)?;
+    let epoch = write_bootstrap_lease_row(
+        &tx,
+        reservation,
+        media_root,
+        profile_guard,
+        database_file_binding,
+        table_exists,
+        owner_identity,
+    )?;
+    tx.commit().map_err(map_sql_error)?;
+    Ok(epoch)
+}
+
+// Exact ordinary bootstrap row body, callable only inside the retained owner's transaction.
+fn write_bootstrap_lease_row(
+    control: &Connection,
+    reservation: &SourceLeaseReservation,
+    media_root: &BoundDatabaseRoot,
+    profile_guard: &WritableProfileGuard,
+    database_file_binding: &DatabaseFileBinding,
+    table_exists: bool,
+    owner_identity: &str,
+) -> Result<i64, SourceLeaseError> {
+    if control.is_autocommit() {
+        return Err(SourceLeaseError::ControlUnavailable);
     }
-    validate_lease_table_schema(&tx, path)?;
-    let prior = read_lease_row(&tx, path)?;
+    let path = database_file_binding.path();
+    if !table_exists {
+        control
+            .execute_batch(LEASE_TABLE_SQL)
+            .map_err(map_sql_error)?;
+    }
+    validate_lease_table_schema(control, path)?;
+    let prior = read_lease_row(control, path)?;
     if table_exists && prior.is_none() {
         return Err(SourceLeaseError::LeaseStateUnavailable {
             path: path.to_path_buf(),
@@ -1509,8 +1596,9 @@ fn bootstrap_lease_row(
         owner_identity,
     ];
     if let Some(_) = prior {
-        tx.execute(
-            "UPDATE source_lease
+        control
+            .execute(
+                "UPDATE source_lease
              SET media_root_identity = ?1,
                  database_root_identity = ?2,
                  database_identity = ?3,
@@ -1524,48 +1612,48 @@ fn bootstrap_lease_row(
                  released_at = NULL,
                  state = 'active'
              WHERE singleton = 1",
-            params![
-                values[0], values[1], values[2], values[3], values[4], values[5], values[6], epoch,
-                now, expires_at
-            ],
-        )
-        .map_err(map_sql_error)?;
+                params![
+                    values[0], values[1], values[2], values[3], values[4], values[5], values[6],
+                    epoch, now, expires_at
+                ],
+            )
+            .map_err(map_sql_error)?;
     } else {
-        tx.execute(
-            "INSERT INTO source_lease (
+        control
+            .execute(
+                "INSERT INTO source_lease (
                  singleton, lease_schema_version, media_root_identity, database_root_identity,
                  database_identity,
                  source_lock_identity, profile_root_identity, profile_lock_identity,
                  owner_identity, lease_epoch, acquired_at, expires_at, released_at, state
              ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, 'active')",
-            params![
-                SOURCE_LEASE_TABLE_SCHEMA_VERSION,
-                values[0],
-                values[1],
-                values[2],
-                values[3],
-                values[4],
-                values[5],
-                values[6],
-                epoch,
-                now,
-                expires_at
-            ],
-        )
-        .map_err(map_sql_error)?;
+                params![
+                    SOURCE_LEASE_TABLE_SCHEMA_VERSION,
+                    values[0],
+                    values[1],
+                    values[2],
+                    values[3],
+                    values[4],
+                    values[5],
+                    values[6],
+                    epoch,
+                    now,
+                    expires_at
+                ],
+            )
+            .map_err(map_sql_error)?;
     }
     reservation.validate_profile(profile_guard)?;
     database_file_binding
-        .validate(&tx)
+        .validate(control)
         .map_err(map_database_error)?;
     validate_lease_row(
-        &read_lease_row(&tx, path)?.ok_or(SourceLeaseError::SchemaUnavailable {
+        &read_lease_row(control, path)?.ok_or(SourceLeaseError::SchemaUnavailable {
             path: path.to_path_buf(),
             reason: "lease row disappeared during bootstrap",
         })?,
         path,
     )?;
-    tx.commit().map_err(map_sql_error)?;
     Ok(epoch)
 }
 
@@ -2401,6 +2489,128 @@ mod tests {
             .validate_before_open(&profile, &binding)
             .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn original_lease_row_body_rolls_back_and_readback_rejects_changed_identity() {
+        // SQL/data fixture only: no adoption admission, capacity grant or SourceLease issued.
+        let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
+        let profile_root = tempfile::tempdir().unwrap();
+        let media = tempfile::tempdir().unwrap();
+        let _app = crate::app_dirs::AppRootGuard::set(profile_root.path().to_path_buf()).unwrap();
+        std::fs::create_dir(profile_root.path().join("legacy")).unwrap();
+        let path = profile_root
+            .path()
+            .join("legacy")
+            .join(super::super::DB_FILE_NAME);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../../tests/fixtures/profile-v11/source.sql"
+            ))
+            .unwrap();
+        connection.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA max_page_count=16384; BEGIN EXCLUSIVE").unwrap();
+        super::super::schema::apply_preserving_legacy_schema(&connection).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version=13; COMMIT")
+            .unwrap();
+        let expected = super::super::schema::bounded_schema_image(&connection).unwrap();
+        let profile = WritableProfileGuard::acquire_current().unwrap();
+        let database_root =
+            Arc::new(BoundDatabaseRoot::for_profile_child(&profile, Path::new("legacy")).unwrap());
+        let media_root =
+            Arc::new(BoundDatabaseRoot::for_external_source_root(&profile, media.path()).unwrap());
+        let original = super::super::sqlite_identity::open_existing_database_file(
+            &database_root,
+            Path::new(super::super::DB_FILE_NAME),
+            &path,
+        )
+        .unwrap();
+        let binding = DatabaseFileBinding::new(
+            database_root.clone(),
+            Path::new(super::super::DB_FILE_NAME),
+            &path,
+            original.identity,
+        );
+        let reservation =
+            SourceLeaseReservation::acquire(database_root.clone(), media_root.clone(), &profile)
+                .unwrap();
+        let owner = Uuid::new_v4().to_string();
+        assert!(
+            reservation
+                .install_original_lease_row(&connection, &profile, &binding, &owner)
+                .is_err()
+        );
+        connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        assert_eq!(
+            reservation
+                .install_original_lease_row(&connection, &profile, &binding, &owner)
+                .unwrap(),
+            1
+        );
+        reservation
+            .verify_original_lease_row(&connection, &profile, &binding, &owner, 1)
+            .unwrap();
+        connection.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            super::super::schema::bounded_schema_image(&connection).unwrap(),
+            expected
+        );
+        assert!(
+            SourceLeaseReservation::acquire(database_root.clone(), media_root.clone(), &profile)
+                .is_err()
+        );
+        connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let epoch = reservation
+            .install_original_lease_row(&connection, &profile, &binding, &owner)
+            .unwrap();
+        connection.execute_batch("COMMIT").unwrap();
+        let mut bootstrapped = expected;
+        bootstrapped.push((
+            "table".into(),
+            "source_lease".into(),
+            "source_lease".into(),
+            Some(LEASE_TABLE_SQL.into()),
+        ));
+        bootstrapped.sort();
+        assert_eq!(
+            super::super::schema::bounded_schema_image(&connection).unwrap(),
+            bootstrapped
+        );
+        reservation
+            .verify_original_lease_row(&connection, &profile, &binding, &owner, epoch)
+            .unwrap();
+        assert!(
+            reservation
+                .verify_original_lease_row(
+                    &connection,
+                    &profile,
+                    &binding,
+                    &Uuid::new_v4().to_string(),
+                    epoch
+                )
+                .is_err()
+        );
+        assert!(
+            reservation
+                .verify_original_lease_row(&connection, &profile, &binding, &owner, epoch + 1)
+                .is_err()
+        );
+        connection
+            .execute_batch("UPDATE source_lease SET database_identity='changed'")
+            .unwrap();
+        assert!(
+            reservation
+                .verify_original_lease_row(&connection, &profile, &binding, &owner, epoch)
+                .is_err()
+        );
+        assert!(SourceLeaseReservation::acquire(database_root, media_root, &profile).is_err());
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            13
+        );
     }
 
     #[test]
