@@ -1,8 +1,10 @@
 //! Original borrowed images, with prepaid producers retained by their values.
 use super::*;
-use crate::operation_journal::store::historical_claim_observation::borrowed_sql::Statement;
+use crate::operation_journal::store::historical_claim_observation::borrowed_sql::{
+    Statement, scalar,
+};
 use crate::operation_journal::{codec::historical_observation, owner::InputPermit};
-use rusqlite::types::{FromSql, FromSqlError, ValueRef};
+use rusqlite::types::ValueRef;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use std::{cell::RefCell, mem::size_of};
 
@@ -34,31 +36,6 @@ fn working_bytes() -> usize {
         + 6 * size_of::<UuidProjection>()
         + 4 * size_of::<InputPermit>()
         + 2048
-}
-// Use the pinned driver's actual scalar conversion and diagnostic variants.
-pub(super) fn scalar<T: FromSql>(row: &Statement<'_>, index: i32) -> Result<T> {
-    let v = row.get_ref(index)?;
-    T::column_result(v).map_err(|e| {
-        match e {
-            FromSqlError::InvalidType => rusqlite::Error::InvalidColumnType(
-                index as usize,
-                row.column_name(index).unwrap().into(),
-                v.data_type(),
-            ),
-            FromSqlError::OutOfRange(n) => {
-                rusqlite::Error::IntegralValueOutOfRange(index as usize, n)
-            }
-            FromSqlError::Other(e) => {
-                rusqlite::Error::FromSqlConversionFailure(index as usize, v.data_type(), e)
-            }
-            e => rusqlite::Error::FromSqlConversionFailure(
-                index as usize,
-                v.data_type(),
-                Box::new(e),
-            ),
-        }
-        .into()
-    })
 }
 fn uuid(row: &Statement<'_>, index: i32) -> Result<UuidProjection> {
     if let ValueRef::Text(bytes) = row.get_ref(index)? {
