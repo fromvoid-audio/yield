@@ -6,7 +6,7 @@ use std::io;
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
-    mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
+    mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
 };
 use std::time::Duration;
 
@@ -97,6 +97,28 @@ impl RecordingSettlements {
             return Err(RecvTimeoutError::Disconnected);
         }
         let joined = self.joined_rx.recv_timeout(timeout)?;
+        self.joined_taken = true;
+        debug_assert!(self.owns_completion(&joined));
+        Ok(joined)
+    }
+    /// Poll the original one-shot barrier without waiting or consuming an empty slot.
+    /// An actor must persist its bound terminal inventory before acknowledging the value.
+    pub fn try_barrier(&mut self) -> Result<RecordingTerminalBarrier, TryRecvError> {
+        if self.barrier_taken {
+            return Err(TryRecvError::Disconnected);
+        }
+        let barrier = self.barrier_rx.try_recv()?;
+        self.barrier_taken = true;
+        debug_assert!(self.owns_barrier(&barrier));
+        Ok(barrier)
+    }
+    /// Poll genuine successful finalization and join without waiting on the producer.
+    /// Worker completion before actual join is still Empty and supplies no evidence.
+    pub fn try_joined(&mut self) -> Result<RecordingJoinedCompletion, TryRecvError> {
+        if self.joined_taken {
+            return Err(TryRecvError::Disconnected);
+        }
+        let joined = self.joined_rx.try_recv()?;
         self.joined_taken = true;
         debug_assert!(self.owns_completion(&joined));
         Ok(joined)

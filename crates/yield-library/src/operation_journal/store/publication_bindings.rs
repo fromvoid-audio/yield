@@ -41,6 +41,7 @@ fn chunk_read_error(error: super::chunk_claims::ChunkClaimReadError) -> Operatio
     }
 }
 
+mod no_effect;
 mod observations;
 use observations::{
     AuthorityObservation, CommandObservation, ExpectedObservation, PublicationObservation,
@@ -69,6 +70,32 @@ pub(crate) struct PublicationBindingDraft {
     charge_generation: u64,
     charge_incremental_bytes: u64,
     chunk: Option<ChunkObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    no_effect: Option<StoredNoEffect>,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredNoEffect {
+    kind: u8,
+    reason: String,
+    digest: [u8; 32],
+}
+impl StoredNoEffect {
+    fn validate(&self, fingerprint: [u8; 32]) -> Result<(), OperationJournalStoreError> {
+        if !(1..=4).contains(&self.kind)
+            || self.reason.len()
+                > crate::file_operation_owner::FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES
+            || self.digest
+                != crate::file_operation_owner::publication_no_effect_digest(
+                    self.kind,
+                    fingerprint,
+                    &self.reason,
+                )
+        {
+            return Err(invalid("stored original no-effect completion is invalid"));
+        }
+        Ok(())
+    }
 }
 // Header + at most three source-fence string groups and two1024-byte locators
 // fit8KiB per typed projection, including the single source Vec element.
@@ -105,8 +132,15 @@ impl PublicationBindingDraft {
             charge_generation: charge_observation.0,
             charge_incremental_bytes: charge_observation.1,
             chunk: chunk.map(|(chunk_id, issue_id)| ChunkObservation { chunk_id, issue_id }),
+            no_effect: None,
         };
         record.validate_staging(staging)?;
+        // Leave room for every bounded outcome, including maximum JSON escaping.
+        if record.encode()?.len() > MAX_RECORD_BYTES - 4096 {
+            return Err(invalid(
+                "publication binding leaves no bounded completion capacity",
+            ));
+        }
         Ok(record)
     }
     fn validate_staging(
@@ -135,7 +169,8 @@ impl PublicationBindingDraft {
             .source_fence()
             .map(std::slice::from_ref)
             .unwrap_or(&[]);
-        if self.schema_version != 1
+        if !((self.schema_version == 1 && self.no_effect.is_none())
+            || (self.schema_version == 2 && self.no_effect.is_some()))
             || self.output_id != staging.output_id()
             || self.checkpoint_sequence <= 0
             || self.issuer_incarnation.is_nil()
@@ -178,6 +213,9 @@ impl PublicationBindingDraft {
                     "publication root authority differs from original source fence",
                 ));
             }
+        }
+        if let Some(completion) = &self.no_effect {
+            completion.validate(self.command_fingerprint)?;
         }
         let mut hash = CanonicalHash {
             hash: blake3::Hasher::new(),
@@ -344,7 +382,7 @@ impl OperationJournalStore {
             params![binding.output_id.to_string(), binding.publication_effect().to_string(), encoded])?;
         Ok(())
     }
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn publication_binding_observation_for_test(
         &self,
         output: Uuid,

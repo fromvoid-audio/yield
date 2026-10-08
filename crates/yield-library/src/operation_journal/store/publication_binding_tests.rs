@@ -80,26 +80,529 @@ mod publication_issuance {
         };
         (fixture, store, staging, binding, sequence)
     }
+    // Real original SQLite persistence under a test-only scalar slot; no physical grant.
+    fn no_effect_prepared() -> (
+        Fixture,
+        OperationJournalStore,
+        staging_checkpoints::StagingCheckpointRecord,
+        super::super::super::owner::JournalNamespaceFundingProbe,
+        super::super::super::owner::NoEffectSlotFixture,
+    ) {
+        let (fixture, store, staging, binding, sequence) = prepared();
+        let funding = super::super::super::owner::JournalNamespaceFundingProbe::new_publication();
+        let slot = funding.original_no_effect_slot(staging.operation_id(), staging.output_id());
+        let issuer = slot.issuer();
+        let mut observed = serde_json::to_value(binding).unwrap();
+        observed["issuer_incarnation"] = serde_json::json!(issuer.0);
+        observed["slot_generation"] = serde_json::json!(issuer.1);
+        let binding = serde_json::from_value(observed.clone()).unwrap();
+        store
+            .reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input)
+            .unwrap();
+        let fingerprint: [u8; 32] =
+            serde_json::from_value(observed["command_fingerprint"].clone()).unwrap();
+        slot.complete(
+            fingerprint,
+            "unsupported original no-effect storage fixture",
+        );
+        (fixture, store, staging, funding, slot)
+    }
+
+    #[test]
+    fn original_no_effect_completion_exact_readback_preserves_issuance_staging_and_charge() {
+        let (_fixture, store, staging, funding, slot) = no_effect_prepared();
+        let before = store.publication_binding_observation_for_test(staging.output_id());
+        let pool = funding.publication_observer();
+        let baseline = pool();
+        slot.settle(|completion| {
+            store
+                .settle_original_publication_no_effect(completion, &funding.input)
+                .is_ok()
+        });
+        assert!(!slot.unresolved());
+        assert_eq!(pool(), baseline);
+        let after = store.publication_binding_observation_for_test(staging.output_id());
+        assert_eq!(after["schema_version"], serde_json::json!(2));
+        assert_eq!(after["no_effect"]["kind"], serde_json::json!(1));
+        assert_eq!(
+            after["no_effect"]["reason"],
+            serde_json::json!("unsupported original no-effect storage fixture")
+        );
+        for key in before
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.as_str() != "schema_version")
+        {
+            assert_eq!(after[key], before[key]);
+        }
+        assert!(
+            store
+                .read_staging_checkpoint_row(staging.output_id())
+                .unwrap()
+                .unwrap()
+                .2
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_journal_ordinary_claim_release",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(store.prove_clean_handoff_durable().is_err());
+    }
+
+    #[test]
+    fn original_no_effect_duplicate_readback_and_restart_preserve_exact_completion() {
+        let (fixture, store, staging, funding, slot) = no_effect_prepared();
+        let before = funding.publication_observer()();
+        slot.settle(|completion| {
+            let first = store
+                .settle_original_publication_no_effect(completion, &funding.input)
+                .unwrap();
+            assert_eq!(format!("{first:?}"), "Committed");
+            let original = store.publication_binding_observation_for_test(staging.output_id());
+            let replay = store
+                .settle_original_publication_no_effect(completion, &funding.input)
+                .unwrap();
+            assert_eq!(format!("{replay:?}"), "Replay");
+            assert_eq!(
+                store.publication_binding_observation_for_test(staging.output_id()),
+                original
+            );
+            true
+        });
+        assert!(!slot.unresolved());
+        assert_eq!(funding.publication_observer()(), before);
+        let original = store.publication_binding_observation_for_test(staging.output_id());
+        drop(store);
+        let reopened =
+            OperationJournalStore::open(&fixture.owner).expect("actual no-effect restart");
+        assert_eq!(
+            reopened.publication_binding_observation_for_test(staging.output_id()),
+            original
+        );
+        assert!(
+            reopened
+                .read_staging_checkpoint_row(staging.output_id())
+                .unwrap()
+                .unwrap()
+                .2
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_journal_ordinary_claim",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_journal_ordinary_claim_release",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(reopened.prove_clean_handoff_durable().is_err());
+    }
+
+    #[test]
+    fn original_no_effect_corrupt_or_oversized_evidence_cannot_close_original_slot() {
+        for malformed in ["digest", "reason", "kind"] {
+            let (_fixture, store, staging, funding, slot) = no_effect_prepared();
+            let mut original = store.publication_binding_observation_for_test(staging.output_id());
+            original["schema_version"] = serde_json::json!(2);
+            original["no_effect"] =
+                serde_json::json!({"kind":1,"reason":"bounded diagnostic","digest":vec![7;32]});
+            match malformed {
+                "reason" => original["no_effect"]["reason"] = serde_json::json!("x".repeat(513)),
+                "kind" => original["no_effect"]["kind"] = serde_json::json!(0),
+                _ => {}
+            }
+            let typed: PublicationBindingDraft = serde_json::from_value(original.clone()).unwrap();
+            let encoded = typed.encode().unwrap();
+            store.connection.execute("UPDATE operation_journal_publication_issuance SET record = ?1 WHERE output_id = ?2", params![encoded, staging.output_id().to_string()]).unwrap();
+            slot.settle(|completion| {
+                store
+                    .settle_original_publication_no_effect(completion, &funding.input)
+                    .is_ok()
+            });
+            assert!(slot.unresolved());
+            assert!(store.connection.is_autocommit());
+            let retained: Vec<u8> = store.connection.query_row(
+                "SELECT record FROM operation_journal_publication_issuance WHERE output_id = ?1",
+                [staging.output_id().to_string()], |row| row.get(0)).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&retained).unwrap(),
+                original
+            );
+            assert!(store.read_publication_binding(staging.output_id()).is_err());
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM operation_journal_ordinary_claim_release",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn original_no_effect_actor_poll_persists_or_quarantines_without_queue_admission() {
+        for lose_ack in [false, true] {
+            let (_fixture, store, staging, funding, mut slot) = no_effect_prepared();
+            if lose_ack {
+                store.set_insert_test_hook(|boundary| {
+                    if boundary == InsertTestBoundary::AfterCommit {
+                        InsertTestDirective::Fail(OperationJournalStoreError::SequenceExhausted)
+                    } else {
+                        InsertTestDirective::Continue
+                    }
+                });
+            }
+            let before = funding.publication_observer()();
+            let store = slot.poll_original_actor(store);
+            assert_eq!(slot.unresolved(), lose_ack);
+            let retained = store.publication_binding_observation_for_test(staging.output_id());
+            assert_eq!(
+                retained["no_effect"]["reason"],
+                serde_json::json!("unsupported original no-effect storage fixture")
+            );
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM operation_journal_ordinary_claim_release",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            if !lose_ack {
+                assert_eq!(funding.publication_observer()(), before);
+            }
+            assert!(store.prove_clean_handoff_durable().is_err());
+        }
+    }
+
+    #[test]
+    fn original_no_effect_failure_before_commit_rolls_back_and_keeps_original_latch_uncertain() {
+        let (_fixture, store, staging, funding, slot) = no_effect_prepared();
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::SequenceExhausted)
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        slot.settle(|completion| {
+            store
+                .settle_original_publication_no_effect(completion, &funding.input)
+                .is_ok()
+        });
+        assert!(slot.unresolved());
+        assert!(store.connection.is_autocommit());
+        let record = store.publication_binding_observation_for_test(staging.output_id());
+        assert_eq!(record["schema_version"], serde_json::json!(1));
+        assert!(record.get("no_effect").is_none());
+        assert!(
+            store
+                .read_staging_checkpoint_row(staging.output_id())
+                .unwrap()
+                .unwrap()
+                .2
+        );
+    }
+
+    #[test]
+    fn original_no_effect_lost_commit_ack_retains_durable_record_and_uncertain_live_slot() {
+        for boundary in [InsertTestBoundary::Commit, InsertTestBoundary::AfterCommit] {
+            let (_fixture, store, staging, funding, slot) = no_effect_prepared();
+            store.set_insert_test_hook(move |at| {
+                if at == boundary {
+                    if at == InsertTestBoundary::Commit {
+                        InsertTestDirective::ExecuteThenFail(
+                            OperationJournalStoreError::SequenceExhausted,
+                        )
+                    } else {
+                        InsertTestDirective::Fail(OperationJournalStoreError::SequenceExhausted)
+                    }
+                } else {
+                    InsertTestDirective::Continue
+                }
+            });
+            slot.settle(|completion| {
+                store
+                    .settle_original_publication_no_effect(completion, &funding.input)
+                    .is_ok()
+            });
+            assert!(slot.unresolved());
+            assert!(store.connection.is_autocommit());
+            let record = store.publication_binding_observation_for_test(staging.output_id());
+            assert_eq!(record["schema_version"], serde_json::json!(2));
+            assert_eq!(record["no_effect"]["kind"], serde_json::json!(1));
+            assert_eq!(
+                record["no_effect"]["reason"],
+                serde_json::json!("unsupported original no-effect storage fixture")
+            );
+            assert!(store.prove_clean_handoff_durable().is_err());
+        }
+    }
+
+    #[test]
+    fn original_no_effect_foreign_issuance_and_changed_digest_refuse_without_overwriting() {
+        for field in ["issuer_incarnation", "slot_generation", "no_effect"] {
+            let (_fixture, store, staging, funding, slot) = no_effect_prepared();
+            let mut original = store.publication_binding_observation_for_test(staging.output_id());
+            match field {
+                "issuer_incarnation" => original[field] = serde_json::json!(Uuid::new_v4()),
+                "slot_generation" => original[field] = serde_json::json!(2),
+                _ => {
+                    original["schema_version"] = serde_json::json!(2);
+                    let fingerprint: [u8; 32] =
+                        serde_json::from_value(original["command_fingerprint"].clone()).unwrap();
+                    let reason = "conflicting exact no-effect diagnostic";
+                    original[field] = serde_json::json!({"kind":1,"reason":reason,"digest":crate::file_operation_owner::publication_no_effect_digest(1, fingerprint, reason)});
+                }
+            }
+            let record = serde_json::to_vec(&original).unwrap();
+            // Re-encode the typed draft to maintain exact canonical field ordering.
+            let typed: PublicationBindingDraft = serde_json::from_slice(&record).unwrap();
+            let bytes = typed.encode().unwrap();
+            store.connection.execute("UPDATE operation_journal_publication_issuance SET record = ?1 WHERE output_id = ?2", params![bytes, staging.output_id().to_string()]).unwrap();
+            slot.settle(|completion| {
+                store
+                    .settle_original_publication_no_effect(completion, &funding.input)
+                    .is_ok()
+            });
+            assert!(slot.unresolved());
+            assert_eq!(
+                store.publication_binding_observation_for_test(staging.output_id()),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn original_publication_input_funds_real_namespace_checkpoint_and_reserved_binding() {
+        let (_fixture, store, staging, binding, _) = prepared();
+        store
+            .connection
+            .execute("DELETE FROM operation_journal_staging_checkpoints", [])
+            .unwrap();
+        let funding = super::super::super::owner::JournalNamespaceFundingProbe::new_publication();
+        let observer = funding.publication_observer();
+        let before = observer();
+        let sequence = match store
+            .checkpoint_staging_with_input(&staging, Some(&funding.input))
+            .unwrap()
+        {
+            staging_checkpoints::StagingCheckpointReceipt::Committed { sequence } => sequence,
+            _ => panic!("fresh original checkpoint"),
+        };
+        assert_eq!(observer(), before);
+        store
+            .reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input)
+            .unwrap();
+        assert_eq!(observer(), before);
+        assert!(
+            store
+                .read_staging_checkpoint_row(staging.output_id())
+                .unwrap()
+                .unwrap()
+                .2
+        );
+        assert!(store
+            .read_publication_binding(staging.output_id())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn original_publication_namespace_failure_keeps_both_debits_through_selected_error() {
+        let (_fixture, store, staging, binding, sequence) = prepared();
+        let funding = super::super::super::owner::JournalNamespaceFundingProbe::new_publication();
+        let observer = funding.publication_observer();
+        let ordinary = funding.pool_bytes_observer_for_test();
+        let before = observer();
+        let sidecar = store
+            .database_path
+            .with_file_name(format!("{JOURNAL_DATABASE_FILE_NAME}{SQLITE_WAL_SUFFIX}"));
+        std::fs::write(sidecar, b"unexpected retained namespace evidence").unwrap();
+        let error = store
+            .reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input)
+            .unwrap_err();
+        assert!(observer().0 < before.0 && observer().1 < before.1);
+        let error = funding.retain_command_error_for_test(error);
+        drop(funding);
+        assert!(observer().0 < ordinary().1);
+        assert!(observer().1 < 2 * 1024 * 1024);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT grant_reserved FROM operation_journal_staging_checkpoints",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            error,
+            super::super::super::owner::OperationJournalOwnerError::RetainedBacking(_)
+        ));
+        drop(error);
+        assert_eq!(observer(), (ordinary().1, 2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn original_publication_subset_exhaustion_refuses_before_sql_with_ordinary_credit_remaining() {
+        let (_fixture, store, staging, binding, sequence) = prepared();
+        let funding = super::super::super::owner::JournalNamespaceFundingProbe::new_publication();
+        let observer = funding.publication_observer();
+        let before = observer();
+        let pressure = funding.input.reserve_historical_scratch(before.1).unwrap();
+        assert_eq!(observer().1, 0);
+        assert!(observer().0 > 1024 * 1024);
+        assert!(matches!(
+            store.reserve_publication_binding_funded_fixture(
+                &staging,
+                sequence,
+                binding,
+                &funding.input
+            ),
+            Err(OperationJournalStoreError::OrdinaryRebuildResourceBound)
+        ));
+        assert!(
+            !store
+                .read_staging_checkpoint_row(staging.output_id())
+                .unwrap()
+                .unwrap()
+                .2
+        );
+        assert!(store
+            .read_publication_binding(staging.output_id())
+            .unwrap()
+            .is_none());
+        drop(pressure);
+        assert_eq!(observer(), before);
+    }
+
+    #[test]
+    fn original_publication_postcommit_failure_keeps_reserved_evidence_and_both_error_debits() {
+        let (_fixture, store, staging, binding, sequence) = prepared();
+        let funding = super::super::super::owner::JournalNamespaceFundingProbe::new_publication();
+        let observer = funding.publication_observer();
+        let ordinary = funding.pool_bytes_observer_for_test();
+        let path = store.database_path.clone();
+        store.set_insert_test_hook(move |boundary| {
+            if boundary == InsertTestBoundary::AfterCommit {
+                let sidecar =
+                    path.with_file_name(format!("{JOURNAL_DATABASE_FILE_NAME}{SQLITE_WAL_SUFFIX}"));
+                std::fs::write(sidecar, b"unexpected postcommit evidence").unwrap();
+            }
+            InsertTestDirective::Continue
+        });
+        let error = store
+            .reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OperationJournalStoreError::StagingOutcomeUncertain { .. }
+        ));
+        let error = funding.retain_command_error_for_test(error);
+        drop(funding);
+        assert!(observer().0 < ordinary().1 && observer().1 < 2 * 1024 * 1024);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT grant_reserved FROM operation_journal_staging_checkpoints",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_journal_publication_issuance",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        drop(error);
+        assert_eq!(observer(), (ordinary().1, 2 * 1024 * 1024));
+    }
+
     #[test]
     fn publication_namespace_pressure_refuses_checkpoint_and_grant_before_writes() {
         let (_fixture, store, staging, binding, sequence) = prepared();
         let funding = super::super::super::owner::JournalNamespaceFundingProbe::new();
-        let pressure = funding.input.reserve_historical_scratch(funding.remaining_bytes()).unwrap();
+        let pressure = funding
+            .input
+            .reserve_historical_scratch(funding.remaining_bytes())
+            .unwrap();
         assert!(matches!(
-            store.reserve_publication_binding_funded_fixture(&staging, sequence, binding.clone(), &funding.input),
+            store.reserve_publication_binding_funded_fixture(
+                &staging,
+                sequence,
+                binding.clone(),
+                &funding.input
+            ),
             Err(OperationJournalStoreError::OrdinaryRebuildResourceBound)
         ));
-        assert!(!store.read_staging_checkpoint_row(staging.output_id()).unwrap().unwrap().2);
-        assert!(store.read_publication_binding(staging.output_id()).unwrap().is_none());
-        store.connection.execute("DELETE FROM operation_journal_staging_checkpoints", []).unwrap();
+        assert!(
+            !store
+                .read_staging_checkpoint_row(staging.output_id())
+                .unwrap()
+                .unwrap()
+                .2
+        );
+        assert!(store
+            .read_publication_binding(staging.output_id())
+            .unwrap()
+            .is_none());
+        store
+            .connection
+            .execute("DELETE FROM operation_journal_staging_checkpoints", [])
+            .unwrap();
         assert!(matches!(
             store.checkpoint_staging_with_input(&staging, Some(&funding.input)),
             Err(OperationJournalStoreError::OrdinaryRebuildResourceBound)
         ));
-        assert!(store.read_staging_checkpoint_row(staging.output_id()).unwrap().is_none());
+        assert!(store
+            .read_staging_checkpoint_row(staging.output_id())
+            .unwrap()
+            .is_none());
         drop(pressure);
         assert!(matches!(
-            store.checkpoint_staging_with_input(&staging, Some(&funding.input)).unwrap(),
+            store
+                .checkpoint_staging_with_input(&staging, Some(&funding.input))
+                .unwrap(),
             staging_checkpoints::StagingCheckpointReceipt::Committed { .. }
         ));
     }
@@ -107,21 +610,42 @@ mod publication_issuance {
     #[test]
     fn publication_namespace_success_and_replay_return_temporary_debits() {
         let (_fixture, store, staging, binding, _) = prepared();
-        store.connection.execute("DELETE FROM operation_journal_staging_checkpoints", []).unwrap();
+        store
+            .connection
+            .execute("DELETE FROM operation_journal_staging_checkpoints", [])
+            .unwrap();
         let funding = super::super::super::owner::JournalNamespaceFundingProbe::new();
         let before = funding.remaining_bytes();
-        let sequence = match store.checkpoint_staging_with_input(&staging, Some(&funding.input)).unwrap() {
+        let sequence = match store
+            .checkpoint_staging_with_input(&staging, Some(&funding.input))
+            .unwrap()
+        {
             staging_checkpoints::StagingCheckpointReceipt::Committed { sequence } => sequence,
             _ => panic!("fresh checkpoint"),
         };
         assert_eq!(funding.remaining_bytes(), before);
-        assert_eq!(store.checkpoint_staging_with_input(&staging, Some(&funding.input)).unwrap(),
-            staging_checkpoints::StagingCheckpointReceipt::Replay { sequence });
+        assert_eq!(
+            store
+                .checkpoint_staging_with_input(&staging, Some(&funding.input))
+                .unwrap(),
+            staging_checkpoints::StagingCheckpointReceipt::Replay { sequence }
+        );
         assert_eq!(funding.remaining_bytes(), before);
-        store.reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input).unwrap();
+        store
+            .reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input)
+            .unwrap();
         assert_eq!(funding.remaining_bytes(), before);
-        assert!(store.read_staging_checkpoint_row(staging.output_id()).unwrap().unwrap().2);
-        assert!(store.read_publication_binding(staging.output_id()).unwrap().is_some());
+        assert!(
+            store
+                .read_staging_checkpoint_row(staging.output_id())
+                .unwrap()
+                .unwrap()
+                .2
+        );
+        assert!(store
+            .read_publication_binding(staging.output_id())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -129,19 +653,36 @@ mod publication_issuance {
         let (_fixture, store, staging, binding, sequence) = prepared();
         let funding = super::super::super::owner::JournalNamespaceFundingProbe::new();
         let observer = funding.pool_bytes_observer_for_test();
-        let sidecar = store.database_path.with_file_name(format!("{JOURNAL_DATABASE_FILE_NAME}{SQLITE_WAL_SUFFIX}"));
+        let sidecar = store
+            .database_path
+            .with_file_name(format!("{JOURNAL_DATABASE_FILE_NAME}{SQLITE_WAL_SUFFIX}"));
         std::fs::write(sidecar, b"unexpected namespace evidence").unwrap();
         let before = funding.remaining_bytes();
-        let error = store.reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input).unwrap_err();
+        let error = store
+            .reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input)
+            .unwrap_err();
         assert!(funding.remaining_bytes() < before);
         let error = funding.retain_command_error_for_test(error);
-        assert!(matches!(error, super::super::super::owner::OperationJournalOwnerError::RetainedBacking(_)));
+        assert!(matches!(
+            error,
+            super::super::super::owner::OperationJournalOwnerError::RetainedBacking(_)
+        ));
         drop(funding);
         assert!(observer().0 < observer().1);
         drop(error);
         assert_eq!(observer().0, observer().1);
         // The actual open SQLite connection remains unchanged; no reservation was written.
-        assert_eq!(store.connection.query_row("SELECT grant_reserved FROM operation_journal_staging_checkpoints", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT grant_reserved FROM operation_journal_staging_checkpoints",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -152,18 +693,44 @@ mod publication_issuance {
         let path = store.database_path.clone();
         store.set_insert_test_hook(move |boundary| {
             if boundary == InsertTestBoundary::AfterCommit {
-                let sidecar = path.with_file_name(format!("{JOURNAL_DATABASE_FILE_NAME}{SQLITE_WAL_SUFFIX}"));
+                let sidecar =
+                    path.with_file_name(format!("{JOURNAL_DATABASE_FILE_NAME}{SQLITE_WAL_SUFFIX}"));
                 std::fs::write(sidecar, b"unexpected namespace evidence").unwrap();
             }
             InsertTestDirective::Continue
         });
-        let error = store.reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input).unwrap_err();
-        assert!(matches!(error, OperationJournalStoreError::StagingOutcomeUncertain { .. }));
+        let error = store
+            .reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OperationJournalStoreError::StagingOutcomeUncertain { .. }
+        ));
         let error = funding.retain_command_error_for_test(error);
         drop(funding);
         assert!(observer().0 < observer().1);
-        assert_eq!(store.connection.query_row("SELECT grant_reserved FROM operation_journal_staging_checkpoints", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
-        assert_eq!(store.connection.query_row("SELECT COUNT(*) FROM operation_journal_publication_issuance", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT grant_reserved FROM operation_journal_staging_checkpoints",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_journal_publication_issuance",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
         drop(error);
         assert_eq!(observer().0, observer().1);
     }
@@ -173,27 +740,52 @@ mod publication_issuance {
         for grant in [false, true] {
             let (_fixture, store, staging, binding, sequence) = prepared();
             if !grant {
-                store.connection.execute("DELETE FROM operation_journal_staging_checkpoints", []).unwrap();
+                store
+                    .connection
+                    .execute("DELETE FROM operation_journal_staging_checkpoints", [])
+                    .unwrap();
             }
-            let funding = std::sync::Arc::new(super::super::super::owner::JournalNamespaceFundingProbe::new());
+            let funding = std::sync::Arc::new(
+                super::super::super::owner::JournalNamespaceFundingProbe::new(),
+            );
             let pressure = std::sync::Arc::new(std::sync::Mutex::new(None));
             let held = pressure.clone();
             let original = funding.clone();
             store.set_insert_test_hook(move |boundary| {
                 if boundary == InsertTestBoundary::BeforePrecommitValidation {
-                    *held.lock().unwrap() = Some(original.input.reserve_historical_scratch(original.remaining_bytes()).unwrap());
+                    *held.lock().unwrap() = Some(
+                        original
+                            .input
+                            .reserve_historical_scratch(original.remaining_bytes())
+                            .unwrap(),
+                    );
                 }
                 InsertTestDirective::Continue
             });
             let result = if grant {
-                store.reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input)
+                store.reserve_publication_binding_funded_fixture(
+                    &staging,
+                    sequence,
+                    binding,
+                    &funding.input,
+                )
             } else {
-                store.checkpoint_staging_with_input(&staging, Some(&funding.input)).map(|_| ())
+                store
+                    .checkpoint_staging_with_input(&staging, Some(&funding.input))
+                    .map(|_| ())
             };
-            assert!(matches!(result, Err(OperationJournalStoreError::OrdinaryRebuildResourceBound)));
+            assert!(matches!(
+                result,
+                Err(OperationJournalStoreError::OrdinaryRebuildResourceBound)
+            ));
             assert!(store.connection.is_autocommit());
-            assert!(store.read_publication_binding(staging.output_id()).unwrap().is_none());
-            let row = store.read_staging_checkpoint_row(staging.output_id()).unwrap();
+            assert!(store
+                .read_publication_binding(staging.output_id())
+                .unwrap()
+                .is_none());
+            let row = store
+                .read_staging_checkpoint_row(staging.output_id())
+                .unwrap();
             assert_eq!(row.is_some(), grant);
             assert!(row.is_none_or(|(_, _, reserved)| !reserved));
             drop(pressure.lock().unwrap().take());
@@ -205,27 +797,60 @@ mod publication_issuance {
         for grant in [false, true] {
             let (_fixture, store, staging, binding, sequence) = prepared();
             if !grant {
-                store.connection.execute("DELETE FROM operation_journal_staging_checkpoints", []).unwrap();
+                store
+                    .connection
+                    .execute("DELETE FROM operation_journal_staging_checkpoints", [])
+                    .unwrap();
             }
-            let funding = std::sync::Arc::new(super::super::super::owner::JournalNamespaceFundingProbe::new());
+            let funding = std::sync::Arc::new(
+                super::super::super::owner::JournalNamespaceFundingProbe::new(),
+            );
             let pressure = std::sync::Arc::new(std::sync::Mutex::new(None));
             let held = pressure.clone();
             let original = funding.clone();
             store.set_insert_test_hook(move |boundary| {
                 if boundary == InsertTestBoundary::AfterCommit {
-                    *held.lock().unwrap() = Some(original.input.reserve_historical_scratch(original.remaining_bytes()).unwrap());
+                    *held.lock().unwrap() = Some(
+                        original
+                            .input
+                            .reserve_historical_scratch(original.remaining_bytes())
+                            .unwrap(),
+                    );
                 }
                 InsertTestDirective::Continue
             });
             let result = if grant {
-                store.reserve_publication_binding_funded_fixture(&staging, sequence, binding, &funding.input)
+                store.reserve_publication_binding_funded_fixture(
+                    &staging,
+                    sequence,
+                    binding,
+                    &funding.input,
+                )
             } else {
-                store.checkpoint_staging_with_input(&staging, Some(&funding.input)).map(|_| ())
+                store
+                    .checkpoint_staging_with_input(&staging, Some(&funding.input))
+                    .map(|_| ())
             };
-            assert!(matches!(result, Err(OperationJournalStoreError::StagingNamespaceOutcomeUncertain)));
+            assert!(matches!(
+                result,
+                Err(OperationJournalStoreError::StagingNamespaceOutcomeUncertain)
+            ));
             assert!(store.connection.is_autocommit());
-            assert_eq!(store.read_staging_checkpoint_row(staging.output_id()).unwrap().unwrap().2, grant);
-            assert_eq!(store.read_publication_binding(staging.output_id()).unwrap().is_some(), grant);
+            assert_eq!(
+                store
+                    .read_staging_checkpoint_row(staging.output_id())
+                    .unwrap()
+                    .unwrap()
+                    .2,
+                grant
+            );
+            assert_eq!(
+                store
+                    .read_publication_binding(staging.output_id())
+                    .unwrap()
+                    .is_some(),
+                grant
+            );
             assert_eq!(funding.remaining_bytes(), 0);
             drop(pressure.lock().unwrap().take());
         }
@@ -308,8 +933,8 @@ mod publication_issuance {
             .unwrap()
             .unwrap();
         assert_eq!(
-            serde_json::to_value(retained).unwrap()["command"]["effect"]["PublishNoReplace"]["target"]
-                ["binding"]["locator"],
+            serde_json::to_value(retained).unwrap()["command"]["effect"]["PublishNoReplace"]
+                ["target"]["binding"]["locator"],
             leaf
         );
         for bad in [
@@ -321,17 +946,15 @@ mod publication_issuance {
         ] {
             assert!(crate::file_operation_owner::BoundedRelativeLocator::new(bad).is_err());
             let canonical = command_bytes(&staging, owner, Uuid::new_v4(), bad);
-            assert!(
-                PublicationBindingDraft::capture(
-                    &canonical,
-                    &staging,
-                    &claim,
-                    (2, 1),
-                    None,
-                    (Uuid::new_v4(), 1)
-                )
-                .is_err()
-            );
+            assert!(PublicationBindingDraft::capture(
+                &canonical,
+                &staging,
+                &claim,
+                (2, 1),
+                None,
+                (Uuid::new_v4(), 1)
+            )
+            .is_err());
         }
     }
 
@@ -350,11 +973,9 @@ mod publication_issuance {
             store.get(staging.operation_id()).expect("operation after"),
             before
         );
-        assert!(
-            store
-                .reserve_publication_binding_fixture(&staging, sequence, binding)
-                .is_err()
-        );
+        assert!(store
+            .reserve_publication_binding_fixture(&staging, sequence, binding)
+            .is_err());
         assert_eq!(
             store
                 .read_publication_binding(staging.output_id())
@@ -381,11 +1002,9 @@ mod publication_issuance {
                 .unwrap(),
             Some((sequence, staging.clone(), true))
         );
-        assert!(
-            reopened
-                .reserve_publication_binding_fixture(&staging, sequence, prepared_binding(&staging))
-                .is_err()
-        );
+        assert!(reopened
+            .reserve_publication_binding_fixture(&staging, sequence, prepared_binding(&staging))
+            .is_err());
     }
     fn prepared_binding(
         staging: &staging_checkpoints::StagingCheckpointRecord,
@@ -475,12 +1094,10 @@ mod publication_issuance {
                 .unwrap()
                 .2
         );
-        assert!(
-            reopened
-                .read_publication_binding(staging.output_id())
-                .unwrap()
-                .is_some()
-        );
+        assert!(reopened
+            .read_publication_binding(staging.output_id())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -537,12 +1154,10 @@ mod publication_issuance {
                     .unwrap()
                     .2
             );
-            assert!(
-                store
-                    .read_publication_binding(staging.output_id())
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(store
+                .read_publication_binding(staging.output_id())
+                .unwrap()
+                .is_none());
         }
         store
             .reserve_publication_binding_fixture(&staging, sequence, binding)
@@ -575,22 +1190,18 @@ mod publication_issuance {
                 .unwrap(),
             Some(before)
         );
-        assert!(
-            reopened
-                .read_publication_binding(staging.output_id())
-                .unwrap()
-                .is_none()
-        );
+        assert!(reopened
+            .read_publication_binding(staging.output_id())
+            .unwrap()
+            .is_none());
         let version: i64 = reopened
             .connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 13);
-        assert!(
-            reopened
-                .reserve_publication_binding_fixture(&staging, sequence, prepared_binding(&staging))
-                .is_err()
-        );
+        assert!(reopened
+            .reserve_publication_binding_fixture(&staging, sequence, prepared_binding(&staging))
+            .is_err());
         assert!(reopened.prove_clean_handoff_durable().is_err());
     }
 
@@ -669,11 +1280,9 @@ mod publication_issuance {
         let issue = Uuid::new_v4();
         value["chunk"] = serde_json::json!({"chunk_id":chunk,"issue_id":issue});
         let selected: PublicationBindingDraft = serde_json::from_value(value.clone()).unwrap();
-        assert!(
-            store
-                .reserve_publication_binding_fixture(&staging, sequence, selected.clone())
-                .is_err()
-        );
+        assert!(store
+            .reserve_publication_binding_fixture(&staging, sequence, selected.clone())
+            .is_err());
         // This is a durable row observation, not a Native grant or allocation fixture.
         store.connection.execute("INSERT INTO operation_journal_chunk_claim
             (chunk_id,operation_id,claim_id,participant_id,output_key,logical_offset,logical_length,
@@ -681,11 +1290,9 @@ mod publication_issuance {
             VALUES (?1,?2,?3,?4,'staged.wav',0,1,'1','DestinationStaging',1,1,1,'Claimed',NULL,NULL)",
             params![chunk.to_string(), staging.operation_id().to_string(),
                 value["charge"]["claim_id"].as_str().unwrap(), staging.participant_id().to_string()]).unwrap();
-        assert!(
-            store
-                .reserve_publication_binding_fixture(&staging, sequence, selected.clone())
-                .is_err()
-        );
+        assert!(store
+            .reserve_publication_binding_fixture(&staging, sequence, selected.clone())
+            .is_err());
         store
             .connection
             .execute(
@@ -693,11 +1300,9 @@ mod publication_issuance {
                 params![Uuid::new_v4().to_string()],
             )
             .unwrap();
-        assert!(
-            store
-                .reserve_publication_binding_fixture(&staging, sequence, selected.clone())
-                .is_err()
-        );
+        assert!(store
+            .reserve_publication_binding_fixture(&staging, sequence, selected.clone())
+            .is_err());
         assert!(
             !store
                 .read_staging_checkpoint_row(staging.output_id())
@@ -715,12 +1320,10 @@ mod publication_issuance {
         store
             .reserve_publication_binding_fixture(&staging, sequence, selected)
             .unwrap();
-        assert!(
-            store
-                .read_publication_binding(staging.output_id())
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .read_publication_binding(staging.output_id())
+            .unwrap()
+            .is_some());
         store
             .connection
             .execute(
@@ -743,27 +1346,23 @@ mod publication_issuance {
         let (_fixture, store, staging, binding, sequence) = prepared();
         let value = serde_json::to_value(&binding).unwrap();
         let claim: AdmissionClaim = serde_json::from_value(value["charge"].clone()).unwrap();
-        assert!(
-            PublicationBindingDraft::capture(
-                &vec![b' '; 12 * 1024 + 1],
-                &staging,
-                &claim,
-                (1, 1),
-                None,
-                (Uuid::new_v4(), 1)
-            )
-            .is_err()
-        );
+        assert!(PublicationBindingDraft::capture(
+            &vec![b' '; 12 * 1024 + 1],
+            &staging,
+            &claim,
+            (1, 1),
+            None,
+            (Uuid::new_v4(), 1)
+        )
+        .is_err());
         let bytes = binding.encode().unwrap();
         store.connection.execute("WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n<8192)
             INSERT INTO operation_journal_publication_issuance(output_id,publication_effect_id,record)
             SELECT printf('00000000-0000-4000-8000-%012d',n),printf('10000000-0000-4000-8000-%012d',n),?1 FROM rows",
             params![bytes]).unwrap();
-        assert!(
-            store
-                .reserve_publication_binding_fixture(&staging, sequence, binding)
-                .is_err()
-        );
+        assert!(store
+            .reserve_publication_binding_fixture(&staging, sequence, binding)
+            .is_err());
         assert!(
             !store
                 .read_staging_checkpoint_row(staging.output_id())
@@ -771,23 +1370,19 @@ mod publication_issuance {
                 .unwrap()
                 .2
         );
-        assert!(
-            store
-                .read_publication_binding(staging.output_id())
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .read_publication_binding(staging.output_id())
+            .unwrap()
+            .is_none());
     }
     #[test]
     fn publication_issuance_effect_collision_rolls_back_original_boolean() {
         let (_fixture, store, staging, binding, sequence) = prepared();
         store.connection.execute("INSERT INTO operation_journal_publication_issuance(output_id,publication_effect_id,record) VALUES (?1,?2,?3)",
             params![Uuid::new_v4().to_string(),binding.publication_effect().to_string(),binding.encode().unwrap()]).unwrap();
-        assert!(
-            store
-                .reserve_publication_binding_fixture(&staging, sequence, binding)
-                .is_err()
-        );
+        assert!(store
+            .reserve_publication_binding_fixture(&staging, sequence, binding)
+            .is_err());
         assert!(
             !store
                 .read_staging_checkpoint_row(staging.output_id())
@@ -795,12 +1390,10 @@ mod publication_issuance {
                 .unwrap()
                 .2
         );
-        assert!(
-            store
-                .read_publication_binding(staging.output_id())
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .read_publication_binding(staging.output_id())
+            .unwrap()
+            .is_none());
         let count: i64 = store
             .connection
             .query_row(
@@ -852,11 +1445,9 @@ mod publication_issuance {
                     params![corrupt, staging.output_id().to_string()],
                 )
                 .unwrap();
-            assert!(
-                store
-                    .read_staging_checkpoint_row(staging.output_id())
-                    .is_err()
-            );
+            assert!(store
+                .read_staging_checkpoint_row(staging.output_id())
+                .is_err());
             assert!(store.read_publication_binding(staging.output_id()).is_err());
             let reserved:bool=store.connection.query_row("SELECT grant_reserved FROM operation_journal_staging_checkpoints WHERE output_id=?1",
                 params![staging.output_id().to_string()],|row|row.get(0)).unwrap();
@@ -869,12 +1460,10 @@ mod publication_issuance {
                 params![original, staging.output_id().to_string()],
             )
             .unwrap();
-        assert!(
-            store
-                .read_publication_binding(staging.output_id())
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .read_publication_binding(staging.output_id())
+            .unwrap()
+            .is_some());
     }
 
     #[test]

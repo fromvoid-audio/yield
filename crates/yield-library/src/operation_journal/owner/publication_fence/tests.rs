@@ -291,7 +291,10 @@ fn original_completion_worker_panic_and_zero_generation_never_become_closed_or_r
             operation: OperationId::new(),
             source: SourceRegistrationId::model_key_for_tests(0),
             generation: 0,
+            incarnation: registry.incarnation,
+            output: OnceLock::new(),
             state: Mutex::new(State::Pending),
+            detail: Mutex::new(None),
             _backing: registry.input.as_ref().unwrap().clone(),
         }),
         entered: false,
@@ -504,4 +507,52 @@ fn publication_fence_custody_backpressure_precedes_header_and_slot_allocation() 
         shared.input_bytes.lock().unwrap().publication_remaining,
         super::super::PUBLICATION_INPUT_BYTES
     );
+}
+
+#[test]
+fn original_no_effect_slot_closes_only_after_exact_durable_callback_without_slot_lock() {
+    let shared = shared();
+    let mut registry = Registry::new();
+    let operation = OperationId::new();
+    let mut pending = registry.issue(operation, &shared).unwrap();
+    pending.bind_reserved_output(uuid::Uuid::new_v4()).unwrap();
+    pending.complete_before_effect([7; 32], true);
+    let mut calls = 0;
+    registry.settle_no_effects(|completion| {
+        calls += 1;
+        assert_eq!(completion.binding().0, operation);
+        // This must be available while the actual store callback runs.
+        assert!(pending.fence.state.try_lock().is_ok());
+        assert!(registry.close_for_cancellation(operation).is_err());
+        true
+    });
+    assert_eq!(calls, 1);
+    assert!(!registry.unresolved());
+    assert!(registry.close_for_cancellation(operation).is_ok());
+    assert!(!pending.enter());
+    pending.complete_before_effect([7; 32], true);
+    assert!(!registry.unresolved());
+    pending.complete_before_effect([8; 32], true);
+    assert!(registry.unresolved());
+    assert!(registry.close_for_mutation(operation).is_err());
+}
+
+#[test]
+fn original_no_effect_callback_failure_or_completion_race_stays_uncertain() {
+    for conflict in [false, true] {
+        let shared = shared();
+        let mut registry = Registry::new();
+        let mut pending = registry.issue(OperationId::new(), &shared).unwrap();
+        pending.bind_reserved_output(uuid::Uuid::new_v4()).unwrap();
+        pending.complete_before_effect([7; 32], true);
+        registry.settle_no_effects(|_| {
+            if conflict {
+                pending.complete_before_effect([8; 32], true);
+            }
+            conflict
+        });
+        assert!(registry.unresolved());
+        assert!(!pending.enter());
+        assert!(registry.issue(OperationId::new(), &shared).is_err());
+    }
 }

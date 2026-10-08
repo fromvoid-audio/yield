@@ -16,6 +16,8 @@ pub(super) const fn arc_bytes<T>() -> usize {
 pub(super) const POOL_BYTES: usize = arc_bytes::<Mutex<InputBudget>>()
     + arc_bytes::<AtomicU8>()
     + arc_bytes::<ResourceAdmission>()
+    + std::mem::size_of::<OnceLock<Uuid>>()
+    + std::mem::align_of::<OnceLock<Uuid>>()
     + 2 * std::mem::size_of::<String>()
     + 4 * REFUSAL.len();
 
@@ -31,12 +33,13 @@ pub(in crate::operation_journal) struct StartupCredit {
     lifecycle: Option<Arc<AtomicU8>>,
     resource: Option<Arc<ResourceAdmission>>,
     bytes: usize,
+    publication: bool,
     // Last field: gates and their allocation headers disappear before the pool.
     pool: Arc<Mutex<InputBudget>>,
 }
 impl InputPermit {
     pub(in crate::operation_journal) fn into_startup_credit(mut self) -> StartupCredit {
-        assert!(self.class == InputClass::Ordinary && !self.publication);
+        assert!(self.class == InputClass::Ordinary);
         assert!(
             self.historical_reply.is_none(),
             "terminal startup credits cannot retain replies"
@@ -44,6 +47,7 @@ impl InputPermit {
         let credit = StartupCredit {
             pool: self.shared.input_bytes.clone(),
             bytes: self.bytes,
+            publication: self.publication,
             lifecycle: Some(self.shared.lifecycle.clone()),
             resource: Some(self.shared.resource_admission.clone()),
         };
@@ -84,9 +88,24 @@ impl Drop for StartupCredit {
             }
         };
         let after = budget.remaining[0].checked_add(self.bytes);
+        let publication_after = if self.publication {
+            budget
+                .publication_remaining
+                .checked_add(self.bytes)
+                .filter(|bytes| *bytes <= PUBLICATION_INPUT_BYTES)
+        } else {
+            Some(budget.publication_remaining)
+        };
+        let mut restored = *budget;
+        if let (Some(ordinary), Some(publication)) = (after, publication_after) {
+            restored.remaining[0] = ordinary;
+            restored.publication_remaining = publication;
+        }
         if !budget.valid()
             || self.bytes == 0
             || after.is_none_or(|n| n > ORDINARY_INPUT_BYTES - POOL_BYTES)
+            || publication_after.is_none()
+            || !restored.valid()
         {
             budget.unavailable = true;
             drop(budget);
@@ -96,7 +115,7 @@ impl Drop for StartupCredit {
         // These original gate allocations must disappear before their last pool holder.
         self.resource.take();
         self.lifecycle.take();
-        budget.remaining[0] = after.unwrap();
+        *budget = restored;
     }
 }
 
@@ -104,9 +123,19 @@ impl OwnerShared {
     pub(super) fn startup_input(
         self: &Arc<Self>,
     ) -> Result<InputPermit, OperationJournalOwnerQueueError> {
-        let mut input =
-            self.reserve_input(InputClass::Ordinary, std::mem::size_of::<InputPermit>())?;
-        let header = self.reserve_input(InputClass::Ordinary, HISTORICAL_REPLY_BYTES)?;
+        self.startup_input_with_publication(false)
+    }
+    pub(super) fn startup_input_with_publication(
+        self: &Arc<Self>,
+        publication: bool,
+    ) -> Result<InputPermit, OperationJournalOwnerQueueError> {
+        let mut input = self.reserve_input_kind(
+            InputClass::Ordinary,
+            std::mem::size_of::<InputPermit>(),
+            publication,
+        )?;
+        let header =
+            self.reserve_input_kind(InputClass::Ordinary, HISTORICAL_REPLY_BYTES, publication)?;
         input.historical_reply = Some(HistoricalReply::new(HistoricalReplyBacking {
             consumer: Mutex::new(None),
             observer: Mutex::new(None),

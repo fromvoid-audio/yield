@@ -414,13 +414,13 @@ fn checkpoint_error(reason: impl Into<String>) -> OperationJournalStoreError {
     }
 }
 
-fn uncertain_outcome(reason: impl Into<String>) -> OperationJournalStoreError {
+pub(super) fn uncertain_outcome(reason: impl Into<String>) -> OperationJournalStoreError {
     OperationJournalStoreError::StagingOutcomeUncertain {
         reason: reason.into(),
     }
 }
 
-fn postcommit_namespace_error(
+pub(super) fn postcommit_namespace_error(
     phase: &'static str,
     error: OperationJournalStoreError,
 ) -> OperationJournalStoreError {

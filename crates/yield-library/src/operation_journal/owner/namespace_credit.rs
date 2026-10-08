@@ -104,6 +104,28 @@ impl JournalNamespaceFundingProbe {
         }
     }
 
+    /// Exercise the exact publication debit class without issuing any live grant.
+    #[cfg(test)]
+    pub(in crate::operation_journal) fn new_publication() -> Self {
+        let (commands, _receivers) = OwnerCommandReceivers::channel();
+        let shared = Arc::new(OwnerShared::new(commands));
+        Self {
+            input: shared
+                .startup_input_with_publication(true)
+                .expect("original publication diagnostic input"),
+        }
+    }
+    /// Observe both original counters without retaining the original owner.
+    #[cfg(test)]
+    pub(in crate::operation_journal) fn publication_observer(
+        &self,
+    ) -> impl Fn() -> (usize, usize) + use<> {
+        let pool = self.input.shared.input_bytes.clone();
+        move || {
+            let budget = pool.lock().unwrap();
+            (budget.remaining[0], budget.publication_remaining)
+        }
+    }
     /// Observe original ordinary-pool availability; this grants no capacity authority.
     pub fn remaining_bytes(&self) -> usize {
         self.input.shared.input_bytes.lock().unwrap().remaining[0]
@@ -202,5 +224,57 @@ impl InputPermit {
             _native: native.map(InputPermit::into_startup_credit),
         });
         error
+    }
+}
+
+/// Test-only original scalar slot, never a Source pin, native grant or effect receipt.
+#[cfg(test)]
+pub(in crate::operation_journal) struct NoEffectSlotFixture {
+    pending: publication_fence::PendingFence,
+    registry: publication_fence::Registry,
+}
+#[cfg(test)]
+impl NoEffectSlotFixture {
+    pub(in crate::operation_journal) fn issuer(&self) -> (Uuid, u64) {
+        self.registry.issuance_observation(&self.pending).unwrap()
+    }
+    pub(in crate::operation_journal) fn complete(&self, fingerprint: [u8; 32], reason: &str) {
+        let digest =
+            crate::file_operation_owner::publication_no_effect_digest(1, fingerprint, reason);
+        self.pending
+            .complete_before_effect_detail(digest, true, 1, reason);
+    }
+    pub(in crate::operation_journal) fn settle(
+        &self,
+        persist: impl FnMut(&NoEffectCompletion) -> bool,
+    ) {
+        self.registry.settle_no_effects(persist);
+    }
+    pub(in crate::operation_journal) fn unresolved(&self) -> bool {
+        self.registry.unresolved()
+    }
+    // Actual actor polling with original scalar custody and real SQLite; no Native grant.
+    pub(in crate::operation_journal) fn poll_original_actor(
+        &mut self,
+        store: OperationJournalStore,
+    ) -> OperationJournalStore {
+        let mut runtime = super::OwnerRuntime::new(store).expect("original actor runtime");
+        std::mem::swap(&mut runtime.publication_fences, &mut self.registry);
+        runtime.poll_publication_completions();
+        std::mem::swap(&mut runtime.publication_fences, &mut self.registry);
+        runtime.store.take().expect("original actor store")
+    }
+}
+#[cfg(test)]
+impl JournalNamespaceFundingProbe {
+    pub(in crate::operation_journal) fn original_no_effect_slot(
+        &self,
+        operation: OperationId,
+        output: Uuid,
+    ) -> NoEffectSlotFixture {
+        let mut registry = publication_fence::Registry::new();
+        let pending = registry.issue(operation, &self.input.shared).unwrap();
+        pending.bind_reserved_output(output).unwrap();
+        NoEffectSlotFixture { pending, registry }
     }
 }

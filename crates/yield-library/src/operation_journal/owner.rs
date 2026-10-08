@@ -15,6 +15,8 @@ mod control_credit;
 mod frozen_copy;
 mod historical_reply;
 mod namespace_credit;
+#[cfg(test)]
+pub(in crate::operation_journal) use namespace_credit::NoEffectSlotFixture;
 pub use namespace_credit::RetainedCommandError;
 mod startup_credit;
 use super::store::FundedChunkClaimRecord;
@@ -40,6 +42,7 @@ mod native_read_capsule;
 mod publication_charge;
 mod publication_custody;
 mod publication_fence;
+pub(crate) use publication_fence::NoEffectCompletion;
 mod resource_custody;
 mod retirement_admission;
 pub use frozen_copy::{FrozenCopyObservation, FrozenCopyValidationError};
@@ -52,7 +55,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -1291,7 +1294,10 @@ impl StagingPublicationGrant {
             result,
             worker,
         );
-        self.fence.complete_before_effect(digest, exact);
+        let (kind, reason) =
+            crate::file_operation_owner::publication_no_effect_detail(result).unwrap_or((0, ""));
+        self.fence
+            .complete_before_effect_detail(digest, exact, kind, reason);
     }
 
     pub(crate) fn begin_publication(
@@ -1947,8 +1953,34 @@ impl OwnerRuntime {
         Ok(handle)
     }
     fn poll_original_work(&mut self) {
-        self.publication_fences.poll_completions();
+        self.poll_publication_completions();
         self.poll_wal_preparation();
+    }
+    fn poll_publication_completions(&self) {
+        self.publication_fences.poll_completions();
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let Some(header) = self.publication_fences.original_input() else {
+            return;
+        };
+        let shared = &header.shared;
+        self.publication_fences.settle_no_effects(|completion| {
+            let input = match shared.startup_input_with_publication(true) {
+                Ok(input) => input,
+                Err(_) => {
+                    shared.mark_unavailable(startup_credit::REFUSAL);
+                    return false;
+                }
+            };
+            match store.settle_original_publication_no_effect(completion, &input) {
+                Ok(_) => true,
+                Err(error) => {
+                    shared.mark_startup_unavailable(&error, &input);
+                    false
+                }
+            }
+        });
     }
     fn poll_wal_preparation(&mut self) {
         self.poll_retirement_admission();
@@ -2920,6 +2952,15 @@ impl OwnerRuntime {
             .store()
             .reserve_staging_grant(checkpoint, validation, binding, &input);
         self.publication_write_result(grant_result)?;
+        let output = match validation.outcome() {
+            crate::file_operation_owner::EffectOutcome::Applied { evidence } => evidence
+                .validated_staging()
+                .expect("validated original staging")
+                .output()
+                .as_uuid(),
+            _ => unreachable!("validated original staging"),
+        };
+        fence.bind_reserved_output(output)?;
         validate_publication_target(&target)?;
         provider
             .validate_publication_charge(&charge)
@@ -5150,6 +5191,18 @@ impl OperationJournalClient {
         self.shared.queue_metrics.snapshot()
     }
 
+    /// Return the original worker's profile acquisition without waiting or allocating.
+    ///
+    /// The worker publishes this equality observation after successful bootstrap,
+    /// before becoming Available. Clones and retained clients keep that original
+    /// identity after closure; a new acquisition cannot redirect an old client.
+    /// `None` means bootstrap has not published an identity. This UUID is no
+    /// writable capability or admission proof; callers must also check lifecycle
+    /// and the owner must revalidate its current guard before admitting work.
+    pub fn original_profile_acquisition(&self) -> Option<Uuid> {
+        self.shared.original_profile_acquisition.get().copied()
+    }
+
     /// Return the current worker lifecycle without waiting for storage I/O.
     pub fn status(&self) -> OperationJournalOwnerStatus {
         self.shared.status()
@@ -5920,7 +5973,9 @@ impl OperationJournalClient {
         };
         let historical_reply = if historical {
             // Fund the Arc allocation (including both reference counters) before allocating.
-            let header = self.shared.reserve_input(class, HISTORICAL_REPLY_BYTES)?;
+            let header =
+                self.shared
+                    .reserve_input_kind(class, HISTORICAL_REPLY_BYTES, publication)?;
             let backing = HistoricalReply::new(HistoricalReplyBacking {
                 _header: header,
                 consumer: Mutex::new(None),
@@ -6119,6 +6174,7 @@ fn bounded_json_input<T: serde::Serialize>(
 }
 
 struct OwnerShared {
+    original_profile_acquisition: OnceLock<Uuid>,
     queue_metrics: Arc<QueueMetrics>,
     resource_admission: Arc<ResourceAdmission>,
     commands: Mutex<Option<OwnerCommandSenders>>,
@@ -6156,6 +6212,7 @@ impl OwnerShared {
         let lifecycle = Arc::new(AtomicU8::new(OwnerLifecycle::Initializing as u8));
         let resource_admission = ResourceAdmission::new();
         Self {
+            original_profile_acquisition: OnceLock::new(),
             queue_metrics: Arc::clone(&commands.ordinary.metrics),
             resource_admission,
             commands: Mutex::new(Some(commands)),
@@ -6589,10 +6646,10 @@ impl InputPermit {
 
     pub(super) fn absorb_historical_scratch(&mut self, mut other: InputPermit) {
         // Both values are privately reserved terminal scratch from this exact
-        // ordinary pool. No new credit, authority or allocation is constructed.
+        // ordinary pool and matching publication subset. No new allowance or authority.
         assert!(Arc::ptr_eq(&self.shared, &other.shared));
         assert!(self.class == InputClass::Ordinary && other.class == self.class);
-        assert!(!self.publication && !other.publication && self.refund && other.refund);
+        assert!(self.publication == other.publication && self.refund && other.refund);
         assert!(self.historical_reply.is_none() && other.historical_reply.is_none());
         self.bytes = self
             .bytes
@@ -6629,17 +6686,17 @@ impl InputPermit {
         Ok(())
     }
 
-    /// Private scratch debit from this exact queued command's original pool.
+    /// Private scratch debit from this exact command's original pool and publication subset.
     pub(super) fn reserve_historical_scratch(
         &self,
         bytes: usize,
     ) -> Result<Self, OperationJournalStoreError> {
-        if self.class != InputClass::Ordinary || self.publication {
+        if self.class != InputClass::Ordinary {
             return Err(OperationJournalStoreError::HistoricalClaimResourceBound);
         }
         let permit = self
             .shared
-            .reserve_input(InputClass::Ordinary, bytes)
+            .reserve_input_kind(InputClass::Ordinary, bytes, self.publication)
             .map_err(|_| OperationJournalStoreError::HistoricalClaimResourceBound)?;
         #[cfg(test)]
         self.shared
@@ -7157,6 +7214,26 @@ fn run_owner(
         }
     }
 
+    // Capture only the original retained guard, after every bootstrap check.
+    // No DTO, current global profile lookup, Source row, or UI request can supply
+    // this identity. The fixed OnceLock backing was prepaid on the original pool.
+    let acquisition = runtime
+        .final_profile_guard
+        .as_ref()
+        .and_then(|guard| Uuid::parse_str(guard.owner_identity()).ok());
+    let Some(acquisition) = acquisition else {
+        shared.mark_unavailable("original journal profile acquisition is invalid");
+        return;
+    };
+    if shared
+        .original_profile_acquisition
+        .set(acquisition)
+        .is_err()
+    {
+        shared.mark_unavailable("original journal profile acquisition already published");
+        return;
+    }
+
     let mut starting = Err(shared.lifecycle.load(Ordering::Acquire));
     shared.resource_admission.activate(|| {
         starting = shared.lifecycle.compare_exchange(
@@ -7210,7 +7287,7 @@ fn run_owner(
             break;
         }
     }
-    runtime.publication_fences.poll_completions();
+    runtime.poll_publication_completions();
     if !runtime.resource_admission.close_and_wait() {
         orderly_shutdown = false;
         if OwnerLifecycle::from_u8(shared.lifecycle.load(Ordering::Acquire))
@@ -8018,6 +8095,7 @@ mod tests {
     mod publication_input_tests;
     mod publication_mutation_tests;
     mod publication_uncertainty_tests;
+    mod service_acquisition_tests;
     mod queue_metrics_integration {
         include!("owner/tests/queue_metrics_integration.rs");
     }
@@ -12037,7 +12115,7 @@ mod tests {
                 crate::file_operation_owner::EffectOutcome::Unsupported { .. }
             ));
             // An actual queued read is an actor barrier. Its dispatch scans the original
-            // completion first; this is not durable settlement.
+            // completion first and confirms the original no-effect record. Charges remain.
             let mut readback = client.get(operation_id).unwrap();
             assert!(
                 readback
@@ -12098,6 +12176,9 @@ mod tests {
                 OperationJournalStore::open(&fixture.owner).expect("original handoff restart");
             let binding =
                 restarted.publication_binding_observation_for_test(staged_output.as_uuid());
+            assert_eq!(binding["schema_version"], serde_json::json!(2));
+            assert_eq!(binding["no_effect"]["kind"], serde_json::json!(1));
+            assert_eq!(binding["no_effect"]["digest"].as_array().unwrap().len(), 32);
             assert_eq!(binding["command"], original_command);
             assert_eq!(binding["charge"], original_charge);
             assert_eq!(
