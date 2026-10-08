@@ -2105,6 +2105,56 @@ pub(in crate::operation_journal) fn serialize_record(
     Ok(result)
 }
 
+// Passive full-family shape inventory only. This borrowed view allows a
+// historical scalar phase overlay before a funded clone exists. It cannot be
+// used as codec validation: original encode/validate_bound remain authoritative.
+pub(in crate::operation_journal) fn serialize_full_record_inventory(
+    record: &StoredOperationRecord,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    writer: &mut impl Write,
+) -> Result<Result<(), serde_json::Error>, EncodeError> {
+    if !matches!(record.schema_version, SCHEMA_V16 | SCHEMA_V17 | SCHEMA_V18) {
+        return serialize_record(record, writer);
+    }
+    let universal_intent =
+        record
+            .universal_intent
+            .as_ref()
+            .ok_or_else(|| EncodeError::InvalidV16Record {
+                reason: "missing participant envelope".into(),
+            })?;
+    let universal_command_args =
+        record
+            .universal_command_args
+            .as_ref()
+            .ok_or_else(|| EncodeError::InvalidV16Record {
+                reason: "missing typed command".into(),
+            })?;
+    let full_capacity_plan =
+        record
+            .full_capacity_plan
+            .as_ref()
+            .ok_or_else(|| EncodeError::InvalidV16Record {
+                reason: "missing full plan".into(),
+            })?;
+    let persisted = PersistedFullCapacityOperationRecordRef {
+        schema_version: record.schema_version,
+        operation_id: record.operation_id.as_uuid(),
+        intent: &record.intent,
+        universal_intent,
+        phase,
+        disposition,
+        universal_command_args,
+        full_capacity_plan,
+        retry_observation: record.retry_observation.as_ref(),
+        cancellation_request: record.cancellation_request.as_ref(),
+        created_unix_ms: record.created_unix_ms,
+        updated_unix_ms: record.updated_unix_ms,
+    };
+    Ok(serde_json::to_writer_pretty(writer, &persisted))
+}
+
 pub(crate) struct CappedWriter {
     bytes: Vec<u8>,
     attempted: usize,

@@ -8,11 +8,22 @@ use std::{cell::RefCell, mem::size_of};
 
 pub(in crate::operation_journal::store) struct Inventory {
     value: DatabaseClaimInventory,
+    reconstruction: Option<(usize, usize)>,
     // Last: all original decoded allocations die before their exact loans.
     _sql: Option<InputPermit>,
     _syntax: Option<InputPermit>,
     _decode: Option<InputPermit>,
 }
+impl Inventory {
+    // Original canonical root wire and transient decode/syntax bounds travel
+    // with this same retained value. Scalars confer no source or grant authority.
+    pub(in crate::operation_journal::store) fn reconstruction_backing(
+        &self,
+    ) -> Option<(usize, usize)> {
+        self.reconstruction
+    }
+}
+
 impl std::ops::Deref for Inventory {
     type Target = DatabaseClaimInventory;
     fn deref(&self) -> &Self::Target {
@@ -30,6 +41,7 @@ pub(in crate::operation_journal::store) fn read_with_input(
         None => super::read(connection, operation).map(|value| {
             value.map(|value| Inventory {
                 value,
+                reconstruction: None,
                 _sql: None,
                 _syntax: None,
                 _decode: None,
@@ -40,7 +52,7 @@ pub(in crate::operation_journal::store) fn read_with_input(
 
 fn working_bytes() -> usize {
     FIXED_BYTES
-        + size_of::<DatabaseClaimInventory>()
+        + size_of::<Inventory>()
         + 3 * size_of::<Statement<'static>>()
         + size_of::<RefCell<Option<InputPermit>>>()
         + 4 * size_of::<InputPermit>()
@@ -56,6 +68,7 @@ pub(in crate::operation_journal::store) fn read(
     let sql = input.reserve_historical_scratch(working_bytes())?;
     let mut syntax = None;
     let mut decoding = None;
+    let mut reconstruction = None;
     let native = RefCell::new(None);
     let result = (|| {
         let mut key = [0; 36];
@@ -97,6 +110,12 @@ pub(in crate::operation_journal::store) fn read(
             })
             .map_err(error)?;
         decoding = Some(input.reserve_historical_scratch(bytes_needed)?);
+        reconstruction = Some((
+            bytes.len(),
+            syntax_bytes
+                .checked_add(bytes_needed)
+                .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?,
+        ));
         let value = DatabaseClaimInventory::decode(bytes).map_err(error)?;
         drop(statement);
         verify(connection, operation, &value, input, &native)?;
@@ -105,6 +124,7 @@ pub(in crate::operation_journal::store) fn read(
     match result {
         Ok(Some(value)) => Ok(Some(Inventory {
             value,
+            reconstruction,
             _sql: Some(sql),
             _syntax: syntax,
             _decode: decoding,
