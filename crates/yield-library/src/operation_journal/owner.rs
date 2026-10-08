@@ -6509,6 +6509,7 @@ impl InputPermit {
     }
 
     /// Private scratch debit from this exact queued command's original pool.
+    #[track_caller]
     pub(super) fn reserve_historical_scratch(
         &self,
         bytes: usize,
@@ -6516,10 +6517,13 @@ impl InputPermit {
         if self.class != InputClass::Ordinary || self.publication {
             return Err(OperationJournalStoreError::HistoricalClaimResourceBound);
         }
-        let permit = self
-            .shared
-            .reserve_input(InputClass::Ordinary, bytes)
-            .map_err(|_| OperationJournalStoreError::HistoricalClaimResourceBound)?;
+        #[cfg(all(test, target_os = "macos"))]
+        let caller = std::panic::Location::caller();
+        let permit = self.shared.reserve_input(InputClass::Ordinary, bytes).map_err(|_| {
+            #[cfg(all(test, target_os = "macos"))]
+            eprintln!("original historical scratch refused: requested={bytes} remaining={} caller={caller}", self.shared.input_bytes.lock().unwrap().remaining[0]);
+            OperationJournalStoreError::HistoricalClaimResourceBound
+        })?;
         #[cfg(test)]
         self.shared
             .historical_scratch_maximum
