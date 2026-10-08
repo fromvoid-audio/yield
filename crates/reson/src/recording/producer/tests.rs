@@ -93,3 +93,68 @@ fn public_producer_denied_barrier_cannot_issue_joined_completion() {
         assert!(producer.stop().is_err());
     });
 }
+
+#[test]
+fn public_producer_nonblocking_poll_preserves_empty_slots_and_original_stop_join_order() {
+    use std::sync::mpsc::TryRecvError;
+    use std::time::Instant;
+    let output = Sink::default();
+    let (binding, mut owner) = super::super::RecordingSinkBinding::bind(Box::new(output.clone()));
+    let (_, foreign) = super::super::RecordingSinkBinding::bind(Box::new(Sink::default()));
+    let mut producer =
+        RecordingProducer::start(binding, RecordingLimits::new(48_000, 1, 1024).unwrap()).unwrap();
+    assert!(matches!(owner.try_barrier(), Err(TryRecvError::Empty)));
+    assert!(matches!(owner.try_joined(), Err(TryRecvError::Empty)));
+    producer.submit(&[0.25; 32]);
+    std::thread::scope(|scope| {
+        let stop = scope.spawn(move || producer.stop().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let barrier = loop {
+            match owner.try_barrier() {
+                Ok(value) => break value,
+                Err(TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("original barrier lost: {error}"),
+            }
+        };
+        assert!(owner.owns_barrier(&barrier));
+        assert!(!foreign.owns_barrier(&barrier));
+        assert!(matches!(
+            owner.try_barrier(),
+            Err(TryRecvError::Disconnected)
+        ));
+        assert!(matches!(owner.try_joined(), Err(TryRecvError::Empty)));
+        assert!(
+            !stop.is_finished(),
+            "Stop cannot join before original owner acknowledgement"
+        );
+        assert_eq!(barrier.frames(), 32);
+        barrier.acknowledge().unwrap();
+        let joined = loop {
+            match owner.try_joined() {
+                Ok(value) => break value,
+                Err(TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("original join lost: {error}"),
+            }
+        };
+        assert!(owner.owns_completion(&joined));
+        assert!(!foreign.owns_completion(&joined));
+        assert_eq!(joined.frames(), 32);
+        assert!(matches!(
+            owner.try_joined(),
+            Err(TryRecvError::Disconnected)
+        ));
+        assert_eq!(stop.join().unwrap().frames, 32);
+    });
+    let bytes = output.0.lock().unwrap().get_ref().clone();
+    let mut wav = hound::WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        wav.samples::<f32>().collect::<Result<Vec<_>, _>>().unwrap(),
+        vec![0.25; 32]
+    );
+}
