@@ -823,4 +823,20 @@ fn legacy_migration_native_actual_worker_commits_original_receipt_and_coalesces_
     );
     drop(connection);
     f.close();
+    let before_recovery = fs::read(f.path()).unwrap();
+    let recovery_journal = OperationJournalStore::open(&f.guard).unwrap();
+    let recovery =
+        SourceDatabase::open_legacy_recovery_read_owner(f.media.path(), &f.guard, "legacy")
+            .unwrap();
+    let historical = recovery
+        .capture_recovery(&f.guard, &recovery_journal)
+        .unwrap();
+    assert_eq!(historical.operation_id(), operation);
+    assert_eq!(historical.request(), &custody.args);
+    assert!(historical.lease_table_present());
+    assert_eq!(fs::read(f.path()).unwrap(), before_recovery);
+    assert!(
+        SourceDatabase::open_legacy_recovery_read_owner(f.media.path(), &f.guard, "legacy")
+            .is_err()
+    );
 }

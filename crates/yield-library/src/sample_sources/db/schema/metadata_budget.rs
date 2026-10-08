@@ -63,6 +63,15 @@ fn reference_image() -> Result<(SchemaImage, Vec<String>), SourceDbError> {
 // additive DDL and the existing lease table. The receipt is syntax/schema evidence only; this
 // validator grants no ownership, capacity, repair, migration or audit authority.
 fn require_known_adopted_schema(connection: &Connection) -> Result<(), SourceDbError> {
+    read_adopted_schema_receipt(connection, true).map(|_| ())
+}
+pub(in crate::sample_sources::db) fn read_adopted_schema_receipt(
+    connection: &Connection,
+    with_lease: bool,
+) -> Result<
+    crate::operation_journal::legacy_adoption_commands::receipt::AdoptionReceiptEnvelope,
+    SourceDbError,
+> {
     use crate::operation_journal::legacy_adoption_commands::receipt::{
         ADOPTION_METADATA_KEY, AdoptionReceiptEnvelope,
     };
@@ -77,7 +86,7 @@ fn require_known_adopted_schema(connection: &Connection) -> Result<(), SourceDbE
         .get_or_init(|| adopted_reference_image().ok())
         .as_ref()
         .ok_or(SourceDbError::Unexpected)?;
-    validate_schema_membership(connection, expected, true)?;
+    validate_schema_membership(connection, expected, true, !with_lease)?;
     // Stream in compiled canonical object order; no SQL sort, actual-image clone or new opener.
     let mut digest = blake3::Hasher::new();
     let mut statement = connection.prepare(
@@ -119,7 +128,7 @@ fn require_known_adopted_schema(connection: &Connection) -> Result<(), SourceDbE
             if !receipt.matches_migration_schema(digest) {
                 return Err(rusqlite::Error::InvalidQuery);
             }
-            Ok(())
+            Ok(receipt)
         })
         .map_err(map_sql_error)
 }
@@ -248,12 +257,13 @@ pub(crate) fn validate_current_schema(
     connection: &Connection,
     expected: &SchemaImage,
 ) -> Result<(), SourceDbError> {
-    validate_schema_membership(connection, expected, false)
+    validate_schema_membership(connection, expected, false, false)
 }
 fn validate_schema_membership(
     connection: &Connection,
     expected: &SchemaImage,
     adopted: bool,
+    skip_lease: bool,
 ) -> Result<(), SourceDbError> {
     if expected.len() > MAX_OBJECTS {
         return Err(SourceDbError::Unexpected);
@@ -285,6 +295,9 @@ fn validate_schema_membership(
                     .then(entry.2.as_str().cmp(table))
             })
             .map_err(|_| SourceDbError::Unexpected)?;
+        if skip_lease && expected[index].1 == "source_lease" {
+            return Err(SourceDbError::Unexpected);
+        }
         let compiled_sql = expected[index].3.as_deref();
         if sql != compiled_sql
             && !(adopted
@@ -302,7 +315,16 @@ fn validate_schema_membership(
         seen[index] = true;
         count += 1;
     }
-    if count != expected.len() || seen[..count].iter().any(|present| !present) {
+    let required = expected
+        .iter()
+        .filter(|entry| !(skip_lease && entry.1 == "source_lease"))
+        .count();
+    if count != required
+        || expected
+            .iter()
+            .enumerate()
+            .any(|(index, entry)| !(skip_lease && entry.1 == "source_lease") && !seen[index])
+    {
         return Err(SourceDbError::Unexpected);
     }
     Ok(())

@@ -732,3 +732,29 @@ digest, excluding only the later lease table, must match. Streaming digest inspe
 uses compiled object order without a SQL sort or an actual-image clone. This accepts
 no unknown SQL or repair and supplies no current owner/claim/audit grant. The immutable
 migration row digest is not applied to later legitimate current-source row edits.
+
+### Bounded historical current13 observation (OPT-2117 work in progress)
+
+`open_legacy_recovery_read_owner` reacquires only an existing sidecar, never creating or
+replacing missing evidence. It opens the existing main through the pre-open no-effect
+VFS fence, enforces query-only/memory-temp/no-spill/no-mmap policy and accepts only the
+complete compiled adopted current13 shape, with the lease table either wholly absent
+or exactly compiled. Canonical bounded receipt and raw schema digest must match actual
+profile/media/source/main/sidecar bindings. Unsupported journal modes/sidecars refuse.
+
+`capture_recovery` reads one coherent source snapshot and matches the receipt's operation
+and exact request to the actual V19 row in the current original journal namespace.
+Profile acquisition, physical journal root/main, source bindings, unchanged old rows,
+read policy, data version and deadline are checked before returning historical evidence.
+The old profile acquisition string is historical; it cannot replace the actual current
+profile/sidecar lock. Missing/conflicting intent or receipt refuses without repairs.
+
+The returned operation/request/table-presence observation grants no writer, current
+lease, capacity admission, claim release, completed audit or SourceRevision. Original
+claim/provider recovery and accounted ownership transfer/current reopen still need their
+explicit journal-worker integration. Local tests use real read custody and SQL/data-only
+receipt fixtures, asserting missing intent/competing lock/wrong root/missing evidence
+refusal and byte preservation. The genuine native worker test additionally reacquires
+read custody after shutdown and checks its actual original committed V19 row; it remains
+unexecuted. Later ordinary current-source edits use ordinary current ownership, rather
+than this unfinished-adoption old-row reader.

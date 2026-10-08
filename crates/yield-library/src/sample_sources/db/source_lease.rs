@@ -547,13 +547,37 @@ impl SourceLeaseReservation {
         media_root: Arc<BoundDatabaseRoot>,
         profile_guard: &WritableProfileGuard,
     ) -> Result<Self, SourceLeaseError> {
+        Self::acquire_mode(database_root, media_root, profile_guard, false)
+    }
+    pub(in crate::sample_sources::db) fn acquire_existing(
+        database_root: Arc<BoundDatabaseRoot>,
+        media_root: Arc<BoundDatabaseRoot>,
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<Self, SourceLeaseError> {
+        Self::acquire_mode(database_root, media_root, profile_guard, true)
+    }
+    fn acquire_mode(
+        database_root: Arc<BoundDatabaseRoot>,
+        media_root: Arc<BoundDatabaseRoot>,
+        profile_guard: &WritableProfileGuard,
+        existing_only: bool,
+    ) -> Result<Self, SourceLeaseError> {
         validate_database_root(&database_root, profile_guard)?;
         media_root
             .validate_profile_guard(profile_guard)
             .map_err(map_profile_error)?;
         let lock_name = PathBuf::from(SOURCE_LEASE_LOCK_FILE_NAME);
         let lock_path = database_root.path().join(&lock_name);
-        let (lock_file, fresh_lock) = open_lock_file(&database_root, &lock_name, &lock_path)?;
+        let (lock_file, fresh_lock) = if existing_only {
+            (
+                database_root
+                    .open_file_nofollow(&lock_name, false)
+                    .map_err(|error| map_lock_io(&lock_path, error))?,
+                false,
+            )
+        } else {
+            open_lock_file(&database_root, &lock_name, &lock_path)?
+        };
         lock_file_is_regular(&lock_file, &lock_path)?;
         acquire_nonblocking_lock(&lock_file, &lock_path)?;
         let lock_identity =

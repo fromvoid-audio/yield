@@ -106,6 +106,15 @@ impl AdoptionReceiptEnvelope {
         }
         Ok(value)
     }
+    pub(crate) fn historical_request(&self) -> &LegacyAdoptionIntentArgs {
+        &self.request
+    }
+    pub(crate) fn historical_operation(&self) -> OperationId {
+        self.receipt.operation_id
+    }
+    pub(crate) fn matches_preserved_rows(&self, rows: [u8; 32]) -> bool {
+        self.receipt.preserved_rows_digest == rows
+    }
     // Schema allowlisting only; this is never an adoption/claim/current-owner proof.
     pub(crate) fn matches_migration_schema(&self, schema: [u8; 32]) -> bool {
         self.receipt.current_schema_digest == schema

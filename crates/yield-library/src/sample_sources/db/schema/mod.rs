@@ -10,12 +10,12 @@ use super::util::map_sql_error;
 
 mod ddl;
 mod metadata_budget;
-pub(super) use metadata_budget::require_known_metadata_schema;
 pub(crate) use metadata_budget::{
     SchemaImage, image as bounded_schema_image, runtime_image as bounded_runtime_image,
     validate_current_runtime as validate_bounded_runtime,
     validate_current_schema as validate_bounded_schema,
 };
+pub(super) use metadata_budget::{read_adopted_schema_receipt, require_known_metadata_schema};
 mod legacy_adoption;
 pub(in crate::sample_sources::db) use legacy_adoption::{
     apply_preserving_legacy_schema, expected_legacy_postimage, legacy_schema_digest,

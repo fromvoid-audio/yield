@@ -3,7 +3,10 @@ use super::*;
 
 impl OwnedConnection {
     pub(crate) fn validate_original_legacy_read_fence(&self) -> bool {
-        if !self.is_autocommit() || !self.has_no_effect_fence() {
+        self.is_autocommit() && self.validate_original_legacy_read_policy()
+    }
+    pub(crate) fn validate_original_legacy_read_policy(&self) -> bool {
+        if !self.has_no_effect_fence() {
             return false;
         }
         let Some(registration) = &self.registration else {

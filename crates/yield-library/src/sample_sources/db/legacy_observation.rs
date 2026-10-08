@@ -13,6 +13,8 @@ use thiserror::Error;
 
 mod admission_custody;
 mod bootstrap;
+mod recovery;
+pub use recovery::LegacyAdoptionRecoveryImage;
 mod migration;
 pub(crate) use bootstrap::LegacyBootstrapSettlement;
 pub(crate) use migration::{LegacyMigrationSettlement, VerifiedLegacyMigration};
@@ -73,7 +75,7 @@ impl LegacySourceImage {
     }
 }
 
-/// Read-only owner retaining the fresh reservation and original profile/file/root bindings.
+/// Read-only owner retaining its reservation and original profile/file/root bindings.
 /// No SQLite connection, lease, mutable row or grant constructor is exposed.
 pub struct LegacySourceReadOwner {
     // Close SQLite before releasing its original file/root/reservation/profile custody.

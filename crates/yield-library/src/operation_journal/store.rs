@@ -4232,6 +4232,27 @@ impl OperationJournalStore {
         })
     }
 
+    // Read-only current namespace comparison against historical bindings.
+    pub(crate) fn validate_legacy_recovery_namespace(
+        &self,
+        profile: &WritableProfileGuard,
+        request: &super::legacy_adoption_commands::LegacyAdoptionIntentArgs,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.validate_namespace()?;
+        if profile.owner_identity() != self.profile_guard.owner_identity()
+            || !request.matches_recovery_journal_bindings(
+                self.profile_guard.profile_root_identity(),
+                self.database_root.identity(),
+                &self.database_identity,
+            )
+        {
+            return Err(OperationJournalStoreError::InconsistentRecord {
+                reason: "historical adoption journal binding differs".into(),
+            });
+        }
+        self.validate_namespace()
+    }
+
     /// Return one bounded operation record by id.
     pub fn get(
         &self,

@@ -313,7 +313,7 @@ fn verify_receipt_storage_bound(connection: &rusqlite::Connection, encoded: &[u8
 
 // Private SQL/data body. Its sole production caller holds the original mutation scope.
 // Direct fixture calls test SQLite atomicity/data only and manufacture no owner capability.
-fn apply_atomic_migration_body(
+pub(super) fn apply_atomic_migration_body(
     connection: &rusqlite::Connection,
     request: &crate::operation_journal::legacy_adoption_commands::LegacyAdoptionIntentArgs,
     operation: OperationId,

@@ -87,6 +87,31 @@ struct Object {
     conditional_logical_bytes: u64,
 }
 impl LegacyAdoptionIntentArgs {
+    // Historical descriptor equality only; a new profile acquisition must validate itself.
+    pub(crate) fn matches_recovery_source_bindings(
+        &self,
+        profile: &str,
+        media: &str,
+        directory: &str,
+        database: &str,
+        reservation: &str,
+    ) -> bool {
+        self.data.profile_root == profile
+            && self.data.media_root == media
+            && self.data.source_directory == directory
+            && self.source_database_identity() == database
+            && self.source_reservation_identity() == reservation
+    }
+    pub(crate) fn matches_recovery_journal_bindings(
+        &self,
+        profile: &str,
+        directory: &str,
+        database: &str,
+    ) -> bool {
+        self.data.profile_root == profile
+            && self.data.journal_directory == directory
+            && self.data.objects[5].identity == database
+    }
     pub(crate) fn original_migration_policy(&self) -> (u64, u64, u64, u64) {
         let p = &self.data.source_policy;
         (

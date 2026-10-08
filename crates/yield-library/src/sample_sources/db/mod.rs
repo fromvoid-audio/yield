@@ -32,9 +32,9 @@ pub(crate) use legacy_observation::{
     VerifiedLegacyMigration,
 };
 pub use legacy_observation::{
-    LegacyAllocationObject, LegacyAllocationRole, LegacyAllocationVolume,
-    LegacyCommonAllocationObservation, LegacyObservationError, LegacySourceImage,
-    LegacySourcePagerObservation, LegacySourceReadOwner,
+    LegacyAdoptionRecoveryImage, LegacyAllocationObject, LegacyAllocationRole,
+    LegacyAllocationVolume, LegacyCommonAllocationObservation, LegacyObservationError,
+    LegacySourceImage, LegacySourcePagerObservation, LegacySourceReadOwner,
 };
 pub(crate) use legacy_observation::{LegacyReserveTarget, LegacyReserveUseProof};
 mod open;
