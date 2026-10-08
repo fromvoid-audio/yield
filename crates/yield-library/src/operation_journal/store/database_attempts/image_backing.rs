@@ -36,7 +36,7 @@ fn working_bytes() -> usize {
         + 2048
 }
 // Use the pinned driver's actual scalar conversion and diagnostic variants.
-fn scalar<T: FromSql>(row: &Statement<'_>, index: i32) -> Result<T> {
+pub(super) fn scalar<T: FromSql>(row: &Statement<'_>, index: i32) -> Result<T> {
     let v = row.get_ref(index)?;
     T::column_result(v).map_err(|e| {
         match e {

@@ -194,14 +194,86 @@ fn read_outcome(
     Ok(Some(outcome))
 }
 
+pub(super) mod audit_backing;
 pub(super) mod context_backing;
 pub(super) mod image_backing;
 
 #[derive(Default)]
-struct Audit {
+pub(super) struct Audit {
     physical: BTreeSet<(u64, String)>,
     charged: BTreeMap<(Uuid, Uuid), u64>,
     operations: BTreeMap<Uuid, usize>,
+    // Last: the complete original collections die before their producer loans.
+    _working: Option<crate::operation_journal::owner::InputPermit>,
+    _collections: Option<crate::operation_journal::owner::InputPermit>,
+}
+impl Audit {
+    pub(super) fn observe_start(
+        &mut self,
+        start: &DatabaseAttemptStart,
+        inventory: &DatabaseClaimInventory,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<()> {
+        let binding = inventory
+            .bindings()
+            .iter()
+            .find(|b| b.id == start.binding)
+            .ok_or_else(|| error("binding disappeared"))?;
+        if let Some(input) = input {
+            let credit = input.reserve_historical_scratch(audit_backing::collection_bytes(
+                binding.main_file.len(),
+            )?)?;
+            if let Some(existing) = &mut self._collections {
+                existing.absorb_historical_scratch(credit);
+            } else {
+                self._collections = Some(credit);
+            }
+        }
+        #[cfg(test)]
+        audit_backing::PHYSICAL_COPIED_BYTES.with(|n| n.set(n.get() + binding.main_file.len()));
+        // No outcome observation supplies genuine settlement authority. Every
+        // retained start remains unresolved, across operations and restarts.
+        if !self
+            .physical
+            .insert((binding.volume, binding.main_file.clone()))
+        {
+            return Err(error("overlapping unresolved physical database attempts"));
+        }
+        let n = self.operations.entry(start.operation).or_default();
+        *n += 1;
+        if *n > MAX_ATTEMPTS_PER_OPERATION {
+            return Err(error("operation attempt ceiling"));
+        }
+        let sidecar = start
+            .wal_bytes
+            .checked_add(start.shm_bytes)
+            .ok_or_else(|| error("sidecar charge overflow"))?;
+        for (slice, charge) in [
+            (start.database_slice, start.database_bytes),
+            (start.sidecar_slice, sidecar),
+        ] {
+            let ceiling = inventory
+                .slices()
+                .iter()
+                .find(|s| s.id == slice)
+                .ok_or_else(|| error("slice disappeared"))?
+                .ceiling;
+            let spent = self.charged.entry((start.operation, slice)).or_default();
+            *spent = spent
+                .checked_add(charge)
+                .ok_or_else(|| error("conserved ceiling overflow"))?;
+            if *spent > ceiling {
+                return Err(error("retained charge exceeds slice"));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn same_values(&self, other: &Self) -> bool {
+        self.physical == other.physical
+            && self.charged == other.charged
+            && self.operations == other.operations
+    }
 }
 impl OperationJournalStore {
     fn attempt_context(
@@ -255,10 +327,13 @@ impl OperationJournalStore {
         self.audit_attempts_with_input(None)
     }
 
-    fn audit_attempts_with_input(
+    pub(super) fn audit_attempts_with_input(
         &self,
         input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<Audit> {
+        if let Some(input) = input {
+            return audit_backing::read(self, input);
+        }
         count(&self.connection, START_TABLE, None)?;
         count(&self.connection, OUTCOME_TABLE, None)?;
         let mut audit = Audit::default();
@@ -289,46 +364,7 @@ impl OperationJournalStore {
                     let inventory = self.attempt_inventory_with_input(&start, false, input)?;
                     image_backing::read_outcome(&self.connection, &start, input)?;
                     if table == START_TABLE {
-                        let binding = inventory
-                            .bindings()
-                            .iter()
-                            .find(|b| b.id == start.binding)
-                            .ok_or_else(|| error("binding disappeared"))?;
-                        // No outcome observation supplies genuine settlement authority. Every
-                        // retained start remains unresolved, across operations and restarts.
-                        if !audit
-                            .physical
-                            .insert((binding.volume, binding.main_file.clone()))
-                        {
-                            return Err(error("overlapping unresolved physical database attempts"));
-                        }
-                        let n = audit.operations.entry(start.operation).or_default();
-                        *n += 1;
-                        if *n > MAX_ATTEMPTS_PER_OPERATION {
-                            return Err(error("operation attempt ceiling"));
-                        }
-                        let sidecar = start
-                            .wal_bytes
-                            .checked_add(start.shm_bytes)
-                            .ok_or_else(|| error("sidecar charge overflow"))?;
-                        for (slice, charge) in [
-                            (start.database_slice, start.database_bytes),
-                            (start.sidecar_slice, sidecar),
-                        ] {
-                            let ceiling = inventory
-                                .slices()
-                                .iter()
-                                .find(|s| s.id == slice)
-                                .ok_or_else(|| error("slice disappeared"))?
-                                .ceiling;
-                            let spent = audit.charged.entry((start.operation, slice)).or_default();
-                            *spent = spent
-                                .checked_add(charge)
-                                .ok_or_else(|| error("conserved ceiling overflow"))?;
-                            if *spent > ceiling {
-                                return Err(error("retained charge exceeds slice"));
-                            }
-                        }
+                        audit.observe_start(&start, &inventory, None)?;
                     }
                     after = id.to_string();
                 }
