@@ -15,7 +15,7 @@ use std::path::{Component, Path};
 #[cfg(test)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1808,6 +1808,28 @@ pub struct FileOperationRequest {
 }
 
 impl FileOperationRequest {
+    /// Poll once without waiting or copying the retained receipt and its observations.
+    ///
+    /// `None` leaves this original request pending, including its result permit. A
+    /// delivered receipt consumes the request exactly once; acknowledgement still
+    /// follows the same owner custody protocol as [`Self::recv`]. Disconnection
+    /// does not establish cancellation, rollback, or successful completion.
+    pub fn try_result(
+        &mut self,
+    ) -> Result<Option<Arc<FileOperationResult>>, FileOperationRequestError> {
+        if self.received {
+            return Err(FileOperationRequestError::AlreadyConsumed);
+        }
+        match self.receiver.try_recv() {
+            Ok(result) => {
+                self.received = true;
+                Ok(Some(result))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(FileOperationRequestError::Disconnected),
+        }
+    }
+
     /// Wait for the accepted result.
     pub fn recv(&mut self) -> Result<FileOperationResult, FileOperationRequestError> {
         if self.received {
@@ -4613,6 +4635,7 @@ mod tests {
             .expect("retire original registration");
         assert_eq!(owner.input_bytes_remaining_for_test(), before);
     }
+    mod request_poll_tests;
     mod telemetry_tests;
 
     use super::*;
