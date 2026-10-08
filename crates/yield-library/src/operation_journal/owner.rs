@@ -15,6 +15,8 @@ mod control_credit;
 mod frozen_copy;
 mod historical_reply;
 mod namespace_credit;
+#[cfg(test)]
+pub(in crate::operation_journal) use namespace_credit::NoEffectSlotFixture;
 pub use namespace_credit::RetainedCommandError;
 mod startup_credit;
 use super::store::FundedChunkClaimRecord;
@@ -40,6 +42,7 @@ mod native_read_capsule;
 mod publication_charge;
 mod publication_custody;
 mod publication_fence;
+pub(crate) use publication_fence::NoEffectCompletion;
 mod resource_custody;
 mod retirement_admission;
 pub use frozen_copy::{FrozenCopyObservation, FrozenCopyValidationError};
@@ -1291,7 +1294,10 @@ impl StagingPublicationGrant {
             result,
             worker,
         );
-        self.fence.complete_before_effect(digest, exact);
+        let (kind, reason) =
+            crate::file_operation_owner::publication_no_effect_detail(result).unwrap_or((0, ""));
+        self.fence
+            .complete_before_effect_detail(digest, exact, kind, reason);
     }
 
     pub(crate) fn begin_publication(
@@ -1947,8 +1953,34 @@ impl OwnerRuntime {
         Ok(handle)
     }
     fn poll_original_work(&mut self) {
-        self.publication_fences.poll_completions();
+        self.poll_publication_completions();
         self.poll_wal_preparation();
+    }
+    fn poll_publication_completions(&self) {
+        self.publication_fences.poll_completions();
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let Some(header) = self.publication_fences.original_input() else {
+            return;
+        };
+        let shared = &header.shared;
+        self.publication_fences.settle_no_effects(|completion| {
+            let input = match shared.startup_input_with_publication(true) {
+                Ok(input) => input,
+                Err(_) => {
+                    shared.mark_unavailable(startup_credit::REFUSAL);
+                    return false;
+                }
+            };
+            match store.settle_original_publication_no_effect(completion, &input) {
+                Ok(_) => true,
+                Err(error) => {
+                    shared.mark_startup_unavailable(&error, &input);
+                    false
+                }
+            }
+        });
     }
     fn poll_wal_preparation(&mut self) {
         self.poll_retirement_admission();
@@ -2920,6 +2952,15 @@ impl OwnerRuntime {
             .store()
             .reserve_staging_grant(checkpoint, validation, binding, &input);
         self.publication_write_result(grant_result)?;
+        let output = match validation.outcome() {
+            crate::file_operation_owner::EffectOutcome::Applied { evidence } => evidence
+                .validated_staging()
+                .expect("validated original staging")
+                .output()
+                .as_uuid(),
+            _ => unreachable!("validated original staging"),
+        };
+        fence.bind_reserved_output(output)?;
         validate_publication_target(&target)?;
         provider
             .validate_publication_charge(&charge)
@@ -7212,7 +7253,7 @@ fn run_owner(
             break;
         }
     }
-    runtime.publication_fences.poll_completions();
+    runtime.poll_publication_completions();
     if !runtime.resource_admission.close_and_wait() {
         orderly_shutdown = false;
         if OwnerLifecycle::from_u8(shared.lifecycle.load(Ordering::Acquire))
@@ -12039,7 +12080,7 @@ mod tests {
                 crate::file_operation_owner::EffectOutcome::Unsupported { .. }
             ));
             // An actual queued read is an actor barrier. Its dispatch scans the original
-            // completion first; this is not durable settlement.
+            // completion first and confirms the original no-effect record. Charges remain.
             let mut readback = client.get(operation_id).unwrap();
             assert!(
                 readback
@@ -12100,6 +12141,9 @@ mod tests {
                 OperationJournalStore::open(&fixture.owner).expect("original handoff restart");
             let binding =
                 restarted.publication_binding_observation_for_test(staged_output.as_uuid());
+            assert_eq!(binding["schema_version"], serde_json::json!(2));
+            assert_eq!(binding["no_effect"]["kind"], serde_json::json!(1));
+            assert_eq!(binding["no_effect"]["digest"].as_array().unwrap().len(), 32);
             assert_eq!(binding["command"], original_command);
             assert_eq!(binding["charge"], original_charge);
             assert_eq!(

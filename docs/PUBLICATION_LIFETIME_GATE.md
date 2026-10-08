@@ -886,3 +886,43 @@ input is dropped; final error destruction refunds memory credit only. These
 checks use authority-free stored observations and do not issue a Source pin,
 physical grant, publication result or settlement. Full original completion,
 qualified backend and checkpoint acceptance remains in OPT-2215/2216/2217.
+
+## Durable original NoEffect completion (OPT-2217)
+
+The original worker latch now retains the bounded outcome kind, exact UTF-8
+reason (at most 512 bytes), and domain-separated digest of those bytes and the
+original command fingerprint. Its original issuer incarnation, slot generation
+and reserved output association are private live custody. Stored observations
+cannot construct the completion value or recover execution authority. Invalid,
+conflicting, poisoned or oversized completion closes authority as uncertain.
+
+The original actor polls at most 32 slots between commands and at shutdown.
+It copies bounded evidence and releases both slot mutexes before namespace or
+SQLite work. Persistence uses the original publication-class input pool; it
+requires no worker-to-actor queue admission or acknowledgement. The preallocated
+header debit now includes the measured fixed completion cells for all slots.
+Compile-time bounds separately enforce 16 KiB shared admission, 64 KiB fixed
+slot backing and the existing 2 MiB composed publication ceiling. Last-alias
+custody still frees allocations before returning their original memory credit.
+
+A NoEffect completion updates only the original reserved issuance record. V1
+canonical records remain byte-compatible; V2 adds the exact kind, reason and
+digest. Fresh issuance leaves 4 KiB encoded space for worst-case diagnostic
+escaping. Exact original operation, output, incarnation, generation, checkpoint,
+command, source, ordinary charge and optional issued chunk are validated before
+CAS. A single exclusive transaction changes that same record, then namespace
+validation and exact canonical readback must confirm it. Exact duplicates replay
+without changing issuance or charges. Only confirmed readback retires the live
+slot's execution authority. Commit, rollback, namespace or readback uncertainty
+retains the original slot, evidence and charges and closes further admission.
+
+NoEffect keeps `grant_reserved`, the staging checkpoint, ordinary claim and issued
+chunk unchanged. It inserts no release row and does not prove clean handoff,
+unused cleanup, storage refund or positive publication. Actual actor polling and
+SQLite regressions cover exact replay, restart, malformed and foreign evidence,
+rollback, lost commit acknowledgement, and retained charges. These use an
+explicit test-only scalar slot rather than fabricated Native authority. The
+genuine macOS handoff harness checks the new completion record when available.
+Qualified Applied provenance, published checkpoints and charge transfer,
+pending cancellation resolution and their native fault qualification remain
+required before OPT-2217 or its parents can be completed.

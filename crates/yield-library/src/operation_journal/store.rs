@@ -327,6 +327,16 @@ pub enum OperationJournalStoreError {
         /// Diagnostic for the unconfirmed commit, rollback or readback.
         reason: String,
     },
+    /// Original publication completion cannot confirm its durable outcome.
+    /// The original typed cause remains retained rather than being flattened or discarded.
+    #[error("publication completion outcome is uncertain ({phase}): {cause}")]
+    PublicationCompletionOutcomeUncertain {
+        /// Fixed original settlement boundary, never caller-controlled text.
+        phase: &'static str,
+        /// Exact original namespace, SQL or readback cause under its original backing.
+        #[source]
+        cause: Box<OperationJournalStoreError>,
+    },
     /// Namespace backing ran out after a staging commit; preserve its durable evidence.
     /// This fixed refusal allocates no diagnostic under exhausted journal-pool pressure.
     #[error(
