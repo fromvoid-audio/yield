@@ -10,6 +10,7 @@ use std::{cell::RefCell, mem::size_of};
 pub(in crate::operation_journal::store) fn reserve(
     store: &OperationJournalStore,
     record: &StoredOperationRecord,
+    encoded: &[u8],
     input: &InputPermit,
 ) -> Result<(), OperationJournalStoreError> {
     let Some(UniversalCommandArgs::Recording(proposal)) = record.universal_command_args() else {
@@ -25,7 +26,12 @@ pub(in crate::operation_journal::store) fn reserve(
     let native = RefCell::new(None);
     let result = (|| {
         if store.connection.is_autocommit()
-            || !initial_settlement_backing::matches_inside(store, record, input)?
+            || !initial_settlement_backing::matches_encoded_inside(
+                store,
+                record.operation_id,
+                encoded,
+                input,
+            )?
         {
             return Err(error(
                 "recording reservation requires the exact initial intent transaction",

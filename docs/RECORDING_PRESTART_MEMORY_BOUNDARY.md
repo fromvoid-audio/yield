@@ -45,9 +45,16 @@ a facade or constructing producer plumbing.
 
 ## Original command and retained debits
 
-The command reserves 3,604,480 bytes from the existing ordinary input pool before
-worker execution. Revalidation reserves the same temporary debit independently
-of the retained slot. The command estimate is for additional owned Rust backing;
+The command reserves 458,752 bytes from the existing ordinary input pool before
+worker execution. Inside the original consistent read snapshot, complete scalar
+SQL preflight and a syntax-only scan of every borrowed original record determine
+the additional working loan before any owned BLOB or graph is constructed.
+The maximum record peak, rather than the sum of sequential record decodes, funds
+the unchanged conservative per-node graph/typed envelopes and string quotas.
+Nonempty complete database inventories add their separately bounded audit stage,
+replacing the initial decoder's second tree. Revalidation retains the original
+slot while reserving its independent command and working loan. Pool exhaustion
+refuses before owned decoding and ends the snapshot. The estimate is for additional owned Rust backing;
 the existing worker, SQLite connection/cache, descriptor registrations and thread
 stack are separate original runtime resources. It does not bound process RSS,
 SQLite's allocator or operating-system memory, and it does not change any of
@@ -128,13 +135,12 @@ journal admission or native physical qualification.
 | Database phase: released tree category | -720,896 |
 | Database phase: complete database-claim backing | 528,088 |
 | Database phase conservative total | 3,411,672 |
-| Maximum stage and unchanged command debit | 3,604,480 |
+| Maximum record stage including command and working loan | 3,604,480 |
 
 The OPT-2361 borrowed participant preflight consumes the prior 64 KiB category
 headroom without changing the original record/rebuild subtotal or any input-pool ceiling.
 OPT-2392 stages separately derived database-claim backing after the initial
-two-tree decoder drops, preserving the original command debit and live producer
-revalidation headroom; attempt/outcome and full-progress backing remain unsupported.
+two-tree decoder drops, preserving the original maximum record envelope; attempt/outcome and full-progress backing remain unsupported.
 Its scanner is explicitly capped to the same 64 KiB Store row envelope; raw input
 plus old/new scratch backing can overlap at 256 KiB. Scanner backing drops before
 owned JSON construction. See [the participant preflight boundary](RECORDING_PARTICIPANT_PREFLIGHT.md)
@@ -154,9 +160,10 @@ boxed sink and route state fit a further 64 KiB envelope. Binding does not alloc
 a callback ring, start serialization or enqueue captured bytes. The remaining
 slot allowance covers its original pin/receipt/context backing.
 
-Only after the original read snapshot, decoded outer records, rebuild maps and
-canonical scratch are destroyed does the factory shrink its command permit to
-the retained debit. This returns memory credit only. Lost replies preserve the
+The factory ends the original snapshot and drops decoded outer records, rebuild
+maps and canonical scratch before installing the retained slot. Its command
+permit becomes the retained debit; the independent reply keeps temporary working
+credit until consumption or loss. This returns memory credit only. Lost replies preserve the
 occupied original slot and its debit. Failed revalidation keeps the slot fenced
 until original shutdown; it cannot replace the route or refund durable charges.
 
@@ -170,3 +177,11 @@ on Linux and has two macOS-only invocations tracked by OPT-2330. It must execute
 on the real supported runtime before claiming original-slot/lost-reply positive
 execution. It grants no physical qualification or recording startup/terminal
 completion. OPT-2145 and OPT-2058 remain open for those implementations.
+
+The working loan remains in the original historical-reply backing through caller
+proposal validation/encoding and selected error destruction. Successful creation
+detaches that reply from the retained slot; consuming or losing the reply releases
+temporary memory while the original 448 KiB slot debit remains. The original
+4,128,768-byte ordinary pool and all structural quotas are unchanged. Other retained
+runtime custody also consumes that pool, so the maximum supported record shape
+need not fit every live owner state; such pressure yields a bounded refusal.

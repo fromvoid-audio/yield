@@ -97,9 +97,11 @@ V17 Recording intent with no disposition or captured bytes, exact four reserved
 controls, current physical capacity boundary, rebuilt claims and provider recovery.
 It then creates the actual inseparable Reson transport binding, receiver and
 settlements and retains all three privately in one fixed runtime slot. A checked
-temporary 3,604,480-byte debit from the existing ordinary input pool covers the
-complete supported read/decode/rebuild envelope, then shrinks to a separate
-448 KiB retained proposal/transport/context debit after temporary backing is gone.
+448 KiB command debit from the existing ordinary input pool funds fixed read
+scratch and the retained proposal/transport/context. Complete borrowed record
+inventory determines an additional same-pool working loan before owned decoding.
+The original reply retains that loan through validation and encoding, then releases
+it on consumption or loss; the slot keeps its independent 448 KiB debit.
 The narrow complete-snapshot resource refusals and pinned implementation evidence
 are in [RECORDING_PRESTART_MEMORY_BOUNDARY.md](RECORDING_PRESTART_MEMORY_BOUNDARY.md).
 No producer, serializer, capture ring or physical writer starts. The weak, non-Clone facade exposes only operation,

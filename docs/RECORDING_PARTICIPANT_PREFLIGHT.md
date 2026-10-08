@@ -61,7 +61,8 @@ factory budget's RAW_AND_SCRATCH category grows192→256 KiB, consuming its prio
 64 KiB record/rebuild headroom exactly; compile-time category equality preserves
 the 3,604,480-byte record/rebuild subtotal. OPT-2392 adds 499,712 bytes of separately
 derived database-claim audit backing after the initial two-tree decode phase,
-reusing its released tree category and preserving the command debit;
+reusing its released tree category. Commands now reserve fixed scratch plus a
+complete borrowed-record structure-derived working loan before owned decoding;
 see [the database-claim boundary](RECORDING_PRESTART_DATABASE_CLAIMS.md). Pool ceilings
 and retained-route credits do not grow.
 Scanner scratch and errors drop before the original owned decoder begins.

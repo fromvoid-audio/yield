@@ -7205,7 +7205,7 @@ impl OperationJournalStore {
             }
         };
         if let Err(error) =
-            self.reserve_recording_initial_inside_transaction_with_input(record, input)
+            self.reserve_recording_initial_inside_transaction_with_input(record, encoded, input)
         {
             return self.rollback_insert_failure_for_input(
                 operation_id,
@@ -7371,7 +7371,9 @@ impl OperationJournalStore {
             );
         }
         let readback = match input {
-            Some(input) => initial_settlement_backing::readback_matches(self, record, input),
+            Some(input) => {
+                initial_settlement_backing::readback_matches(self, record, encoded, input)
+            }
             None => self
                 .get(operation_id)
                 .map(|persisted| persisted.as_ref() == Some(record)),

@@ -6,7 +6,7 @@ their existing 8,192-row ceilings, 64-KiB binary inventory, 64 databases, 256 sl
 and 64 total participants. Nothing is truncated or reconstructed into live authority.
 
 The four-MiB owner pool and its separate 64-KiB control reservation are unchanged.
-The original 3,604,480-byte recording command reservation is unchanged. The
+The original 3,604,480-byte maximum record envelope is unchanged; the command now prepays 448 KiB plus a structure-derived working loan. The
 incremental database backing is 528,088 bytes, but does not overlap the initial
 two-tree record decoder. The database audit peak is 3,411,672 bytes after reusing
 the released 720,896-byte tree category. Compile-time guards cover actual typed
@@ -47,13 +47,14 @@ and copied root image. The original typed-record, local-proposal, ordinary-snaps
 and auxiliary categories remain charged while their owners are live. Ordinary
 unscoped database readback retains its previous audit order and acceptance.
 
-Initial preparation peaks at 3,604,480 bytes. Revalidation keeps the original
-458,752-byte producer debit throughout: its record phase is bounded by 4,063,232
-bytes and database phase by 3,870,424 bytes, both below the original 4,128,768-byte
-ordinary quota. A compile-time guard checks the two original live debits together;
-a real original-queue test holds the producer-sized credit through a revalidation
-reply and verifies temporary release while the lifetime credit stays held. That
-unissued facade still refuses and creates no producer or Source authority.
+Initial preparation reserves its fixed 458,752-byte command debit and a working
+loan measured from every original borrowed record in the same snapshot. Nonempty
+database inventories replace the released decoder tree with their complete audit
+backing; empty inventories add no maximum inventory reservation. Revalidation
+keeps the original 458,752-byte producer debit and pays its own command/working
+loan. All debits, including existing runtime custody, use the original
+4,128,768-byte ordinary quota; insufficient remaining credit refuses before owned
+decoding. An unissued facade still refuses and creates no Source authority.
 
 Before any original inventory copy, scalar SQL checks its type, original length,
 relation ceilings and magic. Every copied binding/slice UUID column and ordinary

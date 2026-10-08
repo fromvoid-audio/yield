@@ -5140,7 +5140,7 @@ mod tests {
             .lock()
             .expect("retained state lock");
         let retained = retained.as_ref().expect("retained evidence");
-        assert!(retained.registrations.is_empty());
+        assert_eq!(retained.registrations.len(), 0);
         assert_eq!(retained.receipts.len(), 1);
     }
 

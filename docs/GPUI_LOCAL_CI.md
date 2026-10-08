@@ -83,3 +83,39 @@ evidence only.
 
 For a private bundle from an exact validated commit, follow
 [GPUI macOS packaging](GPUI_MACOS_PACKAGING.md).
+
+## Focused original recording custody verification
+
+The `Native recording custody` workflow runs the two OPT-2330 production-bootstrap
+fixtures on a real `macos-15-intel` runner, using the repository toolchain and
+original per-user registry. It runs on changes to its workflow/verification script
+or explicit workflow dispatch. It records the exact checkout, SDK, hardware/resource
+limits, APFS home/test volumes and test output, including failures. The verification
+script refuses non-macOS hosts and requires exactly two passed, zero failed/ignored
+tests; a zero-test filtered run supplies no qualification. Local invocation is
+`bash scripts/internal/validation/verify_recording_native_custody.sh`.
+
+A passing run verifies the retained pre-start recording route and slot only. It
+does not qualify recording capture, required-WAL/effect permission, terminal seals,
+publication, audible/UI workflows or release acceptance. A compilation or genuine
+bootstrap/admission failure remains an implementation failure to resolve.
+
+The lane also exercises the original recording initial transaction. Its funded
+control reservation and committed readback compare the already prepaid frozen
+encoding against the borrowed original SQLite BLOB, with the original journal
+family, cell type, byte bound, positive sequence and cross-relation sequence
+uniqueness checks. It avoids decoding a second full graph of a just-inserted
+record. Historical reads still use their complete decoder and classifier. Pool
+ceilings and physical admission requirements are unchanged. Portable SQL tests
+exercise exhausted-pool comparison, changed bytes and corrupt sequence/cell
+refusal; those tests do not supply native qualification.
+
+Native recording prestart custody runs its two original acceptance cases on two
+fresh macOS runner accounts at the same committed head. Each case executes its
+full original test with `--exact`, verifies exactly one pass and no failures or
+ignores, and records genuine APFS/profile/account resources. Both matrix jobs must
+succeed. Prestart leaves an active registration and durable admission claims;
+worker join releases memory custody but cannot prove clean volume handoff. The
+original dirty marker remains preserved. Reusing that account for a foreign
+profile would correctly refuse. This isolation creates no fixture registry,
+changes no home directory, and supplies no capture/terminal/settlement authority.

@@ -1,0 +1,69 @@
+name: Native recording custody
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/recording-native-custody.yml'
+      - 'scripts/internal/validation/verify_recording_native_custody.sh'
+permissions:
+  contents: read
+concurrency:
+  group: recording-native-custody-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  genuine-production-custody:
+    name: Genuine production custody (${{ matrix.case }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: currentness-and-drain
+            test: operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain
+          - case: lost-reply
+            test: operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    env:
+      YIELD_NATIVE_CUSTODY_CASE: ${{ matrix.test }}
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install the repository-pinned Rust toolchain
+        run: rustup show active-toolchain # reads rust-toolchain.toml
+      - name: Reuse pinned native build dependencies
+        id: native-cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: recording-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
+          restore-keys: |
+            recording-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+      - name: Verify original recording custody on native APFS
+        run: bash scripts/internal/validation/verify_recording_native_custody.sh
+      - name: Preserve native evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: recording-native-custody-${{ matrix.case }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifacts/recording-native-custody/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve pinned build cache after a failed native check
+        if: failure() && steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: recording-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}

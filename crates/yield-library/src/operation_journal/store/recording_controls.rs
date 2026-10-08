@@ -179,10 +179,11 @@ impl OperationJournalStore {
     pub(super) fn reserve_recording_initial_inside_transaction_with_input(
         &self,
         record: &super::StoredOperationRecord,
+        encoded: &[u8],
         input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
         match input {
-            Some(input) => initial_funded::reserve(self, record, input),
+            Some(input) => initial_funded::reserve(self, record, encoded, input),
             None => self.reserve_recording_initial_inside_transaction(record),
         }
     }

@@ -597,3 +597,107 @@ fn recording_prestart_participant_preflight_keeps_actual_retained_array_proposal
         assert!(reopened.connection.is_autocommit());
     }
 }
+
+#[test]
+fn recording_prestart_funded_inventory_reserves_peak_not_sum_before_decode() {
+    use crate::operation_journal::owner::JournalNamespaceFundingProbe;
+    let f = fixture();
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    let funding = JournalNamespaceFundingProbe::new();
+    let baseline = funding.remaining_bytes();
+    let proposal =
+        crate::operation_journal::recording_commands::recording_proposal_for_test(2, 100);
+    store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    let working = store
+        .begin_recording_prestart_read_with_input(Some(&funding.input))
+        .unwrap()
+        .unwrap();
+    let first = baseline - funding.remaining_bytes();
+    assert!(first < 3 * 1024 * 1024);
+    assert_eq!(
+        store
+            .recording_prestart_proposal(proposal.operation_id())
+            .unwrap(),
+        proposal
+    );
+    store.finish_recording_prestart_read().unwrap();
+    drop(working);
+    assert_eq!(funding.remaining_bytes(), baseline);
+    let second = crate::operation_journal::recording_commands::recording_proposal_for_test(2, 100);
+    store
+        .insert_intent(&finite_recording_record(&second))
+        .unwrap();
+    let working = store
+        .begin_recording_prestart_read_with_input(Some(&funding.input))
+        .unwrap()
+        .unwrap();
+    assert_eq!(baseline - funding.remaining_bytes(), first);
+    assert_eq!(
+        store
+            .recording_prestart_proposal(second.operation_id())
+            .unwrap(),
+        second
+    );
+    store.finish_recording_prestart_read().unwrap();
+    drop(working);
+    assert_eq!(funding.remaining_bytes(), baseline);
+}
+
+#[test]
+fn recording_prestart_funded_pressure_refuses_before_owned_record_and_ends_snapshot() {
+    use crate::operation_journal::owner::JournalNamespaceFundingProbe;
+    let f = fixture();
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    let funding = JournalNamespaceFundingProbe::new();
+    let proposal =
+        crate::operation_journal::recording_commands::recording_proposal_for_test(2, 100);
+    store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    let pressure = funding
+        .input
+        .reserve_historical_scratch(funding.remaining_bytes())
+        .unwrap();
+    POINT_ROW_MATERIALIZED_BYTES.with(|n| n.set(0));
+    assert!(matches!(
+        store.begin_recording_prestart_read_with_input(Some(&funding.input)),
+        Err(OperationJournalStoreError::HistoricalClaimResourceBound)
+    ));
+    POINT_ROW_MATERIALIZED_BYTES.with(|n| assert_eq!(n.get(), 0));
+    assert!(store.connection.is_autocommit());
+    drop(pressure);
+    assert_eq!(
+        store.get(proposal.operation_id()).unwrap(),
+        Some(finite_recording_record(&proposal))
+    );
+}
+
+#[test]
+fn recording_prestart_funded_decode_failure_retains_original_loan_through_consumer() {
+    use crate::operation_journal::owner::JournalNamespaceFundingProbe;
+    let f = fixture();
+    let store = OperationJournalStore::open(&f.owner).unwrap();
+    let funding = JournalNamespaceFundingProbe::new();
+    let proposal =
+        crate::operation_journal::recording_commands::recording_proposal_for_test(2, 100);
+    store
+        .insert_intent(&finite_recording_record(&proposal))
+        .unwrap();
+    store
+        .connection
+        .execute("UPDATE operation_journal SET record=?1", [b"{}".as_slice()])
+        .unwrap();
+    let error = store
+        .begin_recording_prestart_read_with_input(Some(&funding.input))
+        .err()
+        .unwrap();
+    assert!(store.connection.is_autocommit());
+    let pool = funding.pool_bytes_observer_for_test();
+    let error = funding.retain_command_error_for_test(error);
+    drop(funding);
+    assert!(pool().0 < pool().1);
+    drop(error);
+    assert_eq!(pool().0, pool().1);
+}

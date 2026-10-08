@@ -21,6 +21,16 @@ pub(in crate::operation_journal) fn closed_streaming_shape(
     let shape = scan::scan_full(bytes);
     Some((shape.string_bytes, shape.array_entries, shape.arrays))
 }
+/// Complete scalar inventory for the bounded Recording decoder. The caller
+/// funds syntax scratch before inspecting the original borrowed SQLite cell.
+pub(in crate::operation_journal) fn recording_streaming_shape(
+    bytes: &[u8],
+) -> Option<(usize, usize)> {
+    syntax::validate(bytes).ok()?;
+    let shape = scan::scan_full(bytes);
+    Some((shape.nodes, shape.string_bytes))
+}
+
 /// Borrowed attempt syntax inventory. The byte-array field is decoded by a
 /// bounded streaming Vec, never by Value. Caller prepays parser/error scratch.
 pub(in crate::operation_journal) fn attempt_graph_backing(

@@ -348,6 +348,160 @@ mod initial_settlement_funding {
     }
 
     #[test]
+    fn recording_initial_frozen_comparison_uses_no_second_graph_under_pool_pressure() {
+        use crate::operation_journal::recording_commands::recording_proposal_for_test;
+        let f = fixture();
+        let store = OperationJournalStore::open(&f.owner).unwrap();
+        let record = finite_recording_record(&recording_proposal_for_test(2, 100));
+        let encoded = encode(&record).unwrap();
+        store.insert_intent(&record).unwrap();
+        let funding = JournalNamespaceFundingProbe::new();
+        // The real initial-write scope prepays statement, driver, record and
+        // bounded diagnostics. Exhaust all other original-pool working memory.
+        let claims = AdmissionClaimInventory::new(
+            full_capacity_plan_for_record(&record)
+                .unwrap()
+                .allocations()
+                .iter()
+                .map(|row| {
+                    AdmissionClaim::new(
+                        AdmissionClaimId::new(),
+                        row.volume().clone(),
+                        row.class(),
+                        row.allocated_bytes(),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap();
+        let scope = super::super::initial_settlement_backing::Scope::new(
+            &store,
+            &record,
+            &claims,
+            &funding.input,
+        )
+        .unwrap();
+        let held = funding
+            .input
+            .reserve_historical_scratch(funding.remaining_bytes())
+            .unwrap();
+        super::super::historical_claim_observation::GENERAL_DECODE_ENTRIES.with(|n| n.set(0));
+        assert!(
+            super::super::initial_settlement_backing::matches_encoded_inside(
+                &store,
+                record.operation_id,
+                &encoded,
+                &funding.input
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            super::super::historical_claim_observation::GENERAL_DECODE_ENTRIES.with(|n| n.get()),
+            0
+        );
+        assert_eq!(funding.remaining_bytes(), 0);
+        drop(held);
+        // A semantically equivalent rewrite is not the original frozen bytes.
+        let mut changed = b" ".to_vec();
+        changed.extend_from_slice(&encoded);
+        store
+            .connection
+            .execute(
+                "UPDATE operation_journal SET record=?1 WHERE operation_id=?2",
+                params![&changed, record.operation_id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            !super::super::initial_settlement_backing::matches_encoded_inside(
+                &store,
+                record.operation_id,
+                &encoded,
+                &funding.input
+            )
+            .unwrap()
+        );
+        assert_eq!(store.get(record.operation_id).unwrap(), Some(record));
+        scope.finish(false);
+    }
+
+    #[test]
+    fn recording_initial_frozen_comparison_retains_sequence_and_cell_refusals() {
+        use crate::operation_journal::recording_commands::recording_proposal_for_test;
+        for fault in 0..3 {
+            let f = fixture();
+            let store = OperationJournalStore::open(&f.owner).unwrap();
+            let record = finite_recording_record(&recording_proposal_for_test(2, 100));
+            let encoded = encode(&record).unwrap();
+            store.insert_intent(&record).unwrap();
+            let funding = JournalNamespaceFundingProbe::new();
+            let claims = AdmissionClaimInventory::new(
+                full_capacity_plan_for_record(&record)
+                    .unwrap()
+                    .allocations()
+                    .iter()
+                    .map(|row| {
+                        AdmissionClaim::new(
+                            AdmissionClaimId::new(),
+                            row.volume().clone(),
+                            row.class(),
+                            row.allocated_bytes(),
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            let scope = super::super::initial_settlement_backing::Scope::new(
+                &store,
+                &record,
+                &claims,
+                &funding.input,
+            )
+            .unwrap();
+            match fault {
+                0 => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE operation_journal SET sequence=0 WHERE operation_id=?1",
+                            [record.operation_id.to_string()],
+                        )
+                        .unwrap();
+                }
+                1 => {
+                    store.connection.execute("UPDATE operation_journal_recording_chunks SET sequence=(SELECT sequence FROM operation_journal WHERE operation_id=?1) WHERE slot=20000", [record.operation_id.to_string()]).unwrap();
+                }
+                _ => {
+                    // Deliberately corrupt the actual cell past the DDL bound;
+                    // the original reader must still refuse before BLOB ownership.
+                    store
+                        .connection
+                        .execute_batch("PRAGMA ignore_check_constraints=ON")
+                        .unwrap();
+                    store.connection.execute("UPDATE operation_journal SET record=zeroblob(?1) WHERE operation_id=?2", params![MAX_RECORD_BYTES as i64 + 1,record.operation_id.to_string()]).unwrap();
+                }
+            }
+            let error = super::super::initial_settlement_backing::matches_encoded_inside(
+                &store,
+                record.operation_id,
+                &encoded,
+                &funding.input,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(match fault {
+                0 => "not positive",
+                1 => "duplicate journal-observation",
+                _ => "bounded SQLite BLOB",
+            }));
+            scope.finish(true);
+            let retained = funding.retain_command_error_for_test(error);
+            drop(funding);
+            drop(retained);
+        }
+    }
+
+    #[test]
     fn funded_initial_settlement_construction_credit_precedes_original_clone() {
         use crate::operation_journal::recording_commands::recording_proposal_for_test;
         let proposal = recording_proposal_for_test(2, 100);
