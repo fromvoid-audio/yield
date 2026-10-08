@@ -93,6 +93,155 @@ mod integration {
     }
 
     #[test]
+    fn funded_issuance_original_queue_pressure_refuses_before_transition_or_ticket() {
+        let fixture = fixture("funded-issue-queue-pressure");
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        let (record, _) = v5_copy_record(OperationId::new());
+        store.insert_intent_with_outcome(&record).receipt().unwrap();
+        let input = mutation_request(&record);
+        let row = &record.capacity_plan.as_ref().unwrap().volumes[0];
+        let provider = CapacityProvider::qualified_fixture(BTreeMap::from([(
+            row.identity.clone(),
+            VolumeFacts {
+                identity: row.identity.clone(),
+                free_bytes: PROTECTED_FREE_SPACE_FLOOR + 8,
+                allocation_unit: 1,
+            },
+        )]));
+        let lease = provider
+            .admit(&input.plan().unwrap(), &input.inventory().unwrap())
+            .unwrap();
+        store
+            .persist_chunk_claim_with_lease(&input, &provider, lease)
+            .unwrap();
+        let mut runtime = OwnerRuntime::new(store).unwrap();
+        let (commands, receivers) = OwnerCommandReceivers::channel();
+        let shared = Arc::new(OwnerShared::new(commands));
+        shared
+            .lifecycle
+            .store(OwnerLifecycle::Available as u8, Ordering::Release);
+        runtime.attach_resource_custody(&shared).unwrap();
+        let client = OperationJournalClient {
+            shared: Arc::clone(&shared),
+        };
+        let baseline = shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()];
+        let mut request = client
+            .issue_chunk(input.chunk_id(), record.operation_id)
+            .unwrap();
+        let remaining = shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()];
+        let held = shared
+            .reserve_input(InputClass::Ordinary, remaining - 1)
+            .unwrap();
+        execute_command(receivers.ordinary.try_recv().unwrap(), &mut runtime);
+        let error = request
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OperationJournalOwnerError::Store(
+                OperationJournalStoreError::OrdinaryRebuildResourceBound
+            )
+        ));
+        assert!(runtime.issued_chunk_tickets.is_empty());
+        assert_eq!(
+            runtime
+                .store()
+                .read_chunk_claim(input.chunk_id())
+                .unwrap()
+                .unwrap()
+                .state(),
+            ChunkClaimState::Claimed
+        );
+        assert_eq!(provider.claim_count(), 1);
+        drop(error);
+        drop(request);
+        drop(held);
+        assert_eq!(
+            shared.input_bytes.lock().unwrap().remaining[InputClass::Ordinary.index()],
+            baseline
+        );
+    }
+
+    #[test]
+    fn funded_issuance_empty_original_ticket_buckets_keep_growth_credit_until_owner_drop() {
+        let fixture = fixture("funded-issue-empty-buckets");
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        let mut runtime = OwnerRuntime::new(store).unwrap();
+        let funding = JournalNamespaceFundingProbe::new();
+        let baseline = funding.remaining_bytes();
+        let pool = funding.pool_bytes_observer_for_test();
+        runtime
+            .prepay_chunk_ticket_growth(Some(&funding.input))
+            .unwrap();
+        assert!(runtime.issued_chunk_tickets.capacity() > 0);
+        assert!(runtime.issued_chunk_tickets.is_empty());
+        let debit = baseline - funding.remaining_bytes();
+        assert!(debit > 0);
+        let held = funding
+            .input
+            .reserve_historical_scratch(funding.remaining_bytes())
+            .unwrap();
+        runtime
+            .prepay_chunk_ticket_growth(Some(&funding.input))
+            .unwrap();
+        assert_eq!(funding.remaining_bytes(), 0);
+        drop(held);
+        drop(funding);
+        assert_eq!(pool().1 - pool().0, debit);
+        drop(runtime);
+        assert_eq!(pool().0, pool().1);
+    }
+
+    #[test]
+    fn funded_issuance_identity_keeper_moves_to_entry_and_ticket_survives_permit_drop() {
+        let funding = JournalNamespaceFundingProbe::new();
+        let pool = funding.pool_bytes_observer_for_test();
+        let identity = ChunkWriteIdentity::new(
+            crate::operation_journal::ParticipantId::new(),
+            "kept-original-identity".into(),
+            0,
+            1,
+        )
+        .unwrap();
+        let ticket_loan = funding.input.reserve_historical_scratch(4096).unwrap();
+        let permit_loan = funding.input.reserve_historical_scratch(2048).unwrap();
+        // These are allocation-lifetime projections only. Neither the fixture
+        // permit nor the private entry is submitted as native write authority.
+        let permit = ChunkWritePermit {
+            chunk_id: ChunkId::new(),
+            operation_id: OperationId::new(),
+            issue_id: Uuid::new_v4(),
+            identity: identity.clone(),
+            logical_length: 1,
+            allocated_bytes: 1,
+            _credit: Some(permit_loan.into_startup_credit()),
+        };
+        let mut tickets = HashMap::new();
+        tickets.insert(
+            permit.issue_id(),
+            IssuedChunkTicket {
+                unused_release: None,
+                chunk_id: permit.chunk_id(),
+                operation_id: permit.operation_id(),
+                identity: identity.clone(),
+                live_output: None,
+                live_target: None,
+                live_source_fences: Vec::new(),
+                _credit: Some(ticket_loan.into_startup_credit()),
+            },
+        );
+        let entry = permit.consume(&identity, 1).unwrap();
+        drop(funding);
+        assert_eq!(pool().1 - pool().0, 6144);
+        drop(entry);
+        assert_eq!(pool().1 - pool().0, 4096);
+        assert_eq!(tickets.len(), 1);
+        drop(tickets);
+        assert_eq!(pool().0, pool().1);
+    }
+
+    #[test]
     fn original_completion_actor_idle_poll_defers_real_cancellation_without_sql_change() {
         let fixture = fixture("publication-completion-actor");
         let store = OperationJournalStore::open(&fixture.owner).unwrap();
@@ -462,7 +611,19 @@ mod integration {
             claimed.state()
         );
         assert!(runtime.issued_chunk_tickets.is_empty());
+        let mut queued_issue = client.issue_chunk(request.chunk_id(), operation).unwrap();
+        execute_command(receivers.ordinary.try_recv().unwrap(), &mut runtime);
+        assert!(
+            matches!(queued_issue.recv_timeout(Duration::from_secs(2)).unwrap(), Err(OperationJournalOwnerError::PublicationMutationPending { operation_id }) if operation_id == operation)
+        );
+        drop(queued_issue);
         drop(fence);
+        let mut unsettled_issue = client.issue_chunk(request.chunk_id(), operation).unwrap();
+        execute_command(receivers.ordinary.try_recv().unwrap(), &mut runtime);
+        assert!(
+            matches!(unsettled_issue.recv_timeout(Duration::from_secs(2)).unwrap(), Err(OperationJournalOwnerError::PublicationMutationPending { operation_id }) if operation_id == operation)
+        );
+        drop(unsettled_issue);
         assert!(matches!(
             runtime.issue_chunk(request.chunk_id(), operation),
             Err(OperationJournalOwnerError::PublicationMutationPending { .. })
@@ -487,6 +648,7 @@ mod integration {
                 live_output: None,
                 live_target: None,
                 live_source_fences: Vec::new(),
+                _credit: None,
             },
         );
         assert!(matches!(

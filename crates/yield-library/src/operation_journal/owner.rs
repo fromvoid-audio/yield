@@ -1126,6 +1126,7 @@ struct IssuedChunkTicket {
     live_output: Option<OutputIdentity>,
     live_target: Option<RootRegistrationRef>,
     live_source_fences: Vec<SourceFence>,
+    _credit: Option<StartupCredit>,
 }
 
 /// Proof retained after an unused issuance has been consumed by a release attempt. It forbids
@@ -1148,6 +1149,7 @@ pub(crate) struct ChunkWritePermit {
     identity: ChunkWriteIdentity,
     logical_length: u64,
     allocated_bytes: u64,
+    _credit: Option<StartupCredit>,
 }
 
 /// Authority-free effect identity supplied before the journal issues a chunk.
@@ -1431,6 +1433,7 @@ struct ChunkWriteEntry {
     identity: ChunkWriteIdentity,
     logical_length: u64,
     allocated_bytes: u64,
+    _credit: Option<StartupCredit>,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -1442,7 +1445,15 @@ enum ChunkPermitError {
 }
 
 impl ChunkWritePermit {
+    #[cfg(test)]
     fn from_issue_receipt(receipt: ChunkIssueReceipt) -> Self {
+        Self::from_issue_receipt_funded(receipt, None)
+    }
+
+    fn from_issue_receipt_funded(
+        receipt: ChunkIssueReceipt,
+        credit: Option<StartupCredit>,
+    ) -> Self {
         Self {
             chunk_id: receipt.chunk_id(),
             operation_id: receipt.operation_id(),
@@ -1450,6 +1461,7 @@ impl ChunkWritePermit {
             identity: receipt.write_identity(),
             logical_length: receipt.logical_length(),
             allocated_bytes: receipt.allocated_bytes(),
+            _credit: credit,
         }
     }
 
@@ -1494,6 +1506,7 @@ impl ChunkWritePermit {
             identity: self.identity,
             logical_length: self.logical_length,
             allocated_bytes: self.allocated_bytes,
+            _credit: self._credit,
         })
     }
 }
@@ -1820,6 +1833,8 @@ struct OwnerRuntime {
     synthetic_chunk_write_invocations: Arc<AtomicUsize>,
     #[cfg(test)]
     next_chunk_callback_witness_error: Option<String>,
+    // Last: original ticket buckets are destroyed before their accumulated debit.
+    issued_chunk_ticket_backing: Option<InputPermit>,
 }
 
 impl OwnerRuntime {
@@ -1853,6 +1868,7 @@ impl OwnerRuntime {
             source_registrations: HashMap::new(),
             retired_source_registrations: HashMap::new(),
             issued_chunk_tickets: HashMap::new(),
+            issued_chunk_ticket_backing: None,
             pending_chunk_releases: HashMap::new(),
             #[cfg(test)]
             drop_observer: None,
@@ -2358,19 +2374,43 @@ impl OwnerRuntime {
         chunk_id: ChunkId,
         operation_id: OperationId,
     ) -> Result<ChunkWritePermit, OperationJournalOwnerError> {
-        let record = self
-            .store()
-            .read_chunk_claim(chunk_id)
-            .map_err(OperationJournalOwnerError::from)?
-            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
-                reason: String::from("chunk claim was not found"),
-            })?;
+        self.issue_chunk_with_funding(chunk_id, operation_id, None)
+    }
+
+    fn issue_chunk_with_funding(
+        &mut self,
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        input: Option<&InputPermit>,
+    ) -> Result<ChunkWritePermit, OperationJournalOwnerError> {
+        let record = match input {
+            Some(input) => self.store().read_chunk_claim_for_input(chunk_id, input),
+            None => self
+                .store()
+                .read_chunk_claim(chunk_id)
+                .map(|r| r.map(FundedChunkClaimRecord::unfunded)),
+        }
+        .map_err(OperationJournalOwnerError::from)?
+        .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+            reason: String::from("chunk claim was not found"),
+        })?;
         if record.operation_id() != operation_id {
             return Err(OperationJournalOwnerError::ChunkClaim {
                 reason: String::from("chunk claim belongs to a different operation"),
             });
         }
-        self.validate_chunk_operation_state(operation_id, "issuance")?;
+        match input {
+            Some(input) => self
+                .store()
+                .validate_chunk_operation_for_input(operation_id, "issuance", input)
+                .map_err(|error| match error {
+                    super::store::OperationJournalStoreError::ChunkClaim { reason } => {
+                        OperationJournalOwnerError::ChunkClaim { reason }
+                    }
+                    error => error.into(),
+                })?,
+            None => self.validate_chunk_operation_state(operation_id, "issuance")?,
+        }
         match record.state() {
             ChunkClaimState::Issued => {
                 return Err(OperationJournalOwnerError::ChunkClaim {
@@ -2387,8 +2427,40 @@ impl OwnerRuntime {
             ChunkClaimState::Claimed => {}
         }
         self.publication_fences.close_for_mutation(operation_id)?;
-        self.store().validate_for_admission()?;
-        let snapshot = self.chunk_rebuild_snapshot()?;
+        let mut write_scope = match input {
+            Some(input) => Some(self.store().prepay_chunk_issuance(
+                operation_id,
+                chunk_id,
+                input,
+            )?),
+            None => {
+                self.store().validate_for_admission()?;
+                None
+            }
+        };
+        let snapshot = match input {
+            Some(input) => self.store().rebuild_admission_snapshot_for_input(input)?,
+            None => super::store::FundedSnapshot::unfunded(self.chunk_rebuild_snapshot()?),
+        };
+        // Both original owned identities and the actual retained hash buckets are
+        // paid before native observation, UUID generation or the durable CAS.
+        let ticket_credit = input
+            .map(|input| {
+                input.reserve_historical_scratch(1024 + std::mem::size_of::<IssuedChunkTicket>())
+            })
+            .transpose()?;
+        let permit_credit = input
+            .map(|input| {
+                input.reserve_historical_scratch(
+                    1024 + std::mem::size_of::<ChunkWritePermit>()
+                        + std::mem::size_of::<ChunkWriteEntry>(),
+                )
+            })
+            .transpose()?;
+        self.prepay_chunk_ticket_growth(input)?;
+        if let (Some(input), Some(scope)) = (input, write_scope.as_mut()) {
+            scope.retain_observation_credit(self.admission_observation_credit(input)?);
+        }
         #[cfg(all(test, target_os = "macos"))]
         let observation = self
             .refresh_live_descriptor_capacity_for_admission(None)
@@ -2405,8 +2477,8 @@ impl OwnerRuntime {
                 reason: String::from("capacity provider is not installed"),
             }
         })?;
-        provider
-            .validate_rebuilt_claims(&snapshot)
+        snapshot
+            .validate_provider(provider, input)
             .map_err(|error| OperationJournalOwnerError::ChunkClaim {
                 reason: format!("current durable/live capacity image differs: {error}"),
             })?;
@@ -2415,22 +2487,29 @@ impl OwnerRuntime {
                 reason: error.to_string(),
             }
         })?;
-        provider
-            .validate_durable_chunk_claim(&record)
-            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
-                reason: error.to_string(),
-            })?;
-        provider
-            .validate_durable_chunk_issuance(&record, &witness)
+        record
+            .validate_issuance(provider, &witness)
             .map_err(|error| OperationJournalOwnerError::ChunkClaim {
                 reason: error.to_string(),
             })?;
         let issue_id = Uuid::new_v4();
-        let receipt = self
-            .store()
-            .issue_chunk_claim(chunk_id, operation_id, issue_id)
-            .map_err(OperationJournalOwnerError::from)?;
-        let permit = ChunkWritePermit::from_issue_receipt(receipt);
+        let receipt = match write_scope {
+            Some(scope) => self.store().issue_chunk_claim_funded(
+                chunk_id,
+                operation_id,
+                issue_id,
+                scope,
+                &record,
+            ),
+            None => self
+                .store()
+                .issue_chunk_claim(chunk_id, operation_id, issue_id),
+        }
+        .map_err(OperationJournalOwnerError::from)?;
+        let permit = ChunkWritePermit::from_issue_receipt_funded(
+            receipt,
+            permit_credit.map(InputPermit::into_startup_credit),
+        );
         self.issued_chunk_tickets.insert(
             permit.issue_id(),
             IssuedChunkTicket {
@@ -2441,9 +2520,46 @@ impl OwnerRuntime {
                 live_output: None,
                 live_target: None,
                 live_source_fences: Vec::new(),
+                _credit: ticket_credit.map(InputPermit::into_startup_credit),
             },
         );
         Ok(permit)
+    }
+
+    fn prepay_chunk_ticket_growth(
+        &mut self,
+        input: Option<&InputPermit>,
+    ) -> Result<(), OperationJournalOwnerError> {
+        let Some(input) = input else {
+            return Ok(());
+        };
+        if self.issued_chunk_tickets.len() < self.issued_chunk_tickets.capacity() {
+            return Ok(());
+        }
+        // Repository-pinned Rust 1.93/hashbrown: power-of-two buckets, <=7/8
+        // load, one control byte per bucket and a <=16-byte control group.
+        // Capture actual old capacity. Prepay the complete next table before
+        // try_reserve, including alignment/header slack, even with old unfunded
+        // compatibility entries. Retain all growth debits through table teardown.
+        let bytes = self
+            .issued_chunk_tickets
+            .capacity()
+            .checked_add(1)
+            .and_then(usize::checked_next_power_of_two)
+            .and_then(|n| n.checked_mul(2))
+            .map(|n| n.max(4))
+            .and_then(|n| n.checked_mul(std::mem::size_of::<(Uuid, IssuedChunkTicket)>() + 1))
+            .and_then(|n| n.checked_add(64))
+            .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+        let credit = input.reserve_historical_scratch(bytes)?;
+        self.issued_chunk_tickets
+            .try_reserve(1)
+            .map_err(|_| OperationJournalStoreError::HistoricalClaimResourceBound)?;
+        match self.issued_chunk_ticket_backing.as_mut() {
+            Some(backing) => backing.absorb_historical_scratch(credit),
+            None => self.issued_chunk_ticket_backing = Some(credit),
+        }
+        Ok(())
     }
 
     fn retain_recording_chunk(
@@ -4727,7 +4843,8 @@ impl Drop for OwnerRuntime {
         // The bound is checked before every actual retention; free the keeper heap first.
         drop(credit_heap);
         drop(current_registry_credits);
-        self.issued_chunk_tickets.clear();
+        drop(std::mem::take(&mut self.issued_chunk_tickets));
+        self.issued_chunk_ticket_backing.take();
         self.pending_chunk_releases.clear();
         // Keep this order explicit. The reserve root/descriptor must go first, then SQLite and
         // its profile-child lease, then the cross-process volume lock, and finally the profile
@@ -5349,14 +5466,18 @@ impl OperationJournalClient {
         chunk_id: ChunkId,
         operation_id: OperationId,
     ) -> Result<OperationJournalRequest<ChunkWritePermit>, OperationJournalOwnerQueueError> {
-        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
-            JournalCommand::IssueChunk {
+        self.submit_funded_with_reply(
+            InputClass::Ordinary,
+            std::mem::size_of::<JournalCommand>(),
+            false,
+            true,
+            move |input, result| JournalCommand::IssueChunk {
                 chunk_id,
                 operation_id,
                 input,
                 result,
-            }
-        })
+            },
+        )
     }
 
     /// Issue a sealed effect-scoped grant from a live registered source and a durable chunk
@@ -7507,10 +7628,9 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             operation_id,
             input,
             result,
-        } => {
-            let _input = input;
-            execute_store_result(result, move || runtime.issue_chunk(chunk_id, operation_id))
-        }
+        } => execute_store_result(result, move || {
+            runtime.issue_chunk_with_funding(chunk_id, operation_id, Some(&input))
+        }),
         JournalCommand::IssueLiveChunk {
             chunk_id,
             operation_id,

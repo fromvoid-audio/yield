@@ -33,5 +33,40 @@ confer no native physical qualification. The System historical allocation tests
 measure their original historical and Legacy transport paths, not the entire
 new chunk producer. GNU Windows compilation is not native Windows acceptance.
 
-IssueChunk, write entry, staging checkpoint, release and recording producer funding,
-whole-owner finite policy and native positive acceptance remain separate work.
+IssueChunk uses the same original pool, reply carrier, original point codec,
+complete operation visitor, restart image, provider checks and genuine live witness.
+Its private scope prepays the before-transition, after-transition and committed
+readbacks. The actual Claimed-to-Issued SQL compares the complete original chunk
+row and exact operation digest/sequence before mutation; a sealed receipt escapes
+only after commit and exact readback. Unknown acknowledgement returns no permit
+and retains the existing durable charge.
+
+The returned permit and retained owner ticket independently pay their owned
+identity data before cloning it. Permit consumption moves its keeper into the
+private entry. Ticket removal releases its data keeper, while the original
+HashMap bucket growth keeps a separate accumulated loan through owner teardown.
+The next complete table is charged from the observed capacity before try_reserve,
+including overlapping old/new tables; bucket retention after removal or failure
+cannot refund that debit. No new pool, queue, registry or authority is created.
+
+Real SQL, actual queue, pressure and lifetime tests cover the issuance transition,
+stale operation/chunk refusal, lost commit acknowledgement, fence refusal, receipt
+ownership, permit-to-entry transfer and empty retained ticket buckets. Logical
+fixtures and lifetime projections supply no native effect qualification.
+Live-effect/source-pin entry, staging checkpoint, release and recording producer
+funding and whole-owner finite policy remain separate work.
+
+The new macOS positive harness shares the genuine production recording admission
+setup: original Owner::start, real registered Source and FileOwner root, original
+reserve descriptor facts and admit_prepared. It queues an actual chunk claim and
+one-shot issuance, inspects the original permit identity/debit, and refuses reissue.
+The permit remains backed after joined owner shutdown; only its later destruction
+refunds its memory loan. Reopen retains the exact Issued row and UUID, no release
+receipt, and refuses a clean durable handoff. No capture/staging file is created.
+The staging checkpoint rule remains enforced; dropping an unused permit cannot
+settle its charge. Each case runs on a fresh native account and preserves original
+dirty ownership evidence. Native execution of this revised lifetime assertion is
+pending. The script requires exactly one executed passing issuance test with no
+failures/ignores, independently of the two original recording custody cases.
+Linux compiles the same helper and executes genuine refusal tests; compilation is
+no replacement for native execution.

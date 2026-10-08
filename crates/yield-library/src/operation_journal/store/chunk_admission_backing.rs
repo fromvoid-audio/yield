@@ -13,17 +13,21 @@ struct OperationImage {
 pub(in crate::operation_journal) struct ChunkWriteScope<'a> {
     image: OperationImage,
     operation: OperationId,
-    request: chunk_claims::ChunkClaimRequest,
+    request: Option<chunk_claims::ChunkClaimRequest>,
+    chunk: chunk_claims::ChunkId,
     input: &'a InputPermit,
     working: Option<InputPermit>,
     output: Option<InputPermit>,
     duplicate: Option<InputPermit>,
+    transition: Option<InputPermit>,
     selected: bool,
 }
 impl<'a> ChunkWriteScope<'a> {
     fn new(
         store: &OperationJournalStore,
-        request: &chunk_claims::ChunkClaimRequest,
+        request: Option<&chunk_claims::ChunkClaimRequest>,
+        operation: OperationId,
+        chunk: chunk_claims::ChunkId,
         image: OperationImage,
         input: &'a InputPermit,
     ) -> Result<Self, OperationJournalStoreError> {
@@ -52,19 +56,27 @@ impl<'a> ChunkWriteScope<'a> {
             .checked_add(store.namespace_prepaid_bytes()?)
             .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
         let bytes = bytes
-            .checked_add(request.output_key().len())
+            .checked_add(
+                request.map_or(chunk_claims::MAX_OUTPUT_KEY_BYTES, |r| r.output_key().len()),
+            )
             .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
         let working = input.reserve_historical_scratch(bytes)?;
         let output = input.reserve_historical_scratch(chunk_claims::point_read_bytes())?;
         let duplicate = input.reserve_historical_scratch(chunk_claims::point_read_bytes())?;
+        let transition = request
+            .is_none()
+            .then(|| input.reserve_historical_scratch(chunk_claims::point_read_bytes()))
+            .transpose()?;
         Ok(Self {
             image,
-            operation: request.operation_id(),
-            request: request.clone(),
+            operation,
+            request: request.cloned(),
+            chunk,
             input,
             working: Some(working),
             output: Some(output),
             duplicate: Some(duplicate),
+            transition,
             selected: true,
         })
     }
@@ -112,7 +124,17 @@ impl<'a> ChunkWriteScope<'a> {
         )
     }
     pub(super) fn matches(&self, request: &chunk_claims::ChunkClaimRequest) -> bool {
-        &self.request == request
+        self.request.as_ref() == Some(request)
+    }
+    pub(super) fn matches_issue(
+        &self,
+        chunk: chunk_claims::ChunkId,
+        operation: OperationId,
+    ) -> bool {
+        self.request.is_none() && self.chunk == chunk && self.operation == operation
+    }
+    pub(super) fn take_transition(&mut self) -> InputPermit {
+        self.transition.take().unwrap()
     }
     pub(super) fn validate_namespace(
         &self,
@@ -138,7 +160,7 @@ impl Drop for ChunkWriteScope<'_> {
                 self.working.take().unwrap(),
                 self.output.take(),
                 self.duplicate.take(),
-                None,
+                self.transition.take(),
             );
         }
     }
@@ -149,10 +171,32 @@ impl OperationJournalStore {
         request: &chunk_claims::ChunkClaimRequest,
         input: &'a InputPermit,
     ) -> Result<ChunkWriteScope<'a>, OperationJournalStoreError> {
+        self.prepay_chunk_observation(
+            Some(request),
+            request.operation_id(),
+            request.chunk_id(),
+            input,
+        )
+    }
+    pub(in crate::operation_journal) fn prepay_chunk_issuance<'a>(
+        &self,
+        operation: OperationId,
+        chunk: chunk_claims::ChunkId,
+        input: &'a InputPermit,
+    ) -> Result<ChunkWriteScope<'a>, OperationJournalStoreError> {
+        self.prepay_chunk_observation(None, operation, chunk, input)
+    }
+    fn prepay_chunk_observation<'a>(
+        &self,
+        request: Option<&chunk_claims::ChunkClaimRequest>,
+        operation: OperationId,
+        chunk: chunk_claims::ChunkId,
+        input: &'a InputPermit,
+    ) -> Result<ChunkWriteScope<'a>, OperationJournalStoreError> {
         self.validate_namespace_with_input(Some(input), false)?;
         let mut scope = None;
         let present = self.inspect_bound_complete_claim_operation(
-            request.operation_id(),
+            operation,
             input,
             |record, sequence, digest| {
                 // Only a prepaid private owned observation escapes. Neither its
@@ -168,13 +212,15 @@ impl OperationJournalStore {
                     digest,
                     _credit: credit.into_startup_credit(),
                 };
-                scope = Some(ChunkWriteScope::new(self, request, image, input)?);
+                scope = Some(ChunkWriteScope::new(
+                    self, request, operation, chunk, image, input,
+                )?);
                 Ok(())
             },
         )?;
         if !present {
             return Err(OperationJournalStoreError::OperationNotFound {
-                operation_id: request.operation_id(),
+                operation_id: operation,
             });
         }
         Ok(scope.expect("present complete original operation produced its write budget"))

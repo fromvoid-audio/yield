@@ -2498,6 +2498,162 @@ impl OperationJournalStore {
         })
     }
 
+    /// Same original Claimed-to-Issued transaction with original producer backing.
+    /// The sealed receipt is constructed only after commit and exact readback.
+    pub(in crate::operation_journal) fn issue_chunk_claim_funded(
+        &self,
+        chunk_id: chunk_claims::ChunkId,
+        operation_id: OperationId,
+        issue_id: Uuid,
+        mut scope: ChunkWriteScope<'_>,
+        expected: &FundedChunkClaimRecord,
+    ) -> Result<chunk_claims::ChunkIssueReceipt, OperationJournalStoreError> {
+        let input = scope.input();
+        let result = (|| {
+            if !scope.matches_issue(chunk_id, operation_id) {
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: String::from("chunk issuance scope differs from request"),
+                });
+            }
+            scope.validate_namespace(self, false)?;
+            scope.verify_image(self)?;
+            initial_settlement_backing::control(&self.connection, Some(input), c"BEGIN")?;
+            let transition = (|| {
+                scope.verify_image(self)?;
+                let operation = scope.record();
+                if operation.phase != OperationPhase::IntentDurable
+                    || !matches!(
+                        operation.disposition,
+                        OperationDisposition::None | OperationDisposition::RetryPending
+                    )
+                {
+                    return Err(OperationJournalStoreError::ChunkClaim {
+                        reason: format!(
+                            "operation {operation_id} is not eligible for chunk issuance"
+                        ),
+                    });
+                }
+                let before = scope.take_duplicate();
+                let after = scope.take_transition();
+                let record = chunk_claims::issue_for_input(
+                    &self.connection,
+                    chunk_id,
+                    operation_id,
+                    issue_id,
+                    input,
+                    before,
+                    after,
+                    expected,
+                )?
+                .ok_or_else(|| OperationJournalStoreError::ChunkClaim {
+                    reason: String::from(
+                        "chunk issuance transition was already consumed; no issue receipt minted",
+                    ),
+                })?;
+                #[cfg(test)]
+                if let Some(directive) =
+                    self.insert_test_directive(InsertTestBoundary::BeforePrecommitValidation)
+                {
+                    match directive {
+                        InsertTestDirective::Fail(error)
+                        | InsertTestDirective::FailAndLeaveForRollback(error) => return Err(error),
+                        InsertTestDirective::Continue | InsertTestDirective::ExecuteThenFail(_) => {
+                        }
+                    }
+                }
+                scope.validate_namespace(self, true)?;
+                Ok(record)
+            })();
+            let transitioned = match transition {
+                Ok(row) => row,
+                Err(error) => {
+                    let rollback = initial_settlement_backing::control(
+                        &self.connection,
+                        Some(input),
+                        c"ROLLBACK",
+                    );
+                    return match rollback {
+                        Ok(()) => Err(error),
+                        Err(rollback) => Err(OperationJournalStoreError::ChunkClaim {
+                            reason: format!(
+                                "chunk issuance failed: {error}; rollback was not confirmed: {rollback}"
+                            ),
+                        }),
+                    };
+                }
+            };
+            #[cfg(test)]
+            let commit_directive = self.insert_test_directive(InsertTestBoundary::Commit);
+            #[cfg(test)]
+            if let Some(InsertTestDirective::Fail(error)) = commit_directive {
+                let rollback =
+                    initial_settlement_backing::control(&self.connection, Some(input), c"ROLLBACK");
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: format!(
+                        "chunk issuance commit was rejected: {error}; rollback={rollback:?}"
+                    ),
+                });
+            }
+            #[cfg(test)]
+            if let Some(InsertTestDirective::ExecuteThenFail(error)) = commit_directive {
+                let commit =
+                    initial_settlement_backing::control(&self.connection, Some(input), c"COMMIT");
+                let rollback =
+                    initial_settlement_backing::control(&self.connection, Some(input), c"ROLLBACK");
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: format!(
+                        "chunk issuance commit outcome is uncertain: {error}; commit={commit:?}; rollback={rollback:?}"
+                    ),
+                });
+            }
+            if let Err(error) =
+                initial_settlement_backing::control(&self.connection, Some(input), c"COMMIT")
+            {
+                let rollback =
+                    initial_settlement_backing::control(&self.connection, Some(input), c"ROLLBACK");
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: format!(
+                        "chunk issuance commit outcome is uncertain: {error}; rollback={rollback:?}"
+                    ),
+                });
+            }
+            #[cfg(test)]
+            if let Some(InsertTestDirective::Fail(error)) =
+                self.insert_test_directive(InsertTestBoundary::AfterCommit)
+            {
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: format!("chunk issuance committed but acknowledgement failed: {error}"),
+                });
+            }
+            scope.validate_namespace(self, false)?;
+            let readback = chunk_claims::read_for_input_prepaid(
+                &self.connection,
+                chunk_id,
+                input,
+                scope.take_output(),
+            )?
+            .ok_or_else(|| OperationJournalStoreError::ChunkClaim {
+                reason: String::from("issued chunk claim disappeared during readback"),
+            })?;
+            if readback != transitioned {
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: String::from(
+                        "issued chunk readback differs from the exact committed transition",
+                    ),
+                });
+            }
+            readback
+                .into_issue_receipt()
+                .ok_or_else(|| OperationJournalStoreError::ChunkClaim {
+                    reason: String::from(
+                        "issued chunk readback did not contain a sealed issue proof",
+                    ),
+                })
+        })();
+        scope.finish(result.is_err());
+        result
+    }
+
     /// Durably release a chunk claim and its ordinary row. Provider accounting is reconciled by
     /// the owner only after this transaction has committed and read back the exact receipt.
     pub(crate) fn release_chunk_claim(
@@ -19103,6 +19259,207 @@ mod tests {
                 .unwrap()
                 .matches_request(&request)
         );
+    }
+
+    fn persist_issuance_fixture(
+        store: &OperationJournalStore,
+        record: &StoredOperationRecord,
+    ) -> (ChunkClaimRequest, CapacityProvider) {
+        store.insert_intent_with_outcome(record).receipt().unwrap();
+        let request = chunk_request_for_record(
+            record,
+            ChunkId::new(),
+            AdmissionClaimId::new(),
+            "funded-issuance",
+            0,
+        );
+        let provider = provider_for_intent(record);
+        let lease = provider
+            .admit(&request.plan().unwrap(), &request.inventory().unwrap())
+            .unwrap();
+        store
+            .persist_chunk_claim_with_lease(&request, &provider, lease)
+            .unwrap();
+        (request, provider)
+    }
+
+    #[test]
+    fn funded_chunk_issuance_commits_with_exhausted_pool_and_keeps_original_receipt_credit() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).unwrap();
+        let record = universal_intent_record(OperationId::new());
+        let (request, provider) = persist_issuance_fixture(&store, &record);
+        let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+        let pool = funding.pool_bytes_observer_for_test();
+        let baseline = funding.remaining_bytes();
+        let expected = store
+            .read_chunk_claim_for_input(request.chunk_id(), &funding.input)
+            .unwrap()
+            .unwrap();
+        let scope = store
+            .prepay_chunk_issuance(record.operation_id, request.chunk_id(), &funding.input)
+            .unwrap();
+        let remaining = funding
+            .input
+            .reserve_historical_scratch(funding.remaining_bytes())
+            .unwrap();
+        assert_eq!(funding.remaining_bytes(), 0);
+        let issue = Uuid::new_v4();
+        let receipt = store
+            .issue_chunk_claim_funded(
+                request.chunk_id(),
+                record.operation_id,
+                issue,
+                scope,
+                &expected,
+            )
+            .unwrap();
+        assert_eq!(receipt.issue_id(), issue);
+        assert_eq!(receipt.operation_id(), record.operation_id);
+        assert_eq!(receipt.write_identity(), request.identity());
+        assert_eq!(provider.claim_count(), 1);
+        drop(remaining);
+        drop(expected);
+        assert_eq!(
+            baseline - funding.remaining_bytes(),
+            chunk_claims::point_read_bytes()
+        );
+        drop(funding);
+        assert!(pool().0 < pool().1);
+        drop(receipt);
+        assert_eq!(pool().0, pool().1);
+        assert_eq!(provider.claim_count(), 1);
+        assert!(
+            store
+                .issue_chunk_claim(request.chunk_id(), record.operation_id, Uuid::new_v4())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn funded_chunk_issuance_changed_image_or_chunk_refuses_before_cas() {
+        for operation_image in [false, true] {
+            let fixture = fixture();
+            let store = OperationJournalStore::open(&fixture.owner).unwrap();
+            let record = universal_intent_record(OperationId::new());
+            let (request, provider) = persist_issuance_fixture(&store, &record);
+            let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+            let expected = store
+                .read_chunk_claim_for_input(request.chunk_id(), &funding.input)
+                .unwrap()
+                .unwrap();
+            let scope = store
+                .prepay_chunk_issuance(record.operation_id, request.chunk_id(), &funding.input)
+                .unwrap();
+            if operation_image {
+                store.connection.execute("UPDATE operation_journal SET sequence = sequence + 1 WHERE operation_id = ?1", params![record.operation_id.to_string()]).unwrap();
+            } else {
+                store.connection.execute("UPDATE operation_journal_chunk_claim SET output_key = 'changed-after-validation' WHERE chunk_id = ?1", params![request.chunk_id().to_string()]).unwrap();
+            }
+            let error = store
+                .issue_chunk_claim_funded(
+                    request.chunk_id(),
+                    record.operation_id,
+                    Uuid::new_v4(),
+                    scope,
+                    &expected,
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("changed after preparing"),
+                "{error:?}"
+            );
+            assert_eq!(
+                store
+                    .read_chunk_claim(request.chunk_id())
+                    .unwrap()
+                    .unwrap()
+                    .state(),
+                ChunkClaimState::Claimed
+            );
+            assert!(store.connection.is_autocommit());
+            assert_eq!(provider.claim_count(), 1);
+        }
+    }
+
+    #[test]
+    fn funded_chunk_issuance_faults_retain_charge_and_never_return_receipt() {
+        for boundary in [
+            InsertTestBoundary::BeforePrecommitValidation,
+            InsertTestBoundary::Commit,
+            InsertTestBoundary::AfterCommit,
+        ] {
+            for uncertain in [false, true] {
+                if uncertain && boundary != InsertTestBoundary::Commit {
+                    continue;
+                }
+                let fixture = fixture();
+                let store = OperationJournalStore::open(&fixture.owner).unwrap();
+                let record = universal_intent_record(OperationId::new());
+                let (request, provider) = persist_issuance_fixture(&store, &record);
+                let funding = super::super::owner::JournalNamespaceFundingProbe::new();
+                let pool = funding.pool_bytes_observer_for_test();
+                let expected = store
+                    .read_chunk_claim_for_input(request.chunk_id(), &funding.input)
+                    .unwrap()
+                    .unwrap();
+                let scope = store
+                    .prepay_chunk_issuance(record.operation_id, request.chunk_id(), &funding.input)
+                    .unwrap();
+                store.set_insert_test_hook(move |at| {
+                    if at == boundary {
+                        let error = OperationJournalStoreError::IdentityCheckUnavailable {
+                            reason: "original issuance failure".into(),
+                        };
+                        if uncertain {
+                            InsertTestDirective::ExecuteThenFail(error)
+                        } else {
+                            InsertTestDirective::Fail(error)
+                        }
+                    } else {
+                        InsertTestDirective::Continue
+                    }
+                });
+                let result = store.issue_chunk_claim_funded(
+                    request.chunk_id(),
+                    record.operation_id,
+                    Uuid::new_v4(),
+                    scope,
+                    &expected,
+                );
+                let error = result.unwrap_err();
+                let committed = uncertain || boundary == InsertTestBoundary::AfterCommit;
+                assert_eq!(
+                    store
+                        .read_chunk_claim(request.chunk_id())
+                        .unwrap()
+                        .unwrap()
+                        .state(),
+                    if committed {
+                        ChunkClaimState::Issued
+                    } else {
+                        ChunkClaimState::Claimed
+                    }
+                );
+                assert_eq!(provider.claim_count(), 1);
+                assert_eq!(ordinary_claim_count(&store), 1);
+                assert!(store.connection.is_autocommit());
+                if uncertain {
+                    assert!(error.to_string().contains("outcome is uncertain"));
+                }
+                drop(expected);
+                let retained = funding.retain_command_error_for_test(error);
+                drop(funding);
+                assert!(
+                    pool().0 < pool().1,
+                    "selected diagnostic must remain prepaid"
+                );
+                drop(retained);
+                // The probe retains no request consumer, so its complete custody is
+                // released only when the original funding probe itself is dropped.
+                assert_eq!(pool().0, pool().1);
+            }
+        }
     }
 
     #[test]

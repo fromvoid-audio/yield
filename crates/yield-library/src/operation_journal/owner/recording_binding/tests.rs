@@ -40,6 +40,7 @@ impl Fixture {
 #[test]
 fn recording_custody_original_unqualified_journal_refuses_unissued_source_receipt() {
     let _native_harness: fn(bool) = native_original_recording_custody;
+    let _chunk_harness: fn() = native_original_chunk_issuance;
     let mut f = Fixture::new();
     let media = tempfile::tempdir().unwrap();
     let source = crate::sample_sources::SourceDatabase::open_for_catalog_with_profile_guard(
@@ -199,7 +200,17 @@ fn recording_custody_revalidation_queues_while_original_retained_debit_is_held()
 
 // Native acceptance uses the production constructor and real registered source/root/admission.
 // No fixture capacity registry, injected receipt, synthetic root or platform bypass is used.
+enum NativeProductionCase {
+    RecordingCustody { lost_reply: bool },
+    ChunkIssuance,
+}
 fn native_original_recording_custody(lost_reply: bool) {
+    native_original_production(NativeProductionCase::RecordingCustody { lost_reply });
+}
+fn native_original_chunk_issuance() {
+    native_original_production(NativeProductionCase::ChunkIssuance);
+}
+fn native_original_production(case: NativeProductionCase) {
     use crate::file_operation_owner::{FileOperationOwner, SourceFence};
     use crate::operation_journal::coordinator::StoredRelativePath;
     use crate::operation_journal::namespace_commands::{
@@ -413,6 +424,109 @@ fn native_original_recording_custody(lost_reply: bool) {
     assert_eq!(operation, proposal.operation_id());
     let before = *client.shared.input_bytes.lock().unwrap();
     let factories = FACTORIES.load(Ordering::Acquire);
+    if matches!(case, NativeProductionCase::ChunkIssuance) {
+        let chunk = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                facts.identity.clone(),
+                FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .unwrap(),
+            filesystem,
+            "native-issuance-without-write".into(),
+            0,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .unwrap();
+        let claimed = client
+            .claim_chunk(chunk.clone())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.state(), ChunkClaimState::Claimed);
+        assert!(claimed.matches_request(&chunk));
+        drop(claimed);
+        let permit = client
+            .issue_chunk(chunk.chunk_id(), operation)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(permit.chunk_id(), chunk.chunk_id());
+        assert_eq!(permit.operation_id(), operation);
+        assert!(!permit.issue_id().is_nil());
+        assert_eq!(permit.logical_length(), facts.allocation_unit);
+        assert_eq!(permit.identity().participant_id(), filesystem);
+        let debited = *client.shared.input_bytes.lock().unwrap();
+        assert!(debited.remaining[0] < before.remaining[0]);
+        let replay = client
+            .issue_chunk(chunk.chunk_id(), operation)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .err()
+            .expect("no reissue");
+        assert!(format!("{replay}").contains("already Issued"));
+        drop(replay);
+        assert_eq!(*client.shared.input_bytes.lock().unwrap(), debited);
+        // No entry or checkpoint exists, so this cannot release the durable
+        // staging charge. The exact issued permit independently keeps its data
+        // backing after joined owner teardown; dropping it is not settlement.
+        let issue_id = permit.issue_id();
+        assert_eq!(FACTORIES.load(Ordering::Acquire), factories);
+        assert!(!media.path().join("capture-staging.wav").exists());
+        assert!(!media.path().join("capture.wav").exists());
+        assert!(owner.shutdown());
+        let after_join = *client.shared.input_bytes.lock().unwrap();
+        assert!(after_join.remaining[0] < InputBudget::shared_initial().remaining[0]);
+        assert!(after_join.remaining[0] > debited.remaining[0]);
+        assert_eq!(
+            after_join.publication_remaining,
+            InputBudget::shared_initial().publication_remaining
+        );
+        drop(permit);
+        assert_eq!(
+            *client.shared.input_bytes.lock().unwrap(),
+            InputBudget::shared_initial()
+        );
+        let reopened = OperationJournalStore::open(&guard).unwrap();
+        let row = reopened
+            .read_chunk_claim(chunk.chunk_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state(), ChunkClaimState::Issued);
+        assert_eq!(row.issue_id(), Some(issue_id));
+        assert_eq!(row.release_id(), None);
+        assert!(reopened.prove_clean_handoff_durable().is_err());
+        assert!(row.matches_request(&chunk));
+        assert_eq!(
+            reopened.get(operation).unwrap().unwrap().operation_id,
+            operation
+        );
+        drop(reopened);
+        assert!(matches!(
+            files.shutdown(),
+            crate::file_operation_owner::FileOperationOwnerShutdown::DrainedAck
+        ));
+        drop(authority);
+        drop(original);
+        drop(source);
+        drop(reserve);
+        drop(guard);
+        drop(root);
+        drop(profile);
+        drop(runtime);
+        return;
+    }
+    let NativeProductionCase::RecordingCustody { lost_reply } = case else {
+        unreachable!()
+    };
     let mut request = client
         .prepare_recording_producer_custody(operation, receipt.clone(), &authority)
         .unwrap();
@@ -505,6 +619,12 @@ fn recording_custody_native_production_original_slot_currentness_and_drain() {
 #[test]
 fn recording_custody_native_production_lost_reply_keeps_original_slot_and_credit() {
     native_original_recording_custody(true);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn chunk_issuance_native_production_original_claim_transition_and_retained_backing() {
+    native_original_chunk_issuance();
 }
 
 #[test]

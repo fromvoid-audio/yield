@@ -103,7 +103,7 @@ pub(super) const CREATE_TABLE: &str = "CREATE TABLE operation_journal_chunk_clai
 )";
 
 pub(crate) const MAX_PAGE_ROWS: usize = 256;
-const MAX_OUTPUT_KEY_BYTES: usize = 1024;
+pub(super) const MAX_OUTPUT_KEY_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ChunkId(Uuid);
@@ -356,18 +356,24 @@ impl ChunkWriteIdentity {
 #[derive(Debug)]
 pub(crate) struct ChunkIssueReceipt {
     record: ChunkClaimRecord,
+    _credit: Option<crate::operation_journal::owner::StartupCredit>,
 }
 
 impl ChunkIssueReceipt {
     pub(super) fn from_record(record: ChunkClaimRecord) -> Option<Self> {
-        (record.state == ChunkClaimState::Issued && record.issue_id.is_some())
-            .then_some(Self { record })
+        (record.state == ChunkClaimState::Issued && record.issue_id.is_some()).then_some(Self {
+            record,
+            _credit: None,
+        })
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn for_test(record: ChunkClaimRecord) -> Self {
-        Self { record }
+        Self {
+            record,
+            _credit: None,
+        }
     }
 
     pub(crate) fn chunk_id(&self) -> ChunkId {
@@ -590,6 +596,34 @@ pub(super) fn insert_claimed_inside_transaction(
     Ok(())
 }
 
+fn issuance_action(
+    current: &ChunkClaimRecord,
+    operation_id: OperationId,
+) -> Result<bool, ChunkClaimWriteError> {
+    if current.operation_id != operation_id {
+        return Err(ChunkClaimWriteError::InvalidTransition(String::from(
+            "chunk claim belongs to a different operation",
+        )));
+    }
+    Ok(current.state == ChunkClaimState::Claimed)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn issue_for_input(
+    connection: &Connection,
+    chunk: ChunkId,
+    operation: OperationId,
+    issue: Uuid,
+    input: &crate::operation_journal::owner::InputPermit,
+    before: crate::operation_journal::owner::InputPermit,
+    after: crate::operation_journal::owner::InputPermit,
+    expected: &FundedChunkClaimRecord,
+) -> Result<Option<FundedChunkClaimRecord>, super::OperationJournalStoreError> {
+    funded::issue(
+        connection, chunk, operation, issue, input, before, after, expected,
+    )
+}
+
 pub(super) fn mark_issued_inside_transaction(
     connection: &Connection,
     chunk_id: ChunkId,
@@ -608,26 +642,21 @@ pub(super) fn mark_issued_inside_transaction(
             "chunk claim was not found",
         )));
     };
-    if current.operation_id != operation_id {
-        return Err(ChunkClaimWriteError::InvalidTransition(String::from(
-            "chunk claim belongs to a different operation",
-        )));
+    if !issuance_action(&current, operation_id)? {
+        return Ok(None);
     }
-    match current.state {
-        ChunkClaimState::Claimed => {
-            connection.execute(
+    {
+        connection.execute(
                 &format!("UPDATE {TABLE_NAME} SET state = 'Issued', issue_id = ?2 WHERE chunk_id = ?1 AND operation_id = ?3 AND state = 'Claimed'"),
                 params![chunk_id.to_string(), issue_id.to_string(), operation_id.to_string()],
             )?;
-            let updated = read(connection, chunk_id)
-                .map_err(|error| ChunkClaimWriteError::InvalidTransition(error.to_string()))?
-                .ok_or_else(|| ChunkClaimWriteError::ReadbackMismatch)?;
-            if updated.state != ChunkClaimState::Issued || updated.issue_id != Some(issue_id) {
-                return Err(ChunkClaimWriteError::ReadbackMismatch);
-            }
-            Ok(Some(updated))
+        let updated = read(connection, chunk_id)
+            .map_err(|error| ChunkClaimWriteError::InvalidTransition(error.to_string()))?
+            .ok_or_else(|| ChunkClaimWriteError::ReadbackMismatch)?;
+        if updated.state != ChunkClaimState::Issued || updated.issue_id != Some(issue_id) {
+            return Err(ChunkClaimWriteError::ReadbackMismatch);
         }
-        ChunkClaimState::Issued | ChunkClaimState::Released => Ok(None),
+        Ok(Some(updated))
     }
 }
 
