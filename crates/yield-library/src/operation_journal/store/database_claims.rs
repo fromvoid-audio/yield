@@ -10,6 +10,7 @@ use uuid::Uuid;
 pub(super) mod command_backing;
 pub(super) mod comparison;
 mod funded;
+pub(super) mod restart_backing;
 pub(super) mod scalar_projection;
 pub(super) use funded::{Inventory as RetainedDatabaseInventory, read_with_input};
 
@@ -520,6 +521,9 @@ impl OperationJournalStore {
         &self,
         input: Option<&crate::operation_journal::owner::InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
+        if let Some(input) = input {
+            return restart_backing::validate(self, input);
+        }
         bounded_count(&self.connection, BINDING_TABLE)?;
         bounded_count(&self.connection, SLICE_TABLE)?;
         for table in [BINDING_TABLE, SLICE_TABLE] {
@@ -546,13 +550,7 @@ impl OperationJournalStore {
                         return Err(error("restart noncanonical operation identity"));
                     }
                     let operation = OperationId::from_uuid(id);
-                    if input.is_some() {
-                        let inventory = read_with_input(&self.connection, operation, input)?
-                            .ok_or_else(|| error("missing restart inventory"))?;
-                        self.validate_database_claim_operation_with_input(
-                            operation, &inventory, input,
-                        )?;
-                    } else if self.recording_prestart_scope.get() {
+                    if self.recording_prestart_scope.get() {
                         // Finish the two-tree operation decoder before owning the binary
                         // inventory. Subsequent comparisons reuse this exact decoded row;
                         // command digest construction owns only one JSON tree at a time.

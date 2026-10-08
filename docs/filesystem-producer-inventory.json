@@ -1752,6 +1752,46 @@
       "issue": "OPT-2430",
       "reason": "Private actual Store on its genuine temporary profile exercises passive descriptor and original journal claim observations, selected loan custody, corruption and native errors. Logical fixtures grant no native qualification or effect authority.",
       "retirement": "Keep this precise test-only scope; remove its row if the fixture operation is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_restart_page_funding_tests.rs",
+      "function": "funded_database_restart_pages_keep_original_inventory_and_refund_complete_scan",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2434",
+      "reason": "Private original Store on its genuine temporary profile exercises passive binding/slice restart pages, whole-page diagnostics, pressure refusal and selected producer loan custody. Logical fixture leases grant no native qualification or live effect authority.",
+      "retirement": "Keep this exact test-only Store opening; remove its row when the fixture operation is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_restart_page_funding_tests.rs",
+      "function": "funded_database_restart_pages_preserve_selected_original_nested_inventory_failure",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2434",
+      "reason": "Private original Store on its genuine temporary profile exercises passive binding/slice restart pages, whole-page diagnostics, pressure refusal and selected producer loan custody. Logical fixture leases grant no native qualification or live effect authority.",
+      "retirement": "Keep this exact test-only Store opening; remove its row when the fixture operation is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_restart_page_funding_tests.rs",
+      "function": "funded_database_restart_pages_preserve_whole_page_utf8_before_uuid_errors",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2434",
+      "reason": "Private original Store on its genuine temporary profile exercises passive binding/slice restart pages, whole-page diagnostics, pressure refusal and selected producer loan custody. Logical fixture leases grant no native qualification or live effect authority.",
+      "retirement": "Keep this exact test-only Store opening; remove its row when the fixture operation is removed. No production authority is granted."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/store/database_restart_page_funding_tests.rs",
+      "function": "funded_database_restart_pages_refuse_pressure_before_ownership_and_retain_native_errors",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2434",
+      "reason": "Private original Store on its genuine temporary profile exercises passive binding/slice restart pages, whole-page diagnostics, pressure refusal and selected producer loan custody. Logical fixture leases grant no native qualification or live effect authority.",
+      "retirement": "Keep this exact test-only Store opening; remove its row when the fixture operation is removed. No production authority is granted."
     }
   ]
 }

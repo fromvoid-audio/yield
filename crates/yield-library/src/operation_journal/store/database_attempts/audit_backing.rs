@@ -1,6 +1,8 @@
 //! Original outer audit producers, prepaid without changing observation rules.
 use super::*;
-use crate::operation_journal::store::historical_claim_observation::borrowed_sql::Statement;
+use crate::operation_journal::store::historical_claim_observation::borrowed_sql::{
+    Statement, scalar,
+};
 use crate::operation_journal::{codec::historical_observation::FIXED_BYTES, owner::InputPermit};
 use rusqlite::types::ValueRef;
 use std::{cell::RefCell, ffi::CStr, mem::size_of};
@@ -66,8 +68,7 @@ fn uuid(row: &Statement<'_>) -> Result<Option<UuidProjection>> {
     }
     // Original nullable String fallback succeeds only for NULL. Preserve its
     // original UTF8/type diagnostics before interpreting any page UUID.
-    image_backing::scalar::<Option<String>>(row, 0)
-        .map(|text| text.map(|s| UuidProjection::new(&s)))
+    scalar::<Option<String>>(row, 0).map(|text| text.map(|s| UuidProjection::new(&s)))
 }
 fn count(
     store: &OperationJournalStore,
@@ -80,7 +81,7 @@ fn count(
     if !row.next()? {
         return Err(rusqlite::Error::QueryReturnedNoRows.into());
     }
-    let count = image_backing::scalar::<i64>(&row, 0)?;
+    let count = scalar::<i64>(&row, 0)?;
     if count < 0 || count > MAX_ATTEMPTS as i64 {
         return Err(error("retained row ceiling"));
     }
@@ -108,7 +109,7 @@ pub(in crate::operation_journal::store) fn read(
             if !bad.next()? {
                 return Err(rusqlite::Error::QueryReturnedNoRows.into());
             }
-            if image_backing::scalar::<bool>(&bad, 0)? {
+            if scalar::<bool>(&bad, 0)? {
                 return Err(error("audit key type/length"));
             }
             drop(bad);

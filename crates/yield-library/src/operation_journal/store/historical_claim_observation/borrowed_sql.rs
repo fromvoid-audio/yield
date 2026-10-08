@@ -370,3 +370,33 @@ mod tests {
         }
     }
 }
+
+// Use the pinned driver's actual scalar conversion and diagnostic variants.
+pub(in crate::operation_journal::store) fn scalar<T: rusqlite::types::FromSql>(
+    row: &Statement<'_>,
+    index: i32,
+) -> Result<T, OperationJournalStoreError> {
+    use rusqlite::types::FromSqlError;
+    let v = row.get_ref(index)?;
+    T::column_result(v).map_err(|e| {
+        match e {
+            FromSqlError::InvalidType => rusqlite::Error::InvalidColumnType(
+                index as usize,
+                row.column_name(index).unwrap().into(),
+                v.data_type(),
+            ),
+            FromSqlError::OutOfRange(n) => {
+                rusqlite::Error::IntegralValueOutOfRange(index as usize, n)
+            }
+            FromSqlError::Other(e) => {
+                rusqlite::Error::FromSqlConversionFailure(index as usize, v.data_type(), e)
+            }
+            e => rusqlite::Error::FromSqlConversionFailure(
+                index as usize,
+                v.data_type(),
+                Box::new(e),
+            ),
+        }
+        .into()
+    })
+}
