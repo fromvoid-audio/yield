@@ -79,6 +79,22 @@ fn capture_schema(connection: &Connection, expected_query_only: u64) -> Result<[
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(refused)?;
     actual.sort();
+    validate_original_schema_image(&actual)?;
+    let mut digest = blake3::Hasher::new();
+    for (kind, name, table, sql) in actual {
+        for text in [kind, name, table, sql.unwrap_or_default()] {
+            digest.update(&(text.len() as u64).to_le_bytes());
+            digest.update(text.as_bytes());
+        }
+    }
+    Ok(*digest.finalize().as_bytes())
+}
+
+// Closed finite grammar for an in-memory post-schema reference. Never execute an
+// arbitrary caller-provided schema image merely because its table names match.
+pub(in crate::sample_sources::db) fn validate_original_schema_image(
+    actual: &crate::sample_sources::db::schema::SchemaImage,
+) -> Result<()> {
     let expected = [
         ("index", "sqlite_autoindex_metadata_1", "metadata", None),
         ("index", "sqlite_autoindex_wav_files_1", "wav_files", None),
@@ -103,7 +119,9 @@ fn capture_schema(connection: &Connection, expected_query_only: u64) -> Result<[
                 || a.1 != e.1
                 || a.2 != e.2
                 || !match (a.3.as_deref(), e.3) {
-                    (Some(actual), Some(expected)) => matches_compiled_sql(actual, expected),
+                    (Some(actual), Some(expected)) => {
+                        actual.len() <= 4096 && matches_compiled_sql(actual, expected)
+                    }
                     (None, None) => true,
                     _ => false,
                 }
@@ -111,12 +129,5 @@ fn capture_schema(connection: &Connection, expected_query_only: u64) -> Result<[
     {
         return Err(LegacyObservationError("unknown legacy schema image"));
     }
-    let mut digest = blake3::Hasher::new();
-    for (kind, name, table, sql) in actual {
-        for text in [kind, name, table, sql.unwrap_or_default()] {
-            digest.update(&(text.len() as u64).to_le_bytes());
-            digest.update(text.as_bytes());
-        }
-    }
-    Ok(*digest.finalize().as_bytes())
+    Ok(())
 }

@@ -49,6 +49,8 @@ pub(in crate::sample_sources::db) fn apply_preserving_legacy_schema(
 pub(in crate::sample_sources::db) fn expected_legacy_postimage(
     original: &metadata_budget::SchemaImage,
 ) -> Result<metadata_budget::SchemaImage, SourceDbError> {
+    super::super::legacy_observation::validate_original_schema_image(original)
+        .map_err(|_| SourceDbError::Unexpected)?;
     let reference = Connection::open_in_memory().map_err(map_sql_error)?;
     for (kind, name, _, sql) in original {
         if kind == "table" {
@@ -89,6 +91,33 @@ pub(in crate::sample_sources::db) fn legacy_schema_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_postimage_oracle_rejects_unreviewed_ddl_before_it_can_open_an_attached_file() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE wav_files (path TEXT PRIMARY KEY, file_size INTEGER NOT NULL, modified_ns INTEGER NOT NULL)").unwrap();
+        let original = metadata_budget::image(&connection).unwrap();
+        assert!(expected_legacy_postimage(&original).is_ok());
+        let mut injected = original.clone();
+        let target = root.path().join("unadmitted.sqlite");
+        let table = injected
+            .iter_mut()
+            .find(|entry| entry.1 == "metadata" && entry.0 == "table")
+            .unwrap();
+        table.3.as_mut().unwrap().push_str(&format!(
+            "; ATTACH DATABASE '{}' AS unexpected; CREATE TABLE unexpected.effect(value INTEGER)",
+            target.display()
+        ));
+        assert!(expected_legacy_postimage(&injected).is_err());
+        assert!(!target.exists());
+        let mut oversized = original;
+        let table = oversized
+            .iter_mut()
+            .find(|entry| entry.1 == "metadata" && entry.0 == "table")
+            .unwrap();
+        table.3 = Some(format!("{}{}", " ".repeat(4096), table.3.take().unwrap()));
+        assert!(expected_legacy_postimage(&oversized).is_err());
+    }
     #[test]
     fn legacy_additive_schema_preserves_original_metadata_and_three_column_audio_rows() {
         let root = tempfile::tempdir().unwrap();

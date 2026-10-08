@@ -39,6 +39,8 @@ SOURCE_EXCEPTIONS = {
 # Source owner, lease control, snapshot destination, global library, and journal
 # opens are separate reviewed boundaries. New raw opens need an explicit review.
 RAW_EXCEPTIONS = {
+    # Known-11 grammar is validated before compiled additive DDL in a pathless oracle.
+    ("crates/yield-library/src/sample_sources/db/schema/legacy_adoption.rs", "expected_legacy_postimage", "open_in_memory"): 1,
     # One connection-owned VFS raw constructor, same retained root/no-follow boundary.
     # Mode is immutable before open; legacy no-effect mode refuses native mutation callbacks.
     ("crates/yield-library/src/sqlite_budget.rs", "open_owned_mode", "open_with_flags_and_vfs"): 1,
@@ -195,6 +197,8 @@ def inventory_label(call: Call) -> str:
     if call.path.endswith("/source_lease.rs"):
         return "source-lease-control"
     if call.path.endswith("/library/source_lifecycle_schema.rs") and call.function == "expected_image" and call.opener == "open_in_memory":
+        return "in-memory-schema-probe"
+    if call.path.endswith("/schema/legacy_adoption.rs") and call.function == "expected_legacy_postimage" and call.opener == "open_in_memory":
         return "in-memory-schema-probe"
     if call.path.endswith("/schema/metadata_budget.rs") and call.function == "reference_image" and call.opener == "open_in_memory":
         return "in-memory-schema-probe"
