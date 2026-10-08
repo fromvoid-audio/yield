@@ -827,9 +827,9 @@ impl Browser {
             session.root = source.root.clone();
             session.label = source_label(&source.root);
             if root_changed {
-                session.entries.clear();
-                session.tree = yield_core::FolderTree::default();
-                session.catalog_facts.clear();
+                session.entries = std::sync::Arc::new(Vec::new());
+                session.tree = std::sync::Arc::new(yield_core::FolderTree::default());
+                session.catalog_facts = std::sync::Arc::new(std::collections::HashMap::new());
                 session.selected_audio_id = None;
             }
             sessions.push(session);

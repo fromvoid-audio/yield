@@ -3071,7 +3071,8 @@ impl Browser {
             entry_indices.as_deref(),
         );
         patch_visible_entries(
-            &mut self.source_sessions[active_index].entries,
+            std::sync::Arc::make_mut(&mut self.source_sessions[active_index].entries)
+                .as_mut_slice(),
             patches,
             collection_filter,
             rating_filter,
@@ -3086,7 +3087,8 @@ impl Browser {
             );
         let preserve_passive_focus = playback_type_changed || self.browser_focus_detached;
         patch_visible_playback_types(
-            &mut self.source_sessions[active_index].entries,
+            std::sync::Arc::make_mut(&mut self.source_sessions[active_index].entries)
+                .as_mut_slice(),
             playback_types,
             playback_type_filter,
             entry_indices.as_deref(),

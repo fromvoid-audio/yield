@@ -289,7 +289,7 @@ mod fixtures {
             let mut source = SourceSession::new(root.clone());
             source.source_id = Some(source_id.clone());
             source.catalog_lifecycle_generation = Some(1);
-            source.entries = entries.clone();
+            source.entries = entries.clone().into();
             view.source_sessions = vec![source];
             view.active_source = Some(0);
             view.root = Some(root.clone());
@@ -1453,7 +1453,7 @@ mod fixtures {
             let mut source = SourceSession::new(root.clone());
             source.source_id = Some(source_id.clone());
             source.catalog_lifecycle_generation = Some(1);
-            source.entries = vec![entry.clone()];
+            source.entries = vec![entry.clone()].into();
             view.source_sessions = vec![source];
             view.active_source = Some(0);
             view.root = Some(root.clone());

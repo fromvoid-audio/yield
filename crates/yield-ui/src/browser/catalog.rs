@@ -154,8 +154,80 @@ struct CatalogProjection {
     committed_revision: u64,
     entries: Vec<AudioFile>,
     tree: FolderTree,
-    facts: HashMap<PathBuf, CatalogFileFacts>,
+    facts: Arc<HashMap<PathBuf, CatalogFileFacts>>,
     entry_indices: Arc<HashMap<PathBuf, usize>>,
+}
+
+/// Shared immutable predecessor captured on the UI; materialize only on the worker.
+struct CatalogReplayBase {
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    root: PathBuf,
+    root_identity: RootIdentity,
+    directory_generation: u64,
+    committed_revision: u64,
+    entries: Arc<Vec<AudioFile>>,
+    tree: Arc<FolderTree>,
+    facts: Arc<HashMap<PathBuf, CatalogFileFacts>>,
+    entry_indices: Arc<HashMap<PathBuf, usize>>,
+}
+
+impl CatalogReplayBase {
+    fn capture(
+        context: catalog_metadata::CatalogMetadataContext,
+        session: &SourceSession,
+    ) -> Option<Self> {
+        if session.source_id.as_ref() != Some(&context.source_id)
+            || session.catalog_lifecycle_generation != Some(context.lifecycle_generation)
+            || session.root != context.root
+        {
+            return None;
+        }
+        Some(Self {
+            source_id: context.source_id,
+            lifecycle_generation: context.lifecycle_generation,
+            root: context.root,
+            root_identity: context.root_identity,
+            directory_generation: context.directory_generation,
+            committed_revision: context.revision,
+            entries: Arc::clone(&session.entries),
+            tree: Arc::clone(&session.tree),
+            facts: Arc::clone(&session.catalog_facts),
+            entry_indices: context.entry_indices,
+        })
+    }
+
+    fn materialize(self) -> CatalogProjection {
+        CatalogProjection {
+            source_id: self.source_id,
+            lifecycle_generation: self.lifecycle_generation,
+            root: self.root,
+            root_identity: self.root_identity,
+            directory_generation: self.directory_generation,
+            committed_revision: self.committed_revision,
+            entries: self.entries.as_ref().clone(),
+            tree: self.tree.as_ref().clone(),
+            facts: self.facts,
+            entry_indices: self.entry_indices,
+        }
+    }
+}
+
+/// Prepare both retained and displayed views off render, rather than cloning at delivery.
+struct PreparedCatalogProjection {
+    projection: CatalogProjection,
+    session_entries: Arc<Vec<AudioFile>>,
+    session_tree: Arc<FolderTree>,
+}
+
+impl PreparedCatalogProjection {
+    fn new(projection: CatalogProjection) -> Self {
+        Self {
+            session_entries: Arc::new(projection.entries.clone()),
+            session_tree: Arc::new(projection.tree.clone()),
+            projection,
+        }
+    }
 }
 
 impl Browser {
@@ -255,8 +327,8 @@ impl Browser {
         self.pending_source_return_index = None;
         self.pending_source_return_root = None;
         self.root = Some(root.clone());
-        self.entries = self.source_sessions[index].entries.clone();
-        self.folder_tree = Some(self.source_sessions[index].tree.clone());
+        self.entries = self.source_sessions[index].entries.as_ref().clone();
+        self.folder_tree = Some(self.source_sessions[index].tree.as_ref().clone());
         self.selected_folder = self.source_sessions[index].selected_folder.clone();
         self.expanded_folders = self.source_sessions[index].expanded_folders.clone();
         self.folder_scope = self.source_sessions[index].folder_scope;
@@ -907,18 +979,14 @@ impl Browser {
             else {
                 return;
             };
-            Some(CatalogProjection {
-                source_id: context.source_id,
-                lifecycle_generation: context.lifecycle_generation,
-                root: context.root,
-                root_identity: context.root_identity,
-                directory_generation: context.directory_generation,
-                committed_revision: context.revision,
-                entries: session.entries.clone(),
-                tree: session.tree.clone(),
-                facts: session.catalog_facts.clone(),
-                entry_indices: context.entry_indices,
-            })
+            let Some(base) = CatalogReplayBase::capture(context, session) else {
+                self.catalog_pending_command = Some(CatalogCommandIntent::Audit {
+                    source_id,
+                    lifecycle_generation,
+                });
+                return;
+            };
+            Some(base)
         } else {
             None
         };
@@ -937,13 +1005,17 @@ impl Browser {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    if worker_cancellation.load(Ordering::Acquire) {
+                        return Err("catalog projection canceled".into());
+                    }
                     if let Some(base) = replay_base {
                         return project_catalog_replay_event_with_fence(
                             event,
-                            base,
+                            base.materialize(),
                             &worker_cancellation,
                             worker_publication_fence,
-                        );
+                        )
+                        .map(PreparedCatalogProjection::new);
                     }
                     project_catalog_event_with_fence(
                         event,
@@ -951,6 +1023,7 @@ impl Browser {
                         &worker_cancellation,
                         worker_publication_fence,
                     )
+                    .map(PreparedCatalogProjection::new)
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
@@ -1002,10 +1075,15 @@ impl Browser {
 
     fn apply_catalog_projection(
         &mut self,
-        projection: CatalogProjection,
+        prepared: PreparedCatalogProjection,
         force_reload: bool,
         cx: &mut Context<Self>,
     ) {
+        let PreparedCatalogProjection {
+            projection,
+            session_entries,
+            session_tree,
+        } = prepared;
         self.reset_browser_focus_state();
         self.context_menu = None;
         let Some(index) = self.active_source.filter(|index| {
@@ -1104,8 +1182,8 @@ impl Browser {
         let facts = projection.facts;
         {
             let session = &mut self.source_sessions[index];
-            session.entries = entries.clone();
-            session.tree = tree.clone();
+            session.entries = session_entries;
+            session.tree = session_tree;
             session.catalog_facts = facts;
             session.selected_folder = state.selected.clone();
             session.expanded_folders = state.expanded.clone();
@@ -1501,7 +1579,7 @@ where
         committed_revision,
         entries,
         tree,
-        facts,
+        facts: Arc::new(facts),
         entry_indices: Arc::new(entry_indices),
     })
 }
@@ -1593,7 +1671,7 @@ fn patch_catalog_replay_projection(
                 } else {
                     base.entries.push(audio);
                 }
-                base.facts.insert(
+                Arc::make_mut(&mut base.facts).insert(
                     path.clone(),
                     CatalogFileFacts {
                         relative_path: path,
@@ -1608,7 +1686,7 @@ fn patch_catalog_replay_projection(
                 if let Some(i) = previous {
                     base.entries.remove(i);
                 }
-                base.facts.remove(&path);
+                Arc::make_mut(&mut base.facts).remove(&path);
             }
         }
     }
@@ -1825,10 +1903,96 @@ mod tests {
                         },
                     )
                 })
-                .collect(),
+                .collect::<HashMap<_, _>>()
+                .into(),
             entries,
             entry_indices: Arc::new(HashMap::new()),
         }
+    }
+
+    fn retained_replay_fixture() -> (
+        super::super::SourceSession,
+        super::catalog_metadata::CatalogMetadataContext,
+    ) {
+        let prepared = super::PreparedCatalogProjection::new(replay_projection_fixture());
+        let projection = prepared.projection;
+        let mut session = super::super::SourceSession::new(projection.root.clone());
+        session.source_id = Some(projection.source_id.clone());
+        session.catalog_lifecycle_generation = Some(projection.lifecycle_generation);
+        session.entries = prepared.session_entries;
+        session.tree = prepared.session_tree;
+        session.catalog_facts = Arc::clone(&projection.facts);
+        let context = super::catalog_metadata::CatalogMetadataContext {
+            source_id: projection.source_id,
+            lifecycle_generation: projection.lifecycle_generation,
+            root: projection.root,
+            root_identity: projection.root_identity,
+            directory_generation: projection.directory_generation,
+            revision: projection.committed_revision,
+            entry_indices: projection.entry_indices,
+        };
+        (session, context)
+    }
+
+    #[test]
+    fn replay_capture_shares_original_data_and_isolates_later_metadata_edits() {
+        let (mut session, context) = retained_replay_fixture();
+        let base = super::CatalogReplayBase::capture(context, &session).unwrap();
+        assert!(Arc::ptr_eq(&base.entries, &session.entries));
+        assert!(Arc::ptr_eq(&base.tree, &session.tree));
+        assert!(Arc::ptr_eq(&base.facts, &session.catalog_facts));
+        Arc::make_mut(&mut session.entries)[1].byte_len = 123;
+        Arc::make_mut(&mut session.catalog_facts)
+            .get_mut(&PathBuf::from("keep.wav"))
+            .unwrap()
+            .modified_ns = 99;
+        session.tree = Arc::new(FolderTree::default());
+        let patched = patch_catalog_replay_projection(
+            base.materialize(),
+            replay_projection_delta(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            patched
+                .entries
+                .iter()
+                .find(|e| e.relative_path == PathBuf::from("keep.wav"))
+                .unwrap()
+                .byte_len,
+            10
+        );
+        assert_eq!(patched.facts[&PathBuf::from("keep.wav")].modified_ns, 2);
+        assert!(patched.tree.contains(&PathBuf::from("keep-empty")));
+        assert_eq!(session.entries[1].byte_len, 123);
+        assert_eq!(
+            session.catalog_facts[&PathBuf::from("keep.wav")].modified_ns,
+            99
+        );
+    }
+
+    #[test]
+    fn replay_capture_refuses_foreign_source_lifecycle_and_root() {
+        let (mut session, context) = retained_replay_fixture();
+        session.catalog_lifecycle_generation = Some(context.lifecycle_generation + 1);
+        assert!(super::CatalogReplayBase::capture(context.clone(), &session).is_none());
+        session.catalog_lifecycle_generation = Some(context.lifecycle_generation);
+        session.root = PathBuf::from("/foreign-root");
+        assert!(super::CatalogReplayBase::capture(context.clone(), &session).is_none());
+        session.root = context.root.clone();
+        session.source_id = Some(SourceId::from_string("foreign-source"));
+        assert!(super::CatalogReplayBase::capture(context, &session).is_none());
+    }
+
+    #[test]
+    fn prepared_display_mutations_preserve_retained_replay_rows() {
+        let mut prepared = super::PreparedCatalogProjection::new(replay_projection_fixture());
+        prepared.projection.entries[0].byte_len = 777;
+        assert_eq!(prepared.session_entries[0].byte_len, 10);
+        assert_eq!(
+            prepared.session_entries.len(),
+            prepared.projection.entries.len()
+        );
     }
 
     fn replay_projection_delta() -> yield_session::CatalogReplayDelta {
@@ -2254,8 +2418,7 @@ mod tests {
             file_identity: Some(String::from("inode-1")),
             content_hash: Some(String::from("hash-1")),
         };
-        session
-            .catalog_facts
+        Arc::make_mut(&mut session.catalog_facts)
             .insert(facts.relative_path.clone(), facts.clone());
         let mut projection_facts = HashMap::new();
         projection_facts.insert(facts.relative_path.clone(), facts.clone());
@@ -2278,13 +2441,12 @@ mod tests {
                 curation: None,
             }],
             tree: FolderTree::default(),
-            facts: projection_facts,
+            facts: Arc::new(projection_facts),
             entry_indices: Arc::new(HashMap::from([(PathBuf::from("kick.wav"), 0)])),
         };
         assert!(!focused_manifest_changed(&id, &projection, &session));
         let mut changed = projection;
-        changed
-            .facts
+        Arc::make_mut(&mut changed.facts)
             .get_mut(&PathBuf::from("kick.wav"))
             .expect("fact")
             .modified_ns += 1;

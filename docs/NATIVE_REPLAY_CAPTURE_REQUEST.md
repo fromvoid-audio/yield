@@ -55,10 +55,17 @@ curation stay intact. Delivery pauses while a projection is pending, preserving 
 next delta on the catalog. A missing UI predecessor requests recovery audit instead
 of manufacturing a patch from the checkpoint.
 
-The GPUI implementation still copies its retained vectors/maps into the background
-projection and rebuilds local indices/tree; this is no database hydration, but its
+Replay capture retains shared immutable row, directory-tree and manifest-fact
+snapshots after checking source, lifecycle and root context. The background worker
+materializes rows/tree, patches facts with copy on write, rebuilds local indices,
+and prepares separate displayed and retained row/tree views. Delivery transfers
+those prepared views without copying the full lists on the UI thread. Later
+metadata edits preserve captured predecessors through copy on write.
+
+Curation, view-model and folder-row reconciliation still walk local data on the UI
+thread, and projection still rebuilds local indices/tree in the background. Their
 large-source cost must be measured and, if needed, reduced before responsiveness
-acceptance. This draft is not a claim of constant-cost UI updates or completed
+acceptance. This draft does not claim constant-cost UI updates or complete
 OPT-2080. Native cancellation/root/overflow/restart, actual callback ABI/volume
 history, Finder/GPUI interaction and broader Source physical-family acceptance
 remain unqualified. The new pinned native lane requires exact nonzero tests,
