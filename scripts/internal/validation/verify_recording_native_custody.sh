@@ -23,8 +23,20 @@ mkdir -p "$OUTPUT_DIR"
   ulimit -a
 } > "$OUTPUT_DIR/platform.txt"
 cat "$OUTPUT_DIR/platform.txt"
-diskutil info -plist "$HOME" > "$OUTPUT_DIR/home-filesystem.plist"
-diskutil info -plist "$NATIVE_TEST_TEMP_ROOT" > "$OUTPUT_DIR/test-filesystem.plist"
+record_filesystem() {
+  local location="$1" output="$2" device
+  device="$(df -Pk "$location" | awk 'NR == 2 { print $1 }')"
+  if [[ "$device" != /dev/disk* ]]; then
+    echo "Native filesystem device could not be resolved for $location" >&2
+    return 1
+  fi
+  if ! diskutil info -plist "$device" > "$output"; then
+    cat "$output" >&2
+    return 1
+  fi
+}
+record_filesystem "$HOME" "$OUTPUT_DIR/home-filesystem.plist"
+record_filesystem "$NATIVE_TEST_TEMP_ROOT" "$OUTPUT_DIR/test-filesystem.plist"
 python3 - "$OUTPUT_DIR/home-filesystem.plist" "$OUTPUT_DIR/test-filesystem.plist" <<'PY'
 import plistlib, sys
 for path in sys.argv[1:]:
