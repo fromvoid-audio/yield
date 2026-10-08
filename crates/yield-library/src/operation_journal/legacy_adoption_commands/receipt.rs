@@ -106,6 +106,10 @@ impl AdoptionReceiptEnvelope {
         }
         Ok(value)
     }
+    // Schema allowlisting only; this is never an adoption/claim/current-owner proof.
+    pub(crate) fn matches_migration_schema(&self, schema: [u8; 32]) -> bool {
+        self.receipt.current_schema_digest == schema
+    }
     pub(crate) fn matches_postimage(&self, schema: [u8; 32], rows: [u8; 32]) -> bool {
         self.receipt.current_schema_digest == schema && self.receipt.preserved_rows_digest == rows
     }

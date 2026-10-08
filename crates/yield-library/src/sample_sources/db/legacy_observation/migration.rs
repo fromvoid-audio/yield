@@ -399,12 +399,20 @@ mod tests {
     // Actual original readonly request capture; the second SQLite file below is only a data
     // transaction fixture. It has no Source custody, physical grant or Native qualification.
     fn with_data_fixture(test: impl FnOnce(&rusqlite::Connection, &LegacyAdoptionIntentArgs)) {
+        with_data_fixture_sql(
+            include_str!("../../../../tests/fixtures/profile-v11/source.sql"),
+            test,
+        )
+    }
+    fn with_data_fixture_sql(
+        sql: &str,
+        test: impl FnOnce(&rusqlite::Connection, &LegacyAdoptionIntentArgs),
+    ) {
         let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
         let profile_root = tempfile::tempdir().unwrap();
         let media = tempfile::tempdir().unwrap();
         let _root = AppRootGuard::set(profile_root.path().to_path_buf()).unwrap();
         std::fs::create_dir(profile_root.path().join("legacy")).unwrap();
-        let sql = include_str!("../../../../tests/fixtures/profile-v11/source.sql");
         rusqlite::Connection::open(
             profile_root
                 .path()
@@ -433,6 +441,80 @@ mod tests {
         connection.execute_batch("PRAGMA max_page_count=16384; PRAGMA synchronous=EXTRA; PRAGMA fullfsync=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA query_only=ON").unwrap();
         test(&connection, &args);
     }
+    #[test]
+    fn legacy_migration_current_allowlist_requires_exact_compiled_shape_and_canonical_schema_receipt()
+     {
+        let sql = include_str!("../../../../tests/fixtures/profile-v11/source.sql");
+        for sql in [
+            sql.to_owned(),
+            sql.replace("CREATE TABLE", "create\n table")
+                .replace("PRIMARY KEY", "primary\n key"),
+        ] {
+            with_data_fixture_sql(&sql, |connection, args| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let before_schema = image::capture(connection).unwrap();
+                let before_rows = rows::capture(connection, deadline).unwrap();
+                let original = schema::bounded_schema_image(connection).unwrap();
+                let expected = schema::expected_legacy_postimage(&original).unwrap();
+                connection
+                    .execute_batch("PRAGMA query_only=OFF; BEGIN EXCLUSIVE")
+                    .unwrap();
+                let encoded = apply_atomic_migration_body(
+                    connection,
+                    args,
+                    OperationId::new(),
+                    before_schema,
+                    &before_rows,
+                    &expected,
+                    deadline,
+                    || Ok(()),
+                )
+                .unwrap();
+                connection.execute_batch("COMMIT").unwrap();
+                // Data-only compiled table fixture; its presence is not a current SourceLease.
+                connection
+                    .execute_batch(super::super::super::source_lease::LEASE_TABLE_SQL)
+                    .unwrap();
+                schema::require_known_metadata_schema(connection).unwrap();
+                // The immutable receipt describes migration, not every future legitimate row edit.
+                connection.execute_batch("INSERT INTO metadata VALUES ('later.edit', 'allowed'); UPDATE wav_files SET modified_ns=modified_ns+1").unwrap();
+                schema::require_known_metadata_schema(connection).unwrap();
+                connection
+                    .execute_batch(
+                        "CREATE TRIGGER unexpected AFTER UPDATE ON metadata BEGIN SELECT 1; END",
+                    )
+                    .unwrap();
+                assert!(schema::require_known_metadata_schema(connection).is_err());
+                connection.execute_batch("DROP TRIGGER unexpected").unwrap();
+                schema::require_known_metadata_schema(connection).unwrap();
+                connection
+                    .execute("DELETE FROM metadata WHERE key=?1", [ADOPTION_METADATA_KEY])
+                    .unwrap();
+                assert!(schema::require_known_metadata_schema(connection).is_err());
+                connection
+                    .execute(
+                        "INSERT INTO metadata VALUES (?1,?2)",
+                        rusqlite::params![ADOPTION_METADATA_KEY, "{}"],
+                    )
+                    .unwrap();
+                assert!(schema::require_known_metadata_schema(connection).is_err());
+                connection
+                    .execute(
+                        "UPDATE metadata SET value=?2 WHERE key=?1",
+                        rusqlite::params![
+                            ADOPTION_METADATA_KEY,
+                            std::str::from_utf8(&encoded).unwrap()
+                        ],
+                    )
+                    .unwrap();
+                schema::require_known_metadata_schema(connection).unwrap();
+                // Same known token grammar, different raw DDL: the original receipt must reject it.
+                connection.execute_batch("PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=sql||' ' WHERE name='metadata'; PRAGMA writable_schema=OFF").unwrap();
+                assert!(schema::require_known_metadata_schema(connection).is_err());
+            });
+        }
+    }
+
     #[test]
     fn legacy_migration_receipt_storage_bound_accounts_for_original_utf16_without_changing_encoding()
      {

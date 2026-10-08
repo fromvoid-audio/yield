@@ -23,7 +23,9 @@ pub use common_allocation::{
     LegacyCommonAllocationObservation,
 };
 mod image;
-pub(in crate::sample_sources::db) use image::validate_original_schema_image;
+pub(in crate::sample_sources::db) use image::{
+    matches_compiled_sql, validate_original_schema_image,
+};
 mod reserve_custody;
 mod rows;
 pub use allocation::LegacySourcePagerObservation;

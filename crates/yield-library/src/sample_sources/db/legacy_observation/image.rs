@@ -11,7 +11,23 @@ impl<'a> Iterator for Tokens<'a> {
         self.0 = self.0.trim_ascii_start();
         let first = *self.0.first()?;
         let identifier = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
-        let length = if identifier(&first) {
+        let length = if first == b'\'' {
+            // Preserve a complete SQL literal, including doubled quote escapes. Its case and
+            // internal whitespace are significant; only unquoted identifiers ignore case.
+            let mut end = 1;
+            while end < self.0.len() {
+                if self.0[end] == b'\'' {
+                    if self.0.get(end + 1) == Some(&b'\'') {
+                        end += 2;
+                        continue;
+                    }
+                    end += 1;
+                    break;
+                }
+                end += 1;
+            }
+            end
+        } else if identifier(&first) {
             self.0.iter().take_while(|byte| identifier(byte)).count()
         } else {
             1
@@ -21,15 +37,19 @@ impl<'a> Iterator for Tokens<'a> {
         Some(token)
     }
 }
-fn matches_compiled_sql(actual: &str, expected: &str) -> bool {
+pub(in crate::sample_sources::db) fn matches_compiled_sql(actual: &str, expected: &str) -> bool {
     if !actual.is_ascii() {
         return false;
     }
     let mut actual = Tokens(actual.as_bytes());
     Tokens(expected.as_bytes()).all(|expected| {
-        actual
-            .next()
-            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+        actual.next().is_some_and(|actual| {
+            if expected.first() == Some(&b'\'') {
+                actual == expected
+            } else {
+                actual.eq_ignore_ascii_case(expected)
+            }
+        })
     }) && actual.next().is_none()
 }
 pub(super) fn capture(connection: &Connection) -> Result<[u8; 32]> {
@@ -130,4 +150,29 @@ pub(in crate::sample_sources::db) fn validate_original_schema_image(
         return Err(LegacyObservationError("unknown legacy schema image"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    #[test]
+    fn compiled_sql_tokens_preserve_literal_case_whitespace_and_escaped_quotes() {
+        let compiled = "CREATE TABLE retained (state TEXT DEFAULT 'Pending user''s input')";
+        assert!(matches_compiled_sql(
+            "create\n table retained(state text default 'Pending user''s input')",
+            compiled
+        ));
+        for changed in [
+            "CREATE TABLE retained (state TEXT DEFAULT 'pending user''s input')",
+            "CREATE TABLE retained (state TEXT DEFAULT 'Pending  user''s input')",
+            "CREATE TABLE retained (state TEXT DEFAULT 'Pending user''s input)",
+            "CREATE TABLE retained (state TEXT DEFAULT 'Pending user''s input'); ATTACH 'other' AS other",
+        ] {
+            assert!(!matches_compiled_sql(changed, compiled));
+        }
+        assert!(!matches_compiled_sql(
+            "CREATE TABLE retained (state TEXTDEFAULT 'Pending user''s input')",
+            compiled
+        ));
+    }
 }

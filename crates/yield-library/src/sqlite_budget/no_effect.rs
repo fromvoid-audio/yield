@@ -47,7 +47,8 @@ pub(crate) fn open_existing_no_effect(
     )
 }
 
-// Return before native xFileControl for every opcode outside this exact query/setup list.
+// MMAP query/nonpositive setup is separately filtered in io::control. This helper rejects
+// every other opcode outside the exact query/setup list before native xFileControl.
 // PRAGMA is deliberately handled by SQLite core. No scalar enables writes through this fence.
 pub(super) fn control_result(op: c_int) -> Option<c_int> {
     match op {

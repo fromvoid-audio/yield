@@ -722,3 +722,13 @@ reruns migration/lease SQL or generates another lease identity. Missing/conflict
 readback, open transactions, changed read policy or a quarantined VFS remain uncertain.
 The native lost-readback hooks run after actual COMMIT and confer no grants. Restart
 in a new acquisition still needs its explicit bounded historical recovery route.
+
+The current metadata schema validator has an explicit adopted-source alternative to
+its ordinary compiled reference. It permits only the complete reviewed preserving
+known11 post-image plus the existing lease table. Original unquoted base-declaration
+case/whitespace may vary; SQL string literals retain exact bytes and all other objects
+retain exact compiled SQL. Bounded canonical receipt parsing and the actual raw schema
+digest, excluding only the later lease table, must match. Streaming digest inspection
+uses compiled object order without a SQL sort or an actual-image clone. This accepts
+no unknown SQL or repair and supplies no current owner/claim/audit grant. The immutable
+migration row digest is not applied to later legitimate current-source row edits.

@@ -43,7 +43,9 @@ pub(in crate::sample_sources::db) fn require_known_metadata_schema(
         .get_or_init(|| reference_image().ok())
         .as_ref()
         .ok_or(SourceDbError::Unexpected)?;
-    validate_current_schema(connection, expected)?;
+    if validate_current_schema(connection, expected).is_err() {
+        require_known_adopted_schema(connection)?;
+    }
     validate_current_runtime(connection, runtime)
 }
 
@@ -55,6 +57,88 @@ fn reference_image() -> Result<(SchemaImage, Vec<String>), SourceDbError> {
         .execute_batch(super::super::source_lease::LEASE_TABLE_SQL)
         .map_err(map_sql_error)?;
     Ok((image(&reference)?, runtime_image(&reference)?))
+}
+
+// Explicit second compiled shape: original known11 base declarations plus reviewed preserving
+// additive DDL and the existing lease table. The receipt is syntax/schema evidence only; this
+// validator grants no ownership, capacity, repair, migration or audit authority.
+fn require_known_adopted_schema(connection: &Connection) -> Result<(), SourceDbError> {
+    use crate::operation_journal::legacy_adoption_commands::receipt::{
+        ADOPTION_METADATA_KEY, AdoptionReceiptEnvelope,
+    };
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(map_sql_error)?;
+    if version != super::SOURCE_DB_SCHEMA_VERSION {
+        return Err(SourceDbError::Unexpected);
+    }
+    static EXPECTED: OnceLock<Option<SchemaImage>> = OnceLock::new();
+    let expected = EXPECTED
+        .get_or_init(|| adopted_reference_image().ok())
+        .as_ref()
+        .ok_or(SourceDbError::Unexpected)?;
+    validate_schema_membership(connection, expected, true)?;
+    // Stream in compiled canonical object order; no SQL sort, actual-image clone or new opener.
+    let mut digest = blake3::Hasher::new();
+    let mut statement = connection.prepare(
+        "SELECT type,name,tbl_name,CASE WHEN sql IS NULL OR length(CAST(sql AS BLOB))<=16384 THEN sql END
+         FROM sqlite_master WHERE type=?1 AND name=?2"
+    ).map_err(map_sql_error)?;
+    for (kind, name, _, _) in expected {
+        if name == "source_lease" {
+            continue;
+        }
+        statement
+            .query_row([kind, name], |row| {
+                for column in 0..4 {
+                    let bytes = match row.get_ref(column)? {
+                        rusqlite::types::ValueRef::Text(bytes) => bytes,
+                        rusqlite::types::ValueRef::Null if column == 3 => &[],
+                        _ => return Err(rusqlite::Error::InvalidQuery),
+                    };
+                    digest.update(&(bytes.len() as u64).to_le_bytes());
+                    digest.update(bytes);
+                }
+                Ok(())
+            })
+            .map_err(map_sql_error)?;
+    }
+    drop(statement);
+    let digest = *digest.finalize().as_bytes();
+    let mut statement = connection.prepare(
+        "SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB)) BETWEEN 1 AND 65536 THEN value END
+         FROM metadata WHERE key=?1"
+    ).map_err(map_sql_error)?;
+    statement
+        .query_row([ADOPTION_METADATA_KEY], |row| {
+            let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(0)? else {
+                return Err(rusqlite::Error::InvalidQuery);
+            };
+            let receipt = AdoptionReceiptEnvelope::decode(bytes)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            if !receipt.matches_migration_schema(digest) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok(())
+        })
+        .map_err(map_sql_error)
+}
+fn adopted_reference_image() -> Result<SchemaImage, SourceDbError> {
+    let original = vec![
+        ("index".into(), "sqlite_autoindex_metadata_1".into(), "metadata".into(), None),
+        ("index".into(), "sqlite_autoindex_wav_files_1".into(), "wav_files".into(), None),
+        ("table".into(), "metadata".into(), "metadata".into(), Some("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)".into())),
+        ("table".into(), "wav_files".into(), "wav_files".into(), Some("CREATE TABLE wav_files (path TEXT PRIMARY KEY, file_size INTEGER NOT NULL, modified_ns INTEGER NOT NULL)".into())),
+    ];
+    let mut expected = super::expected_legacy_postimage(&original)?;
+    expected.push((
+        "table".into(),
+        "source_lease".into(),
+        "source_lease".into(),
+        Some(super::super::source_lease::LEASE_TABLE_SQL.into()),
+    ));
+    expected.sort();
+    Ok(expected)
 }
 
 // Sort bounded owned vectors in Rust; no SQLite temporary-sort disk writes before admission.
@@ -164,6 +248,13 @@ pub(crate) fn validate_current_schema(
     connection: &Connection,
     expected: &SchemaImage,
 ) -> Result<(), SourceDbError> {
+    validate_schema_membership(connection, expected, false)
+}
+fn validate_schema_membership(
+    connection: &Connection,
+    expected: &SchemaImage,
+    adopted: bool,
+) -> Result<(), SourceDbError> {
     if expected.len() > MAX_OBJECTS {
         return Err(SourceDbError::Unexpected);
     }
@@ -192,9 +283,19 @@ pub(crate) fn validate_current_schema(
                     .cmp(kind)
                     .then(entry.1.as_str().cmp(name))
                     .then(entry.2.as_str().cmp(table))
-                    .then(entry.3.as_deref().cmp(&sql))
             })
             .map_err(|_| SourceDbError::Unexpected)?;
+        let compiled_sql = expected[index].3.as_deref();
+        if sql != compiled_sql
+            && !(adopted
+                && kind == "table"
+                && name == table
+                && matches!(name, "metadata" | "wav_files")
+                && matches!((sql, compiled_sql), (Some(actual), Some(compiled))
+                if super::super::legacy_observation::matches_compiled_sql(actual, compiled)))
+        {
+            return Err(SourceDbError::Unexpected);
+        }
         if seen[index] {
             return Err(SourceDbError::Unexpected);
         }
