@@ -240,13 +240,74 @@ pub(super) fn matches_inside(
         })?;
     Ok(present && identical)
 }
+/// Exact original encoding already paid by the enclosing initial-write scope.
+/// This only compares a just-inserted recording intent; no stored row is used
+/// as authority and no historical decoder or replacement BLOB is constructed.
+pub(super) fn matches_encoded_inside(
+    store: &OperationJournalStore,
+    operation: OperationId,
+    encoded: &[u8],
+    input: &InputPermit,
+) -> Result<bool, OperationJournalStoreError> {
+    let (legacy, full) = family_presence(store, operation, input)?;
+    if legacy && full {
+        return Err(audit_error(
+            &store.database_path,
+            "operation appears in both journal families",
+        ));
+    }
+    if !legacy {
+        return Ok(false);
+    }
+    statement(&store.connection, input,
+        c"SELECT typeof(operation_id), typeof(sequence), sequence, typeof(record), length(record),
+          CASE WHEN typeof(record) = 'blob' AND length(record) BETWEEN 0 AND ?2 THEN record ELSE NULL END
+          FROM operation_journal WHERE operation_id = ?1", |row| {
+        row.bind_text(1, &operation.to_string())?;
+        row.bind_integer(2, MAX_RECORD_BYTES as i64)?;
+        if !row.next()? { return Ok(false); }
+        if row.get_ref(0)? != ValueRef::Text(b"text") || row.get_ref(1)? != ValueRef::Text(b"integer") || row.get_ref(3)? != ValueRef::Text(b"blob") {
+            return Err(retained_error(Some(operation), "stored operation key, sequence or record has the wrong SQLite type"));
+        }
+        let ValueRef::Integer(sequence) = row.get_ref(2)? else { unreachable!("checked SQLite INTEGER"); };
+        if sequence <= 0 { return Err(retained_error(Some(operation), "stored sequence is not positive")); }
+        statement(&store.connection, input,
+            c"SELECT COUNT(*) FROM (
+             SELECT sequence FROM operation_journal WHERE typeof(sequence) = 'integer' AND sequence = ?1
+             UNION ALL SELECT sequence FROM operation_journal_full_progress WHERE typeof(sequence) = 'integer' AND sequence = ?1
+             UNION ALL SELECT sequence FROM operation_journal_staging_checkpoints WHERE typeof(sequence) = 'integer' AND sequence = ?1
+             UNION ALL SELECT sequence FROM operation_journal_chunk_staging WHERE typeof(sequence) = 'integer' AND sequence = ?1
+             UNION ALL SELECT sequence FROM operation_journal_recording_chunks WHERE typeof(sequence) = 'integer' AND sequence = ?1)", |count| {
+                count.bind_integer(1, sequence)?;
+                if !count.next()? { return Err(rusqlite::Error::QueryReturnedNoRows.into()); }
+                if super::historical_claim_observation::borrowed_sql::scalar::<i64>(count, 0)? > 1 {
+                    return Err(audit_error(&store.database_path, format!("duplicate journal-observation sequence {sequence}")));
+                }
+                Ok(())
+            })?;
+        let ValueRef::Blob(bytes) = row.get_ref(5)? else { return Err(retained_error(Some(operation), "stored record is not a bounded SQLite BLOB")); };
+        if row.get_ref(4)? != ValueRef::Integer(bytes.len() as i64) {
+            return Err(retained_error(Some(operation), "stored record length changed or exceeds its bound"));
+        }
+        Ok(bytes == encoded)
+    })
+}
+
 pub(super) fn readback_matches(
     store: &OperationJournalStore,
     expected: &StoredOperationRecord,
+    encoded: &[u8],
     input: &InputPermit,
 ) -> Result<bool, OperationJournalStoreError> {
     store.validate_namespace_with_input(Some(input), false)?;
-    let identical = matches_inside(store, expected, input)?;
+    let identical = if matches!(
+        expected.universal_command_args(),
+        Some(crate::operation_journal::coordinator::UniversalCommandArgs::Recording(_))
+    ) {
+        matches_encoded_inside(store, expected.operation_id, encoded, input)?
+    } else {
+        matches_inside(store, expected, input)?
+    };
     store.validate_namespace_with_input(Some(input), false)?;
     Ok(identical)
 }

@@ -99,3 +99,13 @@ A passing run verifies the retained pre-start recording route and slot only. It
 does not qualify recording capture, required-WAL/effect permission, terminal seals,
 publication, audible/UI workflows or release acceptance. A compilation or genuine
 bootstrap/admission failure remains an implementation failure to resolve.
+
+The lane also exercises the original recording initial transaction. Its funded
+control reservation and committed readback compare the already prepaid frozen
+encoding against the borrowed original SQLite BLOB, with the original journal
+family, cell type, byte bound, positive sequence and cross-relation sequence
+uniqueness checks. It avoids decoding a second full graph of a just-inserted
+record. Historical reads still use their complete decoder and classifier. Pool
+ceilings and physical admission requirements are unchanged. Portable SQL tests
+exercise exhausted-pool comparison, changed bytes and corrupt sequence/cell
+refusal; those tests do not supply native qualification.

@@ -27,6 +27,16 @@ jobs:
           persist-credentials: false
       - name: Install the repository-pinned Rust toolchain
         run: rustup show active-toolchain # reads rust-toolchain.toml
+      - name: Reuse pinned native build dependencies
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: recording-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
+          restore-keys: |
+            recording-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
       - name: Verify original recording custody on native APFS
         run: bash scripts/internal/validation/verify_recording_native_custody.sh
       - name: Preserve native evidence, including failures
