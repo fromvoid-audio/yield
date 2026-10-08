@@ -1,0 +1,39 @@
+name: Native recording custody
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/recording-native-custody.yml'
+      - 'scripts/internal/validation/verify_recording_native_custody.sh'
+permissions:
+  contents: read
+concurrency:
+  group: recording-native-custody-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  genuine-production-custody:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install the repository-pinned Rust toolchain
+        run: rustup show active-toolchain # reads rust-toolchain.toml
+      - name: Verify original recording custody on native APFS
+        run: bash scripts/internal/validation/verify_recording_native_custody.sh
+      - name: Preserve native evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: recording-native-custody-${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifacts/recording-native-custody/
+          if-no-files-found: warn
+          retention-days: 14
