@@ -1,0 +1,54 @@
+name: macOS catalog native replay
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/macos-catalog-native-replay.yml'
+      - 'scripts/internal/validation/verify_macos_catalog_native_replay.sh'
+      - 'crates/yield-source-watcher/src/**'
+      - 'crates/yield-catalog/src/**'
+      - 'crates/yield-library/src/sample_sources/db/subtree_scan/**'
+      - 'crates/yield-library/src/sample_sources/db/write/transaction.rs'
+      - 'crates/yield-ui/src/browser/catalog.rs'
+      - 'crates/yield-ui/src/browser/source_registry.rs'
+permissions:
+  contents: read
+concurrency:
+  group: macos-catalog-native-replay-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  original-native-replay:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install repository-pinned Rust
+        run: rustup show active-toolchain
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: replay-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
+          restore-keys: |
+            replay-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+      - name: Execute original native history and retained catalog replay
+        run: bash scripts/internal/validation/verify_macos_catalog_native_replay.sh
+      - name: Preserve actual native evidence including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-catalog-native-replay-${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifacts/macos-catalog-native-replay/
+          if-no-files-found: warn
+          retention-days: 14

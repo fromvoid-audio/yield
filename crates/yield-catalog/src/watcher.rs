@@ -9,6 +9,8 @@ use super::{
     WritableProfileGuard, publication_is_current, request_audit, source_root_identity,
 };
 
+mod native_replay;
+
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
 const WATCHER_MAX_DELAY: Duration = Duration::from_secs(2);
 const WATCHER_RETRY_MIN: Duration = Duration::from_secs(1);
@@ -25,6 +27,7 @@ pub(super) enum WatcherMode {
 }
 
 pub(super) struct WatcherSchedule {
+    native_replay: Option<native_replay::NativeReplayWork>,
     pending: Option<PendingWatcherHint>,
     initial_audit_pending: bool,
     watcher_retry_after: Option<Instant>,
@@ -62,6 +65,7 @@ impl WatcherSchedule {
     }
     pub(super) fn new(initial_audit_pending: bool) -> Self {
         Self {
+            native_replay: None,
             pending: None,
             initial_audit_pending,
             watcher_retry_after: None,
@@ -315,6 +319,7 @@ pub(super) fn run_watcher_idle_work(
     probe_source_roots(sources, now);
     refresh_source_watchers(sources, test_gate, watcher_mode, now);
     drain_source_watcher_hints(sources, now);
+    native_replay::run(profile_guard, events, admission, sources, watcher_mode, now);
     let Some((source_id, lifecycle_generation, pending)) =
         claim_watcher_audit(admission, sources, now)
     else {
@@ -486,6 +491,7 @@ fn claim_watcher_audit(
 ) -> Option<(super::SourceId, u64, PendingWatcherHint)> {
     let candidate = sources.iter().find_map(|(source_id, source)| {
         if source.watcher_schedule.initial_audit_pending
+            || source.watcher_schedule.native_replay.is_some()
             || source.watcher_schedule.root_issue_blocks_audit()
         {
             return None;

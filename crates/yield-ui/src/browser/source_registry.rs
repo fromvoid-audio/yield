@@ -468,8 +468,12 @@ impl Browser {
             changed |= self.apply_source_registry_event(event, cx);
         }
         let mut catalog_deliveries = Vec::new();
+        // Keep the next revision's bounded delivery on the catalog while its preceding
+        // projection is still being built. Automatic replay then retains its original
+        // envelope under the existing event budget instead of losing a delta in the UI.
+        let projection_pending = self.catalog_projection_task.is_some();
         let catalog_events_capped = cx.update_global::<SourceRegistryGlobal, _>(|global, _| {
-            global.drain_catalog_deliveries(&mut catalog_deliveries)
+            !projection_pending && global.drain_catalog_deliveries(&mut catalog_deliveries)
         });
         for delivery in catalog_deliveries {
             changed |= self.apply_catalog_delivery(delivery, cx);

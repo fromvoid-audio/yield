@@ -55,6 +55,7 @@ pub(super) fn consume(
             source_id.clone(),
             fence.root_identity().clone(),
             receipt.as_ref().map(DurableReplayReceipt::prior),
+            submission._capture.clone(),
             submission.permit.clone(),
         ) {
             Ok(s) => s,

@@ -761,6 +761,13 @@ impl Browser {
                 self.start_catalog_projection(event, publication_fence, cx);
                 true
             }
+            CatalogEvent::ReplayCommitted { .. } => {
+                super::unsupported_entries::cancel_for_source_change(self, cx);
+                self.job_action = None;
+                self.job_action_error = None;
+                self.start_catalog_projection(event, publication_fence, cx);
+                true
+            }
             CatalogEvent::AuditCommitted { .. } => {
                 super::unsupported_entries::cancel_for_source_change(self, cx);
                 self.job_action = None;
@@ -884,6 +891,37 @@ impl Browser {
         let lifecycle_generation = activation.lifecycle_generation;
         let force_reload = activation.force_reload;
         let root = activation.root.clone();
+        let is_replay = matches!(&event, CatalogEvent::ReplayCommitted { .. });
+        let replay_base = if is_replay {
+            let Some(context) = self.catalog_metadata.context() else {
+                self.set_scan_status("Replay committed; an audited projection is required");
+                self.catalog_pending_command = Some(CatalogCommandIntent::Audit {
+                    source_id,
+                    lifecycle_generation,
+                });
+                return;
+            };
+            let Some(session) = self
+                .active_source
+                .and_then(|index| self.source_sessions.get(index))
+            else {
+                return;
+            };
+            Some(CatalogProjection {
+                source_id: context.source_id,
+                lifecycle_generation: context.lifecycle_generation,
+                root: context.root,
+                root_identity: context.root_identity,
+                directory_generation: context.directory_generation,
+                committed_revision: context.revision,
+                entries: session.entries.clone(),
+                tree: session.tree.clone(),
+                facts: session.catalog_facts.clone(),
+                entry_indices: context.entry_indices,
+            })
+        } else {
+            None
+        };
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
@@ -899,6 +937,14 @@ impl Browser {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    if let Some(base) = replay_base {
+                        return project_catalog_replay_event_with_fence(
+                            event,
+                            base,
+                            &worker_cancellation,
+                            worker_publication_fence,
+                        );
+                    }
                     project_catalog_event_with_fence(
                         event,
                         root,
@@ -933,6 +979,14 @@ impl Browser {
                 match result {
                     Ok(projection) => view.apply_catalog_projection(projection, force_reload, cx),
                     Err(error) => {
+                        if is_replay {
+                            // A missing predecessor/lost projection is a recovery audit, not
+                            // permission to invent a replay patch from a persisted cursor.
+                            view.catalog_pending_command = Some(CatalogCommandIntent::Audit {
+                                source_id: source_id.clone(),
+                                lifecycle_generation,
+                            });
+                        }
                         view.set_scan_status(format!("Catalog projection failed: {error}"));
                         if let Some(index) = view.active_source
                             && let Some(session) = view.source_sessions.get_mut(index)
@@ -1206,6 +1260,11 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             lifecycle_generation,
             ..
         }
+        | CatalogEvent::ReplayCommitted {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
         | CatalogEvent::WavMetadataReady {
             source_id,
             lifecycle_generation,
@@ -1447,6 +1506,149 @@ where
     })
 }
 
+/// Patch only actual committed rows into the retained projection. No SQL, path inspection,
+/// metadata read, or whole-source hydration is permitted in this background transformation.
+fn project_catalog_replay_event_with_fence(
+    event: CatalogEvent,
+    mut base: CatalogProjection,
+    cancellation: &AtomicBool,
+    publication_fence: Option<SourcePublicationFence>,
+) -> Result<CatalogProjection, String> {
+    let CatalogEvent::ReplayCommitted {
+        source_id,
+        lifecycle_generation,
+        root_identity,
+        expected_revision,
+        receipt,
+        delta,
+    } = event
+    else {
+        return Err("expected a replay delta".into());
+    };
+    if cancellation.load(Ordering::Acquire)
+        || base.source_id != source_id
+        || base.lifecycle_generation != lifecycle_generation
+        || base.root_identity != root_identity
+        || base.committed_revision != expected_revision
+        || receipt.prior().source_id() != &source_id
+        || receipt.prior().root_identity() != &root_identity
+        || receipt.prior().watcher_generation()
+            != yield_library::sample_sources::reconciliation::WatcherGeneration::new(
+                lifecycle_generation,
+            )
+        || receipt.source_revision() != delta.revision
+        || delta.revision <= expected_revision
+        || delta.authoritative_snapshot.is_some()
+        || delta.touched_path_changes.len() > yield_session::MAX_CATALOG_REPLAY_DELTA_ENTRIES
+        || delta.touched_directory_changes.len() > 128
+    {
+        return Err("replay delta does not match the retained projection".into());
+    }
+    if let Some(fence) = &publication_fence {
+        fence
+            .validate()
+            .map_err(|e| format!("replay publication fence invalid: {e}"))?;
+    }
+    base = patch_catalog_replay_projection(base, delta, cancellation)?;
+    if let Some(fence) = &publication_fence {
+        fence
+            .validate()
+            .map_err(|e| format!("replay publication fence invalid: {e}"))?;
+    }
+    Ok(base)
+}
+
+fn patch_catalog_replay_projection(
+    mut base: CatalogProjection,
+    delta: yield_session::CatalogReplayDelta,
+    cancellation: &AtomicBool,
+) -> Result<CatalogProjection, String> {
+    for (path, entry) in delta.touched_path_changes {
+        if cancellation.load(Ordering::Acquire) {
+            return Err("replay projection canceled".into());
+        }
+        validate_relative_path(&path)?;
+        if entry.as_ref().is_some_and(|e| e.relative_path != path) {
+            return Err("replay manifest path mismatch".into());
+        }
+        let previous = base.entries.iter().position(|e| e.relative_path == path);
+        match entry {
+            Some(entry) => {
+                let mut audio = previous
+                    .map(|i| base.entries[i].clone())
+                    .unwrap_or(AudioFile {
+                        path: base.root.join(&path),
+                        relative_path: path.clone(),
+                        byte_len: entry.file_size,
+                        duration_seconds: None,
+                        sample_rate: None,
+                        playback_type: None,
+                        curation: None,
+                    });
+                audio.byte_len = entry.file_size;
+                audio.duration_seconds = None;
+                audio.sample_rate = None;
+                if let Some(i) = previous {
+                    base.entries[i] = audio;
+                } else {
+                    base.entries.push(audio);
+                }
+                base.facts.insert(
+                    path.clone(),
+                    CatalogFileFacts {
+                        relative_path: path,
+                        file_size: entry.file_size,
+                        modified_ns: entry.modified_ns,
+                        file_identity: entry.file_identity,
+                        content_hash: entry.content_hash,
+                    },
+                );
+            }
+            None => {
+                if let Some(i) = previous {
+                    base.entries.remove(i);
+                }
+                base.facts.remove(&path);
+            }
+        }
+    }
+    let mut directories = base
+        .tree
+        .paths()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for (path, entry) in delta.touched_directory_changes {
+        validate_relative_path(&path)?;
+        match entry {
+            Some(entry) if entry.relative_path == path => {
+                directories.insert(path);
+            }
+            Some(_) => return Err("replay directory path mismatch".into()),
+            None => {
+                directories.remove(&path);
+            }
+        }
+    }
+    if let Some(generation) = delta.directory_generation {
+        base.directory_generation = generation;
+    }
+    base.entries
+        .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    base.entry_indices = Arc::new(
+        base.entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.relative_path.clone(), i))
+            .collect(),
+    );
+    base.tree = FolderTree::from_scan(&directories.into_iter().collect::<Vec<_>>(), &base.entries);
+    base.committed_revision = delta.revision;
+    if cancellation.load(Ordering::Acquire) {
+        return Err("replay projection canceled".into());
+    }
+    Ok(base)
+}
+
 fn playback_type_from_metadata(metadata: &BrowserFileMetadata) -> Option<PlaybackType> {
     match metadata.playback_type {
         Some(SourcePlaybackType::OneShot) => Some(PlaybackType::OneShot),
@@ -1560,8 +1762,8 @@ mod tests {
         project_catalog_event_with_fence_observer, validate_relative_path,
     };
     use super::{
-        CatalogProjection, catalog_event_identity, coalesce_catalog_remove,
-        focused_manifest_changed,
+        CatalogProjection, RootIdentity, catalog_event_identity, coalesce_catalog_remove,
+        focused_manifest_changed, patch_catalog_replay_projection,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::path::{Path, PathBuf};
@@ -1585,6 +1787,142 @@ mod tests {
         };
         assert_eq!(intent.source_id(), &source_id);
         assert_eq!(intent.lifecycle_generation(), 7);
+    }
+
+    fn replay_projection_fixture() -> CatalogProjection {
+        let root = PathBuf::from("/retained-source");
+        let entries = ["changed.wav", "keep.wav", "removed.wav"]
+            .into_iter()
+            .map(|path| AudioFile {
+                path: root.join(path),
+                relative_path: path.into(),
+                byte_len: 10,
+                duration_seconds: Some(2.0),
+                sample_rate: Some(48000),
+                playback_type: Some(PlaybackType::Loop),
+                curation: None,
+            })
+            .collect::<Vec<_>>();
+        CatalogProjection {
+            source_id: SourceId::from_string("replay-projection"),
+            lifecycle_generation: 7,
+            root,
+            root_identity: RootIdentity::from_bytes(b"root".to_vec()),
+            directory_generation: 3,
+            committed_revision: 4,
+            tree: FolderTree::from_scan(&["old-empty".into(), "keep-empty".into()], &entries),
+            facts: entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.relative_path.clone(),
+                        CatalogFileFacts {
+                            relative_path: entry.relative_path.clone(),
+                            file_size: 10,
+                            modified_ns: 2,
+                            file_identity: Some("original".into()),
+                            content_hash: None,
+                        },
+                    )
+                })
+                .collect(),
+            entries,
+            entry_indices: Arc::new(HashMap::new()),
+        }
+    }
+
+    fn replay_projection_delta() -> yield_session::CatalogReplayDelta {
+        yield_session::CatalogReplayDelta {
+            revision: 5,
+            touched_path_changes: vec![
+                (
+                    "changed.wav".into(),
+                    Some(SourceManifestEntry {
+                        relative_path: "changed.wav".into(),
+                        file_identity: Some("changed-file".into()),
+                        content_hash: None,
+                        file_size: 20,
+                        modified_ns: 30,
+                    }),
+                ),
+                ("removed.wav".into(), None),
+            ],
+            authoritative_snapshot: None,
+            source_index_commit: None,
+            directory_generation: Some(3),
+            touched_directory_changes: vec![
+                ("old-empty".into(), None),
+                (
+                    "new-empty".into(),
+                    Some(SourceDirectoryEntry {
+                        relative_path: "new-empty".into(),
+                        directory_identity: "new-dir".into(),
+                    }),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn replay_projection_patches_retained_rows_and_empty_directories_without_io() {
+        // Passive projection data is not a native producer, receipt or mutation grant.
+        let projection = patch_catalog_replay_projection(
+            replay_projection_fixture(),
+            replay_projection_delta(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(projection.committed_revision, 5);
+        assert_eq!(projection.entries.len(), 2);
+        let changed = &projection.entries[projection.entry_indices[Path::new("changed.wav")]];
+        assert_eq!(changed.byte_len, 20);
+        assert_eq!(changed.duration_seconds, None);
+        assert_eq!(changed.sample_rate, None);
+        assert_eq!(changed.playback_type, Some(PlaybackType::Loop));
+        let unchanged = &projection.entries[projection.entry_indices[Path::new("keep.wav")]];
+        assert_eq!(unchanged.duration_seconds, Some(2.0));
+        assert_eq!(projection.facts[Path::new("keep.wav")].modified_ns, 2);
+        assert!(projection.tree.contains(Path::new("new-empty")));
+        assert!(projection.tree.contains(Path::new("keep-empty")));
+        assert!(!projection.tree.contains(Path::new("old-empty")));
+        assert!(!projection.facts.contains_key(Path::new("removed.wav")));
+        assert_eq!(projection.facts[Path::new("changed.wav")].modified_ns, 30);
+    }
+
+    #[test]
+    fn replay_projection_rejects_cancellation_and_foreign_relative_paths() {
+        assert!(
+            patch_catalog_replay_projection(
+                replay_projection_fixture(),
+                replay_projection_delta(),
+                &AtomicBool::new(true)
+            )
+            .is_err()
+        );
+        let mut delta = replay_projection_delta();
+        delta.touched_path_changes[0].0 = "../escape.wav".into();
+        assert!(
+            patch_catalog_replay_projection(
+                replay_projection_fixture(),
+                delta,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        let mut delta = replay_projection_delta();
+        delta.touched_directory_changes[1]
+            .1
+            .as_mut()
+            .unwrap()
+            .relative_path = "foreign".into();
+        assert!(
+            patch_catalog_replay_projection(
+                replay_projection_fixture(),
+                delta,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
     }
 
     #[test]

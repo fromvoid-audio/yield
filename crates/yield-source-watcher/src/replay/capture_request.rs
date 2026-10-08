@@ -81,6 +81,12 @@ pub struct CapturedNativeReplayBatch {
     batch: ReplayObservationBatch,
     _slot: Arc<CaptureSlot>,
 }
+impl std::fmt::Debug for CapturedNativeReplayBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedNativeReplayBatch")
+            .finish_non_exhaustive()
+    }
+}
 impl CapturedNativeReplayBatch {
     /// Borrow passive input for the existing catalog admission. Retain this wrapper through
     /// admission/reply so dropping a capture request cannot prematurely release its backing.

@@ -3,7 +3,7 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 use yield_library::sample_sources::db::{DurableReplayReceipt, ManifestCommitResult};
 use yield_source_watcher::replay::{
-    MAX_REPLAY_EVENTS, MAX_REPLAY_PATH_BYTES, ReplayObservationBatch,
+    CapturedNativeReplayBatch, MAX_REPLAY_EVENTS, MAX_REPLAY_PATH_BYTES, ReplayObservationBatch,
 };
 
 mod recovery;
@@ -16,6 +16,11 @@ pub(super) use state::ReplayState;
 
 /// Global bound covering queued, retained-failure and caller-held replay requests.
 pub const MAX_CATALOG_REPLAY_REQUESTS: usize = 8;
+/// Maximum manifest rows in one complete bounded replay transaction.
+pub const MAX_CATALOG_REPLAY_DELTA_ENTRIES: usize =
+    yield_scan::sample_sources::scanner::EXACT_SCAN_MAX_ENTRIES;
+/// Passive committed manifest/index/directory delta for renderer projection; no writer access.
+pub type CatalogReplayDelta = ManifestCommitResult;
 static REQUESTS: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug)]
 struct Permit;
@@ -119,6 +124,8 @@ pub enum CatalogReplayOutcome {
 pub struct CatalogReplayRequest {
     reply: Receiver<CatalogReplayOutcome>,
     cancellation: Arc<AtomicBool>,
+    // Retain the original native envelope through caller-held reply/cancellation.
+    _capture: Option<Arc<CapturedNativeReplayBatch>>,
     _permit: Arc<Permit>,
 }
 impl CatalogReplayRequest {
@@ -149,6 +156,8 @@ pub struct CatalogReplaySubmission {
     expected_revision: u64,
     cancellation: Arc<AtomicBool>,
     reply: mpsc::SyncSender<CatalogReplayOutcome>,
+    // The actual worker retains the same original capture even after a lost caller reply.
+    _capture: Option<Arc<CapturedNativeReplayBatch>>,
     permit: Arc<Permit>,
 }
 impl CatalogReplaySubmission {
@@ -193,12 +202,50 @@ impl CatalogService {
         lifecycle_generation: u64,
         expected_revision: u64,
     ) -> Result<CatalogReplayRequest, CatalogReplaySubmitError> {
+        self.submit_replay_with_capture(batch, lifecycle_generation, expected_revision, None, None)
+    }
+
+    /// Queue an actual native capture without releasing its original backing at admission.
+    /// The existing worker still requires genuine durable prior, lifecycle/root/revision
+    /// and exact Source admission. This wrapper is not a proof or committed acknowledgement.
+    /// Keep an original `Arc` when submitting a clone: admission denial leaves that
+    /// original available for retry, and dropping a reply cannot release worker custody.
+    pub fn submit_captured_replay(
+        &self,
+        captured: Arc<CapturedNativeReplayBatch>,
+        lifecycle_generation: u64,
+        expected_revision: u64,
+    ) -> Result<CatalogReplayRequest, CatalogReplaySubmitError> {
+        // Acquire the existing consumer's bounded slot before making its own input copy.
+        // The original capture's slot remains held by the retained opaque wrapper.
+        let permit = Permit::acquire()?;
+        let batch = captured.observation().clone();
+        self.submit_replay_with_capture(
+            batch,
+            lifecycle_generation,
+            expected_revision,
+            Some(captured),
+            Some(permit),
+        )
+    }
+
+    fn submit_replay_with_capture(
+        &self,
+        batch: ReplayObservationBatch,
+        lifecycle_generation: u64,
+        expected_revision: u64,
+        capture: Option<Arc<CapturedNativeReplayBatch>>,
+        permit: Option<Arc<Permit>>,
+    ) -> Result<CatalogReplayRequest, CatalogReplaySubmitError> {
         if batch.batch().observations().len() > MAX_REPLAY_EVENTS + 1
             || input_bytes(&batch) > MAX_REPLAY_PATH_BYTES + (MAX_REPLAY_EVENTS + 1) * 128 + 3072
         {
             return Err(CatalogReplaySubmitError::InputTooLarge);
         }
-        let permit = Permit::acquire()?;
+        let permit = match permit {
+            Some(permit) => permit,
+            None => Permit::acquire()?,
+        };
         let cancellation = Arc::new(AtomicBool::new(false));
         let (reply, receiver) = mpsc::sync_channel(1);
         self.submit(CatalogCommand::ConsumeReplay {
@@ -208,12 +255,14 @@ impl CatalogService {
                 expected_revision,
                 cancellation: cancellation.clone(),
                 reply,
+                _capture: capture.clone(),
                 permit: permit.clone(),
             },
         })?;
         Ok(CatalogReplayRequest {
             reply: receiver,
             cancellation,
+            _capture: capture,
             _permit: permit,
         })
     }
@@ -227,4 +276,35 @@ pub(super) fn consume(
 ) {
     let outcome = worker::consume(&submission, profile, admission, sources);
     let _ = submission.reply.try_send(outcome);
+}
+
+/// The existing retained catalog thread consumes its own native result; no second SQL owner.
+pub(super) fn consume_captured_on_worker(
+    capture: Arc<CapturedNativeReplayBatch>,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    profile: &WritableProfileGuard,
+    admission: &Arc<Mutex<AdmissionState>>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) -> Result<CatalogReplayOutcome, CatalogReplaySubmitError> {
+    let source_id = capture.observation().batch().provenance().source_id();
+    let permit = match sources
+        .get(source_id)
+        .and_then(|s| s.replay.as_ref())
+        .and_then(|state| state.capture_permit(&capture))
+    {
+        Some(permit) => permit,
+        None => Permit::acquire()?,
+    };
+    let (reply, _unused_receiver) = mpsc::sync_channel(1);
+    let submission = CatalogReplaySubmission {
+        batch: capture.observation().clone(),
+        lifecycle_generation,
+        expected_revision,
+        cancellation: Arc::new(AtomicBool::new(false)),
+        reply,
+        _capture: Some(capture),
+        permit,
+    };
+    Ok(worker::consume(&submission, profile, admission, sources))
 }

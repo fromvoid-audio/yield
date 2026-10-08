@@ -28,6 +28,13 @@ pub struct ManifestCommitResult {
     pub authoritative_snapshot: Option<Vec<SourceManifestEntry>>,
     /// Index-only facts committed by this same transaction, when any changed.
     pub source_index_commit: Option<SourceIndexCommitResult>,
+    /// Active generation retained by a complete bounded subtree commit, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_generation: Option<u64>,
+    /// Exact directory additions/replacements/absences from that same transaction.
+    /// Empty for writes that do not change directory truth; never a whole-source read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touched_directory_changes: Vec<(PathBuf, Option<SourceDirectoryEntry>)>,
 }
 
 /// Typed index-only facts proven by one committed source-database write.
@@ -758,6 +765,11 @@ impl SourceWriteBatch<'_> {
             touched_path_changes: changes,
             authoritative_snapshot: snapshot,
             source_index_commit,
+            directory_generation: self.subtree_directory_changes.as_ref().map(|(g, _)| *g),
+            touched_directory_changes: self
+                .subtree_directory_changes
+                .map(|(_, d)| d)
+                .unwrap_or_default(),
         })
     }
 
@@ -802,6 +814,12 @@ impl SourceWriteBatch<'_> {
             touched_path_changes: changes,
             authoritative_snapshot: None,
             source_index_commit,
+            directory_generation: self.subtree_directory_changes.as_ref().map(|(g, _)| *g),
+            touched_directory_changes: self
+                .subtree_directory_changes
+                .as_ref()
+                .map(|(_, d)| d.clone())
+                .unwrap_or_default(),
         })
     }
 

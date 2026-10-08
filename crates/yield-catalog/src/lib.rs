@@ -146,8 +146,9 @@ pub use index_reveal_contract::{
 };
 
 pub use replay::{
-    CatalogReplayError, CatalogReplayOutcome, CatalogReplayRequest, CatalogReplaySubmission,
-    CatalogReplaySubmitError, MAX_CATALOG_REPLAY_REQUESTS,
+    CatalogReplayDelta, CatalogReplayError, CatalogReplayOutcome, CatalogReplayRequest,
+    CatalogReplaySubmission, CatalogReplaySubmitError, MAX_CATALOG_REPLAY_DELTA_ENTRIES,
+    MAX_CATALOG_REPLAY_REQUESTS,
 };
 pub use root::{VerifiedSourceRoot, resolve_source_root};
 
@@ -1477,6 +1478,22 @@ pub enum CatalogPublicationStatus {
 /// Worker output carrying source identity, lifecycle generation, and revision fences.
 #[derive(Debug)]
 pub enum CatalogEvent {
+    /// One bounded replay transaction and its opaque persisted checkpoint.
+    /// No whole-source manifest or metadata hydration accompanies this event.
+    ReplayCommitted {
+        /// Stable registered source.
+        source_id: SourceId,
+        /// Retained source lifecycle.
+        lifecycle_generation: u64,
+        /// Physical root validated by the committing owner.
+        root_identity: RootIdentity,
+        /// Exact prior projection revision required before applying the delta.
+        expected_revision: u64,
+        /// Persisted acknowledgement, never a native qualification grant.
+        receipt: yield_library::sample_sources::db::DurableReplayReceipt,
+        /// Bounded manifest, index and directory changes committed atomically.
+        delta: CatalogReplayDelta,
+    },
     /// Completion of one source-scoped coherent Harvest mask.
     HarvestFilterCompleted {
         /// Exact pending request and projection binding.
@@ -11623,6 +11640,59 @@ mod tests {
             }),
             CatalogEvent::SnapshotReady { .. }
         ));
+        service.shutdown();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_watcher_hint_commits_bounded_replay_delta() {
+        // Actual native producer/catalog SQL integration, not qualification of the separate
+        // journal Source-authority registration, physical capacity family or Finder UI.
+        let fixture = Fixture::new("catalog-native-replay-controller");
+        let root = fs::canonicalize(fixture.root.path()).expect("canonical source");
+        fs::write(root.join("changed.wav"), b"original audio").unwrap();
+        let source_id = SourceId::from_string("native-replay-controller");
+        let service = CatalogService::start_inner(&fixture.guard, None, None, WatcherMode::Native)
+            .expect("actual native catalog");
+        let snapshot = register_and_audit(&service, &root, &source_id);
+        fs::write(root.join("changed.wav"), b"changed audio bytes").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut conservative_audits = 0;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "native known-file hint produced no bounded replay delta; recovery audits={conservative_audits}"
+            );
+            match service.recv_event_timeout(Duration::from_millis(100)) {
+                Ok(CatalogEvent::ReplayCommitted {
+                    source_id: actual_source,
+                    lifecycle_generation,
+                    root_identity,
+                    expected_revision,
+                    receipt,
+                    delta,
+                }) => {
+                    assert_eq!(actual_source, source_id);
+                    assert_eq!(lifecycle_generation, snapshot.lifecycle_generation);
+                    assert_eq!(root_identity, snapshot.root_identity);
+                    assert!(expected_revision >= snapshot.committed_revision);
+                    assert_eq!(receipt.source_revision(), delta.revision);
+                    assert_eq!(receipt.prior().source_id(), &source_id);
+                    assert!(delta.authoritative_snapshot.is_none());
+                    assert!(delta.touched_path_changes.len() <= MAX_CATALOG_REPLAY_DELTA_ENTRIES);
+                    assert!(delta.touched_path_changes.iter().any(|(path, entry)| {
+                        path == Path::new("changed.wav")
+                            && entry.as_ref().is_some_and(|e| e.file_size == 19)
+                    }));
+                    break;
+                }
+                Ok(CatalogEvent::AuditCommitted { .. }) => conservative_audits += 1,
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("native catalog closed before delivery")
+                }
+            }
+        }
         service.shutdown();
     }
 

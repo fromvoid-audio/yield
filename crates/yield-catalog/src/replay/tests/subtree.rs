@@ -50,6 +50,29 @@ fn retained_worker_subtree_atomic_delta_truth_checkpoint_duplicate_and_restart()
     assert_eq!(receipt.prior().acknowledged_sequence(), 18);
     assert!(delta.authoritative_snapshot.is_none());
     assert_eq!(delta.touched_path_changes.len(), 3);
+    assert_eq!(
+        delta.directory_generation,
+        old_dirs.state.active_generation()
+    );
+    assert!(
+        delta
+            .touched_directory_changes
+            .iter()
+            .any(|(p, entry)| p == Path::new("known/nested") && entry.is_none())
+    );
+    assert!(
+        delta
+            .touched_directory_changes
+            .iter()
+            .any(|(p, entry)| p == Path::new("known/new")
+                && entry.as_ref().is_some_and(|e| &e.relative_path == p))
+    );
+    assert!(
+        !delta
+            .touched_directory_changes
+            .iter()
+            .any(|(p, _)| p == Path::new("other"))
+    );
     let read = f.read();
     assert!(
         read.entry_for_path(Path::new("known/old.wav"))
