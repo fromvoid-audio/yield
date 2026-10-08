@@ -601,9 +601,9 @@ impl fmt::Display for BoundDatabaseRootError {
 
 /// Descriptor chain for one bounded nested index locator. Never exposes a native pathname.
 pub(crate) struct HeldIndexFile {
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     chain: Vec<fs::File>,
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     names: Vec<std::ffi::OsString>,
 }
 impl HeldIndexFile {
@@ -625,7 +625,7 @@ impl HeldIndexFile {
         expected_modified: Option<i64>,
     ) -> Result<(), super::super::SourceIndexInspectionError> {
         use super::super::SourceIndexInspectionError as E;
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         {
             for (i, name) in self.names.iter().enumerate() {
                 let current = open_index_component(&self.chain[i], name, i + 1 < self.names.len())?;
@@ -653,7 +653,7 @@ impl HeldIndexFile {
             }
             Ok(())
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = (expected_identity, expected_size, expected_modified);
             Err(E::Unsupported)
@@ -663,7 +663,7 @@ impl HeldIndexFile {
         &self,
     ) -> Result<fs::File, super::super::SourceIndexInspectionError> {
         use super::super::SourceIndexInspectionError as E;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::fd::{AsRawFd, FromRawFd};
             use std::os::unix::ffi::OsStrExt;
@@ -684,7 +684,7 @@ impl HeldIndexFile {
                 return Err(E::Unavailable);
             }
             // openat returned a new, uniquely owned descriptor. Validate it against the held
-            // O_PATH regular file before data access; never follow a pathname/proc alias.
+            // metadata-only regular file before data access; never follow a pathname/proc alias.
             let file = unsafe { fs::File::from_raw_fd(fd) };
             let held = self.chain.last().ok_or(E::Unavailable)?;
             if !file.metadata().map_err(|_| E::Unavailable)?.is_file()
@@ -700,7 +700,7 @@ impl HeldIndexFile {
             windows_index_input::read(self.chain.last().ok_or(E::Unavailable)?)
                 .map_err(|_| E::Unavailable)
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             Err(E::Unsupported)
         }
@@ -715,7 +715,7 @@ fn open_index_component(
     windows_index_input::component(parent, name, directory)
         .map_err(|_| super::super::SourceIndexInspectionError::Unavailable)
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_index_component(
     parent: &fs::File,
     name: &OsStr,
@@ -727,9 +727,14 @@ fn open_index_component(
         unix::ffi::OsStrExt,
     };
     let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| E::InvalidPath)?;
-    // O_PATH never reads data or blocks on FIFO/device open. Each name is one validated
-    // normal component, rooted in a held parent descriptor; symlinks are never followed.
-    let flags = libc::O_PATH
+    // Hold each vnode without data access: Linux O_PATH, Darwin O_EVTONLY. Darwin
+    // O_NONBLOCK also prevents a special-file substitution from waiting on a producer.
+    // Each name is one normal component under a retained parent; never follow symlinks.
+    #[cfg(target_os = "linux")]
+    let metadata_only = libc::O_PATH;
+    #[cfg(target_os = "macos")]
+    let metadata_only = libc::O_EVTONLY | libc::O_NONBLOCK;
+    let flags = metadata_only
         | libc::O_NOFOLLOW
         | libc::O_CLOEXEC
         | if directory { libc::O_DIRECTORY } else { 0 };
@@ -888,7 +893,7 @@ impl BoundDatabaseRoot {
         if names.is_empty() {
             return Err(E::InvalidPath);
         }
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         {
             let mut chain = Vec::with_capacity(33);
             chain.push(self._capability.try_clone().map_err(|_| E::Unavailable)?);
@@ -898,7 +903,7 @@ impl BoundDatabaseRoot {
             }
             Ok(HeldIndexFile { chain, names })
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = names;
             Err(E::Unsupported)
@@ -2158,7 +2163,7 @@ mod tests {
 
 #[cfg(test)]
 mod index_inspection_primitive_tests {
-    #![cfg(any(target_os = "linux", windows))]
+    #![cfg(any(target_os = "linux", target_os = "macos", windows))]
     use super::super::super::{
         SourceIndexClassification, SourceIndexEntry, SourceIndexInspectionError as E,
     };
@@ -2175,6 +2180,49 @@ mod index_inspection_primitive_tests {
             diagnostic: None,
             format_policy_version: 1,
         }
+    }
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn held_index_metadata_only_components_refuse_symlink_fifo_and_device_without_data_reads() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let root = tempfile::tempdir().unwrap();
+        let parent = open_root_nofollow(root.path()).unwrap();
+        fs::write(root.path().join("regular"), b"original").unwrap();
+        symlink("regular", root.path().join("link")).unwrap();
+        let fifo = std::ffi::CString::new(root.path().join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(open_index_component(&parent, OsStr::new("link"), false).is_err());
+        assert!(open_index_component(&parent, OsStr::new("fifo"), false).is_err());
+        assert!(open_index_component(&parent, OsStr::new("regular"), true).is_err());
+        let dev = open_root_nofollow(Path::new("/dev")).unwrap();
+        assert!(open_index_component(&dev, OsStr::new("null"), false).is_err());
+        assert_eq!(fs::read(root.path().join("regular")).unwrap(), b"original");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn held_index_feature_read_requires_original_leaf_before_returning_data_descriptor() {
+        use std::io::Read;
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("audio"), b"original").unwrap();
+        let binding = BoundDatabaseRoot {
+            path: root.path().into(),
+            _capability: Arc::new(open_root_nofollow(root.path()).unwrap()),
+            identity: String::new(),
+            profile_identity: String::new(),
+            named_path: None,
+            namespace_kind: BoundDatabaseRootNamespace::ExternalSource,
+            _lease: None,
+        };
+        let held = binding.inspect_index_file(Path::new("audio")).unwrap();
+        let mut reader = held.open_for_feature_read().unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
+        fs::rename(root.path().join("audio"), root.path().join("parked")).unwrap();
+        fs::write(root.path().join("audio"), b"replacement").unwrap();
+        assert!(matches!(held.open_for_feature_read(), Err(E::ChangedEntry)));
+        assert_eq!(fs::read(root.path().join("parked")).unwrap(), b"original");
     }
     #[test]
     fn held_index_inspection_revalidates_parent_edges_and_held_metadata() {
