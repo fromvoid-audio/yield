@@ -194,6 +194,8 @@ fn read_outcome(
     Ok(Some(outcome))
 }
 
+pub(super) mod context_backing;
+
 #[derive(Default)]
 struct Audit {
     physical: BTreeSet<(u64, String)>,
@@ -209,32 +211,45 @@ impl OperationJournalStore {
         StoredOperationRecord,
         database_claims::RetainedDatabaseInventory,
     )> {
-        self.attempt_context_with_input(start, new_start, None)
-    }
-
-    fn attempt_context_with_input(
-        &self,
-        start: &DatabaseAttemptStart,
-        new_start: bool,
-        input: Option<&crate::operation_journal::owner::InputPermit>,
-    ) -> Result<(
-        StoredOperationRecord,
-        database_claims::RetainedDatabaseInventory,
-    )> {
         let operation = OperationId::from_uuid(start.operation);
-        let inventory = database_claims::read_with_input(&self.connection, operation, input)?
+        let inventory = database_claims::read_with_input(&self.connection, operation, None)?
             .ok_or_else(|| error("missing actual binding"))?;
-        self.validate_database_claim_operation_with_input(operation, &inventory, input)?;
+        self.validate_database_claim_operation_with_input(operation, &inventory, None)?;
         let record = self
             .read_row(operation)?
             .ok_or_else(|| error("orphan start"))?
             .record;
-        self.validate_database_attempt_journal_claims_with_input(&record, input)?;
+        self.validate_database_attempt_journal_claims_with_input(&record, None)?;
         start
             .validate_bound(&record, &inventory, new_start)
             .map_err(error)?;
         Ok((record, inventory))
     }
+    pub(super) fn attempt_inventory_with_input(
+        &self,
+        start: &DatabaseAttemptStart,
+        new_start: bool,
+        input: Option<&crate::operation_journal::owner::InputPermit>,
+    ) -> Result<database_claims::RetainedDatabaseInventory> {
+        let Some(input) = input else {
+            return self
+                .attempt_context(start, new_start)
+                .map(|(_, inventory)| inventory);
+        };
+        let operation = OperationId::from_uuid(start.operation);
+        let inventory = database_claims::read_with_input(&self.connection, operation, Some(input))?
+            .ok_or_else(|| error("missing actual binding"))?;
+        self.validate_database_claim_operation_with_input(operation, &inventory, Some(input))?;
+        let present = self.inspect_complete_claim_operation(operation, input, |record, _| {
+            self.validate_database_attempt_journal_claims_with_input(record, Some(input))?;
+            context_backing::validate(start, record, &inventory, new_start, input)
+        })?;
+        if !present {
+            return Err(error("orphan start"));
+        }
+        Ok(inventory)
+    }
+
     fn audit_attempts(&self) -> Result<Audit> {
         self.audit_attempts_with_input(None)
     }
@@ -270,7 +285,7 @@ impl OperationJournalStore {
                     }
                     let start =
                         read_start(&self.connection, id)?.ok_or_else(|| error("orphan outcome"))?;
-                    let (_, inventory) = self.attempt_context_with_input(&start, false, input)?;
+                    let inventory = self.attempt_inventory_with_input(&start, false, input)?;
                     read_outcome(&self.connection, &start)?;
                     if table == START_TABLE {
                         let binding = inventory

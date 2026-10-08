@@ -18,7 +18,7 @@ fn checked(value: Option<usize>) -> Result<usize, OperationJournalStoreError> {
 // Include the complete tagged argument union too, so a stored enum's widest variant is
 // charged even when its selected representation is a short scalar. Every slot prepays
 // actual Rust layout; this is deliberately conservative for primitive byte/unit arrays.
-fn typed_slot() -> usize {
+pub(super) fn typed_slot() -> usize {
     [
         size_of::<UniversalCommandArgs>(),
         size_of::<FullCapacityAllocation>(),

@@ -21,6 +21,11 @@ pub(in crate::operation_journal) fn closed_streaming_shape(
     let shape = scan::scan_full(bytes);
     Some((shape.string_bytes, shape.array_entries, shape.arrays))
 }
+// Actual widest closed owned array layout, shared with reconstruction accounting.
+pub(in crate::operation_journal) fn typed_array_slot() -> usize {
+    general_backing::typed_slot()
+}
+
 #[cfg(test)]
 mod tests;
 

@@ -165,6 +165,81 @@ impl Write for Shape {
     }
 }
 
+pub(in crate::operation_journal::store) fn shape_working_bytes() -> usize {
+    2 * size_of::<Shape>() + size_of::<ReconstructionShape>()
+}
+
+pub(in crate::operation_journal::store) fn serialized_length(
+    value: &impl serde::Serialize,
+) -> Result<usize, OperationJournalStoreError> {
+    let mut counter = Shape::new();
+    serde_json::to_writer(&mut counter, value).map_err(|_| error("command encoding"))?;
+    Ok(counter.bytes)
+}
+
+pub(in crate::operation_journal::store) struct ReconstructionShape {
+    pub(in crate::operation_journal::store) output: usize,
+    pub(in crate::operation_journal::store) arguments: usize,
+    pub(in crate::operation_journal::store) graph: usize,
+    pub(in crate::operation_journal::store) cloned: usize,
+    pub(in crate::operation_journal::store) reasons: usize,
+}
+
+// Caller prepays original validation map/header scratch before entering. This
+// is an inventory of borrowed serializer output, never schema/effect permission.
+pub(in crate::operation_journal::store) fn reconstruction_shape(
+    record: &StoredOperationRecord,
+    phase: crate::operation_journal::OperationPhase,
+    disposition: crate::operation_journal::OperationDisposition,
+) -> Result<ReconstructionShape, OperationJournalStoreError> {
+    let mut original = Shape::new();
+    codec::serialize_full_record_inventory(record, phase, disposition, &mut original)
+        .map_err(|_| error("unsupported operation codec"))?
+        .map_err(|_| error("unsupported operation codec"))?;
+    let mut args = Shape::new();
+    if let Some(value) = record.universal_command_args() {
+        serde_json::to_writer(&mut args, value).map_err(|_| error("command encoding"))?;
+    } else if let Some(value) = record.command_args() {
+        serde_json::to_writer(&mut args, value).map_err(|_| error("command encoding"))?;
+    } else {
+        return Err(error("untyped legacy command cannot bind database claims"));
+    }
+    let slots = original
+        .entries
+        .checked_mul(2)
+        .and_then(|n| {
+            original
+                .arrays
+                .checked_mul(4)
+                .and_then(|a| n.checked_add(a))
+        })
+        .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+    let graph = original
+        .graph()
+        .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+    let cloned = slots
+        .checked_mul(codec::historical_observation::typed_array_slot())
+        .and_then(|n| {
+            original
+                .strings
+                .checked_mul(2)
+                .and_then(|s| n.checked_add(s))
+        })
+        .and_then(|n| n.checked_add(graph))
+        .and_then(|n| n.checked_add(size_of::<StoredOperationRecord>()))
+        .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
+    Ok(ReconstructionShape {
+        output: original.bytes,
+        arguments: args.bytes,
+        graph,
+        cloned,
+        reasons: original
+            .strings
+            .checked_mul(12)
+            .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?,
+    })
+}
+
 pub(in crate::operation_journal::store) fn validate_record(
     record: &StoredOperationRecord,
     inventory: &DatabaseClaimInventory,
