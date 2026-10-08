@@ -83,6 +83,27 @@ impl FundedChunkClaimRecord {
     ) -> bool {
         self.record.matches_request(request)
     }
+    pub(in crate::operation_journal) fn operation_id(&self) -> OperationId {
+        self.record.operation_id()
+    }
+    pub(in crate::operation_journal) fn validate_issuance(
+        &self,
+        provider: &crate::operation_journal::capacity_provider::CapacityProvider,
+        witness: &crate::operation_journal::owner::LiveAdmissionWitness<'_>,
+    ) -> Result<(), crate::operation_journal::capacity_provider::CapacityProviderError> {
+        provider.validate_durable_chunk_claim(&self.record)?;
+        provider.validate_durable_chunk_issuance(&self.record, witness)
+    }
+    pub(in crate::operation_journal::store) fn into_issue_receipt(
+        self,
+    ) -> Option<ChunkIssueReceipt> {
+        (self.record.state == ChunkClaimState::Issued && self.record.issue_id.is_some()).then_some(
+            ChunkIssueReceipt {
+                record: self.record,
+                _credit: self._credit,
+            },
+        )
+    }
     pub(in crate::operation_journal::store) fn into_unfunded(self) -> ChunkClaimRecord {
         assert!(
             self._credit.is_none(),
@@ -94,7 +115,6 @@ impl FundedChunkClaimRecord {
     pub(in crate::operation_journal) fn matches_original(&self, record: &ChunkClaimRecord) -> bool {
         self.record == *record
     }
-    #[cfg(all(test, unix))]
     pub(in crate::operation_journal) fn state(&self) -> ChunkClaimState {
         self.record.state()
     }
@@ -224,4 +244,67 @@ pub(super) fn insert(
         },
     )
     .map_err(sql_error)
+}
+
+fn write_error(error: ChunkClaimWriteError) -> OperationJournalStoreError {
+    OperationJournalStoreError::ChunkClaim {
+        reason: error.to_string(),
+    }
+}
+fn transition_read_error(error: OperationJournalStoreError) -> OperationJournalStoreError {
+    match error {
+        OperationJournalStoreError::ChunkClaim { reason } => {
+            write_error(ChunkClaimWriteError::InvalidTransition(reason))
+        }
+        error => error,
+    }
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) fn issue(
+    connection: &Connection,
+    chunk: ChunkId,
+    operation: OperationId,
+    issue: Uuid,
+    input: &InputPermit,
+    before: InputPermit,
+    after: InputPermit,
+    expected: &FundedChunkClaimRecord,
+) -> Result<Option<FundedChunkClaimRecord>, OperationJournalStoreError> {
+    if issue.is_nil() {
+        return Err(write_error(ChunkClaimWriteError::InvalidTransition(
+            "issue identity is nil".into(),
+        )));
+    }
+    let current = read_prepaid(connection, chunk, input, before)
+        .map_err(transition_read_error)?
+        .ok_or_else(|| {
+            write_error(ChunkClaimWriteError::InvalidTransition(
+                "chunk claim was not found".into(),
+            ))
+        })?;
+    if !issuance_action(&current.record, operation).map_err(write_error)? {
+        return Ok(None);
+    }
+    if &current != expected {
+        return Err(OperationJournalStoreError::ChunkClaim {
+            reason: "chunk changed after preparing issuance".into(),
+        });
+    }
+    super::super::initial_settlement_backing::statement(connection, input,
+        c"UPDATE operation_journal_chunk_claim SET state = 'Issued', issue_id = ?2 WHERE chunk_id = ?1 AND operation_id = ?3 AND state = 'Claimed'", |row| {
+            row.bind_text(1, &chunk.to_string())?;
+            row.bind_text(2, &issue.to_string())?;
+            row.bind_text(3, &operation.to_string())?;
+            row.next().map(|_| ())
+        }).map_err(|error| match error {
+            OperationJournalStoreError::Sql(error) => write_error(ChunkClaimWriteError::Sql(error)),
+            error => error,
+        })?;
+    let updated = read_prepaid(connection, chunk, input, after)
+        .map_err(transition_read_error)?
+        .ok_or_else(|| write_error(ChunkClaimWriteError::ReadbackMismatch))?;
+    if updated.record.state != ChunkClaimState::Issued || updated.record.issue_id != Some(issue) {
+        return Err(write_error(ChunkClaimWriteError::ReadbackMismatch));
+    }
+    Ok(Some(updated))
 }

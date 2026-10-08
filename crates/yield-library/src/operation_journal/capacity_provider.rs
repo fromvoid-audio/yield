@@ -503,8 +503,8 @@ impl CapacityProvider {
             .ledger
             .try_borrow()
             .map_err(|_| CapacityProviderError::LedgerBusy)?;
-        let mut matching_tokens = Vec::new();
-        for (token, entry) in &ledger.charges_by_token {
+        let mut matching_tokens = 0usize;
+        for entry in ledger.charges_by_token.values() {
             if !matches!(
                 entry.disposition,
                 ProvisionalLeaseDisposition::Durable { .. }
@@ -523,11 +523,11 @@ impl CapacityProvider {
             {
                 return Err(CapacityProviderError::ClaimReleaseConflict);
             }
-            matching_tokens.push(*token);
+            matching_tokens = matching_tokens.saturating_add(1);
         }
-        match matching_tokens.as_slice() {
-            [] => Err(CapacityProviderError::ClaimReleaseNotFound),
-            [_] => Ok(()),
+        match matching_tokens {
+            0 => Err(CapacityProviderError::ClaimReleaseNotFound),
+            1 => Ok(()),
             _ => Err(CapacityProviderError::ClaimReleaseAmbiguous),
         }
     }

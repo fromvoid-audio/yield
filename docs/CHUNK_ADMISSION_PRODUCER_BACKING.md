@@ -33,5 +33,26 @@ confer no native physical qualification. The System historical allocation tests
 measure their original historical and Legacy transport paths, not the entire
 new chunk producer. GNU Windows compilation is not native Windows acceptance.
 
-IssueChunk, write entry, staging checkpoint, release and recording producer funding,
-whole-owner finite policy and native positive acceptance remain separate work.
+IssueChunk uses the same original pool, reply carrier, original point codec,
+complete operation visitor, restart image, provider checks and genuine live witness.
+Its private scope prepays the before-transition, after-transition and committed
+readbacks. The actual Claimed-to-Issued SQL compares the complete original chunk
+row and exact operation digest/sequence before mutation; a sealed receipt escapes
+only after commit and exact readback. Unknown acknowledgement returns no permit
+and retains the existing durable charge.
+
+The returned permit and retained owner ticket independently pay their owned
+identity data before cloning it. Permit consumption moves its keeper into the
+private entry. Ticket removal releases its data keeper, while the original
+HashMap bucket growth keeps a separate accumulated loan through owner teardown.
+The next complete table is charged from the observed capacity before try_reserve,
+including overlapping old/new tables; bucket retention after removal or failure
+cannot refund that debit. No new pool, queue, registry or authority is created.
+
+Real SQL, actual queue, pressure and lifetime tests cover the issuance transition,
+stale operation/chunk refusal, lost commit acknowledgement, fence refusal, receipt
+ownership, permit-to-entry transfer and empty retained ticket buckets. Logical
+fixtures and lifetime projections supply no native effect qualification.
+Live-effect/source-pin entry, staging checkpoint, release and recording producer
+funding, whole-owner finite policy and native positive acceptance remain separate
+work.
