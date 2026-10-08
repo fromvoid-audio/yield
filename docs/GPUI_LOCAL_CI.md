@@ -109,3 +109,13 @@ record. Historical reads still use their complete decoder and classifier. Pool
 ceilings and physical admission requirements are unchanged. Portable SQL tests
 exercise exhausted-pool comparison, changed bytes and corrupt sequence/cell
 refusal; those tests do not supply native qualification.
+
+Native recording prestart custody runs its two original acceptance cases on two
+fresh macOS runner accounts at the same committed head. Each case executes its
+full original test with `--exact`, verifies exactly one pass and no failures or
+ignores, and records genuine APFS/profile/account resources. Both matrix jobs must
+succeed. Prestart leaves an active registration and durable admission claims;
+worker join releases memory custody but cannot prove clean volume handoff. The
+original dirty marker remains preserved. Reusing that account for a foreign
+profile would correctly refuse. This isolation creates no fixture registry,
+changes no home directory, and supplies no capture/terminal/settlement authority.

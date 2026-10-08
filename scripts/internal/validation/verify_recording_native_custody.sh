@@ -48,20 +48,35 @@ for path in sys.argv[1:]:
         raise SystemExit('Native recording verification requires writable home and test volumes')
 print('Native home and test filesystems: APFS, writable')
 PY
-cargo test --locked -p yield-library --lib recording_custody_native_production \
-  -- --test-threads=1 --nocapture 2>&1 | tee "$OUTPUT_DIR/tests.log"
-python3 - "$OUTPUT_DIR/tests.log" <<'PY'
+# An admitted prestart intent leaves genuine registration/charge evidence. A
+# joined worker does not establish clean volume handoff. CI runs each case on a
+# separate fresh native account, preserving the original dirty marker unchanged.
+SELECTED_CASE="${YIELD_NATIVE_CUSTODY_CASE:-}"
+case "$SELECTED_CASE" in
+  operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain|operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit)
+    cargo test --locked -p yield-library --lib "$SELECTED_CASE" \
+      -- --exact --test-threads=1 --nocapture 2>&1 | tee "$OUTPUT_DIR/tests.log"
+    ;;
+  '')
+    cargo test --locked -p yield-library --lib recording_custody_native_production \
+      -- --test-threads=1 --nocapture 2>&1 | tee "$OUTPUT_DIR/tests.log"
+    ;;
+  *) echo "Unknown genuine custody case: $SELECTED_CASE" >&2; exit 1 ;;
+esac
+python3 - "$OUTPUT_DIR/tests.log" "$SELECTED_CASE" <<'PY_CHECK'
 import pathlib, re, sys
 text = pathlib.Path(sys.argv[1]).read_text()
+selected = sys.argv[2]
+names = (selected,) if selected else (
+    'operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain',
+    'operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit',
+)
 results = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', text)
-if results != [('2', '0', '0')]:
-    raise SystemExit(f'Expected exactly two executed genuine tests, zero failed/ignored: {results}')
-for name in (
-    'recording_custody_native_production_original_slot_currentness_and_drain',
-    'recording_custody_native_production_lost_reply_keeps_original_slot_and_credit',
-):
-    if not re.search(r'test [\w:]*' + re.escape(name) + r' \.\.\. ok', text):
+if results != [(str(len(names)), '0', '0')]:
+    raise SystemExit(f'Expected all {len(names)} selected genuine tests, zero failed/ignored: {results}')
+for name in names:
+    if not re.search(r'test ' + re.escape(name) + r' \.\.\. ok', text):
         raise SystemExit(f'Missing completed genuine test: {name}')
-print('OPT-2330: exactly two genuine production-bootstrap tests passed')
-PY
+print(f'OPT-2330: {len(names)} selected genuine production-bootstrap test(s) passed')
+PY_CHECK
 df -Pk "$HOME" "$ROOT_DIR" "$NATIVE_TEST_TEMP_ROOT" > "$OUTPUT_DIR/final-disk.txt"

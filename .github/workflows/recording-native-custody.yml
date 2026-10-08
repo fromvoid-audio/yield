@@ -13,9 +13,19 @@ concurrency:
   cancel-in-progress: true
 jobs:
   genuine-production-custody:
+    name: Genuine production custody (${{ matrix.case }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: currentness-and-drain
+            test: operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain
+          - case: lost-reply
+            test: operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit
     runs-on: macos-15-intel
     timeout-minutes: 45
     env:
+      YIELD_NATIVE_CUSTODY_CASE: ${{ matrix.test }}
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -44,7 +54,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: recording-native-custody-${{ github.event.pull_request.head.sha || github.sha }}
+          name: recording-native-custody-${{ matrix.case }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: artifacts/recording-native-custody/
           if-no-files-found: warn
           retention-days: 14
