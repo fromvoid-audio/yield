@@ -497,6 +497,7 @@ trait StreamingRecordingValue: serde::de::DeserializeOwned {}
 impl StreamingRecordingValue for RecordingCapturedChunk {}
 impl StreamingRecordingValue for controls::RecordingControlReservation {}
 impl StreamingRecordingValue for controls::RecordingFinalizingInventory {}
+impl StreamingRecordingValue for controls::RecordingDeclaredFinalizingInventory {}
 impl StreamingRecordingValue for prefix::RecordingPrefixInventory {}
 impl StreamingRecordingValue for prefix::RecordingPrefixSeal {}
 
