@@ -97,6 +97,14 @@ pub(super) fn verify(
             .and_then(|n| n.checked_add(2 * CONTROL_BYTES))
             .ok_or(OperationJournalStoreError::HistoricalClaimResourceBound)?;
         encoding = Some(input.reserve_historical_scratch(encoded)?);
+        // Exact retained declaration and Frozen scalar graphs coexist across two rows.
+        // Prepay their fixed bounded storage on the original pool before decoding either.
+        let _history_backing = if store.recording_prestart_scope.get() {
+            None // Preserve the existing strict empty-reservation pre-start debit.
+        } else {
+            Some(input.reserve_historical_scratch(4 * CONTROL_BYTES)?)
+        };
+        let mut history = ControlHistory::default();
         let mut previous: Option<i64> = None;
         for role in ControlRole::ALL {
             let expected = RecordingControlReservation::new(proposal, role).map_err(error)?;
@@ -171,6 +179,7 @@ pub(super) fn verify(
                 }
             } else {
                 finalizing_observation(bytes, proposal, role).map_err(error)?;
+                history.observe(bytes, proposal, role, sequence)?;
             }
             // Borrowed payload and decoded scalar control die before raw credit
             // can be replaced for the next role.

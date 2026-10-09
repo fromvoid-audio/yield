@@ -480,7 +480,7 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
         )
         .unwrap();
         producer.submit(&vec![0.25; 17 * usize::from(channels)]);
-        let (inventory, batch) = std::thread::scope(|scope| {
+        let (inventory, batch, joined) = std::thread::scope(|scope| {
             let stopped = scope.spawn(move || producer.stop());
             let barrier = settlements
                 .recv_barrier(std::time::Duration::from_secs(2))
@@ -496,9 +496,12 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
                 &normalizer,
             )
             .unwrap();
-            barrier.deny();
-            assert!(stopped.join().unwrap().is_err());
-            result
+            barrier.acknowledge().unwrap();
+            assert!(stopped.join().unwrap().is_ok());
+            let joined = settlements
+                .recv_joined(std::time::Duration::from_secs(2))
+                .unwrap();
+            (result.0, result.1, joined)
         });
         assert_eq!(batch.chunks().len(), 3);
         let encoded = inventory.encode(&proposal).unwrap();
@@ -527,6 +530,25 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
         assert_eq!(keys, original_keys);
         let totals = store.recording_retained_totals().unwrap();
         assert!(store.verify_recording_reservation(&proposal, true).unwrap());
+        // Exact declarations still require actual retained rows and issued claims. These
+        // adversarial SQL observations are not a Source/startup or physical grant fixture.
+        let audit_funding = JournalNamespaceFundingProbe::new();
+        let audit_scope = store
+            .begin_recording_terminal_write_with_input(&audit_funding.input)
+            .unwrap();
+        assert!(
+            store
+                .validate_original_declared_terminal_retention(
+                    &proposal,
+                    &inventory,
+                    &audit_funding.input
+                )
+                .is_err()
+        );
+        store
+            .rollback_recording_terminal_write(&audit_funding.input)
+            .unwrap();
+        drop(audit_scope);
         for chunk in batch.chunks() {
             inventory.validate_chunk(&proposal, chunk).unwrap();
             // Declaration alone is not permission to bypass the durable append fence.
@@ -593,6 +615,240 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
             )
             .is_err()
         );
+        // Install exact immutable bytes and ordinary/chunk rows as data-only SQL fixtures.
+        store.connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        for chunk in batch.chunks() {
+            let slot = match chunk.role() {
+                crate::operation_journal::recording_commands::RecordingChunkRole::Pcm {
+                    ordinal,
+                } => i64::from(ordinal),
+                crate::operation_journal::recording_commands::RecordingChunkRole::Header {
+                    revision,
+                } => 10000 + i64::from(revision),
+            };
+            let sequence = store.next_sequence_inside_transaction().unwrap();
+            store.connection.execute("INSERT INTO operation_journal_recording_chunks(chunk_id,operation_id,slot,sequence,record) VALUES(?1,?2,?3,?4,?5)",
+                params![chunk.chunk_id().to_string(), proposal.operation_id().to_string(), slot, sequence, chunk.encode(&proposal).unwrap()]).unwrap();
+            let request = ChunkClaimRequest::new(
+                ChunkId::from_uuid(chunk.chunk_id()).unwrap(),
+                proposal.operation_id(),
+                crate::operation_journal::AdmissionClaim::new(
+                    AdmissionClaimId::new(),
+                    VolumeIdentity { device: 1 },
+                    crate::operation_journal::FullCapacityAllocationClass::DestinationStaging,
+                    4096,
+                )
+                .unwrap(),
+                chunk.work_key().participant_id(),
+                "recording-output".into(),
+                chunk.offset(),
+                chunk.bytes().len() as u64,
+                1,
+                crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR,
+            )
+            .unwrap();
+            ordinary_claims::insert_rows_inside_transaction(
+                &store.connection,
+                proposal.operation_id(),
+                &request.inventory().unwrap(),
+            )
+            .unwrap();
+            chunk_claims::insert_claimed_inside_transaction(&store.connection, &request).unwrap();
+        }
+        store.connection.execute_batch("COMMIT").unwrap();
+        let complete_funding = JournalNamespaceFundingProbe::new();
+        let scope = store
+            .begin_recording_terminal_write_with_input(&complete_funding.input)
+            .unwrap();
+        assert!(
+            store
+                .validate_original_declared_terminal_retention(
+                    &proposal,
+                    &inventory,
+                    &complete_funding.input
+                )
+                .is_err()
+        );
+        // A persisted Issued state is a historical observation, not physical completion.
+        for chunk in batch.chunks() {
+            store.connection.execute("UPDATE operation_journal_chunk_claim SET state='Issued',issue_id=?1 WHERE chunk_id=?2",
+                params![Uuid::new_v4().to_string(), chunk.chunk_id().to_string()]).unwrap();
+        }
+        store
+            .validate_original_declared_terminal_retention(
+                &proposal,
+                &inventory,
+                &complete_funding.input,
+            )
+            .unwrap();
+        let sequence = store
+            .original_frozen_control_sequence(&proposal, &complete_funding.input)
+            .unwrap();
+        let frozen = crate::operation_journal::recording_commands::controls::RecordingFrozenInventory::capture(
+            &proposal, &inventory, sequence, &settlements, &joined).unwrap();
+        // Precommit failure cannot consume the reserved slot or change retained charges.
+        let before_frozen = recording_projection_raw_state(&store.connection);
+        store
+            .connection
+            .execute_batch("SAVEPOINT frozen_fault")
+            .unwrap();
+        store.set_insert_test_hook(|at| {
+            if at == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::RecordingRetention {
+                    reason: "Frozen precommit fault".into(),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        assert!(
+            store
+                .record_original_frozen_inventory(
+                    &proposal,
+                    &inventory,
+                    &frozen,
+                    &complete_funding.input
+                )
+                .is_err()
+        );
+        store
+            .connection
+            .execute_batch("ROLLBACK TO frozen_fault; RELEASE frozen_fault")
+            .unwrap();
+        assert_eq!(
+            recording_projection_raw_state(&store.connection),
+            before_frozen
+        );
+        store.set_insert_test_hook(|_| InsertTestDirective::Continue);
+        store
+            .record_original_frozen_inventory(
+                &proposal,
+                &inventory,
+                &frozen,
+                &complete_funding.input,
+            )
+            .unwrap();
+        store
+            .verify_original_frozen_readback(&proposal, &frozen, &complete_funding.input)
+            .unwrap();
+        assert!(store.verify_recording_reservation(&proposal, true).unwrap());
+        if channels == 1 {
+            store.set_insert_test_hook(|at| {
+                if at == InsertTestBoundary::Commit {
+                    InsertTestDirective::ExecuteThenFail(
+                        OperationJournalStoreError::RecordingRetention {
+                            reason: "Frozen commit acknowledgement lost".into(),
+                        },
+                    )
+                } else {
+                    InsertTestDirective::Continue
+                }
+            });
+            assert!(
+                store
+                    .finish_recording_terminal_write(&complete_funding.input)
+                    .is_err()
+            );
+            assert!(store.connection.is_autocommit());
+        } else {
+            store
+                .finish_recording_terminal_write(&complete_funding.input)
+                .unwrap();
+        }
+        drop(scope);
+        let frozen_totals = store.recording_retained_totals().unwrap();
+        drop(store);
+        let store = OperationJournalStore::open(&f.owner).unwrap();
+        store
+            .verify_original_frozen_readback(&proposal, &frozen, &complete_funding.input)
+            .unwrap();
+        assert!(
+            store
+                .verify_recording_reservation_with_input(
+                    &proposal,
+                    true,
+                    Some(&complete_funding.input)
+                )
+                .unwrap()
+        );
+        let scope = store
+            .begin_recording_terminal_write_with_input(&complete_funding.input)
+            .unwrap();
+        assert!(
+            store
+                .record_original_frozen_inventory(
+                    &proposal,
+                    &inventory,
+                    &frozen,
+                    &complete_funding.input
+                )
+                .is_err()
+        );
+        store
+            .rollback_recording_terminal_write(&complete_funding.input)
+            .unwrap();
+        drop(scope);
+        assert_eq!(store.recording_retained_totals().unwrap(), frozen_totals);
+        let scope = store
+            .begin_recording_terminal_write_with_input(&complete_funding.input)
+            .unwrap();
+        let encoded_frozen = frozen.encode(&proposal).unwrap();
+        let wrong: serde_json::Value = serde_json::from_slice(&encoded_frozen).unwrap();
+        for mutation in 0..5 {
+            let mut wrong = wrong.clone();
+            match mutation {
+                0 => wrong["prefix"]["freeze_sequence"] = serde_json::json!(sequence + 1),
+                1 => wrong["prefix"]["terminal_id"] = serde_json::json!(Uuid::new_v4()),
+                2 => wrong["prefix"]["generation"] = serde_json::json!(2),
+                3 => wrong["finalizing_hash"][0] = serde_json::json!(255),
+                _ => wrong["version"] = serde_json::json!(5),
+            }
+            store
+                .connection
+                .execute(
+                    "UPDATE operation_journal_recording_chunks SET record=?1 WHERE slot=20001",
+                    params![serde_json::to_vec(&wrong).unwrap()],
+                )
+                .unwrap();
+            assert!(store.verify_recording_reservation(&proposal, true).is_err());
+            assert!(
+                store
+                    .verify_recording_reservation_with_input(
+                        &proposal,
+                        true,
+                        Some(&complete_funding.input)
+                    )
+                    .is_err()
+            );
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE operation_journal_recording_chunks SET record=?1 WHERE slot=20001",
+                params![encoded_frozen],
+            )
+            .unwrap();
+
+        store
+            .connection
+            .execute(
+                "UPDATE operation_journal_chunk_claim SET logical_offset=logical_offset+1",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .validate_original_declared_terminal_retention(
+                    &proposal,
+                    &inventory,
+                    &complete_funding.input
+                )
+                .is_err()
+        );
+        store
+            .rollback_recording_terminal_write(&complete_funding.input)
+            .unwrap();
+        drop(scope);
         store
             .connection
             .execute(

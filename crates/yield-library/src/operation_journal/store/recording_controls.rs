@@ -94,6 +94,7 @@ impl OperationJournalStore {
             ));
         }
         let mut previous_sequence: Option<i64> = None;
+        let mut history = ControlHistory::default();
         for role in ControlRole::ALL {
             let expected = RecordingControlReservation::new(proposal, role).map_err(error)?;
             let row: Option<(String, i64, String, i64)> = self.connection.query_row(
@@ -151,6 +152,7 @@ impl OperationJournalStore {
             } else {
                 // General historical readers preserve their typed/noncanonical acceptance.
                 finalizing_observation(&bytes, proposal, role).map_err(error)?;
+                history.observe(&bytes, proposal, role, sequence)?;
             }
         }
         // Use the operation/slot index and a capped inventory, not an ordered global sequence
@@ -275,6 +277,46 @@ impl OperationJournalStore {
                 )?;
             }
             self.verify_recording_reservation_with_input(proposal, true, input)?;
+        }
+        Ok(())
+    }
+}
+
+/// Bounded retained control relationships. This is historical data validation, not
+/// recovery of an original adapter, producer join or Source/acquisition permission.
+#[derive(Default)]
+struct ControlHistory {
+    finalizing: Option<crate::operation_journal::recording_commands::controls::RecordingDeclaredFinalizingInventory>,
+}
+impl ControlHistory {
+    fn observe(
+        &mut self,
+        bytes: &[u8],
+        proposal: &RecordingProposal,
+        role: ControlRole,
+        sequence: i64,
+    ) -> Result<(), OperationJournalStoreError> {
+        use crate::operation_journal::recording_commands::controls::{
+            RecordingDeclaredFinalizingInventory, RecordingFrozenInventory,
+        };
+        if role == ControlRole::Finalizing {
+            self.finalizing = RecordingDeclaredFinalizingInventory::decode(bytes, proposal).ok();
+        } else if role == ControlRole::Frozen
+            && finalizing_observation(bytes, proposal, role).map_err(error)?
+        {
+            let frozen = RecordingFrozenInventory::decode(bytes, proposal).map_err(error)?;
+            if u64::try_from(sequence).map_err(error)? != frozen.prefix().freeze_sequence() {
+                return Err(error(
+                    "retained Frozen sequence differs from original reservation",
+                ));
+            }
+            let finalizing = self
+                .finalizing
+                .as_ref()
+                .ok_or_else(|| error("Frozen has no exact declared Finalizing inventory"))?;
+            frozen
+                .validate_finalizing(proposal, finalizing)
+                .map_err(error)?;
         }
         Ok(())
     }

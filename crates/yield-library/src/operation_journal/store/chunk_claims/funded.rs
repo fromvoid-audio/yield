@@ -115,6 +115,19 @@ impl FundedChunkClaimRecord {
     pub(in crate::operation_journal) fn matches_original(&self, record: &ChunkClaimRecord) -> bool {
         self.record == *record
     }
+    /// Borrowed comparison only. It cannot turn an Issued row into physical completion.
+    pub(in crate::operation_journal::store) fn matches_issued_recording_bytes(
+        &self,
+        chunk: &crate::operation_journal::recording_commands::RecordingCapturedChunk,
+    ) -> bool {
+        self.record.state() == ChunkClaimState::Issued
+            && self.record.chunk_id().as_uuid() == chunk.chunk_id()
+            && self.record.operation_id() == chunk.operation_id()
+            && self.record.participant_id() == chunk.work_key().participant_id()
+            && self.record.logical_offset() == chunk.offset()
+            && self.record.logical_length() == chunk.bytes().len() as u64
+            && self.record.allocation_class() == FullCapacityAllocationClass::DestinationStaging
+    }
     pub(in crate::operation_journal) fn state(&self) -> ChunkClaimState {
         self.record.state()
     }

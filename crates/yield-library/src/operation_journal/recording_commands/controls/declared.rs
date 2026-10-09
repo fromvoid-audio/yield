@@ -143,6 +143,44 @@ impl RecordingDeclaredFinalizingInventory {
         }
         Ok(())
     }
+    pub(super) fn prefix_after_join(
+        &self,
+        proposal: &RecordingProposal,
+        sequence: u64,
+        settlements: &RecordingSettlements,
+        joined: &reson::recording::RecordingJoinedCompletion,
+    ) -> Result<prefix::RecordingPrefixInventory, RecordingValueError> {
+        self.validate_joined(proposal, settlements, joined)?;
+        self.observation
+            .prefix_after_join(proposal, sequence, settlements, joined)
+    }
+    pub(super) fn validate_prefix_observation(
+        &self,
+        proposal: &RecordingProposal,
+        prefix: &prefix::RecordingPrefixInventory,
+    ) -> Result<(), RecordingValueError> {
+        self.validate(proposal)?;
+        if *prefix
+            != self
+                .observation
+                .expected_prefix_observation(proposal, prefix.freeze_sequence())?
+        {
+            return Err(invalid(
+                "Frozen accounting/terminal differs from original Finalizing observation",
+            ));
+        }
+        Ok(())
+    }
+    /// Borrow the fixed declared identities; this inspection grants no retention or effect.
+    pub(crate) fn inspect_chunk_ids<E>(
+        &self,
+        mut visit: impl FnMut(Uuid) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for chunk in self.chunks.iter().flatten() {
+            visit(chunk.id)?;
+        }
+        Ok(())
+    }
     pub(crate) fn validate_joined(
         &self,
         proposal: &RecordingProposal,

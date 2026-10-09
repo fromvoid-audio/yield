@@ -36,6 +36,44 @@ impl RecordingFinalizingInventory {
     pub(crate) fn terminal_id(&self) -> Uuid {
         self.terminal_id
     }
+    pub(super) fn prefix_after_join(
+        &self,
+        proposal: &RecordingProposal,
+        sequence: u64,
+        settlements: &RecordingSettlements,
+        joined: &RecordingJoinedCompletion,
+    ) -> Result<prefix::RecordingPrefixInventory, RecordingValueError> {
+        self.validate_joined(proposal, settlements, joined)?;
+        self.expected_prefix_observation(proposal, sequence)
+    }
+    /// Compare historical metadata only; this cannot authenticate successful producer join.
+    pub(super) fn expected_prefix_observation(
+        &self,
+        proposal: &RecordingProposal,
+        sequence: u64,
+    ) -> Result<prefix::RecordingPrefixInventory, RecordingValueError> {
+        self.validate(proposal)?;
+        prefix::RecordingPrefixInventory::new(
+            proposal,
+            self.terminal_id,
+            sequence,
+            self.generation,
+            2,
+            self.terminal,
+            prefix::RecordingSampleAccounting {
+                accepted: self.accepted,
+                encoded: self.encoded,
+                abandoned: self.abandoned,
+                unconfirmed: self.unconfirmed,
+                rejected: self.rejected,
+                overruns: self.overruns,
+                complete: true,
+                overflowed: false,
+                joined_successfully: true,
+                writer_failed: false,
+            },
+        )
+    }
     /// Capture original private producer evidence; this data alone authorizes no transaction.
     pub(crate) fn capture(
         proposal: &RecordingProposal,

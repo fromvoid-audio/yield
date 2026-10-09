@@ -5,6 +5,7 @@ use crate::operation_journal::{
     owner::InputPermit,
     recording_commands::controls::{
         RecordingDeclaredFinalizingInventory, RecordingFinalizingInventory,
+        RecordingFrozenInventory,
     },
 };
 use rusqlite::types::ValueRef;
@@ -242,6 +243,165 @@ impl OperationJournalStore {
                 collection.map(super::super::admission_rebuild_backing::Collection::into_credit),
             ),
         )
+    }
+
+    /// Read original exact declared bytes and issued range claims under one exclusive
+    /// snapshot. Each original row keeper stays live through comparison; no row clone,
+    /// physical completion, closure or publication authority escapes this audit.
+    pub(in crate::operation_journal) fn validate_original_declared_terminal_retention(
+        &self,
+        proposal: &RecordingProposal,
+        inventory: &RecordingDeclaredFinalizingInventory,
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
+        if !self.recording_terminal_scope.get() || self.connection.is_autocommit() {
+            return Err(error(
+                "declared terminal retention needs original exclusive snapshot",
+            ));
+        }
+        let working = terminal_encoding_credit(proposal, input)?;
+        let result = (|| {
+            self.verify_declared_finalizing_readback(proposal, inventory, input)?;
+            inventory.inspect_chunk_ids(|id| {
+                let chunk =
+                    super::super::recording_chunks::funded::read(self, id, proposal, input)?
+                        .ok_or_else(|| error("original declared terminal bytes are missing"))?;
+                inventory
+                    .validate_chunk(proposal, &chunk.1)
+                    .map_err(error)?;
+                let claim_id =
+                    crate::operation_journal::store::chunk_claims::ChunkId::from_uuid(id)
+                        .map_err(error)?;
+                let claim =
+                    super::super::chunk_claims::read_for_input(&self.connection, claim_id, input)?
+                        .ok_or_else(|| {
+                            error("original declared terminal range claim is missing")
+                        })?;
+                if !claim.matches_issued_recording_bytes(&chunk.1) {
+                    return Err(error("original declared terminal issued range changed"));
+                }
+                Ok(())
+            })
+        })();
+        if result.is_err() {
+            input.retain_historical_error(working, None, None, None);
+        }
+        result
+    }
+
+    pub(in crate::operation_journal) fn original_frozen_control_sequence(
+        &self,
+        proposal: &RecordingProposal,
+        input: &InputPermit,
+    ) -> Result<u64, OperationJournalStoreError> {
+        if !self.recording_terminal_scope.get() || self.connection.is_autocommit() {
+            return Err(error("Frozen sequence needs original exclusive snapshot"));
+        }
+        let mut operation = [0; 36];
+        let operation = proposal
+            .operation_id()
+            .as_uuid()
+            .hyphenated()
+            .encode_lower(&mut operation);
+        statement(&self.connection, input,
+            c"SELECT sequence FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=20001 AND typeof(sequence)='integer' AND sequence>0",
+            |row| {
+                row.bind_text(1, operation)?;
+                if !row.next()? { return Err(error("original Frozen reservation sequence missing")); }
+                let sequence = super::super::historical_claim_observation::borrowed_sql::scalar::<i64>(row, 0)?;
+                u64::try_from(sequence).map_err(error)
+            })
+    }
+
+    pub(in crate::operation_journal) fn record_original_frozen_inventory(
+        &self,
+        proposal: &RecordingProposal,
+        finalizing: &RecordingDeclaredFinalizingInventory,
+        frozen: &RecordingFrozenInventory,
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
+        if !self.recording_terminal_scope.get() || self.connection.is_autocommit() {
+            return Err(error("Frozen requires original exclusive transaction"));
+        }
+        let working = terminal_encoding_credit(proposal, input)?;
+        let result = (|| {
+            self.validate_original_declared_terminal_retention(proposal, finalizing, input)?;
+            frozen
+                .validate_finalizing(proposal, finalizing)
+                .map_err(error)?;
+            if frozen.prefix().freeze_sequence()
+                != self.original_frozen_control_sequence(proposal, input)?
+            {
+                return Err(error(
+                    "Frozen prefix sequence differs from original reservation",
+                ));
+            }
+            let reservation =
+                RecordingControlReservation::new(proposal, ControlRole::Frozen).map_err(error)?;
+            let empty = reservation.encode(proposal).map_err(error)?;
+            let encoded = frozen.encode(proposal).map_err(error)?;
+            let mut operation = [0; 36];
+            let operation = proposal
+                .operation_id()
+                .as_uuid()
+                .hyphenated()
+                .encode_lower(&mut operation);
+            let mut id = [0; 36];
+            let id = reservation.id().hyphenated().encode_lower(&mut id);
+            statement(&self.connection, input,
+                c"UPDATE operation_journal_recording_chunks SET record=?1 WHERE operation_id=?2 AND chunk_id=?3 AND slot=20001 AND typeof(sequence)='integer' AND sequence>0 AND record=?4",
+                |row| {
+                    row.bind_blob(1, &encoded)?; row.bind_text(2, operation)?;
+                    row.bind_text(3, id)?; row.bind_blob(4, &empty)?;
+                    row.next().map(|_| ())
+                })?;
+            if self.connection.changes() != 1 {
+                return Err(error("original Frozen inventory CAS changed"));
+            }
+            #[cfg(test)]
+            if let Some(super::super::InsertTestDirective::Fail(error)) = self
+                .insert_test_directive(super::super::InsertTestBoundary::BeforePrecommitValidation)
+            {
+                return Err(error);
+            }
+            self.verify_original_frozen_readback(proposal, frozen, input)?;
+            self.validate_namespace_with_input(Some(input), true)
+        })();
+        if result.is_err() {
+            input.retain_historical_error(working, None, None, None);
+        }
+        result
+    }
+
+    pub(in crate::operation_journal) fn verify_original_frozen_readback(
+        &self,
+        proposal: &RecordingProposal,
+        frozen: &RecordingFrozenInventory,
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
+        let working = terminal_encoding_credit(proposal, input)?;
+        let result = (|| {
+            let expected = frozen.encode(proposal).map_err(error)?;
+            let mut operation = [0; 36];
+            let operation = proposal
+                .operation_id()
+                .as_uuid()
+                .hyphenated()
+                .encode_lower(&mut operation);
+            statement(&self.connection, input,
+                c"SELECT CASE WHEN typeof(record)='blob' AND length(record) BETWEEN 1 AND 4096 THEN record ELSE NULL END FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=20001",
+                |row| {
+                    row.bind_text(1, operation)?;
+                    if !row.next()? { return Err(error("original Frozen inventory missing")); }
+                    let ValueRef::Blob(bytes) = row.get_ref(0)? else { return Err(error("original Frozen inventory shape changed")); };
+                    if bytes != expected { return Err(error("original Frozen inventory readback changed")); }
+                    Ok(())
+                })
+        })();
+        if result.is_err() {
+            input.retain_historical_error(working, None, None, None);
+        }
+        result
     }
 
     pub(in crate::operation_journal) fn connection_is_autocommit_for_recording(&self) -> bool {

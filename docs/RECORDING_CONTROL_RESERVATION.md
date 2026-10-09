@@ -225,3 +225,37 @@ Even an exact declared new chunk remains refused by the generic append path.
 Full OPT-2145 remains open: actual admitted terminal retention/acknowledgement,
 original successful close capability, Frozen/seal persistence and paged verification,
 restart/cancel/drain races and native acceptance are not supplied by a declaration.
+
+
+## Original joined Frozen retention (OPT-2145, partial)
+
+The owner now checks the genuine joined completion against its retained original
+V3 declaration and private producer instance. Inside the same separately funded
+exclusive transaction it revalidates the original Source/profile/provider/capacity
+context, exact Finalizing readback, each declared terminal byte row, and each
+original issued claim's operation, destination participant, staging class and range.
+Issued claim metadata is not evidence of physical completion.
+
+Only after these checks does it replace the exact empty Frozen reservation with a
+closed V4 inventory. This binds the V3 declaration hash and the original successful
+terminal accounting to the existing Frozen row sequence. Its CAS, exact precommit
+and postcommit readback preserve all four original control identities, sequences
+and the full 16-KiB charge. Errors retain their original loans; uncertain outcomes
+and a changed Source after commit make the original route unavailable for recovery.
+
+Historical readers cross-check Frozen against the preceding known V3 declaration
+and its reserved sequence. The funded reader prepays its fixed control-history
+scratch before owning typed observations. Unknown versions, missing declarations,
+changed terminal identities/generations/hashes and conflicting sequences fail closed.
+Reopening these data observations supplies no live producer or Source capability.
+
+Real SQLite tests cover absent/unissued/mismatched terminal claims, exact original
+bytes, precommit rollback, lost commit acknowledgement, immutable retry refusal,
+reopen and cross-control corruption. Their CPU producer and SQL claim fixtures
+provide no native Source or physical admission.
+
+Full OPT-2145 remains open: the pre-start factory still withholds acknowledgement
+and supplies no required-WAL or physical startup grant. The admitted terminal
+append/acknowledgement bridge, bounded actual-byte verification and durable seal,
+complete restart/cancel/drain races and native acceptance remain required. Frozen
+retention does not publish an output or release any retained capacity.
