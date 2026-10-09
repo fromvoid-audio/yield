@@ -21,20 +21,21 @@ SPEC.loader.exec_module(MODULE)
 
 
 class NativeRunnerEvidenceTests(unittest.TestCase):
-    def test_full_native_selector_allowlist_covers_all_seven_isolated_cases(self) -> None:
+    def test_full_native_selector_allowlist_covers_all_eight_isolated_cases(self) -> None:
         self.assertEqual(
             set(MODULE.CASES),
             {
                 "capacity",
                 "control",
                 "namespace",
+                "namespace-poll",
                 "recording-slot-currentness",
                 "recording-lost-reply",
                 "chunk-issuance",
                 "provider-reconciliation",
             },
         )
-        self.assertEqual(len(set(MODULE.CASES.values())), 7)
+        self.assertEqual(len(set(MODULE.CASES.values())), 8)
 
     def test_accepts_one_exact_successful_selector(self) -> None:
         selector = MODULE.CASES["capacity"]

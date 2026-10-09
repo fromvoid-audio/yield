@@ -22,6 +22,149 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+class ExactWorktreeBranchTests(unittest.TestCase):
+    def git(self, repo: pathlib.Path, *args: str) -> str:
+        result = MODULE.subprocess.run(
+            ["git", *args], cwd=repo, text=True, capture_output=True, check=True
+        )
+        return result.stdout.strip()
+
+    def test_exact_feature_worktree_satisfies_guard_and_cleans_up_without_touching_caller(self) -> None:
+        for body_raises in (False, True):
+            with self.subTest(body_raises=body_raises), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                repo = root / "repo"
+                remote = root / "origin.git"
+                repo.mkdir()
+                self.git(root, "init", "--initial-branch=main", str(repo))
+                self.git(repo, "config", "user.email", "ci-test@example.invalid")
+                self.git(repo, "config", "user.name", "CI test")
+                guard = repo / "scripts/internal/check/check_main_branch.sh"
+                guard.parent.mkdir(parents=True)
+                guard.write_bytes((ROOT / "scripts/internal/check/check_main_branch.sh").read_bytes())
+                (repo / "tracked.txt").write_text("pinned source\n", encoding="utf-8")
+                self.git(repo, "add", "tracked.txt", "scripts/internal/check/check_main_branch.sh")
+                self.git(repo, "commit", "-m", "fixture")
+                sha = self.git(repo, "rev-parse", "HEAD")
+                self.git(root, "init", "--bare", str(remote))
+                self.git(repo, "remote", "add", "origin", str(remote))
+                self.git(repo, "push", "--set-upstream", "origin", "main")
+                self.git(repo, "switch", "-c", "codex/caller")
+                dirty = repo / "caller-dirty.txt"
+                dirty.write_text("preserve me\n", encoding="utf-8")
+                caller_branch = self.git(repo, "branch", "--show-current")
+                caller_status = self.git(repo, "status", "--porcelain", "--untracked-files=normal")
+
+                original_command_output = MODULE.command_output
+
+                def command_output_from_fixture(*args: str, **kwargs: object) -> str:
+                    kwargs.setdefault("cwd", repo)
+                    return original_command_output(*args, **kwargs)
+
+                with (
+                    mock.patch.object(MODULE, "ROOT", repo),
+                    mock.patch.object(MODULE, "command_output", side_effect=command_output_from_fixture),
+                ):
+                    if body_raises:
+                        with self.assertRaisesRegex(RuntimeError, "simulated lane failure"):
+                            with MODULE.exact_worktree(sha) as checkout:
+                                branch = self.git(checkout, "branch", "--show-current")
+                                self.assertRegex(branch, r"^codex/local-ci-[0-9a-f]{32}$")
+                                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), sha)
+                                self.assertEqual(
+                                    self.git(checkout, "status", "--porcelain", "--untracked-files=normal"),
+                                    "",
+                                )
+                                guard_result = MODULE.subprocess.run(
+                                    ["bash", str(checkout / "scripts/internal/check/check_main_branch.sh")],
+                                    cwd=checkout,
+                                    text=True,
+                                    capture_output=True,
+                                    check=False,
+                                )
+                                self.assertEqual(guard_result.returncode, 0, guard_result.stderr)
+                                self.assertIn("feature branch", guard_result.stdout)
+                                raise RuntimeError("simulated lane failure")
+                    else:
+                        with MODULE.exact_worktree(sha) as checkout:
+                            branch = self.git(checkout, "branch", "--show-current")
+                            self.assertRegex(branch, r"^codex/local-ci-[0-9a-f]{32}$")
+                            self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), sha)
+                            guard_result = MODULE.subprocess.run(
+                                ["bash", str(checkout / "scripts/internal/check/check_main_branch.sh")],
+                                cwd=checkout,
+                                text=True,
+                                capture_output=True,
+                                check=False,
+                            )
+                            self.assertEqual(guard_result.returncode, 0, guard_result.stderr)
+                            self.assertIn("feature branch", guard_result.stdout)
+
+                self.assertEqual(self.git(repo, "branch", "--show-current"), caller_branch)
+                self.assertEqual(dirty.read_text(encoding="utf-8"), "preserve me\n")
+                self.assertEqual(
+                    self.git(repo, "status", "--porcelain", "--untracked-files=normal"),
+                    caller_status,
+                )
+                self.assertEqual(self.git(repo, "branch", "--list", "codex/local-ci-*"), "")
+                self.assertEqual(self.git(repo, "worktree", "list", "--porcelain").count("\nworktree "), 0)
+
+    def test_failed_add_preserves_preexisting_matching_temporary_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            repo = root / "repo"
+            remote = root / "origin.git"
+            repo.mkdir()
+            self.git(root, "init", "--initial-branch=main", str(repo))
+            self.git(repo, "config", "user.email", "ci-test@example.invalid")
+            self.git(repo, "config", "user.name", "CI test")
+            guard = repo / "scripts/internal/check/check_main_branch.sh"
+            guard.parent.mkdir(parents=True)
+            guard.write_bytes((ROOT / "scripts/internal/check/check_main_branch.sh").read_bytes())
+            (repo / "tracked.txt").write_text("pinned source\n", encoding="utf-8")
+            self.git(repo, "add", "tracked.txt", "scripts/internal/check/check_main_branch.sh")
+            self.git(repo, "commit", "-m", "fixture")
+            sha = self.git(repo, "rev-parse", "HEAD")
+            self.git(root, "init", "--bare", str(remote))
+            self.git(repo, "remote", "add", "origin", str(remote))
+            self.git(repo, "push", "--set-upstream", "origin", "main")
+            fixed_id = "f" * 32
+            temporary_branch = f"codex/local-ci-{fixed_id}"
+            self.git(repo, "branch", temporary_branch, sha)
+            self.git(repo, "switch", "-c", "codex/caller")
+            dirty = repo / "caller-dirty.txt"
+            dirty.write_text("preserve me\n", encoding="utf-8")
+            caller_branch = self.git(repo, "branch", "--show-current")
+            caller_status = self.git(repo, "status", "--porcelain", "--untracked-files=normal")
+
+            original_command_output = MODULE.command_output
+
+            def command_output_from_fixture(*args: str, **kwargs: object) -> str:
+                kwargs.setdefault("cwd", repo)
+                return original_command_output(*args, **kwargs)
+
+            fixed_uuid = type("FixedUuid", (), {"hex": fixed_id})()
+            with (
+                mock.patch.object(MODULE, "ROOT", repo),
+                mock.patch.object(MODULE, "command_output", side_effect=command_output_from_fixture),
+                mock.patch.object(MODULE.uuid, "uuid4", return_value=fixed_uuid),
+            ):
+                with self.assertRaises(MODULE.subprocess.CalledProcessError) as raised:
+                    with MODULE.exact_worktree(sha):
+                        self.fail("git must refuse the pre-existing temporary branch")
+
+            self.assertTrue(
+                any("branch creation was not confirmed" in note for note in raised.exception.__notes__)
+            )
+            self.assertEqual(self.git(repo, "rev-parse", temporary_branch), sha)
+            self.assertEqual(self.git(repo, "branch", "--show-current"), caller_branch)
+            self.assertEqual(dirty.read_text(encoding="utf-8"), "preserve me\n")
+            self.assertEqual(
+                self.git(repo, "status", "--porcelain", "--untracked-files=normal"), caller_status
+            )
+            self.assertEqual(self.git(repo, "worktree", "list", "--porcelain").count("\nworktree "), 0)
+
+
 class ManagedBinaryProbeTests(unittest.TestCase):
     def test_command_output_can_include_stderr_without_changing_default(self) -> None:
         completed = MODULE.subprocess.CompletedProcess(

@@ -270,16 +270,102 @@ def exact_worktree(sha: str) -> Iterator[pathlib.Path]:
     sha = source_sha(sha)
     if command_output("git", "cat-file", "-t", sha) != "commit":
         raise CiError("requested SHA is not an available commit")
-    with tempfile.TemporaryDirectory(prefix="yield-local-ci-") as temporary:
-        checkout = pathlib.Path(temporary) / "checkout"
-        subprocess.run(["git", "worktree", "add", "--detach", str(checkout), sha], cwd=str(ROOT), check=True)
+    temporary = pathlib.Path(tempfile.mkdtemp(prefix="yield-local-ci-"))
+    checkout = temporary / "checkout"
+    branch = f"codex/local-ci-{uuid.uuid4().hex}"
+    worktree_add_attempted = False
+    branch_owned = False
+    active_error: Optional[BaseException] = None
+    try:
+        worktree_add_attempted = True
+        subprocess.run(
+            ["git", "worktree", "add", "-b", branch, str(checkout), sha],
+            cwd=str(ROOT),
+            check=True,
+        )
+        branch_owned = True
+        actual_sha = command_output("git", "rev-parse", "HEAD", cwd=checkout)
+        actual_branch = command_output("git", "branch", "--show-current", cwd=checkout)
+        if actual_sha != sha or actual_branch != branch:
+            raise CiError("temporary source branch does not point at the requested exact commit")
+        dirty = command_output("git", "status", "--porcelain", "--untracked-files=normal", cwd=checkout)
+        if dirty:
+            raise CiError("temporary exact-source worktree is unexpectedly dirty")
+        yield checkout
+    except BaseException as error:
+        active_error = error
+        raise
+    finally:
+        cleanup_errors: list[str] = []
         try:
-            dirty = command_output("git", "status", "--porcelain", "--untracked-files=normal", cwd=checkout)
-            if dirty:
-                raise CiError("detached source worktree is unexpectedly dirty")
-            yield checkout
-        finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(checkout)], cwd=str(ROOT), check=False)
+            registrations = command_output("git", "worktree", "list", "--porcelain")
+        except BaseException as error:
+            registrations = None
+            cleanup_errors.append(f"could not inspect registered worktrees: {error}")
+        registered = registrations is None or any(
+            line == f"worktree {checkout}" for line in registrations.splitlines()
+        )
+        if worktree_add_attempted and registered:
+            try:
+                removed = subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(checkout)],
+                    cwd=str(ROOT),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if removed.returncode:
+                    cleanup_errors.append(removed.stderr.strip() or "worktree removal failed")
+            except BaseException as error:
+                cleanup_errors.append(f"could not remove temporary worktree: {error}")
+        try:
+            registrations = command_output("git", "worktree", "list", "--porcelain")
+            still_registered = any(line == f"worktree {checkout}" for line in registrations.splitlines())
+        except BaseException as error:
+            still_registered = True
+            cleanup_errors.append(f"could not verify worktree removal: {error}")
+        branch_ref = f"refs/heads/{branch}"
+        try:
+            branch_exists = subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", branch_ref], cwd=str(ROOT), check=False
+            ).returncode == 0
+        except BaseException as error:
+            branch_exists = False
+            cleanup_errors.append(f"could not inspect temporary branch ref: {error}")
+        if branch_exists and not branch_owned:
+            cleanup_errors.append("branch creation was not confirmed; pre-existing or ambiguous ref was left intact")
+        elif branch_exists and not still_registered:
+            try:
+                branch_sha = command_output("git", "rev-parse", branch_ref)
+                if branch_sha != sha:
+                    cleanup_errors.append("temporary branch ref changed; it was left intact")
+                else:
+                    removed = subprocess.run(
+                        ["git", "branch", "-D", branch],
+                        cwd=str(ROOT),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if removed.returncode:
+                        cleanup_errors.append(removed.stderr.strip() or "temporary branch removal failed")
+            except BaseException as error:
+                cleanup_errors.append(f"could not safely remove temporary branch ref: {error}")
+        if still_registered:
+            cleanup_errors.append(f"worktree remains registered; preserved for recovery at {checkout}")
+        else:
+            try:
+                if temporary.is_symlink():
+                    raise OSError("temporary worktree parent became a symlink")
+                shutil.rmtree(temporary)
+            except OSError as error:
+                cleanup_errors.append(f"could not remove temporary worktree directory {temporary}: {error}")
+        if cleanup_errors:
+            message = "; ".join(cleanup_errors)
+            if active_error is not None:
+                active_error.add_note(f"exact-source worktree cleanup issue: {message}")
+            else:
+                raise CiError(f"exact-source worktree cleanup failed: {message}")
 
 
 def cargo_env(state_dir: pathlib.Path, channel: str, checkout: pathlib.Path) -> dict[str, str]:
@@ -354,10 +440,30 @@ def filesystem_probe(path: pathlib.Path) -> dict[str, object]:
     return {"device": device, "mount": fields[-1], "filesystem": filesystem, "writable": bool(writable)}
 
 
+def run_namespace_failure_aggregate(sha: str) -> None:
+    failures: list[str] = []
+    for case in (
+        "prerequisite:startup-namespace-receive-failure",
+        "prerequisite:startup-namespace-poll-failure",
+    ):
+        try:
+            check(argparse.Namespace(sha=sha, lane="native", case=case))
+        except CiError as error:
+            failures.append(f"{case}: {error}")
+    if failures:
+        raise CiError(
+            "startup-namespace-failure aggregate requires both independent native windows; "
+            + "; ".join(failures)
+        )
+
+
 def check(args: argparse.Namespace) -> None:
     sha = source_sha(args.sha)
     if args.lane == "native" and not args.case:
         raise CiError("native lane requires one exact allowlisted --case")
+    if args.lane == "native" and args.case == "prerequisite:startup-namespace-failure":
+        run_namespace_failure_aggregate(sha)
+        return
     with common_coordinator() as state_dir, exact_worktree(sha) as checkout:
         if args.lane in {"full", "native"}:
             require_maintenance_protocol(checkout, full_lane=args.lane == "full")
@@ -387,6 +493,8 @@ def check(args: argparse.Namespace) -> None:
                 "startup-production",
                 "startup-control-failure",
                 "startup-namespace-failure",
+                "startup-namespace-receive-failure",
+                "startup-namespace-poll-failure",
                 "sdk-and-startup-components",
             }
             if args.case not in recording_cases and args.case != "catalog-replay":

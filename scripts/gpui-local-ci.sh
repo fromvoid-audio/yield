@@ -110,7 +110,7 @@ run cargo test --locked -p yield-library --lib operation_journal --no-default-fe
   --skip chunk_issuance_native_production_original_claim_transition_and_retained_backing \
   --skip provider_reconciliation_native_production_original_queue_refuses_exact_graph_pressure
 if [[ "$scope" == "full" && "${YIELD_GPUI_SKIP_NATIVE_CASES:-0}" != "1" ]]; then
-  for case in capacity control namespace recording-slot-currentness recording-lost-reply chunk-issuance provider-reconciliation; do
+  for case in capacity control namespace namespace-poll recording-slot-currentness recording-lost-reply chunk-issuance provider-reconciliation; do
     run "$YIELD_CI_PYTHON" scripts/internal/ci/run_native_production_case.py "$case"
   done
 fi

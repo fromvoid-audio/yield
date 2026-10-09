@@ -406,7 +406,7 @@
     {
       "path": "crates/yield-library/src/operation_journal/owner/tests/control_backing_tests.rs",
       "function": "control_backing_native_production_startup_preserves_original_failure_and_journal",
-      "operation": "journal::start",
+      "operation": "journal::start_with_observed_production_bootstrap_for_test",
       "count": 1,
       "classification": "fixture",
       "issue": "OPT-2401",
@@ -1435,7 +1435,7 @@
     },
     {
       "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
-      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join_with",
       "operation": "fs::remove_file",
       "count": 1,
       "classification": "fixture",
@@ -1445,7 +1445,7 @@
     },
     {
       "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
-      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join_with",
       "operation": "fs::write",
       "count": 1,
       "classification": "fixture",
@@ -1455,7 +1455,7 @@
     },
     {
       "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
-      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join_with",
       "operation": "journal::open",
       "count": 1,
       "classification": "fixture",
@@ -1465,7 +1465,7 @@
     },
     {
       "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
-      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join_with",
       "operation": "journal::start",
       "count": 1,
       "classification": "fixture",

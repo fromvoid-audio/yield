@@ -60,6 +60,7 @@ fn capacity_startup_actual_worker_component_preserves_original_bytes_and_exact_r
                 false,
                 None,
                 false,
+                None,
                 copies,
                 Arc::new(AtomicUsize::new(0)),
             )

@@ -1015,6 +1015,24 @@ impl PreparedAdmissionInput {
     }
 }
 
+#[cfg(test)]
+struct StartupReserveObserver {
+    ready: SyncSender<()>,
+    release: Receiver<()>,
+}
+
+#[cfg(test)]
+impl StartupReserveObserver {
+    fn pause_after_reserve(&self) {
+        if self.ready.send(()).is_ok() {
+            // Keep a failed test from permanently stranding the real owner worker. The test
+            // itself has the same bounded wait and explicitly releases before checking the
+            // ordinary capacity-rebuild failure.
+            let _ = self.release.recv_timeout(Duration::from_secs(5));
+        }
+    }
+}
+
 /// The single asynchronous owner of one already-open operation journal.
 ///
 /// The supplied store must have passed the caller's recovery gate before handoff. The owner takes
@@ -4986,6 +5004,8 @@ impl OperationJournalOwner {
             None,
             #[cfg(test)]
             false,
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -5007,6 +5027,8 @@ impl OperationJournalOwner {
             None,
             #[cfg(test)]
             false,
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -5025,6 +5047,8 @@ impl OperationJournalOwner {
             Some(registry_path),
             #[cfg(test)]
             false,
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -5036,7 +5060,25 @@ impl OperationJournalOwner {
         store: OperationJournalStore,
         registry_path: std::path::PathBuf,
     ) -> Result<Self, OperationJournalOwnerStartError> {
-        Self::start_inner(store, None, false, true, Some(registry_path), true)
+        Self::start_inner(store, None, false, true, Some(registry_path), true, None)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn start_with_observed_production_bootstrap_for_test(
+        store: OperationJournalStore,
+    ) -> Result<(Self, Receiver<()>, SyncSender<()>), OperationJournalOwnerStartError> {
+        let (ready, ready_rx) = mpsc::sync_channel(1);
+        let (release_tx, release) = mpsc::sync_channel(1);
+        let owner = Self::start_inner(
+            store,
+            None,
+            false,
+            true,
+            None,
+            false,
+            Some(StartupReserveObserver { ready, release }),
+        )?;
+        Ok((owner, ready_rx, release_tx))
     }
 
     #[cfg(test)]
@@ -5052,6 +5094,7 @@ impl OperationJournalOwner {
             false,
             None,
             false,
+            None,
         )
         .expect("operation journal owner start");
         (owner, ready, release)
@@ -5073,6 +5116,8 @@ impl OperationJournalOwner {
             None,
             #[cfg(test)]
             false,
+            #[cfg(test)]
+            None,
         )
         .expect("operation journal owner start");
         (owner, ready, release)
@@ -5090,6 +5135,7 @@ impl OperationJournalOwner {
             std::path::PathBuf,
         >,
         #[cfg(test)] bootstrap_native_capacity: bool,
+        #[cfg(test)] startup_reserve_observer: Option<StartupReserveObserver>,
     ) -> Result<Self, OperationJournalOwnerStartError> {
         let (command_tx, command_rx) = OwnerCommandReceivers::channel();
         let shared = Arc::new(OwnerShared::new(command_tx));
@@ -5123,6 +5169,8 @@ impl OperationJournalOwner {
                         bootstrap_registry_path,
                         #[cfg(test)]
                         bootstrap_native_capacity,
+                        #[cfg(test)]
+                        startup_reserve_observer,
                         #[cfg(test)]
                         worker_prepared_admission_id_allocations,
                         #[cfg(test)]
@@ -7185,6 +7233,7 @@ fn run_owner(
     #[cfg(any(test, feature = "test-support"))] bootstrap_capacity: bool,
     #[cfg(any(test, feature = "test-support"))] bootstrap_registry_path: Option<std::path::PathBuf>,
     #[cfg(test)] bootstrap_native_capacity: bool,
+    #[cfg(test)] startup_reserve_observer: Option<StartupReserveObserver>,
     #[cfg(test)] prepared_admission_id_allocations: Arc<AtomicUsize>,
     #[cfg(test)] synthetic_chunk_write_invocations: Arc<AtomicUsize>,
 ) {
@@ -7294,6 +7343,10 @@ fn run_owner(
             }
         };
         runtime.install_reserve(reserve);
+        #[cfg(test)]
+        if let Some(observer) = startup_reserve_observer.as_ref() {
+            observer.pause_after_reserve();
+        }
     }
 
     #[cfg(not(any(test, feature = "test-support")))]
