@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 benchmark = []
+development-state = []
 
 [lints.rust]
 warnings = "deny"

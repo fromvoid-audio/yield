@@ -125,6 +125,11 @@ fn capacity_startup_native_production_rebuilds_original_descriptor_bound_image()
         .unwrap();
     assert_eq!(snapshot.claims.len(), 1);
     assert_eq!(snapshot.claims[0].0, original.claims()[0].claim_id());
+    assert_eq!(&snapshot.claims[0].1, original.claims()[0].volume());
+    assert_eq!(
+        snapshot.claims[0].2,
+        original.claims()[0].allocation_class()
+    );
     assert_eq!(snapshot.claims[0].3, original.claims()[0].allocated_bytes());
     assert!(owner.shutdown());
     let reopened = OperationJournalStore::open(&fixture.owner).unwrap();

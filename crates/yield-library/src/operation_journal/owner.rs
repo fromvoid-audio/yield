@@ -8179,7 +8179,7 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 #[cfg(test)]
 mod tests {
     mod native_retirement_inventory;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod wal_preparation;
 
     mod command_drain_tests;
@@ -13965,12 +13965,19 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("recovery-blocked admission result")
             .expect_err("active recovery evidence must block admission");
-        assert!(matches!(
-            result,
-            OperationJournalOwnerError::PreparedAdmission(
-                PreparedAdmissionError::RecoveryRequired { .. }
-            )
-        ));
+        let original = match &result {
+            OperationJournalOwnerError::RetainedBacking(backing) => backing.original_error(),
+            error => error,
+        };
+        assert!(
+            matches!(
+                original,
+                OperationJournalOwnerError::PreparedAdmission(
+                    PreparedAdmissionError::RecoveryRequired { .. }
+                )
+            ),
+            "original recovery rejection: {result:?}"
+        );
         assert_eq!(
             owner.prepared_admission_id_allocations(),
             before_id,

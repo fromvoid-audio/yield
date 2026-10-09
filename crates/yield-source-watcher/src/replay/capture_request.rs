@@ -132,7 +132,7 @@ impl NativeReplayCaptureRequest {
             let deadline = std::time::Instant::now()
                 .checked_add(timeout)
                 .ok_or(NativeReplayCaptureError::InvalidInput)?;
-            Self::spawn(move |cancel| {
+            Self::spawn(move |cancel, custody| {
                 if cancel.load(Ordering::Acquire) {
                     return Err(NativeReplayCaptureError::Canceled);
                 }
@@ -140,7 +140,14 @@ impl NativeReplayCaptureRequest {
                 if remaining.is_zero() {
                     return Err(NativeReplayCaptureError::TimedOut);
                 }
-                super::macos::capture_history(spec, after_event, remaining).map_err(|error| {
+                super::macos::capture_history_with_custody(
+                    spec,
+                    after_event,
+                    remaining,
+                    custody,
+                    cancel,
+                )
+                .map_err(|error| {
                     use super::macos::NativeReplayError as E;
                     match error {
                         E::Busy => NativeReplayCaptureError::Busy,
@@ -166,9 +173,25 @@ impl NativeReplayCaptureRequest {
 
     #[cfg(any(target_os = "macos", test))]
     fn spawn(
-        capture: impl FnOnce(Arc<AtomicBool>) -> Result<ReplayCandidate, NativeReplayCaptureError>
+        capture: impl FnOnce(
+            Arc<AtomicBool>,
+            Arc<CaptureSlot>,
+        ) -> Result<ReplayCandidate, NativeReplayCaptureError>
         + Send
         + 'static,
+    ) -> Result<Self, NativeReplayCaptureError> {
+        Self::spawn_inner(capture, || {})
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn spawn_inner(
+        capture: impl FnOnce(
+            Arc<AtomicBool>,
+            Arc<CaptureSlot>,
+        ) -> Result<ReplayCandidate, NativeReplayCaptureError>
+        + Send
+        + 'static,
+        after_slot_drop: impl FnOnce() + Send + 'static,
     ) -> Result<Self, NativeReplayCaptureError> {
         let slot = CaptureSlot::acquire()?;
         let worker_slot = slot.clone();
@@ -178,18 +201,20 @@ impl NativeReplayCaptureRequest {
         std::thread::Builder::new()
             .name("yield-native-replay-request".into())
             .spawn(move || {
-                let result = capture(worker_cancel.clone());
+                let result = capture(worker_cancel.clone(), worker_slot.clone());
                 let result = if worker_cancel.load(Ordering::Acquire) {
                     Err(NativeReplayCaptureError::Canceled)
                 } else {
                     result
                 };
-                let _ = sender.send(result.map(|candidate| CapturedNativeReplay {
+                let result = result.map(|candidate| CapturedNativeReplay {
                     candidate,
                     slot: worker_slot.clone(),
-                }));
+                });
                 // Failed/lost delivery drops its real candidate before the worker's final slot.
+                let _ = sender.send(result);
                 drop(worker_slot);
+                after_slot_drop();
             })
             .map_err(|_| NativeReplayCaptureError::WorkerUnavailable)?;
         Ok(Self {
@@ -274,6 +299,93 @@ mod tests {
             Some(RootIdentity::from_bytes(b"root".to_vec())),
         )
     }
+    #[cfg(target_os = "macos")]
+    fn native_spec(root: &std::path::Path) -> SourceWatchSpec {
+        let root = std::fs::canonicalize(root).expect("canonical native test source");
+        let metadata = std::fs::metadata(&root).expect("native test source metadata");
+        let identity =
+            yield_library::filesystem_identity::stable_filesystem_identity(&root, &metadata)
+                .map(|identity| RootIdentity::from_bytes(identity.into_bytes()))
+                .expect("native test source identity");
+        SourceWatchSpec::new(
+            SourceId::from_string("capture-timeout-custody"),
+            7,
+            root,
+            Some(identity),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    fn assert_gated_native_custody(cancel_request: bool) {
+        let temp = tempfile::tempdir().expect("disposable APFS source");
+        let spec = native_spec(temp.path());
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (cleaned_tx, cleaned_rx) = mpsc::sync_channel(1);
+        let (outer_done_tx, outer_done_rx) = mpsc::sync_channel(1);
+        let request = NativeReplayCaptureRequest::spawn_inner(
+            move |cancel, custody| {
+                super::super::macos::capture_history_with_test_hooks(
+                    spec,
+                    0,
+                    Duration::from_secs(2),
+                    custody,
+                    cancel,
+                    entered_tx,
+                    release_rx,
+                    cleaned_tx,
+                )
+                .map_err(|error| match error {
+                    super::super::macos::NativeReplayError::Busy => NativeReplayCaptureError::Busy,
+                    super::super::macos::NativeReplayError::InvalidTimeout
+                    | super::super::macos::NativeReplayError::InvalidIdentity(_) => {
+                        NativeReplayCaptureError::InvalidInput
+                    }
+                    super::super::macos::NativeReplayError::RootChanged => {
+                        NativeReplayCaptureError::RootChanged
+                    }
+                    super::super::macos::NativeReplayError::WorkerUnavailable => {
+                        NativeReplayCaptureError::WorkerUnavailable
+                    }
+                    super::super::macos::NativeReplayError::TimedOut => {
+                        NativeReplayCaptureError::TimedOut
+                    }
+                    super::super::macos::NativeReplayError::VolumeHistoryUnavailable
+                    | super::super::macos::NativeReplayError::StreamUnavailable
+                    | super::super::macos::NativeReplayError::CursorUnavailable => {
+                        NativeReplayCaptureError::HistoryUnavailable
+                    }
+                })
+            },
+            move || outer_done_tx.send(()).unwrap(),
+        )
+        .unwrap();
+
+        // The hook follows successful FSEventStreamStart and retained-run-loop publication.
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        if cancel_request {
+            request.cancel();
+            drop(request);
+        } else {
+            assert!(matches!(
+                request.result.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Err(NativeReplayCaptureError::TimedOut)
+            ));
+            drop(request);
+        }
+
+        // The wrapper has finished and its own slot is gone, while the actual native worker is
+        // still gated. The remaining credit must therefore be owned by native-worker custody.
+        outer_done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(CAPTURE_SLOT.load(Ordering::Acquire));
+        assert!(matches!(
+            NativeReplayCaptureRequest::spawn(|_, _slot| Err(NativeReplayCaptureError::Canceled)),
+            Err(NativeReplayCaptureError::Busy)
+        ));
+
+        release_tx.send(()).unwrap();
+        cleaned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!CAPTURE_SLOT.load(Ordering::Acquire));
+    }
     fn wait_released() {
         let deadline = Instant::now() + Duration::from_secs(2);
         while CAPTURE_SLOT.load(Ordering::Acquire) {
@@ -286,7 +398,7 @@ mod tests {
         let _serial = TEST_LOCK.lock().unwrap();
         let (entered, seen) = mpsc::sync_channel(1);
         let (release, gate) = mpsc::sync_channel(1);
-        let mut request = NativeReplayCaptureRequest::spawn(move |cancel| {
+        let mut request = NativeReplayCaptureRequest::spawn(move |cancel, _slot| {
             entered.send(()).unwrap();
             gate.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(cancel.load(Ordering::Acquire));
@@ -298,7 +410,7 @@ mod tests {
         request.cancel();
         drop(request);
         assert!(matches!(
-            NativeReplayCaptureRequest::spawn(|_| Err(NativeReplayCaptureError::Canceled)),
+            NativeReplayCaptureRequest::spawn(|_, _slot| Err(NativeReplayCaptureError::Canceled)),
             Err(NativeReplayCaptureError::Busy)
         ));
         release.send(()).unwrap();
@@ -308,7 +420,7 @@ mod tests {
     fn capture_request_original_result_and_batch_retain_slot_until_final_drop() {
         let _serial = TEST_LOCK.lock().unwrap();
         // Passive ingress data fixture only; no native producer, continuity proof or receipt.
-        let mut request = NativeReplayCaptureRequest::spawn(|_| {
+        let mut request = NativeReplayCaptureRequest::spawn(|_, _slot| {
             Ok(super::super::ReplayIngress::new(spec(), 42, [1; 16], 100)
                 .unwrap()
                 .into_candidate())
@@ -333,11 +445,19 @@ mod tests {
             .unwrap();
         assert!(!batch.observation().continuous());
         assert!(matches!(
-            NativeReplayCaptureRequest::spawn(|_| Err(NativeReplayCaptureError::Canceled)),
+            NativeReplayCaptureRequest::spawn(|_, _slot| Err(NativeReplayCaptureError::Canceled)),
             Err(NativeReplayCaptureError::Busy)
         ));
         drop(batch);
         wait_released();
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn native_capture_gated_cancellation_and_timeout_retain_slot_until_cleanup() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        let _native = super::super::macos::capture_test_guard();
+        assert_gated_native_custody(true);
+        assert_gated_native_custody(false);
     }
     #[test]
     #[cfg(not(target_os = "macos"))]

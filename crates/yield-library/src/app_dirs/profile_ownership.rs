@@ -32,6 +32,9 @@ pub enum ProfileOwnershipError {
     /// Resolving the current profile root failed.
     #[error("profile root unavailable: {0}")]
     AppDirectory(String),
+    /// A sealed canonical bootstrap was reached before eager process admission.
+    #[error("process maintenance admission was not established before canonical bootstrap")]
+    MaintenanceAdmissionNotEstablished,
     /// Opening, validating, or writing the profile ownership boundary failed.
     #[error("profile ownership filesystem operation failed at {path}: {source}")]
     Io {
@@ -137,6 +140,7 @@ pub struct WritableProfileGuard {
     ownership_generation: u64,
     root_dir: Dir,
     _lock_file: File,
+    _maintenance_admission: Arc<super::ProcessMaintenanceAdmission>,
     catalog_leases: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -194,6 +198,8 @@ impl WritableProfileGuard {
     fn acquire_with_generation_counter(
         counter: &std::sync::atomic::AtomicU64,
     ) -> Result<Self, ProfileOwnershipError> {
+        let maintenance_admission = super::acquire_process_maintenance_admission()
+            .map_err(|source| ProfileOwnershipError::AppDirectory(source.to_string()))?;
         let profile_root = super::resolution::resolve_persistence()
             .map_err(|error| ProfileOwnershipError::AppDirectory(error.to_string()))?
             .app_root;
@@ -223,6 +229,7 @@ impl WritableProfileGuard {
             ownership_generation,
             root_dir,
             _lock_file: lock_file,
+            _maintenance_admission: maintenance_admission,
             catalog_leases: Arc::new(Mutex::new(HashSet::new())),
         };
         guard.validate_current()?;
@@ -312,6 +319,7 @@ impl WritableProfileGuard {
             ownership_generation: self.ownership_generation,
             root_dir,
             _lock_file: lock_file,
+            _maintenance_admission: Arc::clone(&self._maintenance_admission),
             catalog_leases: Arc::clone(&self.catalog_leases),
         })
     }
@@ -486,6 +494,9 @@ impl WritableProfileGuard {
 /// than from profile or process-local configuration overrides. Other targets remain unsupported
 /// until an equivalent identity-safe application-data location is qualified.
 pub(crate) fn open_canonical_global_app_root() -> Result<(PathBuf, Dir), ProfileOwnershipError> {
+    if !super::maintenance_admission::process_maintenance_admission_is_established() {
+        return Err(ProfileOwnershipError::MaintenanceAdmissionNotEstablished);
+    }
     #[cfg(target_os = "macos")]
     {
         let home = canonical_user_home().map_err(|source| ProfileOwnershipError::Io {
@@ -517,6 +528,28 @@ pub(crate) fn open_canonical_global_app_root() -> Result<(PathBuf, Dir), Profile
             path: PathBuf::from(super::APP_DIR_NAME),
         })
     }
+}
+
+/// Return the canonical macOS Application Support directory after checking the current user
+/// owns each existing directory and each component is opened without following symlinks.
+#[cfg(target_os = "macos")]
+pub(crate) fn canonical_application_support_dir() -> Result<PathBuf, ProfileOwnershipError> {
+    let home = canonical_user_home().map_err(|source| ProfileOwnershipError::Io {
+        path: PathBuf::from("~"),
+        source,
+    })?;
+    let home_dir = open_profile_root(&home).map_err(|source| ProfileOwnershipError::Io {
+        path: home.clone(),
+        source,
+    })?;
+    ensure_current_user_owned(&home, &home_dir)?;
+    let library_path = home.join("Library");
+    let library_dir = open_existing_child(&home_dir, "Library", &home)?;
+    ensure_current_user_owned(&library_path, &library_dir)?;
+    let support_path = library_path.join("Application Support");
+    let support_dir = open_existing_child(&library_dir, "Application Support", &library_path)?;
+    ensure_current_user_owned(&support_path, &support_dir)?;
+    Ok(support_path)
 }
 
 /// Exact native directory backing after a refused legacy-only app bootstrap. No profile grant.
@@ -556,6 +589,9 @@ pub(crate) fn open_source_canonical_app_root(
         let mut backing = LegacyAppRootBacking::default();
         let result = (|| {
             proof.validate_for_bootstrap().map_err(|_| ())?;
+            if !super::maintenance_admission::process_maintenance_admission_is_established() {
+                return Err(());
+            }
             let home = canonical_user_home().map_err(|_| ())?;
             let bounded = |p: &PathBuf| {
                 p.as_os_str().as_encoded_bytes().len() <= 4096 && p.capacity() <= 8192
@@ -1226,7 +1262,16 @@ mod tests {
         let _profile_guard = PersistenceProfileGuard::named("ownership-serial-exhaustion");
         let holder = WritableProfileGuard::acquire_current().unwrap();
         let lock_path = holder.lock_path.clone();
-        let diagnostic = fs::read(&lock_path).unwrap();
+        let diagnostic = {
+            // Windows byte-range locks deny I/O through a separately opened
+            // file. Read through a duplicate of the genuine held file object;
+            // drop that duplicate before testing the final original release.
+            let mut original = holder._lock_file.try_clone().unwrap();
+            original.seek(io::SeekFrom::Start(0)).unwrap();
+            let mut bytes = Vec::new();
+            original.read_to_end(&mut bytes).unwrap();
+            bytes
+        };
         let counter = AtomicU64::new(i64::MAX as u64 + 1);
         // Native lock conflict wins before the counter is consulted.
         assert!(matches!(

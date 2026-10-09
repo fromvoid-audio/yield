@@ -2060,6 +2060,7 @@ fn profile_error_path(error: &ProfileOwnershipError) -> PathBuf {
         | ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable { path, .. }
         | ProfileOwnershipError::Unsupported { path } => path.clone(),
         ProfileOwnershipError::AppDirectory(_)
+        | ProfileOwnershipError::MaintenanceAdmissionNotEstablished
         | ProfileOwnershipError::OwnershipGenerationExhausted => PathBuf::new(),
     }
 }
@@ -3148,7 +3149,7 @@ mod tests {
         drop(base_guard);
         let _ = Connection::open(
             temp.path()
-                .join(".yield")
+                .join(crate::app_dirs::APP_DIR_NAME)
                 .join("profiles")
                 .join("shutdown")
                 .join("library.db"),

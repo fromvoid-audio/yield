@@ -9,13 +9,52 @@ use std::path::{Path, PathBuf};
 
 use fsevent_sys as fs;
 
+use crate::SourceWatchSpec;
+
 use super::{
-    MAX_REPLAY_EVENTS, ReplayEventCondition, ReplayIngress, ReplayPathKind, ReplayUncertainty,
+    MAX_REPLAY_EVENTS, ReplayCandidate, ReplayEventCondition, ReplayIngress, ReplayPathKind,
+    ReplayUncertainty,
 };
 
 mod native;
 
 pub use native::{BootstrapCapture, NativeReplayError, capture_history};
+
+#[cfg(test)]
+pub(super) use native::capture_test_guard;
+
+pub(super) fn capture_history_with_custody<T: Send + Sync + 'static>(
+    spec: SourceWatchSpec,
+    after_event_id: u64,
+    timeout: std::time::Duration,
+    custody: std::sync::Arc<T>,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<ReplayCandidate, NativeReplayError> {
+    native::capture_history_with_custody(spec, after_event_id, timeout, custody, cancellation)
+}
+
+#[cfg(test)]
+pub(super) fn capture_history_with_test_hooks<T: Send + Sync + 'static>(
+    spec: SourceWatchSpec,
+    after_event_id: u64,
+    timeout: std::time::Duration,
+    custody: std::sync::Arc<T>,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    before_first_slice: std::sync::mpsc::Receiver<()>,
+    cleaned: std::sync::mpsc::SyncSender<()>,
+) -> Result<ReplayCandidate, NativeReplayError> {
+    native::capture_history_with_test_hooks(
+        spec,
+        after_event_id,
+        timeout,
+        custody,
+        cancellation,
+        entered,
+        before_first_slice,
+        cleaned,
+    )
+}
 
 /// One borrowed native callback record, before source-relative validation.
 #[derive(Clone, Copy, Debug)]

@@ -11,6 +11,7 @@ missing_docs = "deny"
 default = []
 sqlite-ext-unsafe = []
 test-support = []
+development-state = []
 
 [dependencies]
 reson = { path = "../reson", default-features = false }

@@ -218,3 +218,31 @@ fn original_control_statement_unwind_drops_payload_before_exact_loan_refund() {
             .is_null()
     );
 }
+
+#[test]
+fn original_reader_control_fault_allows_reserve_transactions_and_keeps_failed_read_backing() {
+    use crate::operation_journal::owner::JournalNamespaceFundingProbe;
+    let _runtime = crate::test_runtime::TestRuntimeGuard::acquire();
+    let temp = tempfile::tempdir().unwrap();
+    let _root =
+        crate::app_dirs::AppRootGuard::set(std::fs::canonicalize(temp.path()).unwrap()).unwrap();
+    let profile = crate::app_dirs::WritableProfileGuard::acquire_current().unwrap();
+    let store = OperationJournalStore::open(&profile).unwrap();
+    store.deny_original_reader_begin_for_test();
+    store.connection.execute_batch("BEGIN; ROLLBACK;").unwrap();
+    let funding = JournalNamespaceFundingProbe::new();
+    let mut reader = Reader::new(&store.connection, Some(&funding.input)).unwrap();
+    let error = reader.begin().unwrap_err();
+    assert!(format!("{error}").contains("not authorized"));
+    assert!(store.connection.is_autocommit());
+    drop(reader);
+    // The scoped marker resets after failure; ordinary original transactions
+    // remain usable and no unrelated bootstrap denial is substituted.
+    store.connection.execute_batch("BEGIN; ROLLBACK;").unwrap();
+    let pool = funding.pool_bytes_observer_for_test();
+    let error = funding.retain_command_error_for_test(error);
+    drop(funding);
+    assert!(pool().0 < pool().1);
+    drop(error);
+    assert_eq!(pool().0, pool().1);
+}

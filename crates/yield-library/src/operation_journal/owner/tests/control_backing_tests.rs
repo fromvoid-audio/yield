@@ -273,7 +273,7 @@ fn control_backing_native_production_startup_preserves_original_failure_and_jour
     let store = OperationJournalStore::open(&fixture.owner).unwrap();
     let path = original_profile_journal_path(&fixture, &store);
     let original = fs::read(&path).unwrap();
-    store.deny_original_control_begin_for_test();
+    store.deny_original_reader_begin_for_test();
     // Genuine original production registry, root descriptors and protected
     // profile/journal reserve bootstrap. The only fault is SQLite's authorizer
     // on this same original connection. No startup/provider component hook.

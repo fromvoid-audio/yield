@@ -6,6 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -125,6 +126,73 @@ pub fn capture_history(
     after_event_id: u64,
     timeout: Duration,
 ) -> Result<ReplayCandidate, NativeReplayError> {
+    capture_history_inner(
+        spec,
+        after_event_id,
+        timeout,
+        Arc::new(()),
+        Arc::new(AtomicBool::new(false)),
+        || {},
+        None,
+    )
+}
+
+pub(super) fn capture_history_with_custody<T: Send + Sync + 'static>(
+    spec: SourceWatchSpec,
+    after_event_id: u64,
+    timeout: Duration,
+    custody: Arc<T>,
+    cancellation: Arc<AtomicBool>,
+) -> Result<ReplayCandidate, NativeReplayError> {
+    capture_history_inner(
+        spec,
+        after_event_id,
+        timeout,
+        custody,
+        cancellation,
+        || {},
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn capture_history_with_test_hooks<T: Send + Sync + 'static>(
+    spec: SourceWatchSpec,
+    after_event_id: u64,
+    timeout: Duration,
+    custody: Arc<T>,
+    cancellation: Arc<AtomicBool>,
+    entered: mpsc::SyncSender<()>,
+    before_first_slice: mpsc::Receiver<()>,
+    cleaned: mpsc::SyncSender<()>,
+) -> Result<ReplayCandidate, NativeReplayError> {
+    capture_history_inner(
+        spec,
+        after_event_id,
+        timeout,
+        custody,
+        cancellation,
+        move || {
+            let _ = entered.send(());
+            let _ = before_first_slice.recv();
+        },
+        Some(cleaned),
+    )
+}
+
+fn capture_history_inner<T, F>(
+    spec: SourceWatchSpec,
+    after_event_id: u64,
+    timeout: Duration,
+    custody: Arc<T>,
+    cancellation: Arc<AtomicBool>,
+    before_first_slice: F,
+    cleaned: Option<mpsc::SyncSender<()>>,
+) -> Result<ReplayCandidate, NativeReplayError>
+where
+    T: Send + Sync + 'static,
+    F: FnOnce() + Send + 'static,
+{
     if timeout.is_zero() {
         return Err(NativeReplayError::InvalidTimeout);
     }
@@ -139,38 +207,85 @@ pub fn capture_history(
     }
     let (result_tx, result_rx) = mpsc::sync_channel(1);
     let (run_loop_tx, run_loop_rx) = mpsc::sync_channel(1);
+    let (stop_tx, stop_rx) = mpsc::sync_channel(1);
+    let worker_cancellation = cancellation.clone();
     let spawned = std::thread::Builder::new()
         .name("yield-fsevents-history".into())
         .spawn(move || {
             let active = ActiveCapture;
-            let result = capture_on_worker(spec, after_event_id, run_loop_tx);
+            let result = capture_on_worker(
+                spec,
+                after_event_id,
+                deadline,
+                run_loop_tx,
+                stop_rx,
+                worker_cancellation,
+                before_first_slice,
+            );
             drop(active);
+            drop(custody);
+            if let Some(cleaned) = cleaned {
+                let _ = cleaned.send(());
+            }
             let _ = result_tx.send(result);
         });
     if spawned.is_err() {
         CAPTURE_ACTIVE.store(false, Ordering::Release);
         return Err(NativeReplayError::WorkerUnavailable);
     }
-    let run_loop =
-        match run_loop_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(run_loop) => run_loop,
-            Err(RecvTimeoutError::Timeout) => return Err(NativeReplayError::TimedOut),
+    let poll_interval = Duration::from_millis(25);
+    let run_loop = loop {
+        if cancellation.load(Ordering::Acquire) {
+            let _ = stop_tx.try_send(());
+            return Err(NativeReplayError::TimedOut);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = stop_tx.try_send(());
+            return Err(NativeReplayError::TimedOut);
+        }
+        match run_loop_rx.recv_timeout(remaining.min(poll_interval)) {
+            Ok(run_loop) => break run_loop,
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                return result_rx
-                    .recv()
-                    .unwrap_or(Err(NativeReplayError::WorkerUnavailable));
+                return match result_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                {
+                    Ok(result) => result,
+                    Err(RecvTimeoutError::Timeout) => Err(NativeReplayError::TimedOut),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        Err(NativeReplayError::WorkerUnavailable)
+                    }
+                };
             }
-        };
-    let result = result_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
-    if result.is_err() {
-        // SAFETY: CoreFoundation permits stopping another thread's retained run loop.
-        unsafe { cf::CFRunLoopStop(run_loop.0) };
-    }
-    // SAFETY: The worker retained this run loop specifically for the caller's one release.
-    unsafe { cf::CFRelease(run_loop.0) };
+        }
+    };
+    let result = loop {
+        if cancellation.load(Ordering::Acquire) {
+            let _ = stop_tx.try_send(());
+            // SAFETY: CoreFoundation permits stopping another thread's retained run loop.
+            unsafe { cf::CFRunLoopStop(run_loop.0) };
+            break None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = stop_tx.try_send(());
+            // SAFETY: CoreFoundation permits stopping another thread's retained run loop.
+            unsafe { cf::CFRunLoopStop(run_loop.0) };
+            break None;
+        }
+        match result_rx.recv_timeout(remaining.min(poll_interval)) {
+            Ok(result) => break Some(result),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                break Some(Err(NativeReplayError::WorkerUnavailable));
+            }
+        }
+    };
+    drop(run_loop);
     match result {
-        Ok(result) => result,
-        Err(_) => Err(NativeReplayError::TimedOut),
+        Some(result) => result,
+        None => Err(NativeReplayError::TimedOut),
     }
 }
 
@@ -184,6 +299,13 @@ impl Drop for ActiveCapture {
 
 struct RunLoopHandle(cf::CFRunLoopRef);
 
+impl Drop for RunLoopHandle {
+    fn drop(&mut self) {
+        // SAFETY: Each handle owns exactly the retain made before it was sent to the caller.
+        unsafe { cf::CFRelease(self.0) };
+    }
+}
+
 // SAFETY: The caller only calls CFRunLoopStop and CFRelease on a retained CoreFoundation object.
 unsafe impl Send for RunLoopHandle {}
 
@@ -194,6 +316,7 @@ struct CallbackContext {
     seen: usize,
     stop_after_history: bool,
     history_done: bool,
+    stop_requested: bool,
 }
 
 fn capture_live_on_worker(
@@ -240,6 +363,7 @@ fn capture_live_on_worker(
         seen: 0,
         stop_after_history: false,
         history_done: false,
+        stop_requested: false,
     }));
     let stream = unsafe { create_stream(&root, &(*context).volume_root, device, cursor, context) };
     let Some(stream) = stream else {
@@ -348,7 +472,11 @@ fn capture_live_on_worker(
 fn capture_on_worker(
     spec: SourceWatchSpec,
     after_event_id: u64,
+    deadline: Instant,
     run_loop_tx: mpsc::SyncSender<RunLoopHandle>,
+    stop: mpsc::Receiver<()>,
+    cancellation: Arc<AtomicBool>,
+    before_first_slice: impl FnOnce(),
 ) -> Result<ReplayCandidate, NativeReplayError> {
     let root = spec.root().to_path_buf();
     let metadata = fs::metadata(&root).map_err(|_| NativeReplayError::RootChanged)?;
@@ -375,6 +503,7 @@ fn capture_on_worker(
         seen: 0,
         stop_after_history: true,
         history_done: false,
+        stop_requested: false,
     }));
     let stream = unsafe {
         create_stream(
@@ -415,7 +544,6 @@ fn capture_on_worker(
     let retained = unsafe { CFRetain(run_loop) };
     if run_loop_tx.send(RunLoopHandle(retained)).is_err() {
         unsafe {
-            cf::CFRelease(retained);
             fs_event::FSEventStreamStop(stream);
             fs_event::FSEventStreamInvalidate(stream);
             fs_event::FSEventStreamRelease(stream);
@@ -423,13 +551,41 @@ fn capture_on_worker(
         }
         return Err(NativeReplayError::TimedOut);
     }
-    unsafe { cf::CFRunLoopRun() };
+    before_first_slice();
+    let interrupted = || {
+        Instant::now() >= deadline
+            || cancellation.load(Ordering::Acquire)
+            || !matches!(stop.try_recv(), Err(mpsc::TryRecvError::Empty))
+    };
+    let run_loop_result = loop {
+        if interrupted() {
+            break Err(NativeReplayError::TimedOut);
+        }
+        if unsafe { (*context).stop_requested } {
+            break Ok(());
+        }
+        // A bounded mode run makes cancellation durable: even if a stop request raced before
+        // the worker entered CoreFoundation, the worker checks it before the next slice.
+        let status = unsafe { CFRunLoopRunInMode(cf::kCFRunLoopDefaultMode, 0.025, 1) };
+        if interrupted() {
+            break Err(NativeReplayError::TimedOut);
+        }
+        if unsafe { (*context).stop_requested } {
+            break Ok(());
+        }
+        match status {
+            1 | 2 => break Ok(()), // finished or explicitly stopped by a callback
+            3 | 4 => {}            // slice elapsed or one source was handled
+            _ => break Err(NativeReplayError::StreamUnavailable),
+        }
+    };
     unsafe {
         fs_event::FSEventStreamStop(stream);
         fs_event::FSEventStreamInvalidate(stream);
         fs_event::FSEventStreamRelease(stream);
     }
     let context = unsafe { Box::from_raw(context) };
+    run_loop_result?;
     let final_metadata = fs::metadata(&root).map_err(|_| NativeReplayError::RootChanged)?;
     if physical_root_identity(&root, &final_metadata).as_ref() != Some(&expected_root)
         || fs::canonicalize(&root).ok().as_deref() != Some(root.as_path())
@@ -561,7 +717,7 @@ extern "C" fn callback(
     let context = unsafe { &mut *info.cast::<CallbackContext>() };
     if count > MAX_REPLAY_EVENTS.saturating_sub(context.seen) {
         context.ingress.mark_reason(ReplayUncertainty::EVENT_LIMIT);
-        unsafe { cf::CFRunLoopStop(context.run_loop) };
+        request_capture_stop(context);
     }
     if count != 0 && (raw_paths.is_null() || flags.is_null() || ids.is_null()) {
         context
@@ -586,7 +742,7 @@ extern "C" fn callback(
                 unsafe { libc::strnlen(pointer, crate::replay::MAX_REPLAY_PATH_BYTES + 1) };
             if length > crate::replay::MAX_REPLAY_PATH_BYTES {
                 context.ingress.mark_reason(ReplayUncertainty::PATH_LIMIT);
-                unsafe { cf::CFRunLoopStop(context.run_loop) };
+                request_capture_stop(context);
                 continue;
             }
             let native = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), length) };
@@ -604,11 +760,17 @@ extern "C" fn callback(
         if is_done {
             context.history_done = true;
             if context.stop_after_history {
-                unsafe { cf::CFRunLoopStop(context.run_loop) };
+                request_capture_stop(context);
             }
         }
     }
     context.seen += bounded;
+}
+
+fn request_capture_stop(context: &mut CallbackContext) {
+    context.stop_requested = true;
+    // SAFETY: This callback runs on the stream's owning run-loop thread.
+    unsafe { cf::CFRunLoopStop(context.run_loop) };
 }
 
 #[link(name = "CoreServices", kind = "framework")]
@@ -630,19 +792,17 @@ unsafe extern "C" {
 }
 
 #[cfg(test)]
+pub(in crate::replay) fn capture_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static CAPTURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CAPTURE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use yield_library::sample_sources::SourceId;
-
-    static CAPTURE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn capture_test_guard() -> MutexGuard<'static, ()> {
-        CAPTURE_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     #[test]
     fn captures_native_history_for_a_disposable_source() {

@@ -6,12 +6,16 @@ positive deadline is at most two seconds, including worker scheduling. Unsupport
 hosts reject before creating a worker or slot. The API performs no Source SQL,
 checkpoint, audit, catalog mutation or GPUI publication and grants no continuity.
 
-The original worker, request and opaque delivered candidate share one capture slot.
+The original worker, request and opaque delivered candidate share one capture slot. The native
+producer receives its own clone and retains it through stream and callback-context cleanup, even
+when the bounded request has already returned TimedOut or Canceled.
 Polling is nonblocking: an empty receiver does not consume the reply, and delivery
 can be consumed only once. Cancellation suppresses delivery and dropping a request
 signals cancellation; neither refunds a live worker's slot. The original native
-producer retains its own active-stream guard until actual native stop. A timeout
-or canceled reply supplies no native-quiescence, cleanup or ownership grant.
+producer retains its active-stream guard and request-slot custody until actual native stop. Its
+run loop checks cancellation/deadline between bounded slices, so a stop that races before the first
+run-loop entry cannot strand the stream. A timeout or canceled reply supplies no native-quiescence,
+cleanup or ownership grant.
 
 `CapturedNativeReplay::into_observation_batch` uses the retained owner's current
 lifecycle/watcher generation and keeps the slot with a nonempty opaque batch.

@@ -58,6 +58,19 @@ pub(super) enum Reader<'a> {
     Unfunded(&'a Connection),
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static ORIGINAL_READER_BEGIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+struct ReaderBeginFaultContext(bool);
+#[cfg(test)]
+impl Drop for ReaderBeginFaultContext {
+    fn drop(&mut self) {
+        ORIGINAL_READER_BEGIN.with(|active| active.set(self.0));
+    }
+}
+
 impl<'a> Reader<'a> {
     pub(super) fn new(
         connection: &'a Connection,
@@ -72,6 +85,9 @@ impl<'a> Reader<'a> {
     }
 
     pub(super) fn begin(&mut self) -> Result<(), OperationJournalStoreError> {
+        #[cfg(test)]
+        let _fault_context =
+            ReaderBeginFaultContext(ORIGINAL_READER_BEGIN.with(|active| active.replace(true)));
         match self {
             Self::Funded(scope) => scope.begin().map_err(|failure| failure.retain(scope.input)),
             Self::Unfunded(connection) => connection.execute_batch("BEGIN").map_err(Into::into),
@@ -236,6 +252,43 @@ mod allocation_probe;
 // allocates nothing, retains no user pointer, and does not create a transaction.
 #[cfg(test)]
 impl OperationJournalStore {
+    /// Deny only the original reader's BEGIN, after unrelated original reserve
+    /// binding/bootstrap transactions have completed. This is a negative fault
+    /// on the same SQLite connection, never a bootstrap/provider shortcut.
+    pub(in crate::operation_journal) fn deny_original_reader_begin_for_test(&self) {
+        unsafe extern "C" fn deny_reader_begin(
+            _: *mut std::ffi::c_void,
+            action: i32,
+            name: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+        ) -> i32 {
+            if ORIGINAL_READER_BEGIN.with(std::cell::Cell::get)
+                && action == rusqlite::ffi::SQLITE_TRANSACTION
+                && !name.is_null()
+                // SAFETY: SQLite supplies a NUL-terminated transaction name.
+                && unsafe { CStr::from_ptr(name) }.to_bytes() == b"BEGIN"
+            {
+                rusqlite::ffi::SQLITE_DENY
+            } else {
+                rusqlite::ffi::SQLITE_OK
+            }
+        }
+        // SAFETY: setup uses the original thread-confined connection. The
+        // callback owns no pointers; the scoped reader marker is allocation-free.
+        assert_eq!(
+            unsafe {
+                rusqlite::ffi::sqlite3_set_authorizer(
+                    self.connection.handle(),
+                    Some(deny_reader_begin),
+                    std::ptr::null_mut(),
+                )
+            },
+            rusqlite::ffi::SQLITE_OK
+        );
+    }
+
     pub(in crate::operation_journal) fn deny_original_control_begin_for_test(&self) {
         unsafe extern "C" fn deny_begin(
             _: *mut std::ffi::c_void,
