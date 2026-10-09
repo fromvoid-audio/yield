@@ -502,6 +502,31 @@ impl PrivateAggregateGuard {
         self.stream_teardown.push(complete);
     }
 
+    /// Resolve the exact hidden CoreAudio object created by this guard.
+    ///
+    /// CPAL's normal device enumeration intentionally omits process-private
+    /// aggregate devices. Its CoreAudio backend provides `Device::new` for
+    /// hidden devices, so bind through the AudioObjectID returned by our
+    /// successful create call and then verify the generated UID.
+    pub(crate) fn cpal_device(&self) -> Result<cpal::Device, String> {
+        use cpal::traits::DeviceTrait;
+
+        let coreaudio_device =
+            <<cpal::platform::CoreAudioHost as cpal::traits::HostTrait>::Device>::new(
+                self.object_id,
+            );
+        let device: cpal::Device = cpal::platform::DeviceInner::CoreAudio(coreaudio_device).into();
+        let device_id = device.id().map_err(|error| error.to_string())?;
+        if device_id.0 != cpal::HostId::CoreAudio || device_id.1 != self.uid {
+            return Err("CPAL direct-ID binding did not preserve the owned aggregate UID".into());
+        }
+        let description = device.description().map_err(|error| error.to_string())?;
+        if description.name() != self.name {
+            return Err("CPAL direct-ID binding did not preserve the owned aggregate name".into());
+        }
+        Ok(device)
+    }
+
     /// Keep the fixture registered until process exit when stream startup
     /// failed before it could return a teardown observer to the test.
     pub(crate) fn retain_for_process_exit(&mut self) {

@@ -2260,28 +2260,17 @@ mod tests {
                 .expect("create process-private same-rate aggregate");
         let aggregate_uid = guard.uid().to_owned();
         let aggregate_name = guard.name().to_owned();
-        let (aggregate_name_matches, resolves_to_guard_uid) = host
-            .output_devices()
-            .expect("enumerate aggregate output")
-            .fold((0, false), |(count, uid_matches), device| {
-                if crate::device::device_label(&device).is_some_and(|name| name == aggregate_name) {
-                    (
-                        count + 1,
-                        uid_matches
-                            || device
-                                .id()
-                                .is_ok_and(|device_id| device_id.1 == aggregate_uid),
-                    )
-                } else {
-                    (count, uid_matches)
-                }
-            });
-        if aggregate_name_matches != 1 || !resolves_to_guard_uid {
-            guard
-                .close()
-                .expect("remove aggregate not exposed under its exact UID");
-            panic!("the private aggregate did not resolve uniquely by its own UID");
-        }
+        // Private aggregates are intentionally absent from system device
+        // enumeration. Bind through the exact AudioObjectID owned by the
+        // guard, then verify CPAL reports that generated UID and name.
+        let aggregate_device = match guard.cpal_device() {
+            Ok(device) => device,
+            Err(error) => {
+                guard.close().expect("remove unbound private aggregate");
+                panic!("bind private aggregate by its owned CoreAudio ID: {error}");
+            }
+        };
+        assert_eq!(aggregate_device.id().unwrap().1, aggregate_uid);
         let config = crate::output::AudioOutputConfig {
             host: Some(host_id.name().to_owned()),
             device: Some(aggregate_name.clone()),
@@ -2313,7 +2302,11 @@ mod tests {
         }
         writer.finalize().expect("finalize default-pair WAV");
 
-        let default_player = match AudioPlayer::from_config(&config) {
+        let default_player = match AudioPlayer::from_native_test_device(
+            aggregate_device.clone(),
+            host_id.name().to_owned(),
+            &config,
+        ) {
             Ok(player) => player,
             Err(error) => {
                 // Stream startup may have constructed a native object before
@@ -2397,7 +2390,11 @@ mod tests {
         let mut pair_one_peaks = [0.0; 4];
         let mut pair_one_allocations = u64::MAX;
         let mut pair_one_deallocations = u64::MAX;
-        let mut player = match AudioPlayer::from_config(&config) {
+        let mut player = match AudioPlayer::from_native_test_device(
+            aggregate_device,
+            host_id.name().to_owned(),
+            &config,
+        ) {
             Ok(player) => player,
             Err(error) => {
                 // Stream startup may have constructed a native object before

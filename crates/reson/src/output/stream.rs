@@ -46,11 +46,53 @@ pub fn open_output_stream(
     let (host, host_id, host_fallback) = resolve_host(config.host.as_deref())?;
     let (device, device_name, device_fallback) = resolve_device(&host, config.device.as_deref())?;
 
-    let mut used_fallback = host_fallback || device_fallback;
-    let resolved_config = resolve_output_stream_config(&device, &host_id, config)?;
+    open_resolved_output_stream(
+        device,
+        host_id,
+        device_name,
+        host_fallback || device_fallback,
+        config,
+        config.host.is_none(),
+    )
+}
+
+/// Open a test-owned device directly, including CoreAudio devices hidden from
+/// the system device enumeration. This is intentionally not a public route or
+/// a production fallback path.
+#[cfg(test)]
+pub(crate) fn open_output_stream_on_test_device(
+    device: cpal::Device,
+    host_id: String,
+    config: &AudioOutputConfig,
+) -> Result<OpenStreamOutcome, AudioOutputError> {
+    if !test_audio_output_enabled() {
+        return Err(AudioOutputError::NoOutputDevices);
+    }
+    let device_name = device_label(&device).ok_or(AudioOutputError::NoOutputDevices)?;
+    if config
+        .host
+        .as_deref()
+        .is_some_and(|requested| requested != host_id)
+        || config
+            .device
+            .as_deref()
+            .is_some_and(|requested| requested != device_name)
+    {
+        return Err(AudioOutputError::NoOutputDevices);
+    }
+    open_resolved_output_stream(device, host_id, device_name, false, config, false)
+}
+
+fn open_resolved_output_stream(
+    device: cpal::Device,
+    mut resolved_host_id: String,
+    mut resolved_device_name: String,
+    mut used_fallback: bool,
+    config: &AudioOutputConfig,
+    allow_default_fallback: bool,
+) -> Result<OpenStreamOutcome, AudioOutputError> {
+    let resolved_config = resolve_output_stream_config(&device, &resolved_host_id, config)?;
     used_fallback |= resolved_config.used_fallback;
-    let mut resolved_host_id = host_id;
-    let mut resolved_device_name = device_name;
 
     let active_sources = Arc::new(AtomicUsize::new(0));
     let volume_bits = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
@@ -83,7 +125,7 @@ pub fn open_output_stream(
     ) {
         Ok(stream) => stream,
         Err(err) => {
-            if config.host.is_some() {
+            if !allow_default_fallback {
                 return Err(AudioOutputError::BuildStream { source: err });
             }
             used_fallback = true;

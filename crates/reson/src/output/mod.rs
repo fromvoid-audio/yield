@@ -17,6 +17,8 @@ use self::discovery::sample_rates_in_range;
 #[cfg(test)]
 pub(crate) use self::stream::monitor_sink_for_tests;
 #[cfg(test)]
+pub(crate) use self::stream::open_output_stream_on_test_device;
+#[cfg(test)]
 use self::stream::resolved_output_from_stream_config;
 
 /// Errors that can occur while enumerating or opening audio outputs.

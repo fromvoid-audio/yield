@@ -23,7 +23,22 @@ impl AudioPlayer {
     /// Create a new audio player honoring the requested output configuration.
     pub fn from_config(config: &AudioOutputConfig) -> Result<Self, String> {
         let outcome = open_output_stream(config).map_err(|err| err.to_string())?;
-        Ok(Self {
+        Ok(Self::from_open_stream_outcome(outcome))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_native_test_device(
+        device: cpal::Device,
+        host_id: String,
+        config: &AudioOutputConfig,
+    ) -> Result<Self, String> {
+        let outcome = crate::output::open_output_stream_on_test_device(device, host_id, config)
+            .map_err(|err| err.to_string())?;
+        Ok(Self::from_open_stream_outcome(outcome))
+    }
+
+    fn from_open_stream_outcome(outcome: crate::output::OpenStreamOutcome) -> Self {
+        Self {
             stream: outcome.stream,
             edit_fade_handle: EditFadeHandle::new(),
             active_sources: 0,
@@ -53,7 +68,7 @@ impl AudioPlayer {
             output: outcome.resolved,
             #[cfg(test)]
             elapsed_override: None,
-        })
+        }
     }
 
     /// Store audio bytes and duration for later playback.
