@@ -89,7 +89,12 @@ def main() -> int:
             ignore_cancellation_signals()
             failure = f"native production selector cancelled by signal {cancelled.signum}"
             status = 128 + cancelled.signum
-            output = b""
+            # The state transaction must outlive Cargo. The outer managed
+            # process-group watchdog owns escalation, so keep draining/reaping
+            # this child here before the finally block restores application
+            # state. A second communicate also preserves output produced while
+            # the child handles the cancellation signal.
+            output, _ = process.communicate()
         decoded = output.decode("utf-8", errors="replace")
         sys.stdout.write(decoded)
         sys.stdout.flush()

@@ -239,6 +239,7 @@ fn control_backing_original_startup_component_handoffs_native_diagnostic_then_re
             false,
             false,
             None,
+            false,
             copies,
             Arc::new(AtomicUsize::new(0)),
         )

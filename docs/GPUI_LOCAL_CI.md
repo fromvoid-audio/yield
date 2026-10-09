@@ -66,17 +66,17 @@ with an OS file lock. The temporary checkout is removed afterward.
 For a commit SHA, inspect:
 
 ```text
-<git-common-dir>/local-ci/runs/<SHA>/result
-<git-common-dir>/local-ci/runs/<SHA>/check.log
+<git-common-dir>/local-ci/runs/<SHA>/<run-id>/result
+<git-common-dir>/local-ci/runs/<SHA>/<run-id>/check.log
 ```
 
 `result` is `RUNNING`, `PASS`, or `FAIL` with a UTC timestamp. `PASS` is scoped
 to the recorded SHA and host. A failed check keeps its log and can be rerun
-with `bash scripts/internal/ci/run_gpui_commit_ci.sh "$(pwd)" <SHA>`; a passed
-SHA is reused. The hook cannot retroactively validate earlier commits. To
+with `bash scripts/internal/ci/run_gpui_commit_ci.sh "$(pwd)" <SHA>`; each invocation records a separate run. The hook cannot retroactively validate earlier commits. To
 update an installed runner after changing these scripts, rerun the installer.
 
-The trigger requires a local `lockf` or `flock` command and Rust/Cargo. It does
+The trigger requires Python 3.11 or newer and Rust/Cargo; it uses Python
+`fcntl.flock` and does not require a separate lockf/flock executable. It does
 not publish artifacts, merge code, or change branch state. An installed runner
 is a copy; rerun the installer after updating the scripts. Its result is macOS
 evidence only.
@@ -86,14 +86,14 @@ For a private bundle from an exact validated commit, follow
 
 ## Focused original recording custody verification
 
-The `Native recording custody` workflow runs the two OPT-2330 production-bootstrap
-fixtures on a real `macos-15-intel` runner, using the repository toolchain and
-original per-user registry. It runs on changes to its workflow/verification script
-or explicit workflow dispatch. It records the exact checkout, SDK, hardware/resource
-limits, APFS home/test volumes and test output, including failures. The verification
-script refuses non-macOS hosts and requires exactly two passed, zero failed/ignored
-tests; a zero-test filtered run supplies no qualification. Local invocation is
-`bash scripts/internal/validation/verify_recording_native_custody.sh`.
+The old `Native recording custody` hosted workflow is retained with a `.disabled`
+suffix. Native validation runs locally through `scripts/yield-local-ci`, using the
+repository toolchain and genuine per-user registry. Each selected production case
+gets its own reversible clean-and-restore window. Existing state is parked by
+same-filesystem rename and restored afterward, including dirty ownership evidence.
+The runner records the exact checkout, SDK, APFS resources and test output and
+requires the original nonzero pass count with zero failures or ignored cases.
+See [Scripts](../scripts/README.md) for local commands and recovery instructions.
 
 A passing run verifies the retained pre-start recording route and slot only. It
 does not qualify recording capture, required-WAL/effect permission, terminal seals,
@@ -110,12 +110,11 @@ ceilings and physical admission requirements are unchanged. Portable SQL tests
 exercise exhausted-pool comparison, changed bytes and corrupt sequence/cell
 refusal; those tests do not supply native qualification.
 
-Native recording prestart custody runs its two original acceptance cases on two
-fresh macOS runner accounts at the same committed head. Each case executes its
-full original test with `--exact`, verifies exactly one pass and no failures or
-ignores, and records genuine APFS/profile/account resources. Both matrix jobs must
-succeed. Prestart leaves an active registration and durable admission claims;
-worker join releases memory custody but cannot prove clean volume handoff. The
-original dirty marker remains preserved. Reusing that account for a foreign
-profile would correctly refuse. This isolation creates no fixture registry,
-changes no home directory, and supplies no capture/terminal/settlement authority.
+Native recording prestart custody runs its two original acceptance cases separately
+at the same committed head, with `--exact` and exactly one pass per case. The local
+runner restores the original state between cases. Prestart leaves an active
+registration and durable admission claims; worker join releases memory custody but
+cannot prove clean volume handoff. The clean test state, including its dirty marker,
+is retained when the original state is restored. This uses the genuine account and
+canonical state location, without a fixture registry or substituted home directory.
+It supplies no capture, terminal or settlement authority.
