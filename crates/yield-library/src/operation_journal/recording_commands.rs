@@ -496,6 +496,10 @@ std::thread_local! {
 trait StreamingRecordingValue: serde::de::DeserializeOwned {}
 impl StreamingRecordingValue for RecordingCapturedChunk {}
 impl StreamingRecordingValue for controls::RecordingControlReservation {}
+impl StreamingRecordingValue for controls::RecordingFinalizingInventory {}
+impl StreamingRecordingValue for controls::RecordingDeclaredFinalizingInventory {}
+impl StreamingRecordingValue for controls::RecordingFrozenInventory {}
+impl StreamingRecordingValue for controls::RecordingSealedInventory {}
 impl StreamingRecordingValue for prefix::RecordingPrefixInventory {}
 impl StreamingRecordingValue for prefix::RecordingPrefixSeal {}
 
@@ -534,3 +538,6 @@ pub(crate) fn recording_proposal_for_test(channels: u16, frames: u64) -> Recordi
 pub(super) fn recording_proposal_with_root_for_test() -> (RecordingProposal, RootRegistrationRef) {
     tests::proposal_with_root(2, 100)
 }
+
+mod pcm;
+pub use pcm::{RecordingPcmBatch, RecordingPcmNormalizer};

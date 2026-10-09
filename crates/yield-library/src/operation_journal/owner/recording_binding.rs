@@ -33,7 +33,8 @@ pub(super) fn matches_original_destination(
 }
 
 // Validated proposal (192 KiB), original route backing and original pin/receipt context.
-// No callback ring, serializer or pending write is allocated by this pre-start factory.
+// The fixed PCM carry fits the original route allowance. No callback ring, serializer
+// or pending request is allocated by this pre-start factory.
 const ROUTE_BYTES: usize = 64 * 1024;
 const INPUT_BYTES: usize = 192 * 1024 + ROUTE_BYTES + 192 * 1024;
 // The command and retained slot are separate original-pool debits. All temporary read,
@@ -121,7 +122,54 @@ pub(super) struct RetainedRecordingProducer {
     proposal: RecordingProposal,
     digest: [u8; 32],
     invalidated: bool,
+    pcm: super::super::recording_commands::RecordingPcmNormalizer,
+    _declared_terminal:
+        Option<super::super::recording_commands::controls::RecordingDeclaredFinalizingInventory>,
+    _terminal_batch: Option<super::super::recording_commands::RecordingPcmBatch>,
+    _terminal_plan_backing: Option<InputPermit>,
+    terminal: Option<super::super::recording_commands::controls::RecordingFinalizingInventory>,
+    _terminal_barrier: Option<reson::recording::RecordingTerminalBarrier>,
+    _terminal_joined: Option<reson::recording::RecordingJoinedCompletion>,
+    _terminal_frozen: Option<super::super::recording_commands::controls::RecordingFrozenInventory>,
+    _terminal_verification: Option<super::super::store::RecordingFrozenVerification>,
+    _terminal_seal: Option<super::super::store::VerifiedRecordingSeal>,
+    _terminal_plan_error: Option<OperationJournalOwnerError>,
+    _terminal_error: Option<OperationJournalOwnerError>,
+    _terminal_backing: Option<InputPermit>,
     input: InputPermit,
+}
+impl RetainedRecordingProducer {
+    pub(super) fn operation_id_for_claim_fence(&self) -> OperationId {
+        self.proposal.operation_id()
+    }
+    pub(super) fn closed_for_generic_claims(&self) -> bool {
+        self.invalidated
+    }
+}
+
+// Borrow original opaque producer evidence; decoded values cannot select this audit.
+enum OriginalTerminalCheck<'a> {
+    Finalizing {
+        inventory: &'a super::super::recording_commands::controls::RecordingFinalizingInventory,
+        barrier: &'a reson::recording::RecordingTerminalBarrier,
+    },
+    Joined {
+        inventory:
+            &'a super::super::recording_commands::controls::RecordingDeclaredFinalizingInventory,
+        joined: &'a reson::recording::RecordingJoinedCompletion,
+    },
+    Verify {
+        inventory:
+            &'a super::super::recording_commands::controls::RecordingDeclaredFinalizingInventory,
+        frozen: &'a super::super::recording_commands::controls::RecordingFrozenInventory,
+        current: &'a super::super::store::RecordingFrozenVerification,
+    },
+}
+#[derive(Default)]
+struct OriginalTerminalOutcome {
+    frozen: Option<super::super::recording_commands::controls::RecordingFrozenInventory>,
+    verification: Option<super::super::store::RecordingFrozenVerification>,
+    seal: Option<super::super::store::VerifiedRecordingSeal>,
 }
 impl OperationJournalClient {
     /// Retain pre-start memory plumbing only after the original admitted/source/provider checks.
@@ -251,7 +299,7 @@ impl OwnerRuntime {
         mut input: InputPermit,
     ) -> Result<RecordingProducerCustody, OperationJournalOwnerError> {
         use RecordingProducerCustodyError as E;
-        if self.recording_producer.is_some() {
+        if self.recording_producer.is_some() || self.recording_restart_audit.is_some() {
             return Err(E::Busy.into());
         }
         if input.shared.status() != OperationJournalOwnerStatus::Available {
@@ -277,6 +325,10 @@ impl OwnerRuntime {
                 .map_err(|_| E::Changed)?;
         #[cfg(test)]
         FACTORIES.fetch_add(1, Ordering::AcqRel);
+        // Reuse the exact already validated/encoded original proposal digest. Do not
+        // overlap another proposal encoding with the factory's retained encoded buffer.
+        let pcm =
+            super::super::recording_commands::RecordingPcmNormalizer::from_proposal_hash(digest);
         let (binding, receiver, settlements) = RecordingTransport::bind(limits);
         let facade = RecordingProducerCustody {
             operation,
@@ -298,9 +350,557 @@ impl OwnerRuntime {
             proposal,
             digest,
             invalidated: false,
+            pcm,
+            _declared_terminal: None,
+            _terminal_batch: None,
+            _terminal_plan_backing: None,
+            terminal: None,
+            _terminal_barrier: None,
+            _terminal_joined: None,
+            _terminal_frozen: None,
+            _terminal_verification: None,
+            _terminal_seal: None,
+            _terminal_plan_error: None,
+            _terminal_error: None,
+            _terminal_backing: None,
             input,
         });
         Ok(facade)
+    }
+
+    /// Inspect original one-shot producer evidence without waiting on the actor. This
+    /// factory has no required-WAL/startup capability: an unexpected terminal observation is retained
+    /// for audit with acknowledgement withheld, never acknowledged on the strength of serialized observations.
+    pub(super) fn poll_recording_custody(&mut self) {
+        let Some(mut retained) = self.recording_producer.take() else {
+            return;
+        };
+        if let Ok(barrier) = retained._settlements.try_barrier() {
+            let observed = (|| {
+                let profile = self.final_profile_guard.as_ref()?;
+                let acquisition = uuid::Uuid::parse_str(profile.owner_identity()).ok()?;
+                let inventory = super::super::recording_commands::controls::RecordingFinalizingInventory::capture(
+                    &retained.proposal,
+                    uuid::Uuid::new_v4(),
+                    acquisition,
+                    1,
+                    &retained._settlements,
+                    &barrier,
+                ).ok()?;
+                Some(inventory)
+            })();
+            if let Some(inventory) = observed.as_ref() {
+                if let Ok(input) = retained.input.shared.startup_input() {
+                    // The original fixed route already funds its carry/barrier. Prepay the
+                    // independent terminal batch and all transient encoding before owning it.
+                    let plan = (|| -> Result<_, OperationJournalOwnerError> {
+                        let backing = input.reserve_historical_scratch(64 * 1024)?;
+                        let encoding = OperationJournalStore::fund_recording_terminal_encoding(
+                            &retained.proposal,
+                            &input,
+                        )?;
+                        let profile = self
+                            .final_profile_guard
+                            .as_ref()
+                            .ok_or(RecordingProducerCustodyError::Closed)?;
+                        let acquisition = uuid::Uuid::parse_str(profile.owner_identity())
+                            .map_err(|_| RecordingProducerCustodyError::Changed)?;
+                        let captured = super::super::recording_commands::controls::RecordingDeclaredFinalizingInventory::capture(
+                            &retained.proposal, inventory.terminal_id(), acquisition, 1,
+                            &retained._settlements, &barrier, &retained.pcm);
+                        let result = match captured {
+                            Ok((declared, batch)) => {
+                                for chunk in batch.chunks() {
+                                    declared
+                                        .validate_chunk(&retained.proposal, chunk)
+                                        .map_err(|_| RecordingProducerCustodyError::Changed)?;
+                                }
+                                Ok((declared, batch, backing))
+                            }
+                            Err(_) => Err(RecordingProducerCustodyError::Changed.into()),
+                        };
+                        drop(encoding);
+                        result
+                    })();
+                    let plan_failed = plan.is_err();
+                    match plan {
+                        Ok((declared, batch, backing)) => {
+                            retained._declared_terminal = Some(declared);
+                            retained._terminal_batch = Some(batch);
+                            retained._terminal_plan_backing = Some(backing);
+                        }
+                        Err(error) => retained._terminal_plan_error = Some(error),
+                    }
+                    // An unknown prior raw cursor retains only the original V2 observation
+                    // for audit. Neither case acknowledges this NeverStarted factory.
+                    if let Err(error) =
+                        self.retain_original_finalizing(&retained, inventory, &barrier, &input)
+                    {
+                        // Keep original selected error loans under the retained producer.
+                        // Neither failed COMMIT nor failed readback permits a replacement.
+                        if !self.store().connection_is_autocommit_for_recording()
+                            || matches!(&error,
+                                OperationJournalOwnerError::RecordingTerminalRollbackUncertain { .. }
+                                | OperationJournalOwnerError::Store(
+                                    OperationJournalStoreError::RecordingTerminalOutcomeUncertain { .. }
+                                    | OperationJournalStoreError::RecordingTerminalRollbackUncertain { .. }
+                                )) {
+                            retained.input.shared.mark_unavailable("original Recording terminal outcome needs audit");
+                        }
+                        retained._terminal_error = Some(error);
+                        retained._terminal_backing = Some(input);
+                    } else if plan_failed {
+                        // Keep the original selected preparation error's working loans even
+                        // when the smaller audit-only V2 observation commits successfully.
+                        retained._terminal_backing = Some(input);
+                    }
+                }
+            }
+            retained.terminal = observed;
+            retained.invalidated = true;
+            retained._terminal_barrier = Some(barrier);
+        }
+        if let Ok(joined) = retained._settlements.try_joined() {
+            // Genuine join evidence must also belong to the original private instance and
+            // agree with the inventory. Even success cannot upgrade this pre-start factory.
+            let _matches = if let Some(declared) = retained._declared_terminal.as_ref() {
+                declared
+                    .validate_joined(&retained.proposal, &retained._settlements, &joined)
+                    .is_ok()
+            } else {
+                retained.terminal.as_ref().is_some_and(|inventory| {
+                    inventory
+                        .validate_joined(&retained.proposal, &retained._settlements, &joined)
+                        .is_ok()
+                })
+            };
+            if _matches
+                && retained._terminal_error.is_none()
+                && retained._terminal_plan_error.is_none()
+            {
+                if let Some(inventory) = retained._declared_terminal.as_ref() {
+                    if let Ok(input) = retained.input.shared.startup_input() {
+                        let audit = self.check_original_terminal(
+                            &retained,
+                            OriginalTerminalCheck::Joined {
+                                inventory,
+                                joined: &joined,
+                            },
+                            &input,
+                        );
+                        if let Err(error) = audit {
+                            if !self.store().connection_is_autocommit_for_recording()
+                                || matches!(&error,
+                                    OperationJournalOwnerError::RecordingTerminalRollbackUncertain { .. }
+                                    | OperationJournalOwnerError::Store(
+                                        OperationJournalStoreError::RecordingTerminalOutcomeUncertain { .. }
+                                        | OperationJournalStoreError::RecordingTerminalRollbackUncertain { .. }
+                                    )) {
+                                retained.input.shared.mark_unavailable(
+                                    "original Recording joined retention audit needs recovery",
+                                );
+                            }
+                            retained._terminal_error = Some(error);
+                            retained._terminal_backing = Some(input);
+                        } else if let Ok(observation) = audit {
+                            retained._terminal_frozen = observation.frozen;
+                            retained._terminal_verification = observation.verification;
+                        }
+                    }
+                }
+            }
+            retained._terminal_joined = Some(joined);
+            retained.invalidated = true;
+        }
+        if retained._terminal_error.is_none() && retained._terminal_plan_error.is_none() {
+            if let Some(current) = retained._terminal_verification.take() {
+                let progress = (|| -> Result<_, OperationJournalOwnerError> {
+                    if current.complete()? {
+                        return Ok(None);
+                    }
+                    let inventory = retained
+                        ._declared_terminal
+                        .as_ref()
+                        .ok_or(RecordingProducerCustodyError::Changed)?;
+                    let frozen = retained
+                        ._terminal_frozen
+                        .as_ref()
+                        .ok_or(RecordingProducerCustodyError::Changed)?;
+                    let input = retained
+                        .input
+                        .shared
+                        .startup_input()
+                        .map_err(OperationJournalOwnerError::RecordingTerminalInput)?;
+                    let result = self.check_original_terminal(
+                        &retained,
+                        OriginalTerminalCheck::Verify {
+                            inventory,
+                            frozen,
+                            current: &current,
+                        },
+                        &input,
+                    );
+                    if result.is_err() {
+                        retained._terminal_backing = Some(input);
+                    }
+                    result.map(Some)
+                })();
+                match progress {
+                    Ok(Some(observation)) => {
+                        retained._terminal_verification = observation.verification;
+                        retained._terminal_seal = observation.seal;
+                    }
+                    Ok(None) => retained._terminal_verification = Some(current),
+                    Err(cause) => {
+                        if !self.store().connection_is_autocommit_for_recording()
+                            || matches!(&cause, OperationJournalOwnerError::RecordingTerminalRollbackUncertain { .. }
+                            | OperationJournalOwnerError::Store(OperationJournalStoreError::RecordingTerminalOutcomeUncertain { .. }
+                                | OperationJournalStoreError::RecordingTerminalRollbackUncertain { .. })) {
+                            retained.input.shared.mark_unavailable("Recording verification outcome needs recovery");
+                        }
+                        retained._terminal_error = Some(cause);
+                        retained._terminal_verification = Some(current);
+                    }
+                }
+            }
+        }
+        self.recording_producer = Some(retained);
+    }
+
+    /// Barrier observation closes generic mutation immediately, even if SQL admission or
+    /// persistence then fails. Only exact already retained data remains replayable.
+    pub(super) fn validate_recording_custody_append(
+        &self,
+        chunk: &RecordingCapturedChunk,
+    ) -> Result<(), OperationJournalOwnerError> {
+        if self.recording_producer.as_ref().is_some_and(|retained| {
+            retained.invalidated && retained.proposal.operation_id() == chunk.operation_id()
+        }) {
+            self.store().require_recording_existing_replay(chunk)?;
+        }
+        Ok(())
+    }
+
+    fn retain_original_finalizing(
+        &mut self,
+        retained: &RetainedRecordingProducer,
+        inventory: &super::super::recording_commands::controls::RecordingFinalizingInventory,
+        barrier: &reson::recording::RecordingTerminalBarrier,
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalOwnerError> {
+        self.check_original_terminal(
+            retained,
+            OriginalTerminalCheck::Finalizing { inventory, barrier },
+            input,
+        )
+        .map(|_| ())
+    }
+
+    fn check_original_terminal(
+        &mut self,
+        retained: &RetainedRecordingProducer,
+        check: OriginalTerminalCheck<'_>,
+        input: &InputPermit,
+    ) -> Result<OriginalTerminalOutcome, OperationJournalOwnerError> {
+        use RecordingProducerCustodyError as E;
+        match &check {
+            OriginalTerminalCheck::Finalizing { barrier, .. } => {
+                if retained.invalidated || !retained._settlements.owns_barrier(barrier) {
+                    return Err(E::Changed.into());
+                }
+            }
+            OriginalTerminalCheck::Joined { inventory, joined } => {
+                if !retained.invalidated
+                    || retained._terminal_error.is_some()
+                    || retained._terminal_plan_error.is_some()
+                    || !retained
+                        ._declared_terminal
+                        .as_ref()
+                        .is_some_and(|held| std::ptr::eq(held, *inventory))
+                {
+                    return Err(E::Changed.into());
+                }
+                inventory
+                    .validate_joined(&retained.proposal, &retained._settlements, joined)
+                    .map_err(|_| E::Changed)?;
+            }
+            OriginalTerminalCheck::Verify { .. } => {}
+        }
+        if let OriginalTerminalCheck::Verify {
+            inventory, frozen, ..
+        } = &check
+        {
+            if !retained.invalidated
+                || retained._terminal_error.is_some()
+                || retained._terminal_plan_error.is_some()
+                || !retained
+                    ._declared_terminal
+                    .as_ref()
+                    .is_some_and(|held| std::ptr::eq(held, *inventory))
+                || !retained
+                    ._terminal_frozen
+                    .as_ref()
+                    .is_some_and(|held| std::ptr::eq(held, *frozen))
+            {
+                return Err(E::Changed.into());
+            }
+            let joined = retained._terminal_joined.as_ref().ok_or(E::Changed)?;
+            inventory
+                .validate_joined(&retained.proposal, &retained._settlements, joined)
+                .map_err(|_| E::Changed)?;
+        }
+        self.publication_fences
+            .close_for_mutation(retained.proposal.operation_id())?;
+        let working = self
+            .store()
+            .begin_recording_terminal_write_with_input(input)?
+            .expect("original funded terminal transaction");
+        let mut result = (|| {
+            self.resource_admission
+                .validate_open()
+                .map_err(|_| E::Closed)?;
+            self.revalidate_capacity_boundary()
+                .map_err(|_| E::Changed)?;
+            let source = self
+                .source_registrations
+                .get(&retained.registration.registration_id)
+                .ok_or(E::Changed)?;
+            if source.receipt != retained.registration
+                || !matches!(source.readiness, SourceRegistrationReadiness::Registered)
+            {
+                return Err(E::Changed.into());
+            }
+            let epoch = u64::try_from(retained.registration.lease_identity.epoch())
+                .map_err(|_| E::Changed)?;
+            if !matches_original_destination(&retained.proposal, &source.request, epoch) {
+                return Err(E::Changed.into());
+            }
+            let profile = self.final_profile_guard.as_ref().ok_or(E::Closed)?;
+            retained
+                .source_pin
+                .validate_for_issuance(&source.request, profile)?;
+            let _source_effect = retained.source_pin.begin_effect()?;
+            let snapshot = self
+                .store()
+                .validate_original_recording_terminal_context(&retained.proposal, input)?;
+            if matches!(
+                snapshot.readiness(),
+                CapacityRebuildReadiness::ReconciliationRequired { .. }
+            ) {
+                return Err(E::Changed.into());
+            }
+            let provider = self.capacity_provider.as_ref().ok_or(E::Changed)?;
+            snapshot
+                .validate_provider(provider, Some(input))
+                .map_err(|_| E::Changed)?;
+            provider.validate_recovery_state().map_err(|_| E::Changed)?;
+            drop(snapshot);
+            let mut terminal_bytes_retained = false;
+            let mut frozen_observation = None;
+            let mut verification_observation = None;
+            let mut seal_observation = None;
+            match &check {
+                OriginalTerminalCheck::Finalizing { inventory, .. } => {
+                    match retained._declared_terminal.as_ref() {
+                        Some(declared) => self
+                            .store()
+                            .record_declared_finalizing_inside_original_transaction(
+                                &retained.proposal,
+                                declared,
+                                input,
+                            )?,
+                        None => self.store().record_finalizing_inside_original_transaction(
+                            &retained.proposal,
+                            inventory,
+                            input,
+                        )?,
+                    }
+                    if let (Some(declared), Some(batch)) = (
+                        retained._declared_terminal.as_ref(),
+                        retained._terminal_batch.as_ref(),
+                    ) {
+                        let mut issued = true;
+                        for chunk in batch.chunks() {
+                            issued &= self
+                                .store()
+                                .original_terminal_chunk_is_issued(chunk, input)?;
+                        }
+                        if issued {
+                            for chunk in batch.chunks() {
+                                self.store().retain_original_declared_terminal_chunk(
+                                    &retained.proposal,
+                                    declared,
+                                    chunk,
+                                    input,
+                                )?;
+                            }
+                            terminal_bytes_retained = true;
+                        }
+                        // Missing issuance preserves the previous audit-only inventory.
+                        // Neither readiness nor retained data acknowledges NeverStarted.
+                    }
+                }
+                OriginalTerminalCheck::Joined { inventory, joined } => {
+                    self.store().validate_original_declared_terminal_retention(
+                        &retained.proposal,
+                        inventory,
+                        input,
+                    )?;
+                    let encoding = OperationJournalStore::fund_recording_terminal_encoding(
+                        &retained.proposal,
+                        input,
+                    )?;
+                    let sequence = self
+                        .store()
+                        .original_frozen_control_sequence(&retained.proposal, input)?;
+                    let frozen = super::super::recording_commands::controls::RecordingFrozenInventory::capture(
+                        &retained.proposal, inventory, sequence, &retained._settlements, joined)
+                        .map_err(|_| E::Changed)?;
+                    self.store().record_original_frozen_inventory(
+                        &retained.proposal,
+                        inventory,
+                        &frozen,
+                        input,
+                    )?;
+                    verification_observation =
+                        Some(self.store().start_original_frozen_verification(
+                            &retained.proposal,
+                            inventory,
+                            &frozen,
+                            input,
+                        )?);
+                    frozen_observation = Some(frozen);
+                    drop(encoding);
+                }
+                OriginalTerminalCheck::Verify {
+                    inventory,
+                    frozen,
+                    current,
+                } => {
+                    self.store().validate_original_declared_terminal_retention(
+                        &retained.proposal,
+                        inventory,
+                        input,
+                    )?;
+                    let next = self.store().original_frozen_verification_page(
+                        &retained.proposal,
+                        frozen,
+                        current,
+                        input,
+                    )?;
+                    if next.complete()? {
+                        let verified = next.finish(input)?;
+                        self.store().retain_original_verified_seal(
+                            &retained.proposal,
+                            frozen,
+                            &verified,
+                            input,
+                        )?;
+                        seal_observation = Some(verified);
+                    } else {
+                        verification_observation = Some(next);
+                    }
+                }
+            }
+            self.store()
+                .finish_recording_terminal_write(input)
+                .map_err(
+                    |cause| OperationJournalStoreError::RecordingTerminalOutcomeUncertain {
+                        phase: "commit or postcommit namespace",
+                        cause: Box::new(cause),
+                    },
+                )?;
+            match &check {
+                OriginalTerminalCheck::Finalizing { inventory, .. } => {
+                    match retained._declared_terminal.as_ref() {
+                        Some(declared) => self.store().verify_declared_finalizing_readback(
+                            &retained.proposal,
+                            declared,
+                            input,
+                        ),
+                        None => self.store().verify_finalizing_readback(
+                            &retained.proposal,
+                            inventory,
+                            input,
+                        ),
+                    }
+                }
+                OriginalTerminalCheck::Joined { inventory, .. }
+                | OriginalTerminalCheck::Verify { inventory, .. } => self
+                    .store()
+                    .verify_declared_finalizing_readback(&retained.proposal, inventory, input),
+            }
+            .map_err(|cause| {
+                OperationJournalStoreError::RecordingTerminalOutcomeUncertain {
+                    phase: "postcommit readback",
+                    cause: Box::new(cause),
+                }
+            })?;
+            if terminal_bytes_retained {
+                let declared = retained._declared_terminal.as_ref().ok_or(E::Changed)?;
+                self.store()
+                    .verify_original_declared_terminal_bytes(&retained.proposal, declared, input)
+                    .map_err(|cause| {
+                        OperationJournalStoreError::RecordingTerminalOutcomeUncertain {
+                            phase: "declared terminal byte exact readback",
+                            cause: Box::new(cause),
+                        }
+                    })?;
+            }
+            let checked_frozen = match &check {
+                OriginalTerminalCheck::Verify { frozen, .. } => Some(*frozen),
+                _ => frozen_observation.as_ref(),
+            };
+            if let Some(frozen) = checked_frozen {
+                self.store()
+                    .verify_original_frozen_readback(&retained.proposal, frozen, input)
+                    .map_err(|cause| {
+                        OperationJournalStoreError::RecordingTerminalOutcomeUncertain {
+                            phase: "Frozen exact readback",
+                            cause: Box::new(cause),
+                        }
+                    })?;
+            }
+            if let (Some(verified), Some(frozen)) = (seal_observation.as_ref(), checked_frozen) {
+                self.store()
+                    .verify_original_seal_readback(&retained.proposal, frozen, verified, input)
+                    .map_err(|cause| {
+                        OperationJournalStoreError::RecordingTerminalOutcomeUncertain {
+                            phase: "Seal exact readback",
+                            cause: Box::new(cause),
+                        }
+                    })?;
+            }
+            retained
+                .source_pin
+                .validate_for_issuance(&source.request, profile)
+                .map_err(|cause| {
+                    // The mutation has committed. A changed Source cannot turn this
+                    // durable terminal observation into a retry on another acquisition.
+                    retained.input.shared.mark_unavailable(
+                        "Recording Source changed after terminal commit; recovery required",
+                    );
+                    OperationJournalOwnerError::from(cause)
+                })?;
+            Ok(OriginalTerminalOutcome {
+                frozen: frozen_observation,
+                verification: verification_observation,
+                seal: seal_observation,
+            })
+        })();
+        if !self.store().connection_is_autocommit_for_recording() {
+            if let Err(cause) = self.store().rollback_recording_terminal_write(input) {
+                result = Err(
+                    OperationJournalOwnerError::RecordingTerminalRollbackUncertain {
+                        original: Box::new(result.err().unwrap_or_else(|| E::Changed.into())),
+                        rollback: Box::new(cause),
+                    },
+                );
+            }
+        }
+        // Original scope backing remains alive through all observed values and selected errors.
+        input.retain_historical_error(working, None, None, None);
+        result
     }
 
     pub(super) fn validate_recording_custody(
