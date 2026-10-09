@@ -780,3 +780,22 @@ component tests cover missing initial rows, changed operation/bytes, released cl
 audit pending, actual retained lock/credit through a lost reply, and shutdown release
 without source/journal byte changes. Full recovery/current ownership and genuine native
 acceptance remain open.
+
+### Recovery reply backing and native worker lane
+
+All three recovery requests use the original ordinary-pool funded reply keeper.
+The keeper follows selected namespace/decoder errors through result consumption;
+request rejection and shutdown retain the existing pool limits and custody rules.
+A paired canonical SQL/receipt data fixture now exercises successful recovery and
+revalidation through the actual worker, missing-provider refusal, unchanged database
+bytes and retained sidecar exclusivity. This fixture supplies no initial claim,
+provider ledger or current writable Source permission.
+
+The [native worker runner](../scripts/internal/validation/verify_legacy_native_worker.sh)
+and [workflow](../.github/workflows/legacy-native-worker.yml) compile the supported
+macOS library graph and execute each existing native initial-settlement, transaction
+fault, and migration/bootstrap/recovery test in its own job. They record SDK,
+toolchain, filesystem and resource facts, require writable APFS and exactly one
+completed test with no failures or skips, and retain failure evidence. These tests
+use their explicitly isolated volume registry. They do not qualify default production
+registry startup, current SourceLease handoff or the full OPT-2117 acceptance.
