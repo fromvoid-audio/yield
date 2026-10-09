@@ -6178,7 +6178,14 @@ impl OperationJournalStore {
         })?;
 
         self.validate_namespace()?;
-        self.connection.execute_batch("BEGIN EXCLUSIVE")?;
+        super::writer_acquisition_telemetry::observe(
+            super::writer_acquisition_telemetry::JournalWriterCall::CancellationRequest,
+            || {
+                self.connection
+                    .execute_batch("BEGIN EXCLUSIVE")
+                    .map_err(Into::into)
+            },
+        )?;
         let result =
             self.request_cancel_inside_transaction(operation_id, expected_sequence, observation);
         match result {
@@ -6457,7 +6464,14 @@ impl OperationJournalStore {
         })?;
 
         self.validate_namespace()?;
-        self.connection.execute_batch("BEGIN EXCLUSIVE")?;
+        super::writer_acquisition_telemetry::observe(
+            super::writer_acquisition_telemetry::JournalWriterCall::RetryPending,
+            || {
+                self.connection
+                    .execute_batch("BEGIN EXCLUSIVE")
+                    .map_err(Into::into)
+            },
+        )?;
         let result =
             self.record_retry_inside_transaction(operation_id, expected_sequence, observation);
         match result {
@@ -7061,11 +7075,15 @@ impl OperationJournalStore {
         {
             return Err(OrdinaryClaimReleaseError::Persistence { source: error });
         }
-        self.connection
-            .execute_batch("BEGIN EXCLUSIVE")
-            .map_err(|error| OrdinaryClaimReleaseError::Persistence {
-                source: error.into(),
-            })?;
+        super::writer_acquisition_telemetry::observe(
+            super::writer_acquisition_telemetry::JournalWriterCall::OrdinaryClaimRelease,
+            || {
+                self.connection
+                    .execute_batch("BEGIN EXCLUSIVE")
+                    .map_err(Into::into)
+            },
+        )
+        .map_err(|source| OrdinaryClaimReleaseError::Persistence { source })?;
         let transition = match self.release_ordinary_claim_inside_transaction(request) {
             Ok(transition) => transition,
             Err(error) => return Err(self.rollback_ordinary_claim_release(error)),
@@ -7371,9 +7389,10 @@ impl OperationJournalStore {
                 None,
             );
         }
-        if let Err(error) =
-            initial_settlement_backing::control(&self.connection, input, c"BEGIN EXCLUSIVE")
-        {
+        if let Err(error) = super::writer_acquisition_telemetry::observe(
+            super::writer_acquisition_telemetry::JournalWriterCall::IntentInsert,
+            || initial_settlement_backing::control(&self.connection, input, c"BEGIN EXCLUSIVE"),
+        ) {
             return failed_insert(
                 operation_id,
                 JournalInsertWriteStage::NoMutationAttempted,
@@ -13757,6 +13776,7 @@ mod tests {
 
     #[test]
     fn typed_insert_outcome_reports_prebegin_and_validation_failures_without_receipts() {
+        let capture = super::super::writer_acquisition_telemetry::tests::Capture::new();
         let fixture = fixture();
         let store = OperationJournalStore::open(&fixture.owner).expect("open store");
 
@@ -13838,6 +13858,13 @@ mod tests {
             })
             .expect("read sequence after rollback");
         assert_eq!(max_sequence, None);
+        assert_eq!(
+            capture.snapshot().count(
+                super::super::writer_acquisition_telemetry::JournalWriterCall::IntentInsert,
+                super::super::writer_acquisition_telemetry::JournalWriterReturn::Acquired,
+            ),
+            1
+        );
     }
 
     #[test]
@@ -14130,6 +14157,7 @@ mod tests {
 
     #[test]
     fn intent_insert_get_duplicate_and_restart_preserve_sequence() {
+        let capture = super::super::writer_acquisition_telemetry::tests::Capture::new();
         let fixture = fixture();
         let store = OperationJournalStore::open(&fixture.owner).expect("open store");
         let first = intent_record(OperationId::new());
@@ -14163,6 +14191,13 @@ mod tests {
                 .get(second.operation_id)
                 .expect("get persisted second"),
             Some(second)
+        );
+        assert_eq!(
+            capture.snapshot().count(
+                super::super::writer_acquisition_telemetry::JournalWriterCall::IntentInsert,
+                super::super::writer_acquisition_telemetry::JournalWriterReturn::Acquired,
+            ),
+            3
         );
     }
 
@@ -15868,6 +15903,7 @@ mod tests {
 
     #[test]
     fn cancellation_request_persists_v4_without_execution_authority() {
+        let capture = super::super::writer_acquisition_telemetry::tests::Capture::new();
         let fixture = fixture();
         let store = OperationJournalStore::open(&fixture.owner).expect("open store");
         let record = universal_intent_record(OperationId::new());
@@ -15924,6 +15960,13 @@ mod tests {
             page.entries()[0].outcome(),
             RecoveryRowOutcome::Consistent(observed) if observed == &persisted
         ));
+        assert_eq!(
+            capture.snapshot().count(
+                super::super::writer_acquisition_telemetry::JournalWriterCall::CancellationRequest,
+                super::super::writer_acquisition_telemetry::JournalWriterReturn::Acquired,
+            ),
+            1
+        );
     }
 
     #[test]
@@ -19018,6 +19061,7 @@ mod tests {
 
     #[test]
     fn ordinary_claim_release_subtracts_one_claim_and_replays_after_token_removal() {
+        let capture = super::super::writer_acquisition_telemetry::tests::Capture::new();
         let fixture = fixture();
         let store = OperationJournalStore::open(&fixture.owner).expect("open store");
         let operation_id = OperationId::new();
@@ -19110,6 +19154,13 @@ mod tests {
             )
             .expect("count release receipts");
         assert_eq!(release_count, 2);
+        assert_eq!(
+            capture.snapshot().count(
+                super::super::writer_acquisition_telemetry::JournalWriterCall::OrdinaryClaimRelease,
+                super::super::writer_acquisition_telemetry::JournalWriterReturn::Acquired,
+            ),
+            5
+        );
     }
 
     #[test]
