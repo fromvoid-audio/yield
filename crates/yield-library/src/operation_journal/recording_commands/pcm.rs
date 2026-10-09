@@ -177,16 +177,14 @@ impl RecordingPcmNormalizer {
             (1, 4, inventory.riff_length_patch()),
             (2, 64, inventory.data_length_patch()),
         ] {
-            let mut hash = blake3::Hasher::new();
-            hash.update(b"yield.recording.terminal.header.v1\0");
-            hash.update(&self.proposal_hash);
-            hash.update(terminal.as_bytes());
-            hash.update(&u32::to_le_bytes(revision));
-            let mut id = [0; 16];
-            id.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+            let id = terminal_chunk_identity(
+                &self.proposal_hash,
+                terminal,
+                RecordingChunkRole::Header { revision },
+            );
             batch.chunks.push(RecordingCapturedChunk::new(
                 proposal,
-                Uuid::from_bytes(id),
+                id,
                 RecordingChunkRole::Header { revision },
                 offset,
                 patch.to_vec(),
@@ -227,16 +225,14 @@ impl RecordingPcmNormalizer {
         let mut chunks = Vec::with_capacity(combined.div_ceil(chunk_bytes));
         for start in (0..combined).step_by(chunk_bytes) {
             let ordinal = self.next_ordinal + (start / chunk_bytes) as u32;
-            let mut hash = blake3::Hasher::new();
-            hash.update(b"yield.recording.terminal.pcm.v1\0");
-            hash.update(&self.proposal_hash);
-            hash.update(terminal.as_bytes());
-            hash.update(&ordinal.to_le_bytes());
-            let mut id = [0; 16];
-            id.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+            let id = terminal_chunk_identity(
+                &self.proposal_hash,
+                terminal,
+                RecordingChunkRole::Pcm { ordinal },
+            );
             chunks.push(RecordingCapturedChunk::new(
                 proposal,
-                Uuid::from_bytes(id),
+                id,
                 RecordingChunkRole::Pcm { ordinal },
                 prefix::RECORDING_WAV_HEADER_BYTES as u64 + u64::from(ordinal) * chunk_bytes as u64,
                 self.combined_range(pending, start, (combined - start).min(chunk_bytes)),
@@ -260,3 +256,28 @@ impl RecordingPcmNormalizer {
 
 #[cfg(test)]
 mod tests;
+
+/// Stable data identity; it cannot issue a chunk grant.
+pub(super) fn terminal_chunk_identity(
+    proposal_hash: &[u8; 32],
+    terminal: Uuid,
+    role: RecordingChunkRole,
+) -> Uuid {
+    let mut hash = blake3::Hasher::new();
+    let ordinal = match role {
+        RecordingChunkRole::Pcm { ordinal } => {
+            hash.update(b"yield.recording.terminal.pcm.v1\0");
+            ordinal
+        }
+        RecordingChunkRole::Header { revision } => {
+            hash.update(b"yield.recording.terminal.header.v1\0");
+            revision
+        }
+    };
+    hash.update(proposal_hash);
+    hash.update(terminal.as_bytes());
+    hash.update(&ordinal.to_le_bytes());
+    let mut id = [0; 16];
+    id.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+    Uuid::from_bytes(id)
+}

@@ -137,6 +137,7 @@ fn original_serializer_transport_and_barrier_normalize_all_channel_counts() {
                     let mut pcm = Vec::new();
                     let mut capturing = false;
                     let mut terminal_done = false;
+                    let mut retained_declaration = None;
                     let deadline = Instant::now() + Duration::from_secs(10);
                     loop {
                         assert!(Instant::now() < deadline);
@@ -178,14 +179,46 @@ fn original_serializer_transport_and_barrier_normalize_all_channel_counts() {
                                         )
                                         .is_err()
                                 );
-                                let plan = cursor
-                                    .prepare_original_terminal(
+                                let (declared, plan) =
+                                    controls::RecordingDeclaredFinalizingInventory::capture(
                                         &proposal,
                                         terminal,
+                                        Uuid::new_v4(),
+                                        1,
                                         &settlements,
                                         &barrier,
+                                        &cursor,
                                     )
                                     .unwrap();
+                                let encoded = declared.encode(&proposal).unwrap();
+                                let decoded =
+                                    controls::RecordingDeclaredFinalizingInventory::decode(
+                                        &encoded, &proposal,
+                                    )
+                                    .unwrap();
+                                assert_eq!(decoded, declared);
+                                assert!(
+                                    controls::finalizing_observation(
+                                        &encoded,
+                                        &proposal,
+                                        controls::ControlRole::Finalizing
+                                    )
+                                    .unwrap()
+                                );
+                                assert!(
+                                    controls::finalizing_observation(
+                                        &encoded,
+                                        &proposal,
+                                        controls::ControlRole::Frozen
+                                    )
+                                    .is_err()
+                                );
+                                for chunk in plan.chunks() {
+                                    decoded.validate_chunk(&proposal, chunk).unwrap();
+                                    let mut changed = chunk.clone();
+                                    changed.bytes[0] ^= 1;
+                                    assert!(decoded.validate_chunk(&proposal, &changed).is_err());
+                                }
                                 let retry = cursor
                                     .prepare_original_terminal(
                                         &proposal,
@@ -218,6 +251,7 @@ fn original_serializer_transport_and_barrier_normalize_all_channel_counts() {
                                         pcm.extend_from_slice(&chunk.bytes);
                                     }
                                 }
+                                retained_declaration = Some(declared);
                                 cursor.accept(plan).unwrap();
                                 terminal_done = true;
                                 barrier.acknowledge().unwrap();
@@ -226,6 +260,11 @@ fn original_serializer_transport_and_barrier_normalize_all_channel_counts() {
                         if let Ok(joined) = settlements.recv_joined(Duration::ZERO) {
                             assert!(settlements.owns_completion(&joined));
                             assert_eq!(joined.frames(), frames as u64);
+                            retained_declaration
+                                .as_ref()
+                                .unwrap()
+                                .validate_joined(&proposal, &settlements, &joined)
+                                .unwrap();
                             return pcm;
                         }
                     }

@@ -195,3 +195,33 @@ from historical rows, persist a Frozen/seal control or confer physical authority
 CPU fixtures exercise the actual serializer transport and original barrier across
 all channel counts, as well as arbitrary raw boundaries and unchanged retry data.
 Full OPT-2145 owner integration remains open.
+
+## Original normalized declaration custody (9 October 2026)
+
+The original pre-start route now funds its fixed PCM carry within the unchanged
+64-KiB route allowance. When it observes its original terminal barrier, it separately
+debits the existing ordinary pool for the bounded prepared batch and transient
+proposal/control encodings before materializing normalized terminal data. The
+original batch, its credit, the barrier and any selected preparation/transaction
+errors stay under the original retained slot. An unknown raw cursor or refused
+debit retains only the previous V2 audit observation, with acknowledgement withheld.
+
+The closed V3 Finalizing payload wraps that original V2 producer observation and
+exactly four optional declaration entries: at most two PCM chunks followed by the
+two fixed header patches. Each entry binds identity, role, range and byte hash.
+Its validator derives the exact terminal slot/range partition from the raw offset
+and finite final extent, checks stable identities and exact patch hashes, and
+rejects missing, extra or reordered entries. Exact prepared bytes are compared
+against declarations before retention; the original joined proof is also checked.
+This is still data custody, never a physical receipt or live close capability.
+
+The same funded exclusive transaction and reservation CAS writes either known V2
+or V3 data, preserving the original four IDs, sequences and 16-KiB charge. Exact
+postcommit readback, original current Source/profile/capacity checks, rollback and
+uncertain-outcome custody remain required. Recovery understands only these known
+Finalizing grammars; unknown versions and other control roles still fail closed.
+Even an exact declared new chunk remains refused by the generic append path.
+
+Full OPT-2145 remains open: actual admitted terminal retention/acknowledgement,
+original successful close capability, Frozen/seal persistence and paged verification,
+restart/cancel/drain races and native acceptance are not supplied by a declaration.

@@ -2,12 +2,21 @@
 use super::super::initial_settlement_backing::statement;
 use super::*;
 use crate::operation_journal::{
-    owner::InputPermit, recording_commands::controls::RecordingFinalizingInventory,
+    owner::InputPermit,
+    recording_commands::controls::{
+        RecordingDeclaredFinalizingInventory, RecordingFinalizingInventory,
+    },
 };
 use rusqlite::types::ValueRef;
 use std::io::{self, Write};
 
 impl OperationJournalStore {
+    pub(in crate::operation_journal) fn fund_recording_terminal_encoding(
+        proposal: &RecordingProposal,
+        input: &InputPermit,
+    ) -> Result<InputPermit, OperationJournalStoreError> {
+        terminal_encoding_credit(proposal, input)
+    }
     /// Only inside the original separately funded terminal snapshot held EXCLUSIVE.
     /// The owner retains its genuine private producer barrier, Source effect pin and current
     /// capacity through this mutation. Initial control identities/sequences never change.
@@ -15,6 +24,35 @@ impl OperationJournalStore {
         &self,
         proposal: &RecordingProposal,
         inventory: &RecordingFinalizingInventory,
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.record_finalizing_encoded_inside_original_transaction(
+            proposal,
+            || inventory.encode(proposal),
+            input,
+        )
+    }
+
+    pub(in crate::operation_journal) fn record_declared_finalizing_inside_original_transaction(
+        &self,
+        proposal: &RecordingProposal,
+        inventory: &RecordingDeclaredFinalizingInventory,
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.record_finalizing_encoded_inside_original_transaction(
+            proposal,
+            || inventory.encode(proposal),
+            input,
+        )
+    }
+
+    fn record_finalizing_encoded_inside_original_transaction(
+        &self,
+        proposal: &RecordingProposal,
+        encode: impl FnOnce() -> Result<
+            Vec<u8>,
+            crate::operation_journal::recording_commands::RecordingValueError,
+        >,
         input: &InputPermit,
     ) -> Result<(), OperationJournalStoreError> {
         if !self.recording_terminal_scope.get() || self.connection.is_autocommit() {
@@ -28,7 +66,7 @@ impl OperationJournalStore {
             let expected = RecordingControlReservation::new(proposal, ControlRole::Finalizing)
                 .map_err(error)?;
             let empty = expected.encode(proposal).map_err(error)?;
-            let encoded = inventory.encode(proposal).map_err(error)?;
+            let encoded = encode().map_err(error)?;
             let mut operation = [0; 36];
             let operation = proposal
                 .operation_id()
@@ -55,7 +93,7 @@ impl OperationJournalStore {
             {
                 return Err(error);
             }
-            self.verify_finalizing_readback(proposal, inventory, input)?;
+            self.verify_finalizing_encoded_readback(proposal, &encoded, input)?;
             self.validate_namespace_with_input(Some(input), true)
         })();
         if result.is_err() {
@@ -71,8 +109,41 @@ impl OperationJournalStore {
         input: &InputPermit,
     ) -> Result<(), OperationJournalStoreError> {
         let working = terminal_encoding_credit(proposal, input)?;
+        let result = inventory
+            .encode(proposal)
+            .map_err(error)
+            .and_then(|encoded| self.verify_finalizing_encoded_readback(proposal, &encoded, input));
+        if result.is_err() {
+            input.retain_historical_error(working, None, None, None);
+        }
+        result
+    }
+
+    pub(in crate::operation_journal) fn verify_declared_finalizing_readback(
+        &self,
+        proposal: &RecordingProposal,
+        inventory: &RecordingDeclaredFinalizingInventory,
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
+        let working = terminal_encoding_credit(proposal, input)?;
+        let result = inventory
+            .encode(proposal)
+            .map_err(error)
+            .and_then(|encoded| self.verify_finalizing_encoded_readback(proposal, &encoded, input));
+        if result.is_err() {
+            input.retain_historical_error(working, None, None, None);
+        }
+        result
+    }
+
+    fn verify_finalizing_encoded_readback(
+        &self,
+        proposal: &RecordingProposal,
+        expected: &[u8],
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
+        let working = terminal_encoding_credit(proposal, input)?;
         let result = (|| {
-            let expected = inventory.encode(proposal).map_err(error)?;
             let mut operation = [0; 36];
             let operation = proposal
                 .operation_id()

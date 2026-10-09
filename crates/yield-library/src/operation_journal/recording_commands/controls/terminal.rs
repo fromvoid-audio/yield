@@ -9,8 +9,8 @@ use reson::recording::{
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecordingFinalizingInventory {
     version: u16,
-    reservation: RecordingControlReservation,
-    terminal_id: Uuid,
+    pub(super) reservation: RecordingControlReservation,
+    pub(super) terminal_id: Uuid,
     acquisition: Uuid,
     generation: u64,
     terminal: RecordingTerminalKind,
@@ -24,15 +24,18 @@ pub(crate) struct RecordingFinalizingInventory {
     pending_write_id: Uuid,
     riff_write_id: Uuid,
     data_write_id: Uuid,
-    pending_offset: u64,
+    pub(super) pending_offset: u64,
     pending_length: u32,
     pending_hash: [u8; 32],
-    object_bytes: u64,
-    riff_length_patch: [u8; 4],
-    data_length_patch: [u8; 4],
+    pub(super) object_bytes: u64,
+    pub(super) riff_length_patch: [u8; 4],
+    pub(super) data_length_patch: [u8; 4],
 }
 
 impl RecordingFinalizingInventory {
+    pub(crate) fn terminal_id(&self) -> Uuid {
+        self.terminal_id
+    }
     /// Capture original private producer evidence; this data alone authorizes no transaction.
     pub(crate) fn capture(
         proposal: &RecordingProposal,
@@ -85,7 +88,7 @@ impl RecordingFinalizingInventory {
         value.validate(proposal)?;
         Ok(value)
     }
-    fn validate(&self, proposal: &RecordingProposal) -> Result<(), RecordingValueError> {
+    pub(super) fn validate(&self, proposal: &RecordingProposal) -> Result<(), RecordingValueError> {
         if self.version != 2
             || self.reservation
                 != RecordingControlReservation::new(proposal, ControlRole::Finalizing)?
