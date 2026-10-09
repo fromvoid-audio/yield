@@ -14,7 +14,7 @@ use std::time::Duration;
 pub use self::buffered::Buffered;
 pub use self::fade::FadeIn;
 pub use self::limit::{TakeDuration, TakeSamples};
-pub(crate) use self::output_adapter::OutputAdapter;
+pub(crate) use self::output_adapter::{OutputAdapter, StereoOutputPair};
 pub use self::repeat::RepeatInfinite;
 pub use self::samples_buffer::SamplesBuffer;
 
@@ -22,6 +22,12 @@ pub use self::samples_buffer::SamplesBuffer;
 ///
 /// Implementors expose channel and sample-rate metadata so playback code can
 /// compose wrappers without losing timing information.
+///
+/// Sources submitted directly to native audio output are advanced on the
+/// device callback thread. Their `next` implementation must therefore be
+/// real-time safe: it must not block, allocate, perform I/O, or acquire a
+/// potentially blocking lock. Sources that cannot meet this contract should
+/// be decoded or prepared off-thread before submission.
 pub trait Source: Iterator<Item = f32> + Send {
     /// Returns the number of samples in the current frame, if known.
     fn current_frame_len(&self) -> Option<usize>;

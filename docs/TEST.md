@@ -181,11 +181,19 @@ Native `--case` accepts one of the exact recording selectors below,
 `prerequisite:<name>` for the six named cases in the retired native-prerequisite
 runner (`profile-generations`, `source-release-policy`, `startup-production`,
 `startup-control-failure`, `startup-namespace-failure`, or
-`sdk-and-startup-components`), or `catalog-replay` for the existing macOS
-catalog replay runner. These routes are closed allowlists; each required frozen
-runner must exist in the requested source commit. Multi-command validators keep
-a shared read lease for their whole process tree, and their generated evidence
-is copied into that run's retained evidence directory.
+`sdk-and-startup-components`), `catalog-replay` for the existing macOS catalog
+replay runner, or `audition-coreaudio` for the two named real-output CoreAudio
+runtime checks. These routes are closed allowlists; each required frozen runner
+must exist in the requested source commit. Multi-command validators keep a
+shared read lease for their whole process tree, and their generated evidence is
+copied into that run's retained evidence directory. The audition route requires
+the caller to set `YIELD_TEST_AUDIO_OUTPUT=1` before invoking the command; the
+CLI refuses before clean-state preparation if the inherited opt-in is absent.
+The runner checks the opt-in and macOS platform again, records device/toolchain
+and writable-APFS evidence, and requires each exact ignored selector to report
+exactly one pass with no failures or ignored tests. Its callback probe verifies
+the selected digital output route and callback behavior; it does not establish
+analog output, audible quality, or blanket hardware compatibility.
 
 The `prerequisite:startup-namespace-failure` compatibility case runs both the
 original blocking-receive namespace failure selector and its poll-based twin.
@@ -210,6 +218,14 @@ explicit after the app exits; do not silently restore over an active clean
 session. Production reset is always explicitly selected, never inferred from a
 default development command. No recursive-delete, force-unlock or marker-editing
 option belongs in this interface.
+
+Run the opt-in CoreAudio checks explicitly with
+`YIELD_TEST_AUDIO_OUTPUT=1 scripts/yield-local-ci check --sha <full-commit-sha> --lane native --case audition-coreaudio`.
+The local runner requires macOS and writable APFS, retains toolchain/device
+inventory and both exact-selector transcripts in the CI run evidence, and
+restores the prior production state on success or failure. This is evidence of
+the tested callback's digital routing and native stream behavior only; it does
+not prove analog output or that a person heard acceptable audio.
 
 ### Reversible clean transaction
 

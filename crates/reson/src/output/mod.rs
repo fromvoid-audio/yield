@@ -63,6 +63,12 @@ pub enum AudioOutputError {
         /// Underlying cpal error.
         source: cpal::PlayStreamError,
     },
+    /// Failed to start the off-thread audio lifecycle dispatcher.
+    #[error("Failed to start audio lifecycle thread: {source}")]
+    LifecycleThread {
+        /// Underlying thread creation error.
+        source: std::io::Error,
+    },
     /// Failed to resolve the default output config for a host.
     #[error("Default config error for {host_id}: {source}")]
     DefaultConfig {

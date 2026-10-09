@@ -35,6 +35,8 @@ mod routing;
 mod source;
 #[cfg(feature = "native-audio")]
 mod telemetry;
+#[cfg(test)]
+mod test_support;
 #[cfg(feature = "native-audio")]
 mod time_stretch;
 #[cfg(feature = "native-audio")]

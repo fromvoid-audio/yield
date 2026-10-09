@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use crate::source::StereoOutputPair;
 use crate::telemetry;
 use crate::{OutputAdapter, Source};
 use tracing::warn;
@@ -52,16 +53,20 @@ impl AudioPlayer {
         let target_channels = self.output.channel_count.max(1);
         let input_sample_rate = source.sample_rate();
         let input_channels = source.channels();
-        let source: Box<dyn Source + Send> =
-            if input_sample_rate == target_sample_rate && input_channels == target_channels {
-                Box::new(source)
-            } else {
-                Box::new(OutputAdapter::new(
-                    source,
-                    target_sample_rate,
-                    target_channels,
-                ))
-            };
+        let output_pair = StereoOutputPair::default();
+        let adapted = input_sample_rate != target_sample_rate
+            || input_channels != target_channels
+            || !output_pair.can_bypass(input_channels.max(1) as usize, target_channels as usize);
+        let source: Box<dyn Source + Send> = if !adapted {
+            Box::new(source)
+        } else {
+            Box::new(OutputAdapter::with_output_pair(
+                source,
+                target_sample_rate,
+                target_channels,
+                output_pair,
+            ))
+        };
         let format = (source.sample_rate(), source.channels());
         let handle = FadeOutHandle::new();
 
@@ -90,7 +95,7 @@ impl AudioPlayer {
                 input_channels,
                 target_sample_rate,
                 target_channels,
-                adapted = input_sample_rate != target_sample_rate || input_channels != target_channels,
+                adapted,
                 elapsed_ms = telemetry::elapsed_ms(append_started_at.elapsed()),
                 "Audio player stage"
             );
@@ -108,7 +113,7 @@ impl AudioPlayer {
                 input_channels,
                 target_sample_rate,
                 target_channels,
-                adapted = input_sample_rate != target_sample_rate || input_channels != target_channels,
+                adapted,
                 elapsed_ms = telemetry::elapsed_ms(started_at.elapsed()),
                 "Audio player stage"
             );

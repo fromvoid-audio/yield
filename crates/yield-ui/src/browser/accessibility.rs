@@ -60,6 +60,9 @@ const THEME_RESET: &str = "settings-theme-reset";
 const MOTION: &str = "settings-motion";
 const TEXT_SCALE: &str = "settings-text-scale";
 const AUTOPLAY: &str = "settings-autoplay";
+const ANTI_CLICK: &str = "settings-anti-click-toggle";
+const ANTI_CLICK_FADE_DECREASE: &str = "settings-anti-click-fade-decrease";
+const ANTI_CLICK_FADE_INCREASE: &str = "settings-anti-click-fade-increase";
 const HELP_TIPS: &str = "settings-help-tips";
 const VISUAL_EFFECT_PRESET: &str = "settings-visual-effect-preset";
 const VISUAL_EFFECT_TOGGLE: &str = "settings-visual-effect-toggle";
@@ -94,6 +97,9 @@ const SETTINGS_ORDER: &[&str] = &[
     MOTION,
     TEXT_SCALE,
     AUTOPLAY,
+    ANTI_CLICK,
+    ANTI_CLICK_FADE_DECREASE,
+    ANTI_CLICK_FADE_INCREASE,
     HELP_TIPS,
     VISUAL_EFFECT_PRESET,
     VISUAL_EFFECT_TOGGLE,
@@ -919,7 +925,13 @@ impl Browser {
             .is_some_and(|state| state.enabled);
         match id {
             SETTINGS_CLOSE | THEME_RESET => true,
-            THEME_CHOOSE | MOTION | TEXT_SCALE | AUTOPLAY | HELP_TIPS => editable,
+            THEME_CHOOSE | MOTION | TEXT_SCALE | AUTOPLAY | ANTI_CLICK | HELP_TIPS => editable,
+            ANTI_CLICK_FADE_DECREASE => editable && self.preferences.anti_click_settings().1 > 0.0,
+            ANTI_CLICK_FADE_INCREASE => {
+                editable
+                    && self.preferences.anti_click_settings().1
+                        < yield_session::MAX_ANTI_CLICK_FADE_MS
+            }
             USER_SHADER_IMPORT => {
                 editable
                     && self.preferences.ready_for_maintenance()
@@ -1004,6 +1016,9 @@ impl Browser {
             MOTION => self.toggle_motion_from_accessibility(cx),
             TEXT_SCALE => self.toggle_text_scale_from_accessibility(cx),
             AUTOPLAY => self.toggle_autoplay_from_accessibility(cx),
+            ANTI_CLICK => self.toggle_anti_click(cx),
+            ANTI_CLICK_FADE_DECREASE => self.change_anti_click_fade(-1.0, cx),
+            ANTI_CLICK_FADE_INCREASE => self.change_anti_click_fade(1.0, cx),
             HELP_TIPS => self.toggle_help_tooltips_from_accessibility(cx),
             VISUAL_EFFECT_PRESET => self.cycle_visual_effect_preset(cx),
             VISUAL_EFFECT_TOGGLE => self.toggle_visual_effect_from_accessibility(window, cx),
@@ -1410,6 +1425,8 @@ impl Browser {
                 let busy = self.general_settings.maintenance_busy();
                 let weeks = self.general_settings.rating_decay_weeks;
                 let weeks_value = Some(format!("{weeks} weeks"));
+                let (anti_click_enabled, anti_click_fade_ms) =
+                    self.preferences.anti_click_settings();
                 let theme = crate::theme::active(cx);
                 let effect = self.visual_effect_config();
                 let debug_effect_override = cx
@@ -1468,6 +1485,26 @@ impl Browser {
                         "Autoplay selection",
                         self.autoplay_selection,
                         editable,
+                    ),
+                    toggle(ANTI_CLICK, "Anti-click fades", anti_click_enabled, editable),
+                    button(
+                        ANTI_CLICK_FADE_DECREASE,
+                        "Decrease anti-click fade",
+                        None,
+                        editable && anti_click_fade_ms > 0.0,
+                    ),
+                    AxChild {
+                        id: "settings-anti-click-fade-value".into(),
+                        role: AxRole::StaticText,
+                        label: "Anti-click fade duration".into(),
+                        value: Some(format!("{anti_click_fade_ms} ms")),
+                        enabled: true,
+                    },
+                    button(
+                        ANTI_CLICK_FADE_INCREASE,
+                        "Increase anti-click fade",
+                        None,
+                        editable && anti_click_fade_ms < yield_session::MAX_ANTI_CLICK_FADE_MS,
                     ),
                     toggle(HELP_TIPS, "Help tips", self.help_tooltips_enabled, editable),
                     button(

@@ -1,6 +1,6 @@
 use crate::Source;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const MIN_MUTE_FADE_SECS: f32 = 0.002;
@@ -90,10 +90,135 @@ pub(crate) struct EditFadeSnapshot {
     pub fade_out: Option<FadeParams>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct EditFadeShared {
-    state: RwLock<EditFadeSnapshot>,
-    version: AtomicU64,
+    writer: Mutex<()>,
+    published: AtomicU64,
+    slots: [EditFadeSlot; 2],
+}
+
+#[derive(Debug)]
+struct EditFadeSlot {
+    active: AtomicU32,
+    start_seconds: AtomicU32,
+    end_seconds: AtomicU32,
+    gain: AtomicU32,
+    fade_in: AtomicFadeParams,
+    fade_out: AtomicFadeParams,
+}
+
+#[derive(Debug)]
+struct AtomicFadeParams {
+    present: AtomicU32,
+    length: AtomicU32,
+    curve: AtomicU32,
+    mute: AtomicU32,
+    outer_gain: AtomicU32,
+}
+
+impl Default for AtomicFadeParams {
+    fn default() -> Self {
+        Self {
+            present: AtomicU32::new(0),
+            length: AtomicU32::new(0.0_f32.to_bits()),
+            curve: AtomicU32::new(0.0_f32.to_bits()),
+            mute: AtomicU32::new(0.0_f32.to_bits()),
+            outer_gain: AtomicU32::new(0.0_f32.to_bits()),
+        }
+    }
+}
+
+impl AtomicFadeParams {
+    fn store(&self, params: Option<FadeParams>) {
+        if let Some(params) = params {
+            self.length.store(params.length.to_bits(), Ordering::SeqCst);
+            self.curve.store(params.curve.to_bits(), Ordering::SeqCst);
+            self.mute.store(params.mute.to_bits(), Ordering::SeqCst);
+            self.outer_gain
+                .store(params.outer_gain.to_bits(), Ordering::SeqCst);
+            self.present.store(1, Ordering::SeqCst);
+        } else {
+            self.present.store(0, Ordering::SeqCst);
+        }
+    }
+
+    fn load(&self) -> Option<FadeParams> {
+        (self.present.load(Ordering::SeqCst) != 0).then(|| FadeParams {
+            length: f32::from_bits(self.length.load(Ordering::SeqCst)),
+            curve: f32::from_bits(self.curve.load(Ordering::SeqCst)),
+            mute: f32::from_bits(self.mute.load(Ordering::SeqCst)),
+            outer_gain: f32::from_bits(self.outer_gain.load(Ordering::SeqCst)),
+        })
+    }
+}
+
+impl Default for EditFadeSlot {
+    fn default() -> Self {
+        Self {
+            active: AtomicU32::new(0),
+            start_seconds: AtomicU32::new(0.0_f32.to_bits()),
+            end_seconds: AtomicU32::new(0.0_f32.to_bits()),
+            gain: AtomicU32::new(1.0_f32.to_bits()),
+            fade_in: AtomicFadeParams::default(),
+            fade_out: AtomicFadeParams::default(),
+        }
+    }
+}
+
+impl EditFadeSlot {
+    fn store(&self, snapshot: EditFadeSnapshot) {
+        self.active
+            .store(u32::from(snapshot.active), Ordering::SeqCst);
+        self.start_seconds
+            .store(snapshot.start_seconds.to_bits(), Ordering::SeqCst);
+        self.end_seconds
+            .store(snapshot.end_seconds.to_bits(), Ordering::SeqCst);
+        self.gain.store(snapshot.gain.to_bits(), Ordering::SeqCst);
+        self.fade_in.store(snapshot.fade_in);
+        self.fade_out.store(snapshot.fade_out);
+    }
+
+    fn load(&self) -> EditFadeSnapshot {
+        EditFadeSnapshot {
+            active: self.active.load(Ordering::SeqCst) != 0,
+            start_seconds: f32::from_bits(self.start_seconds.load(Ordering::SeqCst)),
+            end_seconds: f32::from_bits(self.end_seconds.load(Ordering::SeqCst)),
+            gain: f32::from_bits(self.gain.load(Ordering::SeqCst)),
+            fade_in: self.fade_in.load(),
+            fade_out: self.fade_out.load(),
+        }
+    }
+}
+
+impl Default for EditFadeShared {
+    fn default() -> Self {
+        Self {
+            writer: Mutex::new(()),
+            published: AtomicU64::new(2),
+            slots: [EditFadeSlot::default(), EditFadeSlot::default()],
+        }
+    }
+}
+
+impl EditFadeShared {
+    fn try_snapshot(&self) -> Option<(u64, EditFadeSnapshot)> {
+        let before = self.published.load(Ordering::SeqCst);
+        let slot_index = (before & 1) as usize;
+        let snapshot = self.slots[slot_index].load();
+        let after = self.published.load(Ordering::SeqCst);
+        (before == after).then_some((before >> 1, snapshot))
+    }
+
+    fn publish(&self, snapshot: EditFadeSnapshot) {
+        let current = self.published.load(Ordering::SeqCst);
+        let generation = (current >> 1).wrapping_add(1);
+        let slot_index = ((current & 1) ^ 1) as usize;
+        self.slots[slot_index].store(snapshot);
+        self.published.store(
+            generation.wrapping_mul(2) | slot_index as u64,
+            Ordering::SeqCst,
+        );
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -109,32 +234,49 @@ impl EditFadeHandle {
     }
 
     pub(crate) fn update(&self, range: Option<EditFadeRange>, total_duration_secs: f32) {
-        if let Ok(mut state) = self.shared.state.write() {
-            if let Some(range) = range {
-                state.active = true;
-                state.start_seconds = range.start * total_duration_secs;
-                state.end_seconds = range.end * total_duration_secs;
-                state.gain = range.gain;
-                state.fade_in = range.fade_in;
-                state.fade_out = range.fade_out;
-            } else {
-                state.active = false;
-                state.gain = 1.0;
-                state.fade_in = None;
-                state.fade_out = None;
-            }
-            self.shared.version.fetch_add(1, Ordering::Release);
+        let _writer = self
+            .shared
+            .writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut snapshot = self
+            .shared
+            .try_snapshot()
+            .map_or_else(EditFadeSnapshot::default, |(_, snapshot)| snapshot);
+        if let Some(range) = range {
+            snapshot.active = true;
+            snapshot.start_seconds = range.start * total_duration_secs;
+            snapshot.end_seconds = range.end * total_duration_secs;
+            snapshot.gain = range.gain;
+            snapshot.fade_in = range.fade_in;
+            snapshot.fade_out = range.fade_out;
+        } else {
+            snapshot.active = false;
+            snapshot.gain = 1.0;
+            snapshot.fade_in = None;
+            snapshot.fade_out = None;
         }
+        self.shared.publish(snapshot);
     }
 
     /// Return the current edit-fade snapshot version.
     pub(crate) fn version(&self) -> u64 {
-        self.shared.version.load(Ordering::Acquire)
+        self.shared.published.load(Ordering::SeqCst) >> 1
     }
 
     /// Return a copy of the latest edit-fade snapshot.
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> EditFadeSnapshot {
-        *self.shared.state.read().unwrap_or_else(|e| e.into_inner())
+        loop {
+            if let Some((_, snapshot)) = self.shared.try_snapshot() {
+                return snapshot;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    fn snapshot_with_version(&self) -> Option<(u64, EditFadeSnapshot)> {
+        self.shared.try_snapshot()
     }
 }
 
@@ -194,8 +336,15 @@ where
     ) -> Self {
         let sample_rate = inner.sample_rate();
         let channels = inner.channels();
-        let cached_version = handle.version();
-        let cached_state = handle.snapshot();
+        let (cached_version, cached_state) = loop {
+            if let Some(snapshot) = handle.snapshot_with_version() {
+                break snapshot;
+            }
+            // Construction happens off the audio callback. If a control writer
+            // is publishing the alternate slot, retry rather than recording a
+            // newer version alongside an older default snapshot.
+            std::hint::spin_loop();
+        };
         Self {
             inner,
             handle,
@@ -215,8 +364,10 @@ where
         if version == self.cached_version {
             return;
         }
-        self.cached_state = self.handle.snapshot();
-        self.cached_version = version;
+        if let Some((snapshot_version, snapshot)) = self.handle.snapshot_with_version() {
+            self.cached_state = snapshot;
+            self.cached_version = snapshot_version;
+        }
     }
 }
 
@@ -376,11 +527,16 @@ where
     fn total_duration(&self) -> Option<Duration> {
         self.inner.total_duration()
     }
+
+    fn last_error(&self) -> Option<String> {
+        self.inner.last_error()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     #[test]
     fn outer_gain_scales_realtime_extension_fades() {
@@ -400,5 +556,37 @@ mod tests {
         assert!(left_selection_edge.abs() < 1e-6);
         assert!(right_selection_edge.abs() < 1e-6);
         assert!((right_outer_end - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn atomic_edit_fade_mailbox_publishes_coherent_snapshots() {
+        let handle = EditFadeHandle::new();
+        let writer = handle.clone();
+        let update_thread = thread::spawn(move || {
+            for index in 0..20_000 {
+                let start = index as f32 / 20_000.0;
+                writer.update(
+                    Some(EditFadeRange::new(
+                        start,
+                        start + 0.25,
+                        start + 1.0,
+                        Some(FadeParams::new(0.1, 0.4, 0.2)),
+                        None,
+                    )),
+                    4.0,
+                );
+            }
+        });
+
+        for _ in 0..20_000 {
+            let snapshot = handle.snapshot();
+            if snapshot.active {
+                assert!((snapshot.end_seconds - snapshot.start_seconds - 1.0).abs() < 1e-5);
+                assert!((snapshot.gain - (snapshot.start_seconds / 4.0 + 1.0)).abs() < 1e-5);
+                assert_eq!(snapshot.fade_in, Some(FadeParams::new(0.1, 0.4, 0.2)));
+                assert_eq!(snapshot.fade_out, None);
+            }
+        }
+        update_thread.join().unwrap();
     }
 }

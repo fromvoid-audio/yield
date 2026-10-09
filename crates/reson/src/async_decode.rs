@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,17 +12,73 @@ use crate::telemetry;
 
 const PRODUCER_BACKOFF: Duration = Duration::from_millis(1);
 const PREFILL_POLL: Duration = Duration::from_millis(1);
+const DECODER_WORKER_CAPACITY: usize = 512;
+
+struct DecoderWorkerPool {
+    active: AtomicUsize,
+    capacity: usize,
+}
+
+impl DecoderWorkerPool {
+    const fn new(capacity: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            capacity,
+        }
+    }
+
+    fn try_acquire(&'static self) -> Option<DecoderWorkerPermit> {
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.capacity {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(DecoderWorkerPermit { pool: self }),
+                Err(latest) => active = latest,
+            }
+        }
+    }
+}
+
+static GLOBAL_DECODER_WORKERS: DecoderWorkerPool = DecoderWorkerPool::new(DECODER_WORKER_CAPACITY);
+
+struct DecoderWorkerPermit {
+    pool: &'static DecoderWorkerPool,
+}
+
+impl Drop for DecoderWorkerPermit {
+    fn drop(&mut self) {
+        self.pool.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct DecoderWorkerSource<S> {
+    source: Option<S>,
+    _permit: DecoderWorkerPermit,
+}
+
+impl<S> Drop for DecoderWorkerSource<S> {
+    fn drop(&mut self) {
+        drop(self.source.take());
+    }
+}
 
 /// Streams samples from a source on a background thread into a lock-free ring buffer.
 ///
 /// The decoder thread owns `S` and cooperatively checks `stop` between source reads and
-/// ring-buffer backpressure waits. Consumer-facing methods join the worker once it has
-/// quiesced so resources are reclaimed deterministically. Dropping `AsyncSource` always
-/// requests stop, but it only blocks to join if the worker has already finished; otherwise
+/// ring-buffer backpressure waits. Prefill and off-thread destruction join a finished
+/// worker; the sample callback never joins. Dropping `AsyncSource` always requests stop,
+/// but it only blocks to join if the worker has already finished; otherwise
 /// the worker is intentionally left detached so audio teardown never stalls on a blocked
 /// decoder backend.
 pub(crate) struct AsyncSource<S> {
-    consumer: ringbuf::HeapCons<f32>,
+    consumer: Option<ringbuf::HeapCons<f32>>,
     sample_rate: u32,
     channels: u16,
     total_duration: Option<Duration>,
@@ -41,10 +97,38 @@ where
     ///
     /// Non-finite or tiny buffer sizes are sanitized through [`buffer_samples`].
     pub(crate) fn with_buffer_seconds(source: S, buffer_seconds: f32) -> Self {
+        Self::with_buffer_seconds_from_pool(source, buffer_seconds, &GLOBAL_DECODER_WORKERS)
+    }
+
+    fn with_buffer_seconds_from_pool(
+        source: S,
+        buffer_seconds: f32,
+        pool: &'static DecoderWorkerPool,
+    ) -> Self {
         let construct_started_at = telemetry::playback_telemetry_enabled().then(Instant::now);
         let sample_rate = source.sample_rate();
         let channels = source.channels();
         let total_duration = source.total_duration();
+        let Some(worker_permit) = pool.try_acquire() else {
+            drop(source);
+            return Self {
+                consumer: None,
+                sample_rate,
+                channels,
+                total_duration,
+                worker: None,
+                done: Arc::new(AtomicBool::new(true)),
+                stop: Arc::new(AtomicBool::new(true)),
+                last_error: Arc::new(Mutex::new(Some(String::from(
+                    "Async decode worker capacity reached",
+                )))),
+                _marker: PhantomData,
+            };
+        };
+        let mut worker_source = DecoderWorkerSource {
+            source: Some(source),
+            _permit: worker_permit,
+        };
         let buffer_samples = buffer_samples(sample_rate, channels, buffer_seconds);
 
         let rb = HeapRb::<f32>::new(buffer_samples.max(1));
@@ -60,10 +144,14 @@ where
         let spawn_result = thread::Builder::new()
             .name("audio-decode".to_string())
             .spawn(move || {
+                let source_guard = &mut worker_source;
                 let worker_started_at = telemetry::playback_telemetry_enabled().then(Instant::now);
                 let mut produced_samples = 0usize;
                 let decode_result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let mut source = source;
+                    let mut source = source_guard
+                        .source
+                        .take()
+                        .expect("decoder worker source is present at spawn");
                     loop {
                         if thread_stop.load(Ordering::Relaxed) {
                             break;
@@ -131,7 +219,7 @@ where
         };
 
         let created = Self {
-            consumer,
+            consumer: Some(consumer),
             sample_rate,
             channels,
             total_duration,
@@ -189,7 +277,10 @@ where
     fn prefill_samples(&mut self, target_samples: usize, timeout: Duration) -> usize {
         let started_at = telemetry::playback_telemetry_enabled().then(Instant::now);
         if target_samples == 0 {
-            let available = self.consumer.occupied_len();
+            let available = self
+                .consumer
+                .as_ref()
+                .map_or(0, |consumer| consumer.occupied_len());
             if let Some(started_at) = started_at {
                 tracing::info!(
                     target: "perf::audio_start",
@@ -207,7 +298,10 @@ where
         }
         let deadline = Instant::now() + timeout;
         loop {
-            let available = self.consumer.occupied_len();
+            let available = self
+                .consumer
+                .as_ref()
+                .map_or(0, |consumer| consumer.occupied_len());
             if available >= target_samples {
                 if let Some(started_at) = started_at {
                     tracing::info!(
@@ -226,7 +320,10 @@ where
             }
             if self.done.load(Ordering::Acquire) {
                 self.join_finished_worker();
-                let available = self.consumer.occupied_len();
+                let available = self
+                    .consumer
+                    .as_ref()
+                    .map_or(0, |consumer| consumer.occupied_len());
                 if let Some(started_at) = started_at {
                     tracing::info!(
                         target: "perf::audio_start",
@@ -270,11 +367,14 @@ where
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(sample) = self.consumer.try_pop() {
+        if let Some(sample) = self
+            .consumer
+            .as_mut()
+            .and_then(|consumer| consumer.try_pop())
+        {
             return Some(sample);
         }
         if self.done.load(Ordering::Acquire) {
-            self.join_finished_worker();
             return None;
         }
         Some(0.0)
@@ -287,7 +387,11 @@ where
 {
     fn current_frame_len(&self) -> Option<usize> {
         if self.done.load(Ordering::Acquire) {
-            Some(self.consumer.occupied_len())
+            Some(
+                self.consumer
+                    .as_ref()
+                    .map_or(0, |consumer| consumer.occupied_len()),
+            )
         } else {
             None
         }

@@ -151,6 +151,11 @@ impl PreferenceState {
         self.effective().normalized_audition_enabled
     }
 
+    pub(super) fn anti_click_settings(&self) -> (bool, f32) {
+        let effective = self.effective();
+        (effective.anti_click_enabled, effective.anti_click_fade_ms)
+    }
+
     pub(super) fn collection_name(&self, slot: usize) -> Option<String> {
         let mut name = self.baseline.collection_names.get(slot)?.clone();
         for pending in &self.pending {
@@ -400,6 +405,10 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
         PreferencePatch::SetOutputVolume(volume) => {
             preferences.output_volume = *volume;
         }
+        PreferencePatch::SetAntiClickSettings { enabled, fade_ms } => {
+            preferences.anti_click_enabled = *enabled;
+            preferences.anti_click_fade_ms = yield_session::sanitize_anti_click_fade_ms(*fade_ms);
+        }
         PreferencePatch::SetAudioOutput(audio_output) => {
             preferences.audio_output = audio_output.clone();
         }
@@ -471,9 +480,19 @@ impl Browser {
                 revision,
                 preferences,
             } => {
+                let anti_click_enabled = preferences.anti_click_enabled;
+                let anti_click_fade_ms = preferences.anti_click_fade_ms;
                 if !self.preferences.accept_snapshot(revision, preferences) {
                     return false;
                 }
+                tracing::info!(
+                    target: "yield::preferences",
+                    event = "snapshot_accepted",
+                    preference_revision = revision.get(),
+                    anti_click_enabled,
+                    anti_click_fade_ms,
+                    "Accepted profile-owned GPUI preference snapshot"
+                );
                 self.apply_preference_projection(cx);
                 let _ = self.maybe_start_rating_decay(cx);
                 true
@@ -911,6 +930,22 @@ mod tests {
         assert!(!state.normalized_audition_enabled());
         state.queue_for_test(1, PreferencePatch::SetNormalizedAuditionEnabled(true));
         assert!(state.normalized_audition_enabled());
+    }
+
+    #[test]
+    fn anti_click_patch_projects_enabled_and_duration_to_playback() {
+        let mut state = PreferenceState::new();
+        assert_eq!(state.anti_click_settings(), (true, 3.0));
+        state.queue_for_test(
+            1,
+            PreferencePatch::SetAntiClickSettings {
+                enabled: false,
+                fade_ms: 2.0,
+            },
+        );
+        assert_eq!(state.anti_click_settings(), (false, 2.0));
+        assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
+        assert_eq!(state.anti_click_settings(), (false, 2.0));
     }
 
     #[test]

@@ -37,6 +37,10 @@ pub const MIN_RATING_DECAY_WEEKS: u16 = 1;
 pub const MAX_RATING_DECAY_WEEKS: u16 = 52;
 /// Largest strength value accepted for a shipped visual effect.
 pub const MAX_VISUAL_EFFECT_STRENGTH_PERCENT: u16 = 100;
+/// Default playback edge fade used to prevent clicks at audition boundaries.
+pub const DEFAULT_ANTI_CLICK_FADE_MS: f32 = 3.0;
+/// Longest playback edge fade accepted by the preference contract.
+pub const MAX_ANTI_CLICK_FADE_MS: f32 = 50.0;
 
 fn default_rating_decay_weeks() -> u16 {
     DEFAULT_RATING_DECAY_WEEKS
@@ -52,6 +56,50 @@ fn default_autoplay_selection() -> bool {
 
 fn default_output_volume() -> f32 {
     1.0
+}
+
+fn default_anti_click_enabled() -> bool {
+    true
+}
+
+fn default_anti_click_fade_ms() -> f32 {
+    DEFAULT_ANTI_CLICK_FADE_MS
+}
+
+fn deserialize_anti_click_enabled<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_bool().unwrap_or_else(default_anti_click_enabled))
+}
+
+fn deserialize_anti_click_fade_ms<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_f64()
+        .map(sanitize_anti_click_fade_number)
+        .unwrap_or_else(default_anti_click_fade_ms))
+}
+
+fn sanitize_anti_click_fade_number(value: f64) -> f32 {
+    if !value.is_finite() || value < 0.0 {
+        default_anti_click_fade_ms()
+    } else {
+        value.min(f64::from(MAX_ANTI_CLICK_FADE_MS)) as f32
+    }
+}
+
+/// Normalize one anti-click duration using the persisted preference contract.
+pub fn sanitize_anti_click_fade_ms(value: f32) -> f32 {
+    if !value.is_finite() || value < 0.0 {
+        default_anti_click_fade_ms()
+    } else {
+        sanitize_anti_click_fade_number(f64::from(value))
+    }
 }
 
 fn default_text_scale_percent() -> u16 {
@@ -285,6 +333,18 @@ pub struct UiPreferences {
     /// Linear output volume applied to audition playback.
     #[serde(default = "default_output_volume")]
     pub output_volume: f32,
+    /// Whether playback edges use a short fade to prevent clicks.
+    #[serde(
+        default = "default_anti_click_enabled",
+        deserialize_with = "deserialize_anti_click_enabled"
+    )]
+    pub anti_click_enabled: bool,
+    /// Playback edge fade duration in milliseconds; invalid values use the legacy 3 ms default.
+    #[serde(
+        default = "default_anti_click_fade_ms",
+        deserialize_with = "deserialize_anti_click_fade_ms"
+    )]
+    pub anti_click_fade_ms: f32,
     /// Optional output routing requested by the user.
     #[serde(default)]
     pub audio_output: AudioOutputPreferences,
@@ -314,6 +374,8 @@ impl Default for UiPreferences {
             loop_lock_override: None,
             normalized_audition_enabled: false,
             output_volume: 1.0,
+            anti_click_enabled: default_anti_click_enabled(),
+            anti_click_fade_ms: default_anti_click_fade_ms(),
             audio_output: AudioOutputPreferences::default(),
             collection_names: default_collection_names(),
             shipped_visual_effect: ShippedVisualEffectPreferences::default(),
@@ -338,7 +400,7 @@ impl UiPreferences {
     }
 
     /// Validate the complete preference document without performing filesystem I/O.
-    pub fn validate(self) -> Result<Self, PreferenceError> {
+    pub fn validate(mut self) -> Result<Self, PreferenceError> {
         if self.schema_version != UI_PREFERENCES_SCHEMA_VERSION {
             return Err(PreferenceError::UnsupportedSchema {
                 actual: self.schema_version,
@@ -353,6 +415,7 @@ impl UiPreferences {
         validate_rating_decay_weeks(self.rating_decay_weeks)?;
         validate_trash_folder(self.trash_folder.as_deref())?;
         validate_output_volume(self.output_volume)?;
+        self.anti_click_fade_ms = sanitize_anti_click_fade_ms(self.anti_click_fade_ms);
         self.audio_output.validate()?;
         self.shipped_visual_effect.validate()?;
         if let Some(user_shader) = self.user_shader.as_ref() {
@@ -603,6 +666,13 @@ pub enum PreferencePatch {
     SetNormalizedAuditionEnabled(bool),
     /// Change the linear audition output volume.
     SetOutputVolume(f32),
+    /// Configure the playback edge fade used to prevent clicks.
+    SetAntiClickSettings {
+        /// Whether new audition requests apply a playback edge fade.
+        enabled: bool,
+        /// Requested fade duration in milliseconds, normalized to the supported range.
+        fade_ms: f32,
+    },
     /// Replace all optional audio output routing fields atomically.
     SetAudioOutput(AudioOutputPreferences),
     /// Assign a custom display label to one stable collection slot.
@@ -674,6 +744,10 @@ impl PreferencePatch {
             Self::SetOutputVolume(volume) => {
                 validate_output_volume(volume)?;
                 preferences.output_volume = volume;
+            }
+            Self::SetAntiClickSettings { enabled, fade_ms } => {
+                preferences.anti_click_enabled = enabled;
+                preferences.anti_click_fade_ms = sanitize_anti_click_fade_ms(fade_ms);
             }
             Self::SetAudioOutput(audio_output) => {
                 audio_output.validate()?;
@@ -1914,6 +1988,74 @@ mod tests {
         assert_eq!(preferences.trash_folder, None);
         PreferencePatch::Reset.apply(&mut preferences).unwrap();
         assert_eq!(preferences.rating_decay_weeks, 4);
+    }
+
+    #[test]
+    fn anti_click_settings_default_sanitize_and_round_trip() {
+        let defaults = UiPreferences::default();
+        assert!(defaults.anti_click_enabled);
+        assert_eq!(defaults.anti_click_fade_ms, DEFAULT_ANTI_CLICK_FADE_MS);
+
+        let mut old_payload = serde_json::to_value(defaults).expect("encode old payload");
+        old_payload
+            .as_object_mut()
+            .unwrap()
+            .remove("anti_click_enabled");
+        old_payload
+            .as_object_mut()
+            .unwrap()
+            .remove("anti_click_fade_ms");
+        let old = UiPreferences::from_payload(&old_payload.to_string()).expect("legacy defaults");
+        assert!(old.anti_click_enabled);
+        assert_eq!(old.anti_click_fade_ms, 3.0);
+
+        for encoded in ["null", "0", "\"disabled\"", "{}"] {
+            let mut payload = serde_json::to_value(UiPreferences::default()).unwrap();
+            payload["anti_click_enabled"] = serde_json::from_str(encoded).unwrap();
+            payload["output_volume"] = serde_json::json!(0.25);
+            let loaded = UiPreferences::from_payload(&payload.to_string()).unwrap();
+            assert!(loaded.anti_click_enabled, "invalid enable flag {encoded}");
+            assert_eq!(loaded.output_volume, 0.25, "unrelated preferences survive");
+        }
+
+        for (encoded, expected) in [
+            ("-1", 3.0),
+            ("\"NaN\"", 3.0),
+            ("{}", 3.0),
+            ("0", 0.0),
+            ("2", 2.0),
+            ("3", 3.0),
+            ("51", 50.0),
+            ("1e300", 50.0),
+        ] {
+            let mut payload = serde_json::to_value(UiPreferences::default()).unwrap();
+            payload["anti_click_fade_ms"] = serde_json::from_str(encoded).unwrap();
+            let loaded = UiPreferences::from_payload(&payload.to_string())
+                .unwrap_or_else(|error| panic!("decode {encoded}: {error}"));
+            assert_eq!(loaded.anti_click_fade_ms, expected, "input {encoded}");
+        }
+
+        let mut preferences = old;
+        PreferencePatch::SetAntiClickSettings {
+            enabled: false,
+            fade_ms: 2.0,
+        }
+        .apply(&mut preferences)
+        .expect("apply disabled settings");
+        assert!(!preferences.anti_click_enabled);
+        assert_eq!(preferences.anti_click_fade_ms, 2.0);
+        let persisted = UiPreferences::from_payload(&preferences.to_payload().unwrap()).unwrap();
+        assert!(!persisted.anti_click_enabled);
+        assert_eq!(persisted.anti_click_fade_ms, 2.0);
+
+        PreferencePatch::SetAntiClickSettings {
+            enabled: true,
+            fade_ms: f32::INFINITY,
+        }
+        .apply(&mut preferences)
+        .expect("invalid duration uses default");
+        assert!(preferences.anti_click_enabled);
+        assert_eq!(preferences.anti_click_fade_ms, 3.0);
     }
 
     #[test]

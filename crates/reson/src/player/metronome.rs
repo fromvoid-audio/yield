@@ -177,11 +177,12 @@ where
         let Some(control) = self.live_control.as_ref() else {
             return;
         };
-        let revision = control.applied_metronome_revision();
-        if revision == self.live_revision {
+        let Some(applied) = control.try_applied_metronome() else {
+            return;
+        };
+        if applied.revision() == self.live_revision {
             return;
         }
-        let applied = control.applied_metronome();
         self.live_revision = applied.revision();
         self.enabled = applied.enabled();
         self.config = PlaybackMetronomeConfig::new(applied.beat_count());

@@ -20,10 +20,12 @@ struct PlaybackSpanShared {
 
 /// Single-writer, single-audio-reader control mailbox.
 ///
-/// The writer fills the inactive slot before one release-store publishes its
-/// generation. The audio reader makes one bounded attempt per frame and keeps
-/// its last coherent snapshot if publication changes during that attempt. It
-/// never waits for the writer, and the writer never touches the published slot.
+/// The writer fills the inactive slot before publishing its generation. All
+/// payload and tag accesses are sequentially consistent: their single total
+/// order means a reader that observes payload from a reused slot must also see
+/// the intervening tag change in its trailing read. The audio reader makes one
+/// bounded attempt per frame and keeps its last coherent snapshot if publication
+/// changes during that attempt. It never waits for the writer.
 #[derive(Debug)]
 struct PlaybackControlMailbox {
     published: AtomicU64,
@@ -133,8 +135,10 @@ impl PlaybackSpanHandle {
         self.shared.applied_metronome.snapshot()
     }
 
-    pub(crate) fn applied_metronome_revision(&self) -> u64 {
-        self.shared.applied_metronome.revision()
+    /// One bounded coherent read for audio-thread consumers. If publication
+    /// overlaps this attempt, callers retain their previous applied state.
+    pub(crate) fn try_applied_metronome(&self) -> Option<AppliedMetronomeSnapshot> {
+        self.shared.applied_metronome.try_snapshot()
     }
 
     pub(crate) fn current_metronome_beat_count(&self) -> Option<u16> {
@@ -163,7 +167,7 @@ impl PlaybackControlMailbox {
         seek_frame: Option<u64>,
         metronome: Option<PlaybackMetronomeConfig>,
     ) {
-        let current = self.published.load(Ordering::Relaxed);
+        let current = self.published.load(Ordering::SeqCst);
         let generation = (current >> 1).wrapping_add(1);
         let slot_index = ((current & 1) ^ 1) as usize;
         let snapshot = PlaybackSpanSnapshot::from_plan(generation, plan, seek_frame, metronome);
@@ -171,15 +175,15 @@ impl PlaybackControlMailbox {
         self.slots[slot_index].store(snapshot);
         self.published.store(
             generation.wrapping_mul(2) | slot_index as u64,
-            Ordering::Release,
+            Ordering::SeqCst,
         );
     }
 
     fn try_snapshot(&self) -> Option<PlaybackSpanSnapshot> {
-        let before = self.published.load(Ordering::Acquire);
+        let before = self.published.load(Ordering::SeqCst);
         let slot_index = (before & 1) as usize;
         let snapshot = self.slots[slot_index].snapshot(before >> 1);
-        let after = self.published.load(Ordering::Acquire);
+        let after = self.published.load(Ordering::SeqCst);
         (before == after).then_some(snapshot)
     }
 }
@@ -200,38 +204,38 @@ impl PlaybackControlSlot {
 
     fn store(&self, snapshot: PlaybackSpanSnapshot) {
         self.start_frame
-            .store(snapshot.start_frame, Ordering::Relaxed);
-        self.end_frame.store(snapshot.end_frame, Ordering::Relaxed);
+            .store(snapshot.start_frame, Ordering::SeqCst);
+        self.end_frame.store(snapshot.end_frame, Ordering::SeqCst);
         self.pending_seek_frame.store(
             encode_optional_frame(snapshot.pending_seek_frame),
-            Ordering::Relaxed,
+            Ordering::SeqCst,
         );
         self.metronome_enabled
-            .store(u64::from(snapshot.metronome.enabled), Ordering::Relaxed);
+            .store(u64::from(snapshot.metronome.enabled), Ordering::SeqCst);
         self.metronome_beat_count
-            .store(u64::from(snapshot.metronome.beat_count), Ordering::Relaxed);
+            .store(u64::from(snapshot.metronome.beat_count), Ordering::SeqCst);
         self.metronome_cycle_frames
-            .store(snapshot.metronome.cycle_frames, Ordering::Relaxed);
+            .store(snapshot.metronome.cycle_frames, Ordering::SeqCst);
         self.metronome_anchor_frame
-            .store(snapshot.metronome.anchor_frame, Ordering::Relaxed);
+            .store(snapshot.metronome.anchor_frame, Ordering::SeqCst);
         self.metronome_anchor_phase_frames
-            .store(snapshot.metronome.anchor_phase_frames, Ordering::Relaxed);
+            .store(snapshot.metronome.anchor_phase_frames, Ordering::SeqCst);
     }
 
     fn snapshot(&self, generation: u64) -> PlaybackSpanSnapshot {
         PlaybackSpanSnapshot {
             generation,
-            start_frame: self.start_frame.load(Ordering::Relaxed),
-            end_frame: self.end_frame.load(Ordering::Relaxed),
+            start_frame: self.start_frame.load(Ordering::SeqCst),
+            end_frame: self.end_frame.load(Ordering::SeqCst),
             pending_seek_frame: decode_optional_frame(
-                self.pending_seek_frame.load(Ordering::Relaxed),
+                self.pending_seek_frame.load(Ordering::SeqCst),
             ),
             metronome: PlaybackMetronomeSnapshot {
-                enabled: self.metronome_enabled.load(Ordering::Relaxed) != 0,
-                beat_count: self.metronome_beat_count.load(Ordering::Relaxed) as u16,
-                cycle_frames: self.metronome_cycle_frames.load(Ordering::Relaxed),
-                anchor_frame: self.metronome_anchor_frame.load(Ordering::Relaxed),
-                anchor_phase_frames: self.metronome_anchor_phase_frames.load(Ordering::Relaxed),
+                enabled: self.metronome_enabled.load(Ordering::SeqCst) != 0,
+                beat_count: self.metronome_beat_count.load(Ordering::SeqCst) as u16,
+                cycle_frames: self.metronome_cycle_frames.load(Ordering::SeqCst),
+                anchor_frame: self.metronome_anchor_frame.load(Ordering::SeqCst),
+                anchor_phase_frames: self.metronome_anchor_phase_frames.load(Ordering::SeqCst),
             },
         }
     }
@@ -240,7 +244,7 @@ impl PlaybackControlSlot {
 impl AppliedMetronomeSlot {
     fn new(snapshot: PlaybackMetronomeSnapshot) -> Self {
         Self {
-            revision: AtomicU64::new(1),
+            revision: AtomicU64::new(2),
             enabled: AtomicU64::new(u64::from(snapshot.enabled)),
             beat_count: AtomicU64::new(u64::from(snapshot.beat_count)),
             cycle_frames: AtomicU64::new(snapshot.cycle_frames),
@@ -249,30 +253,44 @@ impl AppliedMetronomeSlot {
     }
 
     fn publish(&self, snapshot: PlaybackMetronomeSnapshot) {
+        // Odd revisions mark an in-progress write; even revisions are stable.
+        self.revision.fetch_add(1, Ordering::SeqCst);
         self.enabled
-            .store(u64::from(snapshot.enabled), Ordering::Relaxed);
+            .store(u64::from(snapshot.enabled), Ordering::SeqCst);
         self.beat_count
-            .store(u64::from(snapshot.beat_count), Ordering::Relaxed);
+            .store(u64::from(snapshot.beat_count), Ordering::SeqCst);
         self.cycle_frames
-            .store(snapshot.cycle_frames, Ordering::Relaxed);
+            .store(snapshot.cycle_frames, Ordering::SeqCst);
         self.phase_frames
-            .store(snapshot.anchor_phase_frames, Ordering::Relaxed);
-        self.revision.fetch_add(1, Ordering::Release);
+            .store(snapshot.anchor_phase_frames, Ordering::SeqCst);
+        self.revision.fetch_add(1, Ordering::SeqCst);
     }
 
     fn snapshot(&self) -> AppliedMetronomeSnapshot {
-        let revision = self.revision.load(Ordering::Acquire);
-        AppliedMetronomeSnapshot {
-            revision,
-            enabled: self.enabled.load(Ordering::Relaxed) != 0,
-            beat_count: self.beat_count.load(Ordering::Relaxed) as u16,
-            cycle_frames: self.cycle_frames.load(Ordering::Relaxed),
-            phase_frames: self.phase_frames.load(Ordering::Relaxed),
+        loop {
+            if let Some(snapshot) = self.try_snapshot() {
+                return snapshot;
+            }
         }
     }
 
-    fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Acquire)
+    fn try_snapshot(&self) -> Option<AppliedMetronomeSnapshot> {
+        let before = self.revision.load(Ordering::SeqCst);
+        if before & 1 != 0 {
+            return None;
+        }
+        let enabled = self.enabled.load(Ordering::SeqCst) != 0;
+        let beat_count = self.beat_count.load(Ordering::SeqCst) as u16;
+        let cycle_frames = self.cycle_frames.load(Ordering::SeqCst);
+        let phase_frames = self.phase_frames.load(Ordering::SeqCst);
+        let after = self.revision.load(Ordering::SeqCst);
+        (before == after).then_some(AppliedMetronomeSnapshot {
+            revision: after,
+            enabled,
+            beat_count,
+            cycle_frames,
+            phase_frames,
+        })
     }
 }
 
@@ -442,6 +460,51 @@ mod tests {
         PlaybackChannelLayout, PlaybackSeekBehavior, PlaybackSourceIdentity, PlaybackSourceKind,
         PlaybackSpanRequest,
     };
+
+    #[test]
+    fn applied_metronome_attempt_never_returns_a_mixed_publication() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let left = PlaybackMetronomeSnapshot {
+            enabled: true,
+            beat_count: 3,
+            cycle_frames: 3_000,
+            anchor_frame: 0,
+            anchor_phase_frames: 30,
+        };
+        let right = PlaybackMetronomeSnapshot {
+            enabled: false,
+            beat_count: 7,
+            cycle_frames: 7_000,
+            anchor_frame: 0,
+            anchor_phase_frames: 70,
+        };
+        let slot = Arc::new(AppliedMetronomeSlot::new(left));
+        let writer_slot = Arc::clone(&slot);
+        let finished = Arc::new(AtomicBool::new(false));
+        let writer_finished = Arc::clone(&finished);
+        let writer = std::thread::spawn(move || {
+            for index in 0..50_000 {
+                writer_slot.publish(if index & 1 == 0 { right } else { left });
+            }
+            writer_finished.store(true, Ordering::Release);
+        });
+
+        while !finished.load(Ordering::Acquire) {
+            if let Some(snapshot) = slot.try_snapshot() {
+                let left_tuple = (true, 3, 3_000, 30);
+                let right_tuple = (false, 7, 7_000, 70);
+                let observed = (
+                    snapshot.enabled(),
+                    snapshot.beat_count(),
+                    snapshot.cycle_frames(),
+                    snapshot.phase_frames(),
+                );
+                assert!(observed == left_tuple || observed == right_tuple);
+            }
+        }
+        writer.join().unwrap();
+    }
 
     #[test]
     fn pending_seek_is_clamped_inside_one_coherent_update() {
