@@ -24,7 +24,16 @@ mkdir -p "$OUTPUT_DIR"
   ulimit -a
   if [[ "$PLATFORM" == macos ]]; then
     sw_vers
-    xcodebuild -version
+    developer_dir="$(xcode-select -p)"
+    printf 'Developer directory: %s\n' "$developer_dir"
+    if [[ "$developer_dir" == */CommandLineTools ]]; then
+      pkgutil --pkg-info com.apple.pkg.CLTools_Executables
+    else
+      xcodebuild -version
+    fi
+    xcrun --sdk macosx --show-sdk-path
+    xcrun --sdk macosx --show-sdk-version
+    xcrun --sdk macosx clang --version
     sysctl hw.memsize hw.logicalcpu
   else
     powershell.exe -NoProfile -Command 'Get-CimInstance Win32_OperatingSystem | Format-List Caption,Version,BuildNumber; Get-Volume | Format-Table DriveLetter,FileSystem,SizeRemaining,Size; whoami /user; Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory | Select-Object Name'
