@@ -1641,6 +1641,10 @@ fn patch_catalog_replay_projection(
     delta: yield_session::CatalogReplayDelta,
     cancellation: &AtomicBool,
 ) -> Result<CatalogProjection, String> {
+    // Validate the bounded batch first, then visit the retained rows once. Scanning
+    // or shifting the whole list separately for each path multiplies large-source
+    // work by the batch size. Duplicate paths cannot supply an ambiguous patch.
+    let mut changes = HashMap::with_capacity(delta.touched_path_changes.len());
     for (path, entry) in delta.touched_path_changes {
         if cancellation.load(Ordering::Acquire) {
             return Err("replay projection canceled".into());
@@ -1649,44 +1653,66 @@ fn patch_catalog_replay_projection(
         if entry.as_ref().is_some_and(|e| e.relative_path != path) {
             return Err("replay manifest path mismatch".into());
         }
-        let previous = base.entries.iter().position(|e| e.relative_path == path);
-        match entry {
-            Some(entry) => {
-                let mut audio = previous
-                    .map(|i| base.entries[i].clone())
-                    .unwrap_or(AudioFile {
-                        path: base.root.join(&path),
-                        relative_path: path.clone(),
-                        byte_len: entry.file_size,
-                        duration_seconds: None,
-                        sample_rate: None,
-                        playback_type: None,
-                        curation: None,
-                    });
-                audio.byte_len = entry.file_size;
-                audio.duration_seconds = None;
-                audio.sample_rate = None;
-                if let Some(i) = previous {
-                    base.entries[i] = audio;
-                } else {
-                    base.entries.push(audio);
+        if changes.insert(path, entry).is_some() {
+            return Err("duplicate replay manifest path".into());
+        }
+    }
+    if !changes.is_empty() {
+        let facts = Arc::make_mut(&mut base.facts);
+        for (path, entry) in &changes {
+            match entry {
+                Some(entry) => {
+                    facts.insert(
+                        path.clone(),
+                        CatalogFileFacts {
+                            relative_path: path.clone(),
+                            file_size: entry.file_size,
+                            modified_ns: entry.modified_ns,
+                            file_identity: entry.file_identity.clone(),
+                            content_hash: entry.content_hash.clone(),
+                        },
+                    );
                 }
-                Arc::make_mut(&mut base.facts).insert(
-                    path.clone(),
-                    CatalogFileFacts {
-                        relative_path: path,
-                        file_size: entry.file_size,
-                        modified_ns: entry.modified_ns,
-                        file_identity: entry.file_identity,
-                        content_hash: entry.content_hash,
-                    },
-                );
+                None => {
+                    facts.remove(path);
+                }
             }
-            None => {
-                if let Some(i) = previous {
-                    base.entries.remove(i);
+        }
+        let mut canceled = false;
+        base.entries.retain_mut(|audio| {
+            if cancellation.load(Ordering::Acquire) {
+                canceled = true;
+                return true;
+            }
+            match changes.remove(&audio.relative_path) {
+                Some(Some(entry)) => {
+                    audio.byte_len = entry.file_size;
+                    audio.duration_seconds = None;
+                    audio.sample_rate = None;
+                    // Source-owned curation/playback type survive the byte change.
+                    true
                 }
-                Arc::make_mut(&mut base.facts).remove(&path);
+                Some(None) => false,
+                None => true,
+            }
+        });
+        if canceled {
+            return Err("replay projection canceled".into());
+        }
+        for (path, entry) in changes {
+            if cancellation.load(Ordering::Acquire) {
+                return Err("replay projection canceled".into());
+            }
+            if let Some(entry) = entry {
+                base.entries.push(AudioFile {
+                    path: base.root.join(&path),
+                    relative_path: path,
+                    byte_len: entry.file_size,
+                    duration_seconds: None,
+                    sample_rate: None,
+                    playback_type: None,
+                    curation: None,
+                });
             }
         }
     }
@@ -2051,6 +2077,122 @@ mod tests {
         assert!(!projection.tree.contains(Path::new("old-empty")));
         assert!(!projection.facts.contains_key(Path::new("removed.wav")));
         assert_eq!(projection.facts[Path::new("changed.wav")].modified_ns, 30);
+    }
+
+    #[test]
+    fn replay_projection_mixed_batch_preserves_large_predecessor_and_row_metadata() {
+        let mut base = replay_projection_fixture();
+        let prototype = base.entries[0].clone();
+        base.entries = (0..20_000)
+            .map(|i| {
+                let mut entry = prototype.clone();
+                entry.relative_path = format!("sample-{i:05}.wav").into();
+                entry.path = base.root.join(&entry.relative_path);
+                entry.curation = super::AudioFileCuration::from_parts(3, true, 1, None, None);
+                entry
+            })
+            .collect();
+        base.facts = Arc::new(
+            base.entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.relative_path.clone(),
+                        CatalogFileFacts {
+                            relative_path: entry.relative_path.clone(),
+                            file_size: 10,
+                            modified_ns: 2,
+                            file_identity: Some("original".into()),
+                            content_hash: None,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let retained_facts = Arc::clone(&base.facts);
+        let curation = base.entries[0].curation;
+        let mut delta = replay_projection_delta();
+        delta.touched_path_changes.clear();
+        for i in 0..yield_session::MAX_CATALOG_REPLAY_DELTA_ENTRIES {
+            let path: PathBuf = if i % 3 == 2 {
+                format!("new-{i:05}.wav").into()
+            } else {
+                format!("sample-{:05}.wav", i * 300).into()
+            };
+            let entry = (i % 3 != 1).then(|| SourceManifestEntry {
+                relative_path: path.clone(),
+                file_identity: Some("replacement".into()),
+                content_hash: None,
+                file_size: 90,
+                modified_ns: 91,
+            });
+            delta.touched_path_changes.push((path, entry));
+        }
+        delta.touched_path_changes.reverse();
+        let projection =
+            patch_catalog_replay_projection(base, delta, &AtomicBool::new(false)).unwrap();
+        let bound = yield_session::MAX_CATALOG_REPLAY_DELTA_ENTRIES;
+        let removed = (0..bound).filter(|i| i % 3 == 1).count();
+        let inserted = (0..bound).filter(|i| i % 3 == 2).count();
+        assert_eq!(projection.entries.len(), 20_000 - removed + inserted);
+        for i in 0..20_000 {
+            let path = PathBuf::from(format!("sample-{i:05}.wav"));
+            let touched = (i % 300 == 0 && i / 300 < bound).then_some(i / 300);
+            if touched.is_some_and(|i| i % 3 == 1) {
+                assert!(!projection.entry_indices.contains_key(&path));
+                assert!(!projection.facts.contains_key(&path));
+                continue;
+            }
+            let entry = &projection.entries[projection.entry_indices[&path]];
+            let changed = touched.is_some_and(|i| i % 3 == 0);
+            assert_eq!(entry.byte_len, if changed { 90 } else { 10 });
+            assert_eq!(
+                entry.duration_seconds,
+                if changed { None } else { Some(2.0) }
+            );
+            assert_eq!(entry.sample_rate, if changed { None } else { Some(48000) });
+            assert_eq!(entry.curation, curation);
+            assert_eq!(entry.playback_type, Some(PlaybackType::Loop));
+            assert_eq!(
+                projection.facts[&path].modified_ns,
+                if changed { 91 } else { 2 }
+            );
+            assert_eq!(retained_facts[&path].modified_ns, 2);
+        }
+        for i in (0..bound).filter(|i| i % 3 == 2) {
+            let path = PathBuf::from(format!("new-{i:05}.wav"));
+            let entry = &projection.entries[projection.entry_indices[&path]];
+            assert_eq!(entry.path, projection.root.join(&path));
+            assert_eq!(entry.byte_len, 90);
+            assert_eq!(entry.curation, None);
+            assert_eq!(entry.playback_type, None);
+            assert!(!retained_facts.contains_key(&path));
+        }
+        assert_eq!(retained_facts.len(), 20_000);
+        assert!(
+            projection
+                .entries
+                .windows(2)
+                .all(|pair| pair[0].relative_path < pair[1].relative_path)
+        );
+    }
+
+    #[test]
+    fn replay_projection_rejects_duplicate_path_before_changing_shared_facts() {
+        for replacement in [
+            None,
+            replay_projection_delta().touched_path_changes[0].1.clone(),
+        ] {
+            let base = replay_projection_fixture();
+            let retained_facts = Arc::clone(&base.facts);
+            let mut delta = replay_projection_delta();
+            delta
+                .touched_path_changes
+                .push(("changed.wav".into(), replacement));
+            assert!(patch_catalog_replay_projection(base, delta, &AtomicBool::new(false)).is_err());
+            assert_eq!(retained_facts[Path::new("changed.wav")].file_size, 10);
+            assert!(retained_facts.contains_key(Path::new("removed.wav")));
+        }
     }
 
     #[test]

@@ -71,3 +71,15 @@ history, Finder/GPUI interaction and broader Source physical-family acceptance
 remain unqualified. The new pinned native lane requires exact nonzero tests,
 including an actual native hint producing a catalog delta, SDK checks and APFS
 facts. A pre-step CI failure supplies no native execution evidence.
+
+## Bounded batch projection follow-up
+
+The background projection validates a whole bounded manifest batch before
+patching facts, rejects duplicate paths, and applies updates/removals in one
+retained-row pass. It appends new rows afterwards; no per-path full-list scan or
+per-removal full-list shift remains. Curation/playback type survive existing
+row updates; derived WAV metadata is invalidated only for changed rows. Shared
+predecessor facts remain immutable. Local sorting/index/tree reconstruction
+still scales with source size, so this does not complete responsiveness or
+native acceptance. The native lane requires all four projection cases, including
+a 20,000-row mixed-batch fixture and duplicate-path refusal.
