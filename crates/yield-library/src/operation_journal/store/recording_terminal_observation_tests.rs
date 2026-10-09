@@ -1331,7 +1331,12 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
                 0 => wrong["prefix"]["freeze_sequence"] = serde_json::json!(sequence + 1),
                 1 => wrong["prefix"]["terminal_id"] = serde_json::json!(Uuid::new_v4()),
                 2 => wrong["prefix"]["generation"] = serde_json::json!(2),
-                3 => wrong["finalizing_hash"][0] = serde_json::json!(255),
+                3 => {
+                    // A fixed 255 can equal the actual hash byte and leave the
+                    // supposedly corrupt fixture unchanged. Always flip a bit.
+                    let original = wrong["finalizing_hash"][0].as_u64().unwrap();
+                    wrong["finalizing_hash"][0] = serde_json::json!(original ^ 1);
+                }
                 _ => wrong["version"] = serde_json::json!(5),
             }
             store
