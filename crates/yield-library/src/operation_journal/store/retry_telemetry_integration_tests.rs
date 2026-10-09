@@ -4,6 +4,10 @@ mod retry_telemetry_integration {
         JournalRetryCall, JournalRetryReturn, tests::Capture,
     };
 
+    use crate::operation_journal::writer_acquisition_telemetry::{
+        JournalWriterCall, JournalWriterReturn, tests::Capture as WriterCapture,
+    };
+
     fn observation(attempt: u32, class: RetryErrorClass) -> RetryObservation {
         RetryObservation::new(
             attempt,
@@ -129,6 +133,7 @@ mod retry_telemetry_integration {
             .execute_batch("BEGIN IMMEDIATE")
             .expect("real competing SQLite reservation");
         let capture = Capture::new();
+        let writer_capture = WriterCapture::new();
         let retry = observation(1, RetryErrorClass::TransientContention);
         let error = store
             .record_retry_pending(id, sequence, retry.clone())
@@ -174,6 +179,19 @@ mod retry_telemetry_integration {
             ),
             1
         );
+        let acquisition = writer_capture.snapshot();
+        assert_eq!(
+            acquisition.count(JournalWriterCall::RetryPending, JournalWriterReturn::Busy),
+            1
+        );
+        assert_eq!(
+            acquisition.count(
+                JournalWriterCall::RetryPending,
+                JournalWriterReturn::Acquired
+            ),
+            1
+        );
+        assert_eq!(acquisition.elapsed_buckets.iter().sum::<u64>(), 2);
         assert!(store.connection.is_autocommit());
     }
 
