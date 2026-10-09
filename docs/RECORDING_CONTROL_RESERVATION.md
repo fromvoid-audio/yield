@@ -38,8 +38,9 @@ versions, and conflicting bindings. Target reservations must contain exactly the
 four expected rows with valid keys, consecutive positive role sequences preceding
 any captured chunk, and exact decoded bytes. The capture ordering query scans a
 capped per-operation inventory and rejects overflow on recovery.
-Partial, corrupt, extra, and future terminal states stay retained and reject
-capture and recovery observation; none is treated as vacant capacity.
+Partial, corrupt, extra, and unsupported terminal states stay retained and reject
+capture and recovery observation; none is treated as vacant capacity. The closed V2
+Finalizing observation described below is readable without recreating a close capability.
 
 Only verified reserved controls are omitted from the existing eight-chunk recovery
 pages. Initial reservations do not masquerade as header finalization. Unknown
@@ -65,8 +66,9 @@ OPT-2145 still owns genuine producer closure, single terminal ownership,
 Finalizing/Frozen transitions, bounded actual-byte prefix verification, seal
 persistence, and live capability integration. OPT-2058/2057/1339 remain open for
 retained serializer transport, physical qualification, publication and retirement.
-This leaf understands reserved controls only; a future Frozen value is unsupported
-until the actual terminal owner explicitly validates and enforces it. Linux paths
+The original reservation leaf understands empty controls. The subsequent V2 Finalizing
+reader below adds one explicit observation schema; Frozen and Seal remain unsupported
+until the actual terminal owner explicitly validates and enforces them. Linux paths
 that lack a qualified platform owner remain unavailable without synthetic grants.
 
 ## Original capacity rebuild audit (OPT-2323)
@@ -129,3 +131,210 @@ startup, current physical recording admission and the actual byte/terminal
 consumer remain separate implementation requirements under OPT-2145/OPT-2058.
 No startup, capture, Finalizing/Frozen/seal or physical qualification is completed
 by this pre-start entry point.
+
+## Original terminal observations and append fencing (OPT-2145, 9 October 2026)
+
+The original retained producer now polls its private one-shot settlement receivers without
+waiting on the actor. Finalizing inventory capture and joined comparison require the same
+opaque producer instance, exact format and complete accounting. The bounded closed V2 value
+binds proposal, original profile acquisition, terminal generation, pending offset/length/hash,
+object length, final RIFF/data patches and stable domain-separated pending/header write IDs.
+These write observations do not substitute for admitted normalized PCM chunk identities.
+
+The owner retains the original barrier and its actual pending bytes. It can persist the
+observation only after current registry/Source pin, complete operation, capacity/provider and
+recovery checks inside the original exclusive SQLite transaction. The dedicated funded
+terminal reader accepts existing capture rows; it does not widen the strict pre-start factory.
+Its chunk audit uses eight-key pages and one original funded typed row, checking ordinary
+charge, participant and release relationships without copying an entire chunk page. Input
+pressure refuses before ownership; retained errors keep their original debit and typed cause.
+
+The original mutation replaces only the exact empty Finalizing reservation payload by CAS.
+The four original control IDs, consecutive reservation sequences, row count and 16-KiB charge
+remain unchanged. Precommit validation and postcommit readback compare exact bounded payloads.
+Rollback/commit/readback uncertainty retains the barrier, original typed failure and input
+backing; unconfirmed transaction outcomes make the original owner unavailable. General
+historical readers understand V2 Finalizing, while the pre-start factory still requires exact
+canonical empty controls. Generic retention checks existing exact-byte replay first, then
+refuses every new identity behind the Finalizing fence. The private original producer also
+closes generic mutation as soon as it observes the barrier, so failure to persist the SQL
+phase cannot reopen new-byte retention. This private refusal still permits only exact existing
+replay; a caller-supplied terminal ID cannot select or reopen that owner state.
+
+This factory still has no qualified recording startup or private terminal-write admission.
+It withholds acknowledgement, never restores one from decoded inventory, and never marks
+Frozen/Sealed or releases capacity. Remaining OPT-2145 work includes original normalized tail
+and header chunk declarations/admitted writes, cancellation/drain/append races through that
+adapter, genuine successful join followed by immutable Frozen retention, bounded actual-byte
+verification/seal persistence and restart/replay. Those missing implementations are not waived
+by unavailable native runners. Physical producer startup/transport and publication remain in
+OPT-2058/2057/1339 and their genuine qualification prerequisites.
+
+## Normalized terminal data preparation (9 October 2026)
+
+`RecordingPcmNormalizer` retains one fixed 16-KiB carry and the exact contiguous
+raw-byte cursor. A raw write prepares at most two complete-frame chunks without
+advancing that cursor. The non-cloneable batch is bound to its original normalizer
+and generation; only accepting that exact batch advances the data cursor. Foreign
+and stale batches, gaps, excess finite extents, nil or duplicate supplied identities,
+and incomplete terminal frames are refused without advancing it.
+
+The original terminal-barrier adapter verifies the original settlement instance
+and producer format, combines its genuine pending fragment with the retained carry,
+and declares at most two normalized PCM chunks and the exact RIFF/data patches at
+offsets 4 and 64. Terminal identities are stable across retry for the same proposal,
+terminal and ordinal/revision. Accepting a terminal batch closes this data cursor.
+The data-only terminal preparation entry point is explicitly observational; it
+cannot authenticate a producer, acknowledge closure or authorize any write.
+
+The owner must separately prepay the carry, prepared batch and proposal/chunk
+encoding scratch, retain exact admitted bytes and satisfy its original Source,
+claim and physical-write checks before acknowledging requests or a barrier. This
+API does not change the pre-start factory into a startup grant, reconstruct carry
+from historical rows, persist a Frozen/seal control or confer physical authority.
+CPU fixtures exercise the actual serializer transport and original barrier across
+all channel counts, as well as arbitrary raw boundaries and unchanged retry data.
+Full OPT-2145 owner integration remains open.
+
+## Original normalized declaration custody (9 October 2026)
+
+The original pre-start route now funds its fixed PCM carry within the unchanged
+64-KiB route allowance. When it observes its original terminal barrier, it separately
+debits the existing ordinary pool for the bounded prepared batch and transient
+proposal/control encodings before materializing normalized terminal data. The
+original batch, its credit, the barrier and any selected preparation/transaction
+errors stay under the original retained slot. An unknown raw cursor or refused
+debit retains only the previous V2 audit observation, with acknowledgement withheld.
+
+The closed V3 Finalizing payload wraps that original V2 producer observation and
+exactly four optional declaration entries: at most two PCM chunks followed by the
+two fixed header patches. Each entry binds identity, role, range and byte hash.
+Its validator derives the exact terminal slot/range partition from the raw offset
+and finite final extent, checks stable identities and exact patch hashes, and
+rejects missing, extra or reordered entries. Exact prepared bytes are compared
+against declarations before retention; the original joined proof is also checked.
+This is still data custody, never a physical receipt or live close capability.
+
+The same funded exclusive transaction and reservation CAS writes either known V2
+or V3 data, preserving the original four IDs, sequences and 16-KiB charge. Exact
+postcommit readback, original current Source/profile/capacity checks, rollback and
+uncertain-outcome custody remain required. Recovery understands only these known
+Finalizing grammars; unknown versions and other control roles still fail closed.
+Even an exact declared new chunk remains refused by the generic append path.
+
+Full OPT-2145 remains open: actual admitted terminal retention/acknowledgement,
+original successful close capability, Frozen/seal persistence and paged verification,
+restart/cancel/drain races and native acceptance are not supplied by a declaration.
+
+
+## Original joined Frozen retention (OPT-2145, partial)
+
+The owner now checks the genuine joined completion against its retained original
+V3 declaration and private producer instance. Inside the same separately funded
+exclusive transaction it revalidates the original Source/profile/provider/capacity
+context, exact Finalizing readback, each declared terminal byte row, and each
+original issued claim's operation, destination participant, staging class and range.
+Issued claim metadata is not evidence of physical completion.
+
+Only after these checks does it replace the exact empty Frozen reservation with a
+closed V4 inventory. This binds the V3 declaration hash and the original successful
+terminal accounting to the existing Frozen row sequence. Its CAS, exact precommit
+and postcommit readback preserve all four original control identities, sequences
+and the full 16-KiB charge. Errors retain their original loans; uncertain outcomes
+and a changed Source after commit make the original route unavailable for recovery.
+
+Historical readers cross-check Frozen against the preceding known V3 declaration
+and its reserved sequence. The funded reader prepays its fixed control-history
+scratch before owning typed observations. Unknown versions, missing declarations,
+changed terminal identities/generations/hashes and conflicting sequences fail closed.
+Reopening these data observations supplies no live producer or Source capability.
+
+Real SQLite tests cover absent/unissued/mismatched terminal claims, exact original
+bytes, precommit rollback, lost commit acknowledgement, immutable retry refusal,
+reopen and cross-control corruption. Their CPU producer and SQL claim fixtures
+provide no native Source or physical admission.
+
+Full OPT-2145 remains open: the pre-start factory still withholds acknowledgement
+and supplies no required-WAL or physical startup grant. The admitted terminal
+append/acknowledgement bridge, bounded actual-byte verification and durable seal,
+complete restart/cancel/drain races and native acceptance remain required. Frozen
+retention does not publish an output or release any retained capacity.
+
+## Bounded retained-byte verification and Seal (OPT-2145, partial)
+
+The original owner retains one separately funded verifier under its original
+producer/Source custody. It rechecks the same current Source/profile/provider and
+capacity context for each page. Each verification page consumes at most eight
+logical byte rows, holding one funded decoded row and its issued-claim keeper at
+a time. Header revisions precede PCM. The immutable Frozen encoding binds the
+cursor; the complete byte-row count must agree with its declared prefix. Missing,
+extra, unissued or conflicting rows refuse progress. The original cursor remains
+retained until the page's transaction, exact control readback and Source checks
+succeed. Existing complete owner admission/recovery audits remain in place.
+
+After the exact final header and all PCM have been verified, the private original
+verifier result can fill the existing Seal reservation. Closed V5 data binds the
+Frozen hash, complete prefix/accounting, reconstructed header hash and actual
+object hash/length. Its CAS and exact precommit/postcommit readback preserve the
+original control identities, sequences and charges. Historical readers require
+Seal to match the preceding exact Frozen inventory. Decoded V5 data is not a
+fresh verifier result; no public submission accepts it as verification authority.
+
+SQLite tests compare the observed hash with an independent actual hound encoding,
+exercise page yielding and refusal without advancing the original state, and
+reopen exact seal data. CPU serializer and SQL claim fixtures still confer no
+native Source/startup or physical authority. Complete admitted terminal append
+and acknowledgement, restart verification scheduling, cancellation/drain races
+and the full OPT-2145 acceptance remain open. No output is published and no
+retention charge is released by this seal observation.
+
+## Original declared terminal byte appends (OPT-2145, partial)
+
+The original barrier handler can retain its own prepared terminal batch inside
+its current funded exclusive Finalizing transaction. Each write must match the
+retained V3 declaration and an already-issued exact operation/participant/staging
+range claim; declaration data alone is insufficient. The same original Source,
+profile, provider and capacity checks surround the mutation. Serialization is
+counted and debited before owning the chunk encoding. Each predecessor is read
+through its original funded keeper; final header patches require all declared
+terminal PCM first. New identities remain forbidden after Frozen, while exact
+byte replay stays read-only. Global row/encoded-byte limits and all original
+control charges stay enforced. Precommit and postcommit readback compare actual
+bytes and issued claims; uncertainty retains the original barrier/error/input.
+
+Missing issuance preserves the previous audit-only V3 observation. The factory
+still supplies no qualified required-WAL/startup capability and withholds producer
+acknowledgement. Issued metadata, byte readiness or successful SQLite retention
+does not qualify physical completion or a live startup/close capability.
+
+Generic chunk claim/issuance also honors the durable Finalizing fence and the
+original private invalidation fence when persistence failed. Existing exact claim
+replay remains a read-only observation; it cannot issue a fresh permit. The
+original terminal route consumes only already-issued exact private-plan claims.
+Full OPT-2145 still requires original terminal admission/acknowledgement with
+qualified startup, actual restart scheduling, complete cancellation/drain races
+and native acceptance. No publication or charge reclamation is enabled here.
+
+## Owner restart audit (OPT-2145, partial)
+
+The bounded owner request `audit_recording_frozen_prefix` schedules a fresh
+read-only audit of an existing V3/V4 recording. It holds the original request
+credit and profile-owned store while advancing at most eight verification rows
+per turn. Only one verifier or producer can occupy the acquisition. Each turn
+checks the current owner and journal namespace, rereads the declared/Frozen
+controls and exact row count, and verifies retained bytes with issued claims.
+A separately funded candidate replaces the cursor only after its transaction
+and namespace checks succeed.
+
+The final data observation contains the hash and length computed from actual
+retained bytes. An existing V5 seal must match this fresh result. An empty Seal
+reservation can be observed without writing it. Historical controls never
+recreate a producer, Source permission or permission to fill the Seal slot.
+Shutdown releases the audit and its transient loans before journal/profile
+custody. Real SQLite and CPU tests cover reopen, multiple pages, lost COMMIT
+acknowledgement, corrupt stored hashes and the actual owner queue without
+capacity or Source authority; all retained rows and charges remain unchanged.
+
+Full OPT-2145 remains open for qualified required-WAL/physical startup, admitted
+terminal acknowledgement, complete cancellation/drain races and native
+acceptance. This read-only request does not publish outputs or reclaim charges.

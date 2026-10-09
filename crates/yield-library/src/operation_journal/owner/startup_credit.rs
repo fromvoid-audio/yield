@@ -18,6 +18,10 @@ pub(super) const POOL_BYTES: usize = arc_bytes::<Mutex<InputBudget>>()
     + arc_bytes::<ResourceAdmission>()
     + std::mem::size_of::<OnceLock<Uuid>>()
     + std::mem::align_of::<OnceLock<Uuid>>()
+    + std::mem::size_of::<std::sync::atomic::AtomicU64>()
+    + std::mem::align_of::<std::sync::atomic::AtomicU64>()
+    + std::mem::size_of::<Uuid>()
+    + std::mem::align_of::<Uuid>()
     + 2 * std::mem::size_of::<String>()
     + 4 * REFUSAL.len();
 
