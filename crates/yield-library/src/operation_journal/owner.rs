@@ -613,6 +613,14 @@ pub enum OperationJournalOwnerError {
     /// Original memory-only recording preparation could not be retained or revalidated.
     #[error(transparent)]
     RecordingProducerCustody(#[from] RecordingProducerCustodyError),
+    /// Original Recording mutation and rollback both retain uncertain outcomes.
+    #[error("recording terminal rollback unconfirmed: {rollback}; original: {original}")]
+    RecordingTerminalRollbackUncertain {
+        /// Exact primary owner/Source/store failure.
+        original: Box<OperationJournalOwnerError>,
+        /// Exact rollback failure under the same original backing.
+        rollback: Box<OperationJournalStoreError>,
+    },
     /// Original pre-lease custody could not be installed or revalidated.
     #[error(transparent)]
     LegacyAdoptionCustody(#[from] LegacyAdoptionCustodyError),
@@ -1953,6 +1961,7 @@ impl OwnerRuntime {
         Ok(handle)
     }
     fn poll_original_work(&mut self) {
+        self.poll_recording_custody();
         self.poll_publication_completions();
         self.poll_wal_preparation();
     }
@@ -2670,6 +2679,7 @@ impl OwnerRuntime {
                 reason: "recording bytes differ from admitted chunk range".into(),
             });
         }
+        self.validate_recording_custody_append(chunk)?;
         self.validate_chunk_operation_state(chunk.operation_id(), "recording retention")?;
         let snapshot = self.chunk_rebuild_snapshot()?;
         let provider = self.capacity_provider.as_ref().ok_or_else(|| {

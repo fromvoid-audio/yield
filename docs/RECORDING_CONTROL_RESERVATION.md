@@ -38,8 +38,9 @@ versions, and conflicting bindings. Target reservations must contain exactly the
 four expected rows with valid keys, consecutive positive role sequences preceding
 any captured chunk, and exact decoded bytes. The capture ordering query scans a
 capped per-operation inventory and rejects overflow on recovery.
-Partial, corrupt, extra, and future terminal states stay retained and reject
-capture and recovery observation; none is treated as vacant capacity.
+Partial, corrupt, extra, and unsupported terminal states stay retained and reject
+capture and recovery observation; none is treated as vacant capacity. The closed V2
+Finalizing observation described below is readable without recreating a close capability.
 
 Only verified reserved controls are omitted from the existing eight-chunk recovery
 pages. Initial reservations do not masquerade as header finalization. Unknown
@@ -65,8 +66,9 @@ OPT-2145 still owns genuine producer closure, single terminal ownership,
 Finalizing/Frozen transitions, bounded actual-byte prefix verification, seal
 persistence, and live capability integration. OPT-2058/2057/1339 remain open for
 retained serializer transport, physical qualification, publication and retirement.
-This leaf understands reserved controls only; a future Frozen value is unsupported
-until the actual terminal owner explicitly validates and enforces it. Linux paths
+The original reservation leaf understands empty controls. The subsequent V2 Finalizing
+reader below adds one explicit observation schema; Frozen and Seal remain unsupported
+until the actual terminal owner explicitly validates and enforces them. Linux paths
 that lack a qualified platform owner remain unavailable without synthetic grants.
 
 ## Original capacity rebuild audit (OPT-2323)
@@ -129,3 +131,41 @@ startup, current physical recording admission and the actual byte/terminal
 consumer remain separate implementation requirements under OPT-2145/OPT-2058.
 No startup, capture, Finalizing/Frozen/seal or physical qualification is completed
 by this pre-start entry point.
+
+## Original terminal observations and append fencing (OPT-2145, 9 October 2026)
+
+The original retained producer now polls its private one-shot settlement receivers without
+waiting on the actor. Finalizing inventory capture and joined comparison require the same
+opaque producer instance, exact format and complete accounting. The bounded closed V2 value
+binds proposal, original profile acquisition, terminal generation, pending offset/length/hash,
+object length, final RIFF/data patches and stable domain-separated pending/header write IDs.
+These write observations do not substitute for admitted normalized PCM chunk identities.
+
+The owner retains the original barrier and its actual pending bytes. It can persist the
+observation only after current registry/Source pin, complete operation, capacity/provider and
+recovery checks inside the original exclusive SQLite transaction. The dedicated funded
+terminal reader accepts existing capture rows; it does not widen the strict pre-start factory.
+Its chunk audit uses eight-key pages and one original funded typed row, checking ordinary
+charge, participant and release relationships without copying an entire chunk page. Input
+pressure refuses before ownership; retained errors keep their original debit and typed cause.
+
+The original mutation replaces only the exact empty Finalizing reservation payload by CAS.
+The four original control IDs, consecutive reservation sequences, row count and 16-KiB charge
+remain unchanged. Precommit validation and postcommit readback compare exact bounded payloads.
+Rollback/commit/readback uncertainty retains the barrier, original typed failure and input
+backing; unconfirmed transaction outcomes make the original owner unavailable. General
+historical readers understand V2 Finalizing, while the pre-start factory still requires exact
+canonical empty controls. Generic retention checks existing exact-byte replay first, then
+refuses every new identity behind the Finalizing fence. The private original producer also
+closes generic mutation as soon as it observes the barrier, so failure to persist the SQL
+phase cannot reopen new-byte retention. This private refusal still permits only exact existing
+replay; a caller-supplied terminal ID cannot select or reopen that owner state.
+
+This factory still has no qualified recording startup or private terminal-write admission.
+It withholds acknowledgement, never restores one from decoded inventory, and never marks
+Frozen/Sealed or releases capacity. Remaining OPT-2145 work includes original normalized tail
+and header chunk declarations/admitted writes, cancellation/drain/append races through that
+adapter, genuine successful join followed by immutable Frozen retention, bounded actual-byte
+verification/seal persistence and restart/replay. Those missing implementations are not waived
+by unavailable native runners. Physical producer startup/transport and publication remain in
+OPT-2058/2057/1339 and their genuine qualification prerequisites.

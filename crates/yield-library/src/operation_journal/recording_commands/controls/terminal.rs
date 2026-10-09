@@ -1,7 +1,9 @@
 //! Bounded original producer inventory observations; decoding never restores a close capability.
 use super::*;
 use crate::operation_journal::recording_commands::prefix::RecordingTerminalKind;
-use reson::recording::{RecordingJoinedCompletion, RecordingPrefixState, RecordingTerminalBarrier};
+use reson::recording::{
+    RecordingJoinedCompletion, RecordingPrefixState, RecordingSettlements, RecordingTerminalBarrier,
+};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +21,9 @@ pub(crate) struct RecordingFinalizingInventory {
     unconfirmed: u64,
     rejected: u64,
     overruns: u64,
+    pending_write_id: Uuid,
+    riff_write_id: Uuid,
+    data_write_id: Uuid,
     pending_offset: u64,
     pending_length: u32,
     pending_hash: [u8; 32],
@@ -34,8 +39,12 @@ impl RecordingFinalizingInventory {
         terminal_id: Uuid,
         acquisition: Uuid,
         generation: u64,
+        settlements: &RecordingSettlements,
         barrier: &RecordingTerminalBarrier,
     ) -> Result<Self, RecordingValueError> {
+        if !settlements.owns_barrier(barrier) {
+            return Err(invalid("terminal barrier belongs to a different producer"));
+        }
         let format = proposal.format();
         let limits = barrier.limits();
         if limits.sample_rate() != format.sample_rate()
@@ -63,6 +72,9 @@ impl RecordingFinalizingInventory {
             unconfirmed: accounting.unconfirmed_samples,
             rejected: accounting.dropped_samples_at_barrier,
             overruns: accounting.overrun_events_at_barrier,
+            pending_write_id: terminal_write_id(proposal, terminal_id, 0)?,
+            riff_write_id: terminal_write_id(proposal, terminal_id, 1)?,
+            data_write_id: terminal_write_id(proposal, terminal_id, 2)?,
             pending_offset: writes.pending_offset(),
             pending_length: u32::try_from(writes.pending_bytes().len()).map_err(invalid)?,
             pending_hash: *blake3::hash(writes.pending_bytes()).as_bytes(),
@@ -80,6 +92,18 @@ impl RecordingFinalizingInventory {
             || self.terminal_id.is_nil()
             || self.acquisition.is_nil()
             || self.generation == 0
+            || self.pending_write_id != terminal_write_id(proposal, self.terminal_id, 0)?
+            || self.riff_write_id != terminal_write_id(proposal, self.terminal_id, 1)?
+            || self.data_write_id != terminal_write_id(proposal, self.terminal_id, 2)?
+            || [
+                self.accepted,
+                self.encoded,
+                self.abandoned,
+                self.unconfirmed,
+                self.rejected,
+                self.overruns,
+            ]
+            .contains(&u64::MAX)
             || self.unconfirmed != 0
             || self
                 .encoded
@@ -97,6 +121,7 @@ impl RecordingFinalizingInventory {
                 .checked_mul(4)
                 .and_then(|n| n.checked_add(prefix::RECORDING_WAV_HEADER_BYTES as u64))
                 != Some(self.object_bytes)
+            || self.pending_offset < prefix::RECORDING_WAV_HEADER_BYTES as u64
             || self.pending_length > 16 * 1024
             || self
                 .pending_offset
@@ -142,9 +167,13 @@ impl RecordingFinalizingInventory {
     pub(crate) fn validate_joined(
         &self,
         proposal: &RecordingProposal,
+        settlements: &RecordingSettlements,
         joined: &RecordingJoinedCompletion,
     ) -> Result<(), RecordingValueError> {
         self.validate(proposal)?;
+        if !settlements.owns_completion(joined) {
+            return Err(invalid("joined completion belongs to a different producer"));
+        }
         let format = proposal.format();
         let limits = joined.limits();
         let accounting = joined.accounting();
@@ -177,4 +206,26 @@ impl RecordingFinalizingInventory {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests;
+
+fn terminal_write_id(
+    proposal: &RecordingProposal,
+    terminal: Uuid,
+    role: u8,
+) -> Result<Uuid, RecordingValueError> {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"yield.recording.terminal.write.v2\0");
+    hash.update(blake3::hash(&proposal.encode()?).as_bytes());
+    hash.update(terminal.as_bytes());
+    hash.update(&[role]);
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+    let id = Uuid::from_bytes(bytes);
+    if id.is_nil() {
+        return Err(invalid("nil terminal write identity"));
+    }
+    Ok(id)
 }

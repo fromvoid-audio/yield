@@ -125,3 +125,28 @@ mod tests;
 // Actual owner integration consumes the original private producer barrier; never a decoded grant.
 mod terminal;
 pub(crate) use terminal::RecordingFinalizingInventory;
+
+/// Validate supported retained control data without recovering any live capability.
+/// Returns true only for the exact closed Finalizing schema; empty reservations are false.
+pub(crate) fn finalizing_observation(
+    bytes: &[u8],
+    proposal: &RecordingProposal,
+    role: ControlRole,
+) -> Result<bool, RecordingValueError> {
+    let expected = RecordingControlReservation::new(proposal, role)?;
+    match RecordingControlReservation::decode(bytes, proposal) {
+        Ok(reserved) if reserved == expected => Ok(false),
+        Ok(_) => Err(invalid("conflicting reserved recording control")),
+        Err(original) => {
+            if role == ControlRole::Finalizing
+                && RecordingFinalizingInventory::decode(bytes, proposal).is_ok()
+            {
+                Ok(true)
+            } else {
+                // Preserve historical diagnostics, including empty-payload EOF. Trying
+                // another supported closed schema does not reinterpret an invalid row.
+                Err(original)
+            }
+        }
+    }
+}

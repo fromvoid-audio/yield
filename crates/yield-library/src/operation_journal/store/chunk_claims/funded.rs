@@ -308,3 +308,6 @@ pub(super) fn issue(
     }
     Ok(Some(updated))
 }
+
+mod audit;
+pub(in crate::operation_journal::store) use audit::validate as validate_original_relations;
