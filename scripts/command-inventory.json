@@ -72,7 +72,7 @@
     },
     {
       "path": "scripts/release.sh",
-      "role": "Repo-root release orchestration for release-train prep plus RC/stable workflow dispatch.",
+      "role": "Compatibility wrapper for exact-source local test, beta and release builds; obsolete hosted dispatch commands fail closed.",
       "windows_supported": false
     },
     {
