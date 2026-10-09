@@ -6902,6 +6902,11 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<LegacyRecoveryCustody, OperationJournalOwnerError>>,
     },
+    RecoverRetainedLegacyReadCustody {
+        operation: OperationId,
+        input: InputPermit,
+        result: SyncSender<Result<LegacyRecoveryCustody, OperationJournalOwnerError>>,
+    },
     ValidateLegacyRecovery {
         operation: OperationId,
         capacity: bool,
@@ -7508,6 +7513,13 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             result,
         } => execute_store_result(result, move || {
             runtime.recover_legacy_read_custody(source, input)
+        }),
+        JournalCommand::RecoverRetainedLegacyReadCustody {
+            operation,
+            input,
+            result,
+        } => execute_store_result(result, move || {
+            runtime.recover_retained_legacy_read_custody(operation, input)
         }),
         JournalCommand::ValidateLegacyRecovery {
             operation,
@@ -8125,7 +8137,8 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
         JournalCommand::PrepareLegacyCustody { result, .. } => {
             let _ = result.send(Err(error));
         }
-        JournalCommand::RecoverLegacyReadCustody { result, .. } => {
+        JournalCommand::RecoverLegacyReadCustody { result, .. }
+        | JournalCommand::RecoverRetainedLegacyReadCustody { result, .. } => {
             let _ = result.send(Err(error));
         }
         JournalCommand::ValidateLegacyRecovery { result, .. } => {

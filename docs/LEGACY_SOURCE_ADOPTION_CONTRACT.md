@@ -799,3 +799,25 @@ toolchain, filesystem and resource facts, require writable APFS and exactly one
 completed test with no failures or skips, and retain failure evidence. These tests
 use their explicitly isolated volume registry. They do not qualify default production
 registry startup, current SourceLease handoff or the full OPT-2117 acceptance.
+
+## Lost readonly recovery delivery
+
+`OperationJournalClient::recover_retained_legacy_read_custody` selects the
+already retained recovery reader on that original worker by its observed
+operation ID. It uses the existing funded ordinary queue/reply path and
+revalidates the actual Source receipt, preserved rows and original journal
+intent before returning the original worker-bound readonly custody handle.
+It never opens a replacement Source, reconstructs a writable lease, installs
+a provider, grants capacity or repeats migration/bootstrap. Missing, failed
+initial inspection, wrong-operation, changed-evidence and closed-owner cases
+remain typed refusals. Losing another reply retains the same reader.
+
+The real portable worker fixture drops the first successful recovery reply,
+uses an actual FIFO journal read as a completion barrier, rejects a foreign
+operation, retrieves/revalidates the original reader, and still refuses claim
+confirmation without a genuine provider. Source/journal bytes and sidecar
+custody remain unchanged, and shutdown closes further recovery requests.
+The paired V19/schema data fixture remains observation-only; it supplies no
+admitted migration, initial claim, current Source lease or physical grant.
+Full current writable handoff, accounted reopen and native acceptance remain
+open.

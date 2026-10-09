@@ -83,6 +83,27 @@ pub(super) struct RetainedLegacyRecovery {
 }
 
 impl OperationJournalClient {
+    /// Recover a lost readonly custody reply from this original worker. The identity
+    /// selects an already retained reader; it never opens another Source or restores
+    /// writable ownership. Exact source/journal evidence is revalidated before return.
+    pub fn recover_retained_legacy_read_custody(
+        &self,
+        operation: OperationId,
+    ) -> Result<OperationJournalRequest<LegacyRecoveryCustody>, OperationJournalOwnerQueueError>
+    {
+        self.submit_funded_with_reply(
+            InputClass::Ordinary,
+            INPUT_BYTES,
+            false,
+            true,
+            move |input, result| JournalCommand::RecoverRetainedLegacyReadCustody {
+                operation,
+                input,
+                result,
+            },
+        )
+    }
+
     /// Transfer an already-open no-effect recovery reader to the journal worker. It
     /// retains that reader even if inspection fails or the caller drops the reply.
     /// No current ownership, capacity or writable promotion is reconstructed from bytes.
@@ -106,6 +127,16 @@ impl OperationJournalClient {
 }
 
 impl OwnerRuntime {
+    pub(super) fn recover_retained_legacy_read_custody(
+        &self,
+        operation: OperationId,
+        input: InputPermit,
+    ) -> Result<LegacyRecoveryCustody, OperationJournalOwnerError> {
+        let owner = Arc::downgrade(&input.shared);
+        self.validate_legacy_recovery(operation, false, input)?;
+        Ok(LegacyRecoveryCustody { operation, owner })
+    }
+
     pub(super) fn recover_legacy_read_custody(
         &mut self,
         source: LegacySourceReadOwner,

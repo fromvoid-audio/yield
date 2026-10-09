@@ -127,6 +127,16 @@ impl Drop for Fixture {
 fn legacy_recovery_actual_worker_retains_refused_reader_and_lost_reply_until_shutdown() {
     let mut f = Fixture::new();
     let client = f.client();
+    assert!(matches!(
+        client
+            .recover_retained_legacy_read_custody(OperationId::new())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap(),
+        Err(OperationJournalOwnerError::LegacyAdoptionCustody(
+            LegacyAdoptionCustodyError::Closed
+        ))
+    ));
     let source_bytes = fs::read(f.path()).unwrap();
     let journal_before = journal_bytes(&f);
     let request = client
@@ -145,6 +155,16 @@ fn legacy_recovery_actual_worker_retains_refused_reader_and_lost_reply_until_shu
         .unwrap()
         .recv_timeout(Duration::from_secs(3))
         .unwrap();
+    assert!(matches!(
+        client
+            .recover_retained_legacy_read_custody(OperationId::new())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap(),
+        Err(OperationJournalOwnerError::LegacyAdoptionCustody(
+            LegacyAdoptionCustodyError::Changed
+        ))
+    ));
     assert!(matches!(
         result,
         Err(OperationJournalOwnerError::LegacyAdoptionCustody(
@@ -892,9 +912,19 @@ fn legacy_migration_native_actual_worker_commits_original_receipt_and_coalesces_
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(5));
     }
-    let recovered = f
-        .client()
-        .recover_legacy_read_custody(recovery)
+    let client = f.client();
+    drop(client.recover_legacy_read_custody(recovery).unwrap());
+    assert!(
+        client
+            .get(operation)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap()
+            .is_some()
+    );
+    let recovered = client
+        .recover_retained_legacy_read_custody(operation)
         .unwrap()
         .recv_timeout(Duration::from_secs(3))
         .unwrap()

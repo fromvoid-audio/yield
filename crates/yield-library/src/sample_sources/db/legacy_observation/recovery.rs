@@ -367,9 +367,30 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
-        let recovered = worker
-            .client()
-            .recover_legacy_read_custody(owner)
+        let client = worker.client();
+        // Losing the original accepted reply must not require reopening a Source
+        // whose original sidecar reservation is still retained by this worker.
+        drop(client.recover_legacy_read_custody(owner).unwrap());
+        // FIFO read is a real owner barrier; its bytes confer no recovery authority.
+        assert!(
+            client
+                .get(operation)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            client
+                .recover_retained_legacy_read_custody(OperationId::new())
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_err()
+        );
+        let recovered = client
+            .recover_retained_legacy_read_custody(operation)
             .unwrap()
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
@@ -404,6 +425,11 @@ mod tests {
                 .is_err()
         );
         assert!(worker.shutdown());
+        assert!(
+            client
+                .recover_retained_legacy_read_custody(operation)
+                .is_err()
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
         assert!(
