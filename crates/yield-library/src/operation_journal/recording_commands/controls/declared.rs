@@ -172,6 +172,18 @@ impl RecordingDeclaredFinalizingInventory {
         Ok(())
     }
     /// Borrow the fixed declared identities; this inspection grants no retention or effect.
+    pub(crate) fn inspect_pcm_chunk_ids<E>(
+        &self,
+        mut inspect: impl FnMut(Uuid) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for chunk in self.chunks.iter().flatten() {
+            if matches!(chunk.role, RecordingChunkRole::Pcm { .. }) {
+                inspect(chunk.id)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn inspect_chunk_ids<E>(
         &self,
         mut visit: impl FnMut(Uuid) -> Result<(), E>,

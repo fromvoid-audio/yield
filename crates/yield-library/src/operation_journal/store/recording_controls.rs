@@ -1,5 +1,6 @@
 //! Same-transaction reserved recording metadata. No closure, grant or retirement authority.
 use super::{OperationJournalStore, OperationJournalStoreError};
+mod appends;
 mod funded;
 mod initial_funded;
 mod terminal;
@@ -182,7 +183,7 @@ impl OperationJournalStore {
     /// The generic captured-byte route holds no private terminal close capability.
     /// Exact replay is checked before this fence. Finalizing bytes may be appended only
     /// through the future original terminal adapter with its declared admitted identities.
-    pub(super) fn require_recording_capturing(
+    pub(in crate::operation_journal) fn require_recording_capturing(
         &self,
         proposal: &RecordingProposal,
     ) -> Result<(), OperationJournalStoreError> {

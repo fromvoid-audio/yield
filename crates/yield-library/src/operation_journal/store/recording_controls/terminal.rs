@@ -259,6 +259,17 @@ impl OperationJournalStore {
                 "declared terminal retention needs original exclusive snapshot",
             ));
         }
+        self.verify_original_declared_terminal_bytes(proposal, inventory, input)
+    }
+
+    // Exact funded readback also works after COMMIT while the original owner keeps its
+    // genuine barrier/Source context. It confers no close or physical capability.
+    pub(in crate::operation_journal) fn verify_original_declared_terminal_bytes(
+        &self,
+        proposal: &RecordingProposal,
+        inventory: &RecordingDeclaredFinalizingInventory,
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalStoreError> {
         let working = terminal_encoding_credit(proposal, input)?;
         let result = (|| {
             self.verify_declared_finalizing_readback(proposal, inventory, input)?;
