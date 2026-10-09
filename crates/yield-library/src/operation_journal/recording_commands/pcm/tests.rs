@@ -265,6 +265,41 @@ fn original_serializer_transport_and_barrier_normalize_all_channel_counts() {
                                 .unwrap()
                                 .validate_joined(&proposal, &settlements, &joined)
                                 .unwrap();
+                            let frozen = controls::RecordingFrozenInventory::capture(
+                                &proposal,
+                                retained_declaration.as_ref().unwrap(),
+                                42,
+                                &settlements,
+                                &joined,
+                            )
+                            .unwrap();
+                            let bytes = frozen.encode(&proposal).unwrap();
+                            let decoded =
+                                controls::RecordingFrozenInventory::decode(&bytes, &proposal)
+                                    .unwrap();
+                            assert_eq!(decoded, frozen);
+                            decoded
+                                .validate_finalizing(
+                                    &proposal,
+                                    retained_declaration.as_ref().unwrap(),
+                                )
+                                .unwrap();
+                            assert!(
+                                controls::finalizing_observation(
+                                    &bytes,
+                                    &proposal,
+                                    controls::ControlRole::Frozen
+                                )
+                                .unwrap()
+                            );
+                            assert!(
+                                controls::finalizing_observation(
+                                    &bytes,
+                                    &proposal,
+                                    controls::ControlRole::Seal
+                                )
+                                .is_err()
+                            );
                             return pcm;
                         }
                     }

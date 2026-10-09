@@ -138,9 +138,11 @@ pub(crate) fn finalizing_observation(
         Ok(reserved) if reserved == expected => Ok(false),
         Ok(_) => Err(invalid("conflicting reserved recording control")),
         Err(original) => {
-            if role == ControlRole::Finalizing
+            if (role == ControlRole::Finalizing
                 && (RecordingFinalizingInventory::decode(bytes, proposal).is_ok()
-                    || RecordingDeclaredFinalizingInventory::decode(bytes, proposal).is_ok())
+                    || RecordingDeclaredFinalizingInventory::decode(bytes, proposal).is_ok()))
+                || (role == ControlRole::Frozen
+                    && RecordingFrozenInventory::decode(bytes, proposal).is_ok())
             {
                 Ok(true)
             } else {
@@ -154,3 +156,6 @@ pub(crate) fn finalizing_observation(
 
 mod declared;
 pub(crate) use declared::RecordingDeclaredFinalizingInventory;
+
+mod frozen;
+pub(crate) use frozen::RecordingFrozenInventory;
