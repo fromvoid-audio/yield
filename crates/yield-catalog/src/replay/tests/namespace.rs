@@ -77,7 +77,15 @@ fn raw_filename_remains_exact_index_evidence_in_the_actual_replay_transaction() 
     let f = Fixture::new(true);
     let service = f.start();
     let before = f.read().get_revision().unwrap();
-    let path = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff.wav".to_vec()));
+    // APFS accepts only valid UTF-8 names. Exercise exact non-ASCII bytes on
+    // macOS; Unix filesystems accepting arbitrary bytes keep the original
+    // undecodable-name coverage below. A generic non-audio extension keeps the
+    // same index-only transaction assertions. Neither path is converted lossily.
+    #[cfg(target_os = "macos")]
+    let filename = "raw-e\u{301}.txt".as_bytes();
+    #[cfg(not(target_os = "macos"))]
+    let filename = b"raw-\xff.wav";
+    let path = PathBuf::from(std::ffi::OsString::from_vec(filename.to_vec()));
     let absolute = f.base.root.path().join(&path);
     fs::write(&absolute, b"raw filename").unwrap();
     let ingress = f.ingress(10);

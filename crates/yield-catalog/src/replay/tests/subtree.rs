@@ -260,14 +260,30 @@ fn budget_missing_target_or_replaced_directory_require_correlated_audit_without_
 fn raw_directory_and_file_addition_then_absence_stay_lossless_in_worker_transaction() {
     use std::os::unix::ffi::OsStringExt;
     let f = Fixture::new(true);
-    let raw = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff-dir".to_vec()));
+    // APFS preserves UTF-8 normalization bytes but rejects undecodable names.
+    // Keep arbitrary-byte Unix coverage and qualify exact decomposed UTF-8
+    // directory/file evidence through the real worker on macOS. Non-audio
+    // extensions retain the original index-only mutation contract.
+    #[cfg(target_os = "macos")]
+    let (directory, old_name, new_name) = (
+        "raw-e\u{301}-dir".as_bytes(),
+        "old-e\u{301}.txt".as_bytes(),
+        "new-a\u{30a}.txt".as_bytes(),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (directory, old_name, new_name) = (
+        &b"raw-\xff-dir"[..],
+        &b"old-\xff.wav"[..],
+        &b"new-\xfe.wav"[..],
+    );
+    let raw = PathBuf::from(std::ffi::OsString::from_vec(directory.to_vec()));
     fs::create_dir(f.base.root.path().join(&raw)).unwrap();
-    let old = raw.join(std::ffi::OsString::from_vec(b"old-\xff.wav".to_vec()));
+    let old = raw.join(std::ffi::OsString::from_vec(old_name.to_vec()));
     fs::write(f.base.root.path().join(&old), b"old raw").unwrap();
     let service = f.start();
     let before = f.read().get_revision().unwrap();
     fs::remove_file(f.base.root.path().join(&old)).unwrap();
-    let new = raw.join(std::ffi::OsString::from_vec(b"new-\xfe.wav".to_vec()));
+    let new = raw.join(std::ffi::OsString::from_vec(new_name.to_vec()));
     fs::write(f.base.root.path().join(&new), b"new raw").unwrap();
     let request = service
         .submit_replay(subtree_batch(&f, 10, 14, &raw), 7, before)
