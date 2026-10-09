@@ -22,6 +22,7 @@ INVENTORY = "docs/filesystem-producer-inventory.json"
 FUNCTION = re.compile(r"\bfn\s+(\w+)\s*(?:<[^\n{]*>)?\s*\(")
 NATIVE = {"rename", "renameat", "renameat2", "unlink", "unlinkat", "mkdir", "mkdirat",
           "link", "linkat", "symlink", "symlinkat", "ftruncate", "truncate"}
+ISSUE_ID = re.compile(r"(?:OPT-[0-9]+|PULSE-[1-9][0-9]*)\Z")
 
 
 def calls_in(path: str, text: str) -> tuple[Counter, list[str]]:
@@ -143,7 +144,7 @@ def validate(calls: Counter, rows: list[dict]) -> list[str]:
         key = (row["path"], row["function"], row["operation"])
         if key in expected or row["count"] <= 0:
             errors.append(f"duplicate/invalid reviewed entry: {key}")
-        if row["classification"] not in {"owner", "maintenance", "compatibility", "fixture"} or not row["reason"] or not row["retirement"] or not re.fullmatch(r"OPT-\d+", row["issue"]):
+        if row["classification"] not in {"owner", "maintenance", "compatibility", "fixture"} or not row["reason"] or not row["retirement"] or not ISSUE_ID.fullmatch(row["issue"]):
             errors.append(f"incomplete classification: {key}")
         expected[key] = row["count"]
     for key in sorted(calls.keys() | expected.keys()):
@@ -179,6 +180,9 @@ def self_test() -> None:
     row = dict(path="fixture.rs", function="later", operation="fs::write", count=1,
                classification="maintenance", reason="isolated disposable cache", retirement="remove with cache owner", issue="OPT-1636")
     assert not validate(calls, [row])
+    assert not validate(calls, [{**row, "issue": "PULSE-79"}])
+    for invalid_issue in ("PULSE-0", "PULSE-079", "PULSE-", "PULSE-7x", "OPT-", "OPT-7x"):
+        assert validate(calls, [{**row, "issue": invalid_issue}])
     assert validate(calls + calls, [row])
     assert validate(Counter(), [row])
     assert validate(calls, [{**row, "retirement": ""}])

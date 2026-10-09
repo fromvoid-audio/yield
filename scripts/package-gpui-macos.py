@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import TextIO
 
 
 BUNDLE_NAME = "Yield.app"
@@ -20,7 +21,7 @@ BUNDLE_ID = "org.portalsurfer.yield.dev"
 
 
 def command(*args: str, cwd: Path) -> str:
-    return subprocess.check_output(args, cwd=cwd, text=True).strip()
+    return subprocess.check_output(args, cwd=cwd, text=True, stderr=subprocess.STDOUT).strip()
 
 
 def sha256(path: Path) -> str:
@@ -29,6 +30,51 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def create_signed_bundle(
+    binary: Path,
+    app_bundle: Path,
+    icon: Path,
+    font_license: Path,
+    info: dict[str, object],
+    *,
+    cwd: Path,
+    log: TextIO | None = None,
+) -> str:
+    """Assemble and ad-hoc sign the shared local-review Yield.app layout."""
+    contents = app_bundle / "Contents"
+    executable = contents / "MacOS" / "yield"
+    resources = contents / "Resources"
+    resources.mkdir(parents=True)
+    executable.parent.mkdir(parents=True)
+    shutil.copy2(binary, executable)
+    shutil.copy2(icon, resources / "Yield.icns")
+    shutil.copy2(font_license, resources / "IoskeleyMono-LICENSE.txt")
+    (contents / "Info.plist").write_bytes(plistlib.dumps(info))
+    def run_codesign(*args: str) -> str:
+        if log is None:
+            return command(*args, cwd=cwd)
+        log.write("$ " + " ".join(args) + "\n")
+        log.flush()
+        result = subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=False)
+        if result.stdout:
+            log.write(result.stdout)
+        if result.stderr:
+            log.write("[stderr]\n" + result.stderr)
+        log.flush()
+        if result.returncode:
+            raise subprocess.CalledProcessError(
+                result.returncode, args, output=result.stdout, stderr=result.stderr
+            )
+        return (result.stdout + result.stderr).strip()
+
+    run_codesign("codesign", "--force", "--deep", "--sign", "-", str(app_bundle))
+    run_codesign("codesign", "--verify", "--strict", "--deep", str(app_bundle))
+    signature = run_codesign("codesign", "--display", "--verbose=4", str(app_bundle))
+    if "Signature=adhoc" not in signature:
+        raise RuntimeError("local review bundle did not receive an ad-hoc signature")
+    return signature
 
 
 def main() -> int:
@@ -81,26 +127,26 @@ def main() -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".yield-package-", dir=output.parent) as temp:
         staged = Path(temp) / "artifact"
-        contents = staged / BUNDLE_NAME / "Contents"
-        executable = contents / "MacOS" / "yield"
-        resources = contents / "Resources"
-        resources.mkdir(parents=True)
-        executable.parent.mkdir(parents=True)
-        shutil.copy2(binary, executable)
-        shutil.copy2(icon, resources / "Yield.icns")
-        shutil.copy2(font_license, resources / "IoskeleyMono-LICENSE.txt")
-        (contents / "Info.plist").write_bytes(plistlib.dumps({
-            "CFBundleExecutable": "yield",
-            "CFBundleIdentifier": BUNDLE_ID,
-            "CFBundleName": "Yield",
-            "CFBundleDisplayName": "Yield",
-            "CFBundleIconFile": "Yield.icns",
-            "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": version,
-            "CFBundleVersion": build_number,
-            "NSHighResolutionCapable": True,
-            "YieldSourceCommit": args.sha,
-        }))
+        app_bundle = staged / BUNDLE_NAME
+        create_signed_bundle(
+            binary,
+            app_bundle,
+            icon,
+            font_license,
+            {
+                "CFBundleExecutable": "yield",
+                "CFBundleIdentifier": BUNDLE_ID,
+                "CFBundleName": "Yield",
+                "CFBundleDisplayName": "Yield",
+                "CFBundleIconFile": "Yield.icns",
+                "CFBundlePackageType": "APPL",
+                "CFBundleShortVersionString": version,
+                "CFBundleVersion": build_number,
+                "NSHighResolutionCapable": True,
+                "YieldSourceCommit": args.sha,
+            },
+            cwd=root,
+        )
         files = sorted(path for path in staged.rglob("*") if path.is_file())
         manifest = {
             "schema_version": 1,

@@ -113,7 +113,7 @@ struct Shared {
     status: Mutex<WalPreparationStatus>,
     #[cfg(test)]
     retirement_for_tests: Mutex<Option<retirement_inventory::Observation>>,
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     retirement_hook_for_tests:
         Mutex<Option<Box<dyn FnOnce(uuid::Uuid) -> Option<HandshakeCredit> + Send>>>,
     // All status/cache payload and the Shared allocation disappear before this
@@ -144,7 +144,7 @@ impl WalPreparationHandle {
     ) -> Option<retirement_inventory::Observation> {
         self.0.retirement_for_tests.lock().unwrap().clone()
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(in crate::operation_journal) fn retirement_hook_for_tests(
         &self,
         hook: impl FnOnce(uuid::Uuid) + Send + 'static,
@@ -155,7 +155,7 @@ impl WalPreparationHandle {
         }));
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(in crate::operation_journal) fn retirement_pressure_hook_for_tests(
         &self,
         hook: impl FnOnce(uuid::Uuid) -> HandshakeCredit + Send + 'static,
@@ -267,7 +267,7 @@ impl Collector {
             status: Mutex::new(WalPreparationStatus::Preparing),
             #[cfg(test)]
             retirement_for_tests: Mutex::new(None),
-            #[cfg(all(test, target_os = "linux"))]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             retirement_hook_for_tests: Mutex::new(None),
             _journal_input: journal_input.clone(),
         });
@@ -318,11 +318,11 @@ impl Collector {
         }
         Ok(())
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(in crate::operation_journal) fn round_for_tests(&self) -> Arc<super::CurrentRound> {
         Arc::clone(self.current.as_ref().unwrap())
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(in crate::operation_journal) fn preparing_round_for_tests(
         &self,
     ) -> Option<Arc<super::CurrentRound>> {
@@ -349,7 +349,7 @@ impl Collector {
             self.ready_cohort.ok_or(WalPreparationError::InvalidInput)?,
         ))
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(in crate::operation_journal) fn begin_decision(
         &mut self,
         expected_digest: [u8; 32],
@@ -423,14 +423,14 @@ impl Collector {
     pub(in crate::operation_journal) fn decision_nonce(&self) -> Option<uuid::Uuid> {
         self.decision.as_ref().map(|decision| decision.nonce())
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(in crate::operation_journal) fn start_settlement(&mut self) -> bool {
         self.decision
             .as_mut()
             .is_some_and(|decision| decision.start_sqlite())
     }
     /// Call only after definite original SQLite outcome or exact durable readback.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(in crate::operation_journal) fn resolve_settlement(&mut self) {
         if let Some(decision) = self.decision.take() {
             decision.resolve();

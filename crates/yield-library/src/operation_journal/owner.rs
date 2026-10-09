@@ -8179,7 +8179,7 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 #[cfg(test)]
 mod tests {
     mod native_retirement_inventory;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod wal_preparation;
 
     mod command_drain_tests;

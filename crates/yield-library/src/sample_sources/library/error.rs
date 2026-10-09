@@ -210,6 +210,9 @@ pub enum LibraryError {
         /// Stable reason for the fail-closed result.
         reason: String,
     },
+    /// Application persistence is unavailable while local clean/reset recovery is pending.
+    #[error("Yield maintenance admission failed: {0}")]
+    MaintenanceAdmission(String),
     /// Failed to open or query the database.
     #[error("Library database query failed: {0}")]
     Sql(#[from] rusqlite::Error),
@@ -343,6 +346,9 @@ pub(super) fn map_app_dir_error(error: app_dirs::AppDirError) -> LibraryError {
         }
         app_dirs::AppDirError::InvalidProfileName { profile } => {
             LibraryError::InvalidProfile { profile }
+        }
+        app_dirs::AppDirError::MaintenanceAdmission(reason) => {
+            LibraryError::MaintenanceAdmission(reason)
         }
     }
 }

@@ -20,7 +20,7 @@ pub(crate) struct CurrentRound {
     acknowledged: Mutex<RoundState>,
     resolved: Condvar,
     nonce: uuid::Uuid,
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     _credit: super::HandshakeCredit,
 }
@@ -139,7 +139,7 @@ impl OriginalDecision {
                 BoundaryRefusal::Changed => WalPreparationError::InvalidInput,
             })
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(in crate::operation_journal) fn start_sqlite(&mut self) -> bool {
         let round = Arc::clone(&self.round);
         round
@@ -177,13 +177,13 @@ impl Drop for OriginalDecision {
 }
 /// Only an actual parked worker retains this non-Clone acknowledgement custody.
 pub(crate) struct CurrentCustody(Arc<CurrentRound>);
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 impl CurrentCustody {
     pub(crate) fn original_round_for_tests(&self) -> Arc<CurrentRound> {
         Arc::clone(&self.0)
     }
 }
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 impl CurrentRound {
     pub(crate) fn foreign_ack_for_tests(
         self: &Arc<Self>,
@@ -288,7 +288,7 @@ impl CurrentRound {
             }),
             resolved: Condvar::new(),
             nonce: uuid::Uuid::new_v4(),
-            #[cfg(all(test, target_os = "linux"))]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             snapshot_hook: Mutex::new(None),
             _credit: credit,
         }))
@@ -337,7 +337,7 @@ impl CurrentRound {
                 .map_err(|_| BoundaryRefusal::Revoked)?;
             (state.boundaries.clone(), state.cohort)
         };
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         {
             let hook = self.snapshot_hook.lock().unwrap().take();
             if let Some(hook) = hook {

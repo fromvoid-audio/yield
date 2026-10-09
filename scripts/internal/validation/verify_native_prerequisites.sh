@@ -85,6 +85,9 @@ case "$CASE" in
     run_tests generations profile_generation 0
     ;;
   source-release-policy)
+    if [[ "$PLATFORM" == macos ]]; then
+      run_tests native-shm darwin_original_shared_mapping_accepts_single_reference_and_refuses_cow 1
+    fi
     cargo test --locked -p yield-library --lib source_retirement_policy -- --list > "$OUTPUT_DIR/source-policy-list.txt"
     run_tests source-policy source_retirement_policy 2
     run_tests generic-compatibility generic_registered_lease_preparation_retains_no_retirement_policy 1

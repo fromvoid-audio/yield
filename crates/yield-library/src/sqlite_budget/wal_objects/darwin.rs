@@ -54,8 +54,11 @@ fn matches(
     let address = u64::try_from(address).ok()?;
     let end = region.address.checked_add(region.size)?;
     let required_end = address.checked_add(32768)?;
-    // Known public constants: VM_PROT_READ|WRITE, PROC_REGION_SHARED (no submap),
-    // SM_SHARED/TRUESHARED/SHARED_ALIASED, VREG and S_IFREG. Unknown shapes refuse.
+    // SM_PRIVATE describes the number of references to a VM object, not MAP_PRIVATE.
+    // XNU reports a sole-reference external pager as SM_PRIVATE even for MAP_SHARED.
+    // A copy-on-write entry instead reports SM_COW (or a nonzero shadow depth).
+    // Require the original vnode and a non-COW, non-submap region; path text and
+    // a reference-count-derived PROC_REGION_SHARED bit cannot establish that alone.
     if address == 0
         || inode == 0
         || bytes < 32768
@@ -65,8 +68,9 @@ fn matches(
         || region.offset != 0
         || region.protection != 3
         || region.max_protection & 3 != 3
-        || region.flags != 2
-        || !matches!(region.share_mode, 4 | 5 | 7)
+        || !matches!(region.flags, 0 | 2)
+        || !matches!(region.share_mode, 2 | 4 | 5 | 7)
+        || region.shadow_depth != 0
         || vnode.kind != 1
         || vnode.mode & 0o170000 != 0o100000
         || vnode.device != device
@@ -146,6 +150,58 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_original_shared_mapping_accepts_single_reference_and_refuses_cow() {
+        use std::os::unix::{fs::MetadataExt, io::AsRawFd};
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(32768).unwrap();
+        let metadata = file.metadata().unwrap();
+        struct Mapping(*mut libc::c_void);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: this guard owns the original successful 32768-byte mapping.
+                assert_eq!(unsafe { libc::munmap(self.0, 32768) }, 0);
+            }
+        }
+        let observe = |flags| {
+            // SAFETY: retained regular tempfile descriptor, exact file-sized mapping,
+            // and no fixed address. The guard unmaps before the descriptor is dropped.
+            let address = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    32768,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    flags,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(address, libc::MAP_FAILED);
+            let mapping = Mapping(address);
+            let check = |inode, deadline| {
+                mapped_identity(
+                    mapping.0 as usize,
+                    metadata.dev(),
+                    inode,
+                    metadata.len(),
+                    &mut ObservationDeadline::new(deadline),
+                )
+            };
+            let fresh = || Instant::now() + Duration::from_secs(2);
+            let expected = (flags == libc::MAP_SHARED).then_some(true);
+            assert_eq!(check(metadata.ino(), fresh()), expected);
+            // Faulting/writing a private mapping must not make it a shared vnode grant.
+            // SAFETY: original live writable mapping contains this byte.
+            unsafe { std::ptr::write_volatile(mapping.0.cast::<u8>(), 7) };
+            assert_eq!(check(metadata.ino(), fresh()), expected);
+            assert_eq!(check(metadata.ino().checked_add(1).unwrap(), fresh()), None);
+            assert_eq!(check(metadata.ino(), Instant::now()), None);
+        };
+        observe(libc::MAP_SHARED);
+        observe(libc::MAP_PRIVATE);
+    }
+
     #[test]
     fn darwin_mapping_record_rejects_aliases_private_regions_and_unknown_identity() {
         // Contract records exercise parsing only. They cannot call the original
@@ -182,16 +238,19 @@ mod tests {
         region.offset = 4096;
         assert_eq!(check(&region, &vnode), None);
         region.offset = 0;
-        for mode in [1, 2, 3, 6, 8, 9] {
+        for mode in [1, 3, 6, 8, 9] {
             region.share_mode = mode;
             assert_eq!(check(&region, &vnode), None);
         }
         region.share_mode = 4;
-        for flags in [0, 1, 3, 4] {
+        for flags in [1, 3, 4] {
             region.flags = flags;
             assert_eq!(check(&region, &vnode), None);
         }
         region.flags = 2;
+        region.shadow_depth = 1;
+        assert_eq!(check(&region, &vnode), None);
+        region.shadow_depth = 0;
         region.protection = 7;
         assert_eq!(check(&region, &vnode), None);
         region.protection = 3;

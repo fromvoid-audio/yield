@@ -89,6 +89,20 @@ fn live_profile_override_bypasses_test_isolation() {
     assert!(root.is_dir());
 }
 
+#[cfg(all(feature = "development-state", target_os = "macos"))]
+#[test]
+fn development_state_redirects_ann_index_root_away_from_production() {
+    let _lock = app_dirs_test_lock();
+    let base = tempdir().expect("tempdir");
+    let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
+    let _profile_guard = PersistenceProfileGuard::live();
+
+    let root = app_root_dir().expect("development ANN root");
+
+    assert_eq!(root, base.path().join(".yield-development"));
+    assert!(!base.path().join(".yield").exists());
+}
+
 #[test]
 fn sandbox_profile_uses_dedicated_profile_root() {
     let _lock = app_dirs_test_lock();
