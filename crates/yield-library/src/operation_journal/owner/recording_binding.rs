@@ -121,6 +121,11 @@ pub(super) struct RetainedRecordingProducer {
     proposal: RecordingProposal,
     digest: [u8; 32],
     invalidated: bool,
+    terminal: Option<super::super::recording_commands::controls::RecordingFinalizingInventory>,
+    _terminal_barrier: Option<reson::recording::RecordingTerminalBarrier>,
+    _terminal_joined: Option<reson::recording::RecordingJoinedCompletion>,
+    _terminal_error: Option<OperationJournalOwnerError>,
+    _terminal_backing: Option<InputPermit>,
     input: InputPermit,
 }
 impl OperationJournalClient {
@@ -298,9 +303,186 @@ impl OwnerRuntime {
             proposal,
             digest,
             invalidated: false,
+            terminal: None,
+            _terminal_barrier: None,
+            _terminal_joined: None,
+            _terminal_error: None,
+            _terminal_backing: None,
             input,
         });
         Ok(facade)
+    }
+
+    /// Inspect original one-shot producer evidence without waiting on the actor. This
+    /// factory has no required-WAL/startup capability: an unexpected terminal observation is retained
+    /// for audit with acknowledgement withheld, never acknowledged on the strength of serialized observations.
+    pub(super) fn poll_recording_custody(&mut self) {
+        let Some(mut retained) = self.recording_producer.take() else {
+            return;
+        };
+        if let Ok(barrier) = retained._settlements.try_barrier() {
+            let observed = (|| {
+                let profile = self.final_profile_guard.as_ref()?;
+                let acquisition = uuid::Uuid::parse_str(profile.owner_identity()).ok()?;
+                let inventory = super::super::recording_commands::controls::RecordingFinalizingInventory::capture(
+                    &retained.proposal,
+                    uuid::Uuid::new_v4(),
+                    acquisition,
+                    1,
+                    &retained._settlements,
+                    &barrier,
+                ).ok()?;
+                Some(inventory)
+            })();
+            if let Some(inventory) = observed.as_ref() {
+                if let Ok(input) = retained.input.shared.startup_input() {
+                    if let Err(error) =
+                        self.retain_original_finalizing(&retained, inventory, &barrier, &input)
+                    {
+                        // Keep original selected error loans under the retained producer.
+                        // Neither failed COMMIT nor failed readback permits a replacement.
+                        if !self.store().connection_is_autocommit_for_recording()
+                            || matches!(&error,
+                                OperationJournalOwnerError::RecordingTerminalRollbackUncertain { .. }
+                                | OperationJournalOwnerError::Store(
+                                    OperationJournalStoreError::RecordingTerminalOutcomeUncertain { .. }
+                                    | OperationJournalStoreError::RecordingTerminalRollbackUncertain { .. }
+                                )) {
+                            retained.input.shared.mark_unavailable("original Recording terminal outcome needs audit");
+                        }
+                        retained._terminal_error = Some(error);
+                        retained._terminal_backing = Some(input);
+                    }
+                }
+            }
+            retained.terminal = observed;
+            retained.invalidated = true;
+            retained._terminal_barrier = Some(barrier);
+        }
+        if let Ok(joined) = retained._settlements.try_joined() {
+            // Genuine join evidence must also belong to the original private instance and
+            // agree with the inventory. Even success cannot upgrade this pre-start factory.
+            let _matches = retained.terminal.as_ref().is_some_and(|inventory| {
+                inventory
+                    .validate_joined(&retained.proposal, &retained._settlements, &joined)
+                    .is_ok()
+            });
+            retained._terminal_joined = Some(joined);
+            retained.invalidated = true;
+        }
+        self.recording_producer = Some(retained);
+    }
+
+    /// Barrier observation closes generic mutation immediately, even if SQL admission or
+    /// persistence then fails. Only exact already retained data remains replayable.
+    pub(super) fn validate_recording_custody_append(
+        &self,
+        chunk: &RecordingCapturedChunk,
+    ) -> Result<(), OperationJournalOwnerError> {
+        if self.recording_producer.as_ref().is_some_and(|retained| {
+            retained.invalidated && retained.proposal.operation_id() == chunk.operation_id()
+        }) {
+            self.store().require_recording_existing_replay(chunk)?;
+        }
+        Ok(())
+    }
+
+    fn retain_original_finalizing(
+        &mut self,
+        retained: &RetainedRecordingProducer,
+        inventory: &super::super::recording_commands::controls::RecordingFinalizingInventory,
+        barrier: &reson::recording::RecordingTerminalBarrier,
+        input: &InputPermit,
+    ) -> Result<(), OperationJournalOwnerError> {
+        use RecordingProducerCustodyError as E;
+        if retained.invalidated || !retained._settlements.owns_barrier(barrier) {
+            return Err(E::Changed.into());
+        }
+        self.publication_fences
+            .close_for_mutation(retained.proposal.operation_id())?;
+        let working = self
+            .store()
+            .begin_recording_terminal_write_with_input(input)?
+            .expect("original funded terminal transaction");
+        let mut result = (|| {
+            self.resource_admission
+                .validate_open()
+                .map_err(|_| E::Closed)?;
+            self.revalidate_capacity_boundary()
+                .map_err(|_| E::Changed)?;
+            let source = self
+                .source_registrations
+                .get(&retained.registration.registration_id)
+                .ok_or(E::Changed)?;
+            if source.receipt != retained.registration
+                || !matches!(source.readiness, SourceRegistrationReadiness::Registered)
+            {
+                return Err(E::Changed.into());
+            }
+            let epoch = u64::try_from(retained.registration.lease_identity.epoch())
+                .map_err(|_| E::Changed)?;
+            if !matches_original_destination(&retained.proposal, &source.request, epoch) {
+                return Err(E::Changed.into());
+            }
+            let profile = self.final_profile_guard.as_ref().ok_or(E::Closed)?;
+            retained
+                .source_pin
+                .validate_for_issuance(&source.request, profile)?;
+            let _source_effect = retained.source_pin.begin_effect()?;
+            let snapshot = self
+                .store()
+                .validate_original_recording_terminal_context(&retained.proposal, input)?;
+            if matches!(
+                snapshot.readiness(),
+                CapacityRebuildReadiness::ReconciliationRequired { .. }
+            ) {
+                return Err(E::Changed.into());
+            }
+            let provider = self.capacity_provider.as_ref().ok_or(E::Changed)?;
+            snapshot
+                .validate_provider(provider, Some(input))
+                .map_err(|_| E::Changed)?;
+            provider.validate_recovery_state().map_err(|_| E::Changed)?;
+            drop(snapshot);
+            self.store().record_finalizing_inside_original_transaction(
+                &retained.proposal,
+                inventory,
+                input,
+            )?;
+            self.store()
+                .finish_recording_terminal_write(input)
+                .map_err(
+                    |cause| OperationJournalStoreError::RecordingTerminalOutcomeUncertain {
+                        phase: "commit or postcommit namespace",
+                        cause: Box::new(cause),
+                    },
+                )?;
+            self.store()
+                .verify_finalizing_readback(&retained.proposal, inventory, input)
+                .map_err(
+                    |cause| OperationJournalStoreError::RecordingTerminalOutcomeUncertain {
+                        phase: "postcommit readback",
+                        cause: Box::new(cause),
+                    },
+                )?;
+            retained
+                .source_pin
+                .validate_for_issuance(&source.request, profile)?;
+            Ok(())
+        })();
+        if !self.store().connection_is_autocommit_for_recording() {
+            if let Err(cause) = self.store().rollback_recording_terminal_write(input) {
+                result = Err(
+                    OperationJournalOwnerError::RecordingTerminalRollbackUncertain {
+                        original: Box::new(result.err().unwrap_or_else(|| E::Changed.into())),
+                        rollback: Box::new(cause),
+                    },
+                );
+            }
+        }
+        // Original scope backing remains alive through all observed values and selected errors.
+        input.retain_historical_error(working, None, None, None);
+        result
     }
 
     pub(super) fn validate_recording_custody(

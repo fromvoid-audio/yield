@@ -169,10 +169,8 @@ pub(super) fn verify(
                 if bytes != expected.encode(proposal).map_err(error)? {
                     return Err(OperationJournalStoreError::RecordingPrestartResourceBound);
                 }
-            } else if RecordingControlReservation::decode(bytes, proposal).map_err(error)?
-                != expected
-            {
-                return Err(error("conflicting reserved recording control"));
+            } else {
+                finalizing_observation(bytes, proposal, role).map_err(error)?;
             }
             // Borrowed payload and decoded scalar control die before raw credit
             // can be replaced for the next role.
