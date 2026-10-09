@@ -4984,6 +4984,8 @@ impl OperationJournalOwner {
             true,
             #[cfg(any(test, feature = "test-support"))]
             None,
+            #[cfg(test)]
+            false,
         )
     }
 
@@ -4997,7 +4999,15 @@ impl OperationJournalOwner {
     pub fn start_without_capacity_for_test(
         store: OperationJournalStore,
     ) -> Result<Self, OperationJournalOwnerStartError> {
-        Self::start_inner(store, None, false, false, None)
+        Self::start_inner(
+            store,
+            None,
+            false,
+            false,
+            None,
+            #[cfg(test)]
+            false,
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -5007,7 +5017,26 @@ impl OperationJournalOwner {
         store: OperationJournalStore,
         registry_path: std::path::PathBuf,
     ) -> Result<Self, OperationJournalOwnerStartError> {
-        Self::start_inner(store, None, false, true, Some(registry_path))
+        Self::start_inner(
+            store,
+            None,
+            false,
+            true,
+            Some(registry_path),
+            #[cfg(test)]
+            false,
+        )
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    /// Start a publication-test owner with a real descriptor-derived macOS volume binding.
+    /// The caller-provided registry is still isolated test state; capacity admission and its
+    /// fault controls remain the normal owner/store implementation.
+    fn start_with_native_capacity_fixture_for_test(
+        store: OperationJournalStore,
+        registry_path: std::path::PathBuf,
+    ) -> Result<Self, OperationJournalOwnerStartError> {
+        Self::start_inner(store, None, false, true, Some(registry_path), true)
     }
 
     #[cfg(test)]
@@ -5022,6 +5051,7 @@ impl OperationJournalOwner {
             false,
             false,
             None,
+            false,
         )
         .expect("operation journal owner start");
         (owner, ready, release)
@@ -5041,6 +5071,8 @@ impl OperationJournalOwner {
             true,
             false,
             None,
+            #[cfg(test)]
+            false,
         )
         .expect("operation journal owner start");
         (owner, ready, release)
@@ -5057,6 +5089,7 @@ impl OperationJournalOwner {
         #[cfg(any(test, feature = "test-support"))] bootstrap_registry_path: Option<
             std::path::PathBuf,
         >,
+        #[cfg(test)] bootstrap_native_capacity: bool,
     ) -> Result<Self, OperationJournalOwnerStartError> {
         let (command_tx, command_rx) = OwnerCommandReceivers::channel();
         let shared = Arc::new(OwnerShared::new(command_tx));
@@ -5088,6 +5121,8 @@ impl OperationJournalOwner {
                         bootstrap_capacity,
                         #[cfg(any(test, feature = "test-support"))]
                         bootstrap_registry_path,
+                        #[cfg(test)]
+                        bootstrap_native_capacity,
                         #[cfg(test)]
                         worker_prepared_admission_id_allocations,
                         #[cfg(test)]
@@ -7149,6 +7184,7 @@ fn run_owner(
     #[cfg(any(test, feature = "test-support"))] panic_on_command: bool,
     #[cfg(any(test, feature = "test-support"))] bootstrap_capacity: bool,
     #[cfg(any(test, feature = "test-support"))] bootstrap_registry_path: Option<std::path::PathBuf>,
+    #[cfg(test)] bootstrap_native_capacity: bool,
     #[cfg(test)] prepared_admission_id_allocations: Arc<AtomicUsize>,
     #[cfg(test)] synthetic_chunk_write_invocations: Arc<AtomicUsize>,
 ) {
@@ -7207,12 +7243,35 @@ fn run_owner(
     let bootstrap_capacity = bootstrap_capacity;
     #[cfg(any(test, feature = "test-support"))]
     let bootstrap_registry_path = bootstrap_registry_path;
+    #[cfg(test)]
+    let bootstrap_native_capacity = bootstrap_native_capacity;
     #[cfg(any(test, feature = "test-support"))]
     if bootstrap_capacity {
-        let volume_owner = match runtime
+        #[cfg(test)]
+        let volume_owner_result = if bootstrap_native_capacity {
+            #[cfg(target_os = "macos")]
+            {
+                match bootstrap_registry_path.as_deref() {
+                    Some(path) => runtime
+                        .store()
+                        .acquire_profile_journal_native_volume_owner_fixture(path),
+                    None => unreachable!("native capacity fixture requires its private registry"),
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                unreachable!("native capacity fixture exists only on macOS")
+            }
+        } else {
+            runtime
+                .store()
+                .acquire_profile_journal_volume_owner(bootstrap_registry_path.as_deref())
+        };
+        #[cfg(all(not(test), feature = "test-support"))]
+        let volume_owner_result = runtime
             .store()
-            .acquire_profile_journal_volume_owner(bootstrap_registry_path.as_deref())
-        {
+            .acquire_profile_journal_volume_owner(bootstrap_registry_path.as_deref());
+        let volume_owner = match volume_owner_result {
             Ok(volume_owner) => volume_owner,
             Err(error) => {
                 shared.mark_unavailable(&format!(
@@ -11140,6 +11199,13 @@ mod tests {
                 }
             });
         }
+        #[cfg(target_os = "macos")]
+        let mut owner = OperationJournalOwner::start_with_native_capacity_fixture_for_test(
+            store,
+            registry_path,
+        )
+        .expect("journal owner");
+        #[cfg(not(target_os = "macos"))]
         let mut owner =
             OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
                 .expect("journal owner");
@@ -12041,6 +12107,7 @@ mod tests {
                 - publication_fence::HEADER_BYTES
                 - native_read_capsule::BACKING
                 - native_read_capsule::REGISTRY
+                - HISTORICAL_REPLY_BYTES
         );
         if let Some(entered) = release_after_entry {
             let (request, unused) = unused_for_release.unwrap();
@@ -12244,6 +12311,7 @@ mod tests {
                     - publication_fence::HEADER_BYTES
                     - native_read_capsule::BACKING
                     - native_read_capsule::REGISTRY
+                    - HISTORICAL_REPLY_BYTES
             );
             staged.acknowledge().unwrap();
             let _ = file_owner.shutdown();
@@ -12322,6 +12390,7 @@ mod tests {
                 - publication_fence::HEADER_BYTES
                 - native_read_capsule::BACKING
                 - native_read_capsule::REGISTRY
+                - HISTORICAL_REPLY_BYTES
         );
         drop(permit);
         assert_eq!(
@@ -13889,6 +13958,13 @@ mod tests {
             facts.identity,
             facts.allocation_unit,
         );
+        let expected_claim_ids = input
+            .claims
+            .claims()
+            .iter()
+            .map(|claim| claim.claim_id().clone())
+            .collect::<Vec<_>>();
+        let input_remaining_before = owner.shared.input_bytes.lock().unwrap().remaining[0];
         let mut request = owner
             .client()
             .admit_prepared(input)
@@ -13897,17 +13973,28 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("uncertain admission result")
             .expect_err("uncertain settlement must be surfaced");
-        assert!(matches!(
-            result,
-            OperationJournalOwnerError::PreparedAdmissionRetained(
-                PreparedAdmissionRetainedError::Uncertain {
-                    stage: JournalInsertWriteStage::CommitOutcomeUnknown,
-                    claim_ids,
-                    ..
-                }
-            ) if claim_ids.len() == 1
-        ));
+        let OperationJournalOwnerError::RetainedBacking(backing) = &result else {
+            panic!("prepared uncertainty must retain its original reply: {result:?}");
+        };
+        assert!(
+            matches!(
+                backing.original_error(),
+                OperationJournalOwnerError::PreparedAdmissionRetained(
+                    PreparedAdmissionRetainedError::Uncertain {
+                        stage: JournalInsertWriteStage::CommitOutcomeUnknown,
+                        claim_ids,
+                        ..
+                    }
+                ) if claim_ids.len() == 1 && claim_ids == &expected_claim_ids
+            ),
+            "unexpected retained uncertainty: {result:?}"
+        );
+        assert!(owner.shared.input_bytes.lock().unwrap().remaining[0] < input_remaining_before);
         assert!(owner.shutdown());
+        drop(result);
+        // The uncertain outcome intentionally leaves the exact claim charge audit-pending in
+        // the owner provider. Do not treat dropping this reply wrapper as proof that the
+        // operation's retained capacity has been released.
         drop(fixture);
     }
 
@@ -14029,16 +14116,24 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("rollback admission result")
             .expect_err("confirmed rollback must be surfaced");
-        assert!(matches!(
-            result,
-            OperationJournalOwnerError::PreparedAdmissionRolledBack(_)
-        ));
+        let OperationJournalOwnerError::RetainedBacking(backing) = &result else {
+            panic!("confirmed rollback must retain its original reply: {result:?}");
+        };
+        assert!(
+            matches!(
+                backing.original_error(),
+                OperationJournalOwnerError::PreparedAdmissionRolledBack(rolled_back)
+                    if rolled_back.reason.contains("prepared admission rollback fault")
+            ),
+            "unexpected retained rollback: {result:?}"
+        );
         assert_eq!(
             owner.prepared_admission_id_allocations(),
             before + 1,
             "rollback is reported only after the post-ID persistence boundary"
         );
         assert!(owner.shutdown());
+        drop(result);
         drop(fixture);
     }
 

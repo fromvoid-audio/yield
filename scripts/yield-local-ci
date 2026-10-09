@@ -425,8 +425,12 @@ def check(args: argparse.Namespace) -> None:
                     validator_lease_fd = local_state.convert_clean_handoff_to_validator_lease(
                         "production", namespace_fd, transition_fd
                     )
-                    os.close(transition_fd)
+                    if validator_lease_fd == namespace_fd:
+                        namespace_fd = None
+                    close_transition_fd = transition_fd
                     transition_fd = None
+                    if close_transition_fd is not None:
+                        os.close(close_transition_fd)
                     log.write("$ exclusive clean/production handoff\n")
                     log.write(json.dumps(native_state, sort_keys=True) + "\n")
                 for cmd in commands:
@@ -468,12 +472,30 @@ def check(args: argparse.Namespace) -> None:
                 details["error"] = str(error)
                 log.write(f"local CI runner error: {error}\n")
             finally:
-                if validator_lease_fd is not None:
-                    os.close(validator_lease_fd)
-                if namespace_fd is not None:
-                    os.close(namespace_fd)
-                if transition_fd is not None:
-                    os.close(transition_fd)
+                cleanup_errors = []
+                descriptors = []
+                seen_fds = set()
+                for label, fd in (
+                    ("validator lease", validator_lease_fd),
+                    ("namespace", namespace_fd),
+                    ("transition", transition_fd),
+                ):
+                    if fd is not None and fd not in seen_fds:
+                        descriptors.append((label, fd))
+                        seen_fds.add(fd)
+                validator_lease_fd = namespace_fd = transition_fd = None
+                for label, fd in descriptors:
+                    try:
+                        os.close(fd)
+                    except BaseException as error:
+                        cleanup_errors.append({"descriptor": label, "error": str(error)})
+                        if failure is None:
+                            failure = error
+                        try:
+                            log.write(f"{label} descriptor cleanup error: {error}\n")
+                            log.flush()
+                        except BaseException:
+                            pass
                 if native_state and native_state.get("transaction"):
                     try:
                         restored = local_state.restore(str(native_state["transaction"]))
@@ -483,8 +505,15 @@ def check(args: argparse.Namespace) -> None:
                         details["restore_error"] = str(error)
                         if failure is None:
                             failure = error
-                        log.write(f"state restore error: {error}\n")
-                        log.flush()
+                        try:
+                            log.write(f"state restore error: {error}\n")
+                            log.flush()
+                        except BaseException:
+                            pass
+                if cleanup_errors:
+                    details["descriptor_cleanup_errors"] = cleanup_errors
+                    if details.get("status") == "passed":
+                        details["status"] = "cleanup_failed"
         details["completed_unix_ns"] = time.time_ns()
         log_path.with_suffix(".json").write_text(json.dumps(details, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(details, indent=2))

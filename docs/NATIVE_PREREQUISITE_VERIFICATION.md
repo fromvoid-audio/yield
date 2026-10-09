@@ -1,8 +1,12 @@
 # Native source, profile and startup prerequisite verification
 
-The active `native-prerequisites.yml` workflow executes the existing acceptance
-harnesses for OPT-2368, OPT-2378 and OPT-2405 on real macOS/APFS and Windows/MSVC
-runners with the repository-pinned Rust toolchain. The script records the exact
+Local native validation executes the existing acceptance harnesses for OPT-2368,
+OPT-2378 and OPT-2405 with the repository-pinned Rust toolchain. The former
+workflow is retained as `native-prerequisites.yml.disabled`; hosted CI is retired.
+On macOS, run each case through
+`scripts/yield-local-ci check --sha <full-commit> --lane native --case prerequisite:<case>`.
+Windows/MSVC requires a separate genuine local Windows host running the original
+script; macOS results do not establish Windows qualification. The script records the exact
 head, kernel/account/filesystem/SDK/resource facts, commands and complete results.
 It refuses other hosts and zero-test results; fixed selectors require exact
 passing counts without ignored tests. The profile suite's standalone process
@@ -20,11 +24,14 @@ native children.
 | sdk-and-startup-components | macOS | Strong/Weak/provider/refund/poison/proof/conflict regressions and canonical native application check |
 
 Every lane additionally checks the library's normal and test targets on its
-supported native compiler/SDK. Production startup cases use separate fresh runner
-accounts: an intentionally unsettled intent or failed bootstrap can preserve a
+supported native compiler/SDK. The macOS local tooling runs production startup
+cases in separate reversible clean-state transactions on this account: an
+intentionally unsettled intent or failed bootstrap can preserve a
 dirty volume marker, and joined worker teardown does not authorize another profile
-to adopt it. The workflow never redirects the native home, substitutes a registry,
-erases a marker or turns a fixture into a physical grant.
+to adopt it. The tooling atomically parks and later restores the original Yield
+state, retaining the displaced test state and marker evidence. It never redirects
+the native home, substitutes a registry, erases a marker or turns a fixture into
+a physical grant. See [TEST.md](TEST.md) for reset refusal and recovery contracts.
 
 These are component/native regression requirements. Historical startup rows and
 arithmetic cases are not qualified issuance. Source policy tests must retain their
@@ -33,7 +40,8 @@ allocation policy, joint WAL decisions, attempts, capture/terminal effects,
 publication/refund/cleanup/settlement and release application acceptance remain
 separate. Actual native results are pending until every required lane succeeds.
 
-The first run confirmed production startup on macOS and original Source policy
+The earlier runner results below are historical; they do not qualify the current
+frozen head or replace its local checks. The first run confirmed production startup on macOS and original Source policy
 execution on Windows/MSVC. It exposed test defects now corrected: canonical
 macOS temporary namespaces preserve no-follow checks; lock diagnostic reads use
 the same held Windows file object and drop the duplicate before release checks;

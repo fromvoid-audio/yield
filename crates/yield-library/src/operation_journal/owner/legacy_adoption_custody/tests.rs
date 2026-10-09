@@ -65,18 +65,27 @@ impl Fixture {
             });
         }
         f.owner = Some(if capacity {
-            OperationJournalOwner::start_with_capacity_fixture_for_test(
-                store,
-                f.profile.path().join("native-volume-registry"),
-            )
-            .unwrap()
+            let registry = f.profile.path().join("native-volume-registry");
+            fs::create_dir(&registry).unwrap();
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry).unwrap()
         } else {
             OperationJournalOwner::start_without_capacity_for_test(store).unwrap()
         });
         let deadline = Instant::now() + Duration::from_secs(2);
-        while f.owner.as_ref().unwrap().status() != OperationJournalOwnerStatus::Available {
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(5));
+        loop {
+            match f.owner.as_ref().unwrap().status() {
+                OperationJournalOwnerStatus::Available => break,
+                status @ OperationJournalOwnerStatus::Unavailable { .. } => {
+                    panic!("journal owner startup failed: {status:?}")
+                }
+                status => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "journal owner startup timed out: {status:?}"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
         }
         f.baseline = *f.client().shared.input_bytes.lock().unwrap();
         f

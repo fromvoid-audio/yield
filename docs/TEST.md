@@ -115,11 +115,12 @@ enclosing watchdog's live PID/start identity, lease record, command, and process
 ancestry. An inherited recursion marker without that proof starts a fresh
 watchdog normally.
 
-## Local macOS CI and reversible state: design contract
+## Local macOS CI and reversible state
 
-This is the implementation contract for Pulse Yield v19.1 ticket 79. The new
-commands below are proposed interfaces, not installed commands. Existing
-validation and packaging commands elsewhere in this document remain executable.
+Implemented for Pulse Yield 0.1 ticket 79, the commands below are available in
+`scripts/yield-local-ci`. Passing safety checks does not establish packaged build,
+manual browsing, audible playback or release acceptance; those require their own
+recorded validation.
 One Mac and one macOS account are sufficient. An OS account is a filesystem and
 ownership boundary here; Yield does not need a product account or login system.
 
@@ -154,7 +155,7 @@ under the existing release policy.
 
 ### Operator interface
 
-The intended single entrypoint is `scripts/yield-local-ci` with these operations:
+The single entrypoint is `scripts/yield-local-ci` with these operations:
 
 ```text
 doctor
