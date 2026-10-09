@@ -13,7 +13,16 @@ mkdir -p "$REPLAY_EVIDENCE_DIR"
   git rev-parse HEAD
   uname -sm
   sw_vers
-  xcodebuild -version
+  developer_dir="$(xcode-select -p)"
+  printf 'Developer directory: %s\n' "$developer_dir"
+  if [[ "$developer_dir" == */CommandLineTools ]]; then
+    pkgutil --pkg-info com.apple.pkg.CLTools_Executables
+  else
+    xcodebuild -version
+  fi
+  xcrun --sdk macosx --show-sdk-path
+  xcrun --sdk macosx --show-sdk-version
+  xcrun --sdk macosx clang --version
   rustc -Vv
   cargo -V
   df -Pk "$REPLAY_REPO_ROOT" "${TMPDIR:-/tmp}"
