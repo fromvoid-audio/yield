@@ -288,7 +288,14 @@ fn control_backing_native_production_startup_preserves_original_failure_and_jour
     );
     assert!(!owner.shared.startup_component.load(Ordering::Acquire));
     assert_eq!(owner.prepared_admission_id_allocations(), 0);
-    assert!(owner.shutdown());
+    // Failed startup remains Unavailable after the genuine worker joins;
+    // shutdown reports false rather than minting a clean-close outcome.
+    assert!(!owner.shutdown());
+    assert!(owner.worker.is_none(), "original startup worker was joined");
+    assert_eq!(
+        owner.status(),
+        OperationJournalOwnerStatus::Unavailable { reason }
+    );
     assert_eq!(fs::read(&path).unwrap(), original);
     assert!(
         pool.lock().unwrap().remaining[0] < baseline.remaining[0],
