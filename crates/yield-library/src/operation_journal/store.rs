@@ -91,7 +91,7 @@ pub(crate) use recording_prestart_budget::COMMAND_INPUT_BYTES as RECORDING_PREST
 mod recording_controls;
 pub(crate) use recording_chunks::{RecordingChunkPage, RecordingChunkReceipt};
 pub(in crate::operation_journal) use recording_controls::{
-    RecordingFrozenVerification, VerifiedRecordingSeal,
+    RecordingFrozenVerification, RecordingRestartAudit, VerifiedRecordingSeal,
 };
 mod frozen_copy;
 #[allow(dead_code)]

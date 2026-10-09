@@ -299,7 +299,7 @@ impl OwnerRuntime {
         mut input: InputPermit,
     ) -> Result<RecordingProducerCustody, OperationJournalOwnerError> {
         use RecordingProducerCustodyError as E;
-        if self.recording_producer.is_some() {
+        if self.recording_producer.is_some() || self.recording_restart_audit.is_some() {
             return Err(E::Busy.into());
         }
         if input.shared.status() != OperationJournalOwnerStatus::Available {
