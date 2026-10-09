@@ -37,16 +37,23 @@ impl RecordingPcmNormalizer {
     /// Initialize only the finite data grammar; this does not activate a producer.
     pub fn new(proposal: &RecordingProposal) -> Result<Self, RecordingValueError> {
         controls::reservation_metadata_bound(proposal)?;
-        Ok(Self {
+        Ok(Self::from_proposal_hash(
+            *blake3::hash(&proposal.encode()?).as_bytes(),
+        ))
+    }
+    /// Original worker data initialization after its existing proposal validation/encoding.
+    /// The hash initializes only a data cursor; it supplies no Source or startup permission.
+    pub(crate) fn from_proposal_hash(proposal_hash: [u8; 32]) -> Self {
+        Self {
             instance: Arc::new(Instance),
-            proposal_hash: *blake3::hash(&proposal.encode()?).as_bytes(),
+            proposal_hash,
             generation: 1,
             next_ordinal: 0,
             raw_offset: prefix::RECORDING_WAV_HEADER_BYTES as u64,
             carry: [0; MAX_RECORDING_CHUNK_BYTES],
             carry_len: 0,
             closed: false,
-        })
+        }
     }
     /// Prepare one original <=16-KiB contiguous write without changing the retained cursor.
     /// IDs must be supplied for exactly the complete chunks. The owner retains this batch until

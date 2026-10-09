@@ -289,8 +289,10 @@ impl OwnerRuntime {
                 .map_err(|_| E::Changed)?;
         #[cfg(test)]
         FACTORIES.fetch_add(1, Ordering::AcqRel);
-        let pcm = super::super::recording_commands::RecordingPcmNormalizer::new(&proposal)
-            .map_err(|_| E::Changed)?;
+        // Reuse the exact already validated/encoded original proposal digest. Do not
+        // overlap another proposal encoding with the factory's retained encoded buffer.
+        let pcm =
+            super::super::recording_commands::RecordingPcmNormalizer::from_proposal_hash(digest);
         let (binding, receiver, settlements) = RecordingTransport::bind(limits);
         let facade = RecordingProducerCustody {
             operation,
