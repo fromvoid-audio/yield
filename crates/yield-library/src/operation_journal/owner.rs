@@ -40,6 +40,7 @@ mod legacy_adoption_custody;
 mod legacy_recovery;
 pub use legacy_recovery::LegacyRecoveryCustody;
 mod legacy_adoption_volumes;
+mod recording_audit;
 mod recording_binding;
 pub use legacy_adoption_custody::{LegacyAdoptionCustody, LegacyAdoptionCustodyError};
 pub use recording_binding::{RecordingProducerCustody, RecordingProducerCustodyError};
@@ -618,6 +619,17 @@ pub enum OperationJournalOwnerError {
     /// Original memory-only recording preparation could not be retained or revalidated.
     #[error(transparent)]
     RecordingProducerCustody(#[from] RecordingProducerCustodyError),
+    /// Original terminal work could not retain its existing-pool input/reply credit.
+    #[error("recording terminal input refused: {0}")]
+    RecordingTerminalInput(#[source] OperationJournalOwnerQueueError),
+    /// Original Recording mutation and rollback both retain uncertain outcomes.
+    #[error("recording terminal rollback unconfirmed: {rollback}; original: {original}")]
+    RecordingTerminalRollbackUncertain {
+        /// Exact primary owner/Source/store failure.
+        original: Box<OperationJournalOwnerError>,
+        /// Exact rollback failure under the same original backing.
+        rollback: Box<OperationJournalStoreError>,
+    },
     /// Original pre-lease custody could not be installed or revalidated.
     #[error(transparent)]
     LegacyAdoptionCustody(#[from] LegacyAdoptionCustodyError),
@@ -1809,6 +1821,7 @@ fn prepared_admission_fault_facts(
 
 struct OwnerRuntime {
     recording_producer: Option<recording_binding::RetainedRecordingProducer>,
+    recording_restart_audit: Option<recording_audit::Pending>,
     publication_fences: publication_fence::Registry,
     legacy_adoption: Option<legacy_adoption_custody::RetainedLegacyAdoption>,
     legacy_recovery: Option<legacy_recovery::RetainedLegacyRecovery>,
@@ -1856,6 +1869,7 @@ impl OwnerRuntime {
             .map_err(|error| error.to_string())?;
         Ok(Self {
             recording_producer: None,
+            recording_restart_audit: None,
             publication_fences: publication_fence::Registry::new(),
             legacy_adoption: None,
             legacy_recovery: None,
@@ -1960,6 +1974,8 @@ impl OwnerRuntime {
         Ok(handle)
     }
     fn poll_original_work(&mut self) {
+        self.poll_recording_custody();
+        self.poll_recording_restart_audit();
         self.poll_publication_completions();
         self.poll_wal_preparation();
     }
@@ -2268,6 +2284,21 @@ impl OwnerRuntime {
                 reason: format!("operation {operation_id} is not eligible for chunk {action}"),
             });
         }
+        if matches!(action, "claim" | "issuance") {
+            if let Some(UniversalCommandArgs::Recording(proposal)) =
+                operation.universal_command_args()
+            {
+                self.store().require_recording_capturing(proposal)?;
+            }
+            if self.recording_producer.as_ref().is_some_and(|retained| {
+                retained.operation_id_for_claim_fence() == operation_id
+                    && retained.closed_for_generic_claims()
+            }) {
+                return Err(OperationJournalOwnerError::RecordingProducerCustody(
+                    RecordingProducerCustodyError::Changed,
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -2306,6 +2337,14 @@ impl OwnerRuntime {
             return Err(OperationJournalOwnerError::ChunkClaim {
                 reason: String::from("chunk identity is already bound to different metadata"),
             });
+        }
+        if self.recording_producer.as_ref().is_some_and(|retained| {
+            retained.operation_id_for_claim_fence() == request.operation_id()
+                && retained.closed_for_generic_claims()
+        }) {
+            return Err(OperationJournalOwnerError::RecordingProducerCustody(
+                RecordingProducerCustodyError::Changed,
+            ));
         }
         self.publication_fences
             .close_for_mutation(request.operation_id())?;
@@ -2464,6 +2503,14 @@ impl OwnerRuntime {
                 });
             }
             ChunkClaimState::Claimed => {}
+        }
+        if self.recording_producer.as_ref().is_some_and(|retained| {
+            retained.operation_id_for_claim_fence() == operation_id
+                && retained.closed_for_generic_claims()
+        }) {
+            return Err(OperationJournalOwnerError::RecordingProducerCustody(
+                RecordingProducerCustodyError::Changed,
+            ));
         }
         self.publication_fences.close_for_mutation(operation_id)?;
         let mut write_scope = match input {
@@ -2677,6 +2724,7 @@ impl OwnerRuntime {
                 reason: "recording bytes differ from admitted chunk range".into(),
             });
         }
+        self.validate_recording_custody_append(chunk)?;
         self.validate_chunk_operation_state(chunk.operation_id(), "recording retention")?;
         let snapshot = self.chunk_rebuild_snapshot()?;
         let provider = self.capacity_provider.as_ref().ok_or_else(|| {
@@ -4876,6 +4924,7 @@ impl Drop for OwnerRuntime {
         self.legacy_adoption.take();
         self.legacy_recovery.take();
         // Original pre-start channels/source pin are released before source/profile teardown.
+        self.recording_restart_audit.take();
         self.recording_producer.take();
         // Source registrations retain non-Send authority guards and external reserve/volume
         // bindings. Release these maps before the journal/profile core so a global shutdown is
@@ -5902,6 +5951,28 @@ impl OperationJournalClient {
         })
     }
 
+    /// Recompute retained Frozen bytes; the result grants no execution permission.
+    #[allow(dead_code)] // Recovery consumer integration remains separate from this observation.
+    pub(crate) fn audit_recording_frozen_prefix(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<
+        OperationJournalRequest<super::recording_commands::prefix::RecordingPrefixSeal>,
+        OperationJournalOwnerQueueError,
+    > {
+        self.submit_funded_with_reply(
+            InputClass::Ordinary,
+            CONTROL_INPUT_BYTES,
+            false,
+            true,
+            move |input, result| JournalCommand::RecordingRestartAudit {
+                operation_id,
+                input,
+                result,
+            },
+        )
+    }
+
     fn submit<T, F>(
         &self,
         input_bytes: usize,
@@ -6885,6 +6956,16 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<RecordingChunkReceipt, OperationJournalOwnerError>>,
     },
+    RecordingRestartAudit {
+        operation_id: OperationId,
+        input: InputPermit,
+        result: SyncSender<
+            Result<
+                super::recording_commands::prefix::RecordingPrefixSeal,
+                OperationJournalOwnerError,
+            >,
+        >,
+    },
     RecordingRecovery {
         operation_id: OperationId,
         after_sequence: Option<i64>,
@@ -7599,6 +7680,14 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                 runtime.retain_recording_chunk(&chunk, registration, source_pin)
             })
         }
+        JournalCommand::RecordingRestartAudit {
+            operation_id,
+            input,
+            result,
+        } => {
+            runtime.start_recording_restart_audit(operation_id, input, result);
+            false
+        }
         JournalCommand::RecordingRecovery {
             operation_id,
             after_sequence,
@@ -8077,6 +8166,9 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             let _ = result.send(Err(error));
         }
         JournalCommand::RetainRecording { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::RecordingRestartAudit { result, .. } => {
             let _ = result.send(Err(error));
         }
         JournalCommand::RecordingRecovery { result, .. } => {

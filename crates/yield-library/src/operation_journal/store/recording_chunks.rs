@@ -470,6 +470,7 @@ impl OperationJournalStore {
                 existing.validate_replay(chunk, &proposal).map_err(error)?;
                 return Ok(RecordingChunkReceipt::Replay { sequence });
             }
+            self.require_recording_capturing(&proposal)?;
             let operation = self
                 .read_row(chunk.operation_id())?
                 .ok_or_else(|| error("operation disappeared"))?
@@ -587,6 +588,25 @@ impl OperationJournalStore {
         }
         Ok(())
     }
+    /// The original owner invokes this refusal fence when its private producer has closed,
+    /// including before a Finalizing SQL acknowledgement exists. This read issues no grant.
+    pub(in crate::operation_journal) fn require_recording_existing_replay(
+        &self,
+        chunk: &RecordingCapturedChunk,
+    ) -> Result<(), OperationJournalStoreError> {
+        let existing = self
+            .get_recording_chunk(chunk.operation_id(), chunk.chunk_id())?
+            .ok_or_else(|| {
+                error("original terminal custody closed new recording byte identities")
+            })?;
+        if existing != *chunk {
+            return Err(error(
+                "original terminal custody conflicts with retained recording bytes",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn get_recording_chunk(
         &self,
         operation_id: OperationId,

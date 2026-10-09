@@ -90,6 +90,9 @@ pub use legacy_allocation_observation::{LegacyJournalObservation, LegacyJournalO
 pub(crate) use recording_prestart_budget::COMMAND_INPUT_BYTES as RECORDING_PRESTART_INPUT_BYTES;
 mod recording_controls;
 pub(crate) use recording_chunks::{RecordingChunkPage, RecordingChunkReceipt};
+pub(in crate::operation_journal) use recording_controls::{
+    RecordingFrozenVerification, RecordingRestartAudit, VerifiedRecordingSeal,
+};
 mod frozen_copy;
 #[allow(dead_code)]
 mod full_progress;
@@ -336,6 +339,23 @@ pub enum OperationJournalStoreError {
         /// Exact original namespace, SQL or readback cause under its original backing.
         #[source]
         cause: Box<OperationJournalStoreError>,
+    },
+    /// Original Recording terminal persistence has an unconfirmed durable outcome.
+    #[error("recording terminal outcome is uncertain ({phase}): {cause}")]
+    RecordingTerminalOutcomeUncertain {
+        /// Original transaction boundary.
+        phase: &'static str,
+        /// Exact retained typed cause.
+        #[source]
+        cause: Box<OperationJournalStoreError>,
+    },
+    /// A failed original Recording scope could not confirm its rollback.
+    #[error("recording terminal rollback unconfirmed: {rollback}; original: {original}")]
+    RecordingTerminalRollbackUncertain {
+        /// Exact initial bounded-scope failure.
+        original: Box<OperationJournalStoreError>,
+        /// Exact rollback cause under the original input backing.
+        rollback: Box<OperationJournalStoreError>,
     },
     /// Namespace backing ran out after a staging commit; preserve its durable evidence.
     /// This fixed refusal allocates no diagnostic under exhausted journal-pool pressure.
@@ -1043,6 +1063,7 @@ pub(crate) enum ReleaseTestDirective {
 pub struct OperationJournalStore {
     connection: Connection,
     recording_prestart_scope: std::cell::Cell<bool>,
+    recording_terminal_scope: std::cell::Cell<bool>,
     recording_prestart_resource_refused: std::cell::Cell<bool>,
     database_path: PathBuf,
     database_identity: String,
@@ -1993,6 +2014,10 @@ impl OperationJournalStore {
                 return Err(OperationJournalStoreError::ChunkClaim {
                     reason: format!("operation {operation} is not eligible for chunk {action}"),
                 });
+            }
+            if let Some(UniversalCommandArgs::Recording(proposal)) = record.universal_command_args()
+            {
+                self.require_recording_claim_capturing_for_input(proposal, input)?;
             }
             Ok(())
         })?;
@@ -4214,6 +4239,7 @@ impl OperationJournalStore {
         Ok(Self {
             connection,
             recording_prestart_scope: std::cell::Cell::new(false),
+            recording_terminal_scope: std::cell::Cell::new(false),
             recording_prestart_resource_refused: std::cell::Cell::new(false),
             database_path,
             database_identity,
@@ -10842,6 +10868,7 @@ mod tests {
     include!("store/record_materialization_tests.rs");
     include!("store/recording_prestart_budget_tests.rs");
     include!("store/recording_control_tests.rs");
+    include!("store/recording_terminal_observation_tests.rs");
     include!("store/recording_control_funding_tests.rs");
     include!("store/recording_restart_producer_funding_tests.rs");
     include!("store/initial_settlement_funding_tests.rs");
