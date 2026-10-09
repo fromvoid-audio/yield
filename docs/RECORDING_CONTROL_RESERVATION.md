@@ -259,3 +259,31 @@ and supplies no required-WAL or physical startup grant. The admitted terminal
 append/acknowledgement bridge, bounded actual-byte verification and durable seal,
 complete restart/cancel/drain races and native acceptance remain required. Frozen
 retention does not publish an output or release any retained capacity.
+
+## Bounded retained-byte verification and Seal (OPT-2145, partial)
+
+The original owner retains one separately funded verifier under its original
+producer/Source custody. It rechecks the same current Source/profile/provider and
+capacity context for each page. Each verification page consumes at most eight
+logical byte rows, holding one funded decoded row and its issued-claim keeper at
+a time. Header revisions precede PCM. The immutable Frozen encoding binds the
+cursor; the complete byte-row count must agree with its declared prefix. Missing,
+extra, unissued or conflicting rows refuse progress. The original cursor remains
+retained until the page's transaction, exact control readback and Source checks
+succeed. Existing complete owner admission/recovery audits remain in place.
+
+After the exact final header and all PCM have been verified, the private original
+verifier result can fill the existing Seal reservation. Closed V5 data binds the
+Frozen hash, complete prefix/accounting, reconstructed header hash and actual
+object hash/length. Its CAS and exact precommit/postcommit readback preserve the
+original control identities, sequences and charges. Historical readers require
+Seal to match the preceding exact Frozen inventory. Decoded V5 data is not a
+fresh verifier result; no public submission accepts it as verification authority.
+
+SQLite tests compare the observed hash with an independent actual hound encoding,
+exercise page yielding and refusal without advancing the original state, and
+reopen exact seal data. CPU serializer and SQL claim fixtures still confer no
+native Source/startup or physical authority. Complete admitted terminal append
+and acknowledgement, restart verification scheduling, cancellation/drain races
+and the full OPT-2145 acceptance remain open. No output is published and no
+retention charge is released by this seal observation.

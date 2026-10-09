@@ -143,6 +143,8 @@ pub(crate) fn finalizing_observation(
                     || RecordingDeclaredFinalizingInventory::decode(bytes, proposal).is_ok()))
                 || (role == ControlRole::Frozen
                     && RecordingFrozenInventory::decode(bytes, proposal).is_ok())
+                || (role == ControlRole::Seal
+                    && RecordingSealedInventory::decode(bytes, proposal).is_ok())
             {
                 Ok(true)
             } else {
@@ -159,3 +161,6 @@ pub(crate) use declared::RecordingDeclaredFinalizingInventory;
 
 mod frozen;
 pub(crate) use frozen::RecordingFrozenInventory;
+
+mod sealed;
+pub(crate) use sealed::RecordingSealedInventory;

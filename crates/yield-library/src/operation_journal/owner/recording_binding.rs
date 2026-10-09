@@ -131,6 +131,8 @@ pub(super) struct RetainedRecordingProducer {
     _terminal_barrier: Option<reson::recording::RecordingTerminalBarrier>,
     _terminal_joined: Option<reson::recording::RecordingJoinedCompletion>,
     _terminal_frozen: Option<super::super::recording_commands::controls::RecordingFrozenInventory>,
+    _terminal_verification: Option<super::super::store::RecordingFrozenVerification>,
+    _terminal_seal: Option<super::super::store::VerifiedRecordingSeal>,
     _terminal_plan_error: Option<OperationJournalOwnerError>,
     _terminal_error: Option<OperationJournalOwnerError>,
     _terminal_backing: Option<InputPermit>,
@@ -147,6 +149,18 @@ enum OriginalTerminalCheck<'a> {
             &'a super::super::recording_commands::controls::RecordingDeclaredFinalizingInventory,
         joined: &'a reson::recording::RecordingJoinedCompletion,
     },
+    Verify {
+        inventory:
+            &'a super::super::recording_commands::controls::RecordingDeclaredFinalizingInventory,
+        frozen: &'a super::super::recording_commands::controls::RecordingFrozenInventory,
+        current: &'a super::super::store::RecordingFrozenVerification,
+    },
+}
+#[derive(Default)]
+struct OriginalTerminalOutcome {
+    frozen: Option<super::super::recording_commands::controls::RecordingFrozenInventory>,
+    verification: Option<super::super::store::RecordingFrozenVerification>,
+    seal: Option<super::super::store::VerifiedRecordingSeal>,
 }
 impl OperationJournalClient {
     /// Retain pre-start memory plumbing only after the original admitted/source/provider checks.
@@ -335,6 +349,8 @@ impl OwnerRuntime {
             _terminal_barrier: None,
             _terminal_joined: None,
             _terminal_frozen: None,
+            _terminal_verification: None,
+            _terminal_seal: None,
             _terminal_plan_error: None,
             _terminal_error: None,
             _terminal_backing: None,
@@ -477,14 +493,67 @@ impl OwnerRuntime {
                             }
                             retained._terminal_error = Some(error);
                             retained._terminal_backing = Some(input);
-                        } else if let Ok(frozen) = audit {
-                            retained._terminal_frozen = frozen;
+                        } else if let Ok(observation) = audit {
+                            retained._terminal_frozen = observation.frozen;
+                            retained._terminal_verification = observation.verification;
                         }
                     }
                 }
             }
             retained._terminal_joined = Some(joined);
             retained.invalidated = true;
+        }
+        if retained._terminal_error.is_none() && retained._terminal_plan_error.is_none() {
+            if let Some(current) = retained._terminal_verification.take() {
+                let progress = (|| -> Result<_, OperationJournalOwnerError> {
+                    if current.complete()? {
+                        return Ok(None);
+                    }
+                    let inventory = retained
+                        ._declared_terminal
+                        .as_ref()
+                        .ok_or(RecordingProducerCustodyError::Changed)?;
+                    let frozen = retained
+                        ._terminal_frozen
+                        .as_ref()
+                        .ok_or(RecordingProducerCustodyError::Changed)?;
+                    let input = retained
+                        .input
+                        .shared
+                        .startup_input()
+                        .map_err(OperationJournalOwnerError::RecordingTerminalInput)?;
+                    let result = self.check_original_terminal(
+                        &retained,
+                        OriginalTerminalCheck::Verify {
+                            inventory,
+                            frozen,
+                            current: &current,
+                        },
+                        &input,
+                    );
+                    if result.is_err() {
+                        retained._terminal_backing = Some(input);
+                    }
+                    result.map(Some)
+                })();
+                match progress {
+                    Ok(Some(observation)) => {
+                        retained._terminal_verification = observation.verification;
+                        retained._terminal_seal = observation.seal;
+                    }
+                    Ok(None) => retained._terminal_verification = Some(current),
+                    Err(cause) => {
+                        if !self.store().connection_is_autocommit_for_recording()
+                            || matches!(&cause, OperationJournalOwnerError::RecordingTerminalRollbackUncertain { .. }
+                            | OperationJournalOwnerError::Store(OperationJournalStoreError::RecordingTerminalOutcomeUncertain { .. }
+                                | OperationJournalStoreError::RecordingTerminalRollbackUncertain { .. })) {
+                            retained.input.shared.mark_unavailable("Recording verification outcome needs recovery");
+                        }
+                        retained._terminal_error = Some(cause);
+                        retained._terminal_verification = Some(current);
+                    }
+                }
+            }
         }
         self.recording_producer = Some(retained);
     }
@@ -523,10 +592,7 @@ impl OwnerRuntime {
         retained: &RetainedRecordingProducer,
         check: OriginalTerminalCheck<'_>,
         input: &InputPermit,
-    ) -> Result<
-        Option<super::super::recording_commands::controls::RecordingFrozenInventory>,
-        OperationJournalOwnerError,
-    > {
+    ) -> Result<OriginalTerminalOutcome, OperationJournalOwnerError> {
         use RecordingProducerCustodyError as E;
         match &check {
             OriginalTerminalCheck::Finalizing { barrier, .. } => {
@@ -549,6 +615,30 @@ impl OwnerRuntime {
                     .validate_joined(&retained.proposal, &retained._settlements, joined)
                     .map_err(|_| E::Changed)?;
             }
+            OriginalTerminalCheck::Verify { .. } => {}
+        }
+        if let OriginalTerminalCheck::Verify {
+            inventory, frozen, ..
+        } = &check
+        {
+            if !retained.invalidated
+                || retained._terminal_error.is_some()
+                || retained._terminal_plan_error.is_some()
+                || !retained
+                    ._declared_terminal
+                    .as_ref()
+                    .is_some_and(|held| std::ptr::eq(held, *inventory))
+                || !retained
+                    ._terminal_frozen
+                    .as_ref()
+                    .is_some_and(|held| std::ptr::eq(held, *frozen))
+            {
+                return Err(E::Changed.into());
+            }
+            let joined = retained._terminal_joined.as_ref().ok_or(E::Changed)?;
+            inventory
+                .validate_joined(&retained.proposal, &retained._settlements, joined)
+                .map_err(|_| E::Changed)?;
         }
         self.publication_fences
             .close_for_mutation(retained.proposal.operation_id())?;
@@ -597,6 +687,8 @@ impl OwnerRuntime {
             provider.validate_recovery_state().map_err(|_| E::Changed)?;
             drop(snapshot);
             let mut frozen_observation = None;
+            let mut verification_observation = None;
+            let mut seal_observation = None;
             match &check {
                 OriginalTerminalCheck::Finalizing { inventory, .. } => {
                     match retained._declared_terminal.as_ref() {
@@ -636,8 +728,44 @@ impl OwnerRuntime {
                         &frozen,
                         input,
                     )?;
+                    verification_observation =
+                        Some(self.store().start_original_frozen_verification(
+                            &retained.proposal,
+                            inventory,
+                            &frozen,
+                            input,
+                        )?);
                     frozen_observation = Some(frozen);
                     drop(encoding);
+                }
+                OriginalTerminalCheck::Verify {
+                    inventory,
+                    frozen,
+                    current,
+                } => {
+                    self.store().validate_original_declared_terminal_retention(
+                        &retained.proposal,
+                        inventory,
+                        input,
+                    )?;
+                    let next = self.store().original_frozen_verification_page(
+                        &retained.proposal,
+                        frozen,
+                        current,
+                        input,
+                    )?;
+                    if next.complete()? {
+                        let verified = next.finish(input)?;
+                        self.store().retain_original_verified_seal(
+                            &retained.proposal,
+                            frozen,
+                            &verified,
+                            input,
+                        )?;
+                        seal_observation = Some(verified);
+                    } else {
+                        verification_observation = Some(next);
+                    }
                 }
             }
             self.store()
@@ -663,7 +791,8 @@ impl OwnerRuntime {
                         ),
                     }
                 }
-                OriginalTerminalCheck::Joined { inventory, .. } => self
+                OriginalTerminalCheck::Joined { inventory, .. }
+                | OriginalTerminalCheck::Verify { inventory, .. } => self
                     .store()
                     .verify_declared_finalizing_readback(&retained.proposal, inventory, input),
             }
@@ -673,12 +802,26 @@ impl OwnerRuntime {
                     cause: Box::new(cause),
                 }
             })?;
-            if let Some(frozen) = frozen_observation.as_ref() {
+            let checked_frozen = match &check {
+                OriginalTerminalCheck::Verify { frozen, .. } => Some(*frozen),
+                _ => frozen_observation.as_ref(),
+            };
+            if let Some(frozen) = checked_frozen {
                 self.store()
                     .verify_original_frozen_readback(&retained.proposal, frozen, input)
                     .map_err(|cause| {
                         OperationJournalStoreError::RecordingTerminalOutcomeUncertain {
                             phase: "Frozen exact readback",
+                            cause: Box::new(cause),
+                        }
+                    })?;
+            }
+            if let (Some(verified), Some(frozen)) = (seal_observation.as_ref(), checked_frozen) {
+                self.store()
+                    .verify_original_seal_readback(&retained.proposal, frozen, verified, input)
+                    .map_err(|cause| {
+                        OperationJournalStoreError::RecordingTerminalOutcomeUncertain {
+                            phase: "Seal exact readback",
                             cause: Box::new(cause),
                         }
                     })?;
@@ -694,7 +837,11 @@ impl OwnerRuntime {
                     );
                     OperationJournalOwnerError::from(cause)
                 })?;
-            Ok(frozen_observation)
+            Ok(OriginalTerminalOutcome {
+                frozen: frozen_observation,
+                verification: verification_observation,
+                seal: seal_observation,
+            })
         })();
         if !self.store().connection_is_autocommit_for_recording() {
             if let Err(cause) = self.store().rollback_recording_terminal_write(input) {
