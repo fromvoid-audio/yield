@@ -468,6 +468,10 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
         store
             .insert_intent(&finite_recording_record(&proposal))
             .unwrap();
+        let capturing_funding = JournalNamespaceFundingProbe::new();
+        store
+            .require_recording_claim_capturing_for_input(&proposal, &capturing_funding.input)
+            .unwrap();
         let original_keys: Vec<(String, i64, i64)> = store.connection.prepare(
             "SELECT chunk_id,slot,sequence FROM operation_journal_recording_chunks WHERE slot>=20000 ORDER BY slot"
         ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap();
@@ -556,6 +560,25 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
         assert_eq!(keys, original_keys);
         let totals = store.recording_retained_totals().unwrap();
         assert!(store.verify_recording_reservation(&proposal, true).unwrap());
+        let after_finalizing = recording_projection_raw_state(&store.connection);
+        assert!(
+            store
+                .require_recording_claim_capturing_for_input(&proposal, &capturing_funding.input)
+                .is_err()
+        );
+        assert!(
+            store
+                .validate_chunk_operation_for_input(
+                    proposal.operation_id(),
+                    "issuance",
+                    &capturing_funding.input
+                )
+                .is_err()
+        );
+        assert_eq!(
+            recording_projection_raw_state(&store.connection),
+            after_finalizing
+        );
         // Exact declarations still require actual retained rows and issued claims. These
         // adversarial SQL observations are not a Source/startup or physical grant fixture.
         let audit_funding = JournalNamespaceFundingProbe::new();
@@ -701,10 +724,93 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
                 )
                 .is_err()
         );
+        // The private terminal append seam does not accept a declaration or exact replay
+        // without an already-issued original range claim.
+        for chunk in batch.chunks() {
+            assert!(
+                !store
+                    .original_terminal_chunk_is_issued(chunk, &complete_funding.input)
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .retain_original_declared_terminal_chunk(
+                        &proposal,
+                        &inventory,
+                        chunk,
+                        &complete_funding.input
+                    )
+                    .is_err()
+            );
+        }
         // A persisted Issued state is a historical observation, not physical completion.
         for chunk in prefix_chunks.iter().chain(batch.chunks()) {
             store.connection.execute("UPDATE operation_journal_chunk_claim SET state='Issued',issue_id=?1 WHERE chunk_id=?2",
                 params![Uuid::new_v4().to_string(), chunk.chunk_id().to_string()]).unwrap();
+        }
+        // Remove just the data fixture's terminal rows, retaining original issued claims.
+        // Reinsert through the actual funded terminal append implementation, not the generic path.
+        for chunk in batch.chunks() {
+            store
+                .connection
+                .execute(
+                    "DELETE FROM operation_journal_recording_chunks WHERE chunk_id=?1",
+                    params![chunk.chunk_id().to_string()],
+                )
+                .unwrap();
+        }
+        let header_patch = batch
+            .chunks()
+            .iter()
+            .find(|chunk| {
+                matches!(
+                    chunk.role(),
+                    crate::operation_journal::recording_commands::RecordingChunkRole::Header {
+                        revision: 1
+                    }
+                )
+            })
+            .unwrap();
+        assert!(
+            store
+                .retain_original_declared_terminal_chunk(
+                    &proposal,
+                    &inventory,
+                    header_patch,
+                    &complete_funding.input
+                )
+                .is_err()
+        );
+        for chunk in batch.chunks() {
+            assert!(
+                store
+                    .original_terminal_chunk_is_issued(chunk, &complete_funding.input)
+                    .unwrap()
+            );
+            assert!(matches!(
+                store
+                    .retain_original_declared_terminal_chunk(
+                        &proposal,
+                        &inventory,
+                        chunk,
+                        &complete_funding.input
+                    )
+                    .unwrap(),
+                super::recording_chunks::RecordingChunkReceipt::Committed { .. }
+            ));
+            let retained = recording_projection_raw_state(&store.connection);
+            assert!(matches!(
+                store
+                    .retain_original_declared_terminal_chunk(
+                        &proposal,
+                        &inventory,
+                        chunk,
+                        &complete_funding.input
+                    )
+                    .unwrap(),
+                super::recording_chunks::RecordingChunkReceipt::Replay { .. }
+            ));
+            assert_eq!(recording_projection_raw_state(&store.connection), retained);
         }
         store
             .validate_original_declared_terminal_retention(
@@ -966,6 +1072,9 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
         );
         drop(store);
         let store = OperationJournalStore::open(&f.owner).unwrap();
+        store
+            .verify_original_declared_terminal_bytes(&proposal, &inventory, &complete_funding.input)
+            .unwrap();
         store
             .verify_original_seal_readback(&proposal, &frozen, &verified, &complete_funding.input)
             .unwrap();

@@ -2273,6 +2273,21 @@ impl OwnerRuntime {
                 reason: format!("operation {operation_id} is not eligible for chunk {action}"),
             });
         }
+        if matches!(action, "claim" | "issuance") {
+            if let Some(UniversalCommandArgs::Recording(proposal)) =
+                operation.universal_command_args()
+            {
+                self.store().require_recording_capturing(proposal)?;
+            }
+            if self.recording_producer.as_ref().is_some_and(|retained| {
+                retained.operation_id_for_claim_fence() == operation_id
+                    && retained.closed_for_generic_claims()
+            }) {
+                return Err(OperationJournalOwnerError::RecordingProducerCustody(
+                    RecordingProducerCustodyError::Changed,
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -2311,6 +2326,14 @@ impl OwnerRuntime {
             return Err(OperationJournalOwnerError::ChunkClaim {
                 reason: String::from("chunk identity is already bound to different metadata"),
             });
+        }
+        if self.recording_producer.as_ref().is_some_and(|retained| {
+            retained.operation_id_for_claim_fence() == request.operation_id()
+                && retained.closed_for_generic_claims()
+        }) {
+            return Err(OperationJournalOwnerError::RecordingProducerCustody(
+                RecordingProducerCustodyError::Changed,
+            ));
         }
         self.publication_fences
             .close_for_mutation(request.operation_id())?;
@@ -2469,6 +2492,14 @@ impl OwnerRuntime {
                 });
             }
             ChunkClaimState::Claimed => {}
+        }
+        if self.recording_producer.as_ref().is_some_and(|retained| {
+            retained.operation_id_for_claim_fence() == operation_id
+                && retained.closed_for_generic_claims()
+        }) {
+            return Err(OperationJournalOwnerError::RecordingProducerCustody(
+                RecordingProducerCustodyError::Changed,
+            ));
         }
         self.publication_fences.close_for_mutation(operation_id)?;
         let mut write_scope = match input {

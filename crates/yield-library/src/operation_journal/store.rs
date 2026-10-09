@@ -2015,6 +2015,10 @@ impl OperationJournalStore {
                     reason: format!("operation {operation} is not eligible for chunk {action}"),
                 });
             }
+            if let Some(UniversalCommandArgs::Recording(proposal)) = record.universal_command_args()
+            {
+                self.require_recording_claim_capturing_for_input(proposal, input)?;
+            }
             Ok(())
         })?;
         if !present {

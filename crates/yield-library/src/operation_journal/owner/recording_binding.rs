@@ -138,6 +138,15 @@ pub(super) struct RetainedRecordingProducer {
     _terminal_backing: Option<InputPermit>,
     input: InputPermit,
 }
+impl RetainedRecordingProducer {
+    pub(super) fn operation_id_for_claim_fence(&self) -> OperationId {
+        self.proposal.operation_id()
+    }
+    pub(super) fn closed_for_generic_claims(&self) -> bool {
+        self.invalidated
+    }
+}
+
 // Borrow original opaque producer evidence; decoded values cannot select this audit.
 enum OriginalTerminalCheck<'a> {
     Finalizing {
@@ -686,6 +695,7 @@ impl OwnerRuntime {
                 .map_err(|_| E::Changed)?;
             provider.validate_recovery_state().map_err(|_| E::Changed)?;
             drop(snapshot);
+            let mut terminal_bytes_retained = false;
             let mut frozen_observation = None;
             let mut verification_observation = None;
             let mut seal_observation = None;
@@ -704,6 +714,30 @@ impl OwnerRuntime {
                             inventory,
                             input,
                         )?,
+                    }
+                    if let (Some(declared), Some(batch)) = (
+                        retained._declared_terminal.as_ref(),
+                        retained._terminal_batch.as_ref(),
+                    ) {
+                        let mut issued = true;
+                        for chunk in batch.chunks() {
+                            issued &= self
+                                .store()
+                                .original_terminal_chunk_is_issued(chunk, input)?;
+                        }
+                        if issued {
+                            for chunk in batch.chunks() {
+                                self.store().retain_original_declared_terminal_chunk(
+                                    &retained.proposal,
+                                    declared,
+                                    chunk,
+                                    input,
+                                )?;
+                            }
+                            terminal_bytes_retained = true;
+                        }
+                        // Missing issuance preserves the previous audit-only inventory.
+                        // Neither readiness nor retained data acknowledges NeverStarted.
                     }
                 }
                 OriginalTerminalCheck::Joined { inventory, joined } => {
@@ -802,6 +836,17 @@ impl OwnerRuntime {
                     cause: Box::new(cause),
                 }
             })?;
+            if terminal_bytes_retained {
+                let declared = retained._declared_terminal.as_ref().ok_or(E::Changed)?;
+                self.store()
+                    .verify_original_declared_terminal_bytes(&retained.proposal, declared, input)
+                    .map_err(|cause| {
+                        OperationJournalStoreError::RecordingTerminalOutcomeUncertain {
+                            phase: "declared terminal byte exact readback",
+                            cause: Box::new(cause),
+                        }
+                    })?;
+            }
             let checked_frozen = match &check {
                 OriginalTerminalCheck::Verify { frozen, .. } => Some(*frozen),
                 _ => frozen_observation.as_ref(),

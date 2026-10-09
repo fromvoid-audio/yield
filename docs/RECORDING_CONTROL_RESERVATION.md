@@ -287,3 +287,30 @@ native Source/startup or physical authority. Complete admitted terminal append
 and acknowledgement, restart verification scheduling, cancellation/drain races
 and the full OPT-2145 acceptance remain open. No output is published and no
 retention charge is released by this seal observation.
+
+## Original declared terminal byte appends (OPT-2145, partial)
+
+The original barrier handler can retain its own prepared terminal batch inside
+its current funded exclusive Finalizing transaction. Each write must match the
+retained V3 declaration and an already-issued exact operation/participant/staging
+range claim; declaration data alone is insufficient. The same original Source,
+profile, provider and capacity checks surround the mutation. Serialization is
+counted and debited before owning the chunk encoding. Each predecessor is read
+through its original funded keeper; final header patches require all declared
+terminal PCM first. New identities remain forbidden after Frozen, while exact
+byte replay stays read-only. Global row/encoded-byte limits and all original
+control charges stay enforced. Precommit and postcommit readback compare actual
+bytes and issued claims; uncertainty retains the original barrier/error/input.
+
+Missing issuance preserves the previous audit-only V3 observation. The factory
+still supplies no qualified required-WAL/startup capability and withholds producer
+acknowledgement. Issued metadata, byte readiness or successful SQLite retention
+does not qualify physical completion or a live startup/close capability.
+
+Generic chunk claim/issuance also honors the durable Finalizing fence and the
+original private invalidation fence when persistence failed. Existing exact claim
+replay remains a read-only observation; it cannot issue a fresh permit. The
+original terminal route consumes only already-issued exact private-plan claims.
+Full OPT-2145 still requires original terminal admission/acknowledgement with
+qualified startup, actual restart scheduling, complete cancellation/drain races
+and native acceptance. No publication or charge reclamation is enabled here.
