@@ -535,3 +535,6 @@ pub(crate) fn recording_proposal_for_test(channels: u16, frames: u64) -> Recordi
 pub(super) fn recording_proposal_with_root_for_test() -> (RecordingProposal, RootRegistrationRef) {
     tests::proposal_with_root(2, 100)
 }
+
+mod pcm;
+pub use pcm::{RecordingPcmBatch, RecordingPcmNormalizer};

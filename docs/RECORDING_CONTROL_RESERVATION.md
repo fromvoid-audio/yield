@@ -169,3 +169,29 @@ adapter, genuine successful join followed by immutable Frozen retention, bounded
 verification/seal persistence and restart/replay. Those missing implementations are not waived
 by unavailable native runners. Physical producer startup/transport and publication remain in
 OPT-2058/2057/1339 and their genuine qualification prerequisites.
+
+## Normalized terminal data preparation (9 October 2026)
+
+`RecordingPcmNormalizer` retains one fixed 16-KiB carry and the exact contiguous
+raw-byte cursor. A raw write prepares at most two complete-frame chunks without
+advancing that cursor. The non-cloneable batch is bound to its original normalizer
+and generation; only accepting that exact batch advances the data cursor. Foreign
+and stale batches, gaps, excess finite extents, nil or duplicate supplied identities,
+and incomplete terminal frames are refused without advancing it.
+
+The original terminal-barrier adapter verifies the original settlement instance
+and producer format, combines its genuine pending fragment with the retained carry,
+and declares at most two normalized PCM chunks and the exact RIFF/data patches at
+offsets 4 and 64. Terminal identities are stable across retry for the same proposal,
+terminal and ordinal/revision. Accepting a terminal batch closes this data cursor.
+The data-only terminal preparation entry point is explicitly observational; it
+cannot authenticate a producer, acknowledge closure or authorize any write.
+
+The owner must separately prepay the carry, prepared batch and proposal/chunk
+encoding scratch, retain exact admitted bytes and satisfy its original Source,
+claim and physical-write checks before acknowledging requests or a barrier. This
+API does not change the pre-start factory into a startup grant, reconstruct carry
+from historical rows, persist a Frozen/seal control or confer physical authority.
+CPU fixtures exercise the actual serializer transport and original barrier across
+all channel counts, as well as arbitrary raw boundaries and unchanged retry data.
+Full OPT-2145 owner integration remains open.
