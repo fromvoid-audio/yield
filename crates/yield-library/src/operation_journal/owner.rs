@@ -43,6 +43,7 @@ mod native_read_capsule;
 mod publication_charge;
 mod publication_custody;
 mod publication_fence;
+pub mod request_inbox;
 pub(crate) use publication_fence::NoEffectCompletion;
 mod resource_custody;
 mod retirement_admission;
@@ -6246,6 +6247,8 @@ fn bounded_json_input<T: serde::Serialize>(
 
 struct OwnerShared {
     original_profile_acquisition: OnceLock<Uuid>,
+    service_incarnation: Uuid,
+    service_generation: std::sync::atomic::AtomicU64,
     queue_metrics: Arc<QueueMetrics>,
     resource_admission: Arc<ResourceAdmission>,
     commands: Mutex<Option<OwnerCommandSenders>>,
@@ -6284,6 +6287,8 @@ impl OwnerShared {
         let resource_admission = ResourceAdmission::new();
         Self {
             original_profile_acquisition: OnceLock::new(),
+            service_incarnation: Uuid::new_v4(),
+            service_generation: std::sync::atomic::AtomicU64::new(0),
             queue_metrics: Arc::clone(&commands.ordinary.metrics),
             resource_admission,
             commands: Mutex::new(Some(commands)),
@@ -8187,6 +8192,8 @@ mod tests {
     mod publication_input_tests;
     mod publication_mutation_tests;
     mod publication_uncertainty_tests;
+    mod request_inbox_restart_tests;
+    mod request_inbox_tests;
     mod service_acquisition_tests;
     mod queue_metrics_integration {
         include!("owner/tests/queue_metrics_integration.rs");
