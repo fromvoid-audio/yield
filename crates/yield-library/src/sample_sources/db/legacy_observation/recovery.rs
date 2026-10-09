@@ -343,6 +343,7 @@ mod tests {
             .path()
             .join(crate::operation_journal::store::JOURNAL_DATABASE_ROOT_NAME)
             .join(crate::operation_journal::store::JOURNAL_DATABASE_FILE_NAME);
+        drop(journal); // Release its exclusive journal connection before fixture setup.
         rusqlite::Connection::open(&journal_path)
             .unwrap()
             .execute(
@@ -353,6 +354,7 @@ mod tests {
         let owner =
             SourceDatabase::open_legacy_recovery_read_owner(media.path(), &profile, "legacy")
                 .unwrap();
+        let journal = OperationJournalStore::open(&profile).unwrap();
         let observed = owner.capture_recovery(&profile, &journal).unwrap();
         assert_eq!(observed.operation_id(), operation);
         assert!(!observed.lease_table_present());
