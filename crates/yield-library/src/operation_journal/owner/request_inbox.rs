@@ -8,6 +8,7 @@ const MAX_POLLS: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JournalServiceInstallation {
     acquisition: Uuid,
+    incarnation: Uuid,
     generation: u64,
 }
 
@@ -138,6 +139,7 @@ impl<T> JournalRequestInbox<T> {
             (
                 JournalServiceInstallation {
                     acquisition,
+                    incarnation: client.shared.service_incarnation,
                     generation,
                 },
                 backing,

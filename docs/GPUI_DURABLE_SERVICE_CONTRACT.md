@@ -122,7 +122,10 @@ accounts bounded proposal bytes before family submission; rejection refunds
 that accounting. Adoption compares the original result permit's owner Arc,
 and never redirects a foreign or already consumed handle. Each installation
 uses a checked, non-reused generation issued by that same owner, paired with
-its original profile acquisition. Polling rotates through at most 16 actual
+its original profile acquisition and original owner incarnation. Restarting
+the journal under the same retained profile acquisition cannot make an old
+delivery current. The incarnation is equality data, not permission; adoption
+still requires the actual original result permit's owner Arc. Polling rotates through at most 16 actual
 handles, retains Empty, and delivers exact owner outcomes or Unconfirmed
 channel loss with original correlation/codec/payload context. Replacement
 installation comparison is explicit; stale delivery cannot confirm its state.
