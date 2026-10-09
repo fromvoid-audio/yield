@@ -3,6 +3,7 @@ use super::{OperationJournalStore, OperationJournalStoreError};
 mod funded;
 mod initial_funded;
 mod terminal;
+mod verification;
 use crate::operation_journal::coordinator::UniversalCommandArgs;
 use crate::operation_journal::recording_commands::RecordingProposal;
 use crate::operation_journal::recording_commands::controls::{
@@ -10,6 +11,9 @@ use crate::operation_journal::recording_commands::controls::{
     RecordingControlReservation, finalizing_observation, reservation_metadata_bound,
 };
 use rusqlite::{OptionalExtension, params};
+pub(in crate::operation_journal) use verification::{
+    RecordingFrozenVerification, VerifiedRecordingSeal,
+};
 
 fn error(reason: impl ToString) -> OperationJournalStoreError {
     OperationJournalStoreError::RecordingRetention {
@@ -286,6 +290,7 @@ impl OperationJournalStore {
 /// recovery of an original adapter, producer join or Source/acquisition permission.
 #[derive(Default)]
 struct ControlHistory {
+    frozen: Option<crate::operation_journal::recording_commands::controls::RecordingFrozenInventory>,
     finalizing: Option<crate::operation_journal::recording_commands::controls::RecordingDeclaredFinalizingInventory>,
 }
 impl ControlHistory {
@@ -298,6 +303,7 @@ impl ControlHistory {
     ) -> Result<(), OperationJournalStoreError> {
         use crate::operation_journal::recording_commands::controls::{
             RecordingDeclaredFinalizingInventory, RecordingFrozenInventory,
+            RecordingSealedInventory,
         };
         if role == ControlRole::Finalizing {
             self.finalizing = RecordingDeclaredFinalizingInventory::decode(bytes, proposal).ok();
@@ -317,6 +323,16 @@ impl ControlHistory {
             frozen
                 .validate_finalizing(proposal, finalizing)
                 .map_err(error)?;
+            self.frozen = Some(frozen);
+        } else if role == ControlRole::Seal
+            && finalizing_observation(bytes, proposal, role).map_err(error)?
+        {
+            let sealed = RecordingSealedInventory::decode(bytes, proposal).map_err(error)?;
+            let frozen = self
+                .frozen
+                .as_ref()
+                .ok_or_else(|| error("Seal has no exact Frozen inventory"))?;
+            sealed.validate_frozen(proposal, frozen).map_err(error)?;
         }
         Ok(())
     }

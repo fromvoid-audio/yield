@@ -170,6 +170,15 @@ impl RecordingPrefixInventory {
         Ok(value)
     }
 
+    /// Number of declared retained byte rows, excluding the reserved controls.
+    pub(crate) fn retained_row_count(
+        &self,
+        proposal: &RecordingProposal,
+    ) -> Result<u64, RecordingValueError> {
+        self.validate(proposal)?;
+        Ok(u64::from(self.pcm_chunks(proposal)?) + u64::from(self.last_header_revision) + 1)
+    }
+
     /// Frozen operation identity; observing it does not establish an acquisition.
     pub fn operation_id(&self) -> OperationId {
         self.operation_id
@@ -307,6 +316,24 @@ impl RecordingPrefixVerifier {
     /// Current exact page position; stale or other-inventory cursors fail without progress.
     pub fn cursor(&self) -> RecordingPrefixCursor {
         self.cursor
+    }
+
+    /// Data-only logical position for the owner's bounded retained-row reader.
+    /// It cannot establish that the underlying SQLite inventory is immutable.
+    pub(crate) fn next_retained_role(
+        &self,
+    ) -> Result<Option<RecordingChunkRole>, RecordingValueError> {
+        if !self.header_verified {
+            return Ok(Some(RecordingChunkRole::Header {
+                revision: self.cursor.next_header,
+            }));
+        }
+        if self.cursor.next_pcm < self.inventory.pcm_chunks(&self.proposal)? {
+            return Ok(Some(RecordingChunkRole::Pcm {
+                ordinal: self.cursor.next_pcm,
+            }));
+        }
+        Ok(None)
     }
 
     fn page_check(

@@ -90,6 +90,9 @@ pub use legacy_allocation_observation::{LegacyJournalObservation, LegacyJournalO
 pub(crate) use recording_prestart_budget::COMMAND_INPUT_BYTES as RECORDING_PRESTART_INPUT_BYTES;
 mod recording_controls;
 pub(crate) use recording_chunks::{RecordingChunkPage, RecordingChunkReceipt};
+pub(in crate::operation_journal) use recording_controls::{
+    RecordingFrozenVerification, VerifiedRecordingSeal,
+};
 mod frozen_copy;
 #[allow(dead_code)]
 mod full_progress;

@@ -499,6 +499,7 @@ impl StreamingRecordingValue for controls::RecordingControlReservation {}
 impl StreamingRecordingValue for controls::RecordingFinalizingInventory {}
 impl StreamingRecordingValue for controls::RecordingDeclaredFinalizingInventory {}
 impl StreamingRecordingValue for controls::RecordingFrozenInventory {}
+impl StreamingRecordingValue for controls::RecordingSealedInventory {}
 impl StreamingRecordingValue for prefix::RecordingPrefixInventory {}
 impl StreamingRecordingValue for prefix::RecordingPrefixSeal {}
 

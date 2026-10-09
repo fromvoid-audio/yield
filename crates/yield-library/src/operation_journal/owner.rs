@@ -613,6 +613,9 @@ pub enum OperationJournalOwnerError {
     /// Original memory-only recording preparation could not be retained or revalidated.
     #[error(transparent)]
     RecordingProducerCustody(#[from] RecordingProducerCustodyError),
+    /// Original terminal work could not retain its existing-pool input/reply credit.
+    #[error("recording terminal input refused: {0}")]
+    RecordingTerminalInput(#[source] OperationJournalOwnerQueueError),
     /// Original Recording mutation and rollback both retain uncertain outcomes.
     #[error("recording terminal rollback unconfirmed: {rollback}; original: {original}")]
     RecordingTerminalRollbackUncertain {

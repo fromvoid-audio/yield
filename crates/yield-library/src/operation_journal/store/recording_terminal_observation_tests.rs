@@ -446,10 +446,10 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
     };
     use reson::recording::{RecordingLimits, RecordingProducer, RecordingSinkBinding};
     use std::io::{self, Cursor, Seek, SeekFrom, Write};
-    struct Sink(Cursor<Vec<u8>>);
+    struct Sink(std::sync::Arc<std::sync::Mutex<Cursor<Vec<u8>>>>);
     impl Write for Sink {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.write(bytes)
+            self.0.lock().unwrap().write(bytes)
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
@@ -457,35 +457,60 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
     }
     impl Seek for Sink {
         fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
-            self.0.seek(from)
+            self.0.lock().unwrap().seek(from)
         }
     }
-    for channels in 1..=8 {
+    for (case, channels) in (1..=8).chain(std::iter::once(1)).enumerate() {
+        let frames = if case == 8 { 26000 } else { 17 };
         let f = fixture();
-        let proposal = recording_proposal_for_test(channels, 100);
+        let proposal = recording_proposal_for_test(channels, frames as u64 + 1);
         let store = OperationJournalStore::open(&f.owner).unwrap();
         store
             .insert_intent(&finite_recording_record(&proposal))
             .unwrap();
-        let header = initial_recording_header(&proposal);
-        store.retain_recording_chunk(&header).unwrap();
         let original_keys: Vec<(String, i64, i64)> = store.connection.prepare(
             "SELECT chunk_id,slot,sequence FROM operation_journal_recording_chunks WHERE slot>=20000 ORDER BY slot"
         ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        let actual_bytes = std::sync::Arc::new(std::sync::Mutex::new(Cursor::new(Vec::new())));
         let (binding, mut settlements) =
-            RecordingSinkBinding::bind(Box::new(Sink(Cursor::new(Vec::new()))));
+            RecordingSinkBinding::bind(Box::new(Sink(actual_bytes.clone())));
         let mut producer = RecordingProducer::start(
             binding,
-            RecordingLimits::new(proposal.format().sample_rate(), channels, 100).unwrap(),
+            RecordingLimits::new(proposal.format().sample_rate(), channels, frames as u64 + 1)
+                .unwrap(),
         )
         .unwrap();
-        producer.submit(&vec![0.25; 17 * usize::from(channels)]);
-        let (inventory, batch, joined) = std::thread::scope(|scope| {
+        producer.submit(&vec![0.25; frames * usize::from(channels)]);
+        let (inventory, batch, joined, prefix_chunks, header) = std::thread::scope(|scope| {
             let stopped = scope.spawn(move || producer.stop());
             let barrier = settlements
                 .recv_barrier(std::time::Duration::from_secs(2))
                 .unwrap();
-            let normalizer = RecordingPcmNormalizer::new(&proposal).unwrap();
+            let mut normalizer = RecordingPcmNormalizer::new(&proposal).unwrap();
+            let mut prefix_chunks = Vec::new();
+            let written = actual_bytes.lock().unwrap();
+            let offset = barrier.write_inventory().pending_offset() as usize;
+            assert_eq!(written.get_ref().len(), offset);
+            let mut initial =
+                crate::operation_journal::recording_commands::prefix::InitialRecordingHeader::new(
+                    &proposal,
+                )
+                .unwrap();
+            initial.apply_write(0, &written.get_ref()[..68]).unwrap();
+            let header = initial.finish(Uuid::new_v4()).unwrap();
+            let mut consumed = 0;
+            for part in written.get_ref()[68..offset].chunks(16384) {
+                let chunk_bytes = proposal.format().pcm_chunk_bytes() as usize;
+                let count = (consumed + part.len()) / chunk_bytes - consumed / chunk_bytes;
+                let ids: Vec<_> = (0..count).map(|_| Uuid::new_v4()).collect();
+                let prepared = normalizer
+                    .prepare(&proposal, 68 + consumed as u64, part, &ids)
+                    .unwrap();
+                prefix_chunks.extend(prepared.chunks().iter().cloned());
+                normalizer.accept(prepared).unwrap();
+                consumed += part.len();
+            }
+            drop(written);
             let result = RecordingDeclaredFinalizingInventory::capture(
                 &proposal,
                 Uuid::new_v4(),
@@ -501,8 +526,9 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
             let joined = settlements
                 .recv_joined(std::time::Duration::from_secs(2))
                 .unwrap();
-            (result.0, result.1, joined)
+            (result.0, result.1, joined, prefix_chunks, header)
         });
+        store.retain_recording_chunk(&header).unwrap();
         assert_eq!(batch.chunks().len(), 3);
         let encoded = inventory.encode(&proposal).unwrap();
         assert!(encoded.len() <= 4096);
@@ -617,7 +643,11 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
         );
         // Install exact immutable bytes and ordinary/chunk rows as data-only SQL fixtures.
         store.connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        for chunk in batch.chunks() {
+        for chunk in prefix_chunks
+            .iter()
+            .chain(batch.chunks())
+            .chain(std::iter::once(&header))
+        {
             let slot = match chunk.role() {
                 crate::operation_journal::recording_commands::RecordingChunkRole::Pcm {
                     ordinal,
@@ -626,9 +656,11 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
                     revision,
                 } => 10000 + i64::from(revision),
             };
-            let sequence = store.next_sequence_inside_transaction().unwrap();
-            store.connection.execute("INSERT INTO operation_journal_recording_chunks(chunk_id,operation_id,slot,sequence,record) VALUES(?1,?2,?3,?4,?5)",
-                params![chunk.chunk_id().to_string(), proposal.operation_id().to_string(), slot, sequence, chunk.encode(&proposal).unwrap()]).unwrap();
+            if chunk.chunk_id() != header.chunk_id() {
+                let sequence = store.next_sequence_inside_transaction().unwrap();
+                store.connection.execute("INSERT INTO operation_journal_recording_chunks(chunk_id,operation_id,slot,sequence,record) VALUES(?1,?2,?3,?4,?5)",
+                    params![chunk.chunk_id().to_string(), proposal.operation_id().to_string(), slot, sequence, chunk.encode(&proposal).unwrap()]).unwrap();
+            }
             let request = ChunkClaimRequest::new(
                 ChunkId::from_uuid(chunk.chunk_id()).unwrap(),
                 proposal.operation_id(),
@@ -636,7 +668,7 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
                     AdmissionClaimId::new(),
                     VolumeIdentity { device: 1 },
                     crate::operation_journal::FullCapacityAllocationClass::DestinationStaging,
-                    4096,
+                    (chunk.bytes().len() as u64).div_ceil(4096) * 4096,
                 )
                 .unwrap(),
                 chunk.work_key().participant_id(),
@@ -670,7 +702,7 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
                 .is_err()
         );
         // A persisted Issued state is a historical observation, not physical completion.
-        for chunk in batch.chunks() {
+        for chunk in prefix_chunks.iter().chain(batch.chunks()) {
             store.connection.execute("UPDATE operation_journal_chunk_claim SET state='Issued',issue_id=?1 WHERE chunk_id=?2",
                 params![Uuid::new_v4().to_string(), chunk.chunk_id().to_string()]).unwrap();
         }
@@ -771,6 +803,216 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
                 )
                 .unwrap()
         );
+        let scope = store
+            .begin_recording_terminal_write_with_input(&complete_funding.input)
+            .unwrap();
+        let current = store
+            .start_original_frozen_verification(
+                &proposal,
+                &inventory,
+                &frozen,
+                &complete_funding.input,
+            )
+            .unwrap();
+        assert!(!current.complete().unwrap());
+        // Header initialization also needs an original issued claim; no shorter caller prefix.
+        assert!(
+            store
+                .original_frozen_verification_page(
+                    &proposal,
+                    &frozen,
+                    &current,
+                    &complete_funding.input
+                )
+                .is_err()
+        );
+        assert!(!current.complete().unwrap());
+        store.connection.execute("UPDATE operation_journal_chunk_claim SET state='Issued',issue_id=?1 WHERE chunk_id=?2",
+            params![Uuid::new_v4().to_string(), header.chunk_id().to_string()]).unwrap();
+        let next = store
+            .original_frozen_verification_page(
+                &proposal,
+                &frozen,
+                &current,
+                &complete_funding.input,
+            )
+            .unwrap();
+        let next = if case == 8 {
+            // Seven PCM rows plus three headers require a second turn; the first
+            // page must yield with the original state still available for retry.
+            assert!(!next.complete().unwrap());
+            store
+                .original_frozen_verification_page(
+                    &proposal,
+                    &frozen,
+                    &next,
+                    &complete_funding.input,
+                )
+                .unwrap()
+        } else {
+            next
+        };
+        assert!(next.complete().unwrap());
+        let verified = next.finish(&complete_funding.input).unwrap();
+        let before_seal = recording_projection_raw_state(&store.connection);
+        store
+            .connection
+            .execute_batch("SAVEPOINT seal_fault")
+            .unwrap();
+        store.set_insert_test_hook(|at| {
+            if at == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::RecordingRetention {
+                    reason: "Seal precommit fault".into(),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        assert!(
+            store
+                .retain_original_verified_seal(
+                    &proposal,
+                    &frozen,
+                    &verified,
+                    &complete_funding.input
+                )
+                .is_err()
+        );
+        store
+            .connection
+            .execute_batch("ROLLBACK TO seal_fault; RELEASE seal_fault")
+            .unwrap();
+        assert_eq!(
+            recording_projection_raw_state(&store.connection),
+            before_seal
+        );
+        store.set_insert_test_hook(|_| InsertTestDirective::Continue);
+        store
+            .retain_original_verified_seal(&proposal, &frozen, &verified, &complete_funding.input)
+            .unwrap();
+        let retained_seal = recording_projection_raw_state(&store.connection);
+        store
+            .retain_original_verified_seal(&proposal, &frozen, &verified, &complete_funding.input)
+            .unwrap();
+        assert_eq!(
+            recording_projection_raw_state(&store.connection),
+            retained_seal
+        );
+        store
+            .verify_original_seal_readback(&proposal, &frozen, &verified, &complete_funding.input)
+            .unwrap();
+        assert!(
+            store
+                .verify_recording_reservation_with_input(
+                    &proposal,
+                    true,
+                    Some(&complete_funding.input)
+                )
+                .unwrap()
+        );
+        if case == 8 {
+            store.set_insert_test_hook(|at| {
+                if at == InsertTestBoundary::AfterCommit {
+                    InsertTestDirective::Fail(OperationJournalStoreError::RecordingRetention {
+                        reason: "Seal commit acknowledgement lost".into(),
+                    })
+                } else {
+                    InsertTestDirective::Continue
+                }
+            });
+            assert!(
+                store
+                    .finish_recording_terminal_write(&complete_funding.input)
+                    .is_err()
+            );
+            assert!(store.connection.is_autocommit());
+        } else {
+            store
+                .finish_recording_terminal_write(&complete_funding.input)
+                .unwrap();
+        }
+        drop(scope);
+        drop(current);
+        // Independent actual encoder oracle for the reconstructed durable object hash.
+        let mut oracle = Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(
+                &mut oracle,
+                hound::WavSpec {
+                    channels,
+                    sample_rate: proposal.format().sample_rate(),
+                    bits_per_sample: 32,
+                    sample_format: hound::SampleFormat::Float,
+                },
+            )
+            .unwrap();
+            for _ in 0..frames * usize::from(channels) {
+                writer.write_sample(0.25_f32).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        let encoded_seal: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal_recording_chunks WHERE slot=20002",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let observed: serde_json::Value = serde_json::from_slice(&encoded_seal).unwrap();
+        assert_eq!(
+            observed["seal"]["content_hash"],
+            serde_json::json!(blake3::hash(oracle.get_ref()).as_bytes())
+        );
+        drop(store);
+        let store = OperationJournalStore::open(&f.owner).unwrap();
+        store
+            .verify_original_seal_readback(&proposal, &frozen, &verified, &complete_funding.input)
+            .unwrap();
+        assert!(store.verify_recording_reservation(&proposal, true).unwrap());
+        assert_eq!(store.recording_retained_totals().unwrap(), frozen_totals);
+        let scope = store
+            .begin_recording_terminal_write_with_input(&complete_funding.input)
+            .unwrap();
+        let mut conflicting: serde_json::Value = serde_json::from_slice(&encoded_seal).unwrap();
+        let first = conflicting["seal"]["content_hash"][0].as_u64().unwrap();
+        conflicting["seal"]["content_hash"][0] = serde_json::json!(first ^ 1);
+        store
+            .connection
+            .execute(
+                "UPDATE operation_journal_recording_chunks SET record=?1 WHERE slot=20002",
+                params![serde_json::to_vec(&conflicting).unwrap()],
+            )
+            .unwrap();
+        let raw_conflict = recording_projection_raw_state(&store.connection);
+        assert!(
+            store
+                .retain_original_verified_seal(
+                    &proposal,
+                    &frozen,
+                    &verified,
+                    &complete_funding.input
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .verify_original_seal_readback(
+                    &proposal,
+                    &frozen,
+                    &verified,
+                    &complete_funding.input
+                )
+                .is_err()
+        );
+        assert_eq!(
+            recording_projection_raw_state(&store.connection),
+            raw_conflict
+        );
+        store
+            .rollback_recording_terminal_write(&complete_funding.input)
+            .unwrap();
+        drop(scope);
         let scope = store
             .begin_recording_terminal_write_with_input(&complete_funding.input)
             .unwrap();
