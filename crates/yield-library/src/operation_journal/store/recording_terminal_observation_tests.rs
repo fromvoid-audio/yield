@@ -472,6 +472,23 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
         store
             .require_recording_claim_capturing_for_input(&proposal, &capturing_funding.input)
             .unwrap();
+        let before_frozen = recording_projection_raw_state(&store.connection);
+        let scope = store
+            .begin_recording_terminal_write_with_input(&capturing_funding.input)
+            .unwrap();
+        assert!(
+            store
+                .start_recording_restart_audit(proposal.operation_id(), &capturing_funding.input)
+                .is_err()
+        );
+        store
+            .rollback_recording_terminal_write(&capturing_funding.input)
+            .unwrap();
+        drop(scope);
+        assert_eq!(
+            recording_projection_raw_state(&store.connection),
+            before_frozen
+        );
         let original_keys: Vec<(String, i64, i64)> = store.connection.prepare(
             "SELECT chunk_id,slot,sequence FROM operation_journal_recording_chunks WHERE slot>=20000 ORDER BY slot"
         ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap();
@@ -1080,6 +1097,149 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
             .unwrap();
         assert!(store.verify_recording_reservation(&proposal, true).unwrap());
         assert_eq!(store.recording_retained_totals().unwrap(), frozen_totals);
+        if case == 8 {
+            // An unsealed Frozen recording is auditable without filling its reserved Seal slot.
+            let scope = store
+                .begin_recording_terminal_write_with_input(&complete_funding.input)
+                .unwrap();
+            let empty_seal = crate::operation_journal::recording_commands::controls::RecordingControlReservation::new(&proposal, ControlRole::Seal).unwrap().encode(&proposal).unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE operation_journal_recording_chunks SET record=?1 WHERE slot=20002",
+                    params![empty_seal],
+                )
+                .unwrap();
+            let empty_snapshot = recording_projection_raw_state(&store.connection);
+            let mut unsealed = store
+                .start_recording_restart_audit(proposal.operation_id(), &complete_funding.input)
+                .unwrap();
+            let observed = loop {
+                let (next, observed) = store
+                    .recording_restart_audit_page(&unsealed, &complete_funding.input)
+                    .unwrap();
+                if let Some(observed) = observed {
+                    break observed;
+                }
+                unsealed.verifier = next;
+            };
+            assert_eq!(
+                observed.content_hash(),
+                *blake3::hash(oracle.get_ref()).as_bytes()
+            );
+            assert_eq!(
+                recording_projection_raw_state(&store.connection),
+                empty_snapshot
+            );
+            drop(unsealed);
+            store
+                .rollback_recording_terminal_write(&complete_funding.input)
+                .unwrap();
+            drop(scope);
+        }
+        // A fresh restart audit is observation only, and never writes a seal or retained row.
+        let before_audit = recording_projection_raw_state(&store.connection);
+        let scope = store
+            .begin_recording_terminal_write_with_input(&complete_funding.input)
+            .unwrap();
+        let mut audit = store
+            .start_recording_restart_audit(proposal.operation_id(), &complete_funding.input)
+            .unwrap();
+        store
+            .finish_recording_terminal_write(&complete_funding.input)
+            .unwrap();
+        drop(scope);
+        let mut audit_pages = 0;
+        let recovered = loop {
+            let scope = store
+                .begin_recording_terminal_write_with_input(&complete_funding.input)
+                .unwrap();
+            let (next, observed) = store
+                .recording_restart_audit_page(&audit, &complete_funding.input)
+                .unwrap();
+            if case == 8 && audit_pages == 0 {
+                // A lost COMMIT acknowledgement cannot consume the old verifier cursor.
+                store.set_insert_test_hook(|boundary| {
+                    if boundary == InsertTestBoundary::AfterCommit {
+                        InsertTestDirective::ExecuteThenFail(
+                            OperationJournalStoreError::RecordingRetention {
+                                reason: "restart audit lost acknowledgement".into(),
+                            },
+                        )
+                    } else {
+                        InsertTestDirective::Continue
+                    }
+                });
+                assert!(
+                    store
+                        .finish_recording_terminal_write(&complete_funding.input)
+                        .is_err()
+                );
+                assert!(!audit.verifier.as_ref().unwrap().complete().unwrap());
+                drop(next);
+                drop(observed);
+                drop(scope);
+                let scope = store
+                    .begin_recording_terminal_write_with_input(&complete_funding.input)
+                    .unwrap();
+                let (next, observed) = store
+                    .recording_restart_audit_page(&audit, &complete_funding.input)
+                    .unwrap();
+                store
+                    .finish_recording_terminal_write(&complete_funding.input)
+                    .unwrap();
+                drop(scope);
+                assert!(observed.is_none());
+                audit.verifier = next;
+            } else {
+                store
+                    .finish_recording_terminal_write(&complete_funding.input)
+                    .unwrap();
+                drop(scope);
+                if let Some(observed) = observed {
+                    break observed;
+                }
+                audit.verifier = next;
+            }
+            audit_pages += 1;
+            assert!(audit_pages <= 2);
+        };
+        assert_eq!(
+            recovered.content_hash(),
+            *blake3::hash(oracle.get_ref()).as_bytes()
+        );
+        assert_eq!(
+            recording_projection_raw_state(&store.connection),
+            before_audit
+        );
+        drop(audit);
+        if case == 8 {
+            // Exercise the actual owner queue and scheduler without any capacity/Source grant.
+            let mut owner = crate::operation_journal::owner::OperationJournalOwner::start_without_capacity_for_test(store).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while owner.status()
+                == crate::operation_journal::owner::OperationJournalOwnerStatus::Initializing
+            {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let result = owner
+                .client()
+                .audit_recording_frozen_prefix(proposal.operation_id())
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.content_hash(), recovered.content_hash());
+            assert!(owner.shutdown());
+        } else {
+            drop(store);
+        }
+        let store = OperationJournalStore::open(&f.owner).unwrap();
+        assert_eq!(
+            recording_projection_raw_state(&store.connection),
+            before_audit
+        );
         let scope = store
             .begin_recording_terminal_write_with_input(&complete_funding.input)
             .unwrap();
@@ -1094,6 +1254,26 @@ fn recording_declared_terminal_cas_exact_readback_and_reopen_preserve_reserved_r
             )
             .unwrap();
         let raw_conflict = recording_projection_raw_state(&store.connection);
+        let mut corrupt_audit = store
+            .start_recording_restart_audit(proposal.operation_id(), &complete_funding.input)
+            .unwrap();
+        let mut detected = false;
+        for _ in 0..2 {
+            match store.recording_restart_audit_page(&corrupt_audit, &complete_funding.input) {
+                Ok((next, None)) => corrupt_audit.verifier = next,
+                Ok((_, Some(_))) => panic!("corrupt stored hash accepted"),
+                Err(_) => {
+                    detected = true;
+                    break;
+                }
+            }
+        }
+        assert!(detected);
+        assert_eq!(
+            recording_projection_raw_state(&store.connection),
+            raw_conflict
+        );
+        drop(corrupt_audit);
         assert!(
             store
                 .retain_original_verified_seal(

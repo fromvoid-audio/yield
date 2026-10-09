@@ -47,6 +47,16 @@ impl RecordingSealedInventory {
         }
         Ok(())
     }
+    pub(crate) fn validate_observed_replay(
+        &self,
+        proposal: &RecordingProposal,
+        frozen: &RecordingFrozenInventory,
+        observed: &prefix::RecordingPrefixSeal,
+    ) -> Result<(), RecordingValueError> {
+        self.validate_frozen(proposal, frozen)?;
+        self.seal.validate_replay(observed, proposal)
+    }
+
     pub(crate) fn encode(
         &self,
         proposal: &RecordingProposal,

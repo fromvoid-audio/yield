@@ -53,6 +53,12 @@ pub(in crate::operation_journal) struct VerifiedRecordingSeal {
     _backing: InputPermit,
 }
 
+impl VerifiedRecordingSeal {
+    pub(super) fn observed_seal(&self) -> &RecordingPrefixSeal {
+        &self.seal
+    }
+}
+
 impl OperationJournalStore {
     pub(in crate::operation_journal) fn start_original_frozen_verification(
         &self,

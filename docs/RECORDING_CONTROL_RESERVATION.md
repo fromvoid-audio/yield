@@ -314,3 +314,27 @@ original terminal route consumes only already-issued exact private-plan claims.
 Full OPT-2145 still requires original terminal admission/acknowledgement with
 qualified startup, actual restart scheduling, complete cancellation/drain races
 and native acceptance. No publication or charge reclamation is enabled here.
+
+## Owner restart audit (OPT-2145, partial)
+
+The bounded owner request `audit_recording_frozen_prefix` schedules a fresh
+read-only audit of an existing V3/V4 recording. It holds the original request
+credit and profile-owned store while advancing at most eight verification rows
+per turn. Only one verifier or producer can occupy the acquisition. Each turn
+checks the current owner and journal namespace, rereads the declared/Frozen
+controls and exact row count, and verifies retained bytes with issued claims.
+A separately funded candidate replaces the cursor only after its transaction
+and namespace checks succeed.
+
+The final data observation contains the hash and length computed from actual
+retained bytes. An existing V5 seal must match this fresh result. An empty Seal
+reservation can be observed without writing it. Historical controls never
+recreate a producer, Source permission or permission to fill the Seal slot.
+Shutdown releases the audit and its transient loans before journal/profile
+custody. Real SQLite and CPU tests cover reopen, multiple pages, lost COMMIT
+acknowledgement, corrupt stored hashes and the actual owner queue without
+capacity or Source authority; all retained rows and charges remain unchanged.
+
+Full OPT-2145 remains open for qualified required-WAL/physical startup, admitted
+terminal acknowledgement, complete cancellation/drain races and native
+acceptance. This read-only request does not publish outputs or reclaim charges.

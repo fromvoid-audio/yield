@@ -3,6 +3,7 @@ use super::{OperationJournalStore, OperationJournalStoreError};
 mod appends;
 mod funded;
 mod initial_funded;
+mod restart_audit;
 mod terminal;
 mod verification;
 use crate::operation_journal::coordinator::UniversalCommandArgs;
@@ -11,6 +12,7 @@ use crate::operation_journal::recording_commands::controls::{
     CONTROL_BYTES, CONTROL_ROWS, ControlRole, FIRST_CONTROL_SLOT, RESERVED_BYTES,
     RecordingControlReservation, finalizing_observation, reservation_metadata_bound,
 };
+pub(in crate::operation_journal) use restart_audit::RecordingRestartAudit;
 use rusqlite::{OptionalExtension, params};
 pub(in crate::operation_journal) use verification::{
     RecordingFrozenVerification, VerifiedRecordingSeal,
