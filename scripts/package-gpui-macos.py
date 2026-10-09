@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import TextIO
 
 
 BUNDLE_NAME = "Yield.app"
@@ -39,6 +40,7 @@ def create_signed_bundle(
     info: dict[str, object],
     *,
     cwd: Path,
+    log: TextIO | None = None,
 ) -> str:
     """Assemble and ad-hoc sign the shared local-review Yield.app layout."""
     contents = app_bundle / "Contents"
@@ -50,9 +52,26 @@ def create_signed_bundle(
     shutil.copy2(icon, resources / "Yield.icns")
     shutil.copy2(font_license, resources / "IoskeleyMono-LICENSE.txt")
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
-    subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(app_bundle)], cwd=cwd, check=True)
-    command("codesign", "--verify", "--strict", "--deep", str(app_bundle), cwd=cwd)
-    signature = command("codesign", "--display", "--verbose=4", str(app_bundle), cwd=cwd)
+    def run_codesign(*args: str) -> str:
+        if log is None:
+            return command(*args, cwd=cwd)
+        log.write("$ " + " ".join(args) + "\n")
+        log.flush()
+        result = subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=False)
+        if result.stdout:
+            log.write(result.stdout)
+        if result.stderr:
+            log.write("[stderr]\n" + result.stderr)
+        log.flush()
+        if result.returncode:
+            raise subprocess.CalledProcessError(
+                result.returncode, args, output=result.stdout, stderr=result.stderr
+            )
+        return (result.stdout + result.stderr).strip()
+
+    run_codesign("codesign", "--force", "--deep", "--sign", "-", str(app_bundle))
+    run_codesign("codesign", "--verify", "--strict", "--deep", str(app_bundle))
+    signature = run_codesign("codesign", "--display", "--verbose=4", str(app_bundle))
     if "Signature=adhoc" not in signature:
         raise RuntimeError("local review bundle did not receive an ad-hoc signature")
     return signature

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one exact native-production startup test inside a reversible state transaction."""
+"""Run one exact native-production selector inside a reversible state transaction."""
 
 from __future__ import annotations
 
@@ -12,6 +12,9 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from runtime_paths import canonicalize_tmpdir  # noqa: E402
+
+canonicalize_tmpdir()
 import local_state  # noqa: E402
 from process_tree import Cancelled, catch_cancellation_signals, ignore_cancellation_signals  # noqa: E402
 
@@ -19,6 +22,10 @@ CASES = {
     "capacity": "operation_journal::owner::tests::capacity_startup_tests::capacity_startup_native_production_rebuilds_original_descriptor_bound_image",
     "control": "operation_journal::owner::tests::control_backing_tests::control_backing_native_production_startup_preserves_original_failure_and_journal",
     "namespace": "operation_journal::owner::tests::namespace_backing_tests::namespace_backing_native_production_error_outlives_original_worker_join",
+    "recording-slot-currentness": "operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain",
+    "recording-lost-reply": "operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit",
+    "chunk-issuance": "operation_journal::owner::recording_binding::tests::chunk_issuance_native_production_original_claim_transition_and_retained_backing",
+    "provider-reconciliation": "operation_journal::owner::tests::provider_reconciliation_tests::provider_reconciliation_native_production_original_queue_refuses_exact_graph_pressure",
 }
 
 
@@ -35,7 +42,7 @@ def selector_output_is_exactly_one_success(selector: str, output: str) -> bool:
 
 def main() -> int:
     if len(sys.argv) != 2 or sys.argv[1] not in CASES:
-        print("usage: run_native_production_case.py <capacity|control|namespace>", file=sys.stderr)
+        print("usage: run_native_production_case.py <" + "|".join(CASES) + ">", file=sys.stderr)
         return 2
     if os.environ.get("YIELD_CONFIG_HOME") or os.environ.get("YIELD_CONFIG_PROFILE"):
         print("clear YIELD_CONFIG_HOME and YIELD_CONFIG_PROFILE before native production validation", file=sys.stderr)

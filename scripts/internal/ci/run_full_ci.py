@@ -9,7 +9,11 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from runtime_paths import canonicalize_tmpdir  # noqa: E402
+
+canonicalize_tmpdir()
 import local_state  # noqa: E402
+from run_native_production_case import CASES as NATIVE_PRODUCTION_CASES  # noqa: E402
 from process_tree import Cancelled, catch_cancellation_signals, ignore_cancellation_signals  # noqa: E402
 
 
@@ -60,6 +64,7 @@ def main() -> int:
             "scripts.internal.ci.test_bundle_packager",
             "scripts.internal.ci.test_local_ci_contract",
             "scripts.internal.ci.test_managed_exec",
+            "scripts.internal.ci.test_runtime_paths",
         ]
         coordinator_fds: tuple[int, ...] = ()
         coordinator = env.get("YIELD_LOCAL_CI_COORDINATOR_FD")
@@ -107,13 +112,13 @@ def main() -> int:
     if status != 0:
         return status
 
-    # Each production-selector acceptance is a separate clean transaction and
-    # exact EX handoff, preserving all three original startup assertions.
+    # Each native production selector is a separate clean transaction and exact
+    # EX handoff, so durable evidence from one case cannot contaminate another.
     runner = checkout / "scripts/internal/ci/run_native_production_case.py"
     native_env = os.environ.copy()
     native_fds: tuple[int, ...] = ()
     native_fds = coordinator_fds
-    for case in ("capacity", "control", "namespace"):
+    for case in NATIVE_PRODUCTION_CASES:
         status = run([sys.executable, str(runner), case], native_env, native_fds)
         if status != 0:
             return status

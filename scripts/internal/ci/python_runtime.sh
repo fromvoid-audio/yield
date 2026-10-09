@@ -26,16 +26,27 @@ yield_ci_python() {
   return 1
 }
 
+yield_canonicalize_tmpdir() {
+  local canonical helper_dir
+  helper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  canonical="$(PYTHONPATH="$helper_dir${PYTHONPATH:+:$PYTHONPATH}" "$YIELD_CI_PYTHON" -c 'from runtime_paths import canonicalize_tmpdir; print(canonicalize_tmpdir())')" || {
+    echo "TMPDIR must resolve to an existing directory" >&2
+    return 1
+  }
+  export TMPDIR="$canonical"
+}
+
 yield_prepare_python_runtime() {
   local interpreter alias_dir
   interpreter="$(yield_ci_python)" || return 1
+  export YIELD_CI_PYTHON="$interpreter"
+  yield_canonicalize_tmpdir || return 1
   alias_dir="$(mktemp -d "${TMPDIR:-/tmp}/yield-python.XXXXXX")" || return 1
   chmod 700 "$alias_dir"
   if ! ln -s "$interpreter" "$alias_dir/python3"; then
     rmdir "$alias_dir" 2>/dev/null || true
     return 1
   fi
-  export YIELD_CI_PYTHON="$interpreter"
   export YIELD_CI_PYTHON_RUNTIME_DIR="$alias_dir"
   export PATH="$alias_dir:$PATH"
   trap 'rm -f "$YIELD_CI_PYTHON_RUNTIME_DIR/python3"; rmdir "$YIELD_CI_PYTHON_RUNTIME_DIR" 2>/dev/null || true' EXIT

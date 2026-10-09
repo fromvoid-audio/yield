@@ -167,6 +167,15 @@ state restore --backup <transaction-id>
 state recover --transaction <transaction-id>
 ```
 
+Managed local-CI entrypoints resolve `TMPDIR` strictly and export its physical
+existing directory before creating temporary files, so macOS `/var` aliases do
+not create multiple apparent roots for one temporary volume. Each channel build
+creates a durable unique run record before validation or Cargo starts; its
+complete command output and `result.json` are retained under
+`.git/local-ci/runs/<source-sha>/build-<channel>/<run-id>/`. Failed or cancelled
+runs remain there for diagnosis and do not publish an accepted artifact
+manifest.
+
 Native `--case` accepts one of the exact recording selectors below,
 `prerequisite:<name>` for the six named cases in the retired native-prerequisite
 runner (`profile-generations`, `source-release-policy`, `startup-production`,
@@ -176,6 +185,13 @@ catalog replay runner. These routes are closed allowlists; each required frozen
 runner must exist in the requested source commit. Multi-command validators keep
 a shared read lease for their whole process tree, and their generated evidence
 is copied into that run's retained evidence directory.
+
+The full local lane filters all seven genuine production-registry selectors out
+of the ordinary `operation_journal` suite, then runs each under its own clean
+and restore transaction using `run_native_production_case.py`: `capacity`,
+`control`, `namespace`, `recording-slot-currentness`, `recording-lost-reply`,
+`chunk-issuance`, and `provider-reconciliation`. The runner requires evidence
+that exactly one requested test passed in each transaction.
 
 `build` does not reset state or launch the application. `run --state clean`
 prints and records its restore transaction ID before launching. Restoration is

@@ -21,7 +21,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Iterator, Optional
+import uuid
+from typing import Iterator, Optional, TextIO
 
 if sys.version_info < (3, 11):
     for candidate in ("python3.13", "python3.12", "python3.11"):
@@ -41,6 +42,13 @@ if sys.version_info < (3, 11):
     )
 
 os.environ.setdefault("YIELD_CI_PYTHON", sys.executable)
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "internal" / "ci"))
+from runtime_paths import canonicalize_tmpdir
+
+try:
+    canonicalize_tmpdir()
+except RuntimeError as error:
+    raise SystemExit(str(error)) from error
 _python_alias_dir = pathlib.Path(tempfile.mkdtemp(prefix="yield-python-"))
 os.chmod(_python_alias_dir, 0o700)
 (_python_alias_dir / "python3").symlink_to(pathlib.Path(sys.executable).resolve())
@@ -75,13 +83,62 @@ class CiError(RuntimeError):
     pass
 
 
-def command_output(*args: str, cwd: pathlib.Path = ROOT, required: bool = True) -> str:
+def command_output(
+    *args: str,
+    cwd: pathlib.Path = ROOT,
+    required: bool = True,
+    log: Optional[TextIO] = None,
+    combined_output: bool = False,
+) -> str:
+    if log is not None:
+        log.write("$ " + " ".join(args) + "\n")
+        log.flush()
     try:
-        return subprocess.check_output(args, cwd=str(cwd), text=True, stderr=subprocess.STDOUT).strip()
-    except (OSError, subprocess.CalledProcessError) as exc:
+        result = subprocess.run(args, cwd=str(cwd), text=True, capture_output=True, check=False)
+    except OSError as exc:
+        if log is not None:
+            log.write(f"command start failed: {exc}\n")
+            log.flush()
         if required:
             raise CiError(f"command failed: {' '.join(args)}: {exc}") from exc
         return "unavailable"
+    if log is not None:
+        if result.stdout:
+            log.write(result.stdout)
+        if result.stderr:
+            log.write("[stderr]\n" + result.stderr)
+        log.write(f"[exit {result.returncode}]\n")
+        log.flush()
+    if result.returncode:
+        exc = subprocess.CalledProcessError(
+            result.returncode, args, output=result.stdout, stderr=result.stderr
+        )
+        if required:
+            raise CiError(f"command failed: {' '.join(args)}: {exc}") from exc
+        return "unavailable"
+    output = result.stdout + result.stderr if combined_output else result.stdout
+    return output.strip()
+
+
+def write_build_record(path: pathlib.Path, record: dict[str, object]) -> None:
+    """Durably replace the run record without risking a stale fixed temp file."""
+    fd, temporary = tempfile.mkstemp(prefix=".result-", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(json.dumps(record, indent=2) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def run_managed(
@@ -441,116 +498,195 @@ def check(args: argparse.Namespace) -> None:
 
 def build(args: argparse.Namespace) -> None:
     sha = source_sha(args.sha)
-    with common_coordinator() as state_dir, exact_worktree(sha) as checkout:
-        require_maintenance_protocol(checkout)
-        facts = doctor("build")
-        env = cargo_env(state_dir, args.channel, checkout)
-        if COORDINATOR_FD is not None:
-            env["YIELD_LOCAL_CI_COORDINATOR_FD"] = str(COORDINATOR_FD)
-        if args.channel == "test":
-            command = ["cargo", "build", "--locked", "-p", "yield", "--features", "development-state"]
-            binary = pathlib.Path(env["CARGO_TARGET_DIR"]) / "debug" / "yield"
-            namespace = ".yield-development"
-        else:
-            command = ["cargo", "build", "--locked", "--profile", "release-local", "-p", "yield"]
-            binary = pathlib.Path(env["CARGO_TARGET_DIR"]) / "release-local" / "yield"
-            namespace = ".yield"
-        pass_fds = (COORDINATOR_FD,) if COORDINATOR_FD is not None else ()
-        exit_code = run_managed(command, cwd=checkout, env=env, pass_fds=pass_fds)
-        if exit_code:
-            raise CiError(f"build failed with exit {exit_code}")
-        if not binary.is_file():
-            raise CiError(f"build did not produce expected executable: {binary}")
-        try:
-            build_info = compiled_build_info(binary)
-        except CiError as exc:
-            raise CiError("built executable did not return valid pre-admission build-info") from exc
-        expected_namespace = ".yield-development" if args.channel == "test" else ".yield"
-        if (
-            build_info.get("protocol") != 1
-            or build_info.get("namespace") != expected_namespace
-            or not isinstance(build_info.get("package_version"), str)
-            or build_info.get("admission_marker") != ADMISSION_MARKER.decode("ascii")
-        ):
-            raise CiError("compiled build-info does not match the pinned channel/admission protocol")
-        run_id = f"{time.time_ns()}-{os.getpid()}"
+    with common_coordinator() as state_dir:
+        run_id = f"{time.time_ns()}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        run_dir = state_dir / "runs" / sha / f"build-{args.channel}" / run_id
+        run_dir.mkdir(parents=True, mode=0o700)
+        log_path = run_dir / "build.log"
+        record_path = run_dir / "result.json"
+        record: dict[str, object] = {
+            "schema": 1,
+            "run_id": run_id,
+            "source_sha": sha,
+            "lane": f"build-{args.channel}",
+            "channel": args.channel,
+            "status": "running",
+            "phase": "setup",
+            "commands": [],
+            "log": str(log_path),
+            "started_unix_ns": time.time_ns(),
+        }
+        write_build_record(record_path, record)
         artifact_dir = ROOT / "artifacts" / "local-ci" / sha / args.channel / run_id
-        artifact_dir.parent.mkdir(parents=True, exist_ok=True)
-        icon = checkout / "assets/logo3.icns"
-        font_license = checkout / "assets/fonts/IoskeleyMono-LICENSE.txt"
-        for required in (icon, font_license):
-            if not required.is_file():
-                raise CiError(f"missing macOS bundle asset: {required}")
-        metadata = json.loads(command_output("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1", cwd=checkout))
-        package_version = next(p["version"] for p in metadata["packages"] if p["name"] == "yield")
-        bundle_version = command_output("git", "rev-list", "--count", sha, cwd=checkout)
-        binary_relative = "Yield.app/Contents/MacOS/yield"
-        with tempfile.TemporaryDirectory(prefix=".yield-local-ci-package-", dir=artifact_dir.parent) as temporary:
-            staged = pathlib.Path(temporary) / "artifact"
-            app_bundle = staged / "Yield.app"
-            staged_binary = app_bundle / "Contents/MacOS/yield"
-            info = {
-                "CFBundleExecutable": "yield",
-                "CFBundleIdentifier": {
-                    "test": "org.portalsurfer.yield.test",
-                    "beta": "org.portalsurfer.yield.beta",
-                    "release": "org.portalsurfer.yield",
-                }[args.channel],
-                "CFBundleName": "Yield",
-                "CFBundleDisplayName": "Yield",
-                "CFBundleIconFile": "Yield.icns",
-                "CFBundlePackageType": "APPL",
-                "CFBundleShortVersionString": package_version,
-                "CFBundleVersion": bundle_version,
-                "NSHighResolutionCapable": True,
-                "YieldSourceCommit": sha,
-                "YieldMaintenanceNamespace": namespace,
-                "YieldMaintenanceProtocol": 1,
-                "YieldChannel": args.channel,
-            }
-            signature_details = _packager.create_signed_bundle(
-                binary,
-                app_bundle,
-                icon,
-                font_license,
-                info,
-                cwd=checkout,
-            )
-            files = sorted(path for path in (staged / "Yield.app").rglob("*") if path.is_file())
-            file_records = [
-                {
-                    "path": str(path.relative_to(staged)),
-                    "size": path.stat().st_size,
-                    "sha256": sha256_file(path),
-                }
-                for path in files
-            ]
-            manifest = {
-                "schema": 1,
-                "source_sha": sha,
-                "run_id": run_id,
-                "dirty": False,
-                "channel": args.channel,
-                "compiled_namespace": namespace,
-                "build_info": build_info,
-                "package_version": package_version,
-                "bundle_version": bundle_version,
-                "bundle_identifier": info["CFBundleIdentifier"],
-                "signature_mode": "adhoc",
-                "host": facts,
-                "toolchain": command_output("rustc", "-Vv", cwd=checkout),
-                "command": command,
-                "exit_code": 0,
-                "binary": binary_relative,
-                "binary_sha256": sha256_file(staged_binary),
-                "artifact_identity": {"device": staged_binary.stat().st_dev, "inode": staged_binary.stat().st_ino},
-                "files": file_records,
-                "created_unix_ns": time.time_ns(),
-            }
-            (staged / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-            os.rename(staged, artifact_dir)
-        manifest_path = artifact_dir / "manifest.json"
-        print(manifest_path)
+        artifact_published = False
+        active_phase = "setup"
+        active_command: Optional[list[str]] = None
+        with log_path.open("w", encoding="utf-8") as log:
+            log.write(f"build run {run_id} source={sha} channel={args.channel}\n")
+            log.flush()
+            try:
+                with exact_worktree(sha) as checkout:
+                    active_phase = "source-validation"
+                    record["phase"] = active_phase
+                    write_build_record(record_path, record)
+                    require_maintenance_protocol(checkout)
+                    facts = doctor("build")
+                    env = cargo_env(state_dir, args.channel, checkout)
+                    if COORDINATOR_FD is not None:
+                        env["YIELD_LOCAL_CI_COORDINATOR_FD"] = str(COORDINATOR_FD)
+                    if args.channel == "test":
+                        command = ["cargo", "build", "--locked", "-p", "yield", "--features", "development-state"]
+                        binary = pathlib.Path(env["CARGO_TARGET_DIR"]) / "debug" / "yield"
+                        namespace = ".yield-development"
+                    else:
+                        command = ["cargo", "build", "--locked", "--profile", "release-local", "-p", "yield"]
+                        binary = pathlib.Path(env["CARGO_TARGET_DIR"]) / "release-local" / "yield"
+                        namespace = ".yield"
+                    pass_fds = (COORDINATOR_FD,) if COORDINATOR_FD is not None else ()
+
+                    active_phase = "cargo-build"
+                    active_command = command
+                    record["phase"] = active_phase
+                    record["commands"].append({"phase": active_phase, "command": command, "status": "running"})
+                    write_build_record(record_path, record)
+                    log.write("$ " + " ".join(command) + "\n")
+                    log.flush()
+                    try:
+                        exit_code = run_managed(command, cwd=checkout, env=env, pass_fds=pass_fds, stdout=log)
+                    except BaseException:
+                        record["commands"][-1]["status"] = "interrupted"
+                        raise
+                    record["commands"][-1].update({"status": "completed", "exit_code": exit_code})
+                    record["commands"][-1]["result_unix_ns"] = time.time_ns()
+                    write_build_record(record_path, record)
+                    active_command = None
+                    if exit_code:
+                        raise CiError(f"build failed with exit {exit_code}")
+                    if not binary.is_file():
+                        raise CiError(f"build did not produce expected executable: {binary}")
+
+                    active_phase = "build-info"
+                    record["phase"] = active_phase
+                    write_build_record(record_path, record)
+                    try:
+                        build_info = compiled_build_info(binary)
+                    except CiError as exc:
+                        raise CiError("built executable did not return valid pre-admission build-info") from exc
+                    log.write("compiled build-info: " + json.dumps(build_info, sort_keys=True) + "\n")
+                    expected_namespace = ".yield-development" if args.channel == "test" else ".yield"
+                    if (
+                        build_info.get("protocol") != 1
+                        or build_info.get("namespace") != expected_namespace
+                        or not isinstance(build_info.get("package_version"), str)
+                        or build_info.get("admission_marker") != ADMISSION_MARKER.decode("ascii")
+                    ):
+                        raise CiError("compiled build-info does not match the pinned channel/admission protocol")
+
+                    active_phase = "packaging"
+                    record["phase"] = active_phase
+                    write_build_record(record_path, record)
+                    artifact_dir.parent.mkdir(parents=True, exist_ok=True)
+                    icon = checkout / "assets/logo3.icns"
+                    font_license = checkout / "assets/fonts/IoskeleyMono-LICENSE.txt"
+                    for required in (icon, font_license):
+                        if not required.is_file():
+                            raise CiError(f"missing macOS bundle asset: {required}")
+                    metadata = json.loads(command_output(
+                        "cargo", "metadata", "--locked", "--no-deps", "--format-version", "1",
+                        cwd=checkout, log=log
+                    ))
+                    package_version = next(p["version"] for p in metadata["packages"] if p["name"] == "yield")
+                    bundle_version = command_output("git", "rev-list", "--count", sha, cwd=checkout, log=log)
+                    binary_relative = "Yield.app/Contents/MacOS/yield"
+                    with tempfile.TemporaryDirectory(prefix=".yield-local-ci-package-", dir=artifact_dir.parent) as temporary:
+                        staged = pathlib.Path(temporary) / "artifact"
+                        app_bundle = staged / "Yield.app"
+                        staged_binary = app_bundle / "Contents/MacOS/yield"
+                        info = {
+                            "CFBundleExecutable": "yield",
+                            "CFBundleIdentifier": {
+                                "test": "org.portalsurfer.yield.test",
+                                "beta": "org.portalsurfer.yield.beta",
+                                "release": "org.portalsurfer.yield",
+                            }[args.channel],
+                            "CFBundleName": "Yield",
+                            "CFBundleDisplayName": "Yield",
+                            "CFBundleIconFile": "Yield.icns",
+                            "CFBundlePackageType": "APPL",
+                            "CFBundleShortVersionString": package_version,
+                            "CFBundleVersion": bundle_version,
+                            "NSHighResolutionCapable": True,
+                            "YieldSourceCommit": sha,
+                            "YieldMaintenanceNamespace": namespace,
+                            "YieldMaintenanceProtocol": 1,
+                            "YieldChannel": args.channel,
+                        }
+                        signature_details = _packager.create_signed_bundle(
+                            binary, app_bundle, icon, font_license, info, cwd=checkout, log=log
+                        )
+                        log.write("ad-hoc signature verified\n")
+                        files = sorted(path for path in (staged / "Yield.app").rglob("*") if path.is_file())
+                        file_records = [
+                            {"path": str(path.relative_to(staged)), "size": path.stat().st_size,
+                             "sha256": sha256_file(path)}
+                            for path in files
+                        ]
+                        manifest = {
+                            "schema": 1, "source_sha": sha, "run_id": run_id, "dirty": False,
+                            "channel": args.channel, "compiled_namespace": namespace,
+                            "build_info": build_info, "package_version": package_version,
+                            "bundle_version": bundle_version, "bundle_identifier": info["CFBundleIdentifier"],
+                            "signature_mode": "adhoc", "host": facts,
+                            "toolchain": command_output("rustc", "-Vv", cwd=checkout, log=log),
+                            "command": command, "exit_code": 0, "binary": binary_relative,
+                            "binary_sha256": sha256_file(staged_binary),
+                            "artifact_identity": {"device": staged_binary.stat().st_dev, "inode": staged_binary.stat().st_ino},
+                            "files": file_records, "created_unix_ns": time.time_ns(),
+                        }
+                        (staged / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+                        if artifact_dir.exists():
+                            raise CiError(f"artifact directory already exists: {artifact_dir}")
+                        os.rename(staged, artifact_dir)
+                        artifact_published = True
+                    manifest_path = artifact_dir / "manifest.json"
+                    record.update({
+                        "status": "passed", "phase": "complete", "completed_unix_ns": time.time_ns(),
+                        "artifact_manifest": str(manifest_path),
+                    })
+                    write_build_record(record_path, record)
+                    print(manifest_path)
+            except BaseException as error:
+                log.write(f"build {active_phase} failed: {type(error).__name__}: {error}\n")
+                log.flush()
+                if active_command is not None:
+                    record["commands"][-1].update({"status": "interrupted", "error": str(error)})
+                command_error = error
+                if isinstance(command_error, CiError) and isinstance(command_error.__cause__, subprocess.CalledProcessError):
+                    command_error = command_error.__cause__
+                if isinstance(command_error, subprocess.CalledProcessError):
+                    record["failed_command"] = list(command_error.cmd) if isinstance(command_error.cmd, (list, tuple)) else str(command_error.cmd)
+                    record["exit_code"] = command_error.returncode
+                status = "cancelled" if isinstance(error, KeyboardInterrupt) or "cancelled" in str(error).lower() else "failed"
+                record.update({
+                    "status": status, "phase": active_phase, "error": f"{type(error).__name__}: {error}",
+                    "completed_unix_ns": time.time_ns(),
+                })
+                try:
+                    write_build_record(record_path, record)
+                except OSError as record_error:
+                    log.write(f"failed to persist final run record: {record_error}\n")
+                    log.flush()
+                if artifact_published:
+                    rejected = run_dir / "rejected-artifact"
+                    if not rejected.exists():
+                        os.rename(artifact_dir, rejected)
+                if isinstance(error, KeyboardInterrupt):
+                    raise
+                if isinstance(error, CiError):
+                    raise CiError(
+                        f"build failed during {active_phase}; run evidence retained at {run_dir}: {error}"
+                    ) from error
+                raise CiError(f"build failed during {active_phase}; run evidence retained at {run_dir}") from error
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -616,7 +752,9 @@ def run_artifact(args: argparse.Namespace) -> None:
     app_bundle = manifest_path.parent / "Yield.app"
     try:
         command_output("codesign", "--verify", "--strict", "--deep", str(app_bundle))
-        signature_details = command_output("codesign", "--display", "--verbose=4", str(app_bundle))
+        signature_details = command_output(
+            "codesign", "--display", "--verbose=4", str(app_bundle), combined_output=True
+        )
         info = plistlib.loads((app_bundle / "Contents/Info.plist").read_bytes())
     except (CiError, OSError, plistlib.InvalidFileException) as exc:
         raise CiError("artifact bundle signature or Info.plist is invalid") from exc

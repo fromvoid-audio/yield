@@ -10,6 +10,8 @@ fi
 repo_root="${YIELD_GPUI_CI_CHECKOUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$repo_root"
 source scripts/internal/ci/python_runtime.sh
+export YIELD_CI_PYTHON="$(yield_ci_python)"
+yield_canonicalize_tmpdir
 if [[ -z "${YIELD_LOCAL_CI_COORDINATOR_FD:-}" ]]; then
   common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
   state_dir="$common_dir/local-ci"
@@ -102,9 +104,13 @@ run cargo test --locked -p yield-library --test readiness_lease_process --featur
 run cargo test --locked -p yield-library --lib operation_journal --no-default-features -- \
   --skip capacity_startup_native_production_rebuilds_original_descriptor_bound_image \
   --skip control_backing_native_production_startup_preserves_original_failure_and_journal \
-  --skip namespace_backing_native_production_error_outlives_original_worker_join
+  --skip namespace_backing_native_production_error_outlives_original_worker_join \
+  --skip recording_custody_native_production_original_slot_currentness_and_drain \
+  --skip recording_custody_native_production_lost_reply_keeps_original_slot_and_credit \
+  --skip chunk_issuance_native_production_original_claim_transition_and_retained_backing \
+  --skip provider_reconciliation_native_production_original_queue_refuses_exact_graph_pressure
 if [[ "$scope" == "full" && "${YIELD_GPUI_SKIP_NATIVE_CASES:-0}" != "1" ]]; then
-  for case in capacity control namespace; do
+  for case in capacity control namespace recording-slot-currentness recording-lost-reply chunk-issuance provider-reconciliation; do
     run "$YIELD_CI_PYTHON" scripts/internal/ci/run_native_production_case.py "$case"
   done
 fi
