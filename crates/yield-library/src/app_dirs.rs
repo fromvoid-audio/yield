@@ -7,6 +7,7 @@
 //! they explicitly request the live profile or another config root.
 
 mod error;
+mod maintenance_admission;
 mod overrides;
 mod paths;
 mod profile;
@@ -16,6 +17,9 @@ mod state;
 mod storage_usage;
 
 pub use error::AppDirError;
+pub use maintenance_admission::{
+    ProcessMaintenanceAdmission, acquire_process_maintenance_admission,
+};
 pub use overrides::{AppRootGuard, ConfigBaseGuard};
 pub use paths::{
     handoff_staging_dir, logs_dir, operation_journal_dir, rebuildable_cache_root_dir,
@@ -39,7 +43,13 @@ pub use storage_usage::{
 };
 
 /// Name of the application directory that lives under the OS config root.
+#[cfg(not(all(feature = "development-state", target_os = "macos")))]
 pub const APP_DIR_NAME: &str = ".yield";
+/// Fixed application root for test-channel binaries, isolated from production state.
+#[cfg(all(feature = "development-state", target_os = "macos"))]
+pub const APP_DIR_NAME: &str = ".yield-development";
+/// Compatibility version for the pre-admission maintenance lock handoff protocol.
+pub const MAINTENANCE_ADMISSION_PROTOCOL_VERSION: u32 = 1;
 /// Name of the directory that stores explicit non-live persistence profiles.
 pub const PROFILE_DIR_NAME: &str = "profiles";
 /// Canonical non-live profile name used for sandbox/manual QA runs.

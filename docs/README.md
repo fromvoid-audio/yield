@@ -1,7 +1,7 @@
 # Developer Docs
 
 This directory now keeps a deliberately small set of canonical developer
-documents. Planning and backlog state now live in Linear rather than Markdown
+documents. Planning and backlog state now live in Pulse rather than Markdown
 plan files. Anything narrow, historical, or investigatory should live in `tmp/`
 only when a durable canonical doc is not the right fit.
 
@@ -34,7 +34,12 @@ Machine-consumed check allowlists do not live here anymore. They now live under
 ## Live operational files
 
 - Planning and backlog
-  - live in Linear project `Yield` under team `PORTALSURFER`
+  - live in the existing Pulse project `Yield` at <http://localhost:7437/>;
+    the active release roadmap starts at `0.1` (macOS browsing and auditioning)
+    and separates later capabilities into `0.2` through `0.7`
+  - imported Linear issue identifiers, descriptions, acceptance criteria and
+    source links remain traceable; Linear and the old version labels are retained
+    as source history
 - Public docs build
   - build locally with `mdbook build` or `bash scripts/check.sh mdbook`
   - preview locally with `mdbook serve --hostname 127.0.0.1 --port 3011`
@@ -63,6 +68,6 @@ Machine-consumed check allowlists do not live here anymore. They now live under
 
 - Prefer a few strong documents over many narrow notes.
 - Prefer current contracts over historical execution diaries.
-- Keep active planning and task hierarchy in Linear, not Markdown plan files.
+- Keep active planning and task hierarchy in Pulse, not Markdown plan files.
 - Use `tmp/` only for narrow investigations or temporary implementation notes.
 - Delete stale docs instead of keeping them as archaeological layers.

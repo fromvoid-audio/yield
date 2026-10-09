@@ -24,7 +24,11 @@ mod overrides;
 pub use overrides::ConfigBaseGuard;
 
 /// Name of the application directory that lives under the OS config root.
+#[cfg(not(all(feature = "development-state", target_os = "macos")))]
 pub const APP_DIR_NAME: &str = ".yield";
+/// Fixed development database namespace, separated from production on macOS.
+#[cfg(all(feature = "development-state", target_os = "macos"))]
+pub const APP_DIR_NAME: &str = ".yield-development";
 /// Name of the directory that stores explicit non-live persistence profiles.
 pub const PROFILE_DIR_NAME: &str = "profiles";
 /// Canonical non-live profile name used for sandbox/manual QA runs.

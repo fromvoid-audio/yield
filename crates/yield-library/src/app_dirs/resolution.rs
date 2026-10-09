@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_os = "macos"))]
 use directories::BaseDirs;
 
 use super::profile::{ProfileSelection, ResolvedPersistence, persistence_mode_from_selection};
@@ -40,6 +41,8 @@ pub fn app_root_dir() -> Result<PathBuf, AppDirError> {
 
 /// Resolve the current config base, app root, and high-level persistence mode.
 pub fn resolve_persistence() -> Result<ResolvedPersistence, AppDirError> {
+    super::acquire_process_maintenance_admission()
+        .map_err(|error| AppDirError::MaintenanceAdmission(error.to_string()))?;
     if should_auto_isolate_test_config_base() {
         ensure_test_config_base();
     }
@@ -69,6 +72,8 @@ pub fn persistence_mode() -> super::PersistenceMode {
 
 /// Override the resolved application root directory (the `.yield` folder).
 pub fn set_app_root_override(path: PathBuf) -> Result<(), AppDirError> {
+    super::acquire_process_maintenance_admission()
+        .map_err(|error| AppDirError::MaintenanceAdmission(error.to_string()))?;
     create_dir(&path)?;
     if TEST_CONFIG_OVERRIDE.with(|override_path| override_path.borrow().is_some())
         || SCOPED_PROFILE_OVERRIDE.with(|override_profile| override_profile.borrow().is_some())
@@ -104,7 +109,21 @@ pub(super) fn config_base_dir() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("YIELD_CONFIG_HOME") {
         return Some(PathBuf::from(path));
     }
-    BaseDirs::new().map(|dirs| dirs.config_dir().to_path_buf())
+    #[cfg(target_os = "macos")]
+    {
+        super::profile_ownership::canonical_application_support_dir().ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        BaseDirs::new().map(|dirs| dirs.config_dir().to_path_buf())
+    }
+}
+
+/// Stable macOS per-user base for maintenance locks, independent of profile overrides.
+#[cfg(target_os = "macos")]
+pub(super) fn maintenance_namespace_base() -> Result<PathBuf, AppDirError> {
+    super::profile_ownership::canonical_application_support_dir()
+        .map_err(|error| AppDirError::MaintenanceAdmission(error.to_string()))
 }
 
 fn scoped_or_global_app_root_override() -> Result<Option<PathBuf>, AppDirError> {

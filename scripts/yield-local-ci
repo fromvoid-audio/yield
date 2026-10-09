@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""Reproducible local macOS build, validation and reversible state entrypoint."""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import contextlib
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+import pathlib
+import platform
+import plistlib
+import signal
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Iterator, Optional
+
+if sys.version_info < (3, 11):
+    for candidate in ("python3.13", "python3.12", "python3.11"):
+        interpreter = shutil.which(candidate)
+        if interpreter:
+            probe = subprocess.run(
+                [interpreter, "-c", "import sys; raise SystemExit(sys.version_info < (3, 11))"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if probe.returncode == 0:
+                os.environ["YIELD_CI_PYTHON"] = interpreter
+                os.execv(interpreter, [interpreter, str(pathlib.Path(__file__).resolve()), *sys.argv[1:]])
+    raise SystemExit(
+        "Yield local CI requires Python 3.11 or newer; install python3.11+ and ensure it is on PATH"
+    )
+
+os.environ.setdefault("YIELD_CI_PYTHON", sys.executable)
+_python_alias_dir = pathlib.Path(tempfile.mkdtemp(prefix="yield-python-"))
+os.chmod(_python_alias_dir, 0o700)
+(_python_alias_dir / "python3").symlink_to(pathlib.Path(sys.executable).resolve())
+os.environ["PATH"] = str(_python_alias_dir) + os.pathsep + os.environ.get("PATH", "")
+if subprocess.run(["python3", "-c", "import tomllib"], check=False).returncode != 0:
+    raise SystemExit("selected Python runtime cannot import tomllib in a python3 child process")
+atexit.register(shutil.rmtree, _python_alias_dir)
+
+SCRIPT = pathlib.Path(__file__).resolve()
+ROOT = SCRIPT.parent.parent
+_packager_spec = importlib.util.spec_from_file_location(
+    "yield_bundle_packager", ROOT / "scripts/package-gpui-macos.py"
+)
+if _packager_spec is None or _packager_spec.loader is None:
+    raise SystemExit("cannot load the shared macOS bundle packager")
+_packager = importlib.util.module_from_spec(_packager_spec)
+_packager_spec.loader.exec_module(_packager)
+sys.path.insert(0, str(ROOT / "scripts" / "internal" / "ci"))
+import local_state  # noqa: E402
+from process_tree import (  # noqa: E402
+    Cancelled,
+    catch_cancellation_signals,
+    ignore_cancellation_signals,
+    terminate_owned_group,
+)
+
+COORDINATOR_FD: Optional[int] = None
+ADMISSION_MARKER = b"YIELD_ADMISSION_PROTOCOL_V1"
+
+
+class CiError(RuntimeError):
+    pass
+
+
+def command_output(*args: str, cwd: pathlib.Path = ROOT, required: bool = True) -> str:
+    try:
+        return subprocess.check_output(args, cwd=str(cwd), text=True, stderr=subprocess.STDOUT).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        if required:
+            raise CiError(f"command failed: {' '.join(args)}: {exc}") from exc
+        return "unavailable"
+
+
+def run_managed(
+    command: list[str],
+    *,
+    cwd: pathlib.Path,
+    env: dict[str, str],
+    pass_fds: tuple[int, ...] = (),
+    stdout: object = None,
+    timeout_seconds: int = 6 * 60 * 60,
+) -> int:
+    with catch_cancellation_signals():
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdout=stdout,
+            stderr=subprocess.STDOUT if stdout is not None else None,
+            pass_fds=pass_fds,
+            start_new_session=True,
+        )
+        try:
+            return process.wait(timeout=timeout_seconds)
+        except Cancelled as cancelled:
+            ignore_cancellation_signals()
+            terminate_owned_group(process.pid, process)
+            if cancelled.signum == signal.SIGINT:
+                raise KeyboardInterrupt
+            raise CiError(f"command cancelled by signal {cancelled.signum}: {' '.join(command)}")
+        except subprocess.TimeoutExpired as exc:
+            ignore_cancellation_signals()
+            terminate_owned_group(process.pid, process)
+            raise CiError(f"command exceeded the six-hour watchdog: {' '.join(command)}") from exc
+
+
+def source_sha(value: str) -> str:
+    if len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+        raise CiError("--sha must be a full lowercase 40-character commit")
+    return value
+
+
+def require_maintenance_protocol(checkout: pathlib.Path, *, full_lane: bool = False) -> None:
+    main_source = (checkout / "crates/yield/src/main.rs").read_text(encoding="utf-8")
+    app_dirs_source = (checkout / "crates/yield-library/src/app_dirs.rs").read_text(encoding="utf-8")
+    if (
+        "--build-info" not in main_source
+        or "YIELD_ADMISSION_PROTOCOL_V1" not in main_source
+        or "MAINTENANCE_ADMISSION_PROTOCOL_VERSION" not in app_dirs_source
+    ):
+        raise CiError("refusing a historical source SHA without pre-admission build-info and the maintenance protocol")
+    if full_lane:
+        full_script = checkout / "scripts/gpui-local-ci.sh"
+        native_runner = checkout / "scripts/internal/ci/run_native_production_case.py"
+        full_runner = checkout / "scripts/internal/ci/run_full_ci.py"
+        runtime_helper = checkout / "scripts/internal/ci/python_runtime.sh"
+        if not all(path.is_file() for path in (full_script, native_runner, full_runner, runtime_helper)):
+            raise CiError("frozen source lacks the reversible full-CI or native production-case runner")
+
+
+def binary_contains_marker(binary: pathlib.Path) -> bool:
+    overlap = b""
+    try:
+        with binary.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                data = overlap + chunk
+                if ADMISSION_MARKER in data:
+                    return True
+                overlap = data[-(len(ADMISSION_MARKER) - 1) :]
+    except OSError:
+        return False
+    return False
+
+
+def compiled_build_info(binary: pathlib.Path) -> dict[str, object]:
+    """Check for the inert v1 marker before executing any possible old binary."""
+    if not binary_contains_marker(binary):
+        raise CiError("refusing to execute a binary without the maintenance admission v1 marker")
+    try:
+        result = subprocess.run(
+            [str(binary), "--build-info"], check=False, capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CiError("compiled binary did not answer its bounded pre-admission build-info probe") from exc
+    if result.returncode != 0:
+        raise CiError("compiled binary rejected its pre-admission build-info probe")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise CiError("compiled binary returned malformed pre-admission build-info") from exc
+    if not isinstance(value, dict) or value.get("admission_marker") != ADMISSION_MARKER.decode("ascii"):
+        raise CiError("compiled binary build-info does not confirm the maintenance admission marker")
+    return value
+
+
+@contextlib.contextmanager
+def common_coordinator() -> Iterator[pathlib.Path]:
+    global COORDINATOR_FD
+    git_common = pathlib.Path(command_output("git", "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    state_dir = git_common / "local-ci"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "active.lock"
+    fd = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        metadata = os.fstat(fd)
+        entry = lock_path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(entry.st_mode)
+            or not stat.S_ISREG(entry.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or (metadata.st_dev, metadata.st_ino) != (entry.st_dev, entry.st_ino)
+        ):
+            raise CiError("shared CI coordinator lock is not a regular current-user-owned file")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        COORDINATOR_FD = fd
+        yield state_dir
+    finally:
+        COORDINATOR_FD = None
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def exact_worktree(sha: str) -> Iterator[pathlib.Path]:
+    sha = source_sha(sha)
+    if command_output("git", "cat-file", "-t", sha) != "commit":
+        raise CiError("requested SHA is not an available commit")
+    with tempfile.TemporaryDirectory(prefix="yield-local-ci-") as temporary:
+        checkout = pathlib.Path(temporary) / "checkout"
+        subprocess.run(["git", "worktree", "add", "--detach", str(checkout), sha], cwd=str(ROOT), check=True)
+        try:
+            dirty = command_output("git", "status", "--porcelain", "--untracked-files=normal", cwd=checkout)
+            if dirty:
+                raise CiError("detached source worktree is unexpectedly dirty")
+            yield checkout
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(checkout)], cwd=str(ROOT), check=False)
+
+
+def cargo_env(state_dir: pathlib.Path, channel: str, checkout: pathlib.Path) -> dict[str, str]:
+    env = os.environ.copy()
+    if env.get("RUSTFLAGS") or env.get("CARGO_ENCODED_RUSTFLAGS"):
+        raise CiError("clear RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS so the pinned channel feature set is reproducible")
+    cache_lane = (
+        "validation"
+        if channel in {"check", "preflight", "full", "native"}
+        else "release-local"
+        if channel in {"beta", "release"}
+        else channel
+    )
+    repository_root = state_dir.parent.parent
+    shared_root = repository_root.parent / "yield-native-target" / cache_lane
+    rust = command_output("rustc", "-vV", cwd=checkout).splitlines()
+    identity = "-".join(line.split(": ", 1)[1] for line in rust if line.startswith(("release: ", "host: ")))
+    lock_hash = hashlib.sha256((checkout / "Cargo.lock").read_bytes()).hexdigest()[:12]
+    target = shared_root / f"{identity}-{lock_hash}"
+    target.mkdir(parents=True, exist_ok=True)
+    env["CARGO_TARGET_DIR"] = str(target)
+    env["YIELD_VALIDATION_TARGET_ROOT"] = str(shared_root)
+    env["CARGO_BUILD_JOBS"] = "2"
+    env["CARGO_INCREMENTAL"] = "0"
+    env["YIELD_GPUI_CI_CHECKOUT"] = str(checkout)
+    return env
+
+
+def doctor(lane: str) -> dict[str, str]:
+    if platform.system() != "Darwin":
+        raise CiError("local GPUI CI and native state operations are macOS-only")
+    rust = command_output("rustc", "--version")
+    if "1.93.0" not in rust:
+        raise CiError(f"pinned Rust 1.93.0 required, found: {rust}")
+    sdk = command_output("xcrun", "--show-sdk-version")
+    sdk_path = pathlib.Path(command_output("xcrun", "--show-sdk-path"))
+    if not sdk_path.is_dir():
+        raise CiError(f"configured macOS SDK path is not a directory: {sdk_path}")
+    clt = command_output("xcode-select", "-p")
+    fs = filesystem_probe(pathlib.Path.home())
+    if lane == "native" and (fs.get("filesystem", "").lower() != "apfs" or not fs.get("writable", False)):
+        raise CiError("native lane requires a writable APFS home volume")
+    return {
+        "host": platform.platform(),
+        "architecture": platform.machine(),
+        "rust": rust,
+        "cargo": command_output("cargo", "--version"),
+        "sdk": sdk,
+        "sdk_path": str(sdk_path),
+        "command_line_tools": clt,
+        "python": sys.version.split()[0],
+        "filesystem_probe": json.dumps(fs, sort_keys=True),
+        "disk_free_bytes": str(shutil.disk_usage(pathlib.Path.home()).free),
+    }
+
+
+def filesystem_probe(path: pathlib.Path) -> dict[str, object]:
+    try:
+        output = subprocess.check_output(["df", "-P", str(path)], text=True, stderr=subprocess.STDOUT)
+        fields = output.splitlines()[-1].split()
+        if len(fields) < 6:
+            raise CiError("df returned an incomplete filesystem record")
+        device = fields[0]
+        plist = subprocess.check_output(["diskutil", "info", "-plist", device], stderr=subprocess.STDOUT)
+        info = plistlib.loads(plist)
+    except (OSError, subprocess.CalledProcessError, plistlib.InvalidFileException) as exc:
+        raise CiError(f"cannot qualify the home filesystem with df and diskutil: {exc}") from exc
+    filesystem = str(info.get("FilesystemType", info.get("FilesystemName", "unknown")))
+    writable = info.get("WritableVolume")
+    if not isinstance(writable, bool):
+        writable = info.get("ReadOnlyVolume") is False
+    return {"device": device, "mount": fields[-1], "filesystem": filesystem, "writable": bool(writable)}
+
+
+def check(args: argparse.Namespace) -> None:
+    sha = source_sha(args.sha)
+    if args.lane == "native" and not args.case:
+        raise CiError("native lane requires one exact allowlisted --case")
+    with common_coordinator() as state_dir, exact_worktree(sha) as checkout:
+        if args.lane in {"full", "native"}:
+            require_maintenance_protocol(checkout, full_lane=args.lane == "full")
+        env = cargo_env(state_dir, "check", checkout)
+        if COORDINATOR_FD is not None:
+            env["YIELD_LOCAL_CI_COORDINATOR_FD"] = str(COORDINATOR_FD)
+        env["YIELD_LOCAL_CI_SOURCE_SHA"] = sha
+        facts = doctor(args.lane)
+        run_id = f"{time.time_ns()}-{os.getpid()}"
+        out_dir = state_dir / "runs" / sha / args.lane / run_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        log_path = out_dir / (args.case.replace("::", "_") if args.case else "run")
+        commands: list[list[str]] = []
+        if args.lane == "preflight":
+            commands = [["bash", "scripts/agent.sh", "preflight"]]
+        elif args.lane == "full":
+            commands = [["bash", "scripts/agent.sh", "preflight"], ["bash", "scripts/gpui-local-ci.sh", "full"]]
+        else:
+            recording_cases = {
+                "operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain",
+                "operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit",
+                "operation_journal::owner::recording_binding::tests::chunk_issuance_native_production_original_claim_transition_and_retained_backing",
+            }
+            prerequisite_cases = {
+                "profile-generations",
+                "source-release-policy",
+                "startup-production",
+                "startup-control-failure",
+                "startup-namespace-failure",
+                "sdk-and-startup-components",
+            }
+            if args.case not in recording_cases and args.case != "catalog-replay":
+                prefix, separator, name = args.case.partition(":")
+                if prefix != "prerequisite" or not separator or name not in prerequisite_cases:
+                    raise CiError("native case is not in an existing exact-selector or named-runner allowlist")
+            if os.environ.get("YIELD_CONFIG_HOME") or os.environ.get("YIELD_CONFIG_PROFILE"):
+                raise CiError("clear YIELD_CONFIG_HOME and YIELD_CONFIG_PROFILE; native production acceptance requires the canonical namespace")
+            if args.case in recording_cases:
+                runner = checkout / "scripts/internal/validation/verify_recording_native_custody.sh"
+                env["YIELD_NATIVE_CUSTODY_CASE"] = args.case
+                env["YIELD_NATIVE_VERIFICATION_OUTPUT"] = str(log_path.parent / (log_path.name + "-evidence"))
+            elif args.case == "catalog-replay":
+                runner = checkout / "scripts/internal/validation/verify_macos_catalog_native_replay.sh"
+            else:
+                _, _, prerequisite = args.case.partition(":")
+                runner = checkout / "scripts/internal/validation/verify_native_prerequisites.sh"
+                env["YIELD_NATIVE_PREREQUISITE_CASE"] = prerequisite
+            if not runner.is_file():
+                raise CiError(f"frozen source lacks the allowlisted native validation runner: {runner.relative_to(checkout)}")
+            commands = [["bash", str(runner)]]
+        details = {"schema": 1, "run_id": run_id, "sha": sha, "lane": args.lane, "case": args.case, "platform": facts, "commands": commands, "results": []}
+        with log_path.with_suffix(".log").open("w", encoding="utf-8") as log:
+            native_state = None
+            namespace_fd = transition_fd = None
+            validator_lease_fd = None
+            failure = None
+            try:
+                if args.lane == "native":
+                    native_state, namespace_fd, transition_fd = local_state.prepare_clean_launch(
+                        "production", artifact=f"native:{sha}:{args.case}"
+                    )
+                    details["production_state_transaction"] = native_state
+                    env.pop("YIELD_MAINTENANCE_ADMISSION_FD", None)
+                    env.pop("YIELD_MAINTENANCE_TRANSITION_FD", None)
+                    validator_lease_fd = local_state.convert_clean_handoff_to_validator_lease(
+                        "production", namespace_fd, transition_fd
+                    )
+                    os.close(transition_fd)
+                    transition_fd = None
+                    log.write("$ exclusive clean/production handoff\n")
+                    log.write(json.dumps(native_state, sort_keys=True) + "\n")
+                for cmd in commands:
+                    log.write("$ " + " ".join(cmd) + "\n")
+                    log.flush()
+                    inherited_fds = [COORDINATOR_FD] if COORDINATOR_FD is not None else []
+                    if validator_lease_fd is not None:
+                        inherited_fds.append(validator_lease_fd)
+                    pass_fds = tuple(inherited_fds)
+                    exit_code = run_managed(
+                        cmd,
+                        cwd=checkout,
+                        env=env,
+                        stdout=log,
+                        pass_fds=pass_fds,
+                    )
+                    details["results"].append({"command": cmd, "exit_code": exit_code})
+                    if exit_code:
+                        details["status"] = "failed"
+                        break
+                else:
+                    details["status"] = "passed"
+                if args.lane == "native" and details.get("status") == "passed":
+                    evidence_source = None
+                    if args.case == "catalog-replay":
+                        evidence_source = checkout / "artifacts/macos-catalog-native-replay"
+                    elif args.case.startswith("prerequisite:"):
+                        prerequisite = args.case.partition(":")[2]
+                        evidence_source = checkout / "artifacts/native-prerequisites" / f"macos-{prerequisite}"
+                    if evidence_source is not None:
+                        if not evidence_source.is_dir() or evidence_source.is_symlink():
+                            raise CiError("native runner passed without retaining its expected evidence directory")
+                        retained = out_dir / "evidence"
+                        shutil.copytree(evidence_source, retained)
+                        details["evidence_directory"] = str(retained)
+            except BaseException as error:
+                failure = error
+                details["status"] = "failed"
+                details["error"] = str(error)
+                log.write(f"local CI runner error: {error}\n")
+            finally:
+                if validator_lease_fd is not None:
+                    os.close(validator_lease_fd)
+                if namespace_fd is not None:
+                    os.close(namespace_fd)
+                if transition_fd is not None:
+                    os.close(transition_fd)
+                if native_state and native_state.get("transaction"):
+                    try:
+                        restored = local_state.restore(str(native_state["transaction"]))
+                        details["production_state_restore"] = restored
+                    except BaseException as error:
+                        details["status"] = "restore_failed"
+                        details["restore_error"] = str(error)
+                        if failure is None:
+                            failure = error
+                        log.write(f"state restore error: {error}\n")
+                        log.flush()
+        details["completed_unix_ns"] = time.time_ns()
+        log_path.with_suffix(".json").write_text(json.dumps(details, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(details, indent=2))
+        if isinstance(failure, KeyboardInterrupt):
+            raise failure
+        if failure is not None:
+            raise CiError(f"validation operation failed: {failure}") from failure
+        if details["status"] != "passed":
+            raise CiError(f"{args.lane} lane failed; complete log retained at {log_path.with_suffix('.log')}")
+
+
+def build(args: argparse.Namespace) -> None:
+    sha = source_sha(args.sha)
+    with common_coordinator() as state_dir, exact_worktree(sha) as checkout:
+        require_maintenance_protocol(checkout)
+        facts = doctor("build")
+        env = cargo_env(state_dir, args.channel, checkout)
+        if COORDINATOR_FD is not None:
+            env["YIELD_LOCAL_CI_COORDINATOR_FD"] = str(COORDINATOR_FD)
+        if args.channel == "test":
+            command = ["cargo", "build", "--locked", "-p", "yield", "--features", "development-state"]
+            binary = pathlib.Path(env["CARGO_TARGET_DIR"]) / "debug" / "yield"
+            namespace = ".yield-development"
+        else:
+            command = ["cargo", "build", "--locked", "--profile", "release-local", "-p", "yield"]
+            binary = pathlib.Path(env["CARGO_TARGET_DIR"]) / "release-local" / "yield"
+            namespace = ".yield"
+        pass_fds = (COORDINATOR_FD,) if COORDINATOR_FD is not None else ()
+        exit_code = run_managed(command, cwd=checkout, env=env, pass_fds=pass_fds)
+        if exit_code:
+            raise CiError(f"build failed with exit {exit_code}")
+        if not binary.is_file():
+            raise CiError(f"build did not produce expected executable: {binary}")
+        try:
+            build_info = compiled_build_info(binary)
+        except CiError as exc:
+            raise CiError("built executable did not return valid pre-admission build-info") from exc
+        expected_namespace = ".yield-development" if args.channel == "test" else ".yield"
+        if (
+            build_info.get("protocol") != 1
+            or build_info.get("namespace") != expected_namespace
+            or not isinstance(build_info.get("package_version"), str)
+            or build_info.get("admission_marker") != ADMISSION_MARKER.decode("ascii")
+        ):
+            raise CiError("compiled build-info does not match the pinned channel/admission protocol")
+        run_id = f"{time.time_ns()}-{os.getpid()}"
+        artifact_dir = ROOT / "artifacts" / "local-ci" / sha / args.channel / run_id
+        artifact_dir.parent.mkdir(parents=True, exist_ok=True)
+        icon = checkout / "assets/logo3.icns"
+        font_license = checkout / "assets/fonts/IoskeleyMono-LICENSE.txt"
+        for required in (icon, font_license):
+            if not required.is_file():
+                raise CiError(f"missing macOS bundle asset: {required}")
+        metadata = json.loads(command_output("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1", cwd=checkout))
+        package_version = next(p["version"] for p in metadata["packages"] if p["name"] == "yield")
+        bundle_version = command_output("git", "rev-list", "--count", sha, cwd=checkout)
+        binary_relative = "Yield.app/Contents/MacOS/yield"
+        with tempfile.TemporaryDirectory(prefix=".yield-local-ci-package-", dir=artifact_dir.parent) as temporary:
+            staged = pathlib.Path(temporary) / "artifact"
+            app_bundle = staged / "Yield.app"
+            staged_binary = app_bundle / "Contents/MacOS/yield"
+            info = {
+                "CFBundleExecutable": "yield",
+                "CFBundleIdentifier": {
+                    "test": "org.portalsurfer.yield.test",
+                    "beta": "org.portalsurfer.yield.beta",
+                    "release": "org.portalsurfer.yield",
+                }[args.channel],
+                "CFBundleName": "Yield",
+                "CFBundleDisplayName": "Yield",
+                "CFBundleIconFile": "Yield.icns",
+                "CFBundlePackageType": "APPL",
+                "CFBundleShortVersionString": package_version,
+                "CFBundleVersion": bundle_version,
+                "NSHighResolutionCapable": True,
+                "YieldSourceCommit": sha,
+                "YieldMaintenanceNamespace": namespace,
+                "YieldMaintenanceProtocol": 1,
+                "YieldChannel": args.channel,
+            }
+            signature_details = _packager.create_signed_bundle(
+                binary,
+                app_bundle,
+                icon,
+                font_license,
+                info,
+                cwd=checkout,
+            )
+            files = sorted(path for path in (staged / "Yield.app").rglob("*") if path.is_file())
+            file_records = [
+                {
+                    "path": str(path.relative_to(staged)),
+                    "size": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                }
+                for path in files
+            ]
+            manifest = {
+                "schema": 1,
+                "source_sha": sha,
+                "run_id": run_id,
+                "dirty": False,
+                "channel": args.channel,
+                "compiled_namespace": namespace,
+                "build_info": build_info,
+                "package_version": package_version,
+                "bundle_version": bundle_version,
+                "bundle_identifier": info["CFBundleIdentifier"],
+                "signature_mode": "adhoc",
+                "host": facts,
+                "toolchain": command_output("rustc", "-Vv", cwd=checkout),
+                "command": command,
+                "exit_code": 0,
+                "binary": binary_relative,
+                "binary_sha256": sha256_file(staged_binary),
+                "artifact_identity": {"device": staged_binary.stat().st_dev, "inode": staged_binary.stat().st_ino},
+                "files": file_records,
+                "created_unix_ns": time.time_ns(),
+            }
+            (staged / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            os.rename(staged, artifact_dir)
+        manifest_path = artifact_dir / "manifest.json"
+        print(manifest_path)
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_artifact(args: argparse.Namespace) -> None:
+    inherited = os.environ.copy()
+    if inherited.get("YIELD_CONFIG_HOME") or inherited.get("YIELD_CONFIG_PROFILE"):
+        raise CiError("remove YIELD_CONFIG_HOME and YIELD_CONFIG_PROFILE; managed launch uses the canonical channel namespace")
+    manifest_path = pathlib.Path(args.artifact).expanduser().resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema") != 1 or not isinstance(manifest.get("binary"), str):
+        raise CiError("artifact manifest has an unsupported shape")
+    expected_bundle_id = {
+        "test": "org.portalsurfer.yield.test",
+        "beta": "org.portalsurfer.yield.beta",
+        "release": "org.portalsurfer.yield",
+    }.get(manifest.get("channel"))
+    if manifest.get("bundle_identifier") != expected_bundle_id:
+        raise CiError("artifact channel and bundle identifier disagree")
+    if manifest.get("signature_mode") != "adhoc":
+        raise CiError("artifact manifest does not identify a local ad-hoc signature")
+    binary_relative = pathlib.PurePosixPath(manifest["binary"])
+    if binary_relative.is_absolute() or ".." in binary_relative.parts:
+        raise CiError("artifact executable path escapes its bundle")
+    binary_entry = manifest_path.parent.joinpath(*binary_relative.parts)
+    cursor = manifest_path.parent
+    for component in binary_relative.parts:
+        cursor = cursor / component
+        if cursor.is_symlink():
+            raise CiError("artifact bundle contains a linked executable path")
+    if not binary_entry.is_file() or binary_entry.stat().st_uid != os.geteuid():
+        raise CiError("artifact executable must be a regular current-user-owned file")
+    binary = binary_entry.resolve()
+    if sha256_file(binary) != manifest.get("binary_sha256"):
+        raise CiError("artifact manifest or executable checksum is invalid")
+    identity = manifest.get("artifact_identity")
+    binary_metadata = binary.stat()
+    if not isinstance(identity, dict) or identity.get("device") != binary_metadata.st_dev or identity.get("inode") != binary_metadata.st_ino:
+        raise CiError("artifact executable identity differs from its build manifest")
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise CiError("artifact manifest does not inventory bundle files")
+    for item in files:
+        if not isinstance(item, dict):
+            raise CiError("artifact file inventory is malformed")
+        relative = pathlib.PurePosixPath(item.get("path", ""))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise CiError("artifact manifest contains a path outside the bundle")
+        entry = manifest_path.parent.joinpath(*relative.parts)
+        cursor = manifest_path.parent
+        for component in relative.parts:
+            cursor = cursor / component
+            if cursor.is_symlink():
+                raise CiError("artifact bundle contains a linked file path")
+        if not entry.is_file() or entry.stat().st_size != item.get("size") or sha256_file(entry) != item.get("sha256"):
+            raise CiError(f"artifact file does not match its manifest: {relative}")
+    app_bundle = manifest_path.parent / "Yield.app"
+    try:
+        command_output("codesign", "--verify", "--strict", "--deep", str(app_bundle))
+        signature_details = command_output("codesign", "--display", "--verbose=4", str(app_bundle))
+        info = plistlib.loads((app_bundle / "Contents/Info.plist").read_bytes())
+    except (CiError, OSError, plistlib.InvalidFileException) as exc:
+        raise CiError("artifact bundle signature or Info.plist is invalid") from exc
+    if (
+        "Signature=adhoc" not in signature_details
+        or info.get("CFBundleIdentifier") != expected_bundle_id
+        or info.get("YieldChannel") != manifest.get("channel")
+        or info.get("YieldSourceCommit") != manifest.get("source_sha")
+        or info.get("YieldMaintenanceNamespace") != manifest.get("compiled_namespace")
+        or info.get("YieldMaintenanceProtocol") != 1
+    ):
+        raise CiError("signed bundle metadata does not match its channel manifest")
+    if not re_full_sha(manifest.get("source_sha")) or manifest.get("dirty") is not False:
+        raise CiError("artifact lacks exact clean-source provenance")
+    if manifest.get("compiled_namespace") != (".yield-development" if manifest.get("channel") == "test" else ".yield"):
+        raise CiError("artifact channel and compiled namespace disagree")
+    build_info = manifest.get("build_info")
+    if (
+        not isinstance(build_info, dict)
+        or build_info.get("protocol") != 1
+        or build_info.get("namespace") != manifest.get("compiled_namespace")
+        or build_info.get("package_version") != manifest.get("package_version")
+        or build_info.get("admission_marker") != ADMISSION_MARKER.decode("ascii")
+    ):
+        raise CiError("artifact lacks verified compiled maintenance-protocol provenance")
+    try:
+        actual_build_info = compiled_build_info(binary)
+    except CiError as exc:
+        raise CiError("artifact executable does not report valid pre-admission build-info") from exc
+    if (
+        actual_build_info.get("protocol") != build_info.get("protocol")
+        or actual_build_info.get("namespace") != build_info.get("namespace")
+        or actual_build_info.get("package_version") != build_info.get("package_version")
+        or actual_build_info.get("admission_marker") != build_info.get("admission_marker")
+    ):
+        raise CiError("artifact's compiled build-info differs from its manifest")
+    namespace = "development" if manifest["compiled_namespace"] == ".yield-development" else "production"
+    if args.state == "clean":
+        result, namespace_fd, transition_fd = local_state.prepare_clean_launch(namespace, artifact=str(manifest_path))
+        print(json.dumps(result, indent=2), flush=True)
+        env = inherited
+        env.pop("YIELD_MAINTENANCE_ADMISSION_FD", None)
+        env.pop("YIELD_MAINTENANCE_TRANSITION_FD", None)
+        env["YIELD_MAINTENANCE_ADMISSION_FD"] = str(namespace_fd)
+        env["YIELD_MAINTENANCE_TRANSITION_FD"] = str(transition_fd)
+        try:
+            exit_code = run_managed(
+                [str(binary)], cwd=ROOT, env=env, pass_fds=(namespace_fd, transition_fd)
+            )
+        finally:
+            os.close(namespace_fd)
+            os.close(transition_fd)
+        if exit_code:
+            raise CiError(f"Yield exited with status {exit_code}")
+    else:
+        _, control = local_state.namespace_paths(namespace)
+        with local_state.maintenance_locks(control, namespace, exclusive=False):
+            env = inherited
+            env.pop("YIELD_MAINTENANCE_ADMISSION_FD", None)
+            env.pop("YIELD_MAINTENANCE_TRANSITION_FD", None)
+            exit_code = run_managed([str(binary)], cwd=ROOT, env=env)
+        if exit_code:
+            raise CiError(f"Yield exited with status {exit_code}")
+
+
+def re_full_sha(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 40 and all(character in "0123456789abcdef" for character in value)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="operation", required=True)
+    sub.add_parser("doctor").add_argument("--lane", choices=("preflight", "full", "native", "build"), default="preflight")
+    check_cmd = sub.add_parser("check")
+    check_cmd.add_argument("--sha", required=True)
+    check_cmd.add_argument("--lane", choices=("preflight", "full", "native"), required=True)
+    check_cmd.add_argument("--case")
+    build_cmd = sub.add_parser("build")
+    build_cmd.add_argument("--sha", required=True)
+    build_cmd.add_argument("--channel", choices=("test", "beta", "release"), required=True)
+    run_cmd = sub.add_parser("run")
+    run_cmd.add_argument("--artifact", required=True)
+    run_cmd.add_argument("--state", choices=("normal", "clean"), required=True)
+    state = sub.add_parser("state")
+    state_sub = state.add_subparsers(dest="state_action", required=True)
+    status_cmd = state_sub.add_parser("status")
+    status_cmd.add_argument("--namespace", choices=("development", "production"), required=True)
+    clean_cmd = state_sub.add_parser("clean")
+    clean_cmd.add_argument("--namespace", choices=("development", "production"), required=True)
+    restore_cmd = state_sub.add_parser("restore")
+    restore_cmd.add_argument("--backup", required=True)
+    recover_cmd = state_sub.add_parser("recover")
+    recover_cmd.add_argument("--transaction", required=True)
+    args = parser.parse_args()
+    try:
+        if args.operation == "doctor":
+            print(json.dumps(doctor(args.lane), indent=2))
+        elif args.operation == "check":
+            check(args)
+        elif args.operation == "build":
+            build(args)
+        elif args.operation == "run":
+            run_artifact(args)
+        elif args.operation == "state":
+            action = args.state_action
+            if action == "status":
+                result = local_state.status(args.namespace)
+            elif action == "clean":
+                result = local_state.clean(args.namespace)
+            elif action == "restore":
+                result = local_state.restore(args.backup)
+            else:
+                result = local_state.recover(args.transaction)
+            print(json.dumps(result, indent=2))
+        return 0
+    except (CiError, local_state.StateError, OSError, subprocess.SubprocessError) as exc:
+        print(f"yield-local-ci: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

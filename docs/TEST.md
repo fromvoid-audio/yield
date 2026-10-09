@@ -115,11 +115,189 @@ enclosing watchdog's live PID/start identity, lease record, command, and process
 ancestry. An inherited recursion marker without that proof starts a fresh
 watchdog normally.
 
+## Local macOS CI and reversible state: design contract
+
+This is the implementation contract for Pulse Yield v19.1 ticket 79. The new
+commands below are proposed interfaces, not installed commands. Existing
+validation and packaging commands elsewhere in this document remain executable.
+One Mac and one macOS account are sufficient. An OS account is a filesystem and
+ownership boundary here; Yield does not need a product account or login system.
+
+### Build channel and state mode
+
+Build channel and launch state are independent choices:
+
+| Channel | Build | Normal launch state | Local signing |
+| --- | --- | --- | --- |
+| `test` | Debug build with the fixed development-state feature | `.yield-development` | Ad hoc |
+| `beta` | Optimized `release-local`, production persistence behavior | Existing `.yield` | Ad hoc; separately requested Developer ID distribution signing |
+| `release` | Optimized `release-local`, production persistence behavior | Existing `.yield` | Ad hoc; separately requested Developer ID distribution signing |
+
+The roots are under the effective macOS user's canonical
+`Library/Application Support` directory. Resolve that home through the OS user
+database, as the production registry already does, rather than trusting `HOME`.
+The development feature must select one fixed root throughout profile resolution,
+logs, caches and the canonical per-user volume registry. A profile or
+`YIELD_CONFIG_HOME` override alone does not isolate that registry. There is no
+arbitrary runtime override for a production registry. Beta and release share the
+normal root deliberately: changing the build channel does not discard the user's
+library. Development and production may run alongside each other only when their
+external Source roots and live ownership allow it; separate app roots do not
+permit two writers to the same Source database.
+
+`normal` never resets state. `clean` is an explicit transaction on the selected
+namespace, followed by launch with ordinary persistence and ownership rules.
+Production qualification uses the production namespace; development results
+cannot satisfy a genuine production-registry gate. Build labels do not grant
+release acceptance or publishing permission. Stable publication remains disabled
+under the existing release policy.
+
+### Operator interface
+
+The intended single entrypoint is `scripts/yield-local-ci` with these operations:
+
+```text
+doctor
+check --sha <commit> --lane preflight|full|native --case <native-case>
+build --sha <commit> --channel test|beta|release
+run --artifact <manifest> --state normal|clean
+state status --namespace development|production
+state clean --namespace development|production
+state restore --backup <transaction-id>
+state recover --transaction <transaction-id>
+```
+
+Native `--case` accepts one of the exact recording selectors below,
+`prerequisite:<name>` for the six named cases in the retired native-prerequisite
+runner (`profile-generations`, `source-release-policy`, `startup-production`,
+`startup-control-failure`, `startup-namespace-failure`, or
+`sdk-and-startup-components`), or `catalog-replay` for the existing macOS
+catalog replay runner. These routes are closed allowlists; each required frozen
+runner must exist in the requested source commit. Multi-command validators keep
+a shared read lease for their whole process tree, and their generated evidence
+is copied into that run's retained evidence directory.
+
+`build` does not reset state or launch the application. `run --state clean`
+prints and records its restore transaction ID before launching. Restoration is
+explicit after the app exits; do not silently restore over an active clean
+session. Production reset is always explicitly selected, never inferred from a
+default development command. No recursive-delete, force-unlock or marker-editing
+option belongs in this interface.
+
+### Reversible clean transaction
+
+Put maintenance locks and transaction records outside the managed root. A clean
+operation takes an exclusive namespace maintenance lock before inspecting state.
+Every updated app takes a shared lock before logging or any app-root access and
+retains it until all workers and database owners have stopped. Writable profile
+and canonical registry admission must participate too, including native helpers
+that bypass the launcher. This is a maintenance fence, not a substitute for
+profile, Source or volume authority. It cannot fabricate reserve evidence or
+perform unaccounted filesystem effects inside a prepaid bootstrap path.
+
+Before any rename, verify each path component without following symlinks, current
+user ownership, regular maintenance-lock identity, root identity and same-device
+backup destination. Refuse live app/helper owners, active profile/volume locks,
+foreign or malformed entries and unresolved prior transactions. Older binaries
+do not know the new maintenance protocol: refuse reset while they are running;
+do not promise race-free reset against an unmanaged old binary launched during
+maintenance. Require all running versions to participate before enabling the
+automatic clean-and-launch operation. Keep the lock inode permanently in place.
+
+Under the exclusive lock:
+
+1. Create and flush a versioned transaction record in a same-filesystem,
+   user-owned backup namespace. Record intended paths, prior root identity,
+   selected namespace and source/artifact identity without logging personal DB
+   contents.
+2. Atomically rename the entire selected root into a new backup transaction.
+   Never copy-and-delete it: profile, Source and volume custody can depend on
+   retained filesystem identities. Keep journals, WAL/SHM, dirty markers, logs
+   and generations unchanged. Flush the containing directories and record the
+   completed transition.
+3. Leave the canonical root absent. A normal application startup creates its
+   fresh state through the ordinary production code path. Hand maintenance
+   ownership to the launched app without a reset/admission race.
+4. Restore only while quiescent: first park the clean session as another retained
+   transaction, then rename the exact original root back to its canonical path.
+   Flush and record both transitions. Never overwrite either session.
+
+A crash between transitions must leave both sessions recoverable. `recover`
+uses recorded identities and observed directory entries to resume or roll back;
+ambiguous identities fail closed with the retained transaction ID. No automatic
+backup expiration or garbage collection. Report `already vanilla` without
+manufacturing an original backup when there was no root. Lack of disk space,
+EXDEV, denied access or a live lock leaves the original session intact.
+
+These operations manage app state only. Source databases and sidecar leases can
+live alongside media outside the app root. New-user tests use separately created
+disposable media, including their Source metadata; they must not wipe metadata
+beside the user's real media. A clean app root is not a clean media library.
+The original historical recovery evidence remains in the parked backup and is
+restored as evidence, not rewritten into a clean authority claim.
+
+### CI execution and artifacts
+
+Reuse `scripts/agent.sh request` for canonical preflight,
+`scripts/gpui-local-ci.sh full` for the broad native suite, the existing explicit
+native PR runners for their exact selectors/counts, and
+`scripts/package-gpui-macos.py` for clean-commit bundle construction. Extend those
+entrypoints where needed rather than duplicating their assertions. The existing
+post-commit runner and new entrypoint must share one coordinator across Git
+worktrees. Agree on the same OS lock primitive; `flock` and POSIX record locks are
+not interchangeable. Serialize Cargo targets and default production-registry
+tests. A clean-state test holds the production resource reservation across its
+backup, test and restore sequence. Avoid recursively taking the same lock from
+nested wrappers; ownership handoff must be verified rather than trusting an
+environment flag.
+
+Run builds and acceptance from a detached exact commit. Uncommitted experiments
+may have a separate explicitly marked preview artifact, never release evidence.
+Cache targets by host architecture, Rust version, lockfile, channel/features and
+profile. Do not reuse a test-feature binary for a production artifact. Record
+source SHA, dirty/snapshot status, OS build, SDK/CLT, Rust 1.93.0, architecture,
+native filesystem qualification, every command and exit status, selector counts,
+channel, compiled namespace, package version and binary/bundle checksums in a
+versioned manifest. Retain complete failed logs; a failed or interrupted lane
+must never yield an accepted manifest. Native macOS arm64, macOS x86_64 and
+Windows are distinct evidence. An ExFAT build cache does not qualify APFS tests.
+
+Keep the existing bounded watchdog and process-tree cleanup. Cancel only the
+processes owned by the run. `doctor` checks disk space, pinned toolchain, Python
+support, CLT SDK, required assets and the selected lane's actual requirements;
+it must not require full Xcode when a CLT/runtime-shader lane supports CLT.
+Packaging first produces a local app. Signing/notarization and publication are
+separate explicit stages with separate results. Finalize checksums only after
+all bundle mutation, including signing and stapling. Reuse existing signing
+tools without printing credentials or changing Keychain permissions.
+
+### Required acceptance before enabling resets
+
+- Normal relaunch retains existing state; test builds consistently isolate every
+  app-root and per-user registry path; beta/release retain production paths.
+- Native process tests prove shared app/helper admission versus exclusive reset,
+  clone/worker lifetime, live-owner refusal and admission during maintenance.
+- Clean/restore retains original root and lock identities and bytes, preserves
+  dirty evidence and the displaced clean session, and touches no media.
+- Fault injection at each transaction boundary proves recovery after process
+  death, refusal of symlinks/foreign roots and cross-device destinations, and
+  safe behavior under insufficient space or a missing original root.
+- Frozen-source builds produce the right namespace and manifest for all three
+  channels; concurrent post-commit/manual/native runs serialize; cancellation
+  retains a failed result and recoverable state.
+- Run production startup success/control-failure/namespace-failure gates with
+  the real account and registry, restoring the prior session afterward. Preserve
+  original assertions and required counts. Test-mode success is separate.
+- Manual GPUI/native-host acceptance remains explicit. A successful local build
+  or unit suite is not audible, responsiveness, Windows or release acceptance.
+
 ## Validation and release lane contract
 
-GitHub Actions owns release packaging, upload, and the release workflow
-validation gates. Local wrappers remain the primary validation contract for
-development and release-risk checks:
+Yield uses local CI only. Active GitHub Actions workflows are retired; their
+`.yml.disabled` files are historical documentation and do not execute. Use the
+local commands below for development, native acceptance, and release-risk
+validation. Release scripts and the existing stable-publication fail-closed
+policy remain available; remote workflow dispatch is outside the CI contract.
 
 ### Release lifecycle and promotion policy
 
@@ -135,59 +313,68 @@ branch freeze or an automatic precursor to an immediate stable release.
    release blockers. Feature work waits until stabilization ends unless the
    release scope is explicitly changed.
 4. When fixes have landed after an RC, move the release branch to the current
-   `main` commit with the same target version and publish the next RC:
+   `main` commit with the same target version and validate the next RC locally:
 
    ```bash
    scripts/internal/release/prepare_release_train.py \
      --version X.Y.Z \
      --source-ref main \
      --push
+   scripts/internal/release/run_release_validation.sh
    scripts/release.sh rc \
      --version X.Y.Z \
      --rc-number N \
      --branch release/X.Y \
-     --dispatch
+     --dry-run
    ```
 
-5. Continue publishing RCs while stable publication is temporarily disabled.
-   Ensure every change intended for the train is published as an RC.
-   The preserved stable workflow promotes the exact latest RC commit, but it is
-   stored outside GitHub's active workflow extensions and the local stable
-   command fails closed. Re-enabling stable publication requires a dedicated
-   reviewed change; PR approval, `approved`, sign-off, or RC acceptance does
-   not authorize that change or a stable publication.
+5. Continue RC preparation while stable publication is temporarily disabled.
+   Ensure every change intended for the train is validated from the intended
+   source commit. The nightly, RC, and stable workflow files are preserved with
+   `.disabled` extensions; no hosted build or publication runs. The local stable
+   command still fails closed. Re-enabling stable publication requires a
+   dedicated reviewed change; PR approval, `approved`, sign-off, or RC
+   acceptance does not authorize that change or a stable publication.
 
 Keep the remote `release/X.Y` branch as the release coordination ref. It is not
 a disposable feature branch and must remain available for subsequent RCs and
 the eventual explicit stable promotion.
 
-| Lane | GitHub job | Local command | Policy |
-| --- | --- | --- | --- |
-| Format and guardrails | none | `scripts/ci.* local` includes the required guardrails; use `scripts/check.* <name>` for focused reruns | Run locally before broad/risky changes |
-| Clippy | none | `scripts/ci.* local` | Run locally before broad/risky changes |
-| Docs | none | `scripts/ci.* local` | Run locally before broad/risky changes |
-| Public mdBook docs | none | `scripts/check.* mdbook` | Run when changing `book.toml` or `docs/book/src/` |
-| Tests | none | `scripts/ci.* local` runs `cargo nextest run --workspace --profile ci-required --all-targets --no-fail-fast` on the local platform | Run locally before broad/risky changes |
-| Quarantined/slow tests | none | `cargo nextest run --workspace --profile ci-quarantine --all-targets --no-fail-fast` | Advisory until the tests are hardened |
-| Dead dependency sweep and env-var nudge | none | `scripts/check.* dead-deps --advisory` and `scripts/check.* report-env-vars` | Advisory Linux-only hygiene |
-| GUI semantic contracts | none | `scripts/gui.ps1 contract` or `scripts/gui.ps1 suite` | Local/manual or issue-specific |
-| Perf guard | none | `scripts/perf.* guard` | Local/manual or release-risk validation |
-| Nightly release build/sync | `Yield nightly release` on the evening schedule or manual dispatch | release workflow dispatch | Resolves the exact `main` SHA, runs `scripts/internal/release/run_release_validation.sh` on Ubuntu before package builds or publication, builds Windows/macOS nightly assets from that SHA, embeds `X.Y.Z-nightly.DATE+SHA` metadata, verifies the checksum signing key against the pinned public key before public publication, uploads and verifies the immutable PortalSurfer release plus full changelog first, then refreshes the rolling GitHub `nightly` release assets and promotes the immutable and rolling GitHub tags as the final public identity step |
-| RC release | `Yield RC release` manual dispatch | release workflow dispatch | Builds Windows/macOS RC assets from `release/X.Y`, validates the requested package version and branch, runs `scripts/internal/release/run_release_validation.sh`, verifies the checksum signing key against the pinned public key before public publication, and publishes `vX.Y.Z-rc.N` as a GitHub pre-release |
-| Stable release | Disabled | `scripts/release.sh stable` fails closed | The implementation is preserved in `.github/workflows/release-stable.yml.disabled`; restore it through a dedicated reviewed change only when Yield is ready for stable publication |
+| Lane | Local command | Policy |
+| --- | --- | --- |
+| Format and guardrails | `scripts/ci.* local`; use `scripts/check.* <name>` for focused reruns | Run locally before broad or risky changes |
+| Clippy | `scripts/ci.* local` | Run locally before broad or risky changes |
+| Docs | `scripts/ci.* local` | Run locally before broad or risky changes |
+| Public mdBook docs | `scripts/check.* mdbook` | Run when changing `book.toml` or `docs/book/src/` |
+| Tests | `scripts/ci.* local` runs `cargo nextest run --workspace --profile ci-required --all-targets --no-fail-fast` on the local platform | Run locally before broad or risky changes |
+| Quarantined/slow tests | `cargo nextest run --workspace --profile ci-quarantine --all-targets --no-fail-fast` | Advisory until the tests are hardened |
+| Dead dependency sweep and env-var nudge | `scripts/check.* dead-deps --advisory` and `scripts/check.* report-env-vars` | Advisory Linux-only hygiene |
+| GUI semantic contracts | `scripts/gui.ps1 contract` or `scripts/gui.ps1 suite` | Local/manual or issue-specific |
+| Perf guard | `scripts/perf.* guard` | Local/manual or release-risk validation |
+| Native acceptance | `scripts/yield-local-ci check --sha <commit> --lane native --case <allowlisted-case>` | Run a named production/native validator on native APFS; preserve runner evidence and exact selector counts |
+| Release validation | `scripts/internal/release/run_release_validation.sh` | Run locally against the exact intended source commit before release preparation; no hosted job or publication is triggered |
 
-Use `scripts/release.sh` from a clean repo root for macOS/Linux release
+The retired `.github/workflows/recording-native-custody.yml.disabled` cases
+map to these exact local selectors:
+
+```text
+operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain
+operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit
+operation_journal::owner::recording_binding::tests::chunk_issuance_native_production_original_claim_transition_and_retained_backing
+```
+
+Run each with `scripts/yield-local-ci check --lane native --case
+<selector>` on native APFS. This is the former workflow's local acceptance
+route; it does not dispatch a hosted job.
+
+Use `scripts/release.sh` from a clean repo root for local macOS/Linux release
 orchestration. It derives major, minor, and patch target versions from the
-package version at the resolved source ref, delegates release-train prep to
-`scripts/internal/release/prepare_release_train.py`, and dispatches the RC
-GitHub workflow only when `--dispatch` is passed. Prepare dispatch uses
-`--workflow-ref` (default `main`) for the workflow file ref and sends the
-resolved source commit SHA through the `source_ref` workflow input. The script
-requires `gh` only for explicit workflow dispatch. When `origin` is a GitHub
-remote, it must match `YIELD_GITHUB_REPO` before release refs are fetched or
-resolved. Dry RC runs print the exact workflow command and follow-up run-list
-command without publishing. Stable commands fail before resolving release refs
-or invoking GitHub.
+package version at the resolved source ref and delegates release-train prep to
+`scripts/internal/release/prepare_release_train.py`. Use dry-run mode to review
+the intended RC command and follow-up steps. Do not pass `--dispatch` in the
+local-only workflow. When `origin` is a GitHub remote, it must match
+`YIELD_GITHUB_REPO` before release refs are fetched or resolved. Stable commands
+fail before resolving release refs or invoking GitHub.
 
 The nextest policy is:
 
@@ -198,22 +385,11 @@ The nextest policy is:
   stale-removal behavior.
 - The default nextest profile stays unfiltered for maintainers who want the
   complete suite and are prepared to triage environment-specific failures.
-- Local nextest runs remain the primary development evidence. GitHub release
-  workflows add deterministic packaging-time checks for nightly, RC, and stable
-  artifacts.
-- Nightly, RC, and stable use `scripts/internal/release/run_release_validation.sh`
-  on `ubuntu-latest` before any package build or public publication. The helper
-  compiles Yield-owned workspace test targets with `cargo test --workspace
-  --locked --no-run`, then runs standalone Radiant validation plus release contract/helper tests
-  and scanner tests. It intentionally avoids running the full native/UI default
-  Cargo test lane in scheduled release workflows; local `ci-required` nextest,
-  quarantined, GUI/manual, and performance checks remain explicit local or
-  issue-specific release-risk evidence.
-- The nightly, RC, and stable Ubuntu release-validation jobs install
-  `pkg-config` and `libasound2-dev` before Cargo builds the workspace.
-  Yield still publishes only the Windows/macOS release targets declared in
-  `release_contract.toml`, but the Linux-hosted validation lane keeps
-  ALSA-backed compilation explicit ahead of planned Linux release support.
+- Local nextest runs are the primary development evidence. Former nightly, RC,
+  stable, and native-custody workflow sources remain as `.disabled`
+  documentation. Run `scripts/internal/release/run_release_validation.sh`
+  locally before release preparation; package builds, signing, upload, and
+  publication remain separate explicit release operations.
 
 The non-blocking app architecture is enforced by
 `scripts/check.* non-blocking-architecture`, and that check is required by
