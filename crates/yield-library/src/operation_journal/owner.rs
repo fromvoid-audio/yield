@@ -5071,6 +5071,7 @@ impl OperationJournalOwner {
             true,
             false,
             None,
+            #[cfg(test)]
             false,
         )
         .expect("operation journal owner start");

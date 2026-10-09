@@ -24,6 +24,10 @@ def run(command: list[str], env: dict[str, str], pass_fds: tuple[int, ...]) -> i
             return process.wait()
     except Cancelled as cancelled:
         ignore_cancellation_signals()
+        # Do not let the caller restore the parked state while its validator
+        # child is still running. The surrounding managed process-group
+        # watchdog owns escalation if this wait does not complete.
+        process.wait()
         return 128 + cancelled.signum
 
 
@@ -61,6 +65,7 @@ def main() -> int:
             "scripts.internal.ci.test_local_state",
             "scripts.internal.ci.test_coordinator_exec",
             "scripts.internal.ci.test_native_runner",
+            "scripts.internal.ci.test_full_ci_runner",
             "scripts.internal.ci.test_bundle_packager",
             "scripts.internal.ci.test_local_ci_contract",
             "scripts.internal.ci.test_managed_exec",
