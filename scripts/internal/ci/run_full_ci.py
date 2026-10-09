@@ -65,6 +65,7 @@ def main() -> int:
             "scripts.internal.ci.test_local_state",
             "scripts.internal.ci.test_coordinator_exec",
             "scripts.internal.ci.test_native_runner",
+            "scripts.internal.ci.test_namespace_window_routing",
             "scripts.internal.ci.test_full_ci_runner",
             "scripts.internal.ci.test_bundle_packager",
             "scripts.internal.ci.test_local_ci_contract",

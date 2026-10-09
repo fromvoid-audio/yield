@@ -187,12 +187,22 @@ runner must exist in the requested source commit. Multi-command validators keep
 a shared read lease for their whole process tree, and their generated evidence
 is copied into that run's retained evidence directory.
 
-The full local lane filters all seven genuine production-registry selectors out
+The `prerequisite:startup-namespace-failure` compatibility case runs both the
+original blocking-receive namespace failure selector and its poll-based twin.
+Each selector gets its own clean production reset, read lease, runner, and
+restore window; the second still runs if the first fails. The shell runner's
+legacy `startup-namespace-failure` case refuses direct execution so it cannot
+report partial coverage. Use the managed CLI aggregate or either explicit
+`prerequisite:startup-namespace-receive-failure` /
+`prerequisite:startup-namespace-poll-failure` subcase.
+
+The full local lane filters all eight genuine production-registry selectors out
 of the ordinary `operation_journal` suite, then runs each under its own clean
 and restore transaction using `run_native_production_case.py`: `capacity`,
-`control`, `namespace`, `recording-slot-currentness`, `recording-lost-reply`,
-`chunk-issuance`, and `provider-reconciliation`. The runner requires evidence
-that exactly one requested test passed in each transaction.
+`control`, `namespace`, `namespace-poll`, `recording-slot-currentness`,
+`recording-lost-reply`, `chunk-issuance`, and `provider-reconciliation`. The
+runner requires evidence that exactly one requested test passed in each
+transaction.
 
 `build` does not reset state or launch the application. `run --state clean`
 prints and records its restore transaction ID before launching. Restoration is
@@ -268,8 +278,13 @@ backup, test and restore sequence. Avoid recursively taking the same lock from
 nested wrappers; ownership handoff must be verified rather than trusting an
 environment flag.
 
-Run builds and acceptance from a detached exact commit. Uncommitted experiments
-may have a separate explicitly marked preview artifact, never release evidence.
+The managed CLI pins each build or acceptance run to the requested exact commit
+in a temporary `codex/local-ci-<id>` feature worktree. This preserves the
+repository's integration-branch guard while keeping the caller's branch and
+uncommitted files untouched. The managed CLI removes only that worktree and its
+own temporary branch after the lane, including on failure. Uncommitted
+experiments may have a separate explicitly marked preview artifact, never
+release evidence.
 Cache targets by host architecture, Rust version, lockfile, channel/features and
 profile. Do not reuse a test-feature binary for a production artifact. Record
 source SHA, dirty/snapshot status, OS build, SDK/CLT, Rust 1.93.0, architecture,

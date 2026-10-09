@@ -22,6 +22,7 @@ CASES = {
     "capacity": "operation_journal::owner::tests::capacity_startup_tests::capacity_startup_native_production_rebuilds_original_descriptor_bound_image",
     "control": "operation_journal::owner::tests::control_backing_tests::control_backing_native_production_startup_preserves_original_failure_and_journal",
     "namespace": "operation_journal::owner::tests::namespace_backing_tests::namespace_backing_native_production_error_outlives_original_worker_join",
+    "namespace-poll": "operation_journal::owner::tests::namespace_backing_tests::namespace_backing_native_production_error_outlives_original_worker_join_poll",
     "recording-slot-currentness": "operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain",
     "recording-lost-reply": "operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit",
     "chunk-issuance": "operation_journal::owner::recording_binding::tests::chunk_issuance_native_production_original_claim_transition_and_retained_backing",

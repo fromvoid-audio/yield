@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 CASE="${YIELD_NATIVE_PREREQUISITE_CASE:?Select a complete native prerequisite case}"
+if [[ "$CASE" == startup-namespace-failure ]]; then
+  echo 'Use scripts/yield-local-ci check --sha <full-commit-sha> --lane native --case prerequisite:startup-namespace-failure; it runs both receive and poll variants in separate production reset windows.' >&2
+  exit 2
+fi
 HOST="$(rustc -vV | sed -n 's/^host: //p')"
 NATIVE_OS="$(uname -s)"
 case "$NATIVE_OS:$HOST" in
@@ -107,8 +111,16 @@ case "$CASE" in
     run_tests production-control operation_journal::owner::tests::control_backing_tests::control_backing_native_production_startup_preserves_original_failure_and_journal 1 --exact
     ;;
   startup-namespace-failure)
+    echo 'Use the managed CLI aggregate for both namespace failure receive/poll variants.' >&2
+    exit 2
+    ;;
+  startup-namespace-receive-failure)
     [[ "$PLATFORM" == macos ]] || exit 1
-    run_tests production-namespace operation_journal::owner::tests::namespace_backing_tests::namespace_backing_native_production_error_outlives_original_worker_join 1 --exact
+    run_tests production-namespace-receive operation_journal::owner::tests::namespace_backing_tests::namespace_backing_native_production_error_outlives_original_worker_join 1 --exact
+    ;;
+  startup-namespace-poll-failure)
+    [[ "$PLATFORM" == macos ]] || exit 1
+    run_tests production-namespace-poll operation_journal::owner::tests::namespace_backing_tests::namespace_backing_native_production_error_outlives_original_worker_join_poll 1 --exact
     ;;
   sdk-and-startup-components)
     [[ "$PLATFORM" == macos ]] || exit 1

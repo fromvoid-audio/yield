@@ -1,6 +1,27 @@
 use super::*;
 use std::fs;
 
+#[cfg(target_os = "macos")]
+struct StartupReserveRelease(Option<std::sync::mpsc::SyncSender<()>>);
+
+#[cfg(target_os = "macos")]
+impl StartupReserveRelease {
+    fn release(mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for StartupReserveRelease {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
 fn shared() -> Arc<OwnerShared> {
     let (commands, _receivers) = OwnerCommandReceivers::channel();
     Arc::new(OwnerShared::new(commands))
@@ -240,6 +261,7 @@ fn control_backing_original_startup_component_handoffs_native_diagnostic_then_re
             false,
             None,
             false,
+            None,
             copies,
             Arc::new(AtomicUsize::new(0)),
         )
@@ -273,12 +295,18 @@ fn control_backing_native_production_startup_preserves_original_failure_and_jour
     let fixture = fixture("control-backing-native-production-startup");
     let store = OperationJournalStore::open(&fixture.owner).unwrap();
     let path = original_profile_journal_path(&fixture, &store);
-    let original = fs::read(&path).unwrap();
     store.deny_original_reader_begin_for_test();
     // Genuine original production registry, root descriptors and protected
-    // profile/journal reserve bootstrap. The only fault is SQLite's authorizer
-    // on this same original connection. No startup/provider component hook.
-    let mut owner = OperationJournalOwner::start(store).unwrap();
+    // profile/journal reserve bootstrap. Pause after the legitimate reserve
+    // binding is durable but before the ordinary rebuild reaches the authorizer.
+    let (mut owner, ready, release) =
+        OperationJournalOwner::start_with_observed_production_bootstrap_for_test(store).unwrap();
+    let release = StartupReserveRelease(Some(release));
+    ready
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reserve bootstrap reached observer");
+    let original = fs::read(&path).unwrap();
+    release.release();
     let pool = owner.shared.input_bytes.clone();
     let baseline = InputBudget::shared_initial();
     let reason = wait_until_unavailable(&owner);
@@ -288,8 +316,21 @@ fn control_backing_native_production_startup_preserves_original_failure_and_jour
     );
     assert!(!owner.shared.startup_component.load(Ordering::Acquire));
     assert_eq!(owner.prepared_admission_id_allocations(), 0);
-    assert!(owner.shutdown());
-    assert_eq!(fs::read(&path).unwrap(), original);
+    // Failed startup remains Unavailable after the genuine worker joins;
+    // shutdown reports false rather than minting a clean-close outcome.
+    assert!(!owner.shutdown());
+    assert!(owner.worker.is_none(), "original startup worker was joined");
+    assert_eq!(
+        owner.status(),
+        OperationJournalOwnerStatus::Unavailable { reason }
+    );
+    let after = fs::read(&path).unwrap();
+    assert!(
+        after == original,
+        "original journal bytes changed across failed startup (before={} bytes, after={} bytes)",
+        original.len(),
+        after.len()
+    );
     assert!(
         pool.lock().unwrap().remaining[0] < baseline.remaining[0],
         "original Shared diagnostic backing remains after actual worker join"
