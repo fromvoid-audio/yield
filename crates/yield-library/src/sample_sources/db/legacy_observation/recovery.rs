@@ -285,10 +285,11 @@ mod tests {
         .unwrap();
         data.execute_batch("PRAGMA query_only=OFF; BEGIN EXCLUSIVE")
             .unwrap();
+        let operation = OperationId::new();
         super::super::migration::apply_atomic_migration_body(
             &data,
             &args,
-            OperationId::new(),
+            operation,
             before_schema,
             &before_rows,
             &expected,
@@ -329,6 +330,80 @@ mod tests {
             lock_identity
         );
         drop(owner);
+        // Canonical paired journal/receipt data is a read-only fixture, never an
+        // admitted migration, provider ledger, initial claim or live Source grant.
+        let record = crate::operation_journal::StoredOperationRecord::new_v19_legacy_adoption(
+            operation,
+            args.clone(),
+            1,
+        )
+        .unwrap();
+        let wire = crate::operation_journal::codec::encode(&record).unwrap();
+        let journal_path = profile_root
+            .path()
+            .join(crate::operation_journal::store::JOURNAL_DATABASE_ROOT_NAME)
+            .join(crate::operation_journal::store::JOURNAL_DATABASE_FILE_NAME);
+        rusqlite::Connection::open(&journal_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO operation_journal(operation_id,sequence,record) VALUES(?1,1,?2)",
+                rusqlite::params![operation.as_uuid().to_string(), wire],
+            )
+            .unwrap();
+        let owner =
+            SourceDatabase::open_legacy_recovery_read_owner(media.path(), &profile, "legacy")
+                .unwrap();
+        let observed = owner.capture_recovery(&profile, &journal).unwrap();
+        assert_eq!(observed.operation_id(), operation);
+        assert!(!observed.lease_table_present());
+        let journal_before = std::fs::read(&journal_path).unwrap();
+        let mut worker = crate::operation_journal::owner::OperationJournalOwner::start_without_capacity_for_test(journal).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.status()
+            == crate::operation_journal::owner::OperationJournalOwnerStatus::Initializing
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let recovered = worker
+            .client()
+            .recover_legacy_read_custody(owner)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.operation_id(), operation);
+        recovered
+            .revalidate()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(
+            recovered
+                .validate_claims()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_err(),
+            "paired data must not establish retained provider capacity"
+        );
+        // A failed capacity observation does not consume the retained readonly reader.
+        recovered
+            .revalidate()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+        assert!(
+            SourceDatabase::open_legacy_recovery_read_owner(media.path(), &profile, "legacy")
+                .is_err()
+        );
+        assert!(worker.shutdown());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
         assert!(
             SourceDatabase::open_legacy_recovery_read_owner(
                 tempfile::tempdir().unwrap().path(),

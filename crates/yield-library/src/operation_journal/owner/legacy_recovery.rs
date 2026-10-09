@@ -35,14 +35,18 @@ impl LegacyRecoveryCustody {
             .upgrade()
             .ok_or(OperationJournalOwnerQueueError::Closed)?;
         let operation = self.operation;
-        OperationJournalClient { shared }.submit(INPUT_BYTES, move |input, result| {
-            JournalCommand::ValidateLegacyRecovery {
+        OperationJournalClient { shared }.submit_funded_with_reply(
+            InputClass::Ordinary,
+            INPUT_BYTES,
+            false,
+            true,
+            move |input, result| JournalCommand::ValidateLegacyRecovery {
                 operation,
                 capacity: false,
                 input,
                 result,
-            }
-        })
+            },
+        )
     }
 
     /// Check immutable initial claims against the V19 plan, complete unreleased rebuild
@@ -56,14 +60,18 @@ impl LegacyRecoveryCustody {
             .upgrade()
             .ok_or(OperationJournalOwnerQueueError::Closed)?;
         let operation = self.operation;
-        OperationJournalClient { shared }.submit(INPUT_BYTES, move |input, result| {
-            JournalCommand::ValidateLegacyRecovery {
+        OperationJournalClient { shared }.submit_funded_with_reply(
+            InputClass::Ordinary,
+            INPUT_BYTES,
+            false,
+            true,
+            move |input, result| JournalCommand::ValidateLegacyRecovery {
                 operation,
                 capacity: true,
                 input,
                 result,
-            }
-        })
+            },
+        )
     }
 }
 
@@ -83,13 +91,17 @@ impl OperationJournalClient {
         source: LegacySourceReadOwner,
     ) -> Result<OperationJournalRequest<LegacyRecoveryCustody>, OperationJournalOwnerQueueError>
     {
-        self.submit(INPUT_BYTES, move |input, result| {
-            JournalCommand::RecoverLegacyReadCustody {
+        self.submit_funded_with_reply(
+            InputClass::Ordinary,
+            INPUT_BYTES,
+            false,
+            true,
+            move |input, result| JournalCommand::RecoverLegacyReadCustody {
                 source,
                 input,
                 result,
-            }
-        })
+            },
+        )
     }
 }
 
