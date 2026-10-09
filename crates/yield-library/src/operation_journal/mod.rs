@@ -72,6 +72,7 @@ pub mod validation;
 pub(crate) mod wal_admission;
 pub mod work_plan;
 pub mod work_progress;
+pub mod writer_acquisition_telemetry;
 
 pub use codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 

@@ -1812,6 +1812,86 @@
       "issue": "OPT-2442",
       "reason": "Linux-only isolated real profile/journal production startup exercises the actual unsupported protected-reserve refusal. It verifies no original acquisition is published on refused bootstrap; no Source/effect/physical qualification is supplied.",
       "retirement": "Keep this exact test-only scope and remove the inventory row if the fixture call is removed. Native qualified startup remains separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/request_inbox_restart_tests.rs",
+      "function": "inbox_owner_restart_under_same_actual_profile_acquisition_never_confirms_old_delivery",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2445",
+      "reason": "Reviewed private test-only original journal/store on an isolated temporary acquired profile. Exercises bounded delivery, gated worker, persistence-only acknowledgement, pre-intent refusal, worker loss or restart; capacity-free fixture grants no Source/native/create/effect authority.",
+      "retirement": "Keep this exact test-only fixture scope; remove its inventory entry if the call is removed. Full supported create and native qualification stay separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/request_inbox_restart_tests.rs",
+      "function": "inbox_owner_restart_under_same_actual_profile_acquisition_never_confirms_old_delivery",
+      "operation": "journal::start_without_capacity_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2445",
+      "reason": "Reviewed private test-only original journal/store on an isolated temporary acquired profile. Exercises bounded delivery, gated worker, persistence-only acknowledgement, pre-intent refusal, worker loss or restart; capacity-free fixture grants no Source/native/create/effect authority.",
+      "retirement": "Keep this exact test-only fixture scope; remove its inventory entry if the call is removed. Full supported create and native qualification stay separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/request_inbox_tests.rs",
+      "function": "inbox_actual_blocked_worker_retains_empty_then_delivers_exact_persistence_receipt_as_stale",
+      "operation": "journal::open",
+      "count": 2,
+      "classification": "fixture",
+      "issue": "OPT-2445",
+      "reason": "Reviewed private test-only original journal/store on an isolated temporary acquired profile. Exercises bounded delivery, gated worker, persistence-only acknowledgement, pre-intent refusal, worker loss or restart; capacity-free fixture grants no Source/native/create/effect authority.",
+      "retirement": "Keep this exact test-only fixture scope; remove its inventory entry if the call is removed. Full supported create and native qualification stay separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/request_inbox_tests.rs",
+      "function": "inbox_actual_blocked_worker_retains_empty_then_delivers_exact_persistence_receipt_as_stale",
+      "operation": "journal::start_with_command_gate_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2445",
+      "reason": "Reviewed private test-only original journal/store on an isolated temporary acquired profile. Exercises bounded delivery, gated worker, persistence-only acknowledgement, pre-intent refusal, worker loss or restart; capacity-free fixture grants no Source/native/create/effect authority.",
+      "retirement": "Keep this exact test-only fixture scope; remove its inventory entry if the call is removed. Full supported create and native qualification stay separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/request_inbox_tests.rs",
+      "function": "inbox_foreign_actual_owner_handle_is_returned_untouched_and_worker_loss_is_unconfirmed",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2445",
+      "reason": "Reviewed private test-only original journal/store on an isolated temporary acquired profile. Exercises bounded delivery, gated worker, persistence-only acknowledgement, pre-intent refusal, worker loss or restart; capacity-free fixture grants no Source/native/create/effect authority.",
+      "retirement": "Keep this exact test-only fixture scope; remove its inventory entry if the call is removed. Full supported create and native qualification stay separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/request_inbox_tests.rs",
+      "function": "inbox_foreign_actual_owner_handle_is_returned_untouched_and_worker_loss_is_unconfirmed",
+      "operation": "journal::start_with_worker_panic_for_test",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2445",
+      "reason": "Reviewed private test-only original journal/store on an isolated temporary acquired profile. Exercises bounded delivery, gated worker, persistence-only acknowledgement, pre-intent refusal, worker loss or restart; capacity-free fixture grants no Source/native/create/effect authority.",
+      "retirement": "Keep this exact test-only fixture scope; remove its inventory entry if the call is removed. Full supported create and native qualification stay separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/request_inbox_tests.rs",
+      "function": "inbox_original_generation_exhaustion_and_queue_rejection_refund_without_reusing_context",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2445",
+      "reason": "Reviewed private test-only original journal/store on an isolated temporary acquired profile. Exercises bounded delivery, gated worker, persistence-only acknowledgement, pre-intent refusal, worker loss or restart; capacity-free fixture grants no Source/native/create/effect authority.",
+      "retirement": "Keep this exact test-only fixture scope; remove its inventory entry if the call is removed. Full supported create and native qualification stay separate."
+    },
+    {
+      "path": "crates/yield-library/src/operation_journal/owner/tests/request_inbox_tests.rs",
+      "function": "inbox_refunds_rejection_and_retains_actual_pre_intent_refusal_without_a_success_identity",
+      "operation": "journal::open",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "OPT-2445",
+      "reason": "Reviewed private test-only original journal/store on an isolated temporary acquired profile. Exercises bounded delivery, gated worker, persistence-only acknowledgement, pre-intent refusal, worker loss or restart; capacity-free fixture grants no Source/native/create/effect authority.",
+      "retirement": "Keep this exact test-only fixture scope; remove its inventory entry if the call is removed. Full supported create and native qualification stay separate."
     }
   ]
 }

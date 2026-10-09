@@ -1,14 +1,22 @@
 //! Same-transaction reserved recording metadata. No closure, grant or retirement authority.
 use super::{OperationJournalStore, OperationJournalStoreError};
+mod appends;
 mod funded;
 mod initial_funded;
+mod restart_audit;
+mod terminal;
+mod verification;
 use crate::operation_journal::coordinator::UniversalCommandArgs;
 use crate::operation_journal::recording_commands::RecordingProposal;
 use crate::operation_journal::recording_commands::controls::{
     CONTROL_BYTES, CONTROL_ROWS, ControlRole, FIRST_CONTROL_SLOT, RESERVED_BYTES,
-    RecordingControlReservation, reservation_metadata_bound,
+    RecordingControlReservation, finalizing_observation, reservation_metadata_bound,
 };
+pub(in crate::operation_journal) use restart_audit::RecordingRestartAudit;
 use rusqlite::{OptionalExtension, params};
+pub(in crate::operation_journal) use verification::{
+    RecordingFrozenVerification, VerifiedRecordingSeal,
+};
 
 fn error(reason: impl ToString) -> OperationJournalStoreError {
     OperationJournalStoreError::RecordingRetention {
@@ -93,6 +101,7 @@ impl OperationJournalStore {
             ));
         }
         let mut previous_sequence: Option<i64> = None;
+        let mut history = ControlHistory::default();
         for role in ControlRole::ALL {
             let expected = RecordingControlReservation::new(proposal, role).map_err(error)?;
             let row: Option<(String, i64, String, i64)> = self.connection.query_row(
@@ -149,11 +158,8 @@ impl OperationJournalStore {
                 }
             } else {
                 // General historical readers preserve their typed/noncanonical acceptance.
-                let observed =
-                    RecordingControlReservation::decode(&bytes, proposal).map_err(error)?;
-                if observed != expected {
-                    return Err(error("conflicting reserved recording control"));
-                }
+                finalizing_observation(&bytes, proposal, role).map_err(error)?;
+                history.observe(&bytes, proposal, role, sequence)?;
             }
         }
         // Use the operation/slot index and a capped inventory, not an ordered global sequence
@@ -174,6 +180,26 @@ impl OperationJournalStore {
             return Err(error("recording capture precedes its terminal reservation"));
         }
         Ok(true)
+    }
+
+    /// The generic captured-byte route holds no private terminal close capability.
+    /// Exact replay is checked before this fence. Finalizing bytes may be appended only
+    /// through the future original terminal adapter with its declared admitted identities.
+    pub(in crate::operation_journal) fn require_recording_capturing(
+        &self,
+        proposal: &RecordingProposal,
+    ) -> Result<(), OperationJournalStoreError> {
+        let bytes: Option<Vec<u8>> = self.connection.query_row(
+            "SELECT CASE WHEN typeof(record)='blob' AND length(record) BETWEEN 1 AND 4096 THEN record ELSE NULL END FROM operation_journal_recording_chunks WHERE operation_id=?1 AND slot=20000",
+            params![proposal.operation_id().to_string()], |row| row.get(0),
+        )?;
+        let bytes = bytes.ok_or_else(|| error("invalid recording Finalizing control shape"))?;
+        if finalizing_observation(&bytes, proposal, ControlRole::Finalizing).map_err(error)? {
+            return Err(error(
+                "recording Finalizing fence requires original terminal write custody",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn reserve_recording_initial_inside_transaction_with_input(
@@ -258,6 +284,58 @@ impl OperationJournalStore {
                 )?;
             }
             self.verify_recording_reservation_with_input(proposal, true, input)?;
+        }
+        Ok(())
+    }
+}
+
+/// Bounded retained control relationships. This is historical data validation, not
+/// recovery of an original adapter, producer join or Source/acquisition permission.
+#[derive(Default)]
+struct ControlHistory {
+    frozen: Option<crate::operation_journal::recording_commands::controls::RecordingFrozenInventory>,
+    finalizing: Option<crate::operation_journal::recording_commands::controls::RecordingDeclaredFinalizingInventory>,
+}
+impl ControlHistory {
+    fn observe(
+        &mut self,
+        bytes: &[u8],
+        proposal: &RecordingProposal,
+        role: ControlRole,
+        sequence: i64,
+    ) -> Result<(), OperationJournalStoreError> {
+        use crate::operation_journal::recording_commands::controls::{
+            RecordingDeclaredFinalizingInventory, RecordingFrozenInventory,
+            RecordingSealedInventory,
+        };
+        if role == ControlRole::Finalizing {
+            self.finalizing = RecordingDeclaredFinalizingInventory::decode(bytes, proposal).ok();
+        } else if role == ControlRole::Frozen
+            && finalizing_observation(bytes, proposal, role).map_err(error)?
+        {
+            let frozen = RecordingFrozenInventory::decode(bytes, proposal).map_err(error)?;
+            if u64::try_from(sequence).map_err(error)? != frozen.prefix().freeze_sequence() {
+                return Err(error(
+                    "retained Frozen sequence differs from original reservation",
+                ));
+            }
+            let finalizing = self
+                .finalizing
+                .as_ref()
+                .ok_or_else(|| error("Frozen has no exact declared Finalizing inventory"))?;
+            frozen
+                .validate_finalizing(proposal, finalizing)
+                .map_err(error)?;
+            self.frozen = Some(frozen);
+        } else if role == ControlRole::Seal
+            && finalizing_observation(bytes, proposal, role).map_err(error)?
+        {
+            let sealed = RecordingSealedInventory::decode(bytes, proposal).map_err(error)?;
+            let frozen = self
+                .frozen
+                .as_ref()
+                .ok_or_else(|| error("Seal has no exact Frozen inventory"))?;
+            sealed.validate_frozen(proposal, frozen).map_err(error)?;
         }
         Ok(())
     }

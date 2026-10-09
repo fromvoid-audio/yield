@@ -1071,3 +1071,5 @@ pub(super) fn read_for_input_prepaid(
 ) -> Result<Option<FundedChunkClaimRecord>, super::OperationJournalStoreError> {
     funded::read_prepaid(connection, chunk_id, input, credit)
 }
+
+pub(in crate::operation_journal::store) use funded::validate_original_relations;
