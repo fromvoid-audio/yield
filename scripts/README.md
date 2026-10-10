@@ -108,14 +108,13 @@ dispatcher maps. These are the public entrypoints people should run directly:
   maintained local/manual or release-risk perf lane. The Bash-only
   `calibrate-startup` command is optional Linux developer tooling for refreshing
   startup threshold lock files; it is not shipped Linux product support.
-- `release.sh`: Bash release orchestration for release-train prep and explicit
-  RC GitHub workflow dispatch. It derives major, minor, and patch targets
-  from the resolved source release package version and delegates
-  packaging/publication to the existing release workflows. RC publication
-  starts stabilization while normal PRs continue on `main`. Stable publication
-  is temporarily disabled and its command fails closed while the implementation
-  remains preserved until an explicit, reviewed change re-enables stable
-  publication.
+- `release.sh`: compatibility wrapper for local CI builds. Use
+  `scripts/release.sh build --sha <40-character-commit-sha> --channel <test|beta|release>`;
+  it delegates to `scripts/yield-local-ci build` and preserves its result. Test
+  apps use isolated state, while beta and release apps use the saved Yield
+  state when launched. Building does not launch or reset state. The former
+  prepare, RC, stable, and GitHub dispatch commands are
+  obsolete; this wrapper performs no release publication.
 - `gui.ps1`: Windows GUI validation lanes.
 
 PowerShell compatibility wrappers also remain available for the older
