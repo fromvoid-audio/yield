@@ -112,7 +112,9 @@ fi
 run cargo test --locked -p yield-library --test profile_admission --no-default-features
 run cargo test --locked -p yield-library --lib app_dirs::profile_ownership --no-default-features
 run cargo test --locked -p yield-library --test readiness_lease_process --features test-support
-run cargo test --locked -p yield-library --lib operation_journal --no-default-features -- \
+# These real SQLite/custody fixtures retain their original short deadlines.
+# Bound simultaneous owners instead of letting host CPU count exhaust them.
+run cargo test --locked -p yield-library --lib operation_journal --no-default-features -- --test-threads=4 \
   --skip capacity_startup_native_production_rebuilds_original_descriptor_bound_image \
   --skip control_backing_native_production_startup_preserves_original_failure_and_journal \
   --skip namespace_backing_native_production_error_outlives_original_worker_join \
