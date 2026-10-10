@@ -6,7 +6,7 @@
 use gpui::{
     AnyElement, ClickEvent, Context, Div, DragMoveEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, StatefulInteractiveElement, Window,
-    canvas, div, font, prelude::*, px, uniform_list,
+    WindowControlArea, canvas, div, font, prelude::*, px, uniform_list,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use yield_core::{PlaybackType, SortColumn, SortDirection, format_duration, format_last_played};
@@ -2000,6 +2000,7 @@ impl Render for Browser {
                             .when(enlarged_text, |element| {
                                 element.h(px(theme.spacing.control_height))
                             })
+                            .window_control_area(WindowControlArea::Drag)
                             .on_mouse_down(MouseButton::Left, |_event, window, _cx| {
                                 window.start_window_move();
                             }),

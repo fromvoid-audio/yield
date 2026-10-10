@@ -104,6 +104,8 @@ if [[ "$scope" == "full" ]]; then
   if [[ -f vendor/gpui/Cargo.toml ]]; then
     # Exercise authored Metal guards; dependency unit tests are otherwise skipped.
     run cargo test --manifest-path vendor/gpui/Cargo.toml --locked --no-default-features --features font-kit,runtime_shaders --lib post_ -- --test-threads=1
+    # Two small native dispatch regressions; do not grow a separate gesture matrix.
+    run_counted 2 0 cargo test --manifest-path vendor/gpui/Cargo.toml --locked --no-default-features --features font-kit,runtime_shaders --lib native_window_ -- --test-threads=1
   fi
 else
   run cargo check --locked -p yield-library --no-default-features
@@ -136,7 +138,11 @@ run cargo test --locked -p yield-library --lib sample_sources::db::source_db_mig
 run cargo test --locked -p yield-library --lib sqlite_wal --no-default-features
 run cargo test --locked -p yield-library --lib app_dirs::storage_usage --no-default-features
 run cargo test --locked -p yield-scan --lib -- --test-threads=4
-run cargo test --locked -p yield-catalog --lib -- --test-threads=4
+# Measure the native query budget without competing catalog fixture workloads.
+# Keep the original rows/deadline and require the same test in a separate lane.
+harvest_budget_test=tests::harvest_facts_tests::fixtures::harvest_filter_actual_multiple_chunks_and_global_invalidation
+run cargo test --locked -p yield-catalog --lib -- --test-threads=4 --skip "$harvest_budget_test"
+run_counted 1 0 cargo test --locked -p yield-catalog --lib "$harvest_budget_test" -- --exact --test-threads=1
 run cargo test --locked -p yield-session --lib -- --test-threads=1
 
 if [[ "$scope" == "storage" ]]; then
