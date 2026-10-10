@@ -31,9 +31,14 @@ impl AudioPlayer {
         device: cpal::Device,
         host_id: String,
         config: &AudioOutputConfig,
+        required_channels: u16,
     ) -> Result<Self, String> {
-        let outcome = crate::output::open_output_stream_on_test_device(device, host_id, config)
-            .map_err(|err| err.to_string())?;
+        let outcome = crate::output::open_output_stream_on_test_device(
+            device,
+            host_id,
+            config,
+            required_channels,
+        )?;
         Ok(Self::from_open_stream_outcome(outcome))
     }
 

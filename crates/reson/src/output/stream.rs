@@ -16,6 +16,8 @@ mod handle;
 use crate::output::callback::CallbackProbe;
 use builder::{BuiltStreamState, build_stream_with_state};
 use config::resolve_output_stream_config;
+#[cfg(test)]
+use config::resolve_output_stream_config_for_test_channels;
 pub(super) use config::resolved_output_from_stream_config;
 #[cfg(test)]
 pub(crate) use handle::monitor_sink_for_tests;
@@ -64,11 +66,12 @@ pub(crate) fn open_output_stream_on_test_device(
     device: cpal::Device,
     host_id: String,
     config: &AudioOutputConfig,
-) -> Result<OpenStreamOutcome, AudioOutputError> {
+    required_channels: u16,
+) -> Result<OpenStreamOutcome, String> {
     if !test_audio_output_enabled() {
-        return Err(AudioOutputError::NoOutputDevices);
+        return Err("native audio output test is not enabled".into());
     }
-    let device_name = device_label(&device).ok_or(AudioOutputError::NoOutputDevices)?;
+    let device_name = device_label(&device).ok_or("native test device has no name")?;
     if config
         .host
         .as_deref()
@@ -78,20 +81,57 @@ pub(crate) fn open_output_stream_on_test_device(
             .as_deref()
             .is_some_and(|requested| requested != device_name)
     {
-        return Err(AudioOutputError::NoOutputDevices);
+        return Err(
+            "native test device identity does not match the requested host and name".into(),
+        );
     }
-    open_resolved_output_stream(device, host_id, device_name, false, config, false)
+    let resolved_config = resolve_output_stream_config_for_test_channels(
+        &device,
+        &host_id,
+        config,
+        required_channels,
+    )?;
+    open_stream_with_resolved_config(
+        device,
+        host_id,
+        device_name,
+        false,
+        config,
+        false,
+        resolved_config,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn open_resolved_output_stream(
+    device: cpal::Device,
+    resolved_host_id: String,
+    resolved_device_name: String,
+    used_fallback: bool,
+    config: &AudioOutputConfig,
+    allow_default_fallback: bool,
+) -> Result<OpenStreamOutcome, AudioOutputError> {
+    let resolved_config = resolve_output_stream_config(&device, &resolved_host_id, config)?;
+    open_stream_with_resolved_config(
+        device,
+        resolved_host_id,
+        resolved_device_name,
+        used_fallback,
+        config,
+        allow_default_fallback,
+        resolved_config,
+    )
+}
+
+fn open_stream_with_resolved_config(
     device: cpal::Device,
     mut resolved_host_id: String,
     mut resolved_device_name: String,
     mut used_fallback: bool,
     config: &AudioOutputConfig,
     allow_default_fallback: bool,
+    resolved_config: config::ResolvedOutputStreamConfig,
 ) -> Result<OpenStreamOutcome, AudioOutputError> {
-    let resolved_config = resolve_output_stream_config(&device, &resolved_host_id, config)?;
     used_fallback |= resolved_config.used_fallback;
 
     let active_sources = Arc::new(AtomicUsize::new(0));

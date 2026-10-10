@@ -2306,6 +2306,7 @@ mod tests {
             aggregate_device.clone(),
             host_id.name().to_owned(),
             &config,
+            4,
         ) {
             Ok(player) => player,
             Err(error) => {
@@ -2321,6 +2322,14 @@ mod tests {
             && resolved.sample_rate == sample_rate
             && resolved.channel_count == 4
             && !resolved.used_fallback;
+        let default_pair_actual = format!(
+            "host={} device={:?} rate={} channels={} fallback={}",
+            resolved.host_id,
+            resolved.device_name,
+            resolved.sample_rate,
+            resolved.channel_count,
+            resolved.used_fallback,
+        );
         let mut executor = AudioPlayerPlaybackExecutor {
             player: default_player,
             configured_metronome_beat_count: None,
@@ -2394,6 +2403,7 @@ mod tests {
             aggregate_device,
             host_id.name().to_owned(),
             &config,
+            4,
         ) {
             Ok(player) => player,
             Err(error) => {
@@ -2409,6 +2419,14 @@ mod tests {
             && resolved.sample_rate == sample_rate
             && resolved.channel_count == 4
             && !resolved.used_fallback;
+        let pair_one_actual = format!(
+            "host={} device={:?} rate={} channels={} fallback={}",
+            resolved.host_id,
+            resolved.device_name,
+            resolved.sample_rate,
+            resolved.channel_count,
+            resolved.used_fallback,
+        );
         let teardown_complete = player.native_stream_teardown_complete();
         guard.track_stream_teardown(Arc::clone(&teardown_complete));
         if pair_one_exact {
@@ -2460,7 +2478,7 @@ mod tests {
 
         assert!(
             default_pair_exact,
-            "default route must open exact four-channel aggregate"
+            "default route must open exact four-channel aggregate; resolved {default_pair_actual}"
         );
         assert!(
             default_pair_started,
@@ -2477,7 +2495,7 @@ mod tests {
 
         assert!(
             pair_one_exact,
-            "pair-one route must open exact four-channel aggregate"
+            "pair-one route must open exact four-channel aggregate; resolved {pair_one_actual}"
         );
         assert!(pair_one_teardown);
         assert!(pair_one_counts.iter().all(|count| *count > 0));
