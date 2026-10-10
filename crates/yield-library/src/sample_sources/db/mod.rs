@@ -630,6 +630,7 @@ pub struct SourceWriteBatch<'conn> {
     manifest_audit_completed: bool,
     /// Exact next revision reserved by a complete targeted directory observation.
     subtree_directory_revision: Option<u64>,
+    subtree_directory_changes: Option<(u64, Vec<(PathBuf, Option<SourceDirectoryEntry>)>)>,
 }
 
 impl SourceDatabase {

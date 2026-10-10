@@ -243,8 +243,8 @@ impl Browser {
             .tree
             .reconcile_state(Some(folder), &session.expanded_folders);
         let root = session.root.clone();
-        let entries = session.entries.clone();
-        let tree = session.tree.clone();
+        let entries = session.entries.as_ref().clone();
+        let tree = session.tree.as_ref().clone();
         let folder_scope = session.folder_scope;
         let expanded = state.expanded.clone();
         let selected_folder = state.selected.clone();
@@ -496,11 +496,11 @@ mod tests {
     #[test]
     fn cached_history_target_prefers_active_source_then_falls_back_to_registered_sources() {
         let mut first = SourceSession::new(PathBuf::from("/first"));
-        first.entries.push(audio("/first/a.wav", "a.wav"));
-        first.entries.push(audio("/first/only.wav", "only.wav"));
+        std::sync::Arc::make_mut(&mut first.entries).push(audio("/first/a.wav", "a.wav"));
+        std::sync::Arc::make_mut(&mut first.entries).push(audio("/first/only.wav", "only.wav"));
         let mut second = SourceSession::new(PathBuf::from("/second"));
-        second.entries.push(audio("/second/b.wav", "b.wav"));
-        second.entries.push(audio("/first/a.wav", "shared.wav"));
+        std::sync::Arc::make_mut(&mut second.entries).push(audio("/second/b.wav", "b.wav"));
+        std::sync::Arc::make_mut(&mut second.entries).push(audio("/first/a.wav", "shared.wav"));
         let sessions = vec![first, second];
 
         assert_eq!(
@@ -545,9 +545,9 @@ mod tests {
     #[test]
     fn direct_random_replay_requires_exact_cached_source_and_unretired_path() {
         let mut first = SourceSession::new(PathBuf::from("/first"));
-        first.entries.push(audio("/first/a.wav", "a.wav"));
+        std::sync::Arc::make_mut(&mut first.entries).push(audio("/first/a.wav", "a.wav"));
         let mut second = SourceSession::new(PathBuf::from("/second"));
-        second.entries.push(audio("/second/a.wav", "a.wav"));
+        std::sync::Arc::make_mut(&mut second.entries).push(audio("/second/a.wav", "a.wav"));
         let visit = DirectRandomVisit {
             source: (None, PathBuf::from("/first")),
             id: first.entries[0].stable_id(),
@@ -586,22 +586,21 @@ mod tests {
         let browser = cx.new(crate::browser::Browser::new);
         browser.update(cx, |view, cx| {
             let mut first = SourceSession::new(first_root.path().to_path_buf());
-            first
-                .entries
+            std::sync::Arc::make_mut(&mut first.entries)
                 .push(audio(first_path.to_str().unwrap(), "a.wav"));
             let visit = DirectRandomVisit {
                 source: (None, first.root.clone()),
                 id: first.entries[0].stable_id(),
             };
             let mut second = SourceSession::new(second_root.path().to_path_buf());
-            second.entries.push(audio(
+            std::sync::Arc::make_mut(&mut second.entries).push(audio(
                 second_root.path().join("b.wav").to_str().unwrap(),
                 "b.wav",
             ));
             view.source_sessions = vec![first, second];
             view.active_source = Some(1);
             view.root = Some(second_root.path().to_path_buf());
-            view.entries = view.source_sessions[1].entries.clone();
+            view.entries = view.source_sessions[1].entries.as_ref().clone();
             view.view_model.set_entries(&view.entries);
             view.selected = Some(0);
             view.replay_direct_random_visit(visit, cx);
@@ -633,22 +632,21 @@ mod tests {
         let browser = cx.new(crate::browser::Browser::new);
         browser.update(cx, |view, cx| {
             let mut first = SourceSession::new(first_root.path().to_path_buf());
-            first
-                .entries
+            std::sync::Arc::make_mut(&mut first.entries)
                 .push(audio(missing.to_str().unwrap(), "missing.wav"));
             let visit = DirectRandomVisit {
                 source: (None, first.root.clone()),
                 id: first.entries[0].stable_id(),
             };
             let mut second = SourceSession::new(second_root.path().to_path_buf());
-            second.entries.push(audio(
+            std::sync::Arc::make_mut(&mut second.entries).push(audio(
                 second_root.path().join("current.wav").to_str().unwrap(),
                 "current.wav",
             ));
             view.source_sessions = vec![first, second];
             view.active_source = Some(1);
             view.root = Some(second_root.path().to_path_buf());
-            view.entries = view.source_sessions[1].entries.clone();
+            view.entries = view.source_sessions[1].entries.as_ref().clone();
             view.view_model.set_entries(&view.entries);
             view.selected = Some(0);
             view.replay_direct_random_visit(visit, cx);
@@ -729,8 +727,8 @@ mod tests {
             let entries = vec![hidden.clone(), current.clone()];
             let mut session = SourceSession::new(root.clone());
             session.source_id = Some(SourceId::from_string("opt-1765-history-fixture"));
-            session.tree = FolderTree::from_scan(&[], &entries);
-            session.entries = entries.clone();
+            session.tree = std::sync::Arc::new(FolderTree::from_scan(&[], &entries));
+            session.entries = std::sync::Arc::new(entries.clone());
             view.source_sessions = vec![session];
             view.active_source = Some(0);
             view.root = Some(root);

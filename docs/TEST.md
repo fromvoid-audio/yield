@@ -187,6 +187,14 @@ runner must exist in the requested source commit. Multi-command validators keep
 a shared read lease for their whole process tree, and their generated evidence
 is copied into that run's retained evidence directory.
 
+The full GPUI lane and `catalog-replay` prepare the native metadata source under
+the shared Git common directory before the first Cargo command. The content-keyed
+fixture manifest and source path are retained in the local-CI run record; an
+existing fixture is verified by exact tree, owner, mode, hash, and device/inode
+identity and is never silently repaired. The catalog test requires
+`YIELD_NATIVE_METADATA_FIXTURE_ROOT`, uses a disposable catalog profile, and
+restores the fixture's original mtime after watcher shutdown.
+
 The `prerequisite:startup-namespace-failure` compatibility case runs both the
 original blocking-receive namespace failure selector and its poll-based twin.
 Each selector gets its own clean production reset, read lease, runner, and
@@ -601,6 +609,23 @@ wall time, CPU time, live heap growth, process disk reads/writes, and target-row
 writes so their cost can be compared directly with an exact pre-change run.
 Pair both with the maintained perf guard for the frame/input-latency budgets from
 `scripts/internal/data/validation_contract.json`.
+
+The macOS native catalog replay lane also checks metadata-only watcher delivery
+against the persistent `.DS_Store` fixture. A live bootstrap capture spans the
+fixture's inode-mtime mutation and must produce a certain, exact-path,
+source/root/stream-bound metadata-only batch before a separate bounded
+historical replay capture is considered. Neither a settled cursor nor history
+completion by itself qualifies the event. The catalog phase then verifies the
+durable checkpoint advances while manifest revision, audio index, and WAV
+projection remain unchanged. The fixture restores its original mtime after
+service shutdown.
+
+The native watcher-restart case accepts the ordinary owner-backed bounded replay
+publication for a known post-restart WAV change, with its exact prior revision,
+source/root/lifecycle receipt, one-path delta, and durable readback. If the
+capture instead retains uncertainty, only one authoritative audit containing
+both the pre-restart and post-restart files is accepted. Both routes retain the
+same mutation deadline and duplicate-publication quiet window.
 
 ### Script and golden checks
 

@@ -1000,8 +1000,8 @@ mod tests {
             let entries = vec![audio(&root, "kick.wav")];
             let tree = FolderTree::from_scan(&[PathBuf::from("empty")], &entries);
             let mut session = SourceSession::new(root.clone());
-            session.entries = entries.clone();
-            session.tree = tree.clone();
+            session.entries = std::sync::Arc::new(entries.clone());
+            session.tree = std::sync::Arc::new(tree.clone());
             session.selected_folder = PathBuf::from("empty");
             view.source_sessions = vec![session];
             view.active_source = Some(0);
@@ -1069,8 +1069,8 @@ mod tests {
             let entries = vec![audio(&root, "kick.wav")];
             let tree = FolderTree::from_scan(&[PathBuf::from("empty")], &entries);
             let mut session = SourceSession::new(root.clone());
-            session.entries = entries.clone();
-            session.tree = tree.clone();
+            session.entries = std::sync::Arc::new(entries.clone());
+            session.tree = std::sync::Arc::new(tree.clone());
             view.source_sessions = vec![session];
             view.active_source = Some(0);
             view.root = Some(root);
@@ -1108,7 +1108,7 @@ mod tests {
         let root = fs::canonicalize(directory.path()).expect("canonical temporary source");
         let mut session = SourceSession::new(root.clone());
         session.source_id = Some(SourceId::from_string("opt-1858-refresh"));
-        session.tree = FolderTree::from_scan(&[], &[]);
+        session.tree = std::sync::Arc::new(FolderTree::from_scan(&[], &[]));
         fs::create_dir(root.join("new-empty-folder")).expect("new disk-only folder");
 
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
@@ -1116,7 +1116,7 @@ mod tests {
             view.source_sessions = vec![session];
             view.active_source = Some(0);
             view.root = Some(root);
-            view.folder_tree = Some(view.source_sessions[0].tree.clone());
+            view.folder_tree = Some(view.source_sessions[0].tree.as_ref().clone());
             view.rebuild_folder_rows_cache();
             assert!(
                 !view.source_sessions[0]
@@ -1161,8 +1161,8 @@ mod tests {
             let entries = vec![audio(&root, "drums/kick.wav")];
             let tree = FolderTree::from_scan(&[PathBuf::from("empty")], &entries);
             let mut session = SourceSession::new(root.clone());
-            session.entries = entries.clone();
-            session.tree = tree.clone();
+            session.entries = std::sync::Arc::new(entries.clone());
+            session.tree = std::sync::Arc::new(tree.clone());
             session.selected_folder = PathBuf::from("empty");
             view.source_sessions = vec![session];
             view.active_source = Some(0);

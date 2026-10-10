@@ -92,4 +92,22 @@ pub(super) fn patch_snapshot(
         // derived from changed audio bytes is invalidated; replay cannot erase curation facts.
     }
     snapshot.committed_revision = delta.revision;
+    for (path, entry) in &delta.touched_directory_changes {
+        match (
+            snapshot
+                .directories
+                .binary_search_by(|e| e.relative_path.cmp(path)),
+            entry,
+        ) {
+            (Ok(i), Some(entry)) => snapshot.directories[i] = entry.clone(),
+            (Err(i), Some(entry)) => snapshot.directories.insert(i, entry.clone()),
+            (Ok(i), None) => {
+                snapshot.directories.remove(i);
+            }
+            (Err(_), None) => {}
+        }
+    }
+    if let Some(generation) = delta.directory_generation {
+        snapshot.directory_generation = generation;
+    }
 }

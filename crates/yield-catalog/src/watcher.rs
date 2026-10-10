@@ -9,6 +9,8 @@ use super::{
     WritableProfileGuard, publication_is_current, request_audit, source_root_identity,
 };
 
+mod native_replay;
+
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
 const WATCHER_MAX_DELAY: Duration = Duration::from_secs(2);
 const WATCHER_RETRY_MIN: Duration = Duration::from_secs(1);
@@ -25,6 +27,7 @@ pub(super) enum WatcherMode {
 }
 
 pub(super) struct WatcherSchedule {
+    native_replay: Option<native_replay::NativeReplayWork>,
     pending: Option<PendingWatcherHint>,
     initial_audit_pending: bool,
     watcher_retry_after: Option<Instant>,
@@ -62,6 +65,7 @@ impl WatcherSchedule {
     }
     pub(super) fn new(initial_audit_pending: bool) -> Self {
         Self {
+            native_replay: None,
             pending: None,
             initial_audit_pending,
             watcher_retry_after: None,
@@ -315,8 +319,9 @@ pub(super) fn run_watcher_idle_work(
     probe_source_roots(sources, now);
     refresh_source_watchers(sources, test_gate, watcher_mode, now);
     drain_source_watcher_hints(sources, now);
+    native_replay::run(profile_guard, events, admission, sources, watcher_mode, now);
     let Some((source_id, lifecycle_generation, pending)) =
-        claim_watcher_audit(admission, sources, now)
+        claim_watcher_audit(admission, sources, watcher_mode, now)
     else {
         return;
     };
@@ -460,18 +465,15 @@ fn drain_source_watcher_hints(
 
 fn merge_source_watcher_hint(source: &mut RegisteredSource, hint: &SourceWatchHint) {
     let evidence = hint.evidence();
-    let root_only_ambiguity = evidence.has_root_metadata_ambiguity()
-        && !evidence.has_descendant_change()
-        && !evidence.requires_full_rescan()
-        && !evidence.has_backend_error();
-    if root_only_ambiguity {
-        let unchanged = source_root_identity(&source.root)
+    let root_only_ambiguity = is_root_only_ambiguity(evidence);
+    let root_unchanged = root_only_ambiguity.then(|| {
+        source_root_identity(&source.root)
             .ok()
-            .is_some_and(|identity| source.known_root_identity.as_ref() == Some(&identity));
-        if unchanged {
-            return;
-        }
-    }
+            .is_some_and(|identity| source.known_root_identity.as_ref() == Some(&identity))
+    });
+    let Some(evidence) = evidence_after_root_probe(evidence, root_unchanged) else {
+        return;
+    };
     source.watcher_schedule.merge_pending(PendingWatcherHint {
         first_observed: hint.first_observed(),
         last_observed: hint.last_observed(),
@@ -479,13 +481,45 @@ fn merge_source_watcher_hint(source: &mut RegisteredSource, hint: &SourceWatchHi
     });
 }
 
+fn evidence_after_root_probe(
+    evidence: WatchHintEvidence,
+    root_unchanged: Option<bool>,
+) -> Option<WatchHintEvidence> {
+    if is_root_only_ambiguity(evidence) && root_unchanged == Some(true) {
+        return evidence
+            .has_finder_metadata_change()
+            .then_some(WatchHintEvidence::FINDER_METADATA_CHANGED);
+    }
+    Some(evidence)
+}
+
+fn is_root_only_ambiguity(evidence: WatchHintEvidence) -> bool {
+    evidence.has_root_metadata_ambiguity()
+        && !evidence.has_descendant_change()
+        && !evidence.requires_full_rescan()
+        && !evidence.has_backend_error()
+}
+
 fn claim_watcher_audit(
     admission: &Arc<Mutex<AdmissionState>>,
     sources: &mut HashMap<super::SourceId, RegisteredSource>,
+    watcher_mode: WatcherMode,
     now: Instant,
 ) -> Option<(super::SourceId, u64, PendingWatcherHint)> {
     let candidate = sources.iter().find_map(|(source_id, source)| {
+        if matches!(watcher_mode, WatcherMode::Detached)
+            && source
+                .watcher_schedule
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.evidence.is_only_finder_metadata_change())
+        {
+            // Detached mode has no original FSEvents stream to advance a replay cursor from.
+            // Keep its historical no-audit behavior for Finder bookkeeping-only writes.
+            return None;
+        }
         if source.watcher_schedule.initial_audit_pending
+            || source.watcher_schedule.native_replay.is_some()
             || source.watcher_schedule.root_issue_blocks_audit()
         {
             return None;
@@ -530,6 +564,31 @@ fn claim_watcher_audit(
 mod tests {
     use super::super::RootIdentity;
     use super::*;
+
+    #[test]
+    fn stable_root_coalescing_preserves_only_the_safe_finder_wake() {
+        let root_only = WatchHintEvidence::ROOT_METADATA_AMBIGUOUS;
+        let finder = WatchHintEvidence::FINDER_METADATA_CHANGED;
+        let coalesced = root_only.union(finder);
+
+        assert_eq!(evidence_after_root_probe(root_only, Some(true)), None);
+        assert_eq!(
+            evidence_after_root_probe(coalesced, Some(true)),
+            Some(finder)
+        );
+        assert_eq!(
+            evidence_after_root_probe(coalesced, Some(false)),
+            Some(coalesced),
+            "a replaced root keeps the original conservative evidence"
+        );
+        assert_eq!(
+            evidence_after_root_probe(coalesced, None),
+            Some(coalesced),
+            "an unverified root keeps the original conservative evidence"
+        );
+        let mixed = coalesced.union(WatchHintEvidence::DESCENDANT_CHANGED);
+        assert_eq!(evidence_after_root_probe(mixed, Some(true)), Some(mixed));
+    }
 
     #[test]
     fn schedule_debounces_and_applies_bounded_retry_backoff() {

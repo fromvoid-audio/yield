@@ -17,13 +17,25 @@ pub(crate) struct ReplayState {
     pub(crate) audit_request: Option<SourceAuditRequest>,
     pub(super) needs_audit: bool,
     pub(super) audit_batch: Option<ReplayObservationBatch>,
+    // The original native slot survives a dropped reply and an uncertain commit.
+    _capture: Option<Arc<CapturedNativeReplayBatch>>,
     _permit: Arc<Permit>,
 }
 impl ReplayState {
+    pub(super) fn capture_permit(
+        &self,
+        capture: &Arc<CapturedNativeReplayBatch>,
+    ) -> Option<Arc<Permit>> {
+        self._capture
+            .as_ref()
+            .filter(|original| Arc::ptr_eq(original, capture))
+            .map(|_| self._permit.clone())
+    }
     pub(super) fn new(
         source: SourceId,
         root: RootIdentity,
         prior: Option<&ReplayPriorToken>,
+        capture: Option<Arc<CapturedNativeReplayBatch>>,
         permit: Arc<Permit>,
     ) -> Result<Self, CatalogReplayError> {
         let raw =
@@ -54,6 +66,7 @@ impl ReplayState {
             audit_request: None,
             needs_audit: false,
             audit_batch: None,
+            _capture: capture,
             _permit: permit,
         })
     }

@@ -468,8 +468,12 @@ impl Browser {
             changed |= self.apply_source_registry_event(event, cx);
         }
         let mut catalog_deliveries = Vec::new();
+        // Keep the next revision's bounded delivery on the catalog while its preceding
+        // projection is still being built. Automatic replay then retains its original
+        // envelope under the existing event budget instead of losing a delta in the UI.
+        let projection_pending = self.catalog_projection_task.is_some();
         let catalog_events_capped = cx.update_global::<SourceRegistryGlobal, _>(|global, _| {
-            global.drain_catalog_deliveries(&mut catalog_deliveries)
+            !projection_pending && global.drain_catalog_deliveries(&mut catalog_deliveries)
         });
         for delivery in catalog_deliveries {
             changed |= self.apply_catalog_delivery(delivery, cx);
@@ -823,9 +827,9 @@ impl Browser {
             session.root = source.root.clone();
             session.label = source_label(&source.root);
             if root_changed {
-                session.entries.clear();
-                session.tree = yield_core::FolderTree::default();
-                session.catalog_facts.clear();
+                session.entries = std::sync::Arc::new(Vec::new());
+                session.tree = std::sync::Arc::new(yield_core::FolderTree::default());
+                session.catalog_facts = std::sync::Arc::new(std::collections::HashMap::new());
                 session.selected_audio_id = None;
             }
             sessions.push(session);

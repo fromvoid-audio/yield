@@ -165,15 +165,15 @@ struct SourceSession {
     role: SourceRole,
     root: PathBuf,
     label: String,
-    entries: Vec<AudioFile>,
-    tree: FolderTree,
+    entries: Arc<Vec<AudioFile>>,
+    tree: Arc<FolderTree>,
     selected_folder: PathBuf,
     expanded_folders: BTreeSet<PathBuf>,
     folder_scope: FolderScope,
     curation_queue_mode: yield_core::CurationQueueMode,
     harvest_mode: harvest_filter::HarvestMode,
     selected_audio_id: Option<AudioFileId>,
-    catalog_facts: HashMap<PathBuf, catalog::CatalogFileFacts>,
+    catalog_facts: Arc<HashMap<PathBuf, catalog::CatalogFileFacts>>,
     catalog_lifecycle_generation: Option<u64>,
     last_error: Option<String>,
 }
@@ -196,15 +196,15 @@ impl SourceSession {
             role: SourceRole::Normal,
             root,
             label,
-            entries: Vec::new(),
-            tree: FolderTree::default(),
+            entries: Arc::new(Vec::new()),
+            tree: Arc::new(FolderTree::default()),
             selected_folder: PathBuf::from("."),
             expanded_folders: BTreeSet::from([PathBuf::from(".")]),
             folder_scope: FolderScope::DirectOnly,
             curation_queue_mode: yield_core::CurationQueueMode::default(),
             harvest_mode: harvest_filter::HarvestMode::default(),
             selected_audio_id: None,
-            catalog_facts: HashMap::new(),
+            catalog_facts: Arc::new(HashMap::new()),
             catalog_lifecycle_generation: None,
             last_error: None,
         }
@@ -1460,9 +1460,9 @@ impl Browser {
         let session = &mut self.source_sessions[source_index];
         session.root = root.clone();
         session.label = source_label(&root);
-        session.entries = entries.clone();
-        session.tree = tree.clone();
-        session.catalog_facts.clear();
+        session.entries = Arc::new(entries.clone());
+        session.tree = Arc::new(tree.clone());
+        session.catalog_facts = Arc::new(HashMap::new());
         session.selected_folder = state.selected.clone();
         session.expanded_folders = state.expanded.clone();
         session.folder_scope = previous_scope;
@@ -1587,8 +1587,8 @@ impl Browser {
         self.pending_source_return_root = None;
         self.pending_source_label = None;
         self.root = Some(self.source_sessions[index].root.clone());
-        self.entries = self.source_sessions[index].entries.clone();
-        self.folder_tree = Some(self.source_sessions[index].tree.clone());
+        self.entries = self.source_sessions[index].entries.as_ref().clone();
+        self.folder_tree = Some(self.source_sessions[index].tree.as_ref().clone());
         self.selected_folder = self.source_sessions[index].selected_folder.clone();
         self.expanded_folders = self.source_sessions[index].expanded_folders.clone();
         self.rebuild_folder_rows_cache();
@@ -3578,7 +3578,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let mut source = SourceSession::new(root.clone());
-            source.entries = entries.clone();
+            source.entries = entries.clone().into();
             view.source_sessions = vec![source];
             view.active_source = Some(0);
             view.root = Some(root);
@@ -3719,7 +3719,7 @@ mod tests {
         assert_eq!(session.source_id, Some(source.id));
         assert_eq!(session.root, root);
         assert!(session.entries.is_empty());
-        assert_eq!(session.tree, super::FolderTree::default());
+        assert_eq!(*session.tree, super::FolderTree::default());
         assert!(session.selected_audio_id.is_none());
     }
 

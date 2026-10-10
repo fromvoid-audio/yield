@@ -143,6 +143,32 @@ changed. A restart or rebind without a replayable cursor follows the same
 unproven/audit path. The adapter boundary is specified here so live and replay
 paths converge; implementing a new backend or cursor is a later slice.
 
+The exact, already-existing regular file `.DS_Store` is retained as a privately
+tagged native observation when FSEvents reports a certain modification. Only a
+complete capture containing exclusively those tagged observations may use the
+source owner's normal replay admission and durable checkpoint writer without
+running path reconciliation. The tag is not proof: the owner still validates
+source, root, stream, watcher generation, prior acknowledgement, revision and
+capture interval, and reads the committed receipt back before retiring capture
+custody. This checkpoint does not change the manifest revision or publish a
+renderer delta. A genuinely empty capture retains its bounded retry behavior;
+mixed source changes, create/rename/remove, non-file entries, and uncertain
+delivery stay on ordinary replay or conservative audit paths.
+The local native acceptance exercises an existing-file inode timestamp change;
+content writes that macOS reports with `ItemCreated` remain on conservative
+ordinary replay and do not qualify for the metadata-only checkpoint.
+
+The native test source is a content-keyed fixture under the Git common
+directory's `.git/local-ci/fixtures/native-metadata/`. Full and native
+`catalog-replay` lanes prepare it before Cargo starts, so detached checkouts and
+temporary clean-state work do not reset its filesystem history. The helper
+creates the key atomically once, records root/file device and inode identities,
+and verifies an existing key without repair. A missing, changed, symlinked, or
+otherwise unexpected keyed tree fails the lane. The test uses a separate
+disposable catalog profile and restores the fixture file's original mtime only
+after watcher shutdown; the persistent source bytes and identities are checked
+again afterward.
+
 ## Conservative normalization (ExactEntry/Subtree/SourceAudit, uncertainty widens, rename/copy/delete/missing-parent/symlink/unsupported-only/empty-folder rules)
 
 Normalization is lossless and syntactic only. It validates root-relative syntax,

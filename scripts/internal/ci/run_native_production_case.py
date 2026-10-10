@@ -9,6 +9,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -16,7 +17,16 @@ from runtime_paths import canonicalize_tmpdir  # noqa: E402
 
 canonicalize_tmpdir()
 import local_state  # noqa: E402
-from process_tree import Cancelled, catch_cancellation_signals, ignore_cancellation_signals  # noqa: E402
+from process_tree import (  # noqa: E402
+    Cancelled,
+    GroupCleanupUnconfirmed,
+    catch_cancellation_signals,
+    group_exists,
+    ignore_cancellation_signals,
+    terminate_owned_group,
+)
+
+CARGO_TERMINATION_GRACE_SECONDS = (10.0, 10.0, 5.0)
 
 CASES = {
     "capacity": "operation_journal::owner::tests::capacity_startup_tests::capacity_startup_native_production_rebuilds_original_descriptor_bound_image",
@@ -41,7 +51,7 @@ def selector_output_is_exactly_one_success(selector: str, output: str) -> bool:
     )
 
 
-def main() -> int:
+def _main() -> int:
     if len(sys.argv) != 2 or sys.argv[1] not in CASES:
         print("usage: run_native_production_case.py <" + "|".join(CASES) + ">", file=sys.stderr)
         return 2
@@ -61,6 +71,7 @@ def main() -> int:
     process = None
     status = 1
     failure = None
+    keep_transaction_parked = False
     env = os.environ.copy()
     env.pop("YIELD_MAINTENANCE_ADMISSION_FD", None)
     env.pop("YIELD_MAINTENANCE_TRANSITION_FD", None)
@@ -75,28 +86,64 @@ def main() -> int:
         coordinator_fd = env.get("YIELD_LOCAL_CI_COORDINATOR_FD")
         if coordinator_fd is not None:
             inherited_fds.append(int(coordinator_fd))
-        process = subprocess.Popen(
-            command,
-            cwd=checkout,
-            env=env,
-            pass_fds=tuple(inherited_fds),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        try:
-            with catch_cancellation_signals():
-                output, _ = process.communicate()
-        except Cancelled as cancelled:
-            ignore_cancellation_signals()
-            failure = f"native production selector cancelled by signal {cancelled.signum}"
-            status = 128 + cancelled.signum
-            # The state transaction must outlive Cargo. The outer managed
-            # process-group watchdog owns escalation, so keep draining/reaping
-            # this child here before the finally block restores application
-            # state. A second communicate also preserves output produced while
-            # the child handles the cancellation signal.
-            output, _ = process.communicate()
-        decoded = output.decode("utf-8", errors="replace")
+        with tempfile.TemporaryFile(mode="w+b") as captured_output:
+            with catch_cancellation_signals(
+                defer_startup=True, preserve_ignored_on_exit=True
+            ) as activate_cancellation:
+                process = None
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        cwd=checkout,
+                        env=env,
+                        pass_fds=tuple(inherited_fds),
+                        stdout=captured_output,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    activate_cancellation()
+                    process.wait()
+                    if group_exists(process.pid):
+                        ignore_cancellation_signals()
+                        if not terminate_owned_group(
+                            process.pid,
+                            process,
+                            grace_seconds=CARGO_TERMINATION_GRACE_SECONDS,
+                        ):
+                            raise GroupCleanupUnconfirmed(
+                                f"could not confirm exit of Cargo process group {process.pid} after leader exit"
+                            )
+                        failure = "Cargo left descendants in its owned process group"
+                        status = 1
+                except Cancelled as cancelled:
+                    ignore_cancellation_signals()
+                    failure = f"native production selector cancelled by signal {cancelled.signum}"
+                    status = 128 + cancelled.signum
+                    if process is not None and not terminate_owned_group(
+                        process.pid,
+                        process,
+                        grace_seconds=CARGO_TERMINATION_GRACE_SECONDS,
+                    ):
+                        raise GroupCleanupUnconfirmed(
+                            f"could not confirm exit of cancelled Cargo process group {process.pid}"
+                        )
+                except GroupCleanupUnconfirmed:
+                    raise
+                except BaseException:
+                    ignore_cancellation_signals()
+                    if process is None:
+                        raise
+                    if not terminate_owned_group(
+                        process.pid,
+                        process,
+                        grace_seconds=CARGO_TERMINATION_GRACE_SECONDS,
+                    ):
+                        raise GroupCleanupUnconfirmed(
+                            f"could not confirm exit of failed Cargo process group {process.pid}"
+                        )
+                    raise
+            captured_output.seek(0)
+            decoded = captured_output.read().decode("utf-8", errors="replace")
         sys.stdout.write(decoded)
         sys.stdout.flush()
         if failure is None:
@@ -108,20 +155,54 @@ def main() -> int:
     except KeyboardInterrupt:
         failure = "interrupted"
         status = 130
+    except Cancelled as cancelled:
+        ignore_cancellation_signals()
+        failure = f"native production selector cancelled before Cargo startup by signal {cancelled.signum}"
+        status = 128 + cancelled.signum
+    except GroupCleanupUnconfirmed as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+        status = 1
+        keep_transaction_parked = True
     except BaseException as exc:
         failure = f"{type(exc).__name__}: {exc}"
     finally:
-        if namespace_fd is not None:
-            os.close(namespace_fd)
-        if transition_fd is not None:
-            os.close(transition_fd)
         if transaction and transaction.get("transaction"):
+            ignore_cancellation_signals()
+        if namespace_fd is not None:
             try:
-                restored = local_state.restore(str(transaction["transaction"]))
-                print(json.dumps({"restore": restored}, indent=2), flush=True)
+                os.close(namespace_fd)
             except BaseException as exc:
-                failure = f"state restore failed: {type(exc).__name__}: {exc}"
+                if failure is None:
+                    failure = f"namespace descriptor close failed: {type(exc).__name__}: {exc}"
                 status = 1
+        if transition_fd is not None:
+            try:
+                os.close(transition_fd)
+            except BaseException as exc:
+                if failure is None:
+                    failure = f"transition descriptor close failed: {type(exc).__name__}: {exc}"
+                status = 1
+        if transaction and transaction.get("transaction"):
+            if keep_transaction_parked:
+                print(
+                    json.dumps(
+                        {
+                            "restore": "deferred",
+                            "transaction": transaction["transaction"],
+                            "reason": "Cargo process-group exit was not confirmed",
+                        },
+                        indent=2,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                try:
+                    restored = local_state.restore(str(transaction["transaction"]))
+                    print(json.dumps({"restore": restored}, indent=2), flush=True)
+                except BaseException as exc:
+                    failure = f"state restore failed: {type(exc).__name__}: {exc}"
+                    status = 1
         record = {
             "schema": 1,
             "case": case_name,
@@ -135,6 +216,14 @@ def main() -> int:
         }
         print(json.dumps(record, indent=2), flush=True)
     return status
+
+
+def main() -> int:
+    # Keep a final signal-restoration scope around transaction cleanup. The
+    # nested Popen scope may leave signals ignored after cancellation so a
+    # later escalation cannot interrupt local_state.restore.
+    with catch_cancellation_signals():
+        return _main()
 
 
 if __name__ == "__main__":

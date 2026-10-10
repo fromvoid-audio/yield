@@ -9,13 +9,52 @@ use std::path::{Path, PathBuf};
 
 use fsevent_sys as fs;
 
+use crate::SourceWatchSpec;
+
 use super::{
-    MAX_REPLAY_EVENTS, ReplayEventCondition, ReplayIngress, ReplayPathKind, ReplayUncertainty,
+    MAX_REPLAY_EVENTS, ReplayCandidate, ReplayEventCondition, ReplayIngress, ReplayPathKind,
+    ReplayUncertainty,
 };
 
 mod native;
 
 pub use native::{BootstrapCapture, NativeReplayError, capture_history};
+
+#[cfg(test)]
+pub(super) use native::capture_test_guard;
+
+pub(super) fn capture_history_with_custody<T: Send + Sync + 'static>(
+    spec: SourceWatchSpec,
+    after_event_id: u64,
+    timeout: std::time::Duration,
+    custody: std::sync::Arc<T>,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<ReplayCandidate, NativeReplayError> {
+    native::capture_history_with_custody(spec, after_event_id, timeout, custody, cancellation)
+}
+
+#[cfg(test)]
+pub(super) fn capture_history_with_test_hooks<T: Send + Sync + 'static>(
+    spec: SourceWatchSpec,
+    after_event_id: u64,
+    timeout: std::time::Duration,
+    custody: std::sync::Arc<T>,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    before_first_slice: std::sync::mpsc::Receiver<()>,
+    cleaned: std::sync::mpsc::SyncSender<()>,
+) -> Result<ReplayCandidate, NativeReplayError> {
+    native::capture_history_with_test_hooks(
+        spec,
+        after_event_id,
+        timeout,
+        custody,
+        cancellation,
+        entered,
+        before_first_slice,
+        cleaned,
+    )
+}
 
 /// One borrowed native callback record, before source-relative validation.
 #[derive(Clone, Copy, Debug)]
@@ -114,39 +153,40 @@ pub(super) fn record_callback_event(
         fs::kFSEventStreamEventFlagItemIsSymlink => ReplayPathKind::Symlink,
         _ => ReplayPathKind::Unknown,
     };
-    if condition == ReplayEventCondition::Changed
-        && kind == ReplayPathKind::File
-        && absolute
+    if condition == ReplayEventCondition::Changed && kind == ReplayPathKind::File {
+        let safe_relative = absolute
             .strip_prefix(ingress.spec.root())
             .ok()
-            .is_some_and(|relative| {
+            .filter(|relative| {
                 relative
                     .components()
                     .all(|component| matches!(component, std::path::Component::Normal(_)))
-                    && relative
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            // Finder writes this exact metadata filename while browsing.
-                            // Only ignore a known file event: a directory with this name,
-                            // an audio filename beginning with it, or uncertain delivery
-                            // must still reach authoritative reconciliation.
-                            (name == ".DS_Store"
-                                && flags
-                                    & (fs::kFSEventStreamEventFlagItemCreated
-                                        | fs::kFSEventStreamEventFlagItemRemoved
-                                        | fs::kFSEventStreamEventFlagItemRenamed)
-                                    == 0)
-                                || ingress
-                                    .spec
-                                    .ignored_file_name_prefixes()
-                                    .iter()
-                                    .any(|prefix| name.starts_with(prefix))
-                        })
-            })
-    {
-        ingress.record_ignored_artifact(event.event_id);
-        return;
+            });
+        if let Some(relative) = safe_relative {
+            let name = relative.file_name().and_then(|name| name.to_str());
+            let known_metadata = name == Some(".DS_Store")
+                && flags
+                    & (fs::kFSEventStreamEventFlagItemCreated
+                        | fs::kFSEventStreamEventFlagItemRemoved
+                        | fs::kFSEventStreamEventFlagItemRenamed)
+                    == 0;
+            if known_metadata {
+                ingress.record_metadata_artifact(event.event_id, &absolute);
+                return;
+            }
+            // Preserve the existing exclusion policy for other source-local runtime sidecars.
+            // Only the exact known Finder metadata file receives a private durable-checkpoint tag.
+            if name.is_some_and(|name| {
+                ingress
+                    .spec
+                    .ignored_file_name_prefixes()
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+            }) {
+                ingress.record_ignored_artifact(event.event_id);
+                return;
+            }
+        }
     }
     ingress.record_with_kind(Some(event.event_id), &absolute, condition, kind);
 }
@@ -302,6 +342,15 @@ mod tests {
         ingress.mark_history_complete();
         let candidate = ingress.into_candidate();
         assert!(candidate.events().is_empty());
+        assert_eq!(candidate.ignored_artifacts().len(), 1);
+        assert_eq!(
+            candidate.ignored_artifacts()[0].relative_path(),
+            Path::new(".DS_Store")
+        );
+        assert_eq!(
+            candidate.ignored_artifacts()[0].kind(),
+            ReplayPathKind::File
+        );
         assert_eq!(candidate.last_seen(), Some(108));
         assert!(candidate.history_complete());
         assert!(candidate.uncertainty().is_empty());

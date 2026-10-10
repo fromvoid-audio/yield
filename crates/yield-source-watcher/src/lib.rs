@@ -53,6 +53,9 @@ impl WatchHintEvidence {
     pub const FULL_RESCAN: Self = Self(1 << 2);
     /// The backend reported an error; [`Self::FULL_RESCAN`] is set with it.
     pub const BACKEND_ERROR: Self = Self(1 << 3);
+    /// A write to the exact known Finder metadata file should wake native history capture.
+    /// This is scheduling evidence only; the native callback must independently classify it.
+    pub const FINDER_METADATA_CHANGED: Self = Self(1 << 4);
 
     /// Return whether no evidence flags are set.
     pub const fn is_empty(self) -> bool {
@@ -77,6 +80,16 @@ impl WatchHintEvidence {
     /// Return whether the watcher backend reported an error.
     pub const fn has_backend_error(self) -> bool {
         self.0 & Self::BACKEND_ERROR.0 != 0
+    }
+
+    /// Return whether this evidence includes a known Finder metadata write.
+    pub const fn has_finder_metadata_change(self) -> bool {
+        self.0 & Self::FINDER_METADATA_CHANGED.0 != 0
+    }
+
+    /// Return whether this hint contains only the exact Finder-metadata wake bit.
+    pub const fn is_only_finder_metadata_change(self) -> bool {
+        self.0 == Self::FINDER_METADATA_CHANGED.0
     }
 
     /// Return whether every flag in `required` is present.
@@ -534,9 +547,11 @@ fn classify_event(spec: &SourceWatchSpec, event: &Event) -> WatchHintEvidence {
                 evidence = evidence.union(classify_root_event(event.kind));
             }
             PathRelation::Descendant => {
-                if is_ignored_file_name(path, spec.ignored_file_name_prefixes)
-                    || is_finder_bookkeeping_event(path, event.kind)
-                {
+                if cfg!(target_os = "macos") && is_finder_bookkeeping_write(path, event.kind) {
+                    evidence = evidence.union(WatchHintEvidence::FINDER_METADATA_CHANGED);
+                    continue;
+                }
+                if is_ignored_file_name(path, spec.ignored_file_name_prefixes) {
                     continue;
                 }
                 evidence = evidence.union(classify_descendant_event(event.kind));
@@ -589,21 +604,15 @@ fn is_ignored_file_name(path: &Path, prefixes: &[&str]) -> bool {
         .is_some_and(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
 }
 
-fn is_finder_bookkeeping_event(path: &Path, kind: EventKind) -> bool {
-    cfg!(target_os = "macos") && is_reserved_finder_bookkeeping_write(path, kind)
-}
-
-fn is_reserved_finder_bookkeeping_write(path: &Path, kind: EventKind) -> bool {
-    // Notify's macOS adapter drops the file/dir flag on data and metadata writes.
-    // Filter only ordinary bookkeeping writes to Finder's exact reserved filename;
-    // directory creation/removal, renames, unknown kinds and rescan flags retain
-    // their conservative behavior. Never prefix-match an audio filename here.
+fn is_finder_bookkeeping_write(path: &Path, kind: EventKind) -> bool {
+    // Notify's macOS adapter drops the file/dir flag on data and metadata writes. Retain an
+    // exact-file wake hint so Native mode can ask FSEvents for the authoritative record. The
+    // detached scheduler suppresses this hint; it is never itself a cursor or mutation grant.
+    // Creates, removals, renames, unknown kinds and rescan flags remain conservative.
     path.file_name().is_some_and(|name| name == ".DS_Store")
         && matches!(
             kind,
-            EventKind::Create(notify::event::CreateKind::File)
-                | EventKind::Remove(notify::event::RemoveKind::File)
-                | EventKind::Modify(ModifyKind::Data(_))
+            EventKind::Modify(ModifyKind::Data(_))
                 | EventKind::Modify(ModifyKind::Metadata(
                     notify::event::MetadataKind::Any
                         | notify::event::MetadataKind::Other
@@ -830,25 +839,25 @@ mod tests {
     }
 
     #[test]
-    fn finder_bookkeeping_policy_preserves_namespace_changes_and_nonreserved_names() {
+    fn finder_bookkeeping_policy_only_matches_known_file_writes() {
         let path = Path::new("/fixture/Library/.DS_Store");
         for kind in [
-            EventKind::Create(notify::event::CreateKind::File),
-            EventKind::Remove(notify::event::RemoveKind::File),
             EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
             EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended)),
         ] {
-            assert!(is_reserved_finder_bookkeeping_write(path, kind));
-            assert!(!is_reserved_finder_bookkeeping_write(
+            assert!(is_finder_bookkeeping_write(path, kind));
+            assert!(!is_finder_bookkeeping_write(
                 Path::new("/fixture/Library/.DS_Store.wav"),
                 kind
             ));
-            assert!(!is_reserved_finder_bookkeeping_write(
+            assert!(!is_finder_bookkeeping_write(
                 Path::new("/fixture/Library/.DS_Store.backup"),
                 kind
             ));
         }
         for kind in [
+            EventKind::Create(notify::event::CreateKind::File),
+            EventKind::Remove(notify::event::RemoveKind::File),
             EventKind::Any,
             EventKind::Other,
             EventKind::Create(notify::event::CreateKind::Folder),
@@ -856,10 +865,7 @@ mod tests {
             EventKind::Create(notify::event::CreateKind::Any),
             EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
         ] {
-            assert!(
-                !is_reserved_finder_bookkeeping_write(path, kind),
-                "{kind:?}"
-            );
+            assert!(!is_finder_bookkeeping_write(path, kind), "{kind:?}");
         }
     }
 
@@ -880,18 +886,20 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn finder_bookkeeping_does_not_schedule_audit_but_real_changes_do() {
+    fn finder_bookkeeping_wakes_native_history_but_keeps_ambiguous_events_conservative() {
         let root = PathBuf::from("/tmp/source-watcher-test-root");
         let signal = WatcherSignal::new(spec(&root));
         let metadata = root.join(".DS_Store");
         for kind in [
-            EventKind::Create(notify::event::CreateKind::File),
             EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
             EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
-            EventKind::Remove(notify::event::RemoveKind::File),
         ] {
             signal.record_notify_result(Ok(event(kind, &[&metadata])), Instant::now());
-            assert!(signal.take_hint().is_none(), "{kind:?}");
+            assert_eq!(
+                signal.take_hint().expect("native history wake").evidence(),
+                WatchHintEvidence::FINDER_METADATA_CHANGED,
+                "{kind:?}"
+            );
         }
         for (path, kind) in [
             (
@@ -911,9 +919,22 @@ mod tests {
                 EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any)),
             ),
             (metadata.clone(), EventKind::Any),
+            (
+                metadata.clone(),
+                EventKind::Create(notify::event::CreateKind::File),
+            ),
+            (
+                metadata.clone(),
+                EventKind::Remove(notify::event::RemoveKind::File),
+            ),
         ] {
             signal.record_notify_result(Ok(event(kind, &[&path])), Instant::now());
-            assert!(signal.take_hint().is_some(), "{path:?}: {kind:?}");
+            let hint = signal.take_hint().expect("conservative hint");
+            assert!(
+                hint.evidence().has_descendant_change() || hint.evidence().requires_full_rescan(),
+                "{path:?}: {kind:?}: {:?}",
+                hint.evidence()
+            );
         }
         let mut rescan = event(
             EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
@@ -990,21 +1011,19 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn native_finder_bookkeeping_is_quiet_while_audio_creation_is_observed() {
+    fn native_finder_bookkeeping_and_audio_paths_remain_observable() {
         let root = tempfile::tempdir().expect("temporary source root");
         let canonical_root = root.path().canonicalize().expect("canonical source root");
+        fs::write(canonical_root.join(".DS_Store"), b"initial Finder metadata")
+            .expect("create known metadata file before watching");
         let watcher = SourceWatcher::start(spec(&canonical_root)).expect("native watcher");
-        fs::write(
-            canonical_root.join(".DS_Store"),
-            b"disposable Finder metadata",
-        )
-        .expect("write bookkeeping file");
+        fs::write(canonical_root.join(".DS_Store"), b"changed Finder metadata")
+            .expect("modify known bookkeeping file");
         let quiet_until = Instant::now() + Duration::from_secs(3);
         while Instant::now() < quiet_until {
             if let Some(hint) = watcher.take_hint() {
                 // Creating a child can also report metadata for the source root. The
                 // catalog already discards that hint after verifying root identity.
-                assert!(!hint.evidence().has_descendant_change());
                 assert!(!hint.evidence().requires_full_rescan());
             }
             thread::sleep(Duration::from_millis(25));

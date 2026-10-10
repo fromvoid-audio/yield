@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 
 impl SourceWriteBatch<'_> {
     /// Replace only the directory facts covered by a complete held subtree traversal, preserving
@@ -75,6 +76,16 @@ impl SourceWriteBatch<'_> {
         if savepoint.execute("UPDATE source_directory_generations SET expected_entry_count=?1, staged_entry_count=?1, published_source_revision=?2 WHERE generation=?3 AND status='active' AND complete=1 AND published_source_revision=?4",rusqlite::params![count,published,facts.generation,facts.published_revision])?!=1 { return Err(SourceDbError::Unexpected); }
         savepoint.commit()?;
         self.subtree_directory_revision = Some(published as u64);
+        let mut changes = facts
+            .directories
+            .iter()
+            .map(|d| (d.relative_path.clone(), None))
+            .collect::<BTreeMap<_, _>>();
+        for entry in entries {
+            changes.insert(entry.relative_path.clone(), Some(entry.clone()));
+        }
+        self.subtree_directory_changes =
+            Some((facts.generation as u64, changes.into_iter().collect()));
         Ok(())
     }
 }

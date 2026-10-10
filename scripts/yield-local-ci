@@ -70,13 +70,17 @@ sys.path.insert(0, str(ROOT / "scripts" / "internal" / "ci"))
 import local_state  # noqa: E402
 from process_tree import (  # noqa: E402
     Cancelled,
+    GroupCleanupUnconfirmed,
     catch_cancellation_signals,
+    group_exists,
     ignore_cancellation_signals,
     terminate_owned_group,
 )
 
 COORDINATOR_FD: Optional[int] = None
 ADMISSION_MARKER = b"YIELD_ADMISSION_PROTOCOL_V1"
+# A full check can contain the runner's 40-second nested-validator cleanup.
+MANAGED_COMMAND_TERMINATION_GRACE_SECONDS = (40.0, 10.0, 5.0)
 
 
 class CiError(RuntimeError):
@@ -149,29 +153,79 @@ def run_managed(
     pass_fds: tuple[int, ...] = (),
     stdout: object = None,
     timeout_seconds: int = 6 * 60 * 60,
+    preserve_ignored_on_exit: bool = False,
 ) -> int:
-    with catch_cancellation_signals():
-        process = subprocess.Popen(
-            command,
-            cwd=str(cwd),
-            env=env,
-            stdout=stdout,
-            stderr=subprocess.STDOUT if stdout is not None else None,
-            pass_fds=pass_fds,
-            start_new_session=True,
-        )
+    with catch_cancellation_signals(
+        defer_startup=True, preserve_ignored_on_exit=preserve_ignored_on_exit
+    ) as activate_cancellation:
+        process = None
         try:
-            return process.wait(timeout=timeout_seconds)
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                env=env,
+                stdout=stdout,
+                stderr=subprocess.STDOUT if stdout is not None else None,
+                pass_fds=pass_fds,
+                start_new_session=True,
+            )
+            activate_cancellation()
+            status = process.wait(timeout=timeout_seconds)
+            if group_exists(process.pid):
+                ignore_cancellation_signals()
+                if not terminate_owned_group(
+                    process.pid,
+                    process,
+                    grace_seconds=MANAGED_COMMAND_TERMINATION_GRACE_SECONDS,
+                ):
+                    raise GroupCleanupUnconfirmed(
+                        f"could not confirm exit of managed command process group {process.pid} after leader exit"
+                    )
+                return status or 1
+            return status
         except Cancelled as cancelled:
             ignore_cancellation_signals()
-            terminate_owned_group(process.pid, process)
+            if process is None:
+                if cancelled.signum == signal.SIGINT:
+                    raise KeyboardInterrupt
+                raise CiError(f"command cancelled by signal {cancelled.signum}: {' '.join(command)}")
+            if not terminate_owned_group(
+                process.pid,
+                process,
+                grace_seconds=MANAGED_COMMAND_TERMINATION_GRACE_SECONDS,
+            ):
+                raise GroupCleanupUnconfirmed(
+                    f"could not confirm exit of managed command process group {process.pid}"
+                )
             if cancelled.signum == signal.SIGINT:
                 raise KeyboardInterrupt
             raise CiError(f"command cancelled by signal {cancelled.signum}: {' '.join(command)}")
         except subprocess.TimeoutExpired as exc:
             ignore_cancellation_signals()
-            terminate_owned_group(process.pid, process)
+            if not terminate_owned_group(
+                process.pid,
+                process,
+                grace_seconds=MANAGED_COMMAND_TERMINATION_GRACE_SECONDS,
+            ):
+                raise GroupCleanupUnconfirmed(
+                    f"could not confirm exit of timed-out command process group {process.pid}"
+                ) from exc
             raise CiError(f"command exceeded the six-hour watchdog: {' '.join(command)}") from exc
+        except GroupCleanupUnconfirmed:
+            raise
+        except BaseException:
+            ignore_cancellation_signals()
+            if process is None:
+                raise
+            if not terminate_owned_group(
+                process.pid,
+                process,
+                grace_seconds=MANAGED_COMMAND_TERMINATION_GRACE_SECONDS,
+            ):
+                raise GroupCleanupUnconfirmed(
+                    f"could not confirm exit of failed managed command process group {process.pid}"
+                )
+            raise
 
 
 def source_sha(value: str) -> str:
@@ -457,7 +511,7 @@ def run_namespace_failure_aggregate(sha: str) -> None:
         )
 
 
-def check(args: argparse.Namespace) -> None:
+def _check(args: argparse.Namespace) -> None:
     sha = source_sha(args.sha)
     if args.lane == "native" and not args.case:
         raise CiError("native lane requires one exact allowlisted --case")
@@ -471,6 +525,9 @@ def check(args: argparse.Namespace) -> None:
         if COORDINATOR_FD is not None:
             env["YIELD_LOCAL_CI_COORDINATOR_FD"] = str(COORDINATOR_FD)
         env["YIELD_LOCAL_CI_SOURCE_SHA"] = sha
+        prepare_metadata_fixture = args.lane == "full" or (
+            args.lane == "native" and args.case == "catalog-replay"
+        )
         facts = doctor(args.lane)
         run_id = f"{time.time_ns()}-{os.getpid()}"
         out_dir = state_dir / "runs" / sha / args.lane / run_id
@@ -523,6 +580,32 @@ def check(args: argparse.Namespace) -> None:
             validator_lease_fd = None
             failure = None
             try:
+                if prepare_metadata_fixture:
+                    fixture_command = [
+                        sys.executable,
+                        str(checkout / "scripts/internal/ci/prepare_native_metadata_fixture.py"),
+                        "--checkout",
+                        str(checkout),
+                        "--state-dir",
+                        str(state_dir),
+                    ]
+                    fixture_result = subprocess.run(
+                        fixture_command, cwd=checkout, check=False, capture_output=True, text=True
+                    )
+                    if fixture_result.returncode != 0:
+                        raise CiError(
+                            "persistent native metadata fixture preparation failed: "
+                            + fixture_result.stderr.strip()
+                        )
+                    try:
+                        fixture_record = json.loads(fixture_result.stdout)
+                    except json.JSONDecodeError as error:
+                        raise CiError("native metadata fixture helper returned malformed evidence") from error
+                    details["native_metadata_fixture"] = fixture_record
+                    env["YIELD_NATIVE_METADATA_FIXTURE_ROOT"] = fixture_record["source_root"]
+                    log.write("$ " + " ".join(fixture_command) + "\n")
+                    log.write(json.dumps(fixture_record, sort_keys=True) + "\n")
+                    log.flush()
                 if args.lane == "native":
                     native_state, namespace_fd, transition_fd = local_state.prepare_clean_launch(
                         "production", artifact=f"native:{sha}:{args.case}"
@@ -554,6 +637,7 @@ def check(args: argparse.Namespace) -> None:
                         env=env,
                         stdout=log,
                         pass_fds=pass_fds,
+                        preserve_ignored_on_exit=args.lane == "native",
                     )
                     details["results"].append({"command": cmd, "exit_code": exit_code})
                     if exit_code:
@@ -580,6 +664,10 @@ def check(args: argparse.Namespace) -> None:
                 details["error"] = str(error)
                 log.write(f"local CI runner error: {error}\n")
             finally:
+                if native_state and native_state.get("transaction"):
+                    # Process cleanup and state restoration form one signal-safe
+                    # transaction, including ordinary child completion.
+                    ignore_cancellation_signals()
                 cleanup_errors = []
                 descriptors = []
                 seen_fds = set()
@@ -605,19 +693,28 @@ def check(args: argparse.Namespace) -> None:
                         except BaseException:
                             pass
                 if native_state and native_state.get("transaction"):
-                    try:
-                        restored = local_state.restore(str(native_state["transaction"]))
-                        details["production_state_restore"] = restored
-                    except BaseException as error:
-                        details["status"] = "restore_failed"
-                        details["restore_error"] = str(error)
-                        if failure is None:
-                            failure = error
+                    if isinstance(failure, GroupCleanupUnconfirmed):
+                        details["status"] = "restore_deferred"
+                        details["restore_error"] = (
+                            "validator process-group exit was not confirmed; "
+                            f"production state remains parked in {native_state['transaction']}"
+                        )
+                        log.write(f"state restore deferred: {details['restore_error']}\n")
+                        log.flush()
+                    else:
                         try:
-                            log.write(f"state restore error: {error}\n")
-                            log.flush()
-                        except BaseException:
-                            pass
+                            restored = local_state.restore(str(native_state["transaction"]))
+                            details["production_state_restore"] = restored
+                        except BaseException as error:
+                            details["status"] = "restore_failed"
+                            details["restore_error"] = str(error)
+                            if failure is None:
+                                failure = error
+                            try:
+                                log.write(f"state restore error: {error}\n")
+                                log.flush()
+                            except BaseException:
+                                pass
                 if cleanup_errors:
                     details["descriptor_cleanup_errors"] = cleanup_errors
                     if details.get("status") == "passed":
@@ -631,6 +728,13 @@ def check(args: argparse.Namespace) -> None:
             raise CiError(f"validation operation failed: {failure}") from failure
         if details["status"] != "passed":
             raise CiError(f"{args.lane} lane failed; complete log retained at {log_path.with_suffix('.log')}")
+
+
+def check(args: argparse.Namespace) -> None:
+    # Keep original signal handlers until _check has closed descriptors and
+    # finished restoring any parked native production state.
+    with catch_cancellation_signals():
+        return _check(args)
 
 
 def build(args: argparse.Namespace) -> None:

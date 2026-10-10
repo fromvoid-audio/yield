@@ -429,7 +429,10 @@ impl Browser {
                     if let Some(entry) = self.entries.get_mut(index) {
                         apply_wav_metadata(entry, wav_metadata.frames, wav_metadata.sample_rate);
                     }
-                    if let Some(entry) = self.source_sessions[active_index].entries.get_mut(index) {
+                    if let Some(entry) =
+                        Arc::make_mut(&mut self.source_sessions[active_index].entries)
+                            .get_mut(index)
+                    {
                         apply_wav_metadata(entry, wav_metadata.frames, wav_metadata.sample_rate);
                     }
                 }

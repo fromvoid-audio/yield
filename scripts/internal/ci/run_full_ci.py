@@ -14,24 +14,90 @@ from runtime_paths import canonicalize_tmpdir  # noqa: E402
 canonicalize_tmpdir()
 import local_state  # noqa: E402
 from run_native_production_case import CASES as NATIVE_PRODUCTION_CASES  # noqa: E402
-from process_tree import Cancelled, catch_cancellation_signals, ignore_cancellation_signals  # noqa: E402
+from process_tree import (  # noqa: E402
+    Cancelled,
+    GroupCleanupUnconfirmed,
+    catch_cancellation_signals,
+    group_exists,
+    ignore_cancellation_signals,
+    terminate_owned_group,
+)
+
+# Native selector children need up to 25 seconds for their Cargo group cleanup.
+# This 30+5+5 ladder grants that cleanup before escalating against the runner.
+CHILD_TERMINATION_GRACE_SECONDS = (30.0, 5.0, 5.0)
 
 
-def run(command: list[str], env: dict[str, str], pass_fds: tuple[int, ...]) -> int:
-    process = subprocess.Popen(command, env=env, pass_fds=pass_fds)
-    try:
-        with catch_cancellation_signals():
-            return process.wait()
-    except Cancelled as cancelled:
-        ignore_cancellation_signals()
-        # Do not let the caller restore the parked state while its validator
-        # child is still running. The surrounding managed process-group
-        # watchdog owns escalation if this wait does not complete.
-        process.wait()
-        return 128 + cancelled.signum
+def run(
+    command: list[str],
+    env: dict[str, str],
+    pass_fds: tuple[int, ...],
+    *,
+    preserve_ignored_on_exit: bool = False,
+) -> int:
+    with catch_cancellation_signals(
+        defer_startup=True, preserve_ignored_on_exit=preserve_ignored_on_exit
+    ) as activate_cancellation:
+        process = None
+        try:
+            process = subprocess.Popen(
+                command,
+                env=env,
+                pass_fds=pass_fds,
+                start_new_session=True,
+            )
+            activate_cancellation()
+            status = process.wait()
+            if group_exists(process.pid):
+                # A normal leader exit must not release the parked-state transaction
+                # while any descendant in its owned group is still running.
+                ignore_cancellation_signals()
+                if not terminate_owned_group(
+                    process.pid,
+                    process,
+                    grace_seconds=CHILD_TERMINATION_GRACE_SECONDS,
+                ):
+                    raise GroupCleanupUnconfirmed(
+                        f"could not confirm exit of validation process group {process.pid} after leader exit"
+                    )
+                print(
+                    f"validation command left descendants in process group {process.pid}; they were terminated",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return status or 1
+            return status
+        except Cancelled as cancelled:
+            ignore_cancellation_signals()
+            if process is None:
+                return 128 + cancelled.signum
+            if not terminate_owned_group(
+                process.pid,
+                process,
+                grace_seconds=CHILD_TERMINATION_GRACE_SECONDS,
+            ):
+                raise GroupCleanupUnconfirmed(
+                    f"could not confirm exit of cancelled validation process group {process.pid}"
+                )
+            return 128 + cancelled.signum
+        except GroupCleanupUnconfirmed:
+            raise
+        except BaseException:
+            ignore_cancellation_signals()
+            if process is None:
+                raise
+            if not terminate_owned_group(
+                process.pid,
+                process,
+                grace_seconds=CHILD_TERMINATION_GRACE_SECONDS,
+            ):
+                raise GroupCleanupUnconfirmed(
+                    f"could not confirm exit of failed validation process group {process.pid}"
+                )
+            raise
 
 
-def main() -> int:
+def _main() -> int:
     if os.name != "posix" or sys.platform != "darwin":
         print("the full native local-CI lane is macOS-only", file=sys.stderr)
         return 2
@@ -54,6 +120,7 @@ def main() -> int:
     transaction = None
     status = 1
     failure: BaseException | None = None
+    keep_transaction_parked = False
     try:
         # These tests use private temporary roots and exercise reset, lock
         # custody and crash recovery without touching Yield's real state. Run
@@ -71,6 +138,7 @@ def main() -> int:
             "scripts.internal.ci.test_local_ci_contract",
             "scripts.internal.ci.test_managed_exec",
             "scripts.internal.ci.test_runtime_paths",
+            "scripts.internal.ci.test_native_metadata_fixture",
         ]
         coordinator_fds: tuple[int, ...] = ()
         coordinator = env.get("YIELD_LOCAL_CI_COORDINATOR_FD")
@@ -97,22 +165,49 @@ def main() -> int:
 
         inherited = [lease_fd]
         inherited.extend(coordinator_fds)
-        status = run(["bash", str(script), "full"], env, tuple(inherited))
+        status = run(
+            ["bash", str(script), "full"],
+            env,
+            tuple(inherited),
+            preserve_ignored_on_exit=True,
+        )
     except BaseException as exc:
         failure = exc
+        if isinstance(exc, Cancelled):
+            ignore_cancellation_signals()
+        keep_transaction_parked = isinstance(exc, GroupCleanupUnconfirmed)
         print(f"full validation setup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
     finally:
-        if namespace_fd is not None:
-            os.close(namespace_fd)
-        if transition_fd is not None:
-            os.close(transition_fd)
         if transaction is not None:
+            ignore_cancellation_signals()
+        descriptor_cleanup_errors: list[str] = []
+        for label, fd in (("namespace", namespace_fd), ("transition", transition_fd)):
+            if fd is None:
+                continue
             try:
-                print(local_state.restore(str(transaction)), flush=True)
+                os.close(fd)
             except BaseException as exc:
-                failure = exc
+                descriptor_cleanup_errors.append(f"{label} descriptor close failed: {type(exc).__name__}: {exc}")
+                if failure is None:
+                    failure = exc
                 status = 1
-                print(f"production state restore failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        for error in descriptor_cleanup_errors:
+            print(error, file=sys.stderr, flush=True)
+        if transaction is not None:
+            if keep_transaction_parked:
+                print(
+                    f"production state remains parked in transaction {transaction}: "
+                    "validator process-group exit was not confirmed",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                try:
+                    print(local_state.restore(str(transaction)), flush=True)
+                except BaseException as exc:
+                    failure = exc
+                    status = 1
+                    print(f"production state restore failed: {type(exc).__name__}: {exc}", file=sys.stderr)
     if failure is not None:
         return 1
     if status != 0:
@@ -129,6 +224,13 @@ def main() -> int:
         if status != 0:
             return status
     return 0
+
+
+def main() -> int:
+    # The transaction restore is part of cancellation cleanup. Keep original
+    # handlers saved until _main has completed its full finally block.
+    with catch_cancellation_signals():
+        return _main()
 
 
 if __name__ == "__main__":

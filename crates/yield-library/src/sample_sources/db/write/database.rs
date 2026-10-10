@@ -177,6 +177,7 @@ impl SourceDatabase {
             source_index_changes: std::collections::BTreeMap::new(),
             manifest_audit_completed: false,
             subtree_directory_revision: None,
+            subtree_directory_changes: None,
         })
     }
 

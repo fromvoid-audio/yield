@@ -77,9 +77,12 @@ fn raw_filename_remains_exact_index_evidence_in_the_actual_replay_transaction() 
     let f = Fixture::new(true);
     let service = f.start();
     let before = f.read().get_revision().unwrap();
-    let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff.wav".to_vec()));
+    // Keep the arbitrary-byte path-conversion contract on APFS, where creating the
+    // corresponding name is rejected, then exercise a lossless decomposed UTF-8 name
+    // through the real index-only transaction.
     #[cfg(target_os = "macos")]
-    let path = {
+    let filename = {
+        let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff.wav".to_vec()));
         assert_eq!(
             RootRelativePath::try_from_path(invalid.clone())
                 .unwrap()
@@ -89,11 +92,11 @@ fn raw_filename_remains_exact_index_evidence_in_the_actual_replay_transaction() 
         let error = fs::write(f.base.root.path().join(&invalid), b"raw filename").unwrap_err();
         assert_eq!(error.raw_os_error(), Some(92), "APFS EILSEQ: {error}");
         assert_eq!(f.read().get_revision().unwrap(), before);
-        // A supported non-audio path preserves the original index-only transaction.
-        PathBuf::from("raw-é.txt")
+        "raw-e\u{301}.txt".as_bytes()
     };
     #[cfg(not(target_os = "macos"))]
-    let path = invalid;
+    let filename = b"raw-\xff.wav";
+    let path = PathBuf::from(std::ffi::OsString::from_vec(filename.to_vec()));
     let absolute = f.base.root.path().join(&path);
     fs::write(&absolute, b"raw filename").unwrap();
     let ingress = f.ingress(10);

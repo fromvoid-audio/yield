@@ -5,7 +5,7 @@ use super::writer::ReplayWriter;
 use super::*;
 use std::cell::{Cell, RefCell};
 use yield_library::sample_sources::reconciliation::{
-    AdapterDisposition, AdmissionOutcome, ReconciliationScopeKind, WatcherGeneration,
+    AdapterDisposition, AdmissionOutcome, RawEventKind, ReconciliationScopeKind, WatcherGeneration,
 };
 use yield_scan::sample_sources::scanner::{
     EXACT_SCAN_MAX_ENTRIES, prepare_exact_scan, prepare_subtree_scan,
@@ -55,6 +55,7 @@ pub(super) fn consume(
             source_id.clone(),
             fence.root_identity().clone(),
             receipt.as_ref().map(DurableReplayReceipt::prior),
+            submission._capture.clone(),
             submission.permit.clone(),
         ) {
             Ok(s) => s,
@@ -278,6 +279,99 @@ pub(super) fn consume(
         return retained(submission, CatalogReplayError::StaleLifecycle);
     };
     source.attempt_token = Some(token.clone());
+    if submission.is_private_metadata_capture() {
+        if !is_exact_metadata_only_batch(submission.batch.batch()) {
+            return audit(
+                source,
+                submission,
+                profile,
+                admission,
+                CatalogReplayError::WrongIdentity,
+            );
+        }
+        if submission.cancellation.load(Ordering::Acquire) {
+            return retained(submission, CatalogReplayError::Canceled);
+        }
+        if source.publication_fence.validate().is_err() {
+            return retained(submission, CatalogReplayError::OwnerUnavailable);
+        }
+        let checkpoint = {
+            let catalog_writer = CatalogScanWriter {
+                profile_guard: profile,
+                database: &source.database,
+                cancel: Some(&submission.cancellation),
+                owner: Some(&source.database.writer),
+                lifecycle: Some(CatalogScanLifecycle {
+                    admission,
+                    source_id,
+                    generation: life,
+                    token: &token,
+                }),
+            };
+            let _lifecycle = match catalog_writer.try_lock(ScanWritePhase::Manifest) {
+                Ok(guard) => guard,
+                Err(_) => return retained(submission, CatalogReplayError::OwnerUnavailable),
+            };
+            if submission.cancellation.load(Ordering::Acquire) {
+                return retained(submission, CatalogReplayError::Canceled);
+            }
+            let checkpoint = match source.database.writer.commit_watcher_replay_checkpoint(
+                &fence,
+                receipt.prior(),
+                &proof,
+            ) {
+                Ok(checkpoint) => checkpoint,
+                Err(_) => return retained(submission, CatalogReplayError::CommitUncertain),
+            };
+            let expected_first = proof.replay_coverage().after_sequence().checked_add(1);
+            let expected_last = proof.replay_coverage().through_sequence();
+            match source.database.read_durable_replay_receipt(
+                source_id,
+                fence.root_identity(),
+                generation,
+                generation,
+            ) {
+                Ok(Some(readback))
+                    if expected_first.is_some_and(|first| {
+                        readback.prior() == &checkpoint
+                            && readback.source_revision() == fence.revision()
+                            && readback.prior().source_id() == source_id
+                            && readback.prior().root_identity() == fence.root_identity()
+                            && readback.prior().backend_stream_identity()
+                                == proof.backend_stream_identity()
+                            && readback.prior().watcher_generation() == generation
+                            && readback.matches_interval(first, expected_last)
+                    }) =>
+                {
+                    readback
+                }
+                _ => return retained(submission, CatalogReplayError::CommitUncertain),
+            }
+        };
+        let state = source.replay.as_mut().unwrap();
+        let pending = state.pending.as_mut().unwrap();
+        if !pending.applied
+            && state
+                .owner
+                .mark_applied(pending.dispatched.ticket())
+                .is_err()
+        {
+            return retained(submission, CatalogReplayError::CommitUncertain);
+        }
+        pending.applied = true;
+        if state
+            .owner
+            .mark_replay_checkpointed(pending.dispatched.ticket(), checkpoint.prior())
+            .is_err()
+        {
+            return retained(submission, CatalogReplayError::CommitUncertain);
+        }
+        state.pending = None;
+        source.replay = None;
+        return CatalogReplayOutcome::CheckpointOnlyCommitted {
+            receipt: checkpoint,
+        };
+    }
     let base = CatalogScanWriter {
         profile_guard: profile,
         database: &source.database,
@@ -375,4 +469,26 @@ pub(super) fn consume(
         receipt: readback,
         delta,
     }
+}
+
+fn is_exact_metadata_only_batch(
+    batch: &yield_library::sample_sources::reconciliation::SyntheticObservationBatch,
+) -> bool {
+    !batch.observations().is_empty()
+        && batch.observations().iter().all(|observation| {
+            observation.kind() == RawEventKind::Modify
+                && observation.uncertainty().is_empty()
+                && observation.paths().len() == 1
+                && observation.paths()[0].hint().is_none()
+                && observation.paths()[0]
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(".DS_Store")
+                && observation.paths()[0]
+                    .path()
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+                && observation.metadata().event_id().is_some()
+        })
 }
