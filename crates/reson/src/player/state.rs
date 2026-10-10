@@ -7,7 +7,6 @@ use crate::telemetry;
 
 use super::super::DEFAULT_ANTI_CLIP_FADE;
 use super::super::output::{AudioOutputConfig, ResolvedOutput, open_output_stream};
-use super::super::routing::duration_from_secs_f32;
 use super::super::timebase::seconds_to_frames_round;
 
 use super::{
@@ -24,7 +23,27 @@ impl AudioPlayer {
     /// Create a new audio player honoring the requested output configuration.
     pub fn from_config(config: &AudioOutputConfig) -> Result<Self, String> {
         let outcome = open_output_stream(config).map_err(|err| err.to_string())?;
-        Ok(Self {
+        Ok(Self::from_open_stream_outcome(outcome))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_native_test_device(
+        device: cpal::Device,
+        host_id: String,
+        config: &AudioOutputConfig,
+        required_channels: u16,
+    ) -> Result<Self, String> {
+        let outcome = crate::output::open_output_stream_on_test_device(
+            device,
+            host_id,
+            config,
+            required_channels,
+        )?;
+        Ok(Self::from_open_stream_outcome(outcome))
+    }
+
+    fn from_open_stream_outcome(outcome: crate::output::OpenStreamOutcome) -> Self {
+        Self {
             stream: outcome.stream,
             edit_fade_handle: EditFadeHandle::new(),
             active_sources: 0,
@@ -54,7 +73,7 @@ impl AudioPlayer {
             output: outcome.resolved,
             #[cfg(test)]
             elapsed_override: None,
-        })
+        }
     }
 
     /// Store audio bytes and duration for later playback.
@@ -273,8 +292,7 @@ impl AudioPlayer {
 
     /// Configure the anti-click fade used for playback edges.
     pub fn set_anti_clip_settings(&mut self, enabled: bool, fade_ms: f32) {
-        self.anti_clip_enabled = enabled;
-        self.anti_clip_fade = duration_from_secs_f32(fade_ms / 1000.0);
+        (self.anti_clip_enabled, self.anti_clip_fade) = anti_clip_settings(enabled, fade_ms);
     }
 
     /// Stop any active playback.
@@ -286,6 +304,38 @@ impl AudioPlayer {
     /// Active output configuration after initialization.
     pub fn output_details(&self) -> &ResolvedOutput {
         &self.output
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_callback_sample_count(&self, channel: usize) -> u64 {
+        self.stream.callback_probe().sample_count(channel)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_callback_peak(&self, channel: usize) -> f32 {
+        self.stream.callback_probe().peak(channel)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_callback_allocation_count(&self) -> u64 {
+        self.stream.callback_probe().allocation_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_callback_deallocation_count(&self) -> u64 {
+        self.stream.callback_probe().deallocation_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_active_source_count(&self) -> usize {
+        self.stream.active_source_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_stream_teardown_complete(
+        &self,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.stream.teardown_complete()
     }
 
     /// Update the realtime fade state for edit selections.
@@ -391,6 +441,22 @@ impl AudioPlayer {
     }
 }
 
+fn anti_clip_settings(enabled: bool, fade_ms: f32) -> (bool, Duration) {
+    if !enabled {
+        return (false, Duration::ZERO);
+    }
+    let default_fade_ms = DEFAULT_ANTI_CLIP_FADE.as_secs_f32() * 1000.0;
+    let fade_ms = if !fade_ms.is_finite() || fade_ms < 0.0 {
+        default_fade_ms
+    } else {
+        fade_ms.min(50.0)
+    };
+    // Convert through f64 so the documented 50 ms cap does not inherit the
+    // positive rounding error in `50.0f32 / 1000.0` (50,000,001 ns).
+    // Duration::from_secs_f64 rounds fractional nanoseconds to the nearest ns.
+    (true, Duration::from_secs_f64(f64::from(fade_ms) / 1000.0))
+}
+
 fn wav_file_metadata(path: &std::path::Path) -> Result<(f32, u32, usize), String> {
     let reader = hound::WavReader::open(path)
         .map_err(|err| format!("Failed to open WAV file {}: {err}", path.display()))?;
@@ -420,7 +486,38 @@ fn test_audio_output_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::wav_file_metadata;
+    use super::{anti_clip_settings, wav_file_metadata};
+    use std::time::Duration;
+
+    #[test]
+    fn anti_click_settings_keep_legacy_default_and_bound_invalid_values() {
+        assert_eq!(
+            anti_clip_settings(true, f32::NAN),
+            (true, Duration::from_millis(3))
+        );
+        assert_eq!(
+            anti_clip_settings(true, f32::INFINITY),
+            (true, Duration::from_millis(3))
+        );
+        assert_eq!(
+            anti_clip_settings(true, -1.0),
+            (true, Duration::from_millis(3))
+        );
+        assert_eq!(anti_clip_settings(true, 0.0), (true, Duration::ZERO));
+        assert_eq!(
+            anti_clip_settings(true, 2.0),
+            (true, Duration::from_millis(2))
+        );
+        assert_eq!(
+            anti_clip_settings(true, 3.0),
+            (true, Duration::from_millis(3))
+        );
+        assert_eq!(
+            anti_clip_settings(true, 90.0),
+            (true, Duration::from_millis(50))
+        );
+        assert_eq!(anti_clip_settings(false, 3.0), (false, Duration::ZERO));
+    }
 
     #[test]
     fn wav_file_metadata_probes_original_file_without_decoding_samples() {

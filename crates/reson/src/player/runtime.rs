@@ -19,6 +19,10 @@ use std::sync::mpsc;
 use super::{AudioPlayer, EditFadeRange, PlaybackMetronomeConfig};
 use crate::output::ResolvedOutput;
 
+#[cfg(all(test, target_os = "macos", feature = "native-audio"))]
+#[path = "../output/native_test_fixture.rs"]
+mod native_test_fixture;
+
 const DEFAULT_PLAYBACK_COMMAND_QUEUE: usize = 8;
 // Keep one bounded cancellation slot available for a priority command that
 // must evict a queued play after ordinary coalescing has saturated records.
@@ -277,6 +281,10 @@ pub struct PlaybackRuntimeRequest {
     pub mode: PlaybackRuntimeMode,
     pub stream_policy: PlaybackRuntimeStreamPolicy,
     pub volume: f32,
+    /// Whether playback boundaries use anti-click edge fades.
+    pub anti_click_enabled: bool,
+    /// Anti-click edge fade duration in milliseconds; invalid values use the 3 ms default.
+    pub anti_click_fade_ms: f32,
     pub playback_gain: f32,
     pub playback_gain_normalization: Option<PlaybackRuntimeGainNormalization>,
     pub replace_policy: PlaybackRuntimeReplacePolicy,
@@ -1155,6 +1163,8 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
         // the previous playback lifetime if setup fails.
         self.configured_metronome_beat_count = None;
         let configured_metronome_beat_count = request.metronome.map(|config| config.beat_count());
+        self.player
+            .set_anti_clip_settings(request.anti_click_enabled, request.anti_click_fade_ms);
         self.player.set_volume(request.volume);
         self.player.set_stream_policy(request.stream_policy);
         self.player
@@ -1981,6 +1991,522 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
+    #[cfg(all(target_os = "macos", feature = "native-audio"))]
+    #[test]
+    #[ignore = "requires explicit native CoreAudio output permission"]
+    fn macos_real_executor_applies_anti_click_settings_independently_of_edit_fades() {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        use std::time::Instant;
+
+        assert_eq!(
+            std::env::var("YIELD_TEST_AUDIO_OUTPUT").ok().as_deref(),
+            Some("1"),
+            "set YIELD_TEST_AUDIO_OUTPUT=1 to explicitly enable real audio output"
+        );
+
+        let host_id = cpal::available_hosts()
+            .into_iter()
+            .find(|host| host.name().eq_ignore_ascii_case("coreaudio"))
+            .expect("CoreAudio host is available");
+        let host = cpal::host_from_id(host_id.clone()).expect("open CoreAudio host");
+        let default_device = host
+            .default_output_device()
+            .expect("CoreAudio default output device");
+        let default_uid = default_device
+            .id()
+            .expect("read default output device identity")
+            .1;
+        let device_name =
+            crate::device::device_label(&default_device).expect("read default output name");
+        let (matching_name_count, default_uid_matches_name) = host
+            .output_devices()
+            .expect("enumerate CoreAudio outputs")
+            .fold((0, false), |(count, uid_matches), device| {
+                if crate::device::device_label(&device).is_some_and(|name| name == device_name) {
+                    (
+                        count + 1,
+                        uid_matches
+                            || device
+                                .id()
+                                .is_ok_and(|device_id| device_id.1 == default_uid),
+                    )
+                } else {
+                    (count, uid_matches)
+                }
+            });
+        assert_eq!(
+            matching_name_count, 1,
+            "the exact default device name must resolve uniquely"
+        );
+        assert!(
+            default_uid_matches_name,
+            "the uniquely resolved device name must belong to the current default output"
+        );
+        let sample_rate = default_device
+            .default_output_config()
+            .expect("read default output format")
+            .sample_rate();
+
+        let config = crate::output::AudioOutputConfig {
+            host: Some(host_id.name().to_owned()),
+            device: Some(device_name.clone()),
+            sample_rate: Some(sample_rate),
+            buffer_size: None,
+        };
+        let player = AudioPlayer::from_config(&config).expect("open exact CoreAudio output");
+        let resolved = player.output_details();
+        assert_eq!(resolved.host_id, host_id.name());
+        assert_eq!(resolved.device_name, device_name);
+        assert_eq!(resolved.sample_rate, sample_rate);
+        assert!(resolved.channel_count >= 2);
+        assert!(!resolved.used_fallback);
+        let mut executor = AudioPlayerPlaybackExecutor {
+            player,
+            configured_metronome_beat_count: None,
+        };
+
+        let root = tempfile::tempdir().expect("temporary WAV root");
+        let path = root.path().join("anti-click-native.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create tiny WAV");
+        for _ in 0..4_096 {
+            writer.write_sample(1_000_i16).expect("write left sample");
+            writer.write_sample(-1_000_i16).expect("write right sample");
+        }
+        writer.finalize().expect("finalize tiny WAV");
+
+        let edit_fade = EditFadeRange::new(
+            0.25,
+            0.75,
+            0.4,
+            Some(crate::player::FadeParams::new(0.2, 0.5, 0.0)),
+            Some(crate::player::FadeParams::new(0.3, 0.5, 0.0)),
+        );
+        let request = |anti_click_enabled, anti_click_fade_ms| PlaybackRuntimeRequest {
+            source: PlaybackRuntimeSource::WavFile { path: path.clone() },
+            mode: PlaybackRuntimeMode::Looped {
+                start: 0.0,
+                end: 1.0,
+                offset: 0.0,
+            },
+            stream_policy: PlaybackRuntimeStreamPolicy::full(),
+            // Keep a low but measurable native signal so allocator assertions
+            // cover callbacks that actually convert and emit source samples.
+            volume: 0.1,
+            anti_click_enabled,
+            anti_click_fade_ms,
+            playback_gain: 1.0,
+            playback_gain_normalization: None,
+            replace_policy: PlaybackRuntimeReplacePolicy::ClearPrevious,
+            edit_fade: Some(edit_fade),
+            metronome: None,
+        };
+        let teardown_complete = executor.player.native_stream_teardown_complete();
+        let mut previous_callback_samples = executor.player.native_callback_sample_count(0);
+
+        for (index, (enabled, fade_ms, expected_fade)) in [
+            (true, 2.0, Duration::from_millis(2)),
+            (false, 0.0, Duration::ZERO),
+            (true, 3.0, Duration::from_millis(3)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            executor
+                .play(request(enabled, fade_ms))
+                .expect("production executor starts native WAV playback");
+            let callback_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < callback_deadline
+                && (executor.player.native_active_source_count() == 0
+                    || executor.player.native_callback_sample_count(0) <= previous_callback_samples)
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let callback_samples = executor.player.native_callback_sample_count(0);
+            assert!(executor.player.native_active_source_count() > 0);
+            assert!(callback_samples > previous_callback_samples);
+            assert!(executor.player.native_callback_peak(0) > 0.001);
+            assert!(executor.player.native_callback_peak(1) > 0.001);
+            previous_callback_samples = callback_samples;
+            assert_eq!(executor.player.anti_clip_enabled, enabled);
+            assert_eq!(executor.player.anti_clip_fade, expected_fade);
+            let edit_snapshot = executor.player.edit_fade_handle.snapshot();
+            assert!(edit_snapshot.active);
+            let duration = 4_096.0 / f64::from(sample_rate) as f32;
+            assert!((edit_snapshot.start_seconds - duration * 0.25).abs() < 1.0e-6);
+            assert!((edit_snapshot.end_seconds - duration * 0.75).abs() < 1.0e-6);
+            assert!((edit_snapshot.gain - 0.4).abs() < f32::EPSILON);
+            assert_eq!(edit_snapshot.fade_in, edit_fade.fade_in);
+            assert_eq!(edit_snapshot.fade_out, edit_fade.fade_out);
+            if index == 0 {
+                executor.player.set_anti_clip_settings(false, 0.0);
+                let after_anti_click_change = executor.player.edit_fade_handle.snapshot();
+                assert_eq!(after_anti_click_change.active, edit_snapshot.active);
+                assert_eq!(
+                    after_anti_click_change.start_seconds,
+                    edit_snapshot.start_seconds
+                );
+                assert_eq!(
+                    after_anti_click_change.end_seconds,
+                    edit_snapshot.end_seconds
+                );
+                assert_eq!(after_anti_click_change.gain, edit_snapshot.gain);
+                assert_eq!(after_anti_click_change.fade_in, edit_snapshot.fade_in);
+                assert_eq!(after_anti_click_change.fade_out, edit_snapshot.fade_out);
+            }
+        }
+        executor.stop().expect("stop native playback");
+        let stop_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < stop_deadline && executor.player.native_active_source_count() != 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(executor.player.native_active_source_count(), 0);
+        assert_eq!(executor.player.native_callback_allocation_count(), 0);
+        assert_eq!(executor.player.native_callback_deallocation_count(), 0);
+        drop(executor);
+        let teardown_deadline = Instant::now() + Duration::from_secs(5);
+        while !teardown_complete.load(std::sync::atomic::Ordering::Acquire)
+            && Instant::now() < teardown_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(teardown_complete.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(all(target_os = "macos", feature = "native-audio"))]
+    #[test]
+    #[ignore = "creates a private CoreAudio aggregate and briefly emits a low-level test signal"]
+    fn macos_private_aggregate_routes_nonzero_pair_through_native_callback() {
+        use crate::source::{OutputAdapter, StereoOutputPair};
+        use cpal::traits::{DeviceTrait, HostTrait};
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        use std::time::Instant;
+
+        assert_eq!(
+            std::env::var("YIELD_TEST_AUDIO_OUTPUT").ok().as_deref(),
+            Some("1"),
+            "set YIELD_TEST_AUDIO_OUTPUT=1 to explicitly enable real audio output"
+        );
+
+        struct StereoSignal {
+            sample_rate: u32,
+            right_channel: bool,
+        }
+
+        impl Iterator for StereoSignal {
+            type Item = f32;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                let sample = if self.right_channel { -0.3 } else { 0.2 };
+                self.right_channel = !self.right_channel;
+                Some(sample)
+            }
+        }
+
+        impl crate::Source for StereoSignal {
+            fn current_frame_len(&self) -> Option<usize> {
+                None
+            }
+
+            fn channels(&self) -> u16 {
+                2
+            }
+
+            fn sample_rate(&self) -> u32 {
+                self.sample_rate
+            }
+
+            fn total_duration(&self) -> Option<Duration> {
+                None
+            }
+        }
+
+        let host_id = cpal::available_hosts()
+            .into_iter()
+            .find(|host| host.name().eq_ignore_ascii_case("coreaudio"))
+            .expect("CoreAudio host is available");
+        let host = cpal::host_from_id(host_id.clone()).expect("open CoreAudio host");
+        let default_device = host
+            .default_output_device()
+            .expect("CoreAudio default output device");
+        let default_uid = default_device.id().expect("read default output identity").1;
+        let sample_rate = default_device
+            .default_output_config()
+            .expect("read default output format")
+            .sample_rate();
+        let second_uid = host
+            .output_devices()
+            .expect("enumerate CoreAudio outputs")
+            .filter_map(|device| {
+                let uid = device.id().ok()?.1;
+                if uid == default_uid {
+                    return None;
+                }
+                let channels = native_test_fixture::physical_output_channels(&uid).ok()?;
+                let config = device.default_output_config().ok()?;
+                (channels == 2 && config.channels() == 2 && config.sample_rate() == sample_rate)
+                    .then_some(uid)
+            })
+            .next()
+            .expect("a second stereo-capable output already running at the default rate");
+
+        let mut guard =
+            native_test_fixture::PrivateAggregateGuard::create(&default_uid, &second_uid)
+                .expect("create process-private same-rate aggregate");
+        let aggregate_uid = guard.uid().to_owned();
+        let aggregate_name = guard.name().to_owned();
+        // Private aggregates are intentionally absent from system device
+        // enumeration. Bind through the exact AudioObjectID owned by the
+        // guard, then verify CPAL reports that generated UID and name.
+        let aggregate_device = match guard.cpal_device() {
+            Ok(device) => device,
+            Err(error) => {
+                guard.close().expect("remove unbound private aggregate");
+                panic!("bind private aggregate by its owned CoreAudio ID: {error}");
+            }
+        };
+        assert_eq!(aggregate_device.id().unwrap().1, aggregate_uid);
+        let config = crate::output::AudioOutputConfig {
+            host: Some(host_id.name().to_owned()),
+            device: Some(aggregate_name.clone()),
+            sample_rate: Some(sample_rate),
+            buffer_size: None,
+        };
+        let mut default_pair_started = false;
+        let mut default_pair_counts = [0; 4];
+        let mut default_pair_peaks = [0.0; 4];
+        let mut default_pair_allocations = u64::MAX;
+        let mut default_pair_deallocations = u64::MAX;
+        let default_route_root = tempfile::tempdir().expect("default-pair WAV root");
+        let default_route_path = default_route_root.path().join("default-pair.wav");
+        let wav_spec = hound::WavSpec {
+            channels: 2,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&default_route_path, wav_spec)
+            .expect("create default-pair WAV");
+        for _ in 0..4_096 {
+            writer
+                .write_sample(8_192_i16)
+                .expect("write WAV left sample");
+            writer
+                .write_sample(-12_288_i16)
+                .expect("write WAV right sample");
+        }
+        writer.finalize().expect("finalize default-pair WAV");
+
+        let default_player = match AudioPlayer::from_native_test_device(
+            aggregate_device.clone(),
+            host_id.name().to_owned(),
+            &config,
+            4,
+        ) {
+            Ok(player) => player,
+            Err(error) => {
+                // Stream startup may have constructed a native object before
+                // returning its error, without exposing a teardown observer.
+                guard.retain_for_process_exit();
+                panic!("open exact private aggregate output: {error}");
+            }
+        };
+        let resolved = default_player.output_details();
+        let default_pair_exact = resolved.host_id == host_id.name()
+            && resolved.device_name == aggregate_name
+            && resolved.sample_rate == sample_rate
+            && resolved.channel_count == 4
+            && !resolved.used_fallback;
+        let default_pair_actual = format!(
+            "host={} device={:?} rate={} channels={} fallback={}",
+            resolved.host_id,
+            resolved.device_name,
+            resolved.sample_rate,
+            resolved.channel_count,
+            resolved.used_fallback,
+        );
+        let mut executor = AudioPlayerPlaybackExecutor {
+            player: default_player,
+            configured_metronome_beat_count: None,
+        };
+        let teardown_complete = executor.player.native_stream_teardown_complete();
+        guard.track_stream_teardown(Arc::clone(&teardown_complete));
+        if default_pair_exact {
+            let before = executor.player.native_callback_sample_count(0);
+            let request = PlaybackRuntimeRequest {
+                source: PlaybackRuntimeSource::WavFile {
+                    path: default_route_path.clone(),
+                },
+                mode: PlaybackRuntimeMode::Looped {
+                    start: 0.0,
+                    end: 1.0,
+                    offset: 0.0,
+                },
+                stream_policy: PlaybackRuntimeStreamPolicy::full(),
+                volume: 0.025,
+                anti_click_enabled: false,
+                anti_click_fade_ms: 0.0,
+                playback_gain: 1.0,
+                playback_gain_normalization: None,
+                replace_policy: PlaybackRuntimeReplacePolicy::ClearPrevious,
+                edit_fade: None,
+                metronome: None,
+            };
+            default_pair_started = executor.play(request).is_ok();
+            let callback_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < callback_deadline
+                && (executor.player.native_active_source_count() == 0
+                    || executor.player.native_callback_sample_count(0) <= before
+                    || executor.player.native_callback_peak(0) <= 0.006
+                    || executor.player.native_callback_peak(1) <= 0.009)
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            default_pair_counts = std::array::from_fn(|channel| {
+                executor.player.native_callback_sample_count(channel)
+            });
+            default_pair_peaks =
+                std::array::from_fn(|channel| executor.player.native_callback_peak(channel));
+            executor
+                .stop()
+                .expect("stop default-pair executor playback");
+            let stop_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < stop_deadline
+                && executor.player.native_active_source_count() != 0
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            default_pair_allocations = executor.player.native_callback_allocation_count();
+            default_pair_deallocations = executor.player.native_callback_deallocation_count();
+        }
+        drop(executor);
+        let teardown_deadline = Instant::now() + Duration::from_secs(5);
+        while !teardown_complete.load(AtomicOrdering::Acquire) && Instant::now() < teardown_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let default_pair_teardown = teardown_complete.load(AtomicOrdering::Acquire);
+        if !default_pair_teardown {
+            panic!("default-pair native stream teardown did not complete");
+        }
+
+        let mut pair_one_counts = [0; 4];
+        let mut pair_one_peaks = [0.0; 4];
+        let mut pair_one_allocations = u64::MAX;
+        let mut pair_one_deallocations = u64::MAX;
+        let mut player = match AudioPlayer::from_native_test_device(
+            aggregate_device,
+            host_id.name().to_owned(),
+            &config,
+            4,
+        ) {
+            Ok(player) => player,
+            Err(error) => {
+                // Stream startup may have constructed a native object before
+                // returning its error, without exposing a teardown observer.
+                guard.retain_for_process_exit();
+                panic!("open private aggregate for pair-one callback: {error}");
+            }
+        };
+        let resolved = player.output_details();
+        let pair_one_exact = resolved.host_id == host_id.name()
+            && resolved.device_name == aggregate_name
+            && resolved.sample_rate == sample_rate
+            && resolved.channel_count == 4
+            && !resolved.used_fallback;
+        let pair_one_actual = format!(
+            "host={} device={:?} rate={} channels={} fallback={}",
+            resolved.host_id,
+            resolved.device_name,
+            resolved.sample_rate,
+            resolved.channel_count,
+            resolved.used_fallback,
+        );
+        let teardown_complete = player.native_stream_teardown_complete();
+        guard.track_stream_teardown(Arc::clone(&teardown_complete));
+        if pair_one_exact {
+            player.set_volume(1.0);
+            let monitor = player.create_monitor_sink(0.025);
+            let adapter = OutputAdapter::with_output_pair(
+                StereoSignal {
+                    sample_rate,
+                    right_channel: false,
+                },
+                sample_rate,
+                4,
+                StereoOutputPair::new(1),
+            );
+            monitor.append(adapter);
+
+            let callback_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < callback_deadline
+                && !(player.native_callback_peak(2) > 0.004
+                    && player.native_callback_peak(3) > 0.006)
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            monitor.stop();
+            let stop_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < stop_deadline && player.native_active_source_count() != 0 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            pair_one_counts =
+                std::array::from_fn(|channel| player.native_callback_sample_count(channel));
+            pair_one_peaks = std::array::from_fn(|channel| player.native_callback_peak(channel));
+            pair_one_allocations = player.native_callback_allocation_count();
+            pair_one_deallocations = player.native_callback_deallocation_count();
+            drop(monitor);
+        }
+        drop(player);
+        let teardown_deadline = Instant::now() + Duration::from_secs(5);
+        while !teardown_complete.load(AtomicOrdering::Acquire) && Instant::now() < teardown_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pair_one_teardown = teardown_complete.load(AtomicOrdering::Acquire);
+        if !pair_one_teardown {
+            panic!("pair-one native stream teardown did not complete");
+        }
+        guard
+            .close()
+            .expect("destroy only the owned aggregate after both streams stop");
+
+        assert!(
+            default_pair_exact,
+            "default route must open exact four-channel aggregate; resolved {default_pair_actual}"
+        );
+        assert!(
+            default_pair_started,
+            "production AudioPlayer executor starts its WAV"
+        );
+        assert!(default_pair_teardown);
+        assert!(default_pair_counts.iter().all(|count| *count > 0));
+        assert!(default_pair_peaks[0] > 0.006);
+        assert!(default_pair_peaks[1] > 0.009);
+        assert_eq!(default_pair_peaks[2], 0.0);
+        assert_eq!(default_pair_peaks[3], 0.0);
+        assert_eq!(default_pair_allocations, 0);
+        assert_eq!(default_pair_deallocations, 0);
+
+        assert!(
+            pair_one_exact,
+            "pair-one route must open exact four-channel aggregate; resolved {pair_one_actual}"
+        );
+        assert!(pair_one_teardown);
+        assert!(pair_one_counts.iter().all(|count| *count > 0));
+        assert_eq!(pair_one_peaks[0], 0.0);
+        assert_eq!(pair_one_peaks[1], 0.0);
+        assert!(pair_one_peaks[2] > 0.004);
+        assert!(pair_one_peaks[3] > 0.006);
+        assert_eq!(pair_one_allocations, 0);
+        assert_eq!(pair_one_deallocations, 0);
+    }
+
     #[derive(Clone)]
     enum FakeOutcome {
         Started(f32),
@@ -1992,6 +2518,7 @@ mod tests {
         played: Arc<Mutex<Vec<PlaybackRuntimeMode>>>,
         retargeted: Arc<Mutex<Vec<PlaybackRuntimeSpanUpdate>>>,
         playback_gains: Arc<Mutex<Vec<(f32, Option<PlaybackRuntimeGainNormalization>)>>>,
+        anti_click_settings: Arc<Mutex<Vec<(bool, f32)>>>,
         stopped: Arc<Mutex<usize>>,
         stop_error: Option<&'static str>,
         retarget_outcomes: Vec<Result<(), &'static str>>,
@@ -2018,6 +2545,7 @@ mod tests {
                 played: Arc::new(Mutex::new(Vec::new())),
                 retargeted: Arc::new(Mutex::new(Vec::new())),
                 playback_gains: Arc::new(Mutex::new(Vec::new())),
+                anti_click_settings: Arc::new(Mutex::new(Vec::new())),
                 stopped: Arc::new(Mutex::new(0)),
                 stop_error: None,
                 retarget_outcomes: Vec::new(),
@@ -2051,6 +2579,10 @@ mod tests {
             &self,
         ) -> Arc<Mutex<Vec<(f32, Option<PlaybackRuntimeGainNormalization>)>>> {
             Arc::clone(&self.playback_gains)
+        }
+
+        fn anti_click_settings(&self) -> Arc<Mutex<Vec<(bool, f32)>>> {
+            Arc::clone(&self.anti_click_settings)
         }
 
         fn dropped(&self) -> Arc<AtomicBool> {
@@ -2164,6 +2696,10 @@ mod tests {
             request: PlaybackRuntimeRequest,
         ) -> Result<PlaybackRuntimeStartedData, String> {
             self.played.lock().expect("played lock").push(request.mode);
+            self.anti_click_settings
+                .lock()
+                .expect("anti-click settings lock")
+                .push((request.anti_click_enabled, request.anti_click_fade_ms));
             if let Some(gate) = self.play_gate.take() {
                 let _ = gate.entered_tx.send(());
                 gate.release_rx.recv().expect("release blocking play");
@@ -2240,6 +2776,40 @@ mod tests {
             playback_gains.lock().expect("playback gains").as_slice(),
             &[(0.5, None)]
         );
+    }
+
+    #[test]
+    fn playback_runtime_passes_each_playback_lifetime_anti_click_settings_to_owner() {
+        let executor = FakeExecutor::new(vec![]);
+        let observed = executor.anti_click_settings();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let first = runtime
+            .handle
+            .try_play(test_request(0.0))
+            .expect("first play");
+        assert!(matches!(
+            runtime.events.recv().expect("first started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == first
+        ));
+
+        let mut replacement = test_request(0.0);
+        replacement.anti_click_enabled = false;
+        replacement.anti_click_fade_ms = 0.0;
+        let second = runtime
+            .handle
+            .try_play(replacement)
+            .expect("replacement play");
+        assert!(matches!(
+            runtime.events.recv().expect("replacement started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == second
+        ));
+        assert_eq!(
+            observed.lock().expect("anti-click settings").as_slice(),
+            &[(true, 3.0), (false, 0.0)]
+        );
+        runtime.handle.try_shutdown().expect("shutdown");
     }
 
     #[test]
@@ -4000,6 +4570,8 @@ mod tests {
             },
             stream_policy: PlaybackRuntimeStreamPolicy::full(),
             volume: 0.0,
+            anti_click_enabled: true,
+            anti_click_fade_ms: 3.0,
             playback_gain: 1.0,
             playback_gain_normalization: None,
             replace_policy: PlaybackRuntimeReplacePolicy::ClearPrevious,
@@ -4146,6 +4718,8 @@ mod tests {
             mode: PlaybackRuntimeMode::OneShot { start, end: 1.0 },
             stream_policy: PlaybackRuntimeStreamPolicy::full(),
             volume: 1.0,
+            anti_click_enabled: true,
+            anti_click_fade_ms: 3.0,
             playback_gain: 1.0,
             playback_gain_normalization: None,
             replace_policy: PlaybackRuntimeReplacePolicy::FadeOutPrevious,

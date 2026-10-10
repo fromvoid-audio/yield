@@ -22,6 +22,7 @@ gpui.workspace = true
 raw-window-handle.workspace = true
 reson.workspace = true
 unicode-segmentation.workspace = true
+tracing = "=0.1.44"
 yield-core.workspace = true
 yield-design.workspace = true
 yield-media.workspace = true

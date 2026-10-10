@@ -1102,6 +1102,7 @@ impl Browser {
             self.metronome_enabled
                 .then_some(self.beat_guide_count as u16),
         );
+        let (anti_click_enabled, anti_click_fade_ms) = self.preferences.anti_click_settings();
         let request = PlaybackRuntimeRequest {
             source: PlaybackRuntimeSource::WavFile {
                 path: intent.path.clone(),
@@ -1109,6 +1110,8 @@ impl Browser {
             mode,
             stream_policy: PlaybackRuntimeStreamPolicy::transient_navigation(),
             volume: super::volume::quantize_volume(intent.volume),
+            anti_click_enabled,
+            anti_click_fade_ms,
             playback_gain: precomputed_gain.unwrap_or(1.0),
             playback_gain_normalization: None,
             replace_policy: PlaybackRuntimeReplacePolicy::ClearPrevious,

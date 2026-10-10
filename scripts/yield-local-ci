@@ -518,6 +518,12 @@ def _check(args: argparse.Namespace) -> None:
     if args.lane == "native" and args.case == "prerequisite:startup-namespace-failure":
         run_namespace_failure_aggregate(sha)
         return
+    if args.lane == "native" and args.case == "audition-coreaudio":
+        if os.environ.get("YIELD_TEST_AUDIO_OUTPUT") != "1":
+            raise CiError(
+                "audition-coreaudio requires inherited YIELD_TEST_AUDIO_OUTPUT=1; "
+                "opt in explicitly before any clean-state preparation"
+            )
     with common_coordinator() as state_dir, exact_worktree(sha) as checkout:
         if args.lane in {"full", "native"}:
             require_maintenance_protocol(checkout, full_lane=args.lane == "full")
@@ -554,7 +560,7 @@ def _check(args: argparse.Namespace) -> None:
                 "startup-namespace-poll-failure",
                 "sdk-and-startup-components",
             }
-            if args.case not in recording_cases and args.case != "catalog-replay":
+            if args.case not in recording_cases and args.case not in {"catalog-replay", "audition-coreaudio"}:
                 prefix, separator, name = args.case.partition(":")
                 if prefix != "prerequisite" or not separator or name not in prerequisite_cases:
                     raise CiError("native case is not in an existing exact-selector or named-runner allowlist")
@@ -566,6 +572,8 @@ def _check(args: argparse.Namespace) -> None:
                 env["YIELD_NATIVE_VERIFICATION_OUTPUT"] = str(log_path.parent / (log_path.name + "-evidence"))
             elif args.case == "catalog-replay":
                 runner = checkout / "scripts/internal/validation/verify_macos_catalog_native_replay.sh"
+            elif args.case == "audition-coreaudio":
+                runner = checkout / "scripts/internal/validation/verify_macos_audition_coreaudio.sh"
             else:
                 _, _, prerequisite = args.case.partition(":")
                 runner = checkout / "scripts/internal/validation/verify_native_prerequisites.sh"
@@ -645,19 +653,25 @@ def _check(args: argparse.Namespace) -> None:
                         break
                 else:
                     details["status"] = "passed"
-                if args.lane == "native" and details.get("status") == "passed":
+                if args.lane == "native" and (
+                    details.get("status") == "passed" or args.case == "audition-coreaudio"
+                ):
                     evidence_source = None
                     if args.case == "catalog-replay":
                         evidence_source = checkout / "artifacts/macos-catalog-native-replay"
+                    elif args.case == "audition-coreaudio":
+                        evidence_source = checkout / "artifacts/macos-audition-coreaudio"
                     elif args.case.startswith("prerequisite:"):
                         prerequisite = args.case.partition(":")[2]
                         evidence_source = checkout / "artifacts/native-prerequisites" / f"macos-{prerequisite}"
                     if evidence_source is not None:
                         if not evidence_source.is_dir() or evidence_source.is_symlink():
-                            raise CiError("native runner passed without retaining its expected evidence directory")
-                        retained = out_dir / "evidence"
-                        shutil.copytree(evidence_source, retained)
-                        details["evidence_directory"] = str(retained)
+                            if details.get("status") == "passed":
+                                raise CiError("native runner passed without retaining its expected evidence directory")
+                        else:
+                            retained = out_dir / "evidence"
+                            shutil.copytree(evidence_source, retained)
+                            details["evidence_directory"] = str(retained)
             except BaseException as error:
                 failure = error
                 details["status"] = "failed"

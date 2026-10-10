@@ -57,6 +57,70 @@ pub(super) fn resolve_output_stream_config(
     })
 }
 
+/// Select a specific channel count from the device's real CPAL-supported
+/// configurations. Used only by the native aggregate test, whose acceptance
+/// case explicitly requires all four channels rather than CoreAudio's default
+/// stream format.
+#[cfg(test)]
+pub(super) fn resolve_output_stream_config_for_test_channels(
+    device: &cpal::Device,
+    host_id: &str,
+    config: &AudioOutputConfig,
+    required_channels: u16,
+) -> Result<ResolvedOutputStreamConfig, String> {
+    let default_config = device
+        .default_output_config()
+        .map_err(|error| format!("read default output config for {host_id}: {error}"))?;
+    let supported = device
+        .supported_output_configs()
+        .map_err(|error| format!("read supported output configs for {host_id}: {error}"))?
+        .collect::<Vec<_>>();
+    let requested_rate = config.sample_rate.unwrap_or(default_config.sample_rate());
+    let candidates = supported
+        .iter()
+        .filter(|range| {
+            range.channels() == required_channels && output_rate_in_range(requested_rate, range)
+        })
+        .collect::<Vec<_>>();
+    let range = candidates
+        .iter()
+        .find(|range| range.sample_format() == default_config.sample_format())
+        .copied()
+        .or_else(|| candidates.first().copied())
+        .ok_or_else(|| {
+            let available = supported
+                .iter()
+                .map(|range| {
+                    format!(
+                        "{}ch/{:?}/{}..{}Hz",
+                        range.channels(),
+                        range.sample_format(),
+                        range.min_sample_rate(),
+                        range.max_sample_rate()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "native test requires a real {required_channels}-channel CPAL config at {requested_rate}Hz; supported: [{available}]"
+            )
+        })?;
+
+    let mut stream_config = range.with_sample_rate(requested_rate).config();
+    let mut used_fallback = false;
+    apply_output_buffer_size(
+        &mut stream_config,
+        Some(range.buffer_size()),
+        config.buffer_size,
+        &mut used_fallback,
+    );
+    Ok(ResolvedOutputStreamConfig {
+        stream_config,
+        sample_format: range.sample_format(),
+        used_fallback,
+    })
+}
+
 fn pick_output_stream_config(
     default_config: &cpal::SupportedStreamConfig,
     supported: &[cpal::SupportedStreamConfigRange],

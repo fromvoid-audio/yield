@@ -125,6 +125,10 @@ where
     fn total_duration(&self) -> Option<Duration> {
         self.inner.total_duration()
     }
+
+    fn last_error(&self) -> Option<String> {
+        self.inner.last_error()
+    }
 }
 
 #[derive(Clone)]
@@ -276,5 +280,9 @@ where
     #[inline]
     fn total_duration(&self) -> Option<Duration> {
         None
+    }
+
+    fn last_error(&self) -> Option<String> {
+        self.inner.last_error()
     }
 }

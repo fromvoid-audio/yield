@@ -295,3 +295,86 @@ fn async_source_reports_worker_panics_and_ends_stream() {
         .expect("worker panic should be reported");
     assert!(error.starts_with("Async decode thread panicked:"));
 }
+
+#[test]
+fn decoder_credit_remains_held_until_detached_worker_really_exits() {
+    static TEST_POOL: DecoderWorkerPool = DecoderWorkerPool::new(1);
+
+    struct BlockedSource {
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Iterator for BlockedSource {
+        type Item = f32;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.entered.wait();
+            self.release.wait();
+            None
+        }
+    }
+
+    impl Source for BlockedSource {
+        fn current_frame_len(&self) -> Option<usize> {
+            None
+        }
+        fn channels(&self) -> u16 {
+            1
+        }
+        fn sample_rate(&self) -> u32 {
+            44_100
+        }
+        fn total_duration(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    impl Drop for BlockedSource {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let source = BlockedSource {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        dropped: Arc::clone(&dropped),
+    };
+    let async_source = AsyncSource::with_buffer_seconds_from_pool(source, 0.1, &TEST_POOL);
+    entered.wait();
+    drop(async_source);
+
+    assert_eq!(TEST_POOL.active.load(Ordering::Acquire), 1);
+    let rejected_source = TestSource {
+        samples: vec![0.1],
+        pos: 0,
+        sample_rate: 44_100,
+        channels: 1,
+        delay: Duration::ZERO,
+        error: None,
+        panic_at: None,
+        start_barrier: None,
+        start_barrier_waited: false,
+        dropped: None,
+    };
+    let rejected = AsyncSource::with_buffer_seconds_from_pool(rejected_source, 0.1, &TEST_POOL);
+    assert_eq!(
+        rejected.last_error().as_deref(),
+        Some("Async decode worker capacity reached")
+    );
+    assert_eq!(TEST_POOL.active.load(Ordering::Acquire), 1);
+
+    release.wait();
+    assert!(wait_for_flag(&dropped, Duration::from_secs(1)));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while TEST_POOL.active.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(TEST_POOL.active.load(Ordering::Acquire), 0);
+    drop(rejected);
+}

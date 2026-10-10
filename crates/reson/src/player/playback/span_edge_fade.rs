@@ -119,6 +119,45 @@ mod tests {
     };
 
     #[test]
+    fn anti_click_fade_duration_maps_to_expected_sample_frames() {
+        for (rate, two_ms, three_ms, fifty_ms) in [
+            (44_100, 88, 132, 2_205),
+            (48_000, 96, 144, 2_400),
+            (96_000, 192, 288, 4_800),
+        ] {
+            assert_eq!(span_edge_fade_frames(rate, 20_000, Duration::ZERO), 0);
+            assert_eq!(
+                span_edge_fade_frames(rate, 20_000, Duration::from_millis(2)),
+                two_ms
+            );
+            assert_eq!(
+                span_edge_fade_frames(rate, 20_000, Duration::from_millis(3)),
+                three_ms
+            );
+            assert_eq!(
+                span_edge_fade_frames(rate, 20_000, Duration::from_millis(50)),
+                fifty_ms
+            );
+        }
+    }
+
+    #[test]
+    fn short_playback_spans_bound_each_edge_fade_to_half_the_span() {
+        assert_eq!(
+            span_edge_fade_frames(48_000, 1, Duration::from_millis(50)),
+            0
+        );
+        assert_eq!(
+            span_edge_fade_frames(48_000, 2, Duration::from_millis(50)),
+            1
+        );
+        assert_eq!(
+            span_edge_fade_frames(48_000, 5, Duration::from_millis(50)),
+            2
+        );
+    }
+
+    #[test]
     fn static_span_edge_fade_repeats_for_loop_cycles() {
         let source = SamplesBuffer::new(1, 1_000, vec![1.0; 4]).repeat_infinite();
         let plan = plan(0, 4, 0, true);

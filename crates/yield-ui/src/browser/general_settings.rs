@@ -15,10 +15,10 @@ use gpui::{
 use yield_design::Theme;
 use yield_session::{
     DEFAULT_RATING_DECAY_WEEKS, DEFAULT_TEXT_SCALE_PERCENT, ENLARGED_TEXT_SCALE_PERCENT,
-    MAX_RATING_DECAY_WEEKS, MAX_USER_SHADER_SOURCE_BYTES, MAX_VISUAL_EFFECT_STRENGTH_PERCENT,
-    MIN_RATING_DECAY_WEEKS, PreferencePatch, ShippedVisualEffectPreferences,
-    ShippedVisualEffectPreset, UiPreferences, UserShaderPreferences,
-    user_shader_content_fingerprint,
+    MAX_ANTI_CLICK_FADE_MS, MAX_RATING_DECAY_WEEKS, MAX_USER_SHADER_SOURCE_BYTES,
+    MAX_VISUAL_EFFECT_STRENGTH_PERCENT, MIN_RATING_DECAY_WEEKS, PreferencePatch,
+    ShippedVisualEffectPreferences, ShippedVisualEffectPreset, UiPreferences,
+    UserShaderPreferences, user_shader_content_fingerprint,
 };
 
 use super::{Browser, source_registry::SourceRegistryGlobal};
@@ -882,6 +882,44 @@ impl Browser {
         }
     }
 
+    pub(super) fn toggle_anti_click(&mut self, cx: &mut Context<Self>) {
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
+        let (enabled, fade_ms) = self.preferences.anti_click_settings();
+        if self.submit_preference_patch(
+            PreferencePatch::SetAntiClickSettings {
+                enabled: !enabled,
+                fade_ms,
+            },
+            cx,
+        ) {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn change_anti_click_fade(&mut self, delta_ms: f32, cx: &mut Context<Self>) {
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
+        let (enabled, fade_ms) = self.preferences.anti_click_settings();
+        let next_fade_ms = (fade_ms + delta_ms).clamp(0.0, MAX_ANTI_CLICK_FADE_MS);
+        if next_fade_ms.to_bits() == fade_ms.to_bits() {
+            return;
+        }
+        if self.submit_preference_patch(
+            PreferencePatch::SetAntiClickSettings {
+                enabled,
+                fade_ms: next_fade_ms,
+            },
+            cx,
+        ) {
+            cx.notify();
+        }
+    }
+
     fn choose_user_shader(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.choose_user_shader_from_accessibility(window, cx);
     }
@@ -1578,6 +1616,9 @@ impl Browser {
             editable && self.general_settings.rating_decay_weeks > MIN_RATING_DECAY_WEEKS;
         let increase_enabled =
             editable && self.general_settings.rating_decay_weeks < MAX_RATING_DECAY_WEEKS;
+        let (anti_click_enabled, anti_click_fade_ms) = self.preferences.anti_click_settings();
+        let anti_click_decrease_enabled = editable && anti_click_fade_ms > 0.0;
+        let anti_click_increase_enabled = editable && anti_click_fade_ms < MAX_ANTI_CLICK_FADE_MS;
         div()
             .flex()
             .flex_col()
@@ -1603,6 +1644,56 @@ impl Browser {
                                 view.close_general_settings(window, cx)
                             }),
                         ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.spacing.control_gap))
+                    .child(div().w(px(120.0)).child("Anti-click fades"))
+                    .child(
+                        control(
+                            self,
+                            "anti-click-toggle",
+                            if anti_click_enabled { "On" } else { "Off" },
+                            editable,
+                            &theme,
+                        )
+                        .when(editable, |button| {
+                            button.on_click(cx.listener(|view, _, _, cx| {
+                                view.toggle_anti_click(cx)
+                            }))
+                        }),
+                    )
+                    .child(
+                        control(
+                            self,
+                            "anti-click-fade-decrease",
+                            "−",
+                            anti_click_decrease_enabled,
+                            &theme,
+                        )
+                        .when(anti_click_decrease_enabled, |button| {
+                            button.on_click(cx.listener(|view, _, _, cx| {
+                                view.change_anti_click_fade(-1.0, cx)
+                            }))
+                        }),
+                    )
+                    .child(format!("{anti_click_fade_ms} ms"))
+                    .child(
+                        control(
+                            self,
+                            "anti-click-fade-increase",
+                            "+",
+                            anti_click_increase_enabled,
+                            &theme,
+                        )
+                        .when(anti_click_increase_enabled, |button| {
+                            button.on_click(cx.listener(|view, _, _, cx| {
+                                view.change_anti_click_fade(1.0, cx)
+                            }))
+                        }),
                     ),
             )
             .child(
@@ -2020,6 +2111,9 @@ pub(super) fn control(
         "general-settings-close" => "settings-close",
         "rating-decay-decrease" => "settings-rating-decay-decrease",
         "rating-decay-increase" => "settings-rating-decay-increase",
+        "anti-click-toggle" => "settings-anti-click-toggle",
+        "anti-click-fade-decrease" => "settings-anti-click-fade-decrease",
+        "anti-click-fade-increase" => "settings-anti-click-fade-increase",
         "choose-trash-folder" => "settings-trash-choose",
         "clear-trash-folder" => "settings-trash-clear",
         "refresh-global-storage" => "settings-storage-refresh",
