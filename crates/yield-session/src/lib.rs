@@ -4061,6 +4061,97 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn foreign_dirty_volume_marker_blocks_session_and_preference_persistence() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let profile_descriptor = fs::File::open(&profile_root).expect("profile descriptor");
+        let volume =
+            yield_library::durable_capacity::descriptor_capacity_facts(&profile_descriptor)
+                .expect("fixture volume facts")
+                .identity;
+        let registry_root = profile_root
+            .parent()
+            .and_then(Path::parent)
+            .expect("fixture app root")
+            .join("volume-registry");
+        fs::create_dir_all(&registry_root).expect("fixture volume registry");
+        let marker_path = registry_root.join(format!("volume-{}.lock", volume.device));
+        let retained_marker =
+            b"version=1\nstate=dirty\nowner_profile_identity=old-profile\ngeneration=9\n";
+        fs::write(&marker_path, retained_marker).expect("foreign dirty marker fixture");
+
+        let mut service = SourceRegistryService::start_inner(Some(profile_root.clone()))
+            .expect("session worker starts despite persistence refusal");
+        let RegistryEvent::PersistenceUnavailable { error, .. } =
+            wait_for_event(&service, |event| {
+                matches!(event, RegistryEvent::PersistenceUnavailable { .. })
+            })
+        else {
+            unreachable!()
+        };
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("operation journal owner unavailable"));
+        assert!(diagnostic.contains("volume ownership requires reconciliation"));
+        assert!(matches!(
+            service.catalog_status(),
+            CatalogStatus::Unavailable { ref reason }
+                if reason.contains("volume ownership requires reconciliation")
+        ));
+        assert!(matches!(
+            service.vocabulary_status(),
+            VocabularyStatus::Unavailable { ref reason }
+                if reason.contains("volume ownership requires reconciliation")
+        ));
+        assert!(matches!(
+            service.lookup_profile_tag_categories(vec![String::from("blocked")]),
+            Err(VocabularySubmitError::Unavailable(reason))
+                if reason.contains("volume ownership requires reconciliation")
+        ));
+
+        let PreferenceEvent::PersistenceUnavailable {
+            error: preference_error,
+            ..
+        } = wait_for_preference_event(&service, |event| {
+            matches!(event, PreferenceEvent::PersistenceUnavailable { .. })
+        })
+        else {
+            unreachable!()
+        };
+        assert_eq!(preference_error.to_string(), diagnostic);
+
+        let request = service
+            .patch_preferences(PreferencePatch::SetLoopEnabled(true))
+            .expect("preference request enters session worker");
+        let PreferenceEvent::RequestFailed {
+            request: failed,
+            error: preference_error,
+        } = wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::RequestFailed { request: failed, .. } if *failed == request),
+        )
+        else {
+            unreachable!()
+        };
+        assert_eq!(failed, request);
+        assert_eq!(preference_error.to_string(), diagnostic);
+        assert_eq!(
+            fs::read(&marker_path).expect("marker remains retained"),
+            retained_marker
+        );
+        assert!(matches!(
+            service.shutdown(),
+            Err(ShutdownError::Session(SessionError::Persistence(reason)))
+                if reason.contains("volume ownership requires reconciliation")
+        ));
+        assert_eq!(
+            fs::read(&marker_path).expect("marker remains retained after shutdown"),
+            retained_marker
+        );
+    }
+
     #[test]
     fn pending_operation_journal_blocks_ordinary_writers_and_remains_reopenable() {
         let temp = TempDir::new().expect("config base");

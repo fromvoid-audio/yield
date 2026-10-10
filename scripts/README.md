@@ -11,6 +11,7 @@ scripts/yield-local-ci build --sha <full-commit-sha> --channel test
 scripts/yield-local-ci run --artifact <artifact-manifest.json> --state normal
 scripts/yield-local-ci run --artifact <artifact-manifest.json> --state clean
 scripts/yield-local-ci state restore --backup <printed-transaction-id>
+scripts/yield-local-ci state reset --namespace production
 ```
 
 `build` never launches or resets state. A clean app launch prints its transaction
@@ -19,6 +20,13 @@ the original production state automatically after their owned processes exit.
 Clean state is parked and retained; no recursive wipe or dirty-marker deletion is
 performed. See [TEST](../docs/TEST.md#local-macos-ci-and-reversible-state) for
 namespace rules, safety boundaries, native selectors and interrupted recovery.
+
+`state reset` is the explicit development reset for starting a fresh **normal**
+session. Quit all Yield versions first. It uses the same backup-preserving whole
+root transition as `state clean`; keep the printed backup transaction. Subsequent
+normal launches retain the newly created state. Restoring the backup brings back
+its original state, including any unresolved ownership or recovery fault. This
+does not reconcile a lost journal or modify metadata beside your audio files.
 
 For the active GPUI fork, use `scripts/gpui-local-ci.sh` on macOS and
 `scripts/install-gpui-local-ci.sh` for its automatic commit hook; see

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 from importlib.machinery import SourceFileLoader
 import json
 import os
@@ -11,7 +12,7 @@ import signal
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from unittest import mock
 
 
@@ -21,6 +22,70 @@ SPEC = importlib.util.spec_from_loader("yield_local_ci", SourceFileLoader("yield
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+
+class DevelopmentResetTests(unittest.TestCase):
+    def test_reset_parks_orphaned_ownership_and_keeps_new_normal_state_and_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            support = pathlib.Path(temporary)
+            root, control = MODULE.local_state.namespace_paths("production", support)
+            development, _ = MODULE.local_state.namespace_paths("development", support)
+            development.mkdir()
+            (development / "preserve.txt").write_text("test build state", encoding="utf-8")
+            marker = root / "volume-ownership" / "volume-123.lock"
+            marker.parent.mkdir(parents=True)
+            evidence = b"version=1\nstate=dirty\nowner_profile_identity=old-profile\ngeneration=1\n"
+            marker.write_bytes(evidence)
+            original_identity = (root.stat().st_dev, root.stat().st_ino)
+            marker_inode = marker.stat().st_ino
+
+            def invoke(*args: str) -> tuple[int, dict[str, object], str]:
+                output, errors = io.StringIO(), io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", [str(CLI), "state", *args]),
+                    mock.patch.object(MODULE.local_state, "canonical_support_dir", return_value=support),
+                    redirect_stdout(output),
+                    redirect_stderr(errors),
+                ):
+                    result = MODULE.main()
+                return result, json.loads(output.getvalue()) if output.getvalue() else {}, errors.getvalue()
+
+            with MODULE.local_state.maintenance_locks(control, "production", exclusive=False):
+                code, _, error = invoke("reset", "--namespace", "production")
+            self.assertEqual(code, 1)
+            self.assertIn("live owner", error)
+            self.assertEqual(marker.read_bytes(), evidence)
+
+            code, result, error = invoke("reset", "--namespace", "production")
+            self.assertEqual(code, 0, error)
+            self.assertFalse(root.exists())
+            backup = pathlib.Path(str(result["backup"]))
+            retained_marker = backup / "volume-ownership" / marker.name
+            self.assertEqual((backup.stat().st_dev, backup.stat().st_ino), original_identity)
+            self.assertEqual(retained_marker.stat().st_ino, marker_inode)
+            self.assertEqual(retained_marker.read_bytes(), evidence)
+            self.assertEqual((development / "preserve.txt").read_text(), "test build state")
+            code, vanilla, error = invoke("reset", "--namespace", "production")
+            self.assertEqual(code, 0, error)
+            self.assertIsNone(vanilla["transaction"])
+            self.assertIn("no backup was created", vanilla["restore_note"])
+            self.assertEqual(retained_marker.read_bytes(), evidence)
+
+            # Ordinary launches create their new state; status must not reset it again.
+            preferences = root / "profiles" / "gpui-development" / "preferences.json"
+            preferences.parent.mkdir(parents=True)
+            preferences.write_text('{"output_volume":0.1}', encoding="utf-8")
+            for _ in range(2):
+                code, current, error = invoke("status", "--namespace", "production")
+                self.assertEqual(code, 0, error)
+                self.assertEqual(current["state"], "present")
+                self.assertEqual(preferences.read_text(), '{"output_volume":0.1}')
+            code, restored, error = invoke("restore", "--backup", str(result["transaction"]))
+            self.assertEqual(code, 0, error)
+            self.assertEqual(marker.read_bytes(), evidence)
+            self.assertEqual(marker.stat().st_ino, marker_inode)
+            displaced = pathlib.Path(str(restored["clean_session"]))
+            self.assertEqual((displaced / preferences.relative_to(root)).read_text(), '{"output_volume":0.1}')
 
 
 class ExactWorktreeBranchTests(unittest.TestCase):

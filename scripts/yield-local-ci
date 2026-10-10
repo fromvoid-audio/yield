@@ -1099,6 +1099,10 @@ def main() -> int:
     status_cmd.add_argument("--namespace", choices=("development", "production"), required=True)
     clean_cmd = state_sub.add_parser("clean")
     clean_cmd.add_argument("--namespace", choices=("development", "production"), required=True)
+    reset_cmd = state_sub.add_parser(
+        "reset", help="start fresh normal state, retaining the entire old state as a backup"
+    )
+    reset_cmd.add_argument("--namespace", choices=("development", "production"), required=True)
     restore_cmd = state_sub.add_parser("restore")
     restore_cmd.add_argument("--backup", required=True)
     recover_cmd = state_sub.add_parser("recover")
@@ -1117,8 +1121,15 @@ def main() -> int:
             action = args.state_action
             if action == "status":
                 result = local_state.status(args.namespace)
-            elif action == "clean":
+            elif action in {"clean", "reset"}:
                 result = local_state.clean(args.namespace)
+                if action == "reset":
+                    result["next_step"] = "Launch normally to create fresh state; subsequent normal launches retain it."
+                    result["restore_note"] = (
+                        "The backup retains all prior state and recovery evidence. Restoring it also restores any prior startup fault."
+                        if result.get("transaction")
+                        else "No prior state was present; no backup was created."
+                    )
             elif action == "restore":
                 result = local_state.restore(args.backup)
             else:
