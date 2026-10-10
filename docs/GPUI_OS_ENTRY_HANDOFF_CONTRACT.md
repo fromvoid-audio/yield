@@ -1,11 +1,22 @@
 # One current-profile OS-entry handoff (OPT-1996)
 
-Baseline `43eaa1acc`. This source slice specifies one **read-only file-open
-proposal for an already registered source**. The executable integration-test
-fixture defines admission/completion identity fences using existing session and
-catalog values; it does not wire a native callback or start a new owner/service.
-OPT-1753 owns the native callback and real owner adapter. OPT-1745 still owns
-legacy migration acceptance; this decision accepts only a current-ready profile.
+This document retains the proposed **read-only file-open handoff for an already
+registered source**. The current Yield 0.1 slice is deliberately smaller: GPUI's
+macOS open-URLs callback is registered before profile and window startup, drops
+all supplied URL strings immediately, and places one coalescing path-free signal
+in a capacity-one channel. The Browser consumes it when ready and displays the
+fixed status “Opening files from macOS is not supported yet. Add a folder in
+Yield to browse it.” No path is parsed, retained, logged, opened, scanned,
+imported, or used to modify source/profile state. The app-reopen callback only
+activates the existing app/window when available; it does not create a Browser or
+profile owner. External file drag-and-drop remains a separate route.
+
+The portable UI tests exercise this path-free ingress and Browser consumer; they
+do not dispatch a native macOS delegate callback. Native callback delivery,
+visibility, and reopen behavior still require macOS acceptance. OPT-1753 owns
+replacing this refusal with the real owner adapter. OPT-1745 still owns legacy
+migration acceptance; the proposed handoff below accepts only a current-ready
+profile.
 
 ## Existing and missing callers
 
@@ -26,13 +37,15 @@ the metadata was attempted but may be missing, malformed, changed or non-WAV;
 its omission is not a filesystem absence proof. The catalog may discard stale
 requests/completions without producing an event.
 
-No current GPUI native file-open/drop/reopen callback is established by this
-inventory. The profile-owner incarnation is not exposed as a public OS-entry
-admission API today. OPT-1753 must attach a private service-instance binding in
-the existing owner adapter, derive current-version readiness from actual profile
-startup, and route completion through the existing catalog delivery boundary.
-Neither field may be supplied as authority by an OS event or renderer. The
-fixture's identity values are synthetic observations, never owner capabilities.
+GPUI native file-open and reopen callbacks are now registered for the bounded
+unsupported response described above. No file-open/drop owner handoff is
+established by this inventory. The profile-owner incarnation is not exposed as a
+public OS-entry admission API today. OPT-1753 must attach a private
+service-instance binding in the existing owner adapter, derive current-version
+readiness from actual profile startup, and route completion through the existing
+catalog delivery boundary. Neither field may be supplied as authority by an OS
+event or renderer. The fixture's identity values are synthetic observations,
+never owner capabilities.
 
 ## Event resolution and bounded admission
 
@@ -108,8 +121,10 @@ filesystem and do not verify native resolution, live owner tokens or physical
 read provenance. Existing catalog metadata/lease tests supply separate current
 worker regressions, not native OS callback acceptance.
 
-OPT-1753 must implement the private owner binding, raw-hint resolution, callback,
-queued delivery integration and native file-open/Finder/reopen/AX verification.
+OPT-1753 must implement the private owner binding, raw-hint resolution, queued
+delivery integration and native file-open/Finder/reopen/AX verification. Its
+owner-backed file-open behavior must replace the Yield 0.1 refusal only after
+those admission and delivery boundaries are implemented and qualified.
 OPT-1745 retains migration/legacy profile acceptance. Parent/native gates remain
 open. This Linux decision does not create import, reveal, mutation, playback or
 filesystem authority, and does not complete either original acceptance issue.
