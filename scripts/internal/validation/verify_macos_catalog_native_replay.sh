@@ -53,6 +53,7 @@ if results != [(sys.argv[2], '0', '0')]:
 PY
 }
 run_replay_case yield-source-watcher captures_native_history_for_a_disposable_source 1 native-history.log
+run_replay_case yield-source-watcher native_history_overflow_is_uncertain_and_releases_worker_slot 1 native-history-overflow.log
 run_replay_case yield-source-watcher live_bootstrap_capture_starts_before_audit_and_flushes_changes 1 native-bootstrap.log
 run_replay_case yield-source-watcher live_bootstrap_capture_rejects_root_replacement 1 native-root-replacement.log
 run_replay_case yield-source-watcher native_capture_gated_cancellation_and_timeout_retain_slot_until_cleanup 1 native-capture-custody.log
@@ -66,4 +67,5 @@ run_replay_case yield-ui browser::catalog::tests::prepared_display_mutations_pre
 bash scripts/internal/agent/run_agent_preflight.sh 2>&1 | tee "$REPLAY_EVIDENCE_DIR/preflight.log"
 cargo check --locked -p yield-source-watcher -p yield-catalog -p yield-library -p yield-ui -p yield \
   2>&1 | tee "$REPLAY_EVIDENCE_DIR/native-sdk.log"
-# Finder overflow/restart, GPUI interaction and Source physical-family acceptance remain manual.
+# Native event-cap overflow is qualified above. Finder/restart, GPUI interaction,
+# kernel dropped-event flags and Source physical-family acceptance remain manual.

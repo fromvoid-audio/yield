@@ -803,6 +803,7 @@ pub(in crate::replay) fn capture_test_guard() -> std::sync::MutexGuard<'static, 
 mod tests {
     use super::*;
     use yield_library::sample_sources::SourceId;
+    use yield_library::sample_sources::reconciliation::WatcherGeneration;
 
     #[test]
     fn captures_native_history_for_a_disposable_source() {
@@ -854,6 +855,60 @@ mod tests {
                     .uncertainty()
                     .contains(ReplayUncertainty::MUST_SCAN_SUBDIRS),
             "{candidate:?}"
+        );
+    }
+
+    #[test]
+    fn native_history_overflow_is_uncertain_and_releases_worker_slot() {
+        let _capture_guard = capture_test_guard();
+        let temp = tempfile::tempdir().expect("temporary source");
+        let root = fs::canonicalize(temp.path()).expect("canonical source");
+        let metadata = fs::metadata(&root).expect("source metadata");
+        let identity = physical_root_identity(&root, &metadata).expect("physical root identity");
+        let spec = SourceWatchSpec::new(
+            SourceId::from_string("native-history-overflow"),
+            1,
+            root,
+            Some(identity),
+        );
+
+        let seed = BootstrapCapture::start(spec.clone(), Duration::from_secs(5))
+            .expect("device-local seed stream");
+        fs::write(temp.path().join("seed.wav"), b"seed").expect("seed event");
+        let seed = seed.finish(Duration::from_secs(5)).expect("seed capture");
+        let since = seed.last_seen().expect("device-local event cursor");
+
+        for index in 0..=(MAX_REPLAY_EVENTS * 2) {
+            let path = temp.path().join(format!("overflow-{index:04}.wav"));
+            fs::write(path, b"native filesystem change").expect("overflow source event");
+        }
+
+        let candidate = capture_history(spec, since, Duration::from_secs(10))
+            .expect("native overflow history capture");
+        assert_eq!(candidate.started_after(), since);
+        assert!(
+            candidate.events().len() <= MAX_REPLAY_EVENTS,
+            "{candidate:?}"
+        );
+        assert!(
+            candidate.events().len() > 0,
+            "native capture retained no source events: {candidate:?}"
+        );
+        assert!(
+            candidate
+                .uncertainty()
+                .contains(ReplayUncertainty::EVENT_LIMIT),
+            "{candidate:?}"
+        );
+        assert!(
+            candidate
+                .into_bootstrap_evidence(WatcherGeneration::new(1))
+                .is_none(),
+            "overflow history must not produce bootstrap continuity evidence"
+        );
+        assert!(
+            !CAPTURE_ACTIVE.load(Ordering::Acquire),
+            "native worker slot remained occupied after capture returned"
         );
     }
 
