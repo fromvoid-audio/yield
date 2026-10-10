@@ -7,6 +7,7 @@ from importlib.machinery import SourceFileLoader
 import json
 import os
 import pathlib
+import signal
 import sys
 import tempfile
 import unittest
@@ -251,7 +252,13 @@ class ManagedBinaryProbeTests(unittest.TestCase):
 
 
 class NativeCheckCleanupTests(unittest.TestCase):
-    def run_native_check(self, command_status: int, *, fail_lease_close: bool = False) -> dict[str, object]:
+    def run_native_check(
+        self,
+        command_status: int,
+        *,
+        fail_lease_close: bool = False,
+        signal_during_restore: bool = False,
+    ) -> dict[str, object]:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             state_dir = root / "git-state"
@@ -265,6 +272,7 @@ class NativeCheckCleanupTests(unittest.TestCase):
             (evidence / "native.log").write_text("native evidence", encoding="utf-8")
             namespace_path = root / "namespace.lock"
             transition_path = root / "transition.lock"
+            prior_sigterm_handler = signal.getsignal(signal.SIGTERM)
             real_close = os.close
             descriptors: dict[str, int] = {}
             close_calls: list[int] = []
@@ -288,6 +296,12 @@ class NativeCheckCleanupTests(unittest.TestCase):
             def worktree(_sha: str):
                 yield checkout
 
+            def restore_native(transaction: str) -> dict[str, object]:
+                self.assertEqual(transaction, "native-ci-test")
+                if signal_during_restore:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return {"transaction": transaction, "restored": True}
+
             args = type(
                 "Args",
                 (),
@@ -310,7 +324,7 @@ class NativeCheckCleanupTests(unittest.TestCase):
                 mock.patch.object(
                     MODULE.local_state,
                     "restore",
-                    return_value={"transaction": "native-ci-test", "restored": True},
+                    side_effect=restore_native,
                 ) as restore,
                 mock.patch.object(MODULE.os, "close", side_effect=tracking_close),
                 mock.patch.object(MODULE, "run_managed", return_value=command_status) as run,
@@ -325,6 +339,8 @@ class NativeCheckCleanupTests(unittest.TestCase):
 
             self.assertEqual(restore.call_count, 1)
             self.assertEqual(run.call_count, 1)
+            self.assertTrue(run.call_args.kwargs["preserve_ignored_on_exit"])
+            self.assertIs(signal.getsignal(signal.SIGTERM), prior_sigterm_handler)
             self.assertEqual(close_calls.count(descriptors["namespace"]), 1)
             self.assertEqual(close_calls.count(descriptors["transition"]), 1)
             result_files = list(
@@ -358,6 +374,9 @@ class NativeCheckCleanupTests(unittest.TestCase):
 
     def test_native_check_descriptor_close_error_still_restores_and_records_evidence(self) -> None:
         self.run_native_check(0, fail_lease_close=True)
+
+    def test_native_check_late_sigterm_during_restore_completes_and_restores_handlers(self) -> None:
+        self.run_native_check(0, signal_during_restore=True)
 
 
 if __name__ == "__main__":

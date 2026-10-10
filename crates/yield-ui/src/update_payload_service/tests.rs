@@ -139,6 +139,8 @@ fn service(address: std::net::SocketAddr, lane: Channel) -> UpdatePayloadService
     }
 }
 pub(crate) fn request(socket: &mut TcpStream) -> String {
+    // Accepted sockets can inherit a nonblocking listener's mode on Darwin.
+    socket.set_nonblocking(false).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
