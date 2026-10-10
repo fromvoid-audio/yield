@@ -12233,9 +12233,10 @@ mod tests {
                 WatcherGeneration::new(lifecycle_generation),
             )
             .expect("live metadata callback yields an observation batch");
-        assert!(live_batch.observation().continuous());
-        assert!(live_batch.is_metadata_only());
-        let live_provenance = live_batch.observation().batch().provenance();
+        // Bootstrap conversion returns the passive batch directly. Certain, empty ordinary
+        // events above plus this nonempty exact sidecar batch qualify its private metadata lane.
+        assert!(live_batch.continuous());
+        let live_provenance = live_batch.batch().provenance();
         assert_eq!(live_provenance.source_id(), &source_id);
         assert_eq!(live_provenance.root_identity(), Some(&root_identity));
         assert_eq!(
@@ -12253,7 +12254,7 @@ mod tests {
                 .is_some_and(|last| last > settled_cursor),
             "live metadata callback must advance beyond the settled cursor"
         );
-        let live_observations = live_batch.observation().batch().observations();
+        let live_observations = live_batch.batch().observations();
         assert_eq!(live_observations.len(), 1);
         assert_eq!(
             live_observations[0].kind(),
