@@ -17,6 +17,8 @@ pub(crate) struct CallbackProbe {
     peak_bits: [AtomicU32; MAX_PROBED_CHANNELS],
     allocations: AtomicU64,
     deallocations: AtomicU64,
+    non_finite_samples: AtomicU64,
+    rejected_contributions: AtomicU64,
 }
 
 #[cfg(test)]
@@ -27,6 +29,8 @@ impl CallbackProbe {
             peak_bits: std::array::from_fn(|_| AtomicU32::new(0)),
             allocations: AtomicU64::new(0),
             deallocations: AtomicU64::new(0),
+            non_finite_samples: AtomicU64::new(0),
+            rejected_contributions: AtomicU64::new(0),
         }
     }
 
@@ -37,6 +41,7 @@ impl CallbackProbe {
         count.fetch_add(1, Ordering::Relaxed);
         let magnitude = sample.abs();
         if !magnitude.is_finite() {
+            self.non_finite_samples.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let Some(peak) = self.peak_bits.get(channel) else {
@@ -74,6 +79,14 @@ impl CallbackProbe {
 
     pub(crate) fn deallocation_count(&self) -> u64 {
         self.deallocations.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn non_finite_sample_count(&self) -> u64 {
+        self.non_finite_samples.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn rejected_contribution_count(&self) -> u64 {
+        self.rejected_contributions.load(Ordering::Acquire)
     }
 
     fn record_callback_churn(&self, allocations: usize, deallocations: usize) {
@@ -440,6 +453,12 @@ where
                     let contribution = sample * combined_gain;
                     if contribution.is_finite() {
                         mixed += contribution;
+                    } else {
+                        #[cfg(test)]
+                        state
+                            .probe
+                            .rejected_contributions
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 None => slot.active = false,

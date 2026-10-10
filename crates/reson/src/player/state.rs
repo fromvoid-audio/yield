@@ -327,6 +327,16 @@ impl AudioPlayer {
     }
 
     #[cfg(test)]
+    pub(crate) fn native_callback_non_finite_sample_count(&self) -> u64 {
+        self.stream.callback_probe().non_finite_sample_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_callback_rejected_contribution_count(&self) -> u64 {
+        self.stream.callback_probe().rejected_contribution_count()
+    }
+
+    #[cfg(test)]
     pub(crate) fn native_active_source_count(&self) -> usize {
         self.stream.active_source_count()
     }

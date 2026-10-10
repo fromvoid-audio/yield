@@ -2160,6 +2160,80 @@ mod tests {
                 assert_eq!(after_anti_click_change.fade_out, edit_snapshot.fade_out);
             }
         }
+        // Reuse the real output stream for malformed IEEE-float WAV qualification.
+        // Ordinary typed-buffer tests separately prove a bad source cannot poison
+        // a simultaneous healthy contribution. Here the native probe sees the
+        // converted device samples, including samples that would be non-finite.
+        let malformed_path = root.path().join("non-finite-native.wav");
+        let mut malformed_writer = hound::WavWriter::create(
+            &malformed_path,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .expect("create IEEE-float WAV");
+        for _ in 0..1_024 {
+            for sample in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.025_f32] {
+                malformed_writer
+                    .write_sample(sample)
+                    .expect("write float sample");
+            }
+        }
+        malformed_writer
+            .finalize()
+            .expect("finalize IEEE-float WAV");
+        // Verify this is genuinely malformed input, rather than a sanitized fixture.
+        let decoded = hound::WavReader::open(&malformed_path)
+            .expect("read IEEE-float WAV")
+            .samples::<f32>()
+            .take(4)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode float samples");
+        assert!(decoded[0].is_nan());
+        assert_eq!(decoded[1], f32::INFINITY);
+        assert_eq!(decoded[2], f32::NEG_INFINITY);
+
+        for volume in [0.01, 0.0] {
+            let mut malformed_request = request(false, 0.0);
+            malformed_request.source = PlaybackRuntimeSource::WavFile {
+                path: malformed_path.clone(),
+            };
+            malformed_request.volume = volume;
+            malformed_request.edit_fade = None;
+            let before = executor.player.native_callback_sample_count(0);
+            let rejected_before = executor
+                .player
+                .native_callback_rejected_contribution_count();
+            executor
+                .play(malformed_request)
+                .expect("play malformed WAV natively");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline
+                && (executor.player.native_active_source_count() == 0
+                    || executor.player.native_callback_sample_count(0) < before + 4_096
+                    || executor
+                        .player
+                        .native_callback_rejected_contribution_count()
+                        <= rejected_before)
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(executor.player.native_active_source_count() > 0);
+            assert!(executor.player.native_callback_sample_count(0) >= before + 4_096);
+            assert!(
+                executor
+                    .player
+                    .native_callback_rejected_contribution_count()
+                    > rejected_before
+            );
+            assert_eq!(executor.player.native_callback_non_finite_sample_count(), 0);
+            eprintln!(
+                "native malformed WAV volume={volume}: rejected non-finite contributions; finite device output verified"
+            );
+        }
         executor.stop().expect("stop native playback");
         let stop_deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < stop_deadline && executor.player.native_active_source_count() != 0 {
