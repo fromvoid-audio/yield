@@ -104,6 +104,8 @@ if [[ "$scope" == "full" ]]; then
   if [[ -f vendor/gpui/Cargo.toml ]]; then
     # Exercise authored Metal guards; dependency unit tests are otherwise skipped.
     run cargo test --manifest-path vendor/gpui/Cargo.toml --locked --no-default-features --features font-kit,runtime_shaders --lib post_ -- --test-threads=1
+    # Two small native dispatch regressions; do not grow a separate gesture matrix.
+    run_counted 2 0 cargo test --manifest-path vendor/gpui/Cargo.toml --locked --no-default-features --features font-kit,runtime_shaders --lib native_window_ -- --test-threads=1
   fi
 else
   run cargo check --locked -p yield-library --no-default-features

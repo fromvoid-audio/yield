@@ -487,6 +487,17 @@ pub enum WindowControlArea {
     Min,
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn window_control_area_at(
+    mouse_position: Point<Pixels>,
+    hitboxes: &[(WindowControlArea, Hitbox)],
+) -> Option<WindowControlArea> {
+    hitboxes
+        .iter()
+        .find(|(_, hitbox)| hitbox.bounds.contains(&mouse_position))
+        .map(|(area, _)| *area)
+}
+
 /// An identifier for a [Hitbox] which also includes [HitboxBehavior].
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct HitboxId(u64);
@@ -1135,6 +1146,20 @@ impl Window {
             Box::new(move || {
                 handle
                     .update(&mut cx, |_, window, _cx| {
+                        // AppKit asks whether a view can move its window while routing the
+                        // native mouse-down, before GPUI dispatches that event. Read the
+                        // platform cursor directly on macOS so the result uses the position of
+                        // this mouse-down, including on first clicks and mixed-scale displays.
+                        #[cfg(target_os = "macos")]
+                        let mouse_position = window.platform_window.mouse_position();
+                        #[cfg(target_os = "macos")]
+                        if let Some(area) = window_control_area_at(
+                            mouse_position,
+                            &window.rendered_frame.window_control_hitboxes,
+                        ) {
+                            return Some(area);
+                        }
+                        #[cfg(not(target_os = "macos"))]
                         for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
                             if window.mouse_hit_test.ids.contains(&hitbox.id) {
                                 return Some(*area);
@@ -5164,5 +5189,32 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+#[cfg(test)]
+mod native_window_control_tests {
+    use super::{
+        ContentMask, Hitbox, HitboxBehavior, HitboxId, WindowControlArea, window_control_area_at,
+    };
+    use crate::{Bounds, point, px, size};
+
+    #[test]
+    fn native_drag_hit_test_uses_the_current_logical_pointer_position() {
+        let drag_strip = Hitbox {
+            id: HitboxId(1),
+            bounds: Bounds::new(point(px(0.), px(0.)), size(px(120.), px(48.))),
+            content_mask: ContentMask::default(),
+            behavior: HitboxBehavior::Normal,
+        };
+        let controls = [(WindowControlArea::Drag, drag_strip)];
+
+        assert_eq!(
+            window_control_area_at(point(px(24.), px(16.)), &controls),
+            Some(WindowControlArea::Drag),
+        );
+        // A toolbar slider outside the marked strip must remain an ordinary control,
+        // including when the pointer is supplied in logical points on a Retina display.
+        assert_eq!(window_control_area_at(point(px(420.), px(40.)), &controls), None);
     }
 }

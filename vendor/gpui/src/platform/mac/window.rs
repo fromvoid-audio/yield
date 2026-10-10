@@ -130,6 +130,10 @@ unsafe fn build_classes() {
                     handle_view_event as extern "C" fn(&Object, Sel, id),
                 );
                 decl.add_method(
+                    sel!(mouseDownCanMoveWindow),
+                    mouse_down_can_move_window as extern "C" fn(&Object, Sel) -> BOOL,
+                );
+                decl.add_method(
                     sel!(mouseUp:),
                     handle_view_event as extern "C" fn(&Object, Sel, id),
                 );
@@ -399,6 +403,7 @@ struct MacWindowState {
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
     should_close_callback: Option<Box<dyn FnMut() -> bool>>,
+    hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     close_callback: Option<Box<dyn FnOnce()>>,
     appearance_changed_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
@@ -702,6 +707,7 @@ impl MacWindow {
                 resize_callback: None,
                 moved_callback: None,
                 should_close_callback: None,
+                hit_test_window_control_callback: None,
                 close_callback: None,
                 appearance_changed_callback: None,
                 input_handler: None,
@@ -1406,7 +1412,8 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().close_callback = Some(callback);
     }
 
-    fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+        self.0.as_ref().lock().hit_test_window_control_callback = Some(callback);
     }
 
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
@@ -1793,6 +1800,27 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 
         _ => NO,
     }
+}
+
+fn native_window_drag_allowed(
+    hit_test: Option<&mut dyn FnMut() -> Option<WindowControlArea>>,
+) -> bool {
+    hit_test.is_some_and(|hit_test| matches!(hit_test(), Some(WindowControlArea::Drag)))
+}
+
+extern "C" fn mouse_down_can_move_window(this: &Object, _: Sel) -> BOOL {
+    let window_state = unsafe { get_window_state(this) };
+    let mut lock = window_state.as_ref().lock();
+    let Some(mut callback) = lock.hit_test_window_control_callback.take() else {
+        return NO;
+    };
+    drop(lock);
+
+    // AppKit calls this before forwarding mouse-down to GPUI. Only explicitly marked drag
+    // regions may pass that press through to NSWindow's native titlebar mover.
+    let can_move = native_window_drag_allowed(Some(callback.as_mut()));
+    window_state.lock().hit_test_window_control_callback = Some(callback);
+    can_move as BOOL
 }
 
 extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
@@ -2664,5 +2692,33 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
             callback();
             window_state.lock().toggle_tab_bar_callback = Some(callback);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native_window_drag_allowed;
+    use crate::WindowControlArea;
+
+    #[test]
+    fn native_window_drag_requires_an_explicit_drag_region() {
+        let mut calls = 0;
+        let mut drag_hit_test = || {
+            calls += 1;
+            Some(WindowControlArea::Drag)
+        };
+        assert!(native_window_drag_allowed(Some(&mut drag_hit_test)));
+        assert_eq!(calls, 1);
+
+        for area in [
+            None,
+            Some(WindowControlArea::Close),
+            Some(WindowControlArea::Max),
+            Some(WindowControlArea::Min),
+        ] {
+            let mut hit_test = || area;
+            assert!(!native_window_drag_allowed(Some(&mut hit_test)));
+        }
+        assert!(!native_window_drag_allowed(None));
     }
 }
