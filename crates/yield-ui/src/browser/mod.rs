@@ -14,8 +14,9 @@ use std::sync::{
 use std::time::Instant;
 
 use gpui::{
-    App, AppContext, BorrowAppContext, ClickEvent, Context, FocusHandle, Focusable, KeyDownEvent,
-    PathPromptOptions, ScrollHandle, ScrollStrategy, Task, UniformListScrollHandle, Window,
+    App, AppContext, BorrowAppContext, Bounds, ClickEvent, Context, FocusHandle, Focusable,
+    KeyDownEvent, PathPromptOptions, Pixels, ScrollHandle, ScrollStrategy, Task,
+    UniformListScrollHandle, Window,
 };
 use reson::{PlaybackRequestId, PlaybackRuntime};
 use yield_core::{
@@ -117,6 +118,7 @@ mod playmark_timing;
 mod preferences;
 mod random_audition;
 mod rating_decay;
+mod sample_list_scrollbar;
 mod shortcut_help;
 mod sidebar;
 mod similar_sections;
@@ -559,6 +561,9 @@ pub(crate) struct Browser {
     directory_open: directory_open::DirectoryOpenState,
     handoff_task: Option<Task<()>>,
     handoff_generation: u64,
+    sample_table_horizontal_scroll_handle: ScrollHandle,
+    sample_list_scrollbar_drag: Option<sample_list_scrollbar::DragState>,
+    sample_list_scrollbar_track_bounds: Option<Bounds<Pixels>>,
     list_scroll_handle: UniformListScrollHandle,
     source_scroll_handle: UniformListScrollHandle,
     folder_scroll_handle: UniformListScrollHandle,
@@ -923,6 +928,9 @@ impl Browser {
             directory_open: directory_open::DirectoryOpenState::default(),
             handoff_task: None,
             handoff_generation: 0,
+            sample_table_horizontal_scroll_handle: ScrollHandle::new(),
+            sample_list_scrollbar_drag: None,
+            sample_list_scrollbar_track_bounds: None,
             list_scroll_handle: UniformListScrollHandle::new(),
             source_scroll_handle: UniformListScrollHandle::new(),
             folder_scroll_handle: UniformListScrollHandle::new(),

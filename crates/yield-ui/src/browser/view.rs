@@ -5,8 +5,9 @@
 
 use gpui::{
     AnyElement, ClickEvent, Context, Div, DragMoveEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, StatefulInteractiveElement, Window,
-    WindowControlArea, canvas, div, font, prelude::*, px, uniform_list,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent,
+    StatefulInteractiveElement, Window, WindowControlArea, canvas, div, font, point, prelude::*,
+    px, uniform_list,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use yield_core::{PlaybackType, SortColumn, SortDirection, format_duration, format_last_played};
@@ -26,6 +27,7 @@ use super::motion;
 use super::normalized_audition;
 use super::panel_resize::{ResizeDrag, bounded_size};
 use super::random_audition;
+use super::sample_list_scrollbar;
 use super::shortcut_help;
 use super::similar_sections;
 use super::tag_filter;
@@ -1875,8 +1877,22 @@ impl Render for Browser {
                             }
                         }),
                     )
+                    .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, window, _| {
+                        let delta = event.delta.pixel_delta(window.line_height());
+                        if delta.x.abs() > delta.y.abs() {
+                            // The list handles scroll before its parent viewport.
+                            // Restore incidental Y before the next layout.
+                            let handle = &view.list_scroll_handle.0.borrow().base_handle;
+                            let offset = handle.offset();
+                            handle.set_offset(point(offset.x, offset.y - delta.y));
+                        }
+                    }))
                     .h_full()
-                    .track_scroll(self.list_scroll_handle.clone()),
+                    .track_scroll(self.list_scroll_handle.clone())
+                    .map(|mut sample_list| {
+                        sample_list.style().restrict_scroll_to_axis = Some(true);
+                        sample_list
+                    }),
                 )
                 .child(motion::scroll_edge_fades(
                     self.list_scroll_handle.clone(),
@@ -2612,15 +2628,42 @@ impl Render for Browser {
                                     .bg(color(theme.colors.surface))
                                     .child(
                                         div()
-                                            .id("sample-table-scroll")
-                                            .debug_selector(|| "sample-table-viewport".into())
+                                            .relative()
                                             .flex()
                                             .flex_col()
                                             .flex_1()
                                             .w_full()
                                             .min_w_0()
-                                            .overflow_x_scroll()
-                                            .child(
+                                            .overflow_hidden()
+                                            .child({
+                                                let mut table_scroll = div()
+                                                    .id("sample-table-scroll")
+                                                    .debug_selector(|| "sample-table-viewport".into())
+                                                    .flex()
+                                                    .flex_col()
+                                                    .size_full()
+                                                    .min_w_0()
+                                                    .overflow_x_scroll()
+                                                    .track_scroll(
+                                                        &self.sample_table_horizontal_scroll_handle,
+                                                    )
+                                                    .on_scroll_wheel(cx.listener(
+                                                        |view, event: &ScrollWheelEvent, window, _| {
+                                                            let delta = event
+                                                                .delta
+                                                                .pixel_delta(window.line_height());
+                                                            if delta.y.abs() >= delta.x.abs() {
+                                                                // Restore incidental X before the
+                                                                // next layout for vertical-dominant
+                                                                // gestures.
+                                                                let offset = view.sample_table_horizontal_scroll_handle.offset();
+                                                                view.sample_table_horizontal_scroll_handle.set_offset(point(offset.x - delta.x, offset.y));
+                                                            }
+                                                        },
+                                                    ));
+                                                table_scroll.style().restrict_scroll_to_axis =
+                                                    Some(true);
+                                                table_scroll.child(
                                                 div()
                                                     .debug_selector(|| "sample-table-content".into())
                                                     .flex()
@@ -2718,7 +2761,15 @@ impl Render for Browser {
                                                             )
                                                     })
                                                     .child(list),
-                                            ),
+                                                )
+                                            })
+                                            .child(sample_list_scrollbar::render(
+                                                self,
+                                                theme.clone(),
+                                                theme.spacing.row_height,
+                                                !self.view_model.rows().is_empty(),
+                                                cx,
+                                            )),
                                     ),
                             ),
                     ),
@@ -3181,6 +3232,206 @@ mod tests {
         assert_eq!(
             row_after.origin.x - row_before.origin.x,
             name_after.origin.x - name_before.origin.x
+        );
+    }
+
+    #[gpui::test]
+    fn vertical_dominant_table_scroll_keeps_columns_still(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, _| {
+            for column in BrowserColumn::DEFAULT_ORDER {
+                view.column_layout.set_width(column, 420.0);
+            }
+            let root = PathBuf::from("/tmp/opt2282-scroll-fixture");
+            view.root = Some(root.clone());
+            view.entries = (0..100)
+                .map(|index| AudioFile {
+                    path: root.join(format!("sample-{index:03}.wav")),
+                    relative_path: PathBuf::from(format!("sample-{index:03}.wav")),
+                    byte_len: 0,
+                    duration_seconds: None,
+                    sample_rate: None,
+                    playback_type: None,
+                    curation: None,
+                })
+                .collect();
+            view.view_model = BrowserViewModel::new(&view.entries);
+        });
+        cx.refresh().expect("render sample table");
+        cx.run_until_parked();
+
+        let name_before = cx.debug_bounds("browser-column-Name").expect("name header");
+        let scrollbar = cx
+            .debug_bounds("sample-list-scrollbar")
+            .expect("visible sample-list scrollbar");
+        assert!(scrollbar.size.height > px(100.0));
+        let position = point(
+            name_before.origin.x + px(50.0),
+            name_before.origin.y + name_before.size.height + px(20.0),
+        );
+
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(-180.0), px(0.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.refresh().expect("render initial horizontal scroll");
+        let horizontally_scrolled = cx
+            .debug_bounds("browser-column-Name")
+            .expect("scrolled name header");
+        assert!(horizontally_scrolled.origin.x < name_before.origin.x - px(50.0));
+        let vertical_offset_before = cx.cx.update(|app| {
+            browser
+                .read(app)
+                .list_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y
+        });
+
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(12.0), px(-100.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.refresh().expect("render diagonal vertical scroll");
+        let after_diagonal_header = cx
+            .debug_bounds("browser-column-Name")
+            .expect("diagonal name header");
+        let vertical_offset_after = cx.cx.update(|app| {
+            browser
+                .read(app)
+                .list_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y
+        });
+        assert_eq!(
+            after_diagonal_header.origin.x,
+            horizontally_scrolled.origin.x
+        );
+        assert!(vertical_offset_after < vertical_offset_before);
+
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-100.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.refresh().expect("render pure vertical scroll");
+        let after_pure_y_header = cx
+            .debug_bounds("browser-column-Name")
+            .expect("pure vertical name header");
+        let vertical_offset_after_pure_y = cx.cx.update(|app| {
+            browser
+                .read(app)
+                .list_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y
+        });
+        assert_eq!(after_pure_y_header.origin.x, after_diagonal_header.origin.x);
+        assert!(vertical_offset_after_pure_y < vertical_offset_after);
+
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(-100.0), px(-8.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.refresh()
+            .expect("render horizontal-dominant diagonal scroll");
+        let after_horizontal_header = cx
+            .debug_bounds("browser-column-Name")
+            .expect("intentionally scrolled name header");
+        let vertical_offset_after_horizontal = cx.cx.update(|app| {
+            browser
+                .read(app)
+                .list_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y
+        });
+        assert!(after_horizontal_header.origin.x < after_pure_y_header.origin.x);
+        assert_eq!(
+            vertical_offset_after_horizontal,
+            vertical_offset_after_pure_y
+        );
+
+        let before_drag = vertical_offset_after_horizontal;
+        let (content_height, list_viewport_height) = cx.cx.update(|app| {
+            let view = browser.read(app);
+            let state = view.list_scroll_handle.0.borrow();
+            (
+                state.last_item_size.expect("measured list").contents.height,
+                state.base_handle.bounds().size.height,
+            )
+        });
+        let thumb_height = (list_viewport_height * (list_viewport_height / content_height))
+            .max(px(28.0))
+            .min(list_viewport_height);
+        let max_scroll = content_height - list_viewport_height;
+        let thumb_travel = list_viewport_height - thumb_height;
+        let thumb_top = thumb_travel * (-before_drag / max_scroll);
+        let scrollbar_x = scrollbar.origin.x + scrollbar.size.width / 2.0;
+        let thumb_center_y = scrollbar.origin.y + thumb_top + thumb_height / 2.0;
+        cx.simulate_mouse_down(
+            point(scrollbar_x, thumb_center_y),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        let (offset_after_press, drag_active) = cx.cx.update(|app| {
+            let view = browser.read(app);
+            (
+                view.list_scroll_handle.0.borrow().base_handle.offset().y,
+                view.sample_list_scrollbar_drag.is_some(),
+            )
+        });
+        assert_eq!(offset_after_press, before_drag);
+        assert!(drag_active);
+        cx.simulate_mouse_move(
+            point(
+                scrollbar_x,
+                scrollbar.origin.y + scrollbar.size.height * 0.75,
+            ),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            point(
+                scrollbar_x,
+                scrollbar.origin.y + scrollbar.size.height * 0.75,
+            ),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.refresh().expect("render scrollbar drag");
+        let after_drag = cx.cx.update(|app| {
+            let view = browser.read(app);
+            (
+                view.list_scroll_handle.0.borrow().base_handle.offset().y,
+                view.sample_list_scrollbar_drag.is_none(),
+            )
+        });
+        assert!(after_drag.0 < before_drag);
+        assert!(after_drag.1);
+        assert_eq!(
+            cx.debug_bounds("browser-column-Name")
+                .expect("header after scrollbar drag")
+                .origin
+                .x,
+            after_horizontal_header.origin.x
         );
     }
 
