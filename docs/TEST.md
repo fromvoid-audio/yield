@@ -623,8 +623,13 @@ prints ten consecutive converged safety-probe costs and one-file
 readiness-delta costs as JSON. Its steady-state and one-file sections include
 wall time, CPU time, live heap growth, process disk reads/writes, and target-row
 writes so their cost can be compared directly with an exact pre-change run.
-Pair both with the maintained perf guard for the frame/input-latency budgets from
-`scripts/internal/data/validation_contract.json`.
+The standalone Radiant perf guard for those historical frame/input budgets is
+retained coverage and is not the active Yield/GPUI browser-performance gate.
+For the bounded 0.1 browser CPU
+slice, use [`GPUI_BROWSER_PERFORMANCE.md`](GPUI_BROWSER_PERFORMANCE.md) and
+`scripts/perf.sh browser-vm`; it checks production view-model projection,
+sorting and collection counts on a deterministic 20k catalog. It does not
+measure GPUI frames or set a native display/input-latency threshold.
 
 The macOS native catalog replay lane also checks metadata-only watcher delivery
 against the persistent `.DS_Store` fixture. A live bootstrap capture spans the

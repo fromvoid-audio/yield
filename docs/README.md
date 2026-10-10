@@ -19,6 +19,8 @@ Machine-consumed check allowlists do not live here anymore. They now live under
 - `docs/TEST.md`
   - development workflow, RC/stable promotion policy, validation gates, and
     test suite map
+- `docs/GPUI_BROWSER_PERFORMANCE.md`
+  - reproducible 20k browser projection CPU workload and host-scoped regression baseline
 - `docs/TARGET.md`
   - product target, architecture ownership, runtime contracts, recovery rules,
     automation surfaces, data formats, UI/performance direction, and the

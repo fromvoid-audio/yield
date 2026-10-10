@@ -4,10 +4,11 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/perf.sh <guard|calibrate-startup|wheel-stability> [args...]
+Usage: scripts/perf.sh <guard|browser-vm|calibrate-startup|wheel-stability> [args...]
 
 Commands:
   guard              Run the maintained local/manual perf guard.
+  browser-vm         Capture 20k BrowserViewModel CPU measurements.
   wheel-stability    Collect wheel-latency stability evidence.
   calibrate-startup  Linux developer-only startup threshold refresh helper.
 
@@ -29,6 +30,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/internal/perf"
 
 case "$command" in
   guard) exec "$script_dir/run_perf_guard.sh" "$@" ;;
+  browser-vm) exec python3 "$script_dir/gpui_browser_view_model.py" "$@" ;;
   calibrate-startup) exec "$script_dir/calibrate_startup_thresholds.sh" "$@" ;;
   wheel-stability) exec "$script_dir/run_perf_wheel_stability.sh" "$@" ;;
   -h|--help) usage ;;

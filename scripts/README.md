@@ -104,10 +104,13 @@ dispatcher maps. These are the public entrypoints people should run directly:
   with JSONL evidence. Perf and GUI checks use their own entrypoints.
 - `check.{sh,ps1}`: focused guardrails and report helpers.
 - `run.{sh,ps1}`: sandbox, cleanup, log, and bug-bundle helpers.
-- `perf.{sh,ps1}`: performance guard commands. `scripts/perf.* guard` is the
-  maintained local/manual or release-risk perf lane. The Bash-only
-  `calibrate-startup` command is optional Linux developer tooling for refreshing
-  startup threshold lock files; it is not shipped Linux product support.
+- `perf.{sh,ps1}`: performance commands. `scripts/perf.sh browser-vm` is the
+  host-calibrated 0.1 CPU regression lane for browser projection; it does not
+  measure native frames. `scripts/perf.* guard` retains the standalone Radiant
+  historical frame/input guard and is not the active Yield/GPUI browser gate.
+  The Bash-only `calibrate-startup` command is optional Linux developer tooling
+  for refreshing startup threshold lock files; it is not shipped Linux product
+  support.
 - `release.sh`: compatibility wrapper for local CI builds. Use
   `scripts/release.sh build --sha <40-character-commit-sha> --channel <test|beta|release>`;
   it delegates to `scripts/yield-local-ci build` and preserves its result. Test
