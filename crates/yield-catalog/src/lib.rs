@@ -12197,6 +12197,10 @@ mod tests {
         let settled_cursor = settled_candidate.started_after();
         drop(settled_candidate);
 
+        // Keep a second real bootstrap stream alive across the inode-metadata mutation. This
+        // establishes the exact live callback before the separate historical replay check.
+        let live_capture = BootstrapCapture::start(spec.clone(), Duration::from_secs(5))
+            .expect("start bounded live capture before metadata mutation");
         let before_preflight_mtime = fs::metadata(&metadata_path)
             .expect("metadata before preflight")
             .modified()
@@ -12207,6 +12211,61 @@ mod tests {
             .modified()
             .expect("metadata mtime after preflight");
         assert!(after_preflight_mtime > before_preflight_mtime);
+        let live_candidate = live_capture
+            .finish(Duration::from_secs(2))
+            .expect("finish bounded live capture after metadata mutation");
+        assert!(live_candidate.history_complete());
+        assert!(
+            live_candidate.uncertainty().is_empty(),
+            "live metadata delivery must be certain: {live_candidate:?}"
+        );
+        assert!(
+            live_candidate.events().is_empty(),
+            "live metadata delivery must not include ordinary source-path changes: {live_candidate:?}"
+        );
+        assert_eq!(live_candidate.source_id(), &source_id);
+        assert_eq!(live_candidate.root_identity(), &root_identity);
+        assert_eq!(live_candidate.lifecycle_generation(), lifecycle_generation);
+        assert_eq!(live_candidate.stream_identity(), &settled_stream);
+        let live_batch = live_candidate
+            .into_observation_batch(
+                lifecycle_generation,
+                WatcherGeneration::new(lifecycle_generation),
+            )
+            .expect("live metadata callback yields an observation batch");
+        assert!(live_batch.observation().continuous());
+        assert!(live_batch.is_metadata_only());
+        let live_provenance = live_batch.observation().batch().provenance();
+        assert_eq!(live_provenance.source_id(), &source_id);
+        assert_eq!(live_provenance.root_identity(), Some(&root_identity));
+        assert_eq!(
+            live_provenance.backend_stream_identity(),
+            Some(&settled_stream)
+        );
+        assert_eq!(
+            live_provenance.watcher_generation(),
+            WatcherGeneration::new(lifecycle_generation)
+        );
+        assert!(
+            live_provenance
+                .capture_boundary()
+                .last_sequence()
+                .is_some_and(|last| last > settled_cursor),
+            "live metadata callback must advance beyond the settled cursor"
+        );
+        let live_observations = live_batch.observation().batch().observations();
+        assert_eq!(live_observations.len(), 1);
+        assert_eq!(
+            live_observations[0].kind(),
+            yield_library::sample_sources::reconciliation::RawEventKind::Modify
+        );
+        assert_eq!(live_observations[0].paths().len(), 1);
+        assert_eq!(
+            live_observations[0].paths()[0].path(),
+            Path::new("Library/.DS_Store")
+        );
+        drop(live_batch);
+
         let mut metadata_request = yield_source_watcher::replay::NativeReplayCaptureRequest::start(
             spec.clone(),
             settled_cursor,
@@ -15905,59 +15964,79 @@ mod tests {
         }
 
         // This file is created only after the restart-recovery audit committed. It must be
-        // observed by the newly installed native watcher and become a single source-owned audit
-        // publication, rather than being lost in the restart gap or published as a raw event.
+        // observed by the newly installed native watcher and become one source-owner publication,
+        // either a bounded replay delta or (if uncertainty requires it) an authoritative audit.
         write_test_wav(&root.join("after-restart.wav"), 16_000, 4);
         let mutation_deadline = Instant::now() + Duration::from_secs(5);
-        let mut mutation_commits = Vec::new();
-        let converged = loop {
-            assert!(
-                Instant::now() < mutation_deadline,
-                "external source change did not audit"
-            );
-            match service.recv_event_timeout(Duration::from_millis(50)) {
-                Ok(CatalogEvent::AuditCommitted { snapshot })
-                    if snapshot.source_id == source_id
-                        && snapshot.lifecycle_generation
-                            == stable_recovery.lifecycle_generation =>
-                {
-                    let contains_external = snapshot
-                        .manifest
-                        .iter()
-                        .any(|entry| entry.relative_path == Path::new("after-restart.wav"));
-                    mutation_commits.push((snapshot.committed_revision, contains_external));
-                    if contains_external {
-                        break snapshot;
+        let (converged_revision, was_authoritative_audit) =
+            loop {
+                assert!(
+                    Instant::now() < mutation_deadline,
+                    "external source change did not publish through the source owner"
+                );
+                match service.recv_event_timeout(Duration::from_millis(50)) {
+                    Ok(CatalogEvent::ReplayCommitted {
+                        source_id: actual_source,
+                        lifecycle_generation,
+                        root_identity: actual_root,
+                        expected_revision,
+                        receipt,
+                        delta,
+                    }) if actual_source == source_id => {
+                        assert_eq!(lifecycle_generation, stable_recovery.lifecycle_generation);
+                        assert_eq!(actual_root, stable_recovery.root_identity);
+                        assert_eq!(expected_revision, stable_recovery.committed_revision);
+                        assert_eq!(delta.revision, stable_recovery.committed_revision + 1);
+                        assert_eq!(receipt.source_revision(), delta.revision);
+                        assert_eq!(receipt.prior().source_id(), &source_id);
+                        assert_eq!(
+                            receipt.prior().root_identity(),
+                            &stable_recovery.root_identity
+                        );
+                        assert_eq!(
+                            receipt.prior().watcher_generation(),
+                            WatcherGeneration::new(stable_recovery.lifecycle_generation)
+                        );
+                        assert_eq!(delta.touched_path_changes.len(), 1);
+                        assert!(delta.touched_path_changes.iter().any(|(path, entry)| {
+                            path == Path::new("after-restart.wav")
+                                && entry.as_ref().is_some_and(|entry| entry.file_size == 52)
+                        }));
+                        assert!(delta.authoritative_snapshot.is_none());
+                        break (delta.revision, false);
+                    }
+                    Ok(CatalogEvent::AuditCommitted { snapshot })
+                        if snapshot.source_id == source_id
+                            && snapshot.lifecycle_generation
+                                == stable_recovery.lifecycle_generation =>
+                    {
+                        assert_eq!(snapshot.root_identity, stable_recovery.root_identity);
+                        assert_eq!(
+                            snapshot.committed_revision,
+                            stable_recovery.committed_revision + 2,
+                            "an uncertainty-driven audit publishes its manifest and completion"
+                        );
+                        assert!(snapshot.manifest.iter().any(|entry| {
+                            entry.relative_path == Path::new("before-restart.wav")
+                        }));
+                        assert!(snapshot.manifest.iter().any(|entry| {
+                            entry.relative_path == Path::new("after-restart.wav")
+                                && entry.file_size == 52
+                        }));
+                        break (snapshot.committed_revision, true);
+                    }
+                    Ok(event) => panic!("unexpected event after external source change: {event:?}"),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("catalog event stream closed before external change audit")
                     }
                 }
-                Ok(event) => panic!("unexpected event after external source change: {event:?}"),
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("catalog event stream closed before external change audit")
-                }
-            }
-        };
-        // A changed manifest batch and the following authoritative audit-completion batch each
-        // advance the source revision; one AuditCommitted event is still the single publication.
-        assert_eq!(
-            mutation_commits,
-            vec![(stable_recovery.committed_revision + 2, true)]
-        );
-        assert_eq!(
-            converged.committed_revision,
-            stable_recovery.committed_revision + 2,
-            "one post-restart filesystem change produces one audit publication"
-        );
-        assert!(
-            converged
-                .manifest
-                .iter()
-                .any(|entry| entry.relative_path == Path::new("before-restart.wav"))
-        );
-
+            };
+        // Exactly one selected source-owner publication is accepted above; an extra publication
+        // remains a failure under the original quiet window.
         match service.recv_event_timeout(Duration::from_millis(650)) {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            other => panic!("duplicate watcher audit publication after convergence: {other:?}"),
+            other => panic!("duplicate watcher publication after convergence: {other:?}"),
         }
         service.shutdown();
 
@@ -15969,15 +16048,30 @@ mod tests {
         .expect("reopen source-owned catalog after watcher restart");
         assert_eq!(
             database.get_revision().expect("durable source revision"),
-            converged.committed_revision
+            converged_revision
         );
-        assert!(
-            database
-                .list_files()
-                .expect("durable authoritative source manifest")
-                .iter()
-                .any(|entry| entry.relative_path == Path::new("after-restart.wav"))
-        );
+        let durable_files = database
+            .list_files()
+            .expect("durable source manifest after watcher restart");
+        assert!(durable_files.iter().any(|entry| {
+            entry.relative_path == Path::new("before-restart.wav") && entry.file_size == 52
+        }));
+        assert!(durable_files.iter().any(|entry| {
+            entry.relative_path == Path::new("after-restart.wav") && entry.file_size == 52
+        }));
+        if was_authoritative_audit {
+            assert_eq!(
+                converged_revision,
+                stable_recovery.committed_revision + 2,
+                "the conservative audit path retains its two original manifest revisions"
+            );
+        } else {
+            assert_eq!(
+                converged_revision,
+                stable_recovery.committed_revision + 1,
+                "the ordinary owner-backed replay publishes exactly one revision"
+            );
+        }
     }
 
     #[test]
