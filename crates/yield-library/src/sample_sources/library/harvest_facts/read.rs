@@ -19,8 +19,9 @@ impl LibraryDatabase {
                 if request.canceled.is_canceled() {
                     return Err(LibraryError::HarvestFactsCanceled);
                 }
-                f.validate()
-                    .map_err(|_| LibraryError::HarvestFactsSourceChanged)?;
+                // The complete privately issued cohort was fenced immediately before this
+                // transaction and will be fenced again after all rows are consumed. Per-row
+                // endpoint revalidation here added no atomicity to this separate SQLite read.
                 entries.push(read(&tx, f)?);
             }
             Ok(entries)

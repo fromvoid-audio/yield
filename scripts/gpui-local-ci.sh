@@ -136,7 +136,7 @@ run cargo test --locked -p yield-library --lib sample_sources::db::source_db_mig
 run cargo test --locked -p yield-library --lib sqlite_wal --no-default-features
 run cargo test --locked -p yield-library --lib app_dirs::storage_usage --no-default-features
 run cargo test --locked -p yield-scan --lib -- --test-threads=4
-run cargo test --locked -p yield-catalog --lib
+run cargo test --locked -p yield-catalog --lib -- --test-threads=4
 run cargo test --locked -p yield-session --lib -- --test-threads=1
 
 if [[ "$scope" == "storage" ]]; then
