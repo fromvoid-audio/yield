@@ -880,6 +880,8 @@ impl BrowserViewModel {
     fn rebuild_with_now(&mut self, entries: &[AudioFile], now_epoch_seconds: i64) {
         let query = self.query.trim().to_ascii_lowercase();
         let reveal_id = self.reveal_id.as_ref();
+        let prepare_extension_sort_key =
+            !self.curation_queue.enabled && self.sort.column == SortColumn::Extension;
         let mut projected = entries
             .iter()
             .enumerate()
@@ -912,7 +914,11 @@ impl BrowserViewModel {
                     entry_index,
                     entry.stable_id(),
                     file_name_sort_key(entry),
-                    extension_sort_key(entry),
+                    if prepare_extension_sort_key {
+                        extension_sort_key(entry)
+                    } else {
+                        String::new()
+                    },
                     entry.byte_len,
                     entry.curation.map(|curation| curation.rating().value()),
                     entry.curation.and_then(AudioFileCuration::first_collection),
@@ -1536,6 +1542,27 @@ mod tests {
         );
 
         model.toggle_sort(&entries, SortColumn::Size);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+    }
+
+    #[test]
+    fn browser_extension_sort_is_case_insensitive_and_keeps_name_ties() {
+        let entries = vec![
+            model_entry("/tmp/zeta.WAV", 10),
+            model_entry("/tmp/alpha.aiff", 30),
+            model_entry("/tmp/bravo.wav", 20),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+
+        model.toggle_sort(&entries, SortColumn::Extension);
+
         assert_eq!(
             model
                 .rows()
