@@ -12,8 +12,8 @@ use block::ConcreteBlock;
 use cocoa::{
     appkit::{
         NSAppKitVersionNumber, NSAppKitVersionNumber12_0, NSApplication, NSBackingStoreBuffered,
-        NSColor, NSEvent, NSEventModifierFlags, NSFilenamesPboardType, NSPasteboard, NSScreen,
-        NSView, NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial,
+        NSColor, NSEvent, NSEventModifierFlags, NSEventType, NSFilenamesPboardType, NSPasteboard,
+        NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial,
         NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowButton,
         NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
         NSWindowStyleMask, NSWindowTitleVisibility,
@@ -58,6 +58,12 @@ static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
+
+thread_local! {
+    // AppKit's outside-event cursor query can lag behind the mouse-down being dispatched.
+    // Keep the native event position scoped to sendEvent so GPUI's hit testing sees that press.
+    static MOUSE_POSITION_FOR_EVENT: Cell<Option<(usize, NSPoint)>> = const { Cell::new(None) };
+}
 
 #[allow(non_upper_case_globals)]
 const NSWindowStyleMaskNonactivatingPanel: NSWindowStyleMask =
@@ -288,6 +294,15 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(&Object, Sel));
 
         decl.add_method(
+            sel!(sendEvent:),
+            if name == "GPUIPanel" {
+                send_panel_event as extern "C" fn(&Object, Sel, id)
+            } else {
+                send_window_event as extern "C" fn(&Object, Sel, id)
+            },
+        );
+
+        decl.add_method(
             sel!(canBecomeMainWindow),
             yes as extern "C" fn(&Object, Sel) -> BOOL,
         );
@@ -417,6 +432,7 @@ struct MacWindowState {
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
+    mouse_gesture_move_state: MouseGestureMoveState,
     fullscreen_restore_bounds: Bounds<Pixels>,
     move_tab_to_new_window_callback: Option<Box<dyn FnMut()>>,
     merge_all_windows_callback: Option<Box<dyn FnMut()>>,
@@ -724,6 +740,7 @@ impl MacWindow {
                 do_command_handled: None,
                 external_files_dragged: false,
                 first_mouse: false,
+                mouse_gesture_move_state: MouseGestureMoveState::default(),
                 fullscreen_restore_bounds: Bounds::default(),
                 move_tab_to_new_window_callback: None,
                 merge_all_windows_callback: None,
@@ -1077,13 +1094,19 @@ impl PlatformWindow for MacWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        let position = unsafe {
-            self.0
-                .lock()
-                .native_window
-                .mouseLocationOutsideOfEventStream()
+        let (native_window, window_height) = {
+            let state = self.0.lock();
+            (state.native_window, state.content_size().height)
         };
-        convert_mouse_position(position, self.content_size().height)
+        let event_position = MOUSE_POSITION_FOR_EVENT.with(|current| {
+            current
+                .get()
+                .filter(|(window, _)| *window == native_window as usize)
+                .map(|(_, position)| position)
+        });
+        let position = event_position
+            .unwrap_or_else(|| unsafe { native_window.mouseLocationOutsideOfEventStream() });
+        convert_mouse_position(position, window_height)
     }
 
     fn modifiers(&self) -> Modifiers {
@@ -1808,6 +1831,182 @@ fn native_window_drag_allowed(
     hit_test.is_some_and(|hit_test| matches!(hit_test(), Some(WindowControlArea::Drag)))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeMouseDownAction {
+    MoveWindow,
+    SuppressImplicitMove,
+    PassThrough,
+}
+
+fn native_mouse_down_action(
+    intercept_enabled: bool,
+    event_type: NSEventType,
+    area: Option<WindowControlArea>,
+) -> NativeMouseDownAction {
+    if !intercept_enabled || event_type != NSEventType::NSLeftMouseDown {
+        return NativeMouseDownAction::PassThrough;
+    }
+
+    match area {
+        Some(WindowControlArea::Drag) => NativeMouseDownAction::MoveWindow,
+        Some(WindowControlArea::Close | WindowControlArea::Max | WindowControlArea::Min) => {
+            NativeMouseDownAction::PassThrough
+        }
+        None => NativeMouseDownAction::SuppressImplicitMove,
+    }
+}
+
+#[derive(Default)]
+struct MouseGestureMoveState {
+    restore_movable: Option<BOOL>,
+}
+
+impl MouseGestureMoveState {
+    fn suppress_if_movable(&mut self, movable: BOOL) -> bool {
+        if movable == YES {
+            self.restore_movable = Some(movable);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn take_restore_value(&mut self) -> Option<BOOL> {
+        self.restore_movable.take()
+    }
+}
+
+fn with_native_event_position<R>(
+    native_window: id,
+    position: NSPoint,
+    callback: impl FnOnce() -> R,
+) -> R {
+    let previous = MOUSE_POSITION_FOR_EVENT.with(|current| {
+        let previous = current.get();
+        current.set(Some((native_window as usize, position)));
+        previous
+    });
+    let _restore_position = EventMousePositionRestore(previous);
+    callback()
+}
+
+struct EventMousePositionRestore(Option<(usize, NSPoint)>);
+
+impl Drop for EventMousePositionRestore {
+    fn drop(&mut self) {
+        MOUSE_POSITION_FOR_EVENT.with(|current| current.set(self.0));
+    }
+}
+
+fn window_control_area_for_event(
+    native_window: id,
+    position: NSPoint,
+    window_state: &Arc<Mutex<MacWindowState>>,
+) -> Option<WindowControlArea> {
+    let callback = {
+        let mut state = window_state.lock();
+        state.hit_test_window_control_callback.take()
+    };
+    let Some(mut callback) = callback else {
+        return None;
+    };
+
+    // GPUI's callback can reenter MacWindow::mouse_position, so run it without the state lock.
+    let area = with_native_event_position(native_window, position, || callback());
+    window_state.lock().hit_test_window_control_callback = Some(callback);
+    area
+}
+
+fn restore_window_movable(state: &Arc<Mutex<MacWindowState>>, native_window: id) {
+    let was_movable = state.lock().mouse_gesture_move_state.take_restore_value();
+    if let Some(was_movable) = was_movable {
+        unsafe {
+            let _: () = msg_send![native_window, setMovable: was_movable];
+        }
+    }
+}
+
+unsafe fn dispatch_window_event(this: &Object, native_event: id, panel: bool) {
+    let event_type = unsafe { native_event.eventType() };
+    let window_state = unsafe { get_window_state(this) };
+    let native_window = this as *const Object as id;
+    let mouse_position = unsafe { native_event.locationInWindow() };
+
+    let intercept_enabled = {
+        let state = window_state.lock();
+        let style_mask: NSWindowStyleMask = unsafe { msg_send![native_window, styleMask] };
+        state.transparent_titlebar
+            && style_mask.contains(NSWindowStyleMask::NSFullSizeContentViewWindowMask)
+    };
+
+    if event_type == NSEventType::NSLeftMouseDown && intercept_enabled {
+        // Recover from a missing mouse-up before beginning another gesture.
+        restore_window_movable(&window_state, native_window);
+
+        let area = window_control_area_for_event(native_window, mouse_position, &window_state);
+        match native_mouse_down_action(intercept_enabled, event_type, area) {
+            NativeMouseDownAction::MoveWindow => {
+                let movable: BOOL = unsafe { msg_send![native_window, isMovable] };
+                if movable == YES {
+                    // This explicit event path works when a transparent full-size titlebar
+                    // routes the press through NSThemeFrame instead of GPUIView.
+                    let _: () = unsafe {
+                        msg_send![native_window, performWindowDragWithEvent: native_event]
+                    };
+                    return;
+                }
+            }
+            NativeMouseDownAction::SuppressImplicitMove => {
+                let movable: BOOL = unsafe { msg_send![native_window, isMovable] };
+                if movable == YES {
+                    let should_suppress = window_state
+                        .lock()
+                        .mouse_gesture_move_state
+                        .suppress_if_movable(movable);
+                    if should_suppress {
+                        let _: () = unsafe { msg_send![native_window, setMovable: NO] };
+                    }
+                }
+            }
+            NativeMouseDownAction::PassThrough => {}
+        }
+    }
+
+    // Keep the event position available to GPUIView's existing control-area check while
+    // AppKit routes this event. Never hold MacWindowState's lock across AppKit dispatch.
+    let dispatch = || unsafe {
+        if panel {
+            let _: () = msg_send![super(this, class!(NSPanel)), sendEvent: native_event];
+        } else {
+            let _: () = msg_send![super(this, class!(NSWindow)), sendEvent: native_event];
+        }
+    };
+    let has_suppressed_gesture = window_state
+        .lock()
+        .mouse_gesture_move_state
+        .restore_movable
+        .is_some();
+    if (intercept_enabled || has_suppressed_gesture)
+        && (event_type == NSEventType::NSLeftMouseDown || event_type == NSEventType::NSLeftMouseUp)
+    {
+        with_native_event_position(native_window, mouse_position, dispatch);
+    } else {
+        dispatch();
+    }
+
+    if event_type == NSEventType::NSLeftMouseUp {
+        restore_window_movable(&window_state, native_window);
+    }
+}
+
+extern "C" fn send_window_event(this: &Object, _: Sel, native_event: id) {
+    unsafe { dispatch_window_event(this, native_event, false) }
+}
+
+extern "C" fn send_panel_event(this: &Object, _: Sel, native_event: id) {
+    unsafe { dispatch_window_event(this, native_event, true) }
+}
+
 extern "C" fn mouse_down_can_move_window(this: &Object, _: Sel) -> BOOL {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
@@ -2024,6 +2223,10 @@ extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
 
 extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
+    if selector == sel!(windowDidResignKey:) {
+        let native_window = window_state.lock().native_window;
+        restore_window_movable(&window_state, native_window);
+    }
     let mut lock = window_state.lock();
     let is_active = unsafe { lock.native_window.isKeyWindow() == YES };
 
@@ -2697,8 +2900,13 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
 
 #[cfg(test)]
 mod tests {
-    use super::native_window_drag_allowed;
+    use super::{
+        MouseGestureMoveState, NativeMouseDownAction, native_mouse_down_action,
+        native_window_drag_allowed,
+    };
     use crate::WindowControlArea;
+    use cocoa::appkit::NSEventType;
+    use objc::runtime::{NO, YES};
 
     #[test]
     fn native_window_drag_requires_an_explicit_drag_region() {
@@ -2720,5 +2928,59 @@ mod tests {
             assert!(!native_window_drag_allowed(Some(&mut hit_test)));
         }
         assert!(!native_window_drag_allowed(None));
+    }
+
+    #[test]
+    fn native_window_mouse_down_dispatch_only_moves_for_the_explicit_drag_region() {
+        assert_eq!(
+            native_mouse_down_action(
+                true,
+                NSEventType::NSLeftMouseDown,
+                Some(WindowControlArea::Drag),
+            ),
+            NativeMouseDownAction::MoveWindow
+        );
+        assert_eq!(
+            native_mouse_down_action(true, NSEventType::NSLeftMouseDown, None),
+            NativeMouseDownAction::SuppressImplicitMove
+        );
+        for area in [
+            WindowControlArea::Close,
+            WindowControlArea::Max,
+            WindowControlArea::Min,
+        ] {
+            assert_eq!(
+                native_mouse_down_action(true, NSEventType::NSLeftMouseDown, Some(area)),
+                NativeMouseDownAction::PassThrough
+            );
+        }
+        assert_eq!(
+            native_mouse_down_action(
+                true,
+                NSEventType::NSLeftMouseUp,
+                Some(WindowControlArea::Drag),
+            ),
+            NativeMouseDownAction::PassThrough
+        );
+        assert_eq!(
+            native_mouse_down_action(false, NSEventType::NSLeftMouseDown, None),
+            NativeMouseDownAction::PassThrough
+        );
+    }
+
+    #[test]
+    fn native_window_mouse_gesture_move_state_restores_once_on_mouse_up_or_key_resign() {
+        let mut state = MouseGestureMoveState::default();
+
+        assert!(!state.suppress_if_movable(NO));
+        assert_eq!(state.take_restore_value(), None);
+
+        assert!(state.suppress_if_movable(YES));
+        assert_eq!(state.take_restore_value(), Some(YES)); // mouse-up
+        assert_eq!(state.take_restore_value(), None); // repeated cleanup is harmless
+
+        assert!(state.suppress_if_movable(YES));
+        assert_eq!(state.take_restore_value(), Some(YES)); // key resignation
+        assert_eq!(state.take_restore_value(), None);
     }
 }
