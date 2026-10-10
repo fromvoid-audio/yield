@@ -17,6 +17,8 @@ use self::discovery::sample_rates_in_range;
 #[cfg(test)]
 pub(crate) use self::stream::monitor_sink_for_tests;
 #[cfg(test)]
+pub(crate) use self::stream::open_output_stream_on_test_device;
+#[cfg(test)]
 use self::stream::resolved_output_from_stream_config;
 
 /// Errors that can occur while enumerating or opening audio outputs.
@@ -62,6 +64,12 @@ pub enum AudioOutputError {
     PlayStream {
         /// Underlying cpal error.
         source: cpal::PlayStreamError,
+    },
+    /// Failed to start the off-thread audio lifecycle dispatcher.
+    #[error("Failed to start audio lifecycle thread: {source}")]
+    LifecycleThread {
+        /// Underlying thread creation error.
+        source: std::io::Error,
     },
     /// Failed to resolve the default output config for a host.
     #[error("Default config error for {host_id}: {source}")]

@@ -84,12 +84,13 @@ pub use maintenance::{
 };
 
 pub use preferences::{
-    AudioOutputPreferences, DEFAULT_RATING_DECAY_WEEKS, DEFAULT_TEXT_SCALE_PERCENT,
-    ENLARGED_TEXT_SCALE_PERCENT, MAX_COLLECTION_NAME_BYTES, MAX_RATING_DECAY_WEEKS,
-    MAX_USER_SHADER_SOURCE_BYTES, MAX_VISUAL_EFFECT_STRENGTH_PERCENT, MIN_RATING_DECAY_WEEKS,
-    PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId, PreferenceRevision,
-    ShippedVisualEffectPreferences, ShippedVisualEffectPreset, UI_PREFERENCES_SCHEMA_VERSION,
-    USER_SHADER_CONTRACT_VERSION, UiPreferences, UserShaderPreferences,
+    AudioOutputPreferences, DEFAULT_ANTI_CLICK_FADE_MS, DEFAULT_RATING_DECAY_WEEKS,
+    DEFAULT_TEXT_SCALE_PERCENT, ENLARGED_TEXT_SCALE_PERCENT, MAX_ANTI_CLICK_FADE_MS,
+    MAX_COLLECTION_NAME_BYTES, MAX_RATING_DECAY_WEEKS, MAX_USER_SHADER_SOURCE_BYTES,
+    MAX_VISUAL_EFFECT_STRENGTH_PERCENT, MIN_RATING_DECAY_WEEKS, PreferenceError, PreferenceEvent,
+    PreferencePatch, PreferenceRequestId, PreferenceRevision, ShippedVisualEffectPreferences,
+    ShippedVisualEffectPreset, UI_PREFERENCES_SCHEMA_VERSION, USER_SHADER_CONTRACT_VERSION,
+    UiPreferences, UserShaderPreferences, sanitize_anti_click_fade_ms,
     user_shader_content_fingerprint,
 };
 use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};

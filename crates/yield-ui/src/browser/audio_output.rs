@@ -1050,6 +1050,7 @@ impl Browser {
         let generation = self.audio_output_open_generation;
         let config = self.audio_output_config.clone();
         let config_for_worker = config.clone();
+        let anti_click_settings = self.preferences.anti_click_settings();
         let retiring = self.audio_output_retiring.take();
         self.audio_output_open_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
@@ -1058,8 +1059,9 @@ impl Browser {
                     if let Some(retiring) = retiring {
                         wait_for_audio_output_runtime_shutdown(retiring)?;
                     }
-                    let player = AudioPlayer::from_config(&config_for_worker)
+                    let mut player = AudioPlayer::from_config(&config_for_worker)
                         .map_err(|error| AudioOutputOpenError::Open(error.to_string()))?;
+                    player.set_anti_clip_settings(anti_click_settings.0, anti_click_settings.1);
                     let resolved = player.output_details().clone();
                     let runtime = PlaybackRuntime::spawn(player, PlaybackRuntimeConfig::default())
                         .map_err(|error| {

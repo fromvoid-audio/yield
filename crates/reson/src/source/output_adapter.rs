@@ -3,6 +3,39 @@
 use super::Source;
 use std::time::Duration;
 
+/// Identifies an interleaved stereo output pair by its zero-based pair index.
+///
+/// This is deliberately a channel-index contract. It does not infer a
+/// speaker layout from the output channel count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StereoOutputPair(usize);
+
+impl StereoOutputPair {
+    #[cfg(test)]
+    pub(crate) const fn new(pair_index: usize) -> Self {
+        Self(pair_index)
+    }
+
+    fn for_output_channels(self, output_channels: usize) -> Self {
+        let pair_count = output_channels / 2;
+        if self.0 < pair_count {
+            self
+        } else {
+            Self::default()
+        }
+    }
+
+    fn first_channel(self) -> usize {
+        self.0 * 2
+    }
+
+    pub(crate) fn can_bypass(self, source_channels: usize, target_channels: usize) -> bool {
+        self == Self::default()
+            && ((source_channels == 1 && target_channels == 1)
+                || (source_channels == 2 && target_channels == 2))
+    }
+}
+
 /// Adapt one source to a concrete output sample rate and channel count.
 ///
 /// The playback callback mixes one interleaved sample per device-buffer slot, so
@@ -13,6 +46,7 @@ pub(crate) struct OutputAdapter<S> {
     inner: S,
     source_channels: usize,
     target_channels: usize,
+    output_pair: StereoOutputPair,
     source_rate: u32,
     target_rate: u32,
     current_frame: Vec<f32>,
@@ -30,17 +64,36 @@ where
     S: Source,
 {
     /// Build an adapter that emits samples in the requested output format.
-    pub(crate) fn new(mut inner: S, target_rate: u32, target_channels: u16) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(inner: S, target_rate: u32, target_channels: u16) -> Self {
+        Self::with_output_pair(
+            inner,
+            target_rate,
+            target_channels,
+            StereoOutputPair::default(),
+        )
+    }
+
+    /// Build an adapter that places a stereo audition program on one output
+    /// pair, silencing every unrelated output channel.
+    pub(crate) fn with_output_pair(
+        mut inner: S,
+        target_rate: u32,
+        target_channels: u16,
+        output_pair: StereoOutputPair,
+    ) -> Self {
         let source_channels = inner.channels().max(1) as usize;
         let mut current_frame = vec![0.0; source_channels];
         let current_frame_valid = read_frame_into(&mut inner, &mut current_frame);
         let mut next_frame = vec![0.0; source_channels];
         let next_frame_valid = read_frame_into(&mut inner, &mut next_frame);
         let target_channels = target_channels.max(1) as usize;
+        let output_pair = output_pair.for_output_channels(target_channels);
         Self {
             source_rate: inner.sample_rate().max(1),
             target_rate: target_rate.max(1),
             target_channels,
+            output_pair,
             inner,
             source_channels,
             current_frame,
@@ -73,14 +126,19 @@ where
                 .sum::<f32>();
             self.pending_output[0] = total / self.source_channels as f32;
         } else {
+            let first_channel = self.output_pair.first_channel();
             for output_channel in 0..self.target_channels {
-                let source_channel = if self.source_channels == 1 {
-                    0
-                } else {
-                    output_channel % self.source_channels
+                let pair_offset = output_channel.checked_sub(first_channel);
+                self.pending_output[output_channel] = match pair_offset {
+                    Some(0) => interpolate_channel(current, next, 0, fraction),
+                    Some(1) => interpolate_channel(
+                        current,
+                        next,
+                        if self.source_channels > 1 { 1 } else { 0 },
+                        fraction,
+                    ),
+                    _ => 0.0,
                 };
-                self.pending_output[output_channel] =
-                    interpolate_channel(current, next, source_channel, fraction);
             }
         }
 
@@ -180,57 +238,9 @@ fn interpolate_channel(
 #[cfg(test)]
 mod tests {
     use super::OutputAdapter;
+    use super::StereoOutputPair;
     use crate::Source;
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
     use std::time::Duration;
-
-    thread_local! {
-        static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
-        static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
-    }
-
-    struct ThreadCountingAllocator;
-
-    unsafe impl GlobalAlloc for ThreadCountingAllocator {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            record_allocation();
-            unsafe { System.alloc(layout) }
-        }
-
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            record_allocation();
-            unsafe { System.alloc_zeroed(layout) }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe { System.dealloc(ptr, layout) };
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            record_allocation();
-            unsafe { System.realloc(ptr, layout, new_size) }
-        }
-    }
-
-    #[global_allocator]
-    static TEST_ALLOCATOR: ThreadCountingAllocator = ThreadCountingAllocator;
-
-    fn record_allocation() {
-        let _ = COUNT_ALLOCATIONS.try_with(|enabled| {
-            if enabled.get() {
-                let _ = ALLOCATION_COUNT.try_with(|count| count.set(count.get() + 1));
-            }
-        });
-    }
-
-    fn count_thread_allocations(run: impl FnOnce()) -> usize {
-        ALLOCATION_COUNT.with(|count| count.set(0));
-        COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
-        run();
-        COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
-        ALLOCATION_COUNT.with(Cell::get)
-    }
 
     struct FrameSource {
         channels: u16,
@@ -301,6 +311,70 @@ mod tests {
     }
 
     #[test]
+    fn stereo_and_mono_route_only_to_selected_pair_for_supported_output_formats() {
+        for target_channels in [2, 4, 6, 8] {
+            let pair_count = usize::from(target_channels / 2);
+            for pair_index in 0..pair_count {
+                let first_channel = pair_index * 2;
+
+                let source = FrameSource::new(2, 48_000, vec![0.25, -0.5]);
+                let samples: Vec<f32> = OutputAdapter::with_output_pair(
+                    source,
+                    48_000,
+                    target_channels,
+                    StereoOutputPair::new(pair_index),
+                )
+                .collect();
+                let mut expected = vec![0.0; target_channels as usize];
+                expected[first_channel] = 0.25;
+                expected[first_channel + 1] = -0.5;
+                assert_eq!(
+                    samples, expected,
+                    "stereo: {target_channels}ch pair {pair_index}"
+                );
+
+                let source = FrameSource::new(1, 48_000, vec![0.75]);
+                let samples: Vec<f32> = OutputAdapter::with_output_pair(
+                    source,
+                    48_000,
+                    target_channels,
+                    StereoOutputPair::new(pair_index),
+                )
+                .collect();
+                let mut expected = vec![0.0; target_channels as usize];
+                expected[first_channel] = 0.75;
+                expected[first_channel + 1] = 0.75;
+                assert_eq!(
+                    samples, expected,
+                    "mono: {target_channels}ch pair {pair_index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multichannel_source_uses_explicit_first_stereo_pair_without_layout_inference() {
+        let source = FrameSource::new(6, 48_000, vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
+        let samples: Vec<f32> = OutputAdapter::new(source, 48_000, 8).collect();
+        assert_eq!(samples, [0.1, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn stale_pair_falls_back_to_pair_zero_after_output_format_rebuild() {
+        let selected = StereoOutputPair::new(2);
+        assert_eq!(selected.for_output_channels(8), selected);
+        assert!(!selected.can_bypass(2, 8));
+        assert_eq!(selected.for_output_channels(2), StereoOutputPair::default());
+        assert!(!selected.can_bypass(2, 2));
+        assert!(StereoOutputPair::default().can_bypass(2, 2));
+
+        let source = FrameSource::new(2, 48_000, vec![0.1, 0.2]);
+        let samples: Vec<f32> =
+            OutputAdapter::with_output_pair(source, 48_000, 2, selected).collect();
+        assert_eq!(samples, [0.1, 0.2]);
+    }
+
+    #[test]
     fn sustained_44100_to_48000_adaptation_allocates_nothing_after_construction() {
         let frames = 4_410;
         let samples = (0..frames * 2)
@@ -310,7 +384,7 @@ mod tests {
         let mut adapted = OutputAdapter::new(source, 48_000, 2);
         let mut emitted = 0usize;
 
-        let allocations = count_thread_allocations(|| {
+        let allocations = crate::test_support::count_thread_allocations(|| {
             while adapted.next().is_some() {
                 emitted += 1;
             }

@@ -258,16 +258,26 @@ class NativeCheckCleanupTests(unittest.TestCase):
         *,
         fail_lease_close: bool = False,
         signal_during_restore: bool = False,
+        case: str = "prerequisite:source-release-policy",
     ) -> dict[str, object]:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             state_dir = root / "git-state"
             state_dir.mkdir()
             checkout = root / "checkout"
-            runner = checkout / "scripts/internal/validation/verify_native_prerequisites.sh"
+            runner_name = (
+                "verify_macos_audition_coreaudio.sh"
+                if case == "audition-coreaudio"
+                else "verify_native_prerequisites.sh"
+            )
+            runner = checkout / "scripts/internal/validation" / runner_name
             runner.parent.mkdir(parents=True)
             runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            evidence = checkout / "artifacts/native-prerequisites/macos-source-release-policy"
+            evidence = (
+                checkout / "artifacts/macos-audition-coreaudio"
+                if case == "audition-coreaudio"
+                else checkout / "artifacts/native-prerequisites/macos-source-release-policy"
+            )
             evidence.mkdir(parents=True)
             (evidence / "native.log").write_text("native evidence", encoding="utf-8")
             namespace_path = root / "namespace.lock"
@@ -305,7 +315,7 @@ class NativeCheckCleanupTests(unittest.TestCase):
             args = type(
                 "Args",
                 (),
-                {"sha": "b" * 40, "lane": "native", "case": "prerequisite:source-release-policy"},
+                {"sha": "b" * 40, "lane": "native", "case": case},
             )()
             with (
                 mock.patch.object(MODULE, "ROOT", root),
@@ -314,7 +324,18 @@ class NativeCheckCleanupTests(unittest.TestCase):
                 mock.patch.object(MODULE, "exact_worktree", worktree),
                 mock.patch.object(MODULE, "require_maintenance_protocol"),
                 mock.patch.object(MODULE, "doctor", return_value={"host": "test"}),
-                mock.patch.object(MODULE, "cargo_env", return_value={"PATH": os.environ.get("PATH", "")}),
+                mock.patch.object(
+                    MODULE,
+                    "cargo_env",
+                    side_effect=lambda *_args: {
+                        "PATH": os.environ.get("PATH", ""),
+                        **(
+                            {"YIELD_TEST_AUDIO_OUTPUT": os.environ["YIELD_TEST_AUDIO_OUTPUT"]}
+                            if "YIELD_TEST_AUDIO_OUTPUT" in os.environ
+                            else {}
+                        ),
+                    },
+                ),
                 mock.patch.object(MODULE.local_state, "prepare_clean_launch", side_effect=prepare),
                 mock.patch.object(
                     MODULE.local_state,
@@ -328,7 +349,14 @@ class NativeCheckCleanupTests(unittest.TestCase):
                 ) as restore,
                 mock.patch.object(MODULE.os, "close", side_effect=tracking_close),
                 mock.patch.object(MODULE, "run_managed", return_value=command_status) as run,
-                mock.patch.dict(MODULE.os.environ, {"YIELD_CONFIG_HOME": "", "YIELD_CONFIG_PROFILE": ""}),
+                mock.patch.dict(
+                    MODULE.os.environ,
+                    {
+                        "YIELD_CONFIG_HOME": "",
+                        "YIELD_CONFIG_PROFILE": "",
+                        **({"YIELD_TEST_AUDIO_OUTPUT": "1"} if case == "audition-coreaudio" else {}),
+                    },
+                ),
             ):
                 expected_exception = command_status != 0 or fail_lease_close
                 if expected_exception:
@@ -339,14 +367,17 @@ class NativeCheckCleanupTests(unittest.TestCase):
 
             self.assertEqual(restore.call_count, 1)
             self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0], ["bash", str(runner)])
+            self.assertEqual(
+                run.call_args.kwargs["env"].get("YIELD_TEST_AUDIO_OUTPUT"),
+                "1" if case == "audition-coreaudio" else None,
+            )
             self.assertTrue(run.call_args.kwargs["preserve_ignored_on_exit"])
             self.assertIs(signal.getsignal(signal.SIGTERM), prior_sigterm_handler)
             self.assertEqual(close_calls.count(descriptors["namespace"]), 1)
             self.assertEqual(close_calls.count(descriptors["transition"]), 1)
             result_files = list(
-                (state_dir / "runs" / ("b" * 40) / "native").glob(
-                    "*/prerequisite:source-release-policy.json"
-                )
+                (state_dir / "runs" / ("b" * 40) / "native").glob(f"*/{case}.json")
             )
             self.assertEqual(len(result_files), 1)
             record = json.loads(result_files[0].read_text(encoding="utf-8"))
@@ -359,7 +390,10 @@ class NativeCheckCleanupTests(unittest.TestCase):
                 self.assertTrue((result_files[0].parent / "evidence/native.log").is_file())
             elif command_status:
                 self.assertEqual(record["status"], "failed")
-                self.assertFalse((result_files[0].parent / "evidence").exists())
+                if case == "audition-coreaudio":
+                    self.assertTrue((result_files[0].parent / "evidence/native.log").is_file())
+                else:
+                    self.assertFalse((result_files[0].parent / "evidence").exists())
             else:
                 self.assertEqual(record["status"], "passed")
                 self.assertEqual(
@@ -377,6 +411,27 @@ class NativeCheckCleanupTests(unittest.TestCase):
 
     def test_native_check_late_sigterm_during_restore_completes_and_restores_handlers(self) -> None:
         self.run_native_check(0, signal_during_restore=True)
+
+    def test_audition_failure_restores_and_retains_runner_evidence(self) -> None:
+        record = self.run_native_check(17, case="audition-coreaudio")
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("production_state_restore", record)
+
+    def test_audition_refuses_before_coordinator_or_clean_state_without_opt_in(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {"sha": "c" * 40, "lane": "native", "case": "audition-coreaudio"},
+        )()
+        with (
+            mock.patch.dict(MODULE.os.environ, {}, clear=True),
+            mock.patch.object(MODULE, "common_coordinator") as coordinator,
+            mock.patch.object(MODULE.local_state, "prepare_clean_launch") as prepare,
+        ):
+            with self.assertRaisesRegex(MODULE.CiError, "inherited YIELD_TEST_AUDIO_OUTPUT=1"):
+                MODULE.check(args)
+        coordinator.assert_not_called()
+        prepare.assert_not_called()
 
 
 if __name__ == "__main__":
