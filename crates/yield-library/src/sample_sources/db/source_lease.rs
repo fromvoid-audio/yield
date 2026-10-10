@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use super::file_ops_journal::BoundDatabaseRoot;
 use super::source_authority::SourceEffectGate;
 use super::sqlite_identity::DatabaseFileBinding;
-use super::{schema, SourceDatabaseIdentityError};
+use super::{SourceDatabaseIdentityError, schema};
 
 /// Filename for the physical-source ownership sidecar.
 pub(crate) const SOURCE_LEASE_LOCK_FILE_NAME: &str = ".yield-source-lease.lock";
@@ -476,8 +476,8 @@ fn read_reference_audit_on_control(
     super::source_reference_fence::SourceReferenceFenceError,
 > {
     use super::{
-        SourceReferenceFenceError as Error, META_LAST_AUTHORITATIVE_AUDIT_REVISION as AUDIT,
-        META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY as ROOT,
+        META_LAST_AUTHORITATIVE_AUDIT_REVISION as AUDIT,
+        META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY as ROOT, SourceReferenceFenceError as Error,
     };
 
     let mut stmt = control.prepare("SELECT CASE WHEN length(CAST(key AS BLOB)) <= 64 THEN key END, CASE WHEN length(CAST(value AS BLOB)) BETWEEN 1 AND CASE WHEN key = ?1 THEN 24576 ELSE 20 END THEN value END FROM metadata WHERE key IN (?1, ?2, 'revision') ORDER BY key LIMIT 4").map_err(super::SourceDbError::from)?;
@@ -2157,7 +2157,7 @@ fn acquire_nonblocking_lock(file: &File, path: &Path) -> Result<(), SourceLeaseE
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE, WIN32_ERROR};
     use windows::Win32::Storage::FileSystem::{
-        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
     };
     use windows::Win32::System::IO::OVERLAPPED;
 
