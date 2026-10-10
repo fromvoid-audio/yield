@@ -14,7 +14,16 @@ mkdir -p "$OUTPUT_DIR"
   git rev-parse HEAD
   uname -sm
   sw_vers
-  xcodebuild -version
+  developer_dir="$(xcode-select -p)"
+  printf 'Developer directory: %s\n' "$developer_dir"
+  if [[ "$developer_dir" == */CommandLineTools ]]; then
+    pkgutil --pkg-info com.apple.pkg.CLTools_Executables
+  else
+    xcodebuild -version
+  fi
+  xcrun --sdk macosx --show-sdk-path
+  xcrun --sdk macosx --show-sdk-version
+  xcrun --sdk macosx clang --version
   rustc -Vv
   cargo -V
   printf 'Build jobs: %s\n' "${CARGO_BUILD_JOBS:-host default}"

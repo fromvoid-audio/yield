@@ -312,7 +312,26 @@ fn prepared_exact_missing_directory_duplicate_and_input_limits_do_not_mutate() {
 fn prepared_exact_raw_paths_are_preserved_and_links_are_rejected() {
     use std::os::unix::{ffi::OsStringExt, fs::symlink};
     let f = Fixture::new();
-    let raw = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff.txt".to_vec()));
+    let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff.txt".to_vec()));
+    // APFS rejects invalid UTF-8 before scanner admission. Qualify that native
+    // boundary and the lossless path value separately, then use a filename the
+    // filesystem can actually hold for the original commit/link assertions.
+    #[cfg(target_os = "macos")]
+    let raw = {
+        assert_eq!(
+            RootRelativePath::try_from_path(invalid.clone())
+                .unwrap()
+                .as_path(),
+            invalid.as_path()
+        );
+        let error = std::fs::write(f.source.path().join(&invalid), b"raw").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(92), "APFS EILSEQ: {error}");
+        assert!(!f.source.path().join(&invalid).exists());
+        assert!(f.owner.catalog_database().list_files().unwrap().is_empty());
+        PathBuf::from("raw-é.txt")
+    };
+    #[cfg(not(target_os = "macos"))]
+    let raw = invalid;
     std::fs::write(f.source.path().join(&raw), b"raw").unwrap();
     let paths = vec![RootRelativePath::try_from_path(raw.clone()).unwrap()];
     let result = prepare_exact_scan(&f.owner, &paths, None)

@@ -97,6 +97,9 @@ fn serve(responses: Vec<Vec<u8>>) -> (protocol::Transport, thread::JoinHandle<Ve
                     Err(e) => panic!("fixture accept: {e}"),
                 }
             };
+            // Accepted sockets can inherit the listener's nonblocking mode on Darwin.
+            // Keep the existing two-second timeout as the bound for reading real headers.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();

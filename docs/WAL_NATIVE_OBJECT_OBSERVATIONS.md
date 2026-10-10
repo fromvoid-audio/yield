@@ -19,10 +19,20 @@ fixed backing. macOS queries the current process's original mapping address
 with libproc `PROC_PIDREGIONPATHINFO`. The kernel returns region data and a
 vnode identity pinned by its vnode ID. The adapter does not parse, trust or
 reopen the accompanying pathname buffer. Non-vnode/failed queries, unknown
-record sizes, private/copy-on-write/submap regions, incorrect protection,
+record sizes, copy-on-write/shadowed/submap regions, incorrect protection,
 offset, address/span, type, device, inode or length remain unknown. The original
 deadline is checked before and after the query; it is cooperative and cannot
 forcibly interrupt a stalled operating-system call.
+
+`SM_PRIVATE` is a kernel VM-object reference classification, not a declaration
+that the caller used `MAP_PRIVATE`. XNU can report a sole-reference shared file
+mapping with `SM_PRIVATE` and no `PROC_REGION_SHARED` bit. The observer accepts
+that native shape only with zero shadow depth and the same exact vnode, address,
+offset, span and protections; COW, private aliases, submaps and unknown flags still
+refuse. A native regression maps one retained disposable file with `MAP_SHARED`
+and `MAP_PRIVATE`, checks both before and after a write fault, and refuses wrong
+inodes and expired observations. The real Source RELEASE policy cases separately
+exercise SQLite's original forwarding-VFS mapping.
 
 The fixed public `proc_regioninfo` prefix is 96 bytes. The native record uses
 the pinned libc 0.2.189 `vnode_info_path`; compile-time assertions keep the
@@ -37,6 +47,7 @@ The reviewed kernel contract is Apple's XNU
 - `bsd/sys/proc_info.h`: region/vnode record ABI and known flags/share modes.
 - `bsd/kern/proc_info.c`: exact returned record size and `vnode_getwithvid`.
 - `osfmk/vm/bsd_vm.c`: region address, file offset, shared/submap flags and vnode lookup.
+- `osfmk/vm/vm_map.c`: sole-reference external pager and COW/shadow classification.
 
 The source review and parsing fixtures are contract evidence. They do not qualify
 the executing kernel or filesystem. Actual Linux tests exercise original SQLite

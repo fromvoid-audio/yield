@@ -3020,6 +3020,26 @@ impl OperationJournalStore {
         .map_err(ProfileJournalReserveBootstrapError::from)
     }
 
+    /// Acquire a genuine macOS volume binding for native publication tests. Unlike the generic
+    /// fixture path, this retains the same descriptor-derived APFS volume proof required by
+    /// read-only source observation; it does not synthesize capacity facts or alter admission.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn acquire_profile_journal_native_volume_owner_fixture(
+        &self,
+        registry_path: &Path,
+    ) -> Result<VolumeOwnershipCapability, ProfileJournalReserveBootstrapError> {
+        self.validate_namespace()?;
+        let descriptor = self.database_root.try_clone_descriptor().map_err(|error| {
+            ProfileJournalReserveBootstrapError::RootDescriptor(error.to_string())
+        })?;
+        super::capacity_volume_owner::acquire_native_reader_fixture_test(
+            &descriptor,
+            registry_path,
+            &self.profile_guard,
+        )
+        .map_err(ProfileJournalReserveBootstrapError::from)
+    }
+
     /// Bootstrap or reopen the profile/journal volume reserve using an already-installed owner
     /// lock. This is recovery-only state: it creates no operation id, charge, permit, or ordinary
     /// admission authority. Any context clone of the lock is dropped before this returns.

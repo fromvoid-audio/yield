@@ -46,10 +46,18 @@ impl SourceReferenceFence {
         &self,
         path: &crate::operation_journal::StoredRelativePath,
     ) -> Result<super::source_file_observation::FileFacts, super::SourceFileObservationError> {
-        self.validate()?;
-        let facts = self.publication.read_file_observation(path)?;
-        self.validate()?;
-        Ok(facts)
+        if self.writer.strong_count() == 0 {
+            return Err(SourceReferenceFenceError::LifecycleEnded.into());
+        }
+        let result = self.publication.read_reference_file_observation(
+            path,
+            self.revision.root_identity(),
+            self.revision.revision(),
+        );
+        if self.writer.strong_count() == 0 {
+            return Err(SourceReferenceFenceError::LifecycleEnded.into());
+        }
+        Ok(result?)
     }
 
     pub(super) fn issue(

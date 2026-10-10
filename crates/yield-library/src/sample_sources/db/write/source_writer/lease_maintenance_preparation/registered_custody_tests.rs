@@ -37,9 +37,12 @@ struct Fixture {
 fn fixture() -> (Fixture, SourceWriter) {
     let runtime = crate::test_runtime::TestRuntimeGuard::acquire();
     let temp = tempfile::tempdir().unwrap();
-    let media = temp.path().join("media");
+    // macOS /var is a symlink; genuine no-follow profile acquisition requires
+    // the original canonical temporary namespace, not relaxed ancestor checks.
+    let original_root = std::fs::canonicalize(temp.path()).unwrap();
+    let media = original_root.join("media");
     std::fs::create_dir(&media).unwrap();
-    let root = AppRootGuard::set(temp.path().join("profile")).unwrap();
+    let root = AppRootGuard::set(original_root.join("profile")).unwrap();
     let profile = WritableProfileGuard::acquire_current().unwrap();
     let database = SourceDatabase::open_for_catalog_with_profile_guard(
         &media,

@@ -16,6 +16,7 @@ mod integration {
     fn source(fixture: &Fixture, name: &str) -> SourceWriter {
         let media = fixture._base.path().join(name);
         fs::create_dir(&media).unwrap();
+        let media = fs::canonicalize(media).unwrap();
         fs::write(media.join("one.wav"), b"original fixture bytes").unwrap();
         let writer = SourceWriter::new_for_scan(
             SourceDatabase::open_for_catalog_with_profile_guard(&media, &fixture.owner, name)

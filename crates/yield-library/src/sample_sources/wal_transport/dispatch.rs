@@ -59,7 +59,7 @@ pub enum SourceWalProducerOwner {
     Lease(SourceLeaseWalTransportOwner),
 }
 impl SourceWalProducerOwner {
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn current_round_for_tests(
         &self,
     ) -> Option<Arc<crate::operation_journal::wal_admission::CurrentRound>> {

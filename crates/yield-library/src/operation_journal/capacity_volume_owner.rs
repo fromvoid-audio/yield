@@ -775,7 +775,7 @@ fn production_registry_root() -> Result<RegistryRoot, VolumeOwnershipError> {
                 path,
                 reason: String::from("no qualified identity-safe per-user application root"),
             },
-            other => root_error(PathBuf::from(".yield"), other),
+            other => root_error(PathBuf::from(crate::app_dirs::APP_DIR_NAME), other),
         })?;
     open_registry_child(app_path, app_capability)
 }

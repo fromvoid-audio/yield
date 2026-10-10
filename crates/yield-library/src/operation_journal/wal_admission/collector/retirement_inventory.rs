@@ -99,7 +99,7 @@ impl Collector {
         plan: &FullCapacityPlan,
         claims: &AdmissionClaimInventory,
     ) -> Result<Observation, WalPreparationError> {
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         // Keep injected pressure through the real inventory debit, but release it
         // before the owner starts genuine refusal cleanup after this call returns.
         let _inventory_pressure = self

@@ -77,7 +77,23 @@ fn raw_filename_remains_exact_index_evidence_in_the_actual_replay_transaction() 
     let f = Fixture::new(true);
     let service = f.start();
     let before = f.read().get_revision().unwrap();
-    let path = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff.wav".to_vec()));
+    let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff.wav".to_vec()));
+    #[cfg(target_os = "macos")]
+    let path = {
+        assert_eq!(
+            RootRelativePath::try_from_path(invalid.clone())
+                .unwrap()
+                .as_path(),
+            invalid.as_path()
+        );
+        let error = fs::write(f.base.root.path().join(&invalid), b"raw filename").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(92), "APFS EILSEQ: {error}");
+        assert_eq!(f.read().get_revision().unwrap(), before);
+        // A supported non-audio path preserves the original index-only transaction.
+        PathBuf::from("raw-é.txt")
+    };
+    #[cfg(not(target_os = "macos"))]
+    let path = invalid;
     let absolute = f.base.root.path().join(&path);
     fs::write(&absolute, b"raw filename").unwrap();
     let ingress = f.ingress(10);

@@ -158,6 +158,7 @@ mod integration {
                 _runtime,
             } = fixture;
             let identity = profile.profile_root_identity().to_owned();
+            let profile_root = profile.profile_root().to_owned();
             let probe = OwnerRuntimeDropProbe {
                 descriptor: descriptor.try_clone().unwrap(),
                 registry_path: registry_path.clone(),
@@ -173,6 +174,9 @@ mod integration {
             thread::scope(|scope| {
                 let observing = admission.clone();
                 let helper = scope.spawn(move || {
+                    // Thread-local fixture selection is not inherited. Probe the exact
+                    // original profile rather than this helper's default test profile.
+                    let _root = crate::app_dirs::AppRootGuard::set(profile_root).unwrap();
                     wait_closed(&observing);
                     let probe = OwnerRuntimeDropProbe {
                         descriptor,

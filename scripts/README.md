@@ -1,5 +1,25 @@
 # Scripts
 
+Use `scripts/yield-local-ci` for exact-commit local checks, channel builds and
+reversible clean state on macOS. Test builds use separate development state;
+beta/release builds use existing production state. Examples:
+
+```sh
+scripts/yield-local-ci doctor
+scripts/yield-local-ci check --sha <full-commit-sha> --lane preflight
+scripts/yield-local-ci build --sha <full-commit-sha> --channel test
+scripts/yield-local-ci run --artifact <artifact-manifest.json> --state normal
+scripts/yield-local-ci run --artifact <artifact-manifest.json> --state clean
+scripts/yield-local-ci state restore --backup <printed-transaction-id>
+```
+
+`build` never launches or resets state. A clean app launch prints its transaction
+ID and leaves restoration explicit after exit. Native/full check lanes restore
+the original production state automatically after their owned processes exit.
+Clean state is parked and retained; no recursive wipe or dirty-marker deletion is
+performed. See [TEST](../docs/TEST.md#local-macos-ci-and-reversible-state) for
+namespace rules, safety boundaries, native selectors and interrupted recovery.
+
 For the active GPUI fork, use `scripts/gpui-local-ci.sh` on macOS and
 `scripts/install-gpui-local-ci.sh` for its automatic commit hook; see
 [GPUI local CI](../docs/GPUI_LOCAL_CI.md). Windows and Linux native release qualification

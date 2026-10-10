@@ -1015,6 +1015,24 @@ impl PreparedAdmissionInput {
     }
 }
 
+#[cfg(test)]
+struct StartupReserveObserver {
+    ready: SyncSender<()>,
+    release: Receiver<()>,
+}
+
+#[cfg(test)]
+impl StartupReserveObserver {
+    fn pause_after_reserve(&self) {
+        if self.ready.send(()).is_ok() {
+            // Keep a failed test from permanently stranding the real owner worker. The test
+            // itself has the same bounded wait and explicitly releases before checking the
+            // ordinary capacity-rebuild failure.
+            let _ = self.release.recv_timeout(Duration::from_secs(5));
+        }
+    }
+}
+
 /// The single asynchronous owner of one already-open operation journal.
 ///
 /// The supplied store must have passed the caller's recovery gate before handoff. The owner takes
@@ -4984,6 +5002,10 @@ impl OperationJournalOwner {
             true,
             #[cfg(any(test, feature = "test-support"))]
             None,
+            #[cfg(test)]
+            false,
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -4997,7 +5019,17 @@ impl OperationJournalOwner {
     pub fn start_without_capacity_for_test(
         store: OperationJournalStore,
     ) -> Result<Self, OperationJournalOwnerStartError> {
-        Self::start_inner(store, None, false, false, None)
+        Self::start_inner(
+            store,
+            None,
+            false,
+            false,
+            None,
+            #[cfg(test)]
+            false,
+            #[cfg(test)]
+            None,
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -5007,7 +5039,46 @@ impl OperationJournalOwner {
         store: OperationJournalStore,
         registry_path: std::path::PathBuf,
     ) -> Result<Self, OperationJournalOwnerStartError> {
-        Self::start_inner(store, None, false, true, Some(registry_path))
+        Self::start_inner(
+            store,
+            None,
+            false,
+            true,
+            Some(registry_path),
+            #[cfg(test)]
+            false,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    /// Start a publication-test owner with a real descriptor-derived macOS volume binding.
+    /// The caller-provided registry is still isolated test state; capacity admission and its
+    /// fault controls remain the normal owner/store implementation.
+    fn start_with_native_capacity_fixture_for_test(
+        store: OperationJournalStore,
+        registry_path: std::path::PathBuf,
+    ) -> Result<Self, OperationJournalOwnerStartError> {
+        Self::start_inner(store, None, false, true, Some(registry_path), true, None)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn start_with_observed_production_bootstrap_for_test(
+        store: OperationJournalStore,
+    ) -> Result<(Self, Receiver<()>, SyncSender<()>), OperationJournalOwnerStartError> {
+        let (ready, ready_rx) = mpsc::sync_channel(1);
+        let (release_tx, release) = mpsc::sync_channel(1);
+        let owner = Self::start_inner(
+            store,
+            None,
+            false,
+            true,
+            None,
+            false,
+            Some(StartupReserveObserver { ready, release }),
+        )?;
+        Ok((owner, ready_rx, release_tx))
     }
 
     #[cfg(test)]
@@ -5020,6 +5091,8 @@ impl OperationJournalOwner {
             store,
             Some((Arc::clone(&ready), Arc::clone(&release))),
             false,
+            false,
+            None,
             false,
             None,
         )
@@ -5041,6 +5114,10 @@ impl OperationJournalOwner {
             true,
             false,
             None,
+            #[cfg(test)]
+            false,
+            #[cfg(test)]
+            None,
         )
         .expect("operation journal owner start");
         (owner, ready, release)
@@ -5057,6 +5134,8 @@ impl OperationJournalOwner {
         #[cfg(any(test, feature = "test-support"))] bootstrap_registry_path: Option<
             std::path::PathBuf,
         >,
+        #[cfg(test)] bootstrap_native_capacity: bool,
+        #[cfg(test)] startup_reserve_observer: Option<StartupReserveObserver>,
     ) -> Result<Self, OperationJournalOwnerStartError> {
         let (command_tx, command_rx) = OwnerCommandReceivers::channel();
         let shared = Arc::new(OwnerShared::new(command_tx));
@@ -5088,6 +5167,10 @@ impl OperationJournalOwner {
                         bootstrap_capacity,
                         #[cfg(any(test, feature = "test-support"))]
                         bootstrap_registry_path,
+                        #[cfg(test)]
+                        bootstrap_native_capacity,
+                        #[cfg(test)]
+                        startup_reserve_observer,
                         #[cfg(test)]
                         worker_prepared_admission_id_allocations,
                         #[cfg(test)]
@@ -7149,6 +7232,8 @@ fn run_owner(
     #[cfg(any(test, feature = "test-support"))] panic_on_command: bool,
     #[cfg(any(test, feature = "test-support"))] bootstrap_capacity: bool,
     #[cfg(any(test, feature = "test-support"))] bootstrap_registry_path: Option<std::path::PathBuf>,
+    #[cfg(test)] bootstrap_native_capacity: bool,
+    #[cfg(test)] startup_reserve_observer: Option<StartupReserveObserver>,
     #[cfg(test)] prepared_admission_id_allocations: Arc<AtomicUsize>,
     #[cfg(test)] synthetic_chunk_write_invocations: Arc<AtomicUsize>,
 ) {
@@ -7207,12 +7292,35 @@ fn run_owner(
     let bootstrap_capacity = bootstrap_capacity;
     #[cfg(any(test, feature = "test-support"))]
     let bootstrap_registry_path = bootstrap_registry_path;
+    #[cfg(test)]
+    let bootstrap_native_capacity = bootstrap_native_capacity;
     #[cfg(any(test, feature = "test-support"))]
     if bootstrap_capacity {
-        let volume_owner = match runtime
+        #[cfg(test)]
+        let volume_owner_result = if bootstrap_native_capacity {
+            #[cfg(target_os = "macos")]
+            {
+                match bootstrap_registry_path.as_deref() {
+                    Some(path) => runtime
+                        .store()
+                        .acquire_profile_journal_native_volume_owner_fixture(path),
+                    None => unreachable!("native capacity fixture requires its private registry"),
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                unreachable!("native capacity fixture exists only on macOS")
+            }
+        } else {
+            runtime
+                .store()
+                .acquire_profile_journal_volume_owner(bootstrap_registry_path.as_deref())
+        };
+        #[cfg(all(not(test), feature = "test-support"))]
+        let volume_owner_result = runtime
             .store()
-            .acquire_profile_journal_volume_owner(bootstrap_registry_path.as_deref())
-        {
+            .acquire_profile_journal_volume_owner(bootstrap_registry_path.as_deref());
+        let volume_owner = match volume_owner_result {
             Ok(volume_owner) => volume_owner,
             Err(error) => {
                 shared.mark_unavailable(&format!(
@@ -7235,6 +7343,10 @@ fn run_owner(
             }
         };
         runtime.install_reserve(reserve);
+        #[cfg(test)]
+        if let Some(observer) = startup_reserve_observer.as_ref() {
+            observer.pause_after_reserve();
+        }
     }
 
     #[cfg(not(any(test, feature = "test-support")))]
@@ -8179,7 +8291,7 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
 #[cfg(test)]
 mod tests {
     mod native_retirement_inventory;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod wal_preparation;
 
     mod command_drain_tests;
@@ -11140,6 +11252,13 @@ mod tests {
                 }
             });
         }
+        #[cfg(target_os = "macos")]
+        let mut owner = OperationJournalOwner::start_with_native_capacity_fixture_for_test(
+            store,
+            registry_path,
+        )
+        .expect("journal owner");
+        #[cfg(not(target_os = "macos"))]
         let mut owner =
             OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
                 .expect("journal owner");
@@ -11608,12 +11727,81 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("stale release result")
             .expect("stale release worker");
+        // Exercise source-grant release on a distinct admitted operation, independent
+        // of any publication-fence custody retained by the original operation.
+        let mut source_input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            claim.claim().volume().clone(),
+            facts.allocation_unit,
+        );
+        let source_prior_intent = source_input.universal_intent.clone();
+        let source_descriptors = source_input
+            .participants
+            .descriptors()
+            .iter()
+            .map(|descriptor| {
+                let source_fence = descriptor.source_fence().map(|stored| {
+                    StoredSourceFence::new(
+                        stored.source_id().clone(),
+                        source_request.media_root().identity(),
+                        source_request.database_file_identity(),
+                        stored.lifecycle_generation(),
+                        stored.source_revision(),
+                        lease_epoch,
+                    )
+                    .expect("source-release participant fence")
+                });
+                ParticipantDescriptor::new(
+                    descriptor.id(),
+                    descriptor.kind(),
+                    descriptor.requirement(),
+                    source_fence,
+                    descriptor.artifact_key().map(str::to_owned),
+                )
+                .expect("source-release participant descriptor")
+            })
+            .collect();
+        let source_participants = ParticipantSet::new(
+            source_descriptors,
+            source_input.participants.checkpoints().to_vec(),
+        )
+        .expect("source-release participants");
+        source_input.universal_intent = UniversalIntent::new(
+            source_prior_intent.parent_operation_id(),
+            source_prior_intent.command_kind(),
+            source_prior_intent.user_status_key(),
+            source_participants.clone(),
+        )
+        .expect("source-release universal intent");
+        source_input.participants = source_participants;
+        let mut source_admit = client
+            .admit_prepared(source_input)
+            .expect("source-release operation queues");
+        let source_operation_id = source_admit
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source-release operation result")
+            .expect("source-release operation worker");
+        let mut source_lookup = client
+            .get(source_operation_id)
+            .expect("source-release operation lookup queues");
+        let source_operation = source_lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source-release operation lookup result")
+            .expect("source-release operation lookup worker")
+            .expect("source-release operation record");
+        let source_participant_id = source_operation
+            .universal_intent
+            .as_ref()
+            .expect("source-release universal intent")
+            .participants()
+            .descriptors()[0]
+            .id();
         let live_target = file_owner
             .register_live_chunk_root_for_test()
             .expect("fresh staging root");
         let source_claim = ChunkClaimRequest::new(
             ChunkId::new(),
-            operation_id,
+            source_operation_id,
             AdmissionClaim::new(
                 AdmissionClaimId::new(),
                 claim.claim().volume().clone(),
@@ -11621,7 +11809,7 @@ mod tests {
                 facts.allocation_unit,
             )
             .expect("source claim"),
-            participant_id,
+            source_participant_id,
             String::from("retired-source-output"),
             facts.allocation_unit * 2,
             facts.allocation_unit,
@@ -11649,7 +11837,7 @@ mod tests {
         let mut source_issue = client
             .issue_live_chunk_effect(
                 source_claim.chunk_id(),
-                operation_id,
+                source_operation_id,
                 registration.clone(),
                 guard.pin_for_effect().expect("source retirement pin"),
                 source_spec,
@@ -12041,6 +12229,7 @@ mod tests {
                 - publication_fence::HEADER_BYTES
                 - native_read_capsule::BACKING
                 - native_read_capsule::REGISTRY
+                - HISTORICAL_REPLY_BYTES
         );
         if let Some(entered) = release_after_entry {
             let (request, unused) = unused_for_release.unwrap();
@@ -12183,6 +12372,11 @@ mod tests {
             let original_charge = serde_json::to_value(publication.charge.claim()).unwrap();
             let original_command_fingerprint = *blake3::hash(&original_command_bytes).as_bytes();
             let original_slot_generation = publication.fence.generation_observation_for_test();
+            let original_pending_identity = (
+                publication.original_target().validation().operation_id(),
+                publication.original_target().validation().participant_id(),
+                publication.original_target().validation().effect_id(),
+            );
             drop(original_command_bytes);
             let original_fingerprint = publication.original_target().fingerprint();
             let foreign = crate::file_operation_owner::FileOperationOwner::start().unwrap();
@@ -12244,15 +12438,36 @@ mod tests {
                     - publication_fence::HEADER_BYTES
                     - native_read_capsule::BACKING
                     - native_read_capsule::REGISTRY
+                    - HISTORICAL_REPLY_BYTES
             );
             staged.acknowledge().unwrap();
-            let _ = file_owner.shutdown();
+            let file_shutdown = file_owner.shutdown();
+            let pending = match file_shutdown {
+                crate::file_operation_owner::FileOperationOwnerShutdown::RetirementDeferred {
+                    pending,
+                    ..
+                } => pending,
+                other => panic!("lost publication reply must remain deferred: {other:?}"),
+            };
+            assert_eq!(
+                pending
+                    .iter()
+                    .filter(|identity| {
+                        identity.operation_id() == original_pending_identity.0
+                            && identity.participant_id() == original_pending_identity.1
+                            && identity.effect_id() == original_pending_identity.2
+                    })
+                    .count(),
+                1,
+                "shutdown must retain the exact lost publication identity"
+            );
             drop(database);
             let original_shared = Arc::clone(&owner.shared);
             let publication_baseline = InputBudget::new().publication_remaining;
-            let _ = owner.shutdown();
-            // This genuine observer retains only the original fence allocation after
-            // both actual workers joined; neither a grant nor runtime resource survives.
+            let journal_worker_joined = owner.shutdown();
+            assert!(journal_worker_joined);
+            // The completion observer is only an alias: after both workers join, the
+            // registry and retained file-owner grant still own the header and tombstone.
             assert!(completion());
             assert_eq!(
                 original_shared
@@ -12260,9 +12475,15 @@ mod tests {
                     .lock()
                     .unwrap()
                     .publication_remaining,
-                publication_baseline - publication_fence::HEADER_BYTES
+                publication_baseline
+                    - publication_fence::HEADER_BYTES
+                    - 64 * 1024
+                    - native_read_capsule::BACKING
+                    - HISTORICAL_REPLY_BYTES
             );
             drop(completion);
+            // Releasing the observer cannot settle the retained grant or reclaim the
+            // registry header; the exact post-drop debit remains unchanged.
             assert_eq!(
                 original_shared
                     .input_bytes
@@ -12270,6 +12491,10 @@ mod tests {
                     .unwrap()
                     .publication_remaining,
                 publication_baseline
+                    - publication_fence::HEADER_BYTES
+                    - 64 * 1024
+                    - native_read_capsule::BACKING
+                    - HISTORICAL_REPLY_BYTES
             );
             let restarted =
                 OperationJournalStore::open(&fixture.owner).expect("original handoff restart");
@@ -12322,6 +12547,7 @@ mod tests {
                 - publication_fence::HEADER_BYTES
                 - native_read_capsule::BACKING
                 - native_read_capsule::REGISTRY
+                - HISTORICAL_REPLY_BYTES
         );
         drop(permit);
         assert_eq!(
@@ -13889,6 +14115,13 @@ mod tests {
             facts.identity,
             facts.allocation_unit,
         );
+        let expected_claim_ids = input
+            .claims
+            .claims()
+            .iter()
+            .map(|claim| claim.claim_id().clone())
+            .collect::<Vec<_>>();
+        let input_remaining_before = owner.shared.input_bytes.lock().unwrap().remaining[0];
         let mut request = owner
             .client()
             .admit_prepared(input)
@@ -13897,17 +14130,28 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("uncertain admission result")
             .expect_err("uncertain settlement must be surfaced");
-        assert!(matches!(
-            result,
-            OperationJournalOwnerError::PreparedAdmissionRetained(
-                PreparedAdmissionRetainedError::Uncertain {
-                    stage: JournalInsertWriteStage::CommitOutcomeUnknown,
-                    claim_ids,
-                    ..
-                }
-            ) if claim_ids.len() == 1
-        ));
+        let OperationJournalOwnerError::RetainedBacking(backing) = &result else {
+            panic!("prepared uncertainty must retain its original reply: {result:?}");
+        };
+        assert!(
+            matches!(
+                backing.original_error(),
+                OperationJournalOwnerError::PreparedAdmissionRetained(
+                    PreparedAdmissionRetainedError::Uncertain {
+                        stage: JournalInsertWriteStage::CommitOutcomeUnknown,
+                        claim_ids,
+                        ..
+                    }
+                ) if claim_ids.len() == 1 && claim_ids == &expected_claim_ids
+            ),
+            "unexpected retained uncertainty: {result:?}"
+        );
+        assert!(owner.shared.input_bytes.lock().unwrap().remaining[0] < input_remaining_before);
         assert!(owner.shutdown());
+        drop(result);
+        // The uncertain outcome intentionally leaves the exact claim charge audit-pending in
+        // the owner provider. Do not treat dropping this reply wrapper as proof that the
+        // operation's retained capacity has been released.
         drop(fixture);
     }
 
@@ -13965,12 +14209,19 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("recovery-blocked admission result")
             .expect_err("active recovery evidence must block admission");
-        assert!(matches!(
-            result,
-            OperationJournalOwnerError::PreparedAdmission(
-                PreparedAdmissionError::RecoveryRequired { .. }
-            )
-        ));
+        let original = match &result {
+            OperationJournalOwnerError::RetainedBacking(backing) => backing.original_error(),
+            error => error,
+        };
+        assert!(
+            matches!(
+                original,
+                OperationJournalOwnerError::PreparedAdmission(
+                    PreparedAdmissionError::RecoveryRequired { .. }
+                )
+            ),
+            "original recovery rejection: {result:?}"
+        );
         assert_eq!(
             owner.prepared_admission_id_allocations(),
             before_id,
@@ -14022,16 +14273,24 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("rollback admission result")
             .expect_err("confirmed rollback must be surfaced");
-        assert!(matches!(
-            result,
-            OperationJournalOwnerError::PreparedAdmissionRolledBack(_)
-        ));
+        let OperationJournalOwnerError::RetainedBacking(backing) = &result else {
+            panic!("confirmed rollback must retain its original reply: {result:?}");
+        };
+        assert!(
+            matches!(
+                backing.original_error(),
+                OperationJournalOwnerError::PreparedAdmissionRolledBack(rolled_back)
+                    if rolled_back.reason.contains("prepared admission rollback fault")
+            ),
+            "unexpected retained rollback: {result:?}"
+        );
         assert_eq!(
             owner.prepared_admission_id_allocations(),
             before + 1,
             "rollback is reported only after the post-ID persistence boundary"
         );
         assert!(owner.shutdown());
+        drop(result);
         drop(fixture);
     }
 

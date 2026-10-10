@@ -1,3 +1,6 @@
+# Retired hosted job. Run each exact case locally with:
+# scripts/yield-local-ci check --lane native --case <exact-case>
+# The allowlisted selectors are documented in docs/TEST.md.
 name: Native recording custody
 on:
   workflow_dispatch:

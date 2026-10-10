@@ -24,4 +24,7 @@ pub enum AppDirError {
         /// Rejected profile name.
         profile: String,
     },
+    /// Process admission could not establish the stable namespace lock.
+    #[error("Yield persistence maintenance admission failed: {0}")]
+    MaintenanceAdmission(String),
 }

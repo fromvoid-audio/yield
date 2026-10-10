@@ -8,6 +8,13 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+development-state = [
+    "yield-library/development-state",
+    "yield-ui/development-state",
+]
+
 [dependencies]
 yield-ui.workspace = true
 yield-library.workspace = true

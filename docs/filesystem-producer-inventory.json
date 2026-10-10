@@ -406,7 +406,7 @@
     {
       "path": "crates/yield-library/src/operation_journal/owner/tests/control_backing_tests.rs",
       "function": "control_backing_native_production_startup_preserves_original_failure_and_journal",
-      "operation": "journal::start",
+      "operation": "journal::start_with_observed_production_bootstrap_for_test",
       "count": 1,
       "classification": "fixture",
       "issue": "OPT-2401",
@@ -1435,7 +1435,7 @@
     },
     {
       "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
-      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join_with",
       "operation": "fs::remove_file",
       "count": 1,
       "classification": "fixture",
@@ -1445,7 +1445,7 @@
     },
     {
       "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
-      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join_with",
       "operation": "fs::write",
       "count": 1,
       "classification": "fixture",
@@ -1455,7 +1455,7 @@
     },
     {
       "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
-      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join_with",
       "operation": "journal::open",
       "count": 1,
       "classification": "fixture",
@@ -1465,7 +1465,7 @@
     },
     {
       "path": "crates/yield-library/src/operation_journal/owner/tests/namespace_backing_tests.rs",
-      "function": "namespace_backing_native_production_error_outlives_original_worker_join",
+      "function": "namespace_backing_native_production_error_outlives_original_worker_join_with",
       "operation": "journal::start",
       "count": 1,
       "classification": "fixture",
@@ -1892,6 +1892,36 @@
       "issue": "OPT-2445",
       "reason": "Reviewed private test-only original journal/store on an isolated temporary acquired profile. Exercises bounded delivery, gated worker, persistence-only acknowledgement, pre-intent refusal, worker loss or restart; capacity-free fixture grants no Source/native/create/effect authority.",
       "retirement": "Keep this exact test-only fixture scope; remove its inventory entry if the call is removed. Full supported create and native qualification stay separate."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/maintenance_admission.rs",
+      "function": "create_owned_directory",
+      "operation": "fs::create_dir",
+      "count": 1,
+      "classification": "maintenance",
+      "issue": "PULSE-79",
+      "reason": "Creates only the canonical per-user Application Support maintenance directory after ownership and symlink checks, before establishing the retained process-lifetime admission locks. It does not create or grant a profile, source, or media capability. Tracked by local Yield Pulse ticket 79 for reversible clean/reset admission and CI.",
+      "retirement": "Keep this bounded setup for the process admission gate; remove the row if the maintenance-directory creation path is removed."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/maintenance_admission.rs",
+      "function": "open_lock_file",
+      "operation": "OpenOptions::create",
+      "count": 1,
+      "classification": "maintenance",
+      "issue": "PULSE-79",
+      "reason": "Opens the fixed transition and namespace lock files under the canonical per-user maintenance directory with no-follow and identity validation; lock existence itself grants no admission. Tracked by local Yield Pulse ticket 79 for reversible clean/reset admission and CI.",
+      "retirement": "Keep this limited to the two validated maintenance lock files; remove the row if their safe opener is removed."
+    },
+    {
+      "path": "crates/yield-library/src/app_dirs/maintenance_admission.rs",
+      "function": "open_lock_file",
+      "operation": "OpenOptions::write",
+      "count": 1,
+      "classification": "maintenance",
+      "issue": "PULSE-79",
+      "reason": "Allows initialization of the fixed maintenance lock files before flock admission; all opens validate canonical path, owner, file type, and exact descriptor identity. Tracked by local Yield Pulse ticket 79 for reversible clean/reset admission and CI.",
+      "retirement": "Keep writes limited to lock-file initialization and reviewed no-follow ownership checks; remove the row if lock-file creation no longer writes."
     }
   ]
 }

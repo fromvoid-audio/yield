@@ -11452,8 +11452,19 @@ mod tests {
                 Err(error) => panic!("unexpected result-capacity fixture error: {error}"),
             }
         }
+        // Ordinary requests cannot consume the reserved control result permits. Fill those
+        // with real idempotent drains too, because finalization uses the control lane.
+        let mut held_control_results = Vec::new();
+        loop {
+            match client.begin_source_drain(receipt.clone()) {
+                Ok(request) => held_control_results.push(request),
+                Err(OperationJournalOwnerQueueError::ResultsFull) => break,
+                Err(OperationJournalOwnerQueueError::Full) => thread::yield_now(),
+                Err(error) => panic!("unexpected control-capacity fixture error: {error}"),
+            }
+        }
         assert_eq!(
-            held_results.len(),
+            held_results.len() + held_control_results.len(),
             OPERATION_JOURNAL_OWNER_RESULT_CAPACITY,
             "fixture must fill result permits before finalization retry"
         );
@@ -11567,6 +11578,7 @@ mod tests {
         assert_eq!(retained.receipt, receipt);
         assert_eq!(retained.acknowledgement, acknowledgement);
         drop(held_results);
+        drop(held_control_results);
 
         let mut pending = pending_finalizations
             .remove(&source_id)
@@ -16496,7 +16508,7 @@ mod tests {
     mod collection_history_group_tests;
     #[cfg(feature = "test-support")]
     mod compound_batch_fault;
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     mod feature_job_tests;
     mod feature_progress_tests;
     #[cfg(target_os = "linux")]

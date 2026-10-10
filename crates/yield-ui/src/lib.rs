@@ -6,9 +6,11 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 
+#[cfg(debug_assertions)]
+use gpui::BorrowAppContext;
 use gpui::{
-    App, AppContext, Application, BorrowAppContext, Bounds, Focusable, KeyBinding, Menu, MenuItem,
-    TitlebarOptions, WindowBounds, WindowOptions, actions, point, px, size,
+    App, AppContext, Application, Bounds, Focusable, KeyBinding, Menu, MenuItem, TitlebarOptions,
+    WindowBounds, WindowOptions, actions, point, px, size,
 };
 
 #[allow(dead_code)]
