@@ -5,7 +5,11 @@ use super::{
 };
 use crate::operation_journal::StoredRelativePath;
 use rusqlite::Connection;
+use std::collections::BTreeSet;
 use thiserror::Error;
+
+const MAX_HARVEST_OBSERVATIONS: usize = 128;
+const MAX_HARVEST_OBSERVATION_PATH_BYTES: usize = 32_768;
 
 /// Fail-closed exact file observation failures.
 #[derive(Debug, Error)]
@@ -117,6 +121,60 @@ impl SourceFileObservation {
             return Err(SourceFileObservationError::IdentityChanged);
         }
         Ok(())
+    }
+
+    /// Revalidate one bounded Harvest cohort using a single retained-control connection lock.
+    /// This is crate-private and grants no capability beyond the existing point-in-time file
+    /// observations; callers must still validate again after consuming the global read result.
+    pub(crate) fn validate_harvest_batch(
+        observations: &[Self],
+        mut should_continue: impl FnMut() -> bool,
+    ) -> Result<bool, SourceFileObservationError> {
+        if observations.is_empty() || observations.len() > MAX_HARVEST_OBSERVATIONS {
+            return Err(SourceFileObservationError::Malformed);
+        }
+        if !should_continue() {
+            return Ok(false);
+        }
+        let first = &observations[0];
+        let mut paths = Vec::with_capacity(observations.len());
+        let mut seen = BTreeSet::new();
+        let mut path_bytes = 0usize;
+        for observation in observations {
+            if !should_continue() {
+                return Ok(false);
+            }
+            if !first.fence.same_issuer(&observation.fence) {
+                return Err(SourceFileObservationError::Malformed);
+            }
+            path_bytes = path_bytes
+                .checked_add(observation.path.as_str().len())
+                .ok_or(SourceFileObservationError::Malformed)?;
+            if path_bytes > MAX_HARVEST_OBSERVATION_PATH_BYTES
+                || !seen.insert(observation.path.as_str())
+            {
+                return Err(SourceFileObservationError::Malformed);
+            }
+            paths.push(observation.path.clone());
+        }
+        let Some(facts) = first
+            .fence
+            .file_facts_for_paths(&paths, &mut should_continue)?
+        else {
+            return Ok(false);
+        };
+        if facts.len() != observations.len() {
+            return Err(SourceFileObservationError::Malformed);
+        }
+        for (observation, facts) in observations.iter().zip(facts) {
+            if facts != observation.facts {
+                return Err(SourceFileObservationError::IdentityChanged);
+            }
+        }
+        if !should_continue() {
+            return Ok(false);
+        }
+        Ok(true)
     }
     /// Require actual full content identity before forming a Harvest derivation proposal.
     /// Index-only or not-yet-hashed metadata explicitly requires content audit/backfill.

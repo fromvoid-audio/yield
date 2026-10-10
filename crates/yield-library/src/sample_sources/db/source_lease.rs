@@ -32,6 +32,7 @@ const SOURCE_LEASE_TABLE_SCHEMA_VERSION: i64 = 1;
 const MAX_LEASE_TEXT_BYTES: i64 = 1024;
 const MAX_LEASE_SCHEMA_SQL_BYTES: i64 = 4096;
 const MAX_LEASE_TRIGGER_COUNT: i64 = 64;
+const MAX_HARVEST_OBSERVATION_BATCH: usize = 128;
 
 /// Typed failures from the physical-source ownership boundary.
 #[derive(Debug, Error)]
@@ -412,6 +413,77 @@ impl SourcePublicationFence {
             return Err(SourcePublicationFenceError::LeaseDropped.into());
         }
         Ok(facts)
+    }
+
+    /// Validate a finite Harvest observation cohort through one retained control connection.
+    /// Each exact row remains an autocommit read; the full binding, lease, and source audit fence
+    /// are checked around the cohort, without opening a transaction or renewing ownership.
+    pub(super) fn read_reference_file_observations(
+        &self,
+        paths: &[crate::operation_journal::StoredRelativePath],
+        expected_root: &crate::sample_sources::reconciliation::RootIdentity,
+        expected_revision: u64,
+        should_continue: &mut impl FnMut() -> bool,
+    ) -> Result<
+        Option<Vec<super::source_file_observation::FileFacts>>,
+        super::source_file_observation::SourceFileObservationError,
+    > {
+        use super::source_file_observation::SourceFileObservationError as ObservationError;
+        use super::source_reference_fence::SourceReferenceFenceError as ReferenceError;
+
+        if paths.is_empty() || paths.len() > MAX_HARVEST_OBSERVATION_BATCH {
+            return Err(ObservationError::Malformed);
+        }
+        if !should_continue() {
+            return Ok(None);
+        }
+        for path in paths {
+            path.validate().map_err(|_| ObservationError::InvalidPath)?;
+        }
+        let lease = self
+            .source_lease
+            .upgrade()
+            .ok_or(SourcePublicationFenceError::LeaseDropped)?;
+        if !self.is_live() {
+            return Err(SourcePublicationFenceError::LeaseDropped.into());
+        }
+        let control = lease.control_connection.lock().map_err(|_| {
+            SourcePublicationFenceError::Lease(SourceLeaseError::ControlUnavailable)
+        })?;
+        lease.validate_publication_fence_on_control(
+            &control,
+            &self.owner_identity,
+            self.lease_epoch,
+        )?;
+        let before = read_reference_audit_on_control(&lease, &control)?;
+        validate_expected_reference_audit(&before, expected_root, expected_revision)?;
+        let mut facts = Vec::with_capacity(paths.len());
+        for path in paths {
+            if !should_continue() {
+                return Ok(None);
+            }
+            facts.push(super::source_file_observation::read_facts(&control, path)?);
+        }
+        if !should_continue() {
+            return Ok(None);
+        }
+        let after = read_reference_audit_on_control(&lease, &control)?;
+        validate_expected_reference_audit(&after, expected_root, expected_revision)?;
+        if before != after {
+            return Err(ReferenceError::RevisionChanged.into());
+        }
+        lease.validate_publication_fence_on_control(
+            &control,
+            &self.owner_identity,
+            self.lease_epoch,
+        )?;
+        if !self.is_live() {
+            return Err(SourcePublicationFenceError::LeaseDropped.into());
+        }
+        if !should_continue() {
+            return Ok(None);
+        }
+        Ok(Some(facts))
     }
 
     /// Return the durable lease epoch captured by this fence.

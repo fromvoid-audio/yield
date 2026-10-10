@@ -60,6 +60,48 @@ impl SourceReferenceFence {
         Ok(result?)
     }
 
+    /// Return whether two point-in-time fences were issued by the same live source writer and
+    /// retained physical-source lease, including matching profile, owner epoch, and revision.
+    pub(super) fn same_issuer(&self, other: &Self) -> bool {
+        if self.revision != other.revision
+            || !self.writer.ptr_eq(&other.writer)
+            || !self.publication.same_claim_identity(&other.publication)
+        {
+            return false;
+        }
+        matches!(
+            (
+                self.publication.profile_acquisition_identity(),
+                other.publication.profile_acquisition_identity()
+            ),
+            (Some(left), Some(right)) if left == right
+        )
+    }
+
+    /// Read exact rows under one retained-control lock and fence the whole bounded cohort.
+    pub(super) fn file_facts_for_paths(
+        &self,
+        paths: &[crate::operation_journal::StoredRelativePath],
+        should_continue: &mut impl FnMut() -> bool,
+    ) -> Result<
+        Option<Vec<super::source_file_observation::FileFacts>>,
+        super::source_file_observation::SourceFileObservationError,
+    > {
+        if self.writer.strong_count() == 0 {
+            return Err(SourceReferenceFenceError::LifecycleEnded.into());
+        }
+        let facts = self.publication.read_reference_file_observations(
+            paths,
+            self.revision.root_identity(),
+            self.revision.revision(),
+            should_continue,
+        )?;
+        if self.writer.strong_count() == 0 {
+            return Err(SourceReferenceFenceError::LifecycleEnded.into());
+        }
+        Ok(facts)
+    }
+
     pub(super) fn issue(
         revision: SourceRevision,
         publication: SourcePublicationFence,

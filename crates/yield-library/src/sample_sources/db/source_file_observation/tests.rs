@@ -140,6 +140,134 @@ fn file_identity_observation_exact_row_recheck_catches_auxiliary_changes() {
         Err(SourceFileObservationError::IdentityChanged)
     ));
 }
+
+#[test]
+fn harvest_observation_batch_preserves_exact_facts_and_performs_only_reads() {
+    let f = Fixture::new();
+    let observations = [
+        f.observe("nested/é.wav").unwrap(),
+        f.observe("plain.txt").unwrap(),
+    ];
+    let connection = f.connection();
+    let data_version: i64 = connection
+        .query_row("PRAGMA data_version", [], |row| row.get(0))
+        .unwrap();
+    let lease: (i64, i64) = connection
+        .query_row(
+            "SELECT acquired_at, expires_at FROM source_lease",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    assert!(SourceFileObservation::validate_harvest_batch(&observations, || true).unwrap());
+    for observation in &observations {
+        observation.validate().unwrap();
+    }
+    assert_eq!(
+        data_version,
+        connection
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    );
+    assert_eq!(
+        lease,
+        connection
+            .query_row(
+                "SELECT acquired_at, expires_at FROM source_lease",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn harvest_observation_batch_catches_a_row_changed_during_the_cohort() {
+    use std::cell::Cell;
+
+    let f = Fixture::new();
+    let observations = [
+        f.observe("nested/é.wav").unwrap(),
+        f.observe("plain.txt").unwrap(),
+    ];
+    let checks = Cell::new(0);
+    let result = SourceFileObservation::validate_harvest_batch(&observations, || {
+        let check = checks.get() + 1;
+        checks.set(check);
+        if check == 6 {
+            // The callback is reached between the two exact-row reads. This auxiliary table
+            // mutation does not advance the manifest revision, so row equality must catch it.
+            f.connection()
+                .execute(
+                    "UPDATE source_index_entries SET format_policy_version=2 WHERE path='plain.txt'",
+                    [],
+                )
+                .unwrap();
+        }
+        true
+    });
+    assert!(matches!(
+        result,
+        Err(SourceFileObservationError::IdentityChanged)
+    ));
+}
+
+#[test]
+fn harvest_observation_batch_rejects_cancellation_and_mixed_issuers() {
+    use std::cell::Cell;
+
+    let f = Fixture::new();
+    let observations = [
+        f.observe("nested/é.wav").unwrap(),
+        f.observe("plain.txt").unwrap(),
+    ];
+    let checks = Cell::new(0);
+    assert!(
+        !SourceFileObservation::validate_harvest_batch(&observations, || {
+            let check = checks.get() + 1;
+            checks.set(check);
+            check < 6
+        })
+        .unwrap()
+    );
+
+    let other_root = tempfile::tempdir().unwrap();
+    let other_db = SourceDatabase::open_for_catalog_with_profile_guard(
+        other_root.path(),
+        &f._guard,
+        Path::new("other-source"),
+    )
+    .unwrap();
+    other_db.upsert_file(Path::new("other.wav"), 10, 1).unwrap();
+    other_db
+        .begin_source_directory_truth_generation(1, 0)
+        .unwrap();
+    let other_writer =
+        SourceWriter::new_for_scan(other_db, SourceId::from_string("other-source"), 7).unwrap();
+    let identity = other_writer
+        .current_scan_fence()
+        .unwrap()
+        .root_identity()
+        .clone();
+    other_writer
+        .catalog_database()
+        .write_batch()
+        .unwrap()
+        .commit_manifest_audit_with_staged_directory_truth(1, 1, 10, identity, None)
+        .unwrap();
+    let other_observation = other_writer
+        .observe_file_identity(StoredRelativePath::new("other.wav").unwrap())
+        .unwrap();
+    assert!(matches!(
+        SourceFileObservation::validate_harvest_batch(
+            &[observations[0].clone(), other_observation],
+            || true
+        ),
+        Err(SourceFileObservationError::Malformed)
+    ));
+}
+
 #[test]
 fn file_identity_observation_rejects_changed_revision_and_ended_writer() {
     let mut f = Fixture::new();

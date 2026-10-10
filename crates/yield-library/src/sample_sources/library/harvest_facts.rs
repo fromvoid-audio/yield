@@ -107,18 +107,23 @@ impl HarvestFactsRequest {
         if self.canceled.is_canceled() {
             return Err(LibraryError::HarvestFactsCanceled);
         }
-        for f in &self.files {
-            if self.canceled.is_canceled() {
-                return Err(LibraryError::HarvestFactsCanceled);
-            }
-            let profile = f
+        for file in &self.files {
+            let profile = file
                 .profile_acquisition_identity()
                 .ok_or(LibraryError::HarvestFactsSourceChanged)?;
             if profile != self.owner.to_string() {
                 return Err(LibraryError::HarvestFactsStaleOwner);
             }
-            f.validate()
-                .map_err(|_| LibraryError::HarvestFactsSourceChanged)?;
+        }
+        if !SourceFileObservation::validate_harvest_batch(&self.files, || {
+            !self.canceled.is_canceled()
+        })
+        .map_err(|_| LibraryError::HarvestFactsSourceChanged)?
+        {
+            return Err(LibraryError::HarvestFactsCanceled);
+        }
+        if self.canceled.is_canceled() {
+            return Err(LibraryError::HarvestFactsCanceled);
         }
         Ok(())
     }

@@ -61,6 +61,12 @@ host-sized concurrency can expire that deadline before readiness is observed.
 This bounds simultaneous fixture owners without changing production deadlines,
 assertions, test selection, or required pass counts.
 
+The catalog suite also runs with four test threads. Its native SQLite owners
+include idle WAL maintenance and bounded similarity queries; host-sized fixture
+concurrency can exhaust their original event deadlines. This controls local
+test scheduling while preserving every selector, assertion and deadline. A
+query that exceeds its budget in isolation still requires a backend fix.
+
 Install the macOS automatic trigger once with
 `bash scripts/install-gpui-local-ci.sh`.
 It installs a `post-commit` hook in this repository's shared Git directory,
