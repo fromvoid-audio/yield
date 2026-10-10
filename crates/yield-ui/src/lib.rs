@@ -13,6 +13,8 @@ use gpui::{
     WindowBounds, WindowOptions, actions, point, px, size,
 };
 
+mod os_entry;
+
 #[allow(dead_code)]
 pub(crate) mod beat_count_input;
 mod browser;
@@ -40,7 +42,21 @@ const WINDOW_HEIGHT: f32 = 720.0;
 
 /// Start the browser window.
 pub fn run(initial_root: Option<PathBuf>) {
-    Application::new().run(move |cx: &mut App| {
+    let os_entry = os_entry::OsEntrySignal::new();
+    let open_signal = os_entry.clone();
+    let application = Application::new();
+    // Register before Application::run so launch-time requests are queued while
+    // profile and Browser startup work is still pending.
+    application.on_open_urls(move |urls| open_signal.receive_open_urls(urls));
+    application.on_reopen(|cx| {
+        cx.activate(true);
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, _| window.activate_window());
+        }
+    });
+    application.run(move |cx: &mut App| {
+        // The callback retains only a capacity-one, path-free signal until Browser is ready.
+        cx.set_global(os_entry.clone());
         update_catalog_service::register(cx);
         #[cfg(debug_assertions)]
         let debug_post_effect_enabled =

@@ -2762,6 +2762,9 @@ impl Render for Browser {
                             .when(self.volume_status.is_some(), |element| {
                                 element.child(self.volume_status.clone().unwrap_or_default())
                             })
+                            .when_some(self.os_entry_status, |element, status| {
+                                element.child(status)
+                            })
                             .child(list_status)
                             .child(self.source_registry_status.clone())
                             .when(curation_status.is_some(), move |element| {

@@ -108,6 +108,7 @@ mod metadata_panel;
 mod metronome;
 mod motion;
 mod normalized_audition;
+mod os_entry;
 mod panel_focus;
 mod panel_resize;
 mod playback_age;
@@ -428,6 +429,8 @@ pub(crate) struct Browser {
     job_action: Option<job_details::JobActionState>,
     job_action_error: Option<String>,
     status_log: status_log::StatusLog,
+    os_entry_status: Option<&'static str>,
+    os_entry_task: Option<Task<()>>,
     playback_status: String,
     volume: f32,
     volume_drag: Option<volume::VolumeDrag>,
@@ -784,6 +787,8 @@ impl Browser {
             job_action: None,
             job_action_error: None,
             status_log: status_log::StatusLog::default(),
+            os_entry_status: None,
+            os_entry_task: None,
             playback_status: "Ready".to_string(),
             volume: volume::DEFAULT_VOLUME,
             volume_drag: None,
@@ -924,6 +929,7 @@ impl Browser {
         };
         browser.start_source_registry_poll(cx);
         browser.start_preferences_poll(cx);
+        browser.start_os_entry_consumer(cx);
         browser
     }
 
@@ -3311,6 +3317,7 @@ impl Drop for Browser {
             cancellation.store(true, Ordering::Release);
         }
         self.source_registry_task.take();
+        self.os_entry_task.take();
         if let Some(cancellation) = self.catalog_projection_cancel.take() {
             cancellation.store(true, Ordering::Release);
         }

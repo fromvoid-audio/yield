@@ -107,6 +107,13 @@ impl Browser {
         self.volume_status = value;
     }
 
+    pub(super) fn set_os_entry_status(&mut self, value: &'static str) {
+        if self.os_entry_status != Some(value) {
+            self.status_log.push_event("macOS", value);
+        }
+        self.os_entry_status = Some(value);
+    }
+
     pub(super) fn observe_statuses(&mut self, list_status: Option<&str>) {
         let list_status = list_status.unwrap_or(&self.scan_status);
         self.status_log.observe(&[
@@ -116,6 +123,7 @@ impl Browser {
             ("Theme", &self.theme_status),
             ("Audio output", &self.audio_output_status),
             ("Volume", self.volume_status.as_deref().unwrap_or("")),
+            ("macOS", self.os_entry_status.unwrap_or("")),
         ]);
     }
 
