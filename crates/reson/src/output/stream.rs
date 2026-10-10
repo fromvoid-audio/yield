@@ -91,15 +91,8 @@ pub(crate) fn open_output_stream_on_test_device(
         config,
         required_channels,
     )?;
-    open_stream_with_resolved_config(
-        device,
-        host_id,
-        device_name,
-        false,
-        false,
-        resolved_config,
-    )
-    .map_err(|error| error.to_string())
+    open_stream_with_resolved_config(device, host_id, device_name, false, false, resolved_config)
+        .map_err(|error| error.to_string())
 }
 
 fn open_resolved_output_stream(
