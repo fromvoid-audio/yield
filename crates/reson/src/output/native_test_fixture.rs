@@ -26,8 +26,18 @@ const ELEMENT_MAIN: u32 = 0;
 const PROP_DEVICES: u32 = fourcc(b"dev#");
 const PROP_DEFAULT_OUTPUT: u32 = fourcc(b"dOut");
 const PROP_DEVICE_UID: u32 = fourcc(b"uid ");
+const PROP_OBJECT_CLASS: u32 = fourcc(b"clas");
+const PROP_DEVICE_TRANSPORT: u32 = fourcc(b"tran");
+const CLASS_DEVICE: u32 = fourcc(b"adev");
+const CLASS_AGGREGATE_DEVICE: u32 = fourcc(b"aagg");
+const TRANSPORT_VIRTUAL: u32 = fourcc(b"virt");
+const TRANSPORT_AGGREGATE: u32 = fourcc(b"grup");
 const PROP_NOMINAL_RATE: u32 = fourcc(b"nsrt");
 const PROP_STREAM_CONFIGURATION: u32 = fourcc(b"slay");
+const PROP_AGGREGATE_FULL_SUBDEVICE_LIST: u32 = fourcc(b"grup");
+const PROP_AGGREGATE_ACTIVE_SUBDEVICE_LIST: u32 = fourcc(b"agrp");
+const PROP_AGGREGATE_COMPOSITION: u32 = fourcc(b"acom");
+const AUDIO_HARDWARE_BAD_OBJECT_ERROR: i32 = fourcc(b"!obj") as i32;
 const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 const CF_NUMBER_SINT32: CfIndex = 3;
 const DESTROY_WAIT: Duration = Duration::from_secs(2);
@@ -99,6 +109,10 @@ unsafe extern "C" {
         number_type: CfIndex,
         value: *const c_void,
     ) -> CfTypeRef;
+    fn CFNumberGetValue(number: CfTypeRef, number_type: CfIndex, value: *mut c_void) -> bool;
+    fn CFArrayGetCount(array: CfTypeRef) -> CfIndex;
+    fn CFArrayGetValueAtIndex(array: CfTypeRef, index: CfIndex) -> CfTypeRef;
+    fn CFDictionaryGetValue(dictionary: CfTypeRef, key: CfTypeRef) -> CfTypeRef;
     fn CFDictionaryCreate(
         allocator: CfTypeRef,
         keys: *const CfTypeRef,
@@ -190,6 +204,105 @@ fn cf_array(values: &[CfOwned]) -> Result<CfOwned, String> {
         },
         "array",
     )
+}
+
+fn borrowed_cf_string(value: CfStringRef) -> Result<String, String> {
+    if value.is_null() {
+        return Err("CoreAudio returned a null string value".into());
+    }
+    let mut buffer = [0_i8; 1024];
+    let converted = unsafe {
+        CFStringGetCString(
+            value,
+            buffer.as_mut_ptr(),
+            buffer.len() as CfIndex,
+            CF_STRING_ENCODING_UTF8,
+        )
+    };
+    if !converted {
+        return Err("CoreAudio string value could not be decoded as UTF-8".into());
+    }
+    unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|_| "CoreAudio string value is not UTF-8".into())
+}
+
+fn dictionary_value(dictionary: CfTypeRef, key: &str) -> Result<CfTypeRef, String> {
+    let key_name = key;
+    let key = cf_string(key)?;
+    let value = unsafe { CFDictionaryGetValue(dictionary, key.0) };
+    if value.is_null() {
+        Err(format!("CoreAudio composition is missing {key_name:?}"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn dictionary_string(dictionary: CfTypeRef, key: &str) -> Result<String, String> {
+    borrowed_cf_string(dictionary_value(dictionary, key)?)
+}
+
+fn dictionary_i32(dictionary: CfTypeRef, key: &str) -> Result<i32, String> {
+    let number = dictionary_value(dictionary, key)?;
+    let mut value = 0_i32;
+    if unsafe { CFNumberGetValue(number, CF_NUMBER_SINT32, (&mut value as *mut i32).cast()) } {
+        Ok(value)
+    } else {
+        Err(format!("CoreAudio composition value {key:?} is not an i32"))
+    }
+}
+
+fn array_strings(array: CfTypeRef) -> Result<Vec<String>, String> {
+    if array.is_null() {
+        return Err("CoreAudio returned a null array".into());
+    }
+    let count = unsafe { CFArrayGetCount(array) };
+    if count < 0 || count > 64 {
+        return Err(format!(
+            "CoreAudio returned an unexpected array length {count}"
+        ));
+    }
+    (0..count)
+        .map(|index| borrowed_cf_string(unsafe { CFArrayGetValueAtIndex(array, index) }))
+        .collect()
+}
+
+fn audio_object_id_array(
+    object: AudioObjectId,
+    selector: u32,
+) -> Result<Vec<AudioObjectId>, String> {
+    let address = property_address(selector, SCOPE_GLOBAL);
+    let mut byte_size = 0;
+    let status =
+        unsafe { AudioObjectGetPropertyDataSize(object, &address, 0, ptr::null(), &mut byte_size) };
+    if status != 0 || byte_size as usize % std::mem::size_of::<AudioObjectId>() != 0 {
+        return Err(format!(
+            "CoreAudio object-ID array query failed (status {status})"
+        ));
+    }
+    let mut values = vec![0; byte_size as usize / std::mem::size_of::<AudioObjectId>()];
+    let mut returned_size = byte_size;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            &address,
+            0,
+            ptr::null(),
+            &mut returned_size,
+            values.as_mut_ptr().cast(),
+        )
+    };
+    if status != 0
+        || returned_size as usize > byte_size as usize
+        || returned_size as usize % std::mem::size_of::<AudioObjectId>() != 0
+    {
+        return Err(format!(
+            "CoreAudio object-ID array query failed (status {status})"
+        ));
+    }
+    values.truncate(returned_size as usize / std::mem::size_of::<AudioObjectId>());
+    Ok(values)
 }
 
 fn unique_uuid() -> Result<String, String> {
@@ -391,8 +504,51 @@ fn output_channel_count(object: AudioObjectId) -> Result<u32, String> {
     Ok(channels)
 }
 
+fn fourcc_text(value: u32) -> String {
+    let bytes = value.to_be_bytes();
+    if bytes.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
+        format!("{} (0x{value:08x})", String::from_utf8_lossy(&bytes))
+    } else {
+        format!("0x{value:08x}")
+    }
+}
+
+fn aggregate_full_uid_order(object: AudioObjectId) -> Result<Vec<String>, String> {
+    let value: CfTypeRef = property_data(object, PROP_AGGREGATE_FULL_SUBDEVICE_LIST, SCOPE_GLOBAL)?;
+    let value = CfOwned::new(value, "aggregate full subdevice UID list")?;
+    array_strings(value.0)
+}
+
+fn aggregate_active_devices(object: AudioObjectId) -> Result<Vec<AudioObjectId>, String> {
+    audio_object_id_array(object, PROP_AGGREGATE_ACTIVE_SUBDEVICE_LIST)
+}
+
+fn aggregate_composition(object: AudioObjectId) -> Result<(i32, i32, String, Vec<String>), String> {
+    let value: CfTypeRef = property_data(object, PROP_AGGREGATE_COMPOSITION, SCOPE_GLOBAL)?;
+    let composition = CfOwned::new(value, "aggregate composition")?;
+    let private = dictionary_i32(composition.0, "private")?;
+    let stacked = dictionary_i32(composition.0, "stacked")?;
+    let master = dictionary_string(composition.0, "master")?;
+    let subdevices = dictionary_value(composition.0, "subdevices")?;
+    let count = unsafe { CFArrayGetCount(subdevices) };
+    if !(0..=64).contains(&count) {
+        return Err(format!(
+            "aggregate composition has unexpected subdevice count {count}"
+        ));
+    }
+    let subdevices = (0..count)
+        .map(|index| {
+            let dictionary = unsafe { CFArrayGetValueAtIndex(subdevices, index) };
+            let uid = dictionary_string(dictionary, "uid")?;
+            Ok(uid)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((private, stacked, master, subdevices))
+}
+
 fn physical_device(uid: &str) -> Result<(AudioObjectId, f64), String> {
     let object = object_for_uid(uid)?;
+    validate_physical_device(object)?;
     if output_channel_count(object)? != 2 {
         return Err("Each aggregate source must have exactly two output channels".into());
     }
@@ -404,16 +560,47 @@ fn physical_device(uid: &str) -> Result<(AudioObjectId, f64), String> {
 }
 
 pub(crate) fn physical_output_channels(uid: &str) -> Result<u32, String> {
-    output_channel_count(object_for_uid(uid)?)
+    let object = object_for_uid(uid)?;
+    validate_physical_device(object)?;
+    output_channel_count(object)
 }
 
-fn device_uid_is_present(uid: &str) -> Result<bool, String> {
-    for device in device_ids()? {
-        if string_property(device, PROP_DEVICE_UID)? == uid {
-            return Ok(true);
-        }
+fn validate_physical_device(object: AudioObjectId) -> Result<(), String> {
+    let class: u32 = property_data(object, PROP_OBJECT_CLASS, SCOPE_GLOBAL)?;
+    if class != CLASS_DEVICE {
+        return Err("Aggregate source is not a physical CoreAudio device".into());
     }
-    Ok(false)
+    let transport: u32 = property_data(object, PROP_DEVICE_TRANSPORT, SCOPE_GLOBAL)?;
+    if matches!(transport, TRANSPORT_VIRTUAL | TRANSPORT_AGGREGATE) {
+        return Err("Aggregate source has a virtual or aggregate transport".into());
+    }
+    Ok(())
+}
+
+fn owned_device_uid_is_present(object: AudioObjectId, expected_uid: &str) -> Result<bool, String> {
+    let address = property_address(PROP_DEVICE_UID, SCOPE_GLOBAL);
+    let mut value = std::mem::MaybeUninit::<CfStringRef>::uninit();
+    let mut size = std::mem::size_of::<CfStringRef>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            &address,
+            0,
+            ptr::null(),
+            &mut size,
+            value.as_mut_ptr().cast(),
+        )
+    };
+    if status == AUDIO_HARDWARE_BAD_OBJECT_ERROR {
+        return Ok(false);
+    }
+    if status != 0 || size as usize != std::mem::size_of::<CfStringRef>() {
+        return Err(format!(
+            "owned CoreAudio aggregate identity query failed (status {status})"
+        ));
+    }
+    let uid = CfOwned::new(unsafe { value.assume_init() }, "owned aggregate UID")?;
+    Ok(borrowed_cf_string(uid.0)? == expected_uid)
 }
 
 fn device_description(uid: &str, drift: bool) -> Result<CfOwned, String> {
@@ -465,11 +652,13 @@ impl PrivateAggregateGuard {
             device_description(second_uid, true)?,
         ];
         let subdevices = cf_array(&subdevices)?;
+        // On the qualified host, stacked=1 mirrored these stereo devices as two channels;
+        // stacked=0 exposed four separately addressable output channels.
         let description = cf_dictionary(&[
             ("uid", cf_string(&uid)?),
             ("name", cf_string(&name)?),
             ("private", cf_number(1)?),
-            ("stacked", cf_number(1)?),
+            ("stacked", cf_number(0)?),
             ("master", cf_string(first_uid)?),
             ("subdevices", subdevices),
         ])?;
@@ -483,7 +672,7 @@ impl PrivateAggregateGuard {
         }
 
         // Establish ownership immediately after the successful create call.
-        Ok(Self {
+        let guard = Self {
             object_id,
             uid,
             name,
@@ -493,7 +682,102 @@ impl PrivateAggregateGuard {
             stream_teardown: Vec::new(),
             retain_for_process_exit: false,
             destroyed: false,
-        })
+        };
+        if let Err(readiness_error) = guard.wait_until_ready() {
+            return match guard.close() {
+                Ok(()) => Err(readiness_error),
+                Err(cleanup_error) => Err(format!(
+                    "{readiness_error}; owned aggregate cleanup also failed: {cleanup_error}"
+                )),
+            };
+        }
+        Ok(guard)
+    }
+
+    fn wait_until_ready(&self) -> Result<(), String> {
+        let deadline = Instant::now() + DESTROY_WAIT;
+        loop {
+            match self.validate_topology() {
+                Ok(()) => return Ok(()),
+                Err(error) if Instant::now() >= deadline => {
+                    return Err(format!(
+                        "private aggregate {} did not become ready: {}; {}",
+                        self.uid,
+                        error,
+                        self.topology_diagnostic()
+                    ));
+                }
+                Err(_) => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    fn validate_topology(&self) -> Result<(), String> {
+        if string_property(self.object_id, PROP_DEVICE_UID)? != self.uid {
+            return Err("owned aggregate UID does not match the requested UID".into());
+        }
+        let class: u32 = property_data(self.object_id, PROP_OBJECT_CLASS, SCOPE_GLOBAL)?;
+        if class != CLASS_AGGREGATE_DEVICE {
+            return Err(format!("owned object class is {}", fourcc_text(class)));
+        }
+        let rate: f64 = property_data(self.object_id, PROP_NOMINAL_RATE, SCOPE_GLOBAL)?;
+        if rate.to_bits() != self.source_rates[0].to_bits() {
+            return Err(format!(
+                "aggregate nominal rate is {rate:.3}, expected {:.3}",
+                self.source_rates[0]
+            ));
+        }
+        let channels = output_channel_count(self.object_id)?;
+        if channels != 4 {
+            return Err(format!(
+                "aggregate exposes {channels} output channels, expected 4"
+            ));
+        }
+        let expected_uids = self.source_uids.to_vec();
+        if aggregate_full_uid_order(self.object_id)? != expected_uids {
+            return Err(
+                "aggregate full subdevice UID order differs from the selected children".into(),
+            );
+        }
+        let expected_ids = self
+            .source_uids
+            .iter()
+            .map(|uid| object_for_uid(uid))
+            .collect::<Result<Vec<_>, _>>()?;
+        if aggregate_active_devices(self.object_id)? != expected_ids {
+            return Err("aggregate active subdevices differ from the selected children".into());
+        }
+        let (private, stacked, master, subdevices) = aggregate_composition(self.object_id)?;
+        if private != 1
+            || stacked != 0
+            || master != self.source_uids[0]
+            || subdevices != expected_uids
+        {
+            return Err(format!(
+                "aggregate composition differs (private={private}, stacked={stacked}, master={master:?}, subdevices={subdevices:?})"
+            ));
+        }
+        Ok(())
+    }
+
+    fn topology_diagnostic(&self) -> String {
+        let class = property_data::<u32>(self.object_id, PROP_OBJECT_CLASS, SCOPE_GLOBAL)
+            .map(fourcc_text)
+            .unwrap_or_else(|error| error);
+        let channels = output_channel_count(self.object_id)
+            .map(|channels| channels.to_string())
+            .unwrap_or_else(|error| error);
+        let rate = property_data::<f64>(self.object_id, PROP_NOMINAL_RATE, SCOPE_GLOBAL)
+            .map(|rate| format!("{rate:.3}"))
+            .unwrap_or_else(|error| error);
+        let composition = aggregate_composition(self.object_id)
+            .map(|(private, stacked, master, subdevices)| {
+                format!(
+                    "private={private}, stacked={stacked}, master={master:?}, subdevices={subdevices:?}"
+                )
+            })
+            .unwrap_or_else(|error| error);
+        format!("class={class}, channels={channels}, rate={rate}, {composition}")
     }
 
     /// Bind a native stream's asynchronous teardown to this aggregate's
@@ -570,7 +854,7 @@ impl PrivateAggregateGuard {
 
         let deadline = Instant::now() + DESTROY_WAIT;
         loop {
-            if !device_uid_is_present(&self.uid)? {
+            if !owned_device_uid_is_present(self.object_id, &self.uid)? {
                 break;
             }
             if Instant::now() >= deadline {

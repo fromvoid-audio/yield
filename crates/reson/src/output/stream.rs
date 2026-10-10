@@ -96,7 +96,6 @@ pub(crate) fn open_output_stream_on_test_device(
         host_id,
         device_name,
         false,
-        config,
         false,
         resolved_config,
     )
@@ -117,7 +116,6 @@ fn open_resolved_output_stream(
         resolved_host_id,
         resolved_device_name,
         used_fallback,
-        config,
         allow_default_fallback,
         resolved_config,
     )
@@ -128,7 +126,6 @@ fn open_stream_with_resolved_config(
     mut resolved_host_id: String,
     mut resolved_device_name: String,
     mut used_fallback: bool,
-    config: &AudioOutputConfig,
     allow_default_fallback: bool,
     resolved_config: config::ResolvedOutputStreamConfig,
 ) -> Result<OpenStreamOutcome, AudioOutputError> {
