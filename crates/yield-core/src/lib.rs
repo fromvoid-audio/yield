@@ -796,11 +796,7 @@ impl BrowserViewModel {
                 || !self.entry_matches_rating(entry)
                 || !self.entry_matches_playback_age(entry, now_unix_secs)
                 || !self.entry_matches_playback_type(entry)
-                || !self.entry_matches_curation_queue(
-                    entry_index,
-                    entry,
-                    current_unix_epoch_seconds(),
-                )
+                || !self.entry_matches_curation_queue(entry_index, entry, now_unix_secs)
             {
                 continue;
             }
@@ -1043,12 +1039,9 @@ fn audio_file_matches_name_query(entry: &AudioFile, query: &str) -> bool {
         .file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let stem = entry
-        .path
-        .file_stem()
-        .map(|name| name.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    file_name.contains(query) || stem.contains(query)
+    // A file stem is a prefix of the filename, so a query found in it is already found in
+    // `file_name`. Avoid building and searching a second lowercased String for every entry.
+    file_name.contains(query)
 }
 
 fn file_name_sort_key(entry: &AudioFile) -> String {
@@ -1087,6 +1080,7 @@ pub fn format_duration(duration_seconds: Option<f32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn model_entry(path: &str, byte_len: u64) -> AudioFile {
         AudioFile {
@@ -1114,6 +1108,98 @@ mod tests {
             playback_type,
             curation,
         }
+    }
+
+    /// Opt-in 20k browser CPU workload. This measures the production view model only, not GPUI,
+    /// display submission, input delivery, audio, or GPU completion.
+    #[test]
+    #[ignore = "explicit local browser performance lane"]
+    fn browser_view_model_20k_performance_workload() {
+        const ENTRY_COUNT: usize = 20_000;
+        const ITERATIONS: usize = 30;
+
+        let entries = (0..ENTRY_COUNT)
+            .map(|index| {
+                let name = if index % 100 == 0 {
+                    format!("library/sample-{index:05}-needle.wav")
+                } else {
+                    format!("library/sample-{index:05}-kick.wav")
+                };
+                let mut entry = model_entry(&name, (index % 4096) as u64);
+                entry.curation = AudioFileCuration::from_parts(
+                    0,
+                    false,
+                    1 << (index % COLLECTION_COUNT),
+                    None,
+                    None,
+                );
+                entry
+            })
+            .collect::<Vec<_>>();
+
+        let mut model = BrowserViewModel::new(&entries);
+        assert_eq!(model.rows().len(), ENTRY_COUNT);
+        model.set_query(&entries, "needle");
+        model.toggle_sort(&entries, SortColumn::Size);
+        model.set_query(&entries, "");
+        assert_eq!(
+            model.collection_counts(&entries),
+            [3334, 3334, 3333, 3333, 3333, 3333]
+        );
+        let mut query_ns = Vec::with_capacity(ITERATIONS);
+        let mut sort_ns = Vec::with_capacity(ITERATIONS);
+        let mut collection_counts_ns = Vec::with_capacity(ITERATIONS);
+        let expected_counts = std::array::from_fn(|slot| {
+            (0..ENTRY_COUNT)
+                .filter(|index| index % COLLECTION_COUNT == slot)
+                .count()
+        });
+
+        for iteration in 0..ITERATIONS {
+            let query = if iteration % 2 == 0 { "needle" } else { "" };
+            let started = Instant::now();
+            model.set_query(&entries, query);
+            query_ns.push(started.elapsed().as_nanos());
+            assert_eq!(
+                model.rows().len(),
+                if query.is_empty() {
+                    ENTRY_COUNT
+                } else {
+                    ENTRY_COUNT / 100
+                }
+            );
+
+            let started = Instant::now();
+            model.toggle_sort(&entries, SortColumn::Size);
+            sort_ns.push(started.elapsed().as_nanos());
+            assert_eq!(
+                model.rows().len(),
+                if query.is_empty() {
+                    ENTRY_COUNT
+                } else {
+                    ENTRY_COUNT / 100
+                }
+            );
+            let sizes = model
+                .rows()
+                .iter()
+                .map(|row| entries[row.entry_index].byte_len);
+            if iteration % 2 == 0 {
+                assert!(sizes.clone().is_sorted_by(|left, right| left >= right));
+            } else {
+                assert!(sizes.is_sorted());
+            }
+
+            model.set_query(&entries, "");
+            let started = Instant::now();
+            let counts = model.collection_counts(&entries);
+            collection_counts_ns.push(started.elapsed().as_nanos());
+            assert_eq!(counts, expected_counts);
+        }
+
+        println!(
+            "YIELD_BROWSER_PERF={{\"schema\":\"yield.browser-vm.v1\",\"entries\":{ENTRY_COUNT},\"iterations\":{ITERATIONS},\"query_ns\":{query_ns:?},\"sort_ns\":{sort_ns:?},\"collection_counts_ns\":{collection_counts_ns:?},\"collection_counts\":{expected_counts:?}}}"
+        );
     }
 
     #[test]
@@ -1359,6 +1445,8 @@ mod tests {
             model_entry("/tmp/Deep Kick.WAV", 10),
             model_entry("/tmp/Über Pad.aiff", 20),
             model_entry("/tmp/ambient.wav", 30),
+            model_entry("/tmp/.Hidden.WAV", 40),
+            model_entry("/tmp/ambient.v2.WAV", 50),
         ];
         let mut model = BrowserViewModel::new(&entries);
 
@@ -1371,9 +1459,36 @@ mod tests {
         assert_eq!(model.rows()[0].entry_index, 1);
 
         model.set_query(&entries, "  .wav ");
-        assert_eq!(model.rows().len(), 2);
-        assert_eq!(model.rows()[0].entry_index, 2);
-        assert_eq!(model.rows()[1].entry_index, 0);
+        assert_eq!(model.rows().len(), 4);
+        assert_eq!(model.rows()[0].entry_index, 3);
+        assert_eq!(model.rows()[1].entry_index, 4);
+        assert_eq!(model.rows()[2].entry_index, 2);
+        assert_eq!(model.rows()[3].entry_index, 0);
+
+        model.set_query(&entries, "hidden");
+        assert_eq!(model.rows()[0].entry_index, 3);
+        model.set_query(&entries, "v2");
+        assert_eq!(model.rows()[0].entry_index, 4);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let name = PathBuf::from(std::ffi::OsString::from_vec(vec![
+                b'n', b'a', b'm', b'e', 0xff, b'.', b'w', b'a', b'v',
+            ]));
+            let lossy = vec![AudioFile {
+                path: name.clone(),
+                relative_path: name,
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: None,
+                curation: None,
+            }];
+            model.set_query(&lossy, "\u{fffd}");
+            assert_eq!(model.rows().len(), 1);
+        }
     }
 
     #[test]
