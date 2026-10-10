@@ -32,7 +32,24 @@ data descriptor. These are filesystem/Source tests, not GUI/audio hardware proof
 
 Genuine macOS execution and supported SDK/filesystem acceptance remain required
 before OPT-2061 is Done. Linux execution does not compile or exercise `O_EVTONLY`.
-Run the exact-head library held-index/feature-artifact/readiness tests, catalog
-feature-job tests, analysis tests, canonical preflight and native crate checks;
-record the actual OS/toolchain/filesystem, command/results and limits. A native
-workflow failing before any steps supplies no acceptance evidence.
+Run `scripts/internal/validation/verify_macos_feature_held_input.sh` on the exact
+head. The runner records the active developer directory, full Xcode version when
+available or the installed Command Line Tools package otherwise, and the
+selected macOS SDK path/version and Clang. Command Line Tools are acceptable
+only when the actual Darwin held-input and retained-source tests, analysis tests,
+canonical preflight, and native crate check all execute successfully; recording
+an SDK alone is not qualification. The held-input and catalog selections must
+execute exactly three and eleven tests respectively, with no ignored or failed
+tests. Every later test selection must execute at least one test with no ignored
+or failed tests. The runner checks writable APFS storage and records command
+results, toolchain, filesystem and limits. A missing tool, zero-match filter or
+native workflow failing before its required steps supplies no acceptance
+evidence.
+
+## Local-only qualification
+
+The hosted workflow is retained as `.yml.disabled`. Run the native script locally
+with Rust 1.93.0 under the shared local-CI coordinator; do not dispatch hosted CI.
+The held-file adapter is a runtime prerequisite for the existing native catalog
+and UI regression checks. Those checks do not accept the broader 0.4 analysis
+and similarity product workflows, or supply audio hardware acceptance.

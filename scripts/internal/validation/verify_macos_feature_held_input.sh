@@ -13,7 +13,27 @@ mkdir -p "$FEATURE_EVIDENCE_DIR"
   git rev-parse HEAD
   uname -sm
   sw_vers
-  xcodebuild -version
+  printf 'Active developer directory: '
+  xcode-select -p
+  if xcodebuild -version > "$FEATURE_EVIDENCE_DIR/xcodebuild-version.txt" 2>&1; then
+    cat "$FEATURE_EVIDENCE_DIR/xcodebuild-version.txt"
+  else
+    printf 'xcodebuild -version unavailable; reporting installed Command Line Tools package if present.\n'
+    if pkgutil --pkg-info com.apple.pkg.CLTools_Executables > "$FEATURE_EVIDENCE_DIR/command-line-tools.txt" 2>&1; then
+      cat "$FEATURE_EVIDENCE_DIR/command-line-tools.txt"
+    else
+      cat "$FEATURE_EVIDENCE_DIR/xcodebuild-version.txt" >&2
+      cat "$FEATURE_EVIDENCE_DIR/command-line-tools.txt" >&2
+      exit 1
+    fi
+  fi
+  printf 'macOS SDK path: '
+  xcrun --sdk macosx --show-sdk-path
+  printf 'macOS SDK version: '
+  xcrun --sdk macosx --show-sdk-version
+  printf 'Clang: '
+  xcrun --find clang
+  xcrun clang --version | head -n 1
   rustc -Vv
   cargo -V
   df -Pk "$FEATURE_REPO_ROOT" "${TMPDIR:-/tmp}"
