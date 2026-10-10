@@ -36,6 +36,9 @@ fn records(f: &Fixture) -> Vec<Vec<u8>> {
     ]
 }
 fn read_request(socket: &mut TcpStream) -> String {
+    // Darwin can inherit the listener's nonblocking mode. The fixture's existing read timeout
+    // bounds blocking IO; it must not fail merely because the client's headers are not ready yet.
+    socket.set_nonblocking(false).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
