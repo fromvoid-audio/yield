@@ -55,6 +55,12 @@ does not change those deadlines or the tests' assertions. Run the lane on a
 macOS host with enough free space for Cargo's shared target and temporary test
 profiles; inspect the exact run log and free space if startup times out.
 
+The journal suite runs with four test threads. Its real SQLite and custody
+fixtures include an unchanged 400 ms preparation deadline; unconstrained
+host-sized concurrency can expire that deadline before readiness is observed.
+This bounds simultaneous fixture owners without changing production deadlines,
+assertions, test selection, or required pass counts.
+
 Install the macOS automatic trigger once with
 `bash scripts/install-gpui-local-ci.sh`.
 It installs a `post-commit` hook in this repository's shared Git directory,
