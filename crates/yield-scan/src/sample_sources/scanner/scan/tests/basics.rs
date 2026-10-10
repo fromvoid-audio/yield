@@ -877,45 +877,49 @@ fn interrupted_manifest_audit_revalidates_checkpointed_paths_in_bounded_slices()
         .begin_or_resume_manifest_audit(101)
         .expect("load durable audit checkpoint");
     assert_eq!(checked.len(), 128);
-    let relative = &checked[0];
+    let relative = &checked[100];
+    let missing = &checked[110];
     let path = dir.path().join(relative);
-    let original_hash = db
+    let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let original_entry = db
         .entry_for_path(relative)
         .unwrap()
-        .expect("checkpointed path is indexed")
+        .expect("checkpointed path is indexed");
+    let original_modified_ns = original_entry.modified_ns;
+    let original_hash = original_entry
         .content_hash
         .expect("small fixture is hashed during the quick scan");
     std::fs::write(&path, b"y").unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(original_modified))
+        .unwrap();
+    std::fs::remove_file(dir.path().join(missing)).unwrap();
 
-    let resumed = audit_source_and_record(&db, None, 0, 200);
-    assert!(matches!(resumed, Err(ScanError::Incomplete { .. })));
-    assert_eq!(
-        db.begin_or_resume_manifest_audit(201)
-            .expect("load remaining bounded checkpoint work")
-            .len(),
-        64
-    );
+    let resumed = audit_source_and_record(&db, None, 0, 200)
+        .expect("one complete resume must revalidate all durable paths");
+    let repaired = db.entry_for_path(relative).unwrap().unwrap();
+    assert_eq!(repaired.file_size, 1);
+    assert_eq!(repaired.modified_ns, original_modified_ns);
     assert_ne!(
-        db.entry_for_path(relative)
-            .unwrap()
-            .unwrap()
-            .content_hash
-            .as_deref(),
+        repaired.content_hash.as_deref(),
         Some(original_hash.as_str())
     );
     assert!(
-        db.get_metadata(crate::sample_sources::db::META_LAST_MANIFEST_AUDIT_AT)
-            .unwrap()
-            .is_none(),
-        "audit completion must remain pending while checkpoint slices remain"
+        db.entry_for_path(missing).unwrap().is_none(),
+        "a durable checkpoint absent from the completed walk must be reconciled as missing"
     );
-
-    audit_source_and_record(&db, None, 0, 300).expect("finish remaining checkpoint slice");
+    assert_eq!(resumed.updated, 1);
+    assert_eq!(resumed.missing, 1);
     assert_eq!(
         db.get_metadata(crate::sample_sources::db::META_LAST_MANIFEST_AUDIT_AT)
             .unwrap()
             .as_deref(),
-        Some("300")
+        Some("200")
+    );
+    assert!(
+        db.begin_or_resume_manifest_audit(201)
+            .expect("completed audit must leave no durable checkpoint")
+            .is_empty()
     );
 }
 
@@ -1062,6 +1066,9 @@ fn manifest_audit_keeps_an_unreadable_subtree_due_for_retry() {
     std::fs::write(protected.join("kick.wav"), b"kick").unwrap();
     let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
+    db.begin_or_resume_manifest_audit(900).unwrap();
+    db.checkpoint_manifest_audit_paths(&[Path::new("protected/kick.wav").to_path_buf()])
+        .unwrap();
     let scan_completion_before = db
         .get_metadata(crate::sample_sources::db::META_LAST_SCAN_COMPLETED_AT)
         .unwrap();
@@ -1085,6 +1092,11 @@ fn manifest_audit_keeps_an_unreadable_subtree_due_for_retry() {
         scan_completion_before,
         "incomplete traversal must not publish a new scan completion marker"
     );
+    assert_eq!(
+        db.begin_or_resume_manifest_audit(1_233).unwrap(),
+        vec![Path::new("protected/kick.wav").to_path_buf()],
+        "an incomplete traversal must retain its unseen durable checkpoint"
+    );
 
     drop(failure);
     let recovered = audit_source_and_record(&db, None, 8, 1_234).unwrap();
@@ -1095,6 +1107,7 @@ fn manifest_audit_keeps_an_unreadable_subtree_due_for_retry() {
             .as_deref(),
         Some("1234")
     );
+    assert!(db.begin_or_resume_manifest_audit(1_235).unwrap().is_empty());
 }
 
 #[test]

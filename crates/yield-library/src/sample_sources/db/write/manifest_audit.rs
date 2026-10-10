@@ -6,6 +6,25 @@ use super::super::util::{map_sql_error, normalize_relative_path, parse_relative_
 use super::super::{META_LAST_MANIFEST_AUDIT_AT, SourceDatabase, SourceDbError, SourceWriteBatch};
 
 impl SourceDatabase {
+    /// Return whether a relative path still needs verification in the interrupted manifest
+    /// audit. The scanner uses this indexed lookup while walking paths beyond its bounded
+    /// in-memory resume slice.
+    pub fn manifest_audit_path_is_pending(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<bool, SourceDbError> {
+        let normalized = normalize_relative_path(path)?;
+        self.connection
+            .prepare_cached(
+                "SELECT EXISTS(
+                    SELECT 1 FROM source_manifest_audit_seen WHERE path = ?1
+                 )",
+            )
+            .map_err(map_sql_error)?
+            .query_row([normalized], |row| row.get(0))
+            .map_err(map_sql_error)
+    }
+
     /// Start a durable manifest-audit cycle or recover the paths already checked by an
     /// interrupted cycle.
     ///
@@ -30,10 +49,34 @@ impl SourceDatabase {
         started_at: i64,
         limit: usize,
     ) -> Result<(Vec<PathBuf>, usize), SourceDbError> {
+        self.load_manifest_audit_batch(started_at, limit, false)
+    }
+
+    /// Begin a scanner-owned attempt, resetting only its traversal provenance before loading
+    /// the bounded durable checkpoint slice. Introspection via begin_or_resume does not reset it.
+    pub fn start_manifest_audit_attempt_batch(
+        &self,
+        started_at: i64,
+        limit: usize,
+    ) -> Result<(Vec<PathBuf>, usize), SourceDbError> {
+        self.load_manifest_audit_batch(started_at, limit, true)
+    }
+
+    fn load_manifest_audit_batch(
+        &self,
+        started_at: i64,
+        limit: usize,
+        reset_attempt: bool,
+    ) -> Result<(Vec<PathBuf>, usize), SourceDbError> {
         self.validate_profile_owned_mutation()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
                 .map_err(map_sql_error)?;
+        if reset_attempt {
+            transaction
+                .execute("DELETE FROM source_manifest_audit_current_seen", [])
+                .map_err(map_sql_error)?;
+        }
         transaction
             .execute(
                 "INSERT OR IGNORE INTO source_manifest_audit_state (
@@ -106,10 +149,20 @@ impl SourceDatabase {
             let mut insert = transaction
                 .prepare("INSERT OR IGNORE INTO source_manifest_audit_seen (path) VALUES (?1)")
                 .map_err(map_sql_error)?;
+            let mut current_seen = transaction
+                .prepare(
+                    "INSERT OR IGNORE INTO source_manifest_audit_current_seen (path) VALUES (?1)",
+                )
+                .map_err(map_sql_error)?;
             for path in paths {
                 let normalized = normalize_relative_path(path)?;
-                inserted += usize::try_from(insert.execute([normalized]).map_err(map_sql_error)?)
-                    .unwrap_or(0);
+                inserted += usize::try_from(
+                    insert
+                        .execute([normalized.as_str()])
+                        .map_err(map_sql_error)?,
+                )
+                .unwrap_or(0);
+                current_seen.execute([normalized]).map_err(map_sql_error)?;
             }
         }
         transaction
@@ -125,6 +178,33 @@ impl SourceDatabase {
         self.validate_profile_owned_mutation()?;
         transaction.commit().map_err(map_sql_error)?;
         Ok(inserted)
+    }
+
+    /// Drop durable checkpoints absent from a complete authoritative traversal of this attempt.
+    /// Newly checked paths are retained because checkpointing records them in current_seen in
+    /// the same transaction.
+    pub fn clear_manifest_audit_paths_missing_from_attempt(&self) -> Result<(), SourceDbError> {
+        self.validate_profile_owned_mutation()?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(map_sql_error)?;
+        transaction
+            .execute(
+                "DELETE FROM source_manifest_audit_seen
+                 WHERE path NOT IN (SELECT path FROM source_manifest_audit_current_seen)",
+                [],
+            )
+            .map_err(map_sql_error)?;
+        transaction
+            .execute(
+                "UPDATE source_manifest_audit_state
+                 SET checked_files = (SELECT COUNT(*) FROM source_manifest_audit_seen)
+                 WHERE singleton = 1",
+                [],
+            )
+            .map_err(map_sql_error)?;
+        self.validate_profile_owned_mutation()?;
+        transaction.commit().map_err(map_sql_error)
     }
 
     /// Remove paths whose resumed checkpoint revalidation committed successfully.
@@ -167,6 +247,9 @@ impl SourceWriteBatch<'_> {
         self.set_metadata(META_LAST_MANIFEST_AUDIT_AT, &completed_at.to_string())?;
         self.tx
             .execute("DELETE FROM source_manifest_audit_seen", [])
+            .map_err(map_sql_error)?;
+        self.tx
+            .execute("DELETE FROM source_manifest_audit_current_seen", [])
             .map_err(map_sql_error)?;
         self.tx
             .execute(
@@ -228,6 +311,20 @@ mod tests {
         let mut batch = database.write_batch().expect("completion batch");
         batch.complete_manifest_audit(30).expect("complete audit");
         batch.commit().expect("commit completion");
+
+        for table in [
+            "source_manifest_audit_state",
+            "source_manifest_audit_seen",
+            "source_manifest_audit_current_seen",
+        ] {
+            let count = database
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("read completed audit state");
+            assert_eq!(count, 0, "completion must clear {table}");
+        }
 
         assert!(
             database

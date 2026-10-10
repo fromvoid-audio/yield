@@ -17,6 +17,9 @@ const BASE_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS metadata (
     CREATE TABLE IF NOT EXISTS source_manifest_audit_seen (
         path TEXT PRIMARY KEY
     ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS source_manifest_audit_current_seen (
+        path TEXT PRIMARY KEY
+    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS source_content_audit_state (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         rotation_id INTEGER NOT NULL,
