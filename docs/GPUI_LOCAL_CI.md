@@ -84,6 +84,15 @@ evidence only.
 For a private bundle from an exact validated commit, follow
 [GPUI macOS packaging](GPUI_MACOS_PACKAGING.md).
 
+The real-packer payload tests exercise stable, RC and nightly archives across all
+three declared targets. The macOS release ZIP uses `ditto --norsrc` so its regular
+members match the authenticated manifest exactly: host resource forks, extended
+attributes and ACLs are not separate payload files. Bundle file bytes and Unix
+modes, including the code-signature seal files, remain in the archive. Verify
+the extracted app's signature after packaging. Ad-hoc signature roundtrips do
+not qualify preservation of a notarized Yield build's stapled ticket; that
+requires a genuinely ticketed artifact and before/after `stapler validate`.
+
 ## Focused original recording custody verification
 
 The old `Native recording custody` hosted workflow is retained with a `.disabled`

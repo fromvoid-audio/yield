@@ -270,7 +270,9 @@ EOF
 
 create_zip() {
   if [[ "$PLATFORM" == "macos" ]] && command -v ditto >/dev/null 2>&1; then
-    (cd "$WORK_DIR" && ditto -c -k --sequesterRsrc --keepParent "$APP_NAME" "$ZIP_PATH")
+    # The authenticated manifest inventories bundle files and Unix modes, not host xattrs,
+    # ACLs or resource-fork AppleDouble members. Code seals and stapled tickets are bundle files.
+    (cd "$WORK_DIR" && ditto -c -k --norsrc --keepParent "$APP_NAME" "$ZIP_PATH")
   elif command -v zip >/dev/null 2>&1; then
     (cd "$WORK_DIR" && zip -r "$ZIP_PATH" "$APP_NAME" >/dev/null)
   elif command -v powershell.exe >/dev/null 2>&1; then
