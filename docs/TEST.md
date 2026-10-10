@@ -610,6 +610,23 @@ writes so their cost can be compared directly with an exact pre-change run.
 Pair both with the maintained perf guard for the frame/input-latency budgets from
 `scripts/internal/data/validation_contract.json`.
 
+The macOS native catalog replay lane also checks metadata-only watcher delivery
+against the persistent `.DS_Store` fixture. A live bootstrap capture spans the
+fixture's inode-mtime mutation and must produce a certain, exact-path,
+source/root/stream-bound metadata-only batch before a separate bounded
+historical replay capture is considered. Neither a settled cursor nor history
+completion by itself qualifies the event. The catalog phase then verifies the
+durable checkpoint advances while manifest revision, audio index, and WAV
+projection remain unchanged. The fixture restores its original mtime after
+service shutdown.
+
+The native watcher-restart case accepts the ordinary owner-backed bounded replay
+publication for a known post-restart WAV change, with its exact prior revision,
+source/root/lifecycle receipt, one-path delta, and durable readback. If the
+capture instead retains uncertainty, only one authoritative audit containing
+both the pre-restart and post-restart files is accepted. Both routes retain the
+same mutation deadline and duplicate-publication quiet window.
+
 ### Script and golden checks
 
 Use for tooling, fixtures, and numerical-reference flows.
