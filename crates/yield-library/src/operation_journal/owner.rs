@@ -11727,12 +11727,81 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("stale release result")
             .expect("stale release worker");
+        // Exercise source-grant release on a distinct admitted operation, independent
+        // of any publication-fence custody retained by the original operation.
+        let mut source_input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            claim.claim().volume().clone(),
+            facts.allocation_unit,
+        );
+        let source_prior_intent = source_input.universal_intent.clone();
+        let source_descriptors = source_input
+            .participants
+            .descriptors()
+            .iter()
+            .map(|descriptor| {
+                let source_fence = descriptor.source_fence().map(|stored| {
+                    StoredSourceFence::new(
+                        stored.source_id().clone(),
+                        source_request.media_root().identity(),
+                        source_request.database_file_identity(),
+                        stored.lifecycle_generation(),
+                        stored.source_revision(),
+                        lease_epoch,
+                    )
+                    .expect("source-release participant fence")
+                });
+                ParticipantDescriptor::new(
+                    descriptor.id(),
+                    descriptor.kind(),
+                    descriptor.requirement(),
+                    source_fence,
+                    descriptor.artifact_key().map(str::to_owned),
+                )
+                .expect("source-release participant descriptor")
+            })
+            .collect();
+        let source_participants = ParticipantSet::new(
+            source_descriptors,
+            source_input.participants.checkpoints().to_vec(),
+        )
+        .expect("source-release participants");
+        source_input.universal_intent = UniversalIntent::new(
+            source_prior_intent.parent_operation_id(),
+            source_prior_intent.command_kind(),
+            source_prior_intent.user_status_key(),
+            source_participants.clone(),
+        )
+        .expect("source-release universal intent");
+        source_input.participants = source_participants;
+        let mut source_admit = client
+            .admit_prepared(source_input)
+            .expect("source-release operation queues");
+        let source_operation_id = source_admit
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source-release operation result")
+            .expect("source-release operation worker");
+        let mut source_lookup = client
+            .get(source_operation_id)
+            .expect("source-release operation lookup queues");
+        let source_operation = source_lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source-release operation lookup result")
+            .expect("source-release operation lookup worker")
+            .expect("source-release operation record");
+        let source_participant_id = source_operation
+            .universal_intent
+            .as_ref()
+            .expect("source-release universal intent")
+            .participants()
+            .descriptors()[0]
+            .id();
         let live_target = file_owner
             .register_live_chunk_root_for_test()
             .expect("fresh staging root");
         let source_claim = ChunkClaimRequest::new(
             ChunkId::new(),
-            operation_id,
+            source_operation_id,
             AdmissionClaim::new(
                 AdmissionClaimId::new(),
                 claim.claim().volume().clone(),
@@ -11740,7 +11809,7 @@ mod tests {
                 facts.allocation_unit,
             )
             .expect("source claim"),
-            participant_id,
+            source_participant_id,
             String::from("retired-source-output"),
             facts.allocation_unit * 2,
             facts.allocation_unit,
@@ -11768,7 +11837,7 @@ mod tests {
         let mut source_issue = client
             .issue_live_chunk_effect(
                 source_claim.chunk_id(),
-                operation_id,
+                source_operation_id,
                 registration.clone(),
                 guard.pin_for_effect().expect("source retirement pin"),
                 source_spec,
@@ -12303,6 +12372,11 @@ mod tests {
             let original_charge = serde_json::to_value(publication.charge.claim()).unwrap();
             let original_command_fingerprint = *blake3::hash(&original_command_bytes).as_bytes();
             let original_slot_generation = publication.fence.generation_observation_for_test();
+            let original_pending_identity = (
+                publication.original_target().validation().operation_id(),
+                publication.original_target().validation().participant_id(),
+                publication.original_target().validation().effect_id(),
+            );
             drop(original_command_bytes);
             let original_fingerprint = publication.original_target().fingerprint();
             let foreign = crate::file_operation_owner::FileOperationOwner::start().unwrap();
@@ -12367,13 +12441,33 @@ mod tests {
                     - HISTORICAL_REPLY_BYTES
             );
             staged.acknowledge().unwrap();
-            let _ = file_owner.shutdown();
+            let file_shutdown = file_owner.shutdown();
+            let pending = match file_shutdown {
+                crate::file_operation_owner::FileOperationOwnerShutdown::RetirementDeferred {
+                    pending,
+                    ..
+                } => pending,
+                other => panic!("lost publication reply must remain deferred: {other:?}"),
+            };
+            assert_eq!(
+                pending
+                    .iter()
+                    .filter(|identity| {
+                        identity.operation_id() == original_pending_identity.0
+                            && identity.participant_id() == original_pending_identity.1
+                            && identity.effect_id() == original_pending_identity.2
+                    })
+                    .count(),
+                1,
+                "shutdown must retain the exact lost publication identity"
+            );
             drop(database);
             let original_shared = Arc::clone(&owner.shared);
             let publication_baseline = InputBudget::new().publication_remaining;
-            let _ = owner.shutdown();
-            // This genuine observer retains only the original fence allocation after
-            // both actual workers joined; neither a grant nor runtime resource survives.
+            let journal_worker_joined = owner.shutdown();
+            assert!(journal_worker_joined);
+            // The completion observer is only an alias: after both workers join, the
+            // registry and retained file-owner grant still own the header and tombstone.
             assert!(completion());
             assert_eq!(
                 original_shared
@@ -12381,9 +12475,15 @@ mod tests {
                     .lock()
                     .unwrap()
                     .publication_remaining,
-                publication_baseline - publication_fence::HEADER_BYTES
+                publication_baseline
+                    - publication_fence::HEADER_BYTES
+                    - 64 * 1024
+                    - native_read_capsule::BACKING
+                    - HISTORICAL_REPLY_BYTES
             );
             drop(completion);
+            // Releasing the observer cannot settle the retained grant or reclaim the
+            // registry header; the exact post-drop debit remains unchanged.
             assert_eq!(
                 original_shared
                     .input_bytes
@@ -12391,6 +12491,10 @@ mod tests {
                     .unwrap()
                     .publication_remaining,
                 publication_baseline
+                    - publication_fence::HEADER_BYTES
+                    - 64 * 1024
+                    - native_read_capsule::BACKING
+                    - HISTORICAL_REPLY_BYTES
             );
             let restarted =
                 OperationJournalStore::open(&fixture.owner).expect("original handoff restart");
