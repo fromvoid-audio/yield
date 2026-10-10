@@ -18,6 +18,9 @@ use super::{
 pub struct ReplayObservationBatch {
     batch: SyntheticObservationBatch,
     continuous: bool,
+    // Only minted from the native ingress' private ignored-artifact lane. A path that happens
+    // to spell `.DS_Store` in a caller-created batch never gets this classification.
+    metadata_only: bool,
 }
 
 impl ReplayObservationBatch {
@@ -31,6 +34,10 @@ impl ReplayObservationBatch {
         self.continuous
     }
 
+    pub(crate) const fn metadata_only(&self) -> bool {
+        self.metadata_only
+    }
+
     /// Pass these values together to the existing reconciliation replay adapter.
     pub fn into_admission_parts(self) -> (SyntheticObservationBatch, bool) {
         (self.batch, self.continuous)
@@ -42,14 +49,16 @@ impl ReplayCandidate {
     ///
     /// The first sequence denotes the start of the covered interval, not the first delivered
     /// changed-path event: FSEvents IDs are shared across the volume and may legitimately skip.
-    /// A certain capture with no changed paths has no batch to admit. An uncertain capture always
-    /// carries a diagnostic marker and must be admitted as unproven for a source audit.
+    /// A truly empty certain capture has no batch to admit. Ignored metadata callbacks are
+    /// retained as real, ordered observations so the source owner can durably acknowledge their
+    /// native interval without reconciling their path. An uncertain capture carries a diagnostic
+    /// marker and must be admitted as unproven for a source audit.
     pub fn into_observation_batch(
         self,
         expected_source_lifecycle_generation: u64,
         owner_watcher_generation: WatcherGeneration,
     ) -> Option<ReplayObservationBatch> {
-        let has_events = !self.events.is_empty();
+        let has_events = !self.events.is_empty() || !self.ignored_artifacts().is_empty();
         let continuous = self.history_complete
             && self.uncertainty.is_empty()
             && self.last_seen.is_some()
@@ -64,8 +73,28 @@ impl ReplayCandidate {
         {
             return None;
         }
-        let mut observations = Vec::with_capacity(self.events.len() + usize::from(!continuous));
-        for event in self.events {
+        if self.events.is_empty()
+            && self.unqualified_ignored_artifact
+            && self.history_complete
+            && self.uncertainty.is_empty()
+            && self.lifecycle_generation == expected_source_lifecycle_generation
+            && expected_source_lifecycle_generation != 0
+        {
+            // Preserve the former empty-capture retry behavior when an excluded sidecar shares
+            // this interval. It has no private metadata tag and must not inherit the `.DS_Store`
+            // cursor-only route.
+            return None;
+        }
+        let metadata_only = continuous
+            && self.events.is_empty()
+            && !self.unqualified_ignored_artifact
+            && !self.ignored_artifacts().is_empty();
+        let mut ordered_events = self.events;
+        let mut ignored_artifacts = self.ignored_artifacts;
+        ordered_events.append(&mut ignored_artifacts);
+        ordered_events.sort_unstable_by_key(|event| event.event_id());
+        let mut observations = Vec::with_capacity(ordered_events.len() + usize::from(!continuous));
+        for event in ordered_events {
             let mut path = RawObservedPath::new(event.relative_path, RawPathRole::Subject);
             path = match event.kind {
                 ReplayPathKind::File => path,
@@ -121,6 +150,7 @@ impl ReplayCandidate {
         Some(ReplayObservationBatch {
             batch: SyntheticObservationBatch::new(provenance, observations, limits),
             continuous,
+            metadata_only,
         })
     }
 }
@@ -227,6 +257,147 @@ mod tests {
                 .into_observation_batch(4, WatcherGeneration::new(8))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn private_metadata_capture_keeps_real_event_and_ordered_cursor_boundary() {
+        let ingress = ingress();
+        ingress.record_metadata_artifact(103, Path::new("/source/Library/.DS_Store"));
+        ingress.mark_history_complete();
+        let handoff = ingress
+            .into_candidate()
+            .into_observation_batch(4, WatcherGeneration::new(8))
+            .expect("metadata callback is a durable replay candidate");
+        assert!(handoff.continuous());
+        assert!(handoff.metadata_only());
+        assert_eq!(handoff.batch().observations().len(), 1);
+        assert_eq!(
+            handoff.batch().observations()[0].kind(),
+            RawEventKind::Modify
+        );
+        assert_eq!(
+            handoff.batch().observations()[0].paths()[0].path(),
+            Path::new("Library/.DS_Store")
+        );
+        assert_eq!(
+            handoff.batch().observations()[0].metadata().event_id(),
+            Some(103)
+        );
+        let boundary = handoff.batch().provenance().capture_boundary();
+        assert_eq!(boundary.first_sequence(), Some(101));
+        assert_eq!(boundary.last_sequence(), Some(103));
+        let (provenance, observations, limits) = handoff.into_admission_parts().0.into_parts();
+        RawObservationEnvelope::try_new(provenance, observations, limits)
+            .expect("real metadata observation is a valid bounded owner-admission input");
+    }
+
+    #[test]
+    fn mixed_metadata_and_audio_capture_is_not_metadata_only_and_keeps_native_order() {
+        let ingress = ingress();
+        ingress.record_metadata_artifact(103, Path::new("/source/Library/.DS_Store"));
+        ingress.record_with_kind(
+            Some(105),
+            Path::new("/source/Kick.wav"),
+            ReplayEventCondition::Changed,
+            ReplayPathKind::File,
+        );
+        ingress.record_metadata_artifact(109, Path::new("/source/Library/.DS_Store"));
+        ingress.mark_history_complete();
+        let handoff = ingress
+            .into_candidate()
+            .into_observation_batch(4, WatcherGeneration::new(8))
+            .expect("mixed actual events");
+        assert!(!handoff.metadata_only());
+        let observations = handoff.batch().observations();
+        assert_eq!(observations.len(), 3);
+        assert_eq!(observations[0].metadata().event_id(), Some(103));
+        assert_eq!(observations[1].metadata().event_id(), Some(105));
+        assert_eq!(observations[1].paths()[0].path(), Path::new("Kick.wav"));
+        assert_eq!(observations[2].metadata().event_id(), Some(109));
+    }
+
+    #[test]
+    fn other_ignored_sidecar_prevents_ds_store_only_checkpoint_classification() {
+        let ingress = ingress();
+        ingress.record_ignored_artifact(103);
+        ingress.record_metadata_artifact(105, Path::new("/source/.DS_Store"));
+        ingress.mark_history_complete();
+        assert!(
+            ingress
+                .into_candidate()
+                .into_observation_batch(4, WatcherGeneration::new(8))
+                .is_none(),
+            "an untagged excluded sidecar must not inherit metadata cursor authority"
+        );
+    }
+
+    #[test]
+    fn metadata_limit_overflow_prevents_a_metadata_only_claim() {
+        let ingress = ingress();
+        for event_id in 101..=100 + MAX_REPLAY_EVENTS as u64 {
+            ingress.record_metadata_artifact(event_id, Path::new("/source/.DS_Store"));
+        }
+        ingress.record_metadata_artifact(
+            101 + MAX_REPLAY_EVENTS as u64,
+            Path::new("/source/.DS_Store"),
+        );
+        ingress.mark_history_complete();
+        let candidate = ingress.into_candidate();
+        assert_eq!(candidate.ignored_artifacts().len(), MAX_REPLAY_EVENTS);
+        assert!(
+            candidate
+                .uncertainty()
+                .contains(ReplayUncertainty::EVENT_LIMIT)
+        );
+        let handoff = candidate
+            .into_observation_batch(4, WatcherGeneration::new(8))
+            .expect("overflow retains an uncertainty marker");
+        assert!(!handoff.continuous());
+        assert!(!handoff.metadata_only());
+    }
+
+    #[test]
+    fn non_monotonic_metadata_callback_never_claims_cursor_only_coverage() {
+        let ingress = ingress();
+        ingress.record_metadata_artifact(103, Path::new("/source/.DS_Store"));
+        ingress.record_metadata_artifact(102, Path::new("/source/.DS_Store"));
+        ingress.mark_history_complete();
+        let candidate = ingress.into_candidate();
+        assert!(
+            candidate
+                .uncertainty()
+                .contains(ReplayUncertainty::NON_MONOTONIC_CURSOR)
+        );
+        let handoff = candidate
+            .into_observation_batch(4, WatcherGeneration::new(8))
+            .expect("non-monotonic capture retains diagnostic evidence");
+        assert!(!handoff.continuous());
+        assert!(!handoff.metadata_only());
+        assert_eq!(
+            handoff.batch().observations().last().unwrap().kind(),
+            RawEventKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn metadata_path_byte_limit_prevents_a_metadata_only_claim() {
+        let ingress = ingress();
+        let long_parent = "x".repeat(MAX_REPLAY_PATH_BYTES);
+        let path = PathBuf::from("/source").join(long_parent).join(".DS_Store");
+        ingress.record_metadata_artifact(101, &path);
+        ingress.mark_history_complete();
+        let candidate = ingress.into_candidate();
+        assert!(candidate.ignored_artifacts().is_empty());
+        assert!(
+            candidate
+                .uncertainty()
+                .contains(ReplayUncertainty::PATH_LIMIT)
+        );
+        let handoff = candidate
+            .into_observation_batch(4, WatcherGeneration::new(8))
+            .expect("path overflow retains an uncertainty marker");
+        assert!(!handoff.continuous());
+        assert!(!handoff.metadata_only());
     }
 
     #[test]

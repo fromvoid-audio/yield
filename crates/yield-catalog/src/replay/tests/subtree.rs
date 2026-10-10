@@ -260,10 +260,20 @@ fn budget_missing_target_or_replaced_directory_require_correlated_audit_without_
 fn raw_directory_and_file_addition_then_absence_stay_lossless_in_worker_transaction() {
     use std::os::unix::ffi::OsStringExt;
     let f = Fixture::new(true);
-    // APFS preserves UTF-8 normalization bytes but rejects undecodable names.
-    // Keep arbitrary-byte Unix coverage and qualify exact decomposed UTF-8
-    // directory/file evidence through the real worker on macOS. Non-audio
-    // extensions retain the original index-only mutation contract.
+    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "macos")]
+    {
+        let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff-dir".to_vec()));
+        assert_eq!(
+            RootRelativePath::try_from_path(invalid.clone())
+                .unwrap()
+                .as_path(),
+            invalid.as_path()
+        );
+        let error = fs::create_dir(f.base.root.path().join(&invalid)).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(92), "APFS EILSEQ: {error}");
+        assert!(!f.base.root.path().join(&invalid).exists());
+    }
     #[cfg(target_os = "macos")]
     let (directory, old_name, new_name) = (
         "raw-e\u{301}-dir".as_bytes(),

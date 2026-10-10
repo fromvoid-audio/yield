@@ -8810,6 +8810,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "hound",
+ "libc",
  "rusqlite",
  "serde_json",
  "tempfile",

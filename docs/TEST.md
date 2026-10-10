@@ -195,6 +195,14 @@ exactly one pass with no failures or ignored tests. Its callback probe verifies
 the selected digital output route and callback behavior; it does not establish
 analog output, audible quality, or blanket hardware compatibility.
 
+The full GPUI lane and `catalog-replay` prepare the native metadata source under
+the shared Git common directory before the first Cargo command. The content-keyed
+fixture manifest and source path are retained in the local-CI run record; an
+existing fixture is verified by exact tree, owner, mode, hash, and device/inode
+identity and is never silently repaired. The catalog test requires
+`YIELD_NATIVE_METADATA_FIXTURE_ROOT`, uses a disposable catalog profile, and
+restores the fixture's original mtime after watcher shutdown.
+
 The `prerequisite:startup-namespace-failure` compatibility case runs both the
 original blocking-receive namespace failure selector and its poll-based twin.
 Each selector gets its own clean production reset, read lease, runner, and

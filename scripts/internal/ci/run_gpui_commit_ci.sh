@@ -83,6 +83,9 @@ lock_hash="$(shasum -a 256 "$tmp_parent/checkout/Cargo.lock" | awk '{print subst
 rust_identity="$(rustc -vV | awk '/^(release|host):/{print $2}' | tr '\n' '-' | sed 's/-$//')"
 export YIELD_VALIDATION_TARGET_ROOT="$shared_target_root"
 export CARGO_TARGET_DIR="$shared_target_root/$rust_identity-$lock_hash"
+# Match the managed local-CI build profile regardless of the hook caller's shell.
+export CARGO_BUILD_JOBS=2
+export CARGO_INCREMENTAL=0
 export YIELD_GPUI_CI_CHECKOUT="$tmp_parent/checkout"
 set +e
 "$YIELD_CI_PYTHON" "$tmp_parent/checkout/scripts/internal/ci/managed_exec.py" \

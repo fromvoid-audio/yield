@@ -176,9 +176,9 @@ impl SourceWriter {
         if accounted > 65536 {
             return Err(SourceFileObservationError::Malformed);
         }
-        let observation = SourceFileObservation { path, facts, fence };
-        observation.validate()?;
-        Ok(observation)
+        // file_facts already validates the issuing owner and exact revision before and after
+        // reading this row. Consumers revalidate the point-in-time observation at each use.
+        Ok(SourceFileObservation { path, facts, fence })
     }
 }
 

@@ -101,6 +101,12 @@ pub enum CatalogReplayOutcome {
         /// At most the scanner's bounded touched rows; no whole-source snapshot fallback.
         delta: ManifestCommitResult,
     },
+    /// Only the durable native replay cursor advanced for a privately classified metadata-only
+    /// capture. No manifest delta or renderer projection is implied.
+    CheckpointOnlyCommitted {
+        /// Read-back persisted authority after the cursor-only source-owner commit.
+        receipt: DurableReplayReceipt,
+    },
     /// Exact interval/terminal was already durably covered; no new delta is fabricated.
     PreviouslyCommitted {
         /// Read-back persisted authority after duplicate delivery/restart/lost response.
@@ -166,6 +172,12 @@ impl CatalogReplaySubmission {
     }
     pub(super) fn input_bytes(&self) -> usize {
         input_bytes(&self.batch)
+    }
+
+    pub(super) fn is_private_metadata_capture(&self) -> bool {
+        self._capture.as_ref().is_some_and(|capture| {
+            capture.is_metadata_only() && capture.observation() == &self.batch
+        })
     }
 }
 fn input_bytes(batch: &ReplayObservationBatch) -> usize {

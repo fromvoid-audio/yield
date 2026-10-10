@@ -138,6 +138,11 @@ pub struct ReplayCandidate {
     started_after: u64,
     last_seen: Option<u64>,
     events: Vec<ReplayPathEvent>,
+    // Exact, source-local metadata changes which advance the native boundary but do not
+    // describe an audio-tree mutation. Kept separate from `events` so its classification
+    // cannot be recreated from a caller-supplied path.
+    ignored_artifacts: Vec<ReplayPathEvent>,
+    unqualified_ignored_artifact: bool,
     history_complete: bool,
     uncertainty: ReplayUncertainty,
 }
@@ -199,6 +204,10 @@ impl ReplayCandidate {
         &self.events
     }
 
+    pub(crate) fn ignored_artifacts(&self) -> &[ReplayPathEvent] {
+        &self.ignored_artifacts
+    }
+
     /// Return whether the native stream delivered its historical-replay completion marker.
     pub const fn history_complete(&self) -> bool {
         self.history_complete
@@ -229,6 +238,8 @@ pub enum ReplayStartError {
 struct ReplayState {
     last_seen: Option<u64>,
     events: Vec<ReplayPathEvent>,
+    ignored_artifacts: Vec<ReplayPathEvent>,
+    unqualified_ignored_artifact: bool,
     path_bytes: usize,
     history_complete: bool,
     uncertainty: ReplayUncertainty,
@@ -285,6 +296,8 @@ impl ReplayIngress {
             state: Mutex::new(ReplayState {
                 last_seen: None,
                 events: Vec::new(),
+                ignored_artifacts: Vec::new(),
+                unqualified_ignored_artifact: false,
                 path_bytes: 0,
                 history_complete: false,
                 uncertainty: ReplayUncertainty::default(),
@@ -335,7 +348,7 @@ impl ReplayIngress {
         if condition_uncertainty.is_some() {
             return;
         }
-        if state.events.len() >= MAX_REPLAY_EVENTS {
+        if state.events.len() + state.ignored_artifacts.len() >= MAX_REPLAY_EVENTS {
             mark_uncertain(&mut state, ReplayUncertainty::EVENT_LIMIT);
             return;
         }
@@ -366,7 +379,7 @@ impl ReplayIngress {
 
     /// Advance the native cursor for a known source-local artifact without treating it as an
     /// audio-tree mutation. The caller must have validated the path and conservative flags.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", test))]
     fn record_ignored_artifact(&self, event_id: u64) {
         let mut state = lock_unpoisoned(&self.state);
         if state.closed {
@@ -377,6 +390,50 @@ impl ReplayIngress {
             return;
         }
         state.last_seen = Some(event_id);
+        state.unqualified_ignored_artifact = true;
+    }
+
+    /// Retain an exact `.DS_Store` callback for source-owner cursor admission without treating it
+    /// as an audio-tree mutation. The macOS translator is the only caller and validates flags.
+    #[cfg(any(target_os = "macos", test))]
+    fn record_metadata_artifact(&self, event_id: u64, path: &Path) {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.closed {
+            return;
+        }
+        if event_id <= self.started_after || state.last_seen.is_some_and(|last| event_id <= last) {
+            mark_uncertain(&mut state, ReplayUncertainty::NON_MONOTONIC_CURSOR);
+            return;
+        }
+        state.last_seen = Some(event_id);
+        if state.events.len() + state.ignored_artifacts.len() >= MAX_REPLAY_EVENTS {
+            mark_uncertain(&mut state, ReplayUncertainty::EVENT_LIMIT);
+            return;
+        }
+        let native_bytes = path.as_os_str().as_encoded_bytes().len();
+        if native_bytes > MAX_REPLAY_PATH_BYTES.saturating_sub(state.path_bytes) {
+            mark_uncertain(&mut state, ReplayUncertainty::PATH_LIMIT);
+            return;
+        }
+        let Ok(relative_path) = path.strip_prefix(self.spec.root()) else {
+            mark_uncertain(&mut state, ReplayUncertainty::INVALID_PATH);
+            return;
+        };
+        if !relative_path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+            || relative_path.as_os_str().is_empty()
+            || relative_path.file_name().and_then(|name| name.to_str()) != Some(".DS_Store")
+        {
+            mark_uncertain(&mut state, ReplayUncertainty::INVALID_PATH);
+            return;
+        }
+        state.path_bytes += native_bytes;
+        state.ignored_artifacts.push(ReplayPathEvent {
+            event_id,
+            relative_path: relative_path.to_path_buf(),
+            kind: ReplayPathKind::File,
+        });
     }
 
     /// Stop accepting callbacks. Late events cannot mutate the retained candidate.
@@ -423,6 +480,8 @@ impl ReplayIngress {
             started_after: self.started_after,
             last_seen: state.last_seen,
             events: state.events,
+            ignored_artifacts: state.ignored_artifacts,
+            unqualified_ignored_artifact: state.unqualified_ignored_artifact,
             history_complete: state.history_complete,
             uncertainty: state.uncertainty,
         }

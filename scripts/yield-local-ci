@@ -478,6 +478,9 @@ def check(args: argparse.Namespace) -> None:
         if COORDINATOR_FD is not None:
             env["YIELD_LOCAL_CI_COORDINATOR_FD"] = str(COORDINATOR_FD)
         env["YIELD_LOCAL_CI_SOURCE_SHA"] = sha
+        prepare_metadata_fixture = args.lane == "full" or (
+            args.lane == "native" and args.case == "catalog-replay"
+        )
         facts = doctor(args.lane)
         run_id = f"{time.time_ns()}-{os.getpid()}"
         out_dir = state_dir / "runs" / sha / args.lane / run_id
@@ -532,6 +535,32 @@ def check(args: argparse.Namespace) -> None:
             validator_lease_fd = None
             failure = None
             try:
+                if prepare_metadata_fixture:
+                    fixture_command = [
+                        sys.executable,
+                        str(checkout / "scripts/internal/ci/prepare_native_metadata_fixture.py"),
+                        "--checkout",
+                        str(checkout),
+                        "--state-dir",
+                        str(state_dir),
+                    ]
+                    fixture_result = subprocess.run(
+                        fixture_command, cwd=checkout, check=False, capture_output=True, text=True
+                    )
+                    if fixture_result.returncode != 0:
+                        raise CiError(
+                            "persistent native metadata fixture preparation failed: "
+                            + fixture_result.stderr.strip()
+                        )
+                    try:
+                        fixture_record = json.loads(fixture_result.stdout)
+                    except json.JSONDecodeError as error:
+                        raise CiError("native metadata fixture helper returned malformed evidence") from error
+                    details["native_metadata_fixture"] = fixture_record
+                    env["YIELD_NATIVE_METADATA_FIXTURE_ROOT"] = fixture_record["source_root"]
+                    log.write("$ " + " ".join(fixture_command) + "\n")
+                    log.write(json.dumps(fixture_record, sort_keys=True) + "\n")
+                    log.flush()
                 if args.lane == "native":
                     native_state, namespace_fd, transition_fd = local_state.prepare_clean_launch(
                         "production", artifact=f"native:{sha}:{args.case}"
