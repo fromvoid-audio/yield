@@ -264,7 +264,8 @@ fn poll(
                 );
             }
         }
-        Ok(CatalogReplayOutcome::PreviouslyCommitted { receipt }) => {
+        Ok(CatalogReplayOutcome::PreviouslyCommitted { receipt })
+        | Ok(CatalogReplayOutcome::CheckpointOnlyCommitted { receipt }) => {
             // The persisted receipt covers this exact interval. There is no new projection
             // patch to invent after a duplicate or lost response.
             if source

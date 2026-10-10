@@ -7,8 +7,14 @@ if [[ "$(uname -s)" != Darwin ]]; then
 fi
 REPLAY_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPLAY_REPO_ROOT"
+REPLAY_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+REPLAY_FIXTURE_RECORD="$(python3 scripts/internal/ci/prepare_native_metadata_fixture.py \
+  --checkout "$REPLAY_REPO_ROOT" --state-dir "$REPLAY_COMMON_DIR/local-ci")"
+REPLAY_FIXTURE_ROOT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_root"])' <<<"$REPLAY_FIXTURE_RECORD")"
+export YIELD_NATIVE_METADATA_FIXTURE_ROOT="$REPLAY_FIXTURE_ROOT"
 REPLAY_EVIDENCE_DIR="$REPLAY_REPO_ROOT/artifacts/macos-catalog-native-replay"
 mkdir -p "$REPLAY_EVIDENCE_DIR"
+printf '%s\n' "$REPLAY_FIXTURE_RECORD" > "$REPLAY_EVIDENCE_DIR/metadata-fixture.json"
 {
   git rev-parse HEAD
   uname -sm
@@ -60,6 +66,7 @@ run_replay_case yield-source-watcher native_capture_gated_cancellation_and_timeo
 run_replay_case yield-catalog native_initial_audit_bootstraps_durable_replay_prior 1 catalog-bootstrap.log
 run_replay_case yield-catalog canceled_native_initial_audit_leaves_no_replay_prior 1 catalog-canceled.log
 run_replay_case yield-catalog native_watcher_hint_commits_bounded_replay_delta 1 native-controller.log
+run_replay_case yield-catalog native_inode_metadata_only_capture_advances_durable_cursor_without_reconciliation 1 native-inode-metadata-cursor.log
 run_replay_case yield-catalog replay:: 19 catalog-replay.log
 run_replay_case yield-ui browser::catalog::tests::replay_projection 4 ui-delta.log
 run_replay_case yield-ui browser::catalog::tests::replay_capture 2 ui-shared-snapshot.log

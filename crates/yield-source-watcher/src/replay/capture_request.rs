@@ -66,6 +66,7 @@ impl CapturedNativeReplay {
         self.candidate
             .into_observation_batch(lifecycle, generation)
             .map(|batch| CapturedNativeReplayBatch {
+                metadata_only: batch.metadata_only(),
                 batch,
                 _slot: self.slot,
             })
@@ -79,6 +80,7 @@ impl CapturedNativeReplay {
 /// ```
 pub struct CapturedNativeReplayBatch {
     batch: ReplayObservationBatch,
+    metadata_only: bool,
     _slot: Arc<CaptureSlot>,
 }
 impl std::fmt::Debug for CapturedNativeReplayBatch {
@@ -92,6 +94,12 @@ impl CapturedNativeReplayBatch {
     /// admission/reply so dropping a capture request cannot prematurely release its backing.
     pub fn observation(&self) -> &ReplayObservationBatch {
         &self.batch
+    }
+
+    /// Whether this original capture consists only of privately classified safe metadata writes.
+    /// This marker is absent from caller-created replay submissions and is not a proof by itself.
+    pub fn is_metadata_only(&self) -> bool {
+        self.metadata_only
     }
 }
 

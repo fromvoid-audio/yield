@@ -11469,8 +11469,19 @@ mod tests {
                 Err(error) => panic!("unexpected result-capacity fixture error: {error}"),
             }
         }
+        // Ordinary requests cannot consume the reserved control result permits. Fill those
+        // with real idempotent drains too, because finalization uses the control lane.
+        let mut held_control_results = Vec::new();
+        loop {
+            match client.begin_source_drain(receipt.clone()) {
+                Ok(request) => held_control_results.push(request),
+                Err(OperationJournalOwnerQueueError::ResultsFull) => break,
+                Err(OperationJournalOwnerQueueError::Full) => thread::yield_now(),
+                Err(error) => panic!("unexpected control-capacity fixture error: {error}"),
+            }
+        }
         assert_eq!(
-            held_results.len(),
+            held_results.len() + held_control_results.len(),
             OPERATION_JOURNAL_OWNER_RESULT_CAPACITY,
             "fixture must fill result permits before finalization retry"
         );
@@ -11584,6 +11595,7 @@ mod tests {
         assert_eq!(retained.receipt, receipt);
         assert_eq!(retained.acknowledgement, acknowledgement);
         drop(held_results);
+        drop(held_control_results);
 
         let mut pending = pending_finalizations
             .remove(&source_id)
@@ -11694,6 +11706,768 @@ mod tests {
             }
         }
         service.shutdown();
+    }
+
+    #[cfg(target_os = "macos")]
+    mod native_metadata_mtime {
+        use std::ffi::{CString, OsStr};
+        use std::fs::{self, File};
+        use std::io;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        use std::path::{Component, Path};
+        use std::time::{Duration, SystemTime};
+
+        const DIR_FLAGS: i32 =
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        const FILE_FLAGS: i32 = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+        struct DirectoryLink {
+            parent: File,
+            name: CString,
+            child: File,
+            identity: (u64, u64),
+        }
+
+        fn c_name(name: &OsStr) -> io::Result<CString> {
+            CString::new(name.as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "path component contains NUL")
+            })
+        }
+
+        fn open_at(parent: &File, name: &CString, flags: i32) -> io::Result<File> {
+            // SAFETY: `name` is NUL-terminated and both descriptors remain owned for the call.
+            let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `openat` returned a new descriptor transferred to this File.
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+
+        fn named_metadata(parent: &File, name: &CString) -> io::Result<libc::stat> {
+            let mut value = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `value` is writable storage and `name` is NUL-terminated; NOFOLLOW prevents
+            // following a replacement symlink at the named entry.
+            let result = unsafe {
+                libc::fstatat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: successful fstatat initialized the complete stat value.
+            Ok(unsafe { value.assume_init() })
+        }
+
+        fn identity(metadata: &fs::Metadata) -> (u64, u64) {
+            (metadata.dev(), metadata.ino())
+        }
+
+        fn stat_identity(value: &libc::stat) -> (u64, u64) {
+            (value.st_dev as u64, value.st_ino as u64)
+        }
+
+        fn require_stat_kind(value: &libc::stat, directory: bool, label: &str) -> io::Result<()> {
+            let expected_kind = if directory {
+                libc::S_IFDIR
+            } else {
+                libc::S_IFREG
+            };
+            if value.st_mode & libc::S_IFMT != expected_kind {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("native fixture entry has the wrong type: {label}"),
+                ));
+            }
+            Ok(())
+        }
+
+        fn require_user_owned(metadata: &fs::Metadata, label: &str) -> io::Result<()> {
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("native fixture entry is not owned by this user: {label}"),
+                ));
+            }
+            Ok(())
+        }
+
+        fn open_directory_chain(path: &Path) -> io::Result<Vec<DirectoryLink>> {
+            if !path.is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fixture path must be absolute",
+                ));
+            }
+            let mut current = File::open("/")?;
+            let mut links = Vec::new();
+            for component in path.components() {
+                let Component::Normal(name) = component else {
+                    if matches!(component, Component::RootDir) {
+                        continue;
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "fixture path is not normalized",
+                    ));
+                };
+                let name = c_name(name)?;
+                let child = open_at(&current, &name, DIR_FLAGS)?;
+                let child_metadata = child.metadata()?;
+                if !child_metadata.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "fixture ancestor is not a directory",
+                    ));
+                }
+                let entry = named_metadata(&current, &name)?;
+                require_stat_kind(&entry, true, "fixture ancestor")?;
+                let child_identity = identity(&child_metadata);
+                if child_identity != stat_identity(&entry) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "fixture ancestor changed while opening",
+                    ));
+                }
+                links.push(DirectoryLink {
+                    parent: current.try_clone()?,
+                    name,
+                    child: child.try_clone()?,
+                    identity: child_identity,
+                });
+                current = child;
+            }
+            if links.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fixture root cannot be filesystem root",
+                ));
+            }
+            require_user_owned(
+                &links
+                    .last()
+                    .expect("nonempty directory chain")
+                    .child
+                    .metadata()?,
+                "source root",
+            )?;
+            Ok(links)
+        }
+
+        fn verify_directory_link(link: &DirectoryLink, label: &str) -> io::Result<()> {
+            let child = link.child.metadata()?;
+            let entry = named_metadata(&link.parent, &link.name)?;
+            require_stat_kind(&entry, true, label)?;
+            if !child.is_dir()
+                || identity(&child) != link.identity
+                || stat_identity(&entry) != link.identity
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("fixture directory was replaced: {label}"),
+                ));
+            }
+            Ok(())
+        }
+
+        fn verify_directory_entry(
+            parent: &File,
+            name: &CString,
+            child: &File,
+            label: &str,
+        ) -> io::Result<()> {
+            let child_metadata = child.metadata()?;
+            let entry = named_metadata(parent, name)?;
+            require_stat_kind(&entry, true, label)?;
+            if !child_metadata.is_dir() || identity(&child_metadata) != stat_identity(&entry) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("fixture directory was replaced: {label}"),
+                ));
+            }
+            Ok(())
+        }
+
+        fn verify_file_entry(
+            parent: &File,
+            name: &CString,
+            file: &File,
+            expected: (u64, u64),
+        ) -> io::Result<()> {
+            let opened = file.metadata()?;
+            let entry = named_metadata(parent, name)?;
+            require_stat_kind(&entry, false, "Library/.DS_Store")?;
+            if !opened.is_file()
+                || identity(&opened) != expected
+                || stat_identity(&entry) != expected
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "native metadata file was replaced; refusing to modify a replacement",
+                ));
+            }
+            Ok(())
+        }
+
+        pub(super) struct FileMtimeRestoreGuard {
+            directory_chain: Vec<DirectoryLink>,
+            library: File,
+            library_name: CString,
+            file: File,
+            file_name: CString,
+            file_identity: (u64, u64),
+            original_modified: SystemTime,
+            restored: bool,
+        }
+
+        impl FileMtimeRestoreGuard {
+            pub(super) fn new(path: &Path) -> io::Result<Self> {
+                if path.file_name() != Some(OsStr::new(".DS_Store"))
+                    || path.parent().and_then(Path::file_name) != Some(OsStr::new("Library"))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unexpected metadata fixture path",
+                    ));
+                }
+                let root_path = path.parent().and_then(Path::parent).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "metadata fixture root is missing",
+                    )
+                })?;
+                let directory_chain = open_directory_chain(root_path)?;
+                let root = &directory_chain
+                    .last()
+                    .expect("nonempty directory chain")
+                    .child;
+                let library_name = CString::new("Library").expect("static component has no NUL");
+                let library = open_at(root, &library_name, DIR_FLAGS)?;
+                let library_metadata = library.metadata()?;
+                if !library_metadata.is_dir()
+                    || library_metadata.uid() != unsafe { libc::geteuid() }
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Library fixture directory is not owned",
+                    ));
+                }
+                verify_directory_entry(root, &library_name, &library, "Library")?;
+                let file_name = CString::new(".DS_Store").expect("static component has no NUL");
+                let file = open_at(&library, &file_name, FILE_FLAGS)?;
+                let metadata = file.metadata()?;
+                if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "metadata fixture is not a user-owned regular file",
+                    ));
+                }
+                let file_identity = identity(&metadata);
+                verify_file_entry(&library, &file_name, &file, file_identity)?;
+                Ok(Self {
+                    directory_chain,
+                    library,
+                    library_name,
+                    file,
+                    file_name,
+                    file_identity,
+                    original_modified: metadata.modified()?,
+                    restored: false,
+                })
+            }
+
+            fn verify_bindings(&self) -> io::Result<()> {
+                for link in &self.directory_chain {
+                    verify_directory_link(link, "source fixture ancestor")?;
+                }
+                let root = &self
+                    .directory_chain
+                    .last()
+                    .expect("nonempty directory chain")
+                    .child;
+                require_user_owned(&root.metadata()?, "source root")?;
+                require_user_owned(&self.library.metadata()?, "Library")?;
+                verify_directory_entry(root, &self.library_name, &self.library, "Library")?;
+                verify_file_entry(
+                    &self.library,
+                    &self.file_name,
+                    &self.file,
+                    self.file_identity,
+                )
+            }
+
+            pub(super) fn advance_mtime(&self) -> io::Result<()> {
+                self.verify_bindings()?;
+                let modified = self
+                    .file
+                    .metadata()?
+                    .modified()?
+                    .checked_add(Duration::from_secs(2))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "metadata time overflow")
+                    })?;
+                self.file
+                    .set_times(fs::FileTimes::new().set_modified(modified))?;
+                Ok(())
+            }
+
+            pub(super) fn restore(&mut self) -> io::Result<()> {
+                self.verify_bindings()?;
+                self.file
+                    .set_times(fs::FileTimes::new().set_modified(self.original_modified))?;
+                self.restored = true;
+                Ok(())
+            }
+        }
+
+        impl Drop for FileMtimeRestoreGuard {
+            fn drop(&mut self) {
+                if !self.restored {
+                    // Drop never follows a pathname or panics. A changed binding leaves the
+                    // replacement untouched and the fixture retained for explicit investigation.
+                    let _ = self.restore();
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    use native_metadata_mtime::FileMtimeRestoreGuard;
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod native_metadata_mtime_tests {
+        use super::native_metadata_mtime::FileMtimeRestoreGuard;
+        use std::fs::{self, FileTimes, OpenOptions};
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        fn fixture_tree() -> (tempfile::TempDir, PathBuf) {
+            let temp = tempfile::tempdir().expect("temporary metadata fixture");
+            let root = temp.path().join("source");
+            let library = root.join("Library");
+            fs::create_dir_all(&library).expect("create fixture Library");
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("mode source root");
+            fs::set_permissions(&library, fs::Permissions::from_mode(0o700)).expect("mode Library");
+            let metadata = library.join(".DS_Store");
+            fs::write(&metadata, b"metadata").expect("write metadata fixture");
+            fs::set_permissions(&metadata, fs::Permissions::from_mode(0o600))
+                .expect("mode metadata");
+            (temp, metadata)
+        }
+
+        fn set_mtime(path: &std::path::Path, seconds: u64) -> SystemTime {
+            let time = UNIX_EPOCH + Duration::from_secs(seconds);
+            OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("open test fixture")
+                .set_times(FileTimes::new().set_modified(time))
+                .expect("set test fixture mtime");
+            fs::metadata(path)
+                .expect("read test fixture mtime")
+                .modified()
+                .expect("mtime")
+        }
+
+        #[test]
+        fn mtime_guard_refuses_replaced_file_without_touching_replacement() {
+            let (_temp, path) = fixture_tree();
+            let mut guard = FileMtimeRestoreGuard::new(&path).expect("pin fixture file");
+            let retired = path.with_extension("retired");
+            fs::rename(&path, &retired).expect("retain original inode under another name");
+            fs::write(&path, b"replacement").expect("create replacement file");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("mode replacement");
+            let replacement_time = set_mtime(&path, 1_700_000_123);
+
+            assert!(guard.advance_mtime().is_err());
+            assert!(guard.restore().is_err());
+            drop(guard);
+            assert_eq!(
+                fs::metadata(&path).unwrap().modified().unwrap(),
+                replacement_time
+            );
+            assert_eq!(fs::read(&retired).unwrap(), b"metadata");
+        }
+
+        #[test]
+        fn mtime_guard_refuses_symlink_without_touching_external_target() {
+            use std::os::unix::fs::symlink;
+
+            let (temp, path) = fixture_tree();
+            let mut guard = FileMtimeRestoreGuard::new(&path).expect("pin fixture file");
+            let external = temp.path().join("outside");
+            fs::write(&external, b"external").expect("write external target");
+            fs::set_permissions(&external, fs::Permissions::from_mode(0o600))
+                .expect("mode external target");
+            let external_time = set_mtime(&external, 1_700_000_321);
+            fs::remove_file(&path).expect("remove fixture name");
+            symlink(&external, &path).expect("replace fixture entry with symlink");
+
+            assert!(guard.advance_mtime().is_err());
+            assert!(guard.restore().is_err());
+            drop(guard);
+            assert_eq!(
+                fs::metadata(&external).unwrap().modified().unwrap(),
+                external_time
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn update_existing_file_mtime(guard: &FileMtimeRestoreGuard) {
+        guard
+            .advance_mtime()
+            .expect("update existing metadata through its verified pinned file handle");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_fixture_file_identity(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs::metadata(path).expect("native fixture file metadata");
+        (metadata.dev(), metadata.ino())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_inode_metadata_only_capture_advances_durable_cursor_without_reconciliation() {
+        let fixture = Fixture::new("catalog-native-metadata-cursor");
+        let root = fs::canonicalize(
+            std::env::var_os("YIELD_NATIVE_METADATA_FIXTURE_ROOT")
+                .expect("managed native metadata fixture must be prepared before Cargo"),
+        )
+        .expect("canonical persistent native source fixture");
+        let metadata_path = root.join("Library/.DS_Store");
+        let stable_path = root.join("stable.wav");
+        let mut mtime_restore = FileMtimeRestoreGuard::new(&metadata_path)
+            .expect("pin native metadata fixture identity");
+        let original_metadata_mtime = fs::metadata(&metadata_path)
+            .expect("metadata fixture file facts")
+            .modified()
+            .expect("metadata fixture original mtime");
+        let metadata_identity_before = native_fixture_file_identity(&metadata_path);
+        let stable_identity_before = native_fixture_file_identity(&stable_path);
+        let metadata_bytes_before = fs::read(&metadata_path).expect("metadata fixture bytes");
+        let stable_bytes_before = fs::read(&stable_path).expect("stable WAV fixture bytes");
+        let metadata_hash_before = blake3::hash(&metadata_bytes_before);
+        let stable_hash_before = blake3::hash(&stable_bytes_before);
+        hound::WavReader::open(&stable_path).expect("checked-in stable audio is a valid WAV");
+
+        let source_id = SourceId::from_string("native-metadata-cursor");
+        let lifecycle_generation = 1;
+        let root_identity = source_root_identity(&root).expect("source root identity");
+        let spec = SourceWatchSpec::new(
+            source_id.clone(),
+            lifecycle_generation,
+            root.clone(),
+            Some(root_identity.clone()),
+        );
+        // The content-keyed persistent source is prepared before Cargo starts, so its root and
+        // files remain stable across detached checkouts and clean catalog profiles.
+        let settled_capture = BootstrapCapture::start(spec.clone(), Duration::from_secs(5))
+            .expect("start bounded no-mutation history capture on populated source");
+        let settled_candidate = settled_capture
+            .finish(Duration::from_secs(2))
+            .expect("finish settled populated-source history capture");
+        assert!(settled_candidate.history_complete());
+        assert!(
+            settled_candidate.uncertainty().is_empty(),
+            "settled history must be complete and certain: {settled_candidate:?}"
+        );
+        assert!(
+            settled_candidate.events().is_empty(),
+            "settled history must not contain live path changes: {settled_candidate:?}"
+        );
+        assert_eq!(settled_candidate.source_id(), &source_id);
+        assert_eq!(settled_candidate.root_identity(), &root_identity);
+        assert_eq!(
+            settled_candidate.lifecycle_generation(),
+            lifecycle_generation
+        );
+        let settled_stream = settled_candidate.stream_identity().clone();
+        let settled_cursor = settled_candidate.started_after();
+        drop(settled_candidate);
+
+        let before_preflight_mtime = fs::metadata(&metadata_path)
+            .expect("metadata before preflight")
+            .modified()
+            .expect("metadata mtime before preflight");
+        update_existing_file_mtime(&mtime_restore);
+        let after_preflight_mtime = fs::metadata(&metadata_path)
+            .expect("metadata after preflight")
+            .modified()
+            .expect("metadata mtime after preflight");
+        assert!(after_preflight_mtime > before_preflight_mtime);
+        let mut metadata_request = yield_source_watcher::replay::NativeReplayCaptureRequest::start(
+            spec.clone(),
+            settled_cursor,
+            Duration::from_secs(2),
+        )
+        .expect("start bounded history after settled populated-source history");
+        let capture_deadline = Instant::now() + Duration::from_secs(2);
+        let captured = loop {
+            match metadata_request.try_result() {
+                Ok(Some(captured)) => break captured,
+                Ok(None) => {
+                    assert!(
+                        Instant::now() < capture_deadline,
+                        "native inode-metadata history did not complete"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("native inode-metadata capture failed: {error:?}"),
+            }
+        };
+        let metadata_batch = captured
+            .into_observation_batch(
+                lifecycle_generation,
+                WatcherGeneration::new(lifecycle_generation),
+            )
+            .expect("native metadata event yields an observation batch");
+        assert!(
+            metadata_batch.is_metadata_only(),
+            "metadata preflight failed: metadata_only={}, continuous={}, bounded observations={:?}",
+            metadata_batch.is_metadata_only(),
+            metadata_batch.observation().continuous(),
+            metadata_batch.observation().batch().observations()
+        );
+        assert!(metadata_batch.observation().continuous());
+        let provenance = metadata_batch.observation().batch().provenance();
+        assert_eq!(provenance.source_id(), &source_id);
+        assert_eq!(provenance.root_identity(), Some(&root_identity));
+        assert_eq!(provenance.backend_stream_identity(), Some(&settled_stream));
+        assert_eq!(
+            provenance.watcher_generation(),
+            WatcherGeneration::new(lifecycle_generation)
+        );
+        let boundary = provenance.capture_boundary();
+        assert_eq!(boundary.first_sequence(), Some(settled_cursor + 1));
+        assert!(
+            boundary
+                .last_sequence()
+                .is_some_and(|last| last > settled_cursor)
+        );
+        let observations = metadata_batch.observation().batch().observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].kind(),
+            yield_library::sample_sources::reconciliation::RawEventKind::Modify
+        );
+        assert_eq!(observations[0].paths().len(), 1);
+        assert_eq!(
+            observations[0].paths()[0].path(),
+            Path::new("Library/.DS_Store")
+        );
+        drop(metadata_batch);
+        drop(metadata_request);
+
+        let service = CatalogService::start_inner(&fixture.guard, None, None, WatcherMode::Native)
+            .expect("actual native catalog");
+        let snapshot = register_and_audit(&service, &root, &source_id);
+        assert_eq!(snapshot.root_identity, root_identity);
+        assert_eq!(snapshot.lifecycle_generation, lifecycle_generation);
+        let database = SourceDatabase::open_for_ui_read_with_database_root(
+            &root,
+            fixture
+                .guard
+                .profile_root()
+                .join(catalog_profile_child(&source_id)),
+        )
+        .expect("read the same source-owned replay database");
+        let bootstrap_receipt = database
+            .read_durable_replay_receipt(
+                &source_id,
+                &snapshot.root_identity,
+                WatcherGeneration::new(snapshot.lifecycle_generation),
+                WatcherGeneration::new(snapshot.lifecycle_generation),
+            )
+            .expect("read initial durable receipt")
+            .expect("completed source audit bootstraps native replay");
+
+        // The file exists before catalog startup. Its ordinary initial audit and replay bootstrap
+        // establish the baseline, so the measured interval contains only a later write.
+        let initial = bootstrap_receipt;
+        assert_eq!(initial.prior().backend_stream_identity(), &settled_stream);
+        let baseline_revision = database
+            .get_revision()
+            .expect("bootstrapped source revision");
+        let baseline_index = database
+            .source_index_snapshot()
+            .expect("read bootstrapped metadata index entry");
+        let baseline_manifest = database
+            .manifest_snapshot_with_revision()
+            .expect("read bootstrapped audio manifest");
+        assert!(
+            baseline_manifest
+                .1
+                .iter()
+                .any(|entry| entry.relative_path == Path::new("stable.wav"))
+        );
+        assert_eq!(baseline_manifest.0, baseline_revision);
+        let metadata_entry = baseline_index
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == Path::new("Library/.DS_Store"))
+            .expect("pre-existing metadata file is in the source index");
+        assert_eq!(
+            metadata_entry.file_size,
+            Some(metadata_bytes_before.len() as u64)
+        );
+
+        // Change only the inode modification time on the existing file. Content rewrites may
+        // legitimately carry ItemCreated on macOS and remain on ordinary conservative replay.
+        let before_measured_mtime = fs::metadata(&metadata_path)
+            .expect("metadata before measured change")
+            .modified()
+            .expect("metadata mtime before measured change");
+        update_existing_file_mtime(&mtime_restore);
+        assert!(
+            fs::metadata(&metadata_path)
+                .expect("metadata after measured change")
+                .modified()
+                .expect("metadata mtime after measured change")
+                > before_measured_mtime
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let committed = loop {
+            assert!(
+                Instant::now() < deadline,
+                "metadata-only native capture did not advance its durable receipt"
+            );
+            match service.recv_event_timeout(Duration::from_millis(50)) {
+                Ok(
+                    ref event @ CatalogEvent::AuditCommitted {
+                        snapshot: ref event_snapshot,
+                    },
+                ) if event_snapshot.source_id == source_id => {
+                    panic!("metadata-only event triggered reconciliation: {event:?}")
+                }
+                Ok(
+                    ref event @ CatalogEvent::ReplayCommitted {
+                        source_id: ref actual,
+                        ..
+                    },
+                ) if actual == &source_id => {
+                    panic!("metadata-only event triggered reconciliation: {event:?}")
+                }
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("native catalog closed before metadata cursor commit")
+                }
+            }
+            let receipt = database
+                .read_durable_replay_receipt(
+                    &source_id,
+                    &snapshot.root_identity,
+                    WatcherGeneration::new(snapshot.lifecycle_generation),
+                    WatcherGeneration::new(snapshot.lifecycle_generation),
+                )
+                .expect("read durable receipt while waiting");
+            if let Some(receipt) = receipt.filter(|receipt| {
+                receipt.prior().acknowledged_sequence() > initial.prior().acknowledged_sequence()
+            }) {
+                break receipt;
+            }
+        };
+        assert_eq!(committed.source_revision(), baseline_revision);
+        assert_eq!(
+            database.get_revision().expect("source revision"),
+            baseline_revision
+        );
+        let final_index = database
+            .source_index_snapshot()
+            .expect("read source index after metadata cursor commit");
+        assert_eq!(final_index, baseline_index);
+        assert_eq!(
+            database
+                .manifest_snapshot_with_revision()
+                .expect("read audio manifest after metadata cursor commit"),
+            baseline_manifest
+        );
+        assert_eq!(committed.prior().source_id(), &source_id);
+        assert_eq!(committed.prior().root_identity(), &snapshot.root_identity);
+        assert_eq!(
+            committed.prior().backend_stream_identity(),
+            initial.prior().backend_stream_identity()
+        );
+        assert_eq!(
+            committed.prior().watcher_generation(),
+            WatcherGeneration::new(snapshot.lifecycle_generation)
+        );
+        assert!(committed.matches_interval(
+            initial.prior().acknowledged_sequence() + 1,
+            committed.prior().acknowledged_sequence()
+        ));
+        assert!(matches!(
+            database
+                .read_durable_replay_uncertainty()
+                .expect("read uncertainty"),
+            yield_library::sample_sources::db::DurableReplayUncertaintyState::Absent
+        ));
+        let root_identity_hex = snapshot
+            .root_identity
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let stream_identity_hex = committed
+            .prior()
+            .backend_stream_identity()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        eprintln!(
+            "YIELD_NATIVE_INODE_METADATA_CURSOR_ACCEPTANCE {{\"source_id\":\"{}\",\"root_identity_hex\":\"{}\",\"stream_identity_hex\":\"{}\",\"lifecycle_generation\":{},\"prior_cursor\":{},\"terminal_cursor\":{},\"manifest_revision_before\":{},\"manifest_revision_after\":{},\"audit_emitted\":false,\"projection_delta_emitted\":false}}",
+            source_id.as_str(),
+            root_identity_hex,
+            stream_identity_hex,
+            snapshot.lifecycle_generation,
+            initial.prior().acknowledged_sequence(),
+            committed.prior().acknowledged_sequence(),
+            baseline_revision,
+            database.get_revision().expect("source revision")
+        );
+        service.shutdown();
+        mtime_restore
+            .restore()
+            .expect("restore checked-in metadata fixture modification time");
+        assert_eq!(
+            fs::metadata(&metadata_path)
+                .expect("metadata after mtime restoration")
+                .modified()
+                .expect("restored metadata mtime"),
+            original_metadata_mtime
+        );
+        assert_eq!(
+            source_root_identity(&root).expect("source root identity after restore"),
+            root_identity
+        );
+        assert_eq!(
+            native_fixture_file_identity(&metadata_path),
+            metadata_identity_before
+        );
+        assert_eq!(
+            native_fixture_file_identity(&stable_path),
+            stable_identity_before
+        );
+        assert_eq!(
+            blake3::hash(&fs::read(&metadata_path).expect("metadata bytes after run")),
+            metadata_hash_before
+        );
+        assert_eq!(
+            blake3::hash(&fs::read(&stable_path).expect("stable WAV bytes after run")),
+            stable_hash_before
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -15376,6 +16150,28 @@ mod tests {
     }
 
     #[test]
+    fn detached_finder_metadata_wake_does_not_trigger_audit() {
+        let fixture = Fixture::new("catalog-watcher-finder-metadata");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-watcher-finder-metadata");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        register_and_audit(&service, fixture.root.path(), &source_id);
+
+        assert!(
+            test_gate.record_watcher_evidence(
+                &source_id,
+                1,
+                WatchHintEvidence::FINDER_METADATA_CHANGED
+                    .union(WatchHintEvidence::ROOT_METADATA_AMBIGUOUS),
+            )
+        );
+        thread::sleep(Duration::from_millis(550));
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        service.shutdown();
+    }
+
+    #[test]
     fn removed_source_drops_watcher_signal_before_late_hint() {
         let fixture = Fixture::new("catalog-watcher-remove");
         write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
@@ -16566,7 +17362,7 @@ mod tests {
     mod collection_history_group_tests;
     #[cfg(feature = "test-support")]
     mod compound_batch_fault;
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     mod feature_job_tests;
     mod feature_progress_tests;
     #[cfg(target_os = "linux")]
