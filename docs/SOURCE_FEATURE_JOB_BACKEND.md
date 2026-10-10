@@ -56,13 +56,21 @@ descriptor for data read, validating again before and after content capture and
 before publication. Symlink replacement and parent/root relocation fail closed.
 The descriptor is never converted to an ambient or proc pathname.
 
-The existing held inspection primitive is Linux-only. **OPT-2061** requires the
-actual macOS readable-object adapter and native verification; **OPT-2062** requires
-the distinct Windows HANDLE adapter and verification. Both currently return
-UnsupportedPlatform and preserve retry evidence. They are implementation gates,
-not test waivers. Linux source/SQLite/DSP execution does not qualify those native
-primitives or complete native GPUI/physical artifact acceptance. OPT-2055 covers
-the source-owned SQLite owner regression separately.
+Darwin uses an `O_EVTONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` component chain,
+with `O_DIRECTORY` for each intermediate edge. Each held vnode must have the
+expected directory/regular-file type before it enters the chain. A separate
+no-follow, nonblocking readonly `openat` under the held parent returns a data
+descriptor only after its regular-file type and identity match the original
+metadata-only leaf. The same root/edge/size/mtime/content and current owner fences
+apply before read and publication; no pathname/proc fallback or writable reopen
+is introduced. Index inspection gains the same metadata-only chain, but this does
+not enable the separate native reveal adapter.
+
+Windows uses the separate held HANDLE adapter documented in
+[WINDOWS_FEATURE_HELD_INPUT.md](WINDOWS_FEATURE_HELD_INPUT.md). **OPT-2061/2062**
+retain genuine native execution and supported filesystem/SDK qualification; local
+Linux tests and Windows compilation do not establish Darwin or Windows runtime
+acceptance. OPT-2055 covers the source-owned SQLite owner regression separately.
 
 ## Verification
 

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use super::file_ops_journal::BoundDatabaseRoot;
 use super::source_authority::SourceEffectGate;
 use super::sqlite_identity::DatabaseFileBinding;
-use super::{SourceDatabaseIdentityError, schema};
+use super::{schema, SourceDatabaseIdentityError};
 
 /// Filename for the physical-source ownership sidecar.
 pub(crate) const SOURCE_LEASE_LOCK_FILE_NAME: &str = ".yield-source-lease.lock";
@@ -344,107 +344,73 @@ impl SourcePublicationFence {
         (crate::sample_sources::reconciliation::RootIdentity, u64),
         super::SourceReferenceFenceError,
     > {
-        use super::{
-            META_LAST_AUTHORITATIVE_AUDIT_REVISION as AUDIT,
-            META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY as ROOT,
-            SourceReferenceFenceError as Error,
-        };
         self.validate()?;
         let lease = self
             .source_lease
             .upgrade()
             .ok_or(SourcePublicationFenceError::LeaseDropped)?;
-        let rows = {
+        let audit = {
             let control = lease.control_connection.lock().map_err(|_| {
                 SourcePublicationFenceError::Lease(SourceLeaseError::ControlUnavailable)
             })?;
             lease
                 .validate_control_connection(&control)
                 .map_err(SourcePublicationFenceError::Lease)?;
-            let mut stmt = control.prepare("SELECT CASE WHEN length(CAST(key AS BLOB)) <= 64 THEN key END, CASE WHEN length(CAST(value AS BLOB)) BETWEEN 1 AND CASE WHEN key = ?1 THEN 24576 ELSE 20 END THEN value END FROM metadata WHERE key IN (?1, ?2, 'revision') ORDER BY key LIMIT 4").map_err(super::SourceDbError::from)?;
-            let values = stmt
-                .query_map(params![ROOT, AUDIT], |r| {
-                    Ok((
-                        r.get::<_, Option<String>>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                    ))
-                })
-                .map_err(super::SourceDbError::from)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(super::SourceDbError::from)?;
+            let audit = read_reference_audit_on_control(&lease, &control)?;
             lease
                 .validate_control_connection(&control)
                 .map_err(SourcePublicationFenceError::Lease)?;
-            values
+            audit
         };
         self.validate()?;
-        if rows.len() != 3 {
-            return Err(Error::MalformedAudit);
-        }
-        let mut root = None;
-        let mut audit = None;
-        let mut current = None;
-        for (key, value) in rows {
-            let key = key.ok_or(Error::MalformedAudit)?;
-            let value = value.ok_or(Error::MalformedAudit)?;
-            let slot = match key.as_str() {
-                ROOT => &mut root,
-                AUDIT => &mut audit,
-                "revision" => &mut current,
-                _ => return Err(Error::MalformedAudit),
-            };
-            if slot.replace(value).is_some() {
-                return Err(Error::MalformedAudit);
-            }
-        }
-        let root: Vec<u8> = serde_json::from_str(&root.ok_or(Error::MalformedAudit)?)
-            .map_err(|_| Error::MalformedAudit)?;
-        let parse = |raw: Option<String>| -> Result<u64, Error> {
-            raw.ok_or(Error::MalformedAudit)?
-                .parse::<u64>()
-                .ok()
-                .filter(|v| *v <= i64::MAX as u64)
-                .ok_or(Error::MalformedAudit)
-        };
-        let revision = parse(current)?;
-        if parse(audit)? != revision
-            || root.is_empty()
-            || root.len() > 4096
-            || root.as_slice() != lease.media_root_binding().identity().as_bytes()
-        {
-            return Err(Error::MalformedAudit);
-        }
-        self.validate()?;
-        Ok((
-            crate::sample_sources::reconciliation::RootIdentity::from_bytes(root),
-            revision,
-        ))
+        Ok(audit)
     }
 
-    /// Read one bounded file record through retained control custody; no callback/write grant.
-    pub(super) fn read_file_observation(
+    /// Read one exact row while holding the retained owner connection once. The two audit reads
+    /// bracket the row query, preserving the revision fence around auxiliary tables that can
+    /// change without the manifest revision.
+    pub(super) fn read_reference_file_observation(
         &self,
         path: &crate::operation_journal::StoredRelativePath,
-    ) -> Result<super::source_file_observation::FileFacts, super::SourceFileObservationError> {
-        self.validate()?;
+        expected_root: &crate::sample_sources::reconciliation::RootIdentity,
+        expected_revision: u64,
+    ) -> Result<
+        super::source_file_observation::FileFacts,
+        super::source_file_observation::SourceFileObservationError,
+    > {
+        use super::source_reference_fence::SourceReferenceFenceError as ReferenceError;
+
         let lease = self
             .source_lease
             .upgrade()
             .ok_or(SourcePublicationFenceError::LeaseDropped)?;
-        let facts = {
-            let control = lease.control_connection.lock().map_err(|_| {
-                SourcePublicationFenceError::Lease(SourceLeaseError::ControlUnavailable)
-            })?;
-            lease
-                .validate_control_connection(&control)
-                .map_err(SourcePublicationFenceError::Lease)?;
-            let facts = super::source_file_observation::read_facts(&control, path)?;
-            lease
-                .validate_control_connection(&control)
-                .map_err(SourcePublicationFenceError::Lease)?;
-            facts
-        };
-        self.validate()?;
+        if !self.is_live() {
+            return Err(SourcePublicationFenceError::LeaseDropped.into());
+        }
+        let control = lease.control_connection.lock().map_err(|_| {
+            SourcePublicationFenceError::Lease(SourceLeaseError::ControlUnavailable)
+        })?;
+        lease.validate_publication_fence_on_control(
+            &control,
+            &self.owner_identity,
+            self.lease_epoch,
+        )?;
+        let before = read_reference_audit_on_control(&lease, &control)?;
+        validate_expected_reference_audit(&before, expected_root, expected_revision)?;
+        let facts = super::source_file_observation::read_facts(&control, path)?;
+        let after = read_reference_audit_on_control(&lease, &control)?;
+        validate_expected_reference_audit(&after, expected_root, expected_revision)?;
+        if before != after {
+            return Err(ReferenceError::RevisionChanged.into());
+        }
+        lease.validate_publication_fence_on_control(
+            &control,
+            &self.owner_identity,
+            self.lease_epoch,
+        )?;
+        if !self.is_live() {
+            return Err(SourcePublicationFenceError::LeaseDropped.into());
+        }
         Ok(facts)
     }
 
@@ -500,6 +466,86 @@ impl SourcePublicationFence {
         }
         result
     }
+}
+
+fn read_reference_audit_on_control(
+    lease: &SourceLease,
+    control: &Connection,
+) -> Result<
+    (crate::sample_sources::reconciliation::RootIdentity, u64),
+    super::source_reference_fence::SourceReferenceFenceError,
+> {
+    use super::{
+        SourceReferenceFenceError as Error, META_LAST_AUTHORITATIVE_AUDIT_REVISION as AUDIT,
+        META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY as ROOT,
+    };
+
+    let mut stmt = control.prepare("SELECT CASE WHEN length(CAST(key AS BLOB)) <= 64 THEN key END, CASE WHEN length(CAST(value AS BLOB)) BETWEEN 1 AND CASE WHEN key = ?1 THEN 24576 ELSE 20 END THEN value END FROM metadata WHERE key IN (?1, ?2, 'revision') ORDER BY key LIMIT 4").map_err(super::SourceDbError::from)?;
+    let rows = stmt
+        .query_map(params![ROOT, AUDIT], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .map_err(super::SourceDbError::from)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(super::SourceDbError::from)?;
+    if rows.len() != 3 {
+        return Err(Error::MalformedAudit);
+    }
+    let mut root = None;
+    let mut audit = None;
+    let mut current = None;
+    for (key, value) in rows {
+        let key = key.ok_or(Error::MalformedAudit)?;
+        let value = value.ok_or(Error::MalformedAudit)?;
+        let slot = match key.as_str() {
+            ROOT => &mut root,
+            AUDIT => &mut audit,
+            "revision" => &mut current,
+            _ => return Err(Error::MalformedAudit),
+        };
+        if slot.replace(value).is_some() {
+            return Err(Error::MalformedAudit);
+        }
+    }
+    let root: Vec<u8> = serde_json::from_str(&root.ok_or(Error::MalformedAudit)?)
+        .map_err(|_| Error::MalformedAudit)?;
+    let parse = |raw: Option<String>| -> Result<u64, Error> {
+        raw.ok_or(Error::MalformedAudit)?
+            .parse::<u64>()
+            .ok()
+            .filter(|v| *v <= i64::MAX as u64)
+            .ok_or(Error::MalformedAudit)
+    };
+    let revision = parse(current)?;
+    if parse(audit)? != revision
+        || root.is_empty()
+        || root.len() > 4096
+        || root.as_slice() != lease.media_root_binding().identity().as_bytes()
+    {
+        return Err(Error::MalformedAudit);
+    }
+    Ok((
+        crate::sample_sources::reconciliation::RootIdentity::from_bytes(root),
+        revision,
+    ))
+}
+
+fn validate_expected_reference_audit(
+    actual: &(crate::sample_sources::reconciliation::RootIdentity, u64),
+    expected_root: &crate::sample_sources::reconciliation::RootIdentity,
+    expected_revision: u64,
+) -> Result<(), super::source_reference_fence::SourceReferenceFenceError> {
+    use super::source_reference_fence::SourceReferenceFenceError as Error;
+    if actual.0 != *expected_root {
+        return Err(Error::MalformedAudit);
+    }
+    if actual.1 != expected_revision {
+        return Err(Error::RevisionChanged);
+    }
+    Ok(())
 }
 
 impl SourceLeaseReservation {
@@ -1099,10 +1145,29 @@ impl SourceLease {
         let control = self.control_connection.lock().map_err(|_| {
             SourcePublicationFenceError::Lease(SourceLeaseError::ControlUnavailable)
         })?;
-        self.validate_control_connection(&control)
+        self.validate_publication_fence_on_control(
+            &control,
+            expected_owner_identity,
+            expected_epoch,
+        )
+    }
+
+    fn validate_publication_fence_on_control(
+        &self,
+        control: &Connection,
+        expected_owner_identity: &str,
+        expected_epoch: i64,
+    ) -> Result<(), SourcePublicationFenceError> {
+        if self.owner_identity != expected_owner_identity {
+            return Err(SourcePublicationFenceError::OwnerChanged);
+        }
+        if self.lease_epoch != expected_epoch {
+            return Err(SourcePublicationFenceError::EpochChanged);
+        }
+        self.validate_control_connection(control)
             .map_err(SourcePublicationFenceError::Lease)?;
         let row = self
-            .read_current_row(&control)
+            .read_current_row(control)
             .map_err(SourcePublicationFenceError::Lease)?;
         if row.owner_identity != expected_owner_identity {
             return Err(SourcePublicationFenceError::OwnerChanged);
@@ -1120,7 +1185,7 @@ impl SourceLease {
                 },
             ));
         }
-        self.validate_control_connection(&control)
+        self.validate_control_connection(control)
             .map_err(SourcePublicationFenceError::Lease)?;
         Ok(())
     }
@@ -2092,7 +2157,7 @@ fn acquire_nonblocking_lock(file: &File, path: &Path) -> Result<(), SourceLeaseE
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE, WIN32_ERROR};
     use windows::Win32::Storage::FileSystem::{
-        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
     };
     use windows::Win32::System::IO::OVERLAPPED;
 

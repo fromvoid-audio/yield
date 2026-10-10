@@ -48,7 +48,7 @@ Cross-display and visual acceptance remain separate native checks.
 The full and storage lanes run the `yield-session` library suite. Use
 `bash scripts/gpui-local-ci.sh session` to run that suite by itself. OPT-1861
 records the test fixture repair that restored this coverage on macOS. All three
-lanes limit that suite to four test threads: each session test starts several
+lanes run that suite serially: each session test starts several
 SQLite-backed owners, and the host's default test parallelism can exhaust its
 existing five-second event deadlines before the owners finish initializing. This limit
 does not change those deadlines or the tests' assertions. Run the lane on a

@@ -237,13 +237,34 @@ fn budget_missing_target_or_replaced_directory_require_correlated_audit_without_
 fn raw_directory_and_file_addition_then_absence_stay_lossless_in_worker_transaction() {
     use std::os::unix::ffi::OsStringExt;
     let f = Fixture::new(true);
-    let raw = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff-dir".to_vec()));
+    let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff-dir".to_vec()));
+    #[cfg(target_os = "macos")]
+    let raw = {
+        assert_eq!(
+            RootRelativePath::try_from_path(invalid.clone())
+                .unwrap()
+                .as_path(),
+            invalid.as_path()
+        );
+        let error = fs::create_dir(f.base.root.path().join(&invalid)).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(92), "APFS EILSEQ: {error}");
+        assert!(!f.base.root.path().join(&invalid).exists());
+        PathBuf::from("raw-é-dir")
+    };
+    #[cfg(not(target_os = "macos"))]
+    let raw = invalid;
     fs::create_dir(f.base.root.path().join(&raw)).unwrap();
+    #[cfg(target_os = "macos")]
+    let old = raw.join("old-é.txt");
+    #[cfg(not(target_os = "macos"))]
     let old = raw.join(std::ffi::OsString::from_vec(b"old-\xff.wav".to_vec()));
     fs::write(f.base.root.path().join(&old), b"old raw").unwrap();
     let service = f.start();
     let before = f.read().get_revision().unwrap();
     fs::remove_file(f.base.root.path().join(&old)).unwrap();
+    #[cfg(target_os = "macos")]
+    let new = raw.join("new-ø.txt");
+    #[cfg(not(target_os = "macos"))]
     let new = raw.join(std::ffi::OsString::from_vec(b"new-\xfe.wav".to_vec()));
     fs::write(f.base.root.path().join(&new), b"new raw").unwrap();
     let request = service
