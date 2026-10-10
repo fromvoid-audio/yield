@@ -285,17 +285,27 @@ fn retained_index_pages_reject_reopened_lifecycle_cursor_and_preserve_raw_paths(
     fs::write(fixture.root.path().join("a.txt"), b"facts").unwrap();
     fs::write(fixture.root.path().join("b.txt"), b"facts").unwrap();
     #[cfg(unix)]
-    {
+    let raw = {
         use std::os::unix::ffi::OsStringExt;
-        fs::write(
-            fixture
-                .root
-                .path()
-                .join(std::ffi::OsString::from_vec(b"raw-\xff.wav".to_vec())),
-            b"facts",
-        )
-        .unwrap();
-    }
+        let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff.wav".to_vec()));
+        #[cfg(target_os = "macos")]
+        let path = {
+            assert_eq!(
+                RootRelativePath::try_from_path(invalid.clone())
+                    .unwrap()
+                    .as_path(),
+                invalid.as_path()
+            );
+            let error = fs::write(fixture.root.path().join(&invalid), b"facts").unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(92), "APFS EILSEQ: {error}");
+            // A supported non-audio path has no WAV diagnostic, unlike the invalid raw value.
+            PathBuf::from("raw-é.txt")
+        };
+        #[cfg(not(target_os = "macos"))]
+        let path = invalid;
+        fs::write(fixture.root.path().join(&path), b"facts").unwrap();
+        path
+    };
     let id = SourceId::from_string("index-reopen");
     let service = CatalogService::start(&fixture.guard).unwrap();
     register_and_audit(&service, fixture.root.path(), &id);
@@ -339,9 +349,18 @@ fn retained_index_pages_reject_reopened_lifecycle_cursor_and_preserve_raw_paths(
     let page = receive_index_page(&service, 31);
     #[cfg(unix)]
     assert!(page.entries.iter().any(|entry| {
-        entry.relative_path.as_path().as_os_str().as_encoded_bytes() == b"raw-\xff.wav"
-            && entry.diagnostic
-                == Some(yield_library::sample_sources::SourceIndexDiagnostic::NonUnicodePath)
+        entry.relative_path.as_path().as_os_str().as_encoded_bytes()
+            == raw.as_os_str().as_encoded_bytes()
+            && entry.diagnostic == {
+                #[cfg(target_os = "macos")]
+                {
+                    None
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Some(yield_library::sample_sources::SourceIndexDiagnostic::NonUnicodePath)
+                }
+            }
     }));
     assert!(page.schema_available);
 }

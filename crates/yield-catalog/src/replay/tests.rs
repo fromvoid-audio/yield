@@ -10,12 +10,20 @@ mod subtree;
 use fixture::Fixture;
 
 #[test]
-fn ordered_audio_index_commit_and_duplicate_are_atomic() {
+fn ordered_audio_index_and_untrusted_metadata_path_commit_atomically() {
     let f = Fixture::new(true);
     let service = f.start();
     f.put("one.wav", b"changed audio");
     f.put("notes.txt", b"changed notes");
-    let batch = f.batch(10, &[(Some(14), "one.wav"), (Some(19), "notes.txt")]);
+    f.put(".DS_Store", b"ordinary source entry");
+    let batch = f.batch(
+        10,
+        &[
+            (Some(14), "one.wav"),
+            (Some(19), "notes.txt"),
+            (Some(20), ".DS_Store"),
+        ],
+    );
     let before = f.read().get_revision().unwrap();
     let request = service.submit_replay(batch.clone(), 7, before).unwrap();
     let CatalogReplayOutcome::Committed { receipt, delta } = Fixture::receive(&request) else {
@@ -31,11 +39,11 @@ fn ordered_audio_index_commit_and_duplicate_are_atomic() {
             .unwrap()
             .upserted_entries
             .len(),
-        1
+        2
     );
-    assert_eq!(receipt.prior().acknowledged_sequence(), 19);
-    assert!(receipt.matches_interval(11, 19));
-    assert!(!receipt.matches_interval(12, 19));
+    assert_eq!(receipt.prior().acknowledged_sequence(), 20);
+    assert!(receipt.matches_interval(11, 20));
+    assert!(!receipt.matches_interval(12, 20));
     assert_eq!(receipt.source_revision(), delta.revision);
     assert_eq!(f.read().get_revision().unwrap(), delta.revision);
     let entry = f
@@ -55,7 +63,7 @@ fn ordered_audio_index_commit_and_duplicate_are_atomic() {
     drop(duplicate);
     f.put("one.wav", b"second change");
     let next = service
-        .submit_replay(f.batch(19, &[(Some(25), "one.wav")]), 7, delta.revision)
+        .submit_replay(f.batch(20, &[(Some(25), "one.wav")]), 7, delta.revision)
         .unwrap();
     assert!(matches!(
         Fixture::receive(&next),

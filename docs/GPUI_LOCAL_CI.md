@@ -48,7 +48,7 @@ Cross-display and visual acceptance remain separate native checks.
 The full and storage lanes run the `yield-session` library suite. Use
 `bash scripts/gpui-local-ci.sh session` to run that suite by itself. OPT-1861
 records the test fixture repair that restored this coverage on macOS. All three
-lanes limit that suite to four test threads: each session test starts several
+lanes run that suite serially: each session test starts several
 SQLite-backed owners, and the host's default test parallelism can exhaust its
 existing five-second event deadlines before the owners finish initializing. This limit
 does not change those deadlines or the tests' assertions. Run the lane on a
@@ -83,6 +83,15 @@ evidence only.
 
 For a private bundle from an exact validated commit, follow
 [GPUI macOS packaging](GPUI_MACOS_PACKAGING.md).
+
+The real-packer payload tests exercise stable, RC and nightly archives across all
+three declared targets. The macOS release ZIP uses `ditto --norsrc` so its regular
+members match the authenticated manifest exactly: host resource forks, extended
+attributes and ACLs are not separate payload files. Bundle file bytes and Unix
+modes, including the code-signature seal files, remain in the archive. Verify
+the extracted app's signature after packaging. Ad-hoc signature roundtrips do
+not qualify preservation of a notarized Yield build's stapled ticket; that
+requires a genuinely ticketed artifact and before/after `stapler validate`.
 
 ## Focused original recording custody verification
 

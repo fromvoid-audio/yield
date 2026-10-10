@@ -9,12 +9,12 @@ fi
 
 repo_root="${YIELD_GPUI_CI_CHECKOUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$repo_root"
+common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+state_dir="$common_dir/local-ci"
 source scripts/internal/ci/python_runtime.sh
 export YIELD_CI_PYTHON="$(yield_ci_python)"
 yield_canonicalize_tmpdir
 if [[ -z "${YIELD_LOCAL_CI_COORDINATOR_FD:-}" ]]; then
-  common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
-  state_dir="$common_dir/local-ci"
   exec "$YIELD_CI_PYTHON" scripts/internal/ci/managed_exec.py --timeout-seconds 21600 \
     "$YIELD_CI_PYTHON" scripts/internal/ci/coordinator_exec.py \
     "$state_dir/active.lock" env YIELD_GPUI_CI_COORDINATED=1 bash "$0" "$@"
@@ -31,6 +31,17 @@ case "$scope" in
   full|storage|session) ;;
   *) echo "Usage: scripts/gpui-local-ci.sh [full|storage|session]" >&2; exit 2 ;;
 esac
+
+if [[ "$scope" == "full" ]]; then
+  metadata_fixture_record="$(
+    "$YIELD_CI_PYTHON" scripts/internal/ci/prepare_native_metadata_fixture.py \
+      --checkout "$repo_root" --state-dir "$state_dir"
+  )"
+  export YIELD_NATIVE_METADATA_FIXTURE_ROOT="$(
+    "$YIELD_CI_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["source_root"])' <<<"$metadata_fixture_record"
+  )"
+  echo "[gpui-local-ci] verified persistent metadata fixture: $metadata_fixture_record"
+fi
 
 if [[ "$scope" == "full" && "${YIELD_GPUI_CI_ORCHESTRATED:-0}" != "1" ]]; then
   "$YIELD_CI_PYTHON" scripts/internal/ci/run_full_ci.py

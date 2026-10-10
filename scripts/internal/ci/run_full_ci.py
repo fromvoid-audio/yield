@@ -72,6 +72,7 @@ def main() -> int:
             "scripts.internal.ci.test_managed_exec",
             "scripts.internal.ci.test_runtime_paths",
             "scripts.internal.release.test_release_wrapper",
+            "scripts.internal.ci.test_native_metadata_fixture",
         ]
         coordinator_fds: tuple[int, ...] = ()
         coordinator = env.get("YIELD_LOCAL_CI_COORDINATOR_FD")
