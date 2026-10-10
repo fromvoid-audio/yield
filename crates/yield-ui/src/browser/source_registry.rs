@@ -633,6 +633,12 @@ impl Browser {
                 self.source_registry_revision = revision;
                 self.source_reorder_drag = None;
                 self.fail_pending_registry_mutations(error.to_string());
+                tracing::error!(
+                    target: "yield::session",
+                    event = "persistence_unavailable",
+                    error = %error,
+                    "Session persistence is unavailable"
+                );
                 self.set_source_registry_status(format!("Source persistence unavailable: {error}"));
                 true
             }

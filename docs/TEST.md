@@ -237,6 +237,34 @@ not prove analog output or that a person heard acceptable audio.
 
 ### Reversible clean transaction
 
+#### Intentional development reset after a missing profile
+
+If startup reports `session persistence unavailable` with an
+`ambiguous legacy dirty volume marker`, a retained ownership marker belongs to a
+different profile identity. Deleting only the profile leaves this evidence
+behind; startup must refuse to claim that the old work was reconciled. Keep the
+original state if you need to recover its session or journal.
+
+For an intentional development reset, quit every Yield version, then run:
+
+```sh
+scripts/yield-local-ci state reset --namespace production
+```
+
+This parks the **entire** `.yield` root in a recoverable backup, including the
+volume registry, journals and logs, and prints its transaction ID. Launch the
+beta or release normally afterward. It creates fresh state; subsequent normal
+launches preserve that state. Use `development` instead of `production` for test
+builds. No media or source-side metadata is reset. To return to the old state,
+quit Yield and use `state restore --backup <transaction-id>`; that also restores
+any old unresolved startup fault. Keep the backup for recovery, and never clear
+just the dirty marker or treat this reset as journal reconciliation.
+
+For regression qualification, verify that adding a disposable source and changing
+volume/loop settings persists across normal quit/reopen after reset. Test the
+refusal separately: a foreign dirty marker must remain unchanged and persistence
+must report its underlying cause. Physical disconnect/resume is a separate lane.
+
 Put maintenance locks and transaction records outside the managed root. A clean
 operation takes an exclusive namespace maintenance lock before inspecting state.
 Every updated app takes a shared lock before logging or any app-root access and
