@@ -15,8 +15,8 @@ use super::scan_capability::{SourcePathBinding, SourceRootCapability};
 use super::scan_diff::{PreparedFile, apply_diff};
 use super::scan_diff_phase::prepare_diff_from_facts;
 use super::scan_fs::{
-    compute_content_hash_with_reader, is_supported_scannable_audio_file, read_facts_from_open_file,
-    visit_dir_with_cancel_check,
+    FileFacts, compute_content_hash_with_reader, is_supported_scannable_audio_file,
+    read_facts_from_open_file, visit_dir_with_cancel_check,
 };
 use super::scan_index::inaccessible_index_entry;
 use super::scan_writer::{ScanWritePhase, ScanWriter};
@@ -54,29 +54,29 @@ pub(super) fn walk_phase(
                 .strip_prefix(root)
                 .map(Path::to_path_buf)
                 .map_err(|_| ScanError::InvalidRoot(path.to_path_buf()))?;
-            let mut prepared =
-                match prepare_diff_from_capability(&source_root, root, &relative_path, context) {
-                    Ok(Some(prepared)) => prepared,
-                    Ok(None) => {
-                        record_unavailable_preparation(
-                            context,
-                            relative_path,
-                            path,
-                            committed.get(),
-                        );
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        record_inaccessible_preparation(
-                            context,
-                            relative_path,
-                            path,
-                            committed.get(),
-                            &error,
-                        );
-                        return Ok(());
-                    }
-                };
+            let mut prepared = match prepare_diff_from_capability_for_audit(
+                db,
+                &source_root,
+                root,
+                &relative_path,
+                context,
+            ) {
+                Ok(Some(prepared)) => prepared,
+                Ok(None) => {
+                    record_unavailable_preparation(context, relative_path, path, committed.get());
+                    return Ok(());
+                }
+                Err(error) => {
+                    record_inaccessible_preparation(
+                        context,
+                        relative_path,
+                        path,
+                        committed.get(),
+                        &error,
+                    );
+                    return Ok(());
+                }
+            };
             if !context.resumable_manifest_audit_active() {
                 context.stats.total_files += 1;
                 if let Some(on_progress) = on_progress.as_mut() {
@@ -93,6 +93,7 @@ pub(super) fn walk_phase(
                     committed.get(),
                 )?
                 else {
+                    context.forget_manifest_audit_revalidation_paths([relative_path]);
                     return Ok(());
                 };
                 prepared = refreshed;
@@ -124,6 +125,10 @@ pub(super) fn walk_phase(
             pending.push(prepared);
             if pending.len() == APPLY_BATCH_SIZE {
                 let files = std::mem::replace(&mut pending, Vec::with_capacity(APPLY_BATCH_SIZE));
+                let attempted_paths = files
+                    .iter()
+                    .map(|file| file.facts.relative.clone())
+                    .collect::<Vec<_>>();
                 let outcome = apply_batch_with_source_root(
                     db,
                     root,
@@ -140,6 +145,7 @@ pub(super) fn walk_phase(
                 }
                 let last_path = outcome.audited_paths.last().cloned();
                 context.record_manifest_audit_paths(outcome.audited_paths);
+                context.forget_manifest_audit_revalidation_paths(attempted_paths);
                 if context.manifest_audit_checkpoint_due() {
                     let progress_path = last_path.map(|path| root.join(path));
                     checkpoint_manifest_audit_with_progress(
@@ -157,6 +163,10 @@ pub(super) fn walk_phase(
         },
     )?;
     if !pending.is_empty() {
+        let attempted_paths = pending
+            .iter()
+            .map(|file| file.facts.relative.clone())
+            .collect::<Vec<_>>();
         let outcome = apply_batch_with_source_root(
             db,
             root,
@@ -173,6 +183,7 @@ pub(super) fn walk_phase(
         }
         let last_path = outcome.audited_paths.last().cloned();
         context.record_manifest_audit_paths(outcome.audited_paths);
+        context.forget_manifest_audit_revalidation_paths(attempted_paths);
         let progress_path = last_path.map(|path| root.join(path));
         checkpoint_manifest_audit_with_progress(
             db,
@@ -185,21 +196,37 @@ pub(super) fn walk_phase(
         )?;
     }
     context.mark_uncertain_prefixes(source_tree_snapshot.uncertain_prefixes.clone());
-    if !context.has_uncertain_prefixes() {
-        context.complete_missing_manifest_audit_paths();
-    }
-    checkpoint_manifest_audit_with_progress(
-        db,
-        root,
-        &source_root,
-        context,
-        &mut pending_noops,
-        last_manifest_audit_path.as_deref(),
-        on_progress,
-    )?;
+    finish_manifest_audit_walk(context, &mut pending_noops, |context, pending_noops| {
+        checkpoint_manifest_audit_with_progress(
+            db,
+            root,
+            &source_root,
+            context,
+            pending_noops,
+            last_manifest_audit_path.as_deref(),
+            on_progress,
+        )?;
+        Ok(())
+    })?;
     context.observe_index_entries(source_tree_snapshot.index_entries.clone());
     context.stats.source_tree_snapshot =
         Some(finalize_source_tree_snapshot(context, source_tree_snapshot));
+    Ok(())
+}
+
+fn finish_manifest_audit_walk(
+    context: &mut ScanContext,
+    pending_noops: &mut Vec<PreparedFile>,
+    mut checkpoint: impl FnMut(&mut ScanContext, &mut Vec<PreparedFile>) -> Result<(), ScanError>,
+) -> Result<(), ScanError> {
+    checkpoint(context, pending_noops)?;
+    if context.resumable_manifest_audit_active()
+        && !context.source_tree_incomplete()
+        && !context.has_uncertain_prefixes()
+    {
+        context.complete_missing_manifest_audit_paths();
+        checkpoint(context, pending_noops)?;
+    }
     Ok(())
 }
 
@@ -322,10 +349,34 @@ fn prepare_diff_from_capability(
     };
     let absolute = root.join(relative_path);
     let facts = read_facts_from_open_file(root, &absolute, &file)?;
+    Ok(Some(finish_prepared_capability_file(facts, file, context)))
+}
+
+fn prepare_diff_from_capability_for_audit(
+    db: &SourceDatabase,
+    source_root: &SourceRootCapability,
+    root: &Path,
+    relative_path: &Path,
+    context: &mut ScanContext,
+) -> Result<Option<PreparedFile>, ScanError> {
+    let Some(file) = source_root.open_regular_file(relative_path)? else {
+        return Ok(None);
+    };
+    let absolute = root.join(relative_path);
+    let facts = read_facts_from_open_file(root, &absolute, &file)?;
+    context.promote_manifest_audit_path_if_pending(db, &facts.relative)?;
+    Ok(Some(finish_prepared_capability_file(facts, file, context)))
+}
+
+fn finish_prepared_capability_file(
+    facts: FileFacts,
+    file: std::fs::File,
+    context: &ScanContext,
+) -> PreparedFile {
     let mut prepared = prepare_diff_from_facts(facts, context);
     prepared.source_file = Some(file);
     prepared.source_handle_verified = true;
-    Ok(Some(prepared))
+    prepared
 }
 
 fn record_unavailable_preparation(
@@ -890,9 +941,10 @@ fn cancel_requested(cancel: Option<&AtomicBool>) -> bool {
 mod tests {
     use super::{
         PrepareForApply, SourceRootCapability, apply_batch, apply_batch_with_precommit_hook,
-        finalize_source_tree_snapshot, flush_manifest_audit_checkpoint_with_noops_hook,
-        prepare_diff_from_capability, prepare_for_apply, prepare_for_apply_with_post_hash_hook,
-        refresh_noop_preparation_or_skip,
+        finalize_source_tree_snapshot, finish_manifest_audit_walk,
+        flush_manifest_audit_checkpoint_with_noops_hook, prepare_diff_from_capability,
+        prepare_diff_from_capability_for_audit, prepare_for_apply,
+        prepare_for_apply_with_post_hash_hook, refresh_noop_preparation_or_skip,
     };
     use crate::sample_sources::scanner::open_maintained_scan_database;
     use crate::sample_sources::scanner::scan::{ScanContext, ScanError, ScanMode, scan_once};
@@ -900,7 +952,7 @@ mod tests {
     use crate::sample_sources::scanner::scan_diff_phase::prepare_diff;
     use crate::sample_sources::scanner::scan_fs::read_facts;
     use std::collections::HashMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
     #[test]
@@ -1023,13 +1075,23 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let relative = Path::new("one.wav");
+        let tail = Path::new("zz-tail.wav");
         let source = dir.path().join(relative);
+        let tail_source = dir.path().join(tail);
         let outside = tempdir().unwrap();
         let outside_file = outside.path().join("outside.wav");
         std::fs::write(&source, b"inside").unwrap();
+        std::fs::write(&tail_source, b"tail").unwrap();
         std::fs::write(&outside_file, b"outside").unwrap();
         let db = open_maintained_scan_database(dir.path()).unwrap();
         scan_once(&db).unwrap();
+        db.begin_or_resume_manifest_audit(99).unwrap();
+        let mut durable_paths = (0..64)
+            .map(|index| PathBuf::from(format!("before-{index:03}.wav")))
+            .collect::<Vec<_>>();
+        durable_paths.push(tail.to_path_buf());
+        db.checkpoint_manifest_audit_paths(&durable_paths).unwrap();
+        std::fs::remove_file(&tail_source).unwrap();
         let entry = db.entry_for_path(relative).unwrap().unwrap();
         let mut context = ScanContext::from_existing(
             HashMap::from([(relative.to_path_buf(), entry)]),
@@ -1039,9 +1101,15 @@ mod tests {
         );
         context.resume_manifest_audit(&db, 100).unwrap();
         let source_root = SourceRootCapability::open(dir.path()).unwrap();
-        let prepared = prepare_diff_from_capability(&source_root, dir.path(), relative, &context)
-            .unwrap()
-            .unwrap();
+        let prepared = prepare_diff_from_capability_for_audit(
+            &db,
+            &source_root,
+            dir.path(),
+            relative,
+            &mut context,
+        )
+        .unwrap()
+        .unwrap();
         let prepared = refresh_noop_preparation_or_skip(
             &db,
             dir.path(),
@@ -1055,24 +1123,27 @@ mod tests {
         context.record_manifest_audit_paths([relative.to_path_buf()]);
         let mut pending_noops = vec![prepared];
 
-        flush_manifest_audit_checkpoint_with_noops_hook(
-            &db,
-            dir.path(),
-            &source_root,
+        finish_manifest_audit_walk(
             &mut context,
             &mut pending_noops,
-            |_| {
-                std::fs::remove_file(&source).unwrap();
-                symlink(&outside_file, &source).unwrap();
+            |context, pending_noops| {
+                flush_manifest_audit_checkpoint_with_noops_hook(
+                    &db,
+                    dir.path(),
+                    &source_root,
+                    context,
+                    pending_noops,
+                    |_| {
+                        std::fs::remove_file(&source).unwrap();
+                        symlink(&outside_file, &source).unwrap();
+                    },
+                )
             },
         )
         .unwrap();
 
-        assert!(
-            !db.begin_or_resume_manifest_audit(101)
-                .unwrap()
-                .contains(&relative.to_path_buf())
-        );
+        assert!(db.manifest_audit_path_is_pending(tail).unwrap());
+        assert!(context.manifest_audit_revalidation_pending());
         assert!(context.existing.contains_key(relative));
         assert!(context.source_tree_incomplete());
     }

@@ -14,6 +14,18 @@ pub(super) const SOURCE_DB_SCHEMA_CONTRACT: &[TableContract] = &[
         columns: &["key", "value"],
     },
     TableContract {
+        name: "source_manifest_audit_state",
+        columns: &["singleton", "started_at", "checked_files"],
+    },
+    TableContract {
+        name: "source_manifest_audit_seen",
+        columns: &["path"],
+    },
+    TableContract {
+        name: "source_manifest_audit_current_seen",
+        columns: &["path"],
+    },
+    TableContract {
         name: "wav_files",
         columns: &[
             "path",
