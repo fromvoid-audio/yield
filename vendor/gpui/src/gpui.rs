@@ -29,6 +29,12 @@ mod key_dispatch;
 mod keymap;
 mod path_builder;
 mod platform;
+#[cfg(all(target_os = "macos", feature = "native-window-selector-test"))]
+#[doc(hidden)]
+/// Run GPUI's native window-selector probe from a main-thread executable harness.
+pub fn run_native_window_selector_probe() -> std::result::Result<(), &'static str> {
+    platform::run_native_window_selector_probe()
+}
 pub mod prelude;
 mod scene;
 mod shared_string;

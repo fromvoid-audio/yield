@@ -106,6 +106,8 @@ if [[ "$scope" == "full" ]]; then
     run cargo test --manifest-path vendor/gpui/Cargo.toml --locked --no-default-features --features font-kit,runtime_shaders --lib post_ -- --test-threads=1
     # Focused native dispatch regressions; physical window/display acceptance is separate.
     run_counted 4 0 cargo test --manifest-path vendor/gpui/Cargo.toml --locked --no-default-features --features font-kit,runtime_shaders --lib native_window_ -- --test-threads=1
+    # This harness-free executable runs AppKit window construction on the process main thread.
+    run cargo test --manifest-path vendor/gpui/Cargo.toml --locked --no-default-features --features font-kit,runtime_shaders,native-window-selector-test --test native_window_selector_probe
   fi
 else
   run cargo check --locked -p yield-library --no-default-features

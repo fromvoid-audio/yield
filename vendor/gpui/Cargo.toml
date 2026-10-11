@@ -65,6 +65,7 @@ test-support = [
     "wayland",
     "x11",
 ]
+native-window-selector-test = []
 wayland = [
     "blade-graphics",
     "blade-macros",
@@ -230,6 +231,12 @@ path = "examples/window_shadow.rs"
 [[test]]
 name = "action_macros"
 path = "tests/action_macros.rs"
+
+[[test]]
+name = "native_window_selector_probe"
+path = "tests/native_window_selector_probe.rs"
+harness = false
+required-features = ["native-window-selector-test"]
 
 [dependencies.anyhow]
 version = "1.0.86"

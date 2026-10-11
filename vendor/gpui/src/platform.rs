@@ -8,6 +8,11 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod mac;
 
+#[cfg(all(target_os = "macos", feature = "native-window-selector-test"))]
+pub(crate) fn run_native_window_selector_probe() -> std::result::Result<(), &'static str> {
+    mac::run_native_window_selector_probe()
+}
+
 #[cfg(any(
     all(
         any(target_os = "linux", target_os = "freebsd"),
