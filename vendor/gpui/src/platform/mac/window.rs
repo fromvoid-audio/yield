@@ -1831,6 +1831,19 @@ fn native_window_drag_allowed(
     hit_test.is_some_and(|hit_test| matches!(hit_test(), Some(WindowControlArea::Drag)))
 }
 
+fn native_window_uses_explicit_control_drag(native_window: id) -> bool {
+    if native_window.is_null() {
+        return false;
+    }
+
+    unsafe {
+        let titlebar_is_transparent: BOOL = msg_send![native_window, titlebarAppearsTransparent];
+        let style_mask: NSWindowStyleMask = msg_send![native_window, styleMask];
+        titlebar_is_transparent == YES
+            && style_mask.contains(NSWindowStyleMask::NSFullSizeContentViewWindowMask)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeMouseDownAction {
     MoveWindow,
@@ -1932,12 +1945,7 @@ unsafe fn dispatch_window_event(this: &Object, native_event: id, panel: bool) {
     let native_window = this as *const Object as id;
     let mouse_position = unsafe { native_event.locationInWindow() };
 
-    let intercept_enabled = {
-        let state = window_state.lock();
-        let style_mask: NSWindowStyleMask = unsafe { msg_send![native_window, styleMask] };
-        state.transparent_titlebar
-            && style_mask.contains(NSWindowStyleMask::NSFullSizeContentViewWindowMask)
-    };
+    let intercept_enabled = native_window_uses_explicit_control_drag(native_window);
 
     if event_type == NSEventType::NSLeftMouseDown && intercept_enabled {
         // Recover from a missing mouse-up before beginning another gesture.
@@ -2008,6 +2016,14 @@ extern "C" fn send_panel_event(this: &Object, _: Sel, native_event: id) {
 }
 
 extern "C" fn mouse_down_can_move_window(this: &Object, _: Sel) -> BOOL {
+    let native_window: id = unsafe { msg_send![this, window] };
+    if native_window_uses_explicit_control_drag(native_window) {
+        // AppKit may ask before forwarding mouse-down to GPUI, while its cursor query still
+        // points at the previous location. For transparent full-size content, only the
+        // event-position-aware NSWindow dispatch path may authorize a window drag.
+        return NO;
+    }
+
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     let Some(mut callback) = lock.hit_test_window_control_callback.take() else {
@@ -2020,6 +2036,106 @@ extern "C" fn mouse_down_can_move_window(this: &Object, _: Sel) -> BOOL {
     let can_move = native_window_drag_allowed(Some(callback.as_mut()));
     window_state.lock().hit_test_window_control_callback = Some(callback);
     can_move as BOOL
+}
+
+#[cfg(feature = "native-window-selector-test")]
+pub(crate) fn run_native_window_selector_probe() -> std::result::Result<(), &'static str> {
+    unsafe {
+        let is_main_thread: BOOL = msg_send![class!(NSThread), isMainThread];
+        if is_main_thread != YES {
+            return Err("selector probe must run on the process main thread");
+        }
+
+        let pool = NSAutoreleasePool::new(nil);
+        let application = NSApplication::sharedApplication(nil);
+        if application.is_null() {
+            let _: () = msg_send![pool, drain];
+            return Err("AppKit did not create NSApplication");
+        }
+
+        let Some(mut declaration) = ClassDecl::new("YieldSelectorRegressionView", class!(NSView))
+        else {
+            let _: () = msg_send![pool, drain];
+            return Err("could not declare selector regression view");
+        };
+        declaration.add_method(
+            sel!(mouseDownCanMoveWindow),
+            mouse_down_can_move_window as extern "C" fn(&Object, Sel) -> BOOL,
+        );
+        let view_class = declaration.register();
+
+        let frame = NSRect::new(NSPoint::new(20.0, 20.0), NSSize::new(120.0, 80.0));
+        let style = NSWindowStyleMask::NSTitledWindowMask
+            | NSWindowStyleMask::NSFullSizeContentViewWindowMask;
+        let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_screen_(
+            frame,
+            style,
+            NSBackingStoreBuffered,
+            NO,
+            nil,
+        );
+        if window.is_null() {
+            let _: () = msg_send![pool, drain];
+            return Err("AppKit returned a nil transparent test window");
+        }
+        let _: () = msg_send![window, setTitlebarAppearsTransparent: YES];
+        if !native_window_uses_explicit_control_drag(window) {
+            let _: () = msg_send![window, release];
+            let _: () = msg_send![pool, drain];
+            return Err("AppKit did not preserve transparent full-size window settings");
+        }
+
+        let view: id = msg_send![view_class, alloc];
+        let view: id = msg_send![view, initWithFrame: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(120.0, 80.0),
+        )];
+        if view.is_null() {
+            let _: () = msg_send![window, release];
+            let _: () = msg_send![pool, drain];
+            return Err("AppKit returned a nil selector test view");
+        }
+        let _: () = msg_send![window, setContentView: view];
+        let attached_window: id = msg_send![view, window];
+        if attached_window != window {
+            let _: () = msg_send![view, release];
+            let _: () = msg_send![window, release];
+            let _: () = msg_send![pool, drain];
+            return Err("AppKit did not attach the selector test view");
+        }
+        let _: () = msg_send![view, release];
+        let can_move: BOOL = msg_send![view, mouseDownCanMoveWindow];
+        if can_move != NO {
+            let _: () = msg_send![window, release];
+            let _: () = msg_send![pool, drain];
+            return Err("transparent full-size selector allowed an implicit window move");
+        }
+        let _: () = msg_send![window, release];
+
+        let opaque_style = NSWindowStyleMask::NSTitledWindowMask;
+        let opaque_window = NSWindow::alloc(nil)
+            .initWithContentRect_styleMask_backing_defer_screen_(
+                frame,
+                opaque_style,
+                NSBackingStoreBuffered,
+                NO,
+                nil,
+            );
+        if opaque_window.is_null() {
+            let _: () = msg_send![pool, drain];
+            return Err("AppKit returned a nil opaque test window");
+        }
+        let _: () = msg_send![opaque_window, setTitlebarAppearsTransparent: NO];
+        let opaque_uses_explicit_drag = native_window_uses_explicit_control_drag(opaque_window);
+        let _: () = msg_send![opaque_window, release];
+        let _: () = msg_send![pool, drain];
+
+        if opaque_uses_explicit_drag {
+            return Err("opaque window unexpectedly entered transparent-window dispatch");
+        }
+    }
+
+    Ok(())
 }
 
 extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
