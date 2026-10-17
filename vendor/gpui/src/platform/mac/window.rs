@@ -2089,7 +2089,7 @@ unsafe fn dispatch_window_event(this: &Object, native_event: id, panel: bool) {
                         mouse_position.x,
                         mouse_position.y,
                         native_frame_summary(before),
-                        movable == YES,
+                        native_window_is_movable(native_window),
                     );
                     let _: () = unsafe {
                         msg_send![native_window, performWindowDragWithEvent: native_event]
