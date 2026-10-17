@@ -407,9 +407,14 @@ def archive(transaction_id: str, reason: str, support: Optional[pathlib.Path] = 
         if namespace_history.stat().st_dev != original_identity["device"]:
             raise StateError("historical evidence must remain on the same filesystem")
         slot = namespace_history / transaction_id
-        # A new private slot prevents replacing an existing historical archive.
-        slot.mkdir(mode=0o700)
-        _fsync_dir(namespace_history)
+        # Reuse only an unfinished reservation. Never replace historical custody.
+        _mkdir_owned(slot)
+        if stat.S_IMODE(slot.stat().st_mode) != 0o700:
+            raise StateError("historical reservation is not private; preserve it for review")
+        for entry in slot.iterdir():
+            if entry.name != "archive.json" and not re.fullmatch(r"archive\.json\.[0-9a-f]{32}\.tmp", entry.name):
+                raise StateError("historical slot contains retained custody or unknown evidence")
+            _validate_regular_owned(entry)
         destination = slot / "transaction"
         receipt = {
             "schema": SCHEMA, "transaction": transaction_id, "namespace": namespace,
@@ -421,7 +426,22 @@ def archive(transaction_id: str, reason: str, support: Optional[pathlib.Path] = 
             "current_root_identity": current_identity,
             "restoration_authority": False,
         }
-        _write_record(slot / "archive.json", receipt)
+        receipt_path = slot / "archive.json"
+        if _entry_exists(receipt_path):
+            try:
+                retained_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise StateError("historical reservation receipt is unreadable; preserve it for review") from exc
+            if not isinstance(retained_receipt, dict):
+                raise StateError("historical reservation receipt is malformed")
+            reserved_at = retained_receipt.get("archived_unix_ns")
+            receipt["archived_unix_ns"] = reserved_at
+            if type(reserved_at) is not int or reserved_at <= 0 or retained_receipt != receipt:
+                raise StateError("historical reservation no longer matches the original transaction, root or reason")
+            # Preserve the original decision receipt, including its timestamp and inode.
+        else:
+            # Interrupted temporary receipts stay as evidence; the fresh receipt is atomic.
+            _write_record(receipt_path, receipt)
         if (_identity_if_directory(tx_dir) != transaction_identity
                 or _identity_if_directory(original) != original_identity
                 or _identity_if_directory(root) != current_identity

@@ -37,8 +37,11 @@ preserving its original record, files and identities. It records the reason and
 observed identities separately. It never rebases a legacy device number or grants
 restoration authority; `state restore` and `state recover` no longer select that
 archive. An interrupted operation retains all evidence at the source or its
-deterministic history location; inspect it before retrying. No automatic archival
-is performed during startup or checks.
+deterministic history location. Retry with the same transaction and reason: an
+unfinished private reservation is reused only while the original transaction,
+current root and any committed decision receipt still match. Temporary receipt
+files are retained; existing archived custody or unknown entries refuse the retry.
+No automatic archival is performed during startup or checks.
 
 For the active GPUI fork, use `scripts/gpui-local-ci.sh` on macOS and
 `scripts/install-gpui-local-ci.sh` for its automatic commit hook; see
