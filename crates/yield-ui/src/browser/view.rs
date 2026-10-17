@@ -9,6 +9,10 @@ use gpui::{
     StatefulInteractiveElement, Window, WindowControlArea, canvas, div, font, point, prelude::*,
     px, uniform_list,
 };
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use yield_core::{PlaybackType, SortColumn, SortDirection, format_duration, format_last_played};
 use yield_design::Theme;
@@ -34,6 +38,21 @@ use super::tag_filter;
 use super::volume;
 use super::waveform;
 use super::zero_crossing;
+
+fn trace_toolbar_drag_strip(position: Point<Pixels>) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static LINES: AtomicUsize = AtomicUsize::new(0);
+    if !*ENABLED.get_or_init(|| {
+        std::env::var_os("YIELD_WINDOW_DRAG_TRACE").is_some_and(|value| value == "1")
+    }) || LINES.fetch_add(1, Ordering::Relaxed) >= 32
+    {
+        return;
+    }
+    eprintln!(
+        "[yield-window-drag] toolbar-strip-mouse-down point=({:.1},{:.1}) action=start-window-move",
+        position.x, position.y
+    );
+}
 
 struct RandomNavigationTooltip;
 
@@ -2017,7 +2036,8 @@ impl Render for Browser {
                                 element.h(px(theme.spacing.control_height))
                             })
                             .window_control_area(WindowControlArea::Drag)
-                            .on_mouse_down(MouseButton::Left, |_event, window, _cx| {
+                            .on_mouse_down(MouseButton::Left, |event, window, _cx| {
+                                trace_toolbar_drag_strip(event.position);
                                 window.start_window_move();
                             }),
                     )

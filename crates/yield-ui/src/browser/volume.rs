@@ -5,6 +5,10 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use gpui::{
     Bounds, Context, DragMoveEvent, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point,
@@ -24,6 +28,31 @@ const TRACK_HEIGHT: f32 = 8.0;
 const KEYBOARD_STEP: f32 = 0.05;
 const QUANTIZATION_STEPS: f32 = 1_000.0;
 const MAX_RUNTIME_RETRIES: u8 = 3;
+
+fn trace_volume_drag(stage: &str, position: Option<Point<Pixels>>, bounds: Option<Bounds<Pixels>>) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static LINES: AtomicUsize = AtomicUsize::new(0);
+    if !*ENABLED.get_or_init(|| {
+        std::env::var_os("YIELD_WINDOW_DRAG_TRACE").is_some_and(|value| value == "1")
+    }) || LINES.fetch_add(1, Ordering::Relaxed) >= 128
+    {
+        return;
+    }
+    let position = position.map_or_else(
+        || "none".to_owned(),
+        |position| format!("{:.1},{:.1}", position.x, position.y),
+    );
+    let bounds = bounds.map_or_else(
+        || "none".to_owned(),
+        |bounds| {
+            format!(
+                "{:.1},{:.1},{:.1},{:.1}",
+                bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height
+            )
+        },
+    );
+    eprintln!("[yield-window-drag] volume-{stage} point=({position}) slider-bounds={bounds}");
+}
 
 /// State retained while the pointer owns a volume-slider drag.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -162,7 +191,9 @@ pub(super) fn render_slider(
                     window.prevent_default();
                     cx.stop_propagation();
                     window.focus(&view.volume_focus_handle);
-                    let Some(bounds) = bounds_for_down.borrow().as_ref().copied() else {
+                    let bounds = bounds_for_down.borrow().as_ref().copied();
+                    trace_volume_drag("mouse-down", Some(event.position), bounds);
+                    let Some(bounds) = bounds else {
                         return;
                     };
                     view.begin_volume_drag(event.position, bounds, cx);
@@ -229,6 +260,7 @@ impl Browser {
         bounds: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        trace_volume_drag("begin", Some(position), Some(bounds));
         if !self.preferences_editable() {
             self.mark_preferences_edit_blocked(cx);
             return;
@@ -244,6 +276,7 @@ impl Browser {
         let Some(drag) = self.volume_drag else {
             return;
         };
+        trace_volume_drag("move", Some(position), Some(drag.bounds));
         let Some(value) = volume_for_position(position, drag.bounds) else {
             return;
         };
@@ -254,6 +287,7 @@ impl Browser {
         let Some(drag) = self.volume_drag.take() else {
             return;
         };
+        trace_volume_drag("finish", Some(position), Some(drag.bounds));
         if let Some(value) = volume_for_position(position, drag.bounds) {
             self.set_volume(value, cx);
         }
@@ -268,6 +302,7 @@ impl Browser {
         let Some(drag) = self.volume_drag.take() else {
             return false;
         };
+        trace_volume_drag("cancel", None, Some(drag.bounds));
         cx.stop_active_drag(window);
         if (self.volume - drag.initial).abs() > f32::EPSILON {
             self.set_volume(drag.initial, cx);
