@@ -12,6 +12,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from local_state import (
     StateError,
+    archive,
     clean,
     convert_clean_handoff_to_validator_lease,
     maintenance_locks,
@@ -59,6 +60,55 @@ class LocalStateTests(unittest.TestCase):
             with self.assertRaises(StateError):
                 clean("development", self.support)
         self.assertEqual((self.root / "dirty.marker").read_text(encoding="utf-8"), "retained evidence")
+
+    def test_explicit_archive_preserves_remounted_backup_without_restoration_authority(self) -> None:
+        transaction = str(clean("development", self.support)["transaction"])
+        tx_dir = self.control / "backups" / ".yield-development" / transaction
+        record_path = tx_dir / "transaction.json"
+        record = json.loads(record_path.read_text())
+        record["original_identity"]["device"] += 100
+        record_path.write_text(json.dumps(record))
+        original_record = record_path.read_bytes()
+        original_marker = tx_dir / "original-root" / "dirty.marker"
+        original_marker_identity = original_marker.stat().st_ino
+        self.root.mkdir()
+        (self.root / "current").write_text("current profile")
+        current_identity = self.root.stat().st_ino
+        with self.assertRaisesRegex(StateError, "original filesystem"):
+            restore(transaction, self.support)
+        result = archive(transaction, "Owner chose historical evidence", self.support)
+        destination = pathlib.Path(result["archive"])
+        self.assertFalse(tx_dir.exists())
+        self.assertEqual((destination / "transaction.json").read_bytes(), original_record)
+        marker = destination / "original-root" / "dirty.marker"
+        self.assertEqual(marker.stat().st_ino, original_marker_identity)
+        self.assertEqual(marker.read_text(), "retained evidence")
+        self.assertEqual(self.root.stat().st_ino, current_identity)
+        self.assertEqual((self.root / "current").read_text(), "current profile")
+        self.assertFalse(json.loads(pathlib.Path(result["receipt"]).read_text())["restoration_authority"])
+        with self.assertRaisesRegex(StateError, "unknown or ambiguous"):
+            restore(transaction, self.support)
+        next_transaction = str(clean("development", self.support)["transaction"])
+        restore(next_transaction, self.support)
+        self.assertEqual(self.root.stat().st_ino, current_identity)
+
+    def test_archive_refuses_missing_current_root_live_owner_and_ambiguous_original(self) -> None:
+        transaction = str(clean("development", self.support)["transaction"])
+        with self.assertRaisesRegex(StateError, "distinct current normal root"):
+            archive(transaction, "Historical", self.support)
+        self.root.mkdir()
+        with maintenance_locks(self.control, "development", exclusive=False):
+            with self.assertRaisesRegex(StateError, "live owner"):
+                archive(transaction, "Historical", self.support)
+        tx_dir = self.control / "backups" / ".yield-development" / transaction
+        record_path = tx_dir / "transaction.json"
+        record = json.loads(record_path.read_text())
+        record["original_identity"]["inode"] += 1
+        record_path.write_text(json.dumps(record))
+        with self.assertRaisesRegex(StateError, "inode differs"):
+            archive(transaction, "Historical", self.support)
+        self.assertTrue((tx_dir / "original-root" / "dirty.marker").exists())
+        self.assertFalse((self.control / "history").exists())
 
     def test_validator_lease_allows_successive_admitting_children_and_blocks_reset(self) -> None:
         result, namespace_fd, transition_fd = prepare_clean_launch("development", self.support)

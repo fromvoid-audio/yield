@@ -164,6 +164,7 @@ mod integration {
         let client = owner.client();
         let id = OperationId::new();
         let (record, _) = v5_copy_record(id);
+        let completion_deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut inserted = client.persist_intent(record).unwrap();
         let sequence = inserted
             .recv_timeout(Duration::from_secs(2))
@@ -172,6 +173,25 @@ mod integration {
             .receipt()
             .unwrap()
             .sequence();
+        // The reply precedes command-input Drop. A real readonly control command
+        // executes only after that Drop, without assuming the live owner's retained
+        // resource charges are absent or borrowing ordinary input credit.
+        let mut barrier = client
+            .submit_control(CONTROL_INPUT_BYTES, |input, result| JournalCommand::Get {
+                operation_id: OperationId::new(),
+                input,
+                result,
+            })
+            .unwrap();
+        assert!(
+            barrier
+                .recv_timeout(
+                    completion_deadline.saturating_duration_since(std::time::Instant::now())
+                )
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
         let ordinary = exhausted(&owner.shared, InputClass::Ordinary);
         assert!(matches!(
             client.get(id),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
@@ -366,8 +367,81 @@ def _load_record(control: pathlib.Path, transaction_id: str) -> tuple[pathlib.Pa
     return tx_dir, record_path, record
 
 
+def archive(transaction_id: str, reason: str, support: Optional[pathlib.Path] = None) -> dict[str, object]:
+    """Retain an explicitly superseded reset backup outside active recovery.
+
+    Archival never supplies restoration or volume ownership authority and never
+    rewrites a legacy device identity after a remount.
+    """
+    if not re.fullmatch(r"[0-9a-f]{32}", transaction_id):
+        raise StateError("transaction ID must be a 32-character local transaction ID")
+    if not reason.strip() or len(reason) > 2048:
+        raise StateError("archiving requires a nonempty reason of at most 2048 characters")
+    support = support or canonical_support_dir()
+    control = support / CONTROL_NAME
+    _validate_owned_dir(control)
+    tx_dir, record_path, namespace, record = _locate_transaction(control, transaction_id, archival=True)
+    root = support / NAMESPACES[namespace]
+    with maintenance_locks(control, namespace, exclusive=True):
+        locked_dir, locked_record, locked_namespace, record = _locate_transaction(control, transaction_id, archival=True)
+        if (locked_dir, locked_record, locked_namespace) != (tx_dir, record_path, namespace):
+            raise StateError("transaction identity changed while waiting for maintenance ownership")
+        if record is None or record.get("phase") != "original_parked":
+            raise StateError("only an explicitly superseded parked reset backup can be archived")
+        original = tx_dir / "original-root"
+        original_identity = _identity_if_directory(original)
+        current_identity = _identity_if_directory(root)
+        if current_identity is None or original_identity is None or current_identity == original_identity:
+            raise StateError("archiving requires a distinct current normal root and retained original")
+        if original_identity["inode"] != record["original_identity"]["inode"]:
+            raise StateError("retained original inode differs; preserve it for review")
+        if current_identity["device"] != original_identity["device"]:
+            raise StateError("archive and current root must remain on the same filesystem")
+        _refuse_legacy_profile_owners(root, (original, tx_dir / "clean-root"))
+        transaction_identity = _identity_if_directory(tx_dir)
+        record_bytes = record_path.read_bytes()
+        history = control / "history"
+        _mkdir_owned(history)
+        namespace_history = history / NAMESPACES[namespace]
+        _mkdir_owned(namespace_history)
+        if namespace_history.stat().st_dev != original_identity["device"]:
+            raise StateError("historical evidence must remain on the same filesystem")
+        slot = namespace_history / transaction_id
+        # A new private slot prevents replacing an existing historical archive.
+        slot.mkdir(mode=0o700)
+        _fsync_dir(namespace_history)
+        destination = slot / "transaction"
+        receipt = {
+            "schema": SCHEMA, "transaction": transaction_id, "namespace": namespace,
+            "reason": reason.strip(), "archived_unix_ns": time.time_ns(),
+            "source": str(tx_dir), "destination": str(destination),
+            "record_sha256": hashlib.sha256(record_bytes).hexdigest(),
+            "observed_transaction_identity": transaction_identity,
+            "observed_original_identity": original_identity,
+            "current_root_identity": current_identity,
+            "restoration_authority": False,
+        }
+        _write_record(slot / "archive.json", receipt)
+        if (_identity_if_directory(tx_dir) != transaction_identity
+                or _identity_if_directory(original) != original_identity
+                or _identity_if_directory(root) != current_identity
+                or record_path.read_bytes() != record_bytes):
+            raise StateError("state changed before archival; reserved evidence slot retained")
+        os.rename(tx_dir, destination)
+        _fsync_dir(tx_dir.parent)
+        _fsync_dir(slot)
+        if (_identity_if_directory(destination) != transaction_identity
+                or _identity_if_directory(destination / "original-root") != original_identity
+                or (destination / "transaction.json").read_bytes() != record_bytes
+                or _identity_if_directory(root) != current_identity):
+            raise StateError("archived evidence changed; preserve the historical slot for review")
+        return {"state": "archived", "transaction": transaction_id, "namespace": namespace,
+                "archive": str(destination), "receipt": str(slot / "archive.json"),
+                "note": "Historical evidence only; original records are unchanged and no longer an active restore candidate."}
+
+
 def _locate_transaction(
-    control: pathlib.Path, transaction_id: str
+    control: pathlib.Path, transaction_id: str, *, archival: bool = False
 ) -> tuple[pathlib.Path, pathlib.Path, str, Optional[dict[str, object]]]:
     if not re.fullmatch(r"[0-9a-f]{32}", transaction_id):
         raise StateError("transaction ID must be a 32-character local transaction ID")
@@ -413,7 +487,7 @@ def _locate_transaction(
         isinstance(original_identity.get(key), int) and original_identity[key] >= 0 for key in ("device", "inode")
     ):
         raise StateError("transaction original root identity is malformed")
-    if os.stat(record_path.parent).st_dev != original_identity["device"] or os.stat(expected_root.parent).st_dev != original_identity["device"]:
+    if not archival and (os.stat(record_path.parent).st_dev != original_identity["device"] or os.stat(expected_root.parent).st_dev != original_identity["device"]):
         raise StateError("transaction backup and canonical root are not on the original filesystem")
     return tx_dir, record_path, namespace, record
 
