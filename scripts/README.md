@@ -28,6 +28,18 @@ normal launches retain the newly created state. Restoring the backup brings back
 its original state, including any unresolved ownership or recovery fault. This
 does not reconcile a lost journal or modify metadata beside your audio files.
 
+When the owner explicitly chooses to keep a superseded reset backup only as
+historical evidence, run `scripts/yield-local-ci state archive --transaction
+<transaction-id> --reason '<owner decision>'` after quitting Yield. The current
+normal root must exist and differ from the retained original. This moves the
+whole transaction by same-filesystem rename into `.yield-local-ci/history/`,
+preserving its original record, files and identities. It records the reason and
+observed identities separately. It never rebases a legacy device number or grants
+restoration authority; `state restore` and `state recover` no longer select that
+archive. An interrupted operation retains all evidence at the source or its
+deterministic history location; inspect it before retrying. No automatic archival
+is performed during startup or checks.
+
 For the active GPUI fork, use `scripts/gpui-local-ci.sh` on macOS and
 `scripts/install-gpui-local-ci.sh` for its automatic commit hook; see
 [GPUI local CI](../docs/GPUI_LOCAL_CI.md). Windows and Linux native release qualification
