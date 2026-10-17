@@ -16,10 +16,11 @@ It is subordinate to the product principles and user-visible direction in
 [`docs/TARGET.md`](TARGET.md). Read `docs/TARGET.md` first for product intent, filesystem
 source-of-truth, protected-source policy, no-follow requirements, GUI boundaries, and
 readiness meaning. [`docs/DATABASE_MIGRATIONS.md`](DATABASE_MIGRATIONS.md) remains
-authoritative for schema versions, DDL, compatibility opens, migration tests, and the
-mechanics of shipping a schema change. This document may define a journal or identity
+authoritative for current-format DDL, validation and format changes under the
+[active alpha policy](../AGENTS.md#active-alpha-compatibility-policy); earlier alpha
+compatibility readers and migrations are out of scope. This document may define a journal or identity
 concept without authorizing a schema change; any eventual schema work follows the
-migration contract.
+current-format change contract.
 
 The target covers:
 

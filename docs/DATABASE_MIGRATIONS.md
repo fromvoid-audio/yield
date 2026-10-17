@@ -1,88 +1,66 @@
-# Database Migration Contract
+# Database Format and Change Contract
 
-Yield treats persisted SQLite state as a user-trust surface. Schema changes
-must preserve existing ratings, tags, collection state, curation timestamps,
-file-operation recovery state, analysis status, and cache references wherever
-the old data can be interpreted safely.
+The [active alpha policy](../AGENTS.md#active-alpha-compatibility-policy) is
+authoritative. Breaking source, model, schema and database-format changes are
+allowed until the user explicitly declares release readiness or a compatibility
+commitment. Legacy readers, migrations, historical conversions and tests solely
+for earlier alpha formats are not required, including unpublished branch formats.
+Fresh or recreated alpha databases are acceptable for development. Make format
+rejection and any intentional recreation explicit; do not silently reset user
+state or delete/modify user media. This policy update performs no reset.
+
+This replaces this document's earlier mandatory migration, additive repair,
+backfill, legacy read-only projection and old-row preservation requirements.
+Existing implementations and verification results remain historical facts;
+their existence does not impose future compatibility work. Removing unrelated
+migration code is not part of this policy change.
 
 ## Database Families
 
 - Source databases live in each indexed source folder as `.yield.db`.
-  They own source-local file metadata, tags assigned to files in that source,
-  ratings, curation state, scan status, pending rename records, file-operation
-  recovery state, revision-fenced versioned readiness targets/artifact completions, readiness-owned
-  job metadata, and source-local analysis/cache references.
+  They own source-local metadata, tags, ratings, curation and scan state,
+  pending rename and file-operation recovery state, revision-fenced readiness
+  targets/completions, job metadata and analysis/cache references.
 - The global library database lives under Yield's app config directory as
   `library.db`. It owns configured source references and global analysis/cache
   state that is not source-local.
 
-## Source Database Path Policy
+## Current-Format Correctness
 
-Source-local database writes must stay inside the configured source/database
-root. Writable opens, read-only opens, legacy filename migration, and SQLite
-WAL/SHM sidecar handling must reject symlinked `.yield.db`,
-`.yield_samples.db`, and related sidecar paths before handing the path to
-SQLite or filesystem rename operations. Existing regular DB files and newly
-created DB parents must resolve under the canonical database root.
+Schema changes must update the current base DDL, affected readers/writers and
+meaningful current-format contract tests together. Identify the current format
+explicitly. A version stamp alone does not establish structural validity; validate
+required structure and report unsupported or malformed state explicitly. There
+is no obligation to repair older alpha shapes or keep them readable.
 
-## Required Change Pattern
+Preserve complete promised save/reopen behavior, current-format recovery and
+transaction correctness, ownership boundaries, media references and consistency
+between durable state and UI projection. Do not suppress a safety assertion or
+accept invalid current state merely to avoid a failing test. Intentional format
+breaks do not justify accidental corruption or partial writes.
 
-Every schema change must update these pieces together:
+## Source Database Path and Read-Only Policy
 
-1. Base DDL for newly created databases.
-2. The migration or repair path for existing databases.
-3. The schema contract test for the affected database family.
-4. Compatibility behavior for read-only source opens when UI reads can touch
-   pre-migration source databases.
-5. Focused tests that prove important existing rows keep their data.
+Source-local writes stay inside the configured source/database root. Existing
+and newly created database parents must resolve under the canonical root. Opens,
+any retained legacy filename handling and SQLite WAL/SHM operations reject linked
+database/sidecar paths before SQLite or rename operations.
 
-For source databases, additive columns/tables must be represented in the
-current-stamp repair path. A matching `PRAGMA user_version` is not enough to
-skip structural repairs, because development builds can create current-stamped
-databases that are missing newer additive columns. Current-stamp repairs must be
-low-cost and idempotent.
+Read-only UI/background roles must not mutate databases or apply migrations.
+They may report an unsupported older format; safe-default projections and legacy
+reader fixtures are not required solely for earlier alpha compatibility.
 
-For non-additive or destructive changes, bump the source DB schema version and
-add a fixture-style migration test that starts from the old shape, opens the
-database through `SourceDatabase::open_for_test_fixture_source_write`, and
-verifies both schema shape and data preservation. Prefer additive expansion
-plus backfill over table rebuilds unless the old shape cannot remain valid.
+## Verification
 
-The global library database currently runs idempotent base DDL and additive
-migrations on open. Future non-additive library changes should introduce an
-explicit versioned migration before shipping.
+Choose focused existing checks for the changed current-format behavior. Relevant
+tests currently live in
+`crates/yield-library/src/sample_sources/db/source_db_migration_tests/` and
+`crates/yield-library/src/sample_sources/library/tests.rs`; historical test/module
+names are not compatibility obligations. Adapt affected compatibility-only checks
+when a deliberate format break makes their old assumptions obsolete, preserving
+current-format safety and correctness coverage.
 
-## Read-Only Source Compatibility
-
-`SourceDatabase::open_for_ui_read` and the `UiRead`/`BackgroundRead` roles must
-not apply migrations. Any query reachable
-from a read-only UI or worker path must either:
-
-- project safe defaults for optional columns that may not exist yet, or
-- avoid the feature-specific query when the required table or column is absent.
-
-Do not add direct `SELECT new_column` reads to read-only paths without a legacy
-fixture proving an older `.yield.db` still opens and shows usable metadata.
-
-## Tests
-
-Schema contract tests live in `tests/unit/source_db_migration_tests/` for source
-databases and in `crates/yield-library/src/sample_sources/library/tests.rs`
-for the global library database.
-
-Use these focused checks after persistence changes:
-
-```sh
-cargo test -p yield-library source_db_migration_tests
-cargo test -p yield-library sample_sources::db::read
-cargo test -p yield-library sample_sources::library
-cargo check -p yield-library
-```
-
-Run the broader wrapper lane for release-risk or cross-module persistence work:
-
-```sh
-bash scripts/ci.sh agent
-```
-
-Use the PowerShell equivalent on Windows.
+Use the current [GPUI local validation guidance](GPUI_LOCAL_CI.md) and
+[test map](TEST.md#database-format-validation). Native requirements remain scoped
+to the behavior changed; this document does not reinstate archived CI lanes or
+require a broad native run for a documentation-only policy edit.
