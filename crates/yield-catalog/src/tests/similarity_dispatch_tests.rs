@@ -172,24 +172,26 @@ mod fixtures {
         submit(&service, request, SimilarityCancellation::new());
         // Real retained result, not a preexecution error or fabricated row fixture.
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let ready = service
+        let mut queue = service
+            .events
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        while !queue.events.iter().any(|queued| {
+            matches!(&queued.event,
+                CatalogEvent::SimilarityCompleted { request, .. } if request.generation() == 40)
+        }) {
+            let now = Instant::now();
+            assert!(now < deadline);
+            // Release queue ownership until the real producer publishes its completion.
+            // Keep the event retained so the result-credit assertions still precede delivery.
+            (queue, _) = service
                 .events
-                .queue
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .events
-                .iter()
-                .any(|queued| {
-                    matches!(&queued.event,
-                    CatalogEvent::SimilarityCompleted { request, .. } if request.generation() == 40)
-                });
-            if ready {
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            thread::yield_now();
+                .wake
+                .wait_timeout(queue, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|p| p.into_inner());
         }
+        drop(queue);
         assert_eq!(
             admission_state(&service.admission, |state| state.tag_read_payload_bytes),
             crate::similarity_dispatch::MAX_RESULT_BYTES

@@ -1107,6 +1107,9 @@ def main() -> int:
     restore_cmd.add_argument("--backup", required=True)
     recover_cmd = state_sub.add_parser("recover")
     recover_cmd.add_argument("--transaction", required=True)
+    archive_cmd = state_sub.add_parser("archive", help="retain a superseded reset backup as historical evidence")
+    archive_cmd.add_argument("--transaction", required=True)
+    archive_cmd.add_argument("--reason", required=True)
     args = parser.parse_args()
     try:
         if args.operation == "doctor":
@@ -1132,6 +1135,8 @@ def main() -> int:
                     )
             elif action == "restore":
                 result = local_state.restore(args.backup)
+            elif action == "archive":
+                result = local_state.archive(args.transaction, args.reason)
             else:
                 result = local_state.recover(args.transaction)
             print(json.dumps(result, indent=2))
