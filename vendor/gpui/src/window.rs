@@ -498,6 +498,41 @@ fn window_control_area_at(
         .map(|(area, _)| *area)
 }
 
+#[cfg(target_os = "macos")]
+fn trace_window_control_hit_test(
+    mouse_position: Point<Pixels>,
+    hitboxes: &[(WindowControlArea, Hitbox)],
+    result: Option<WindowControlArea>,
+) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LINES: AtomicUsize = AtomicUsize::new(0);
+    if !*ENABLED.get_or_init(|| {
+        std::env::var_os("YIELD_WINDOW_DRAG_TRACE").is_some_and(|value| value == "1")
+    }) {
+        return;
+    }
+    if LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 256 {
+        return;
+    }
+    let bounds = hitboxes
+        .iter()
+        .map(|(area, hitbox)| {
+            format!(
+                "{area:?}@({:.1},{:.1},{:.1},{:.1})",
+                hitbox.bounds.origin.x,
+                hitbox.bounds.origin.y,
+                hitbox.bounds.size.width,
+                hitbox.bounds.size.height,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[yield-window-drag] gpui-control-hit-test point=({:.1},{:.1}) result={result:?} hitboxes=[{bounds}]",
+        mouse_position.x, mouse_position.y
+    );
+}
+
 /// An identifier for a [Hitbox] which also includes [HitboxBehavior].
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct HitboxId(u64);
@@ -1153,10 +1188,13 @@ impl Window {
                         #[cfg(target_os = "macos")]
                         let mouse_position = window.platform_window.mouse_position();
                         #[cfg(target_os = "macos")]
-                        if let Some(area) = window_control_area_at(
-                            mouse_position,
-                            &window.rendered_frame.window_control_hitboxes,
-                        ) {
+                        let hitboxes = &window.rendered_frame.window_control_hitboxes;
+                        #[cfg(target_os = "macos")]
+                        let result = window_control_area_at(mouse_position, hitboxes);
+                        #[cfg(target_os = "macos")]
+                        trace_window_control_hit_test(mouse_position, hitboxes, result);
+                        #[cfg(target_os = "macos")]
+                        if let Some(area) = result {
                             return Some(area);
                         }
                         #[cfg(not(target_os = "macos"))]
