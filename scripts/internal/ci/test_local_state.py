@@ -8,6 +8,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from local_state import (
@@ -109,6 +110,57 @@ class LocalStateTests(unittest.TestCase):
             archive(transaction, "Historical", self.support)
         self.assertTrue((tx_dir / "original-root" / "dirty.marker").exists())
         self.assertFalse((self.control / "history").exists())
+
+    def test_archive_retries_interrupted_reservation_without_replacing_evidence(self) -> None:
+        for boundary in ("before_receipt", "temporary_receipt", "before_move"):
+            with self.subTest(boundary=boundary):
+                support = self.support / boundary
+                support.mkdir()
+                root, control = namespace_paths("development", support)
+                root.mkdir()
+                (root / "evidence").write_bytes(b"original")
+                transaction = str(clean("development", support)["transaction"])
+                tx = control / "backups" / ".yield-development" / transaction
+                record = (tx / "transaction.json").read_bytes()
+                original_inode = (tx / "original-root" / "evidence").stat().st_ino
+                root.mkdir()
+                current_inode = root.stat().st_ino
+                target = {"before_receipt": "local_state._write_record",
+                          "temporary_receipt": "local_state.os.replace",
+                          "before_move": "local_state.os.rename"}[boundary]
+                with mock.patch(target, side_effect=OSError("interrupted archive")):
+                    with self.assertRaisesRegex(OSError, "interrupted archive"):
+                        archive(transaction, "Retain history", support)
+                slot = control / "history" / ".yield-development" / transaction
+                retained = {p.name: (p.stat().st_ino, p.read_bytes()) for p in slot.iterdir()}
+                self.assertTrue(tx.is_dir())
+                result = archive(transaction, "Retain history", support)
+                destination = pathlib.Path(result["archive"])
+                self.assertFalse(tx.exists())
+                self.assertEqual((destination / "transaction.json").read_bytes(), record)
+                self.assertEqual((destination / "original-root" / "evidence").stat().st_ino, original_inode)
+                self.assertEqual((destination / "original-root" / "evidence").read_bytes(), b"original")
+                self.assertEqual(root.stat().st_ino, current_inode)
+                for name, identity_and_bytes in retained.items():
+                    self.assertEqual(((slot / name).stat().st_ino, (slot / name).read_bytes()), identity_and_bytes)
+
+    def test_archive_retry_refuses_conflicting_receipt_or_occupied_slot(self) -> None:
+        transaction = str(clean("development", self.support)["transaction"])
+        self.root.mkdir()
+        tx = self.control / "backups" / ".yield-development" / transaction
+        with mock.patch("local_state.os.rename", side_effect=OSError("interrupted archive")):
+            with self.assertRaises(OSError):
+                archive(transaction, "Retain history", self.support)
+        slot = self.control / "history" / ".yield-development" / transaction
+        receipt = (slot / "archive.json").read_bytes()
+        with self.assertRaisesRegex(StateError, "no longer matches"):
+            archive(transaction, "Different decision", self.support)
+        (slot / "transaction").mkdir()
+        with self.assertRaisesRegex(StateError, "retained custody or unknown evidence"):
+            archive(transaction, "Retain history", self.support)
+        self.assertTrue(tx.is_dir())
+        self.assertEqual((slot / "archive.json").read_bytes(), receipt)
+        self.assertTrue((tx / "original-root" / "dirty.marker").is_file())
 
     def test_validator_lease_allows_successive_admitting_children_and_blocks_reset(self) -> None:
         result, namespace_fd, transition_fd = prepare_clean_launch("development", self.support)
