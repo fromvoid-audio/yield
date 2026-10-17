@@ -147,7 +147,9 @@ native qualification prerequisites.
   prerequisites remain authoritative. OPT-1634 owns verified filesystem checkpoint bridging;
   missing production bridges cannot be deferred as native tests.
 - OPT-1592 owns restore-family wiring; OPT-1597 owns crashed-phase replay. This decision does
-  not complete either. Family migrations must preserve pending legacy/full recovery rows.
+  not complete either. Current-format pending recovery rows and transaction integrity
+  remain protected. Earlier alpha family migrations/legacy readers are not required
+  under the [active alpha policy](../AGENTS.md#active-alpha-compatibility-policy).
 - Full participant/lifecycle/physical acceptance remains in OPT-1341, OPT-1357, OPT-1670,
   OPT-1473 and their concrete leaves. Native handle/effect qualification retains OPT-1843's
   matrix and scoped platform issues. No unavailable platform is needed to finish this decision.
