@@ -475,6 +475,7 @@ struct MacWindowState {
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
+    requested_movable: bool,
     mouse_gesture_move_state: MouseGestureMoveState,
     fullscreen_restore_bounds: Bounds<Pixels>,
     move_tab_to_new_window_callback: Option<Box<dyn FnMut()>>,
@@ -783,6 +784,7 @@ impl MacWindow {
                 do_command_handled: None,
                 external_files_dragged: false,
                 first_mouse: false,
+                requested_movable: is_movable,
                 mouse_gesture_move_state: MouseGestureMoveState::default(),
                 fullscreen_restore_bounds: Bounds::default(),
                 move_tab_to_new_window_callback: None,
@@ -810,8 +812,6 @@ impl MacWindow {
                 window.set_title(title);
             }
 
-            native_window.setMovable_(is_movable as BOOL);
-
             if let Some(window_min_size) = window_min_size {
                 native_window.setContentMinSize_(NSSize {
                     width: window_min_size.width.to_f64(),
@@ -823,6 +823,7 @@ impl MacWindow {
                 native_window.setTitlebarAppearsTransparent_(YES);
                 native_window.setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleHidden);
             }
+            configure_native_window_idle_movement(native_window, is_movable);
 
             native_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
             native_view.setWantsBestResolutionOpenGLSurface_(YES);
@@ -1887,6 +1888,16 @@ fn native_window_uses_explicit_control_drag(native_window: id) -> bool {
     }
 }
 
+fn configure_native_window_idle_movement(native_window: id, requested_movable: bool) {
+    // WindowServer can begin a titlebar move before sendEvent handles the press.
+    // Keep transparent full-size windows immovable while idle, then enable native
+    // movement only around an explicitly hit-tested toolbar drag.
+    let movable = requested_movable && !native_window_uses_explicit_control_drag(native_window);
+    unsafe {
+        let _: () = msg_send![native_window, setMovable: movable as BOOL];
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeMouseDownAction {
     MoveWindow,
@@ -1918,6 +1929,14 @@ struct MouseGestureMoveState {
 }
 
 impl MouseGestureMoveState {
+    fn begin_explicit_move(&mut self, requested_movable: bool, previous: BOOL) -> bool {
+        if !requested_movable {
+            return false;
+        }
+        self.restore_movable = Some(previous);
+        true
+    }
+
     fn suppress_if_movable(&mut self, movable: BOOL) -> bool {
         if movable == YES {
             self.restore_movable = Some(movable);
@@ -2043,7 +2062,15 @@ unsafe fn dispatch_window_event(this: &Object, native_event: id, panel: bool) {
         match action {
             NativeMouseDownAction::MoveWindow => {
                 let movable: BOOL = unsafe { msg_send![native_window, isMovable] };
-                if movable == YES {
+                let allow_move = {
+                    let mut state = window_state.lock();
+                    let requested = state.requested_movable;
+                    state
+                        .mouse_gesture_move_state
+                        .begin_explicit_move(requested, movable)
+                };
+                if allow_move {
+                    let _: () = unsafe { msg_send![native_window, setMovable: YES] };
                     // This explicit event path works when a transparent full-size titlebar
                     // routes the press through NSThemeFrame instead of GPUIView.
                     let before: NSRect = unsafe { msg_send![native_window, frame] };
@@ -2067,6 +2094,7 @@ unsafe fn dispatch_window_event(this: &Object, native_event: id, panel: bool) {
                     let _: () = unsafe {
                         msg_send![native_window, performWindowDragWithEvent: native_event]
                     };
+                    restore_window_movable(&window_state, native_window);
                     if tracing {
                         EXPLICIT_WINDOW_DRAG_ACTIVE.with(|active| active.set(previous));
                     }
@@ -2236,6 +2264,12 @@ pub(crate) fn run_native_window_selector_probe() -> std::result::Result<(), &'st
             let _: () = msg_send![pool, drain];
             return Err("AppKit did not preserve transparent full-size window settings");
         }
+        configure_native_window_idle_movement(window, true);
+        if native_window_is_movable(window) {
+            let _: () = msg_send![window, release];
+            let _: () = msg_send![pool, drain];
+            return Err("transparent test window permits movement before mouse-down dispatch");
+        }
 
         let view: id = msg_send![view_class, alloc];
         let view: id = msg_send![view, initWithFrame: NSRect::new(
@@ -2278,12 +2312,19 @@ pub(crate) fn run_native_window_selector_probe() -> std::result::Result<(), &'st
             return Err("AppKit returned a nil opaque test window");
         }
         let _: () = msg_send![opaque_window, setTitlebarAppearsTransparent: NO];
+        configure_native_window_idle_movement(opaque_window, true);
+        let opaque_movable = native_window_is_movable(opaque_window);
+        configure_native_window_idle_movement(opaque_window, false);
+        let fixed_opaque_movable = native_window_is_movable(opaque_window);
         let opaque_uses_explicit_drag = native_window_uses_explicit_control_drag(opaque_window);
         let _: () = msg_send![opaque_window, release];
         let _: () = msg_send![pool, drain];
 
         if opaque_uses_explicit_drag {
             return Err("opaque window unexpectedly entered transparent-window dispatch");
+        }
+        if !opaque_movable || fixed_opaque_movable {
+            return Err("opaque window did not preserve requested movability");
         }
     }
 
@@ -3258,6 +3299,12 @@ mod tests {
     #[test]
     fn native_window_mouse_gesture_move_state_restores_once_on_mouse_up_or_key_resign() {
         let mut state = MouseGestureMoveState::default();
+
+        assert!(!state.begin_explicit_move(false, NO));
+        assert_eq!(state.take_restore_value(), None);
+        assert!(state.begin_explicit_move(true, NO));
+        assert_eq!(state.take_restore_value(), Some(NO));
+        assert_eq!(state.take_restore_value(), None);
 
         assert!(!state.suppress_if_movable(NO));
         assert_eq!(state.take_restore_value(), None);

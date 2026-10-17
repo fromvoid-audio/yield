@@ -5253,6 +5253,9 @@ mod native_window_control_tests {
         );
         // A toolbar slider outside the marked strip must remain an ordinary control,
         // including when the pointer is supplied in logical points on a Retina display.
-        assert_eq!(window_control_area_at(point(px(420.), px(40.)), &controls), None);
+        assert_eq!(
+            window_control_area_at(point(px(420.), px(40.)), &controls),
+            None
+        );
     }
 }
