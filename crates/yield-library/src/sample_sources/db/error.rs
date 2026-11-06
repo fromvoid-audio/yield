@@ -208,6 +208,12 @@ pub enum SourceDbError {
     /// SQLite returned an unexpected result.
     #[error("SQLite returned an unexpected result")]
     Unexpected,
+    /// The fourth keep can only lock a current, unlocked Keep 3 row.
+    #[error("Fourth keep requires its own rating update from unlocked Keep 3 for {path}")]
+    KeepAcceptanceConflict {
+        /// Path relative to the source root.
+        path: PathBuf,
+    },
     /// A per-file Curation tag-facts read observed a different source revision.
     #[error("Curation tag facts source revision mismatch: expected {expected}, actual {actual}")]
     CurationTagFactsStaleRevision {

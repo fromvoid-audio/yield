@@ -1,0 +1,791 @@
+#[cfg(test)]
+mod fixtures {
+    use super::super::*;
+    use std::io::{Seek, SeekFrom, Write};
+    use yield_analysis::transients::{DETECTOR_VERSION, STREAM_DETECTOR_VERSION, TransientPreset};
+
+    fn write_attacks(path: &Path, total_frames: u32, attacks: [u32; 2]) {
+        // Standard mono 16-bit PCM at 16 kHz. Sparse silence keeps test
+        // provisioning small while the reader still consumes every frame.
+        let data_bytes = total_frames * 2;
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(b"RIFF").unwrap();
+        file.write_all(&(data_bytes + 36).to_le_bytes()).unwrap();
+        file.write_all(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data")
+            .unwrap();
+        file.write_all(&data_bytes.to_le_bytes()).unwrap();
+        file.set_len(u64::from(data_bytes) + 44).unwrap();
+        for attack in attacks {
+            assert!(attack < total_frames);
+            file.seek(SeekFrom::Start(44 + u64::from(attack) * 2))
+                .unwrap();
+            file.write_all(&24_000_i16.to_le_bytes()).unwrap();
+        }
+    }
+
+    fn setup() -> (Fixture, CatalogService, SourceId, u64) {
+        setup_attacks(16_000, [1237, 9673])
+    }
+
+    fn setup_attacks(
+        total_frames: u32,
+        attacks: [u32; 2],
+    ) -> (Fixture, CatalogService, SourceId, u64) {
+        let fixture = Fixture::new("transient-dispatch");
+        write_attacks(
+            &fixture.root.path().join("attacks.wav"),
+            total_frames,
+            attacks,
+        );
+        let source = SourceId::from_string("transient-dispatch");
+        let service = CatalogService::start(&fixture.guard).unwrap();
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source);
+        (fixture, service, source, snapshot.committed_revision)
+    }
+
+    fn delivery(service: &CatalogService, id: u64) -> CatalogDelivery {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(delivery) = service.recv_delivery_timeout(Duration::from_millis(50))
+                && matches!(&delivery.event, CatalogEvent::TransientMarkersCompleted { request, .. } if request.request_id() == id)
+            {
+                return delivery;
+            }
+            assert!(Instant::now() < deadline, "missing transient completion");
+        }
+    }
+
+    fn request(source: &SourceId, revision: u64, id: u64) -> SourceTransientRequest {
+        SourceTransientRequest::new(
+            source,
+            1,
+            revision,
+            id,
+            Path::new("attacks.wav"),
+            TransientPreset::Normal,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn transient_worker_keeps_catalog_responsive_and_refunds_cancelled_and_busy_requests() {
+        let fixture = Fixture::new("transient-compute-slot");
+        write_attacks(
+            &fixture.root.path().join("attacks.wav"),
+            16_000,
+            [1237, 9673],
+        );
+        let source = SourceId::from_string("transient-compute-slot");
+        let (service, gate) = CatalogService::start_with_test_gate(&fixture.guard).unwrap();
+        let revision =
+            register_and_audit(&service, fixture.root.path(), &source).committed_revision;
+        let (entered_send, entered_recv) = mpsc::sync_channel(1);
+        let (release_send, release_recv) = mpsc::sync_channel(1);
+        *gate.transient_compute.lock().unwrap() = Some((entered_send, release_recv));
+        let cancellation = FeatureAnalysisCancellation::new();
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request(&source, revision, 1),
+                cancellation: cancellation.clone(),
+            })
+            .unwrap();
+        entered_recv.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id: source.clone(),
+                expected_revision: Some(revision),
+            })
+            .unwrap();
+        receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        });
+
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request(&source, revision, 2),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        let digest =
+            SourceContentDigestRequest::new(&source, 1, revision, 3, Path::new("attacks.wav"))
+                .unwrap();
+        service
+            .submit(CatalogCommand::RequestSourceContentDigest {
+                request: digest.clone(),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            receive_until(&service, |event| matches!(event, CatalogEvent::SourceContentDigestFailed { .. })),
+            CatalogEvent::SourceContentDigestFailed {
+                request, error: SourceContentDigestFailure::Busy, ..
+            } if request == digest
+        ));
+        cancellation.cancel();
+        release_send.send(()).unwrap();
+        let CatalogEvent::TransientMarkersCompleted { result, .. } =
+            delivery(&service, 2).into_event_if_live().unwrap()
+        else {
+            panic!("expected waiting request");
+        };
+        assert_eq!(result.unwrap().markers.frames(), [1237, 9673]);
+        wait_for_tag_read_payload(&service, 0);
+        wait_for_tag_page_input_release(&service);
+        service.shutdown();
+    }
+
+    #[test]
+    fn digest_only_enriches_quick_audited_input_without_running_a_detector() {
+        use yield_library::sample_sources::readiness::FEATURE_INPUT_MAX_BYTES;
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 256;
+        let (_fixture, service, source, revision) = setup_attacks(frames, [32_767, frames - 73]);
+        let request =
+            SourceContentDigestRequest::new(&source, 1, revision, 1, Path::new("attacks.wav"))
+                .unwrap();
+        let cancellation = FeatureAnalysisCancellation::new();
+        service
+            .submit(CatalogCommand::RequestSourceContentDigest {
+                request: request.clone(),
+                cancellation: cancellation.clone(),
+            })
+            .unwrap();
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::SourceContentDigestCommitted { .. }
+                    | CatalogEvent::SourceContentDigestFailed { .. }
+            )
+        });
+        let CatalogEvent::SourceContentDigestCommitted {
+            scope,
+            origin,
+            committed_revision,
+            entry,
+        } = event
+        else {
+            panic!("expected digest-only enrichment, got {event:?}");
+        };
+        assert_eq!(&scope, request.scope());
+        assert_eq!(
+            origin,
+            SourceContentDigestOrigin::DigestOnly(request.request_id())
+        );
+        assert_eq!(committed_revision, revision + 1);
+        assert_eq!(entry.relative_path, Path::new("attacks.wav"));
+        assert_eq!(entry.content_hash.as_ref().map(String::len), Some(64));
+        wait_for_tag_read_payload(&service, 0);
+        wait_for_tag_page_input_release(&service);
+        assert!(!matches!(
+            service.try_recv_event(),
+            Ok(CatalogEvent::TransientMarkersCompleted { .. })
+        ));
+        service
+            .submit(CatalogCommand::RequestSourceContentDigest {
+                request: request.clone(),
+                cancellation,
+            })
+            .unwrap();
+        assert!(matches!(
+            receive_until(&service, |event| matches!(event, CatalogEvent::SourceContentDigestFailed { .. })),
+            CatalogEvent::SourceContentDigestFailed { request: rejected, error: SourceContentDigestFailure::StaleSource, .. }
+                if rejected == request
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn retiring_the_source_cancels_a_held_digest_and_refunds_its_credit() {
+        use yield_library::sample_sources::readiness::FEATURE_INPUT_MAX_BYTES;
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 256;
+        let fixture = Fixture::new("digest-only-retirement");
+        let path = Path::new("attacks.wav");
+        write_attacks(
+            &fixture.root.path().join(path),
+            frames,
+            [32_767, frames - 73],
+        );
+        let source = SourceId::from_string("digest-only-retirement");
+        let (service, gate) = CatalogService::start_with_test_gate(&fixture.guard).unwrap();
+        let revision =
+            register_and_audit(&service, fixture.root.path(), &source).committed_revision;
+        let (entered_send, entered_recv) = mpsc::sync_channel(1);
+        let (release_send, release_recv) = mpsc::sync_channel(1);
+        *gate.transient_compute.lock().unwrap() = Some((entered_send, release_recv));
+        let cancellation = FeatureAnalysisCancellation::new();
+        service
+            .submit(CatalogCommand::RequestSourceContentDigest {
+                request: SourceContentDigestRequest::new(&source, 1, revision, 1, path).unwrap(),
+                cancellation: cancellation.clone(),
+            })
+            .unwrap();
+        entered_recv.recv_timeout(Duration::from_secs(2)).unwrap();
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source,
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        assert!(cancellation.is_cancelled());
+        release_send.send(()).unwrap();
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Removed { .. }
+                    | CatalogEvent::SourceContentDigestCommitted { .. }
+                    | CatalogEvent::SourceContentDigestFailed { .. }
+            )
+        });
+        assert!(matches!(event, CatalogEvent::Removed { .. }), "{event:?}");
+        wait_for_tag_read_payload(&service, 0);
+        wait_for_tag_page_input_release(&service);
+        service.shutdown();
+    }
+
+    fn run_request(
+        service: &CatalogService,
+        source: &SourceId,
+        revision: u64,
+        id: u64,
+        preset: TransientPreset,
+    ) -> TransientJobOutcome {
+        let request =
+            SourceTransientRequest::new(source, 1, revision, id, Path::new("attacks.wav"), preset)
+                .unwrap();
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request,
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        let CatalogEvent::TransientMarkersCompleted { result, .. } =
+            delivery(service, id).into_event_if_live().unwrap()
+        else {
+            panic!("expected transient completion");
+        };
+        result.unwrap()
+    }
+
+    #[test]
+    fn transient_cache_hits_after_reopen_and_misses_for_a_new_preset() {
+        let (fixture, service, source, revision) = setup();
+        let first = run_request(&service, &source, revision, 1, TransientPreset::Normal);
+        assert_eq!(first.cache, TransientCacheUse::MissStored);
+        assert_eq!(first.detector_version, DETECTOR_VERSION);
+        assert_eq!(first.markers.frames(), [1237, 9673]);
+        service.shutdown();
+
+        let reopened = CatalogService::start(&fixture.guard).unwrap();
+        let snapshot = register_and_audit(&reopened, fixture.root.path(), &source);
+        let same = run_request(
+            &reopened,
+            &source,
+            snapshot.committed_revision,
+            2,
+            TransientPreset::Normal,
+        );
+        assert_eq!(same.cache, TransientCacheUse::Hit);
+        assert_eq!(same.markers.frames(), first.markers.frames());
+        let high = run_request(
+            &reopened,
+            &source,
+            snapshot.committed_revision,
+            3,
+            TransientPreset::High,
+        );
+        assert_eq!(high.cache, TransientCacheUse::MissStored);
+        assert_eq!(high.markers.preset(), TransientPreset::High);
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn transient_stream_routes_and_reuses_a_wav_above_the_encoded_limit() {
+        let frames =
+            (yield_library::sample_sources::readiness::FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        let attacks = [32_767, 3_500_073];
+        let (fixture, service, source, _) = setup_attacks(frames, attacks);
+        service.shutdown();
+        // Quick audit defers this file's digest. Complete the existing targeted
+        // scanner hash under the same profile before reopening the Catalog.
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source),
+        )
+        .unwrap();
+        yield_scan::complete_pending_deep_hash_for_path(&database, Path::new("attacks.wav"), None)
+            .unwrap();
+        drop(database);
+        let service = CatalogService::start(&fixture.guard).unwrap();
+        let revision =
+            register_and_audit(&service, fixture.root.path(), &source).committed_revision;
+        let first = run_request(&service, &source, revision, 1, TransientPreset::Normal);
+        assert_eq!(first.cache, TransientCacheUse::MissStored);
+        assert_eq!(first.detector_version, STREAM_DETECTOR_VERSION);
+        assert_eq!(first.markers.source_frames(), frames);
+        assert_eq!(first.markers.frames(), attacks);
+        let cached = run_request(&service, &source, revision, 2, TransientPreset::Normal);
+        assert_eq!(cached.cache, TransientCacheUse::Hit);
+        assert_eq!(cached.detector_version, STREAM_DETECTOR_VERSION);
+        assert_eq!(cached.markers.frames(), attacks);
+        service.shutdown();
+    }
+
+    #[test]
+    fn transient_stream_reports_a_pending_quick_audit_digest() {
+        use yield_library::sample_sources::readiness::{
+            FEATURE_INPUT_MAX_BYTES, SourceFeatureInputError,
+        };
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        let (_fixture, service, source, revision) = setup_attacks(frames, [32_767, 3_500_073]);
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request(&source, revision, 1),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            delivery(&service, 1).into_event_if_live(),
+            Some(CatalogEvent::TransientMarkersCompleted {
+                result: Err(TransientRequestFailure::Input(
+                    SourceFeatureInputError::ContentPending
+                )),
+                ..
+            })
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn transient_request_enriches_only_the_selected_pending_file_and_retries() {
+        use yield_library::sample_sources::readiness::FEATURE_INPUT_MAX_BYTES;
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        let attacks = [32_767, 3_500_073];
+        let fixture = Fixture::new("transient-digest-retry");
+        write_attacks(&fixture.root.path().join("attacks.wav"), frames, attacks);
+        write_attacks(&fixture.root.path().join("other.wav"), frames, attacks);
+        let service = CatalogService::start(&fixture.guard).unwrap();
+        let source = SourceId::from_string("transient-digest-retry");
+        let before = register_and_audit(&service, fixture.root.path(), &source);
+        assert_eq!(before.manifest.len(), 2);
+        assert!(
+            before
+                .manifest
+                .iter()
+                .all(|entry| entry.content_hash.is_none())
+        );
+        let request = request(&source, before.committed_revision, 1).with_pending_digest();
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request.clone(),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        let CatalogEvent::SourceContentDigestCommitted {
+            scope,
+            origin,
+            committed_revision,
+            entry,
+        } = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SourceContentDigestCommitted { .. })
+        })
+        else {
+            unreachable!()
+        };
+        assert!(request.matches_digest_scope(&scope));
+        assert_eq!(
+            origin,
+            SourceContentDigestOrigin::Transients(request.request_id())
+        );
+        assert_eq!(committed_revision, before.committed_revision + 1);
+        assert_eq!(entry.relative_path, Path::new("attacks.wav"));
+        assert!(entry.content_hash.is_some());
+        let CatalogEvent::TransientMarkersCompleted {
+            request: observed,
+            result,
+            ..
+        } = delivery(&service, 1).into_event_if_live().unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(observed, request);
+        let result = result.unwrap();
+        assert_eq!(result.cache, TransientCacheUse::MissStored);
+        assert_eq!(result.detector_version, STREAM_DETECTOR_VERSION);
+        assert_eq!(result.markers.frames(), attacks);
+
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id: source.clone(),
+                expected_revision: Some(committed_revision),
+            })
+            .unwrap();
+        let CatalogEvent::SnapshotReady { snapshot: after } = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        }) else {
+            unreachable!()
+        };
+        assert_eq!(after.manifest, [entry, before.manifest[1].clone()]);
+        assert_eq!(after.directory_generation, before.directory_generation);
+        assert_eq!(
+            run_request(
+                &service,
+                &source,
+                committed_revision,
+                2,
+                TransientPreset::Normal
+            )
+            .cache,
+            TransientCacheUse::Hit,
+        );
+        wait_for_tag_read_payload(&service, 0);
+        service.shutdown();
+    }
+
+    #[test]
+    fn transient_request_discards_a_deferred_digest_after_the_file_is_replaced() {
+        use yield_library::sample_sources::readiness::{
+            FEATURE_INPUT_MAX_BYTES, SourceFeatureInputError,
+        };
+        let fixture = Fixture::new("transient-digest-replaced");
+        let file = fixture.root.path().join("attacks.wav");
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        write_attacks(&file, frames, [32_767, 3_500_073]);
+        let (service, gate) = CatalogService::start_with_test_gate(&fixture.guard).unwrap();
+        let source = SourceId::from_string("transient-digest-replaced");
+        let before = register_and_audit(&service, fixture.root.path(), &source);
+        let (entered_send, entered_recv) = mpsc::sync_channel(1);
+        let (release_send, release_recv) = mpsc::sync_channel(1);
+        *gate.transient_compute.lock().unwrap() = Some((entered_send, release_recv));
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request(&source, before.committed_revision, 1).with_pending_digest(),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        entered_recv.recv_timeout(Duration::from_secs(2)).unwrap();
+        fs::rename(&file, file.with_extension("old")).unwrap();
+        write_attacks(&file, frames, [20_000, 3_500_073]);
+        release_send.send(()).unwrap();
+        assert!(matches!(
+            service
+                .recv_delivery_timeout(Duration::from_secs(2))
+                .unwrap()
+                .into_event_if_live(),
+            Some(CatalogEvent::TransientMarkersCompleted {
+                result: Err(TransientRequestFailure::Input(
+                    SourceFeatureInputError::Changed
+                )),
+                ..
+            }),
+        ));
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id: source,
+                expected_revision: Some(before.committed_revision),
+            })
+            .unwrap();
+        let CatalogEvent::SnapshotReady { snapshot: after } = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        }) else {
+            unreachable!()
+        };
+        assert_eq!(after.manifest, before.manifest);
+        wait_for_tag_read_payload(&service, 0);
+        service.shutdown();
+    }
+
+    #[test]
+    fn pending_source_digest_captures_all_bytes_and_rejects_retired_custody() {
+        use yield_library::sample_sources::readiness::{
+            FEATURE_INPUT_MAX_BYTES, SourceFeatureInputError,
+        };
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        let (fixture, service, source, _) = setup_attacks(frames, [32_767, 3_500_073]);
+        service.shutdown();
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source),
+        )
+        .unwrap();
+        let writer = SourceWriter::new(database, source.clone(), 2).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let path = RootRelativePath::try_from_path("attacks.wav".into()).unwrap();
+        let media = fixture.root.path().join(path.as_path());
+        let cancelled = writer
+            .prepare_pending_content_digest(&revision, &path)
+            .unwrap();
+        assert!(matches!(
+            cancelled.compute(&AtomicBool::new(true)),
+            Err(SourceFeatureInputError::Cancelled)
+        ));
+
+        let input = writer
+            .prepare_pending_content_digest(&revision, &path)
+            .unwrap();
+        let proof = thread::spawn(move || input.compute(&AtomicBool::new(false)))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.relative_path(), &path);
+        assert_eq!(
+            proof.digest(),
+            blake3::hash(&fs::read(&media).unwrap()).to_hex().as_str()
+        );
+        writer.validate_pending_content_digest(&proof).unwrap();
+
+        let displaced = media.with_extension("old");
+        fs::rename(&media, &displaced).unwrap();
+        fs::copy(&displaced, &media).unwrap();
+        assert!(writer.validate_pending_content_digest(&proof).is_err());
+        let replacement = SourceWriter::new(writer.into_catalog_database(), source, 3).unwrap();
+        assert!(matches!(
+            replacement.validate_pending_content_digest(&proof),
+            Err(SourceWriterError::StaleFence)
+        ));
+        assert!(matches!(
+            replacement.commit_pending_content_digest(proof, &AtomicBool::new(false)),
+            Err(SourceWriterError::StaleFence)
+        ));
+    }
+
+    #[test]
+    fn pending_source_digest_commit_preserves_the_authoritative_audit_on_reopen() {
+        use yield_library::sample_sources::db::SourceDirectoryTruthState;
+        use yield_library::sample_sources::readiness::{
+            FEATURE_INPUT_MAX_BYTES, SourceFeatureInputError,
+        };
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        let (fixture, service, source, _) = setup_attacks(frames, [32_767, 3_500_073]);
+        service.shutdown();
+        let open = || {
+            SourceDatabase::open_for_catalog_with_profile_guard(
+                fixture.root.path(),
+                &fixture.guard,
+                catalog_profile_child(&source),
+            )
+            .unwrap()
+        };
+        let writer = SourceWriter::new(open(), source.clone(), 2).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let original_generation = writer
+            .catalog_database()
+            .source_directory_truth_state()
+            .unwrap()
+            .active_generation()
+            .unwrap();
+        let original_metadata = writer
+            .catalog_database()
+            .browser_metadata_snapshot()
+            .unwrap();
+        let path = RootRelativePath::try_from_path("attacks.wav".into()).unwrap();
+        let proof = || {
+            writer
+                .prepare_pending_content_digest(&revision, &path)
+                .unwrap()
+                .compute(&AtomicBool::new(false))
+                .unwrap()
+        };
+        assert!(matches!(
+            writer.commit_pending_content_digest(proof(), &AtomicBool::new(true)),
+            Err(SourceWriterError::FeatureInput(
+                SourceFeatureInputError::Cancelled
+            ))
+        ));
+        assert_eq!(writer.current_revision().unwrap(), revision);
+        let stale = proof();
+        let (committed, entry) = writer
+            .commit_pending_content_digest(proof(), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(committed.revision(), revision.revision() + 1);
+        assert_eq!(writer.current_revision().unwrap(), committed);
+        assert!(matches!(
+            writer.commit_pending_content_digest(stale, &AtomicBool::new(false)),
+            Err(SourceWriterError::StaleRevision { .. })
+        ));
+        drop(writer);
+
+        let reopened = SourceWriter::new(open(), source.clone(), 3).unwrap();
+        let current = reopened.current_revision().unwrap();
+        assert_eq!(current.revision(), committed.revision());
+        assert_eq!(
+            reopened
+                .catalog_database()
+                .source_directory_truth_state()
+                .unwrap(),
+            SourceDirectoryTruthState::Active {
+                generation: original_generation,
+                published_source_revision: current.revision(),
+            },
+        );
+        assert_eq!(
+            reopened
+                .catalog_database()
+                .browser_metadata_snapshot()
+                .unwrap()
+                .files,
+            original_metadata.files,
+        );
+        let (actual_revision, entries) = reopened
+            .catalog_database()
+            .manifest_snapshot_with_revision_for_exact_paths(std::slice::from_ref(&path))
+            .unwrap();
+        assert_eq!(actual_revision, current.revision());
+        assert_eq!(entries, [entry]);
+        reopened
+            .prepare_transient_stream_input(&current, &path)
+            .unwrap();
+    }
+
+    #[test]
+    fn transient_stream_falls_back_when_small_encoded_input_exceeds_the_pcm_limit() {
+        let attacks = [32_768, 1_950_073];
+        let (_fixture, service, source, revision) = setup_attacks(2_000_200, attacks);
+        let result = run_request(&service, &source, revision, 1, TransientPreset::Normal);
+        assert_eq!(result.detector_version, STREAM_DETECTOR_VERSION);
+        assert_eq!(result.markers.frames(), attacks);
+        service.shutdown();
+    }
+
+    #[test]
+    fn transient_cache_recomputes_after_audited_content_changes() {
+        let (fixture, service, source, revision) = setup();
+        let first = run_request(&service, &source, revision, 1, TransientPreset::Normal);
+        assert_eq!(first.cache, TransientCacheUse::MissStored);
+        let file = fixture.root.path().join("attacks.wav");
+        write_attacks(&file, 17_000, [2041, 10_779]);
+        let new_bytes = fs::read(&file).unwrap();
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id: source.clone(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        let CatalogEvent::AuditCommitted { snapshot } = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::AuditCommitted { .. })
+        }) else {
+            unreachable!();
+        };
+        assert!(snapshot.committed_revision > revision);
+        let result = run_request(
+            &service,
+            &source,
+            snapshot.committed_revision,
+            2,
+            TransientPreset::Normal,
+        );
+        assert_eq!(result.cache, TransientCacheUse::MissStored);
+        assert_eq!(result.markers.frames(), [2041, 10_779]);
+        assert_eq!(fs::read(&file).unwrap(), new_bytes);
+        service.shutdown();
+    }
+
+    #[test]
+    fn transient_dispatch_returns_exact_frames_and_refunds_payload_credit() {
+        let (_fixture, service, source, revision) = setup();
+        let request = request(&source, revision, 1);
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request.clone(),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        wait_for_tag_read_payload(&service, transient_dispatch::MAX_RESULT_BYTES);
+        let CatalogEvent::TransientMarkersCompleted {
+            request: delivered,
+            result,
+            ..
+        } = delivery(&service, 1).into_event_if_live().unwrap()
+        else {
+            panic!("expected transient completion");
+        };
+        assert_eq!(delivered, request);
+        assert_eq!(result.unwrap().markers.frames(), [1237, 9673]);
+        wait_for_tag_read_payload(&service, 0);
+        wait_for_tag_page_input_release(&service);
+        service.shutdown();
+    }
+
+    #[test]
+    fn transient_dispatch_refuses_stale_cancelled_and_retired_results() {
+        let (_fixture, service, source, revision) = setup();
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request(&source, revision + 1, 1),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            delivery(&service, 1).into_event_if_live(),
+            Some(CatalogEvent::TransientMarkersCompleted {
+                result: Err(TransientRequestFailure::StaleSource),
+                ..
+            })
+        ));
+
+        let cancellation = FeatureAnalysisCancellation::new();
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request(&source, revision, 2),
+                cancellation: cancellation.clone(),
+            })
+            .unwrap();
+        let completed = delivery(&service, 2);
+        assert!(matches!(
+            &completed.event,
+            CatalogEvent::TransientMarkersCompleted { result: Ok(_), .. }
+        ));
+        cancellation.cancel();
+        assert!(completed.into_event_if_live().is_none());
+
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request(&source, revision, 3),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        let completed = delivery(&service, 3);
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source,
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        let retirement = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Removed { .. }
+                    | CatalogEvent::Failed {
+                        operation: CatalogOperation::Remove,
+                        ..
+                    }
+            )
+        });
+        assert!(
+            matches!(retirement, CatalogEvent::Removed { .. }),
+            "{retirement:?}"
+        );
+        assert!(completed.into_event_if_live().is_none());
+        wait_for_tag_read_payload(&service, 0);
+        service.shutdown();
+    }
+
+    #[test]
+    fn transient_dispatch_rejects_invalid_path_and_request_id_at_construction() {
+        let source = SourceId::from_string("source");
+        for (id, path) in [(1, "../escape.wav"), (0, "attacks.wav")] {
+            assert_eq!(
+                SourceTransientRequest::new(
+                    &source,
+                    1,
+                    1,
+                    id,
+                    Path::new(path),
+                    TransientPreset::Normal,
+                ),
+                Err(TransientRequestFailure::InvalidInput),
+            );
+        }
+    }
+}

@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use gpui::{
     App, AppContext, BorrowAppContext, Bounds, ClickEvent, Context, FocusHandle, Focusable,
-    KeyDownEvent, PathPromptOptions, Pixels, ScrollHandle, ScrollStrategy, Task,
+    KeyDownEvent, KeyUpEvent, PathPromptOptions, Pixels, ScrollHandle, ScrollStrategy, Task,
     UniformListScrollHandle, Window,
 };
 use reson::{PlaybackRequestId, PlaybackRuntime};
@@ -30,7 +30,9 @@ use yield_library::sample_sources::{SampleSource, SourceId, SourceRole};
 use yield_media::{
     WaveformPreview, enumerate_audio_files_with_cancel, load_waveform_preview_with_cancel,
 };
-use yield_session::{CatalogStatus, PreferencePatch, RegistryRevision, RequestId};
+use yield_session::{
+    CatalogStatus, PreferencePatch, RegistryRevision, RequestId, SourcePlaymarkTempo,
+};
 
 use crate::beat_count_input::{BeatCountChanged, BeatCountInput, DEFAULT_BEAT_COUNT};
 use crate::search_input::{SearchChanged, SearchInput, SearchInputOptions, SearchInputRejected};
@@ -84,6 +86,8 @@ mod accessibility {
 }
 mod analysis;
 mod audio_output;
+mod bpm_snap_entry;
+mod bpm_snap_persistence;
 mod catalog;
 mod catalog_metadata;
 mod collection_rename;
@@ -105,8 +109,10 @@ mod handoff;
 mod harvest_filter;
 mod history;
 mod job_details;
+mod link_settings;
 mod metadata_panel;
 mod metronome;
+mod metronome_settings;
 mod motion;
 mod normalized_audition;
 mod os_entry;
@@ -114,6 +120,8 @@ mod panel_focus;
 mod panel_resize;
 mod playback_age;
 mod played_ranges;
+mod playmark_resize;
+mod playmark_tempo;
 mod playmark_timing;
 mod preferences;
 mod random_audition;
@@ -123,6 +131,8 @@ mod shortcut_help;
 mod sidebar;
 mod similar_sections;
 mod similarity_list;
+mod source_digest;
+mod source_drop;
 mod source_recovery;
 mod source_registry;
 mod status_log;
@@ -133,6 +143,7 @@ mod tag_filter;
 mod tag_library;
 mod tag_pager;
 mod tags;
+mod tempo_audition;
 mod transient_markers;
 mod transport;
 mod unsupported_entries;
@@ -393,6 +404,7 @@ pub(crate) struct Browser {
     similarity_list: similarity_list::SimilarityListState,
     transient_markers: transient_markers::TransientMarkersState,
     bpm_snap_enabled: bool,
+    bpm_snap_entry: bpm_snap_entry::BpmSnapEntry,
     beat_guides_enabled: bool,
     beat_guide_count: u8,
     random_audition_sticky: bool,
@@ -414,14 +426,21 @@ pub(crate) struct Browser {
     preferred_metadata_height: Option<f32>,
     preferred_collections_height: Option<f32>,
     pane_resize_drag: Option<view::PaneResizeDrag>,
-    pane_resize_activation: Option<gpui::Subscription>,
+    window_activation_subscription: Option<gpui::Subscription>,
     pane_resize_environment_subscriptions: Vec<gpui::Subscription>,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
+    waveform_play_grid: Option<yield_core::SnappedPlaymark>,
+    playmark_tempo: playmark_tempo::PlaymarkTempoState,
+    source_digest_requests: source_digest::SourceDigestRequests,
+    playmark_resize_anchor: Option<playmark_resize::ResizeAnchor>,
+    held_playmark_slide: Option<waveform::WaveformRegionSlide>,
+    playmark_slide_blur_subscription: Option<gpui::Subscription>,
     waveform_edit_region: Option<WaveformEditRegion>,
     waveform_edit_settings: WaveformEditSettings,
     waveform_fade_hover: Option<waveform_fades::WaveformEditFadeHit>,
     waveform_region_drag: Option<waveform::WaveformRegionDrag>,
+    playmark_tempo_audition: Option<transport::PlaymarkTempoAudition>,
     waveform_pan_drag: Option<waveform::WaveformPanDrag>,
     waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
     played_ranges: played_ranges::PlayedRanges,
@@ -465,6 +484,8 @@ pub(crate) struct Browser {
     waveform_last_play_start: Option<f32>,
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_task: Option<Task<()>>,
+    external_source_drop_task: Option<Task<()>>,
+    external_source_drop_batch: Option<source_drop::SourceDropBatch>,
     source_registry_task: Option<Task<()>>,
     preferences_task: Option<Task<()>>,
     source_registry_loaded: bool,
@@ -523,6 +544,8 @@ pub(crate) struct Browser {
     theme_task: Option<Task<()>>,
     theme_settings_open: bool,
     general_settings: general_settings::GeneralSettings,
+    metronome_settings: metronome_settings::State,
+    link_settings: link_settings::State,
     audio_settings_open: bool,
     shortcut_help: shortcut_help::ShortcutHelpState,
     unsupported_entries: unsupported_entries::UnsupportedEntriesState,
@@ -557,6 +580,7 @@ pub(crate) struct Browser {
     playback_monitor_generation: u64,
     playback_monitor_running: bool,
     playback: Option<PlaybackRuntime>,
+    tempo_audition: tempo_audition::State,
     file_drag: file_drag::FileDragState,
     directory_open: directory_open::DirectoryOpenState,
     handoff_task: Option<Task<()>>,
@@ -612,6 +636,7 @@ impl Browser {
                 window,
                 cx,
                 browser.job_details_focus_handle.clone(),
+                browser.metronome_settings.focus_handles(),
             );
             browser
         };
@@ -638,6 +663,7 @@ impl Browser {
             });
         let playmark_timing_input =
             cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::playmark_timing()));
+        let bpm_snap_entry = bpm_snap_entry::BpmSnapEntry::new(cx);
         let playmark_timing_subscription = cx.subscribe(
             &playmark_timing_input,
             |view, _input, _: &SearchChanged, cx| {
@@ -661,8 +687,14 @@ impl Browser {
         let beat_count_subscription = cx.subscribe(
             &beat_count_input,
             |view, _input, event: &BeatCountChanged, cx| {
+                if view.waveform.is_some() && view.beat_guide_count != event.count {
+                    view.playmark_tempo.preserve_local_edit();
+                    view.waveform_play_grid = None;
+                }
                 view.beat_guide_count = event.count;
-                view.apply_metronome_count_change(event.count, cx);
+                if event.committed {
+                    view.apply_metronome_count_change(event.count, cx);
+                }
                 cx.notify();
             },
         );
@@ -754,6 +786,7 @@ impl Browser {
             similarity_list: similarity_list::SimilarityListState::default(),
             transient_markers: transient_markers::TransientMarkersState::default(),
             bpm_snap_enabled: false,
+            bpm_snap_entry,
             beat_guides_enabled: false,
             beat_guide_count: DEFAULT_BEAT_COUNT,
             random_audition_sticky: false,
@@ -775,14 +808,21 @@ impl Browser {
             preferred_metadata_height: None,
             preferred_collections_height: None,
             pane_resize_drag: None,
-            pane_resize_activation: None,
+            window_activation_subscription: None,
             pane_resize_environment_subscriptions: Vec::new(),
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
+            waveform_play_grid: None,
+            playmark_tempo: playmark_tempo::PlaymarkTempoState::default(),
+            source_digest_requests: source_digest::SourceDigestRequests::default(),
+            playmark_resize_anchor: None,
+            held_playmark_slide: None,
+            playmark_slide_blur_subscription: None,
             waveform_edit_region: None,
             waveform_edit_settings: waveform::default_edit_settings(),
             waveform_fade_hover: None,
             waveform_region_drag: None,
+            playmark_tempo_audition: None,
             waveform_pan_drag: None,
             waveform_scrollbar_drag: None,
             played_ranges: played_ranges::PlayedRanges::default(),
@@ -826,6 +866,8 @@ impl Browser {
             waveform_last_play_start: None,
             scan_cancel: None,
             scan_task: None,
+            external_source_drop_task: None,
+            external_source_drop_batch: None,
             source_registry_task: None,
             preferences_task: None,
             source_registry_loaded: false,
@@ -890,6 +932,8 @@ impl Browser {
             theme_task: None,
             theme_settings_open: false,
             general_settings: general_settings::GeneralSettings::default(),
+            metronome_settings: metronome_settings::State::new(cx),
+            link_settings: link_settings::State::new(cx),
             audio_settings_open: false,
             shortcut_help: shortcut_help::ShortcutHelpState::new(cx),
             unsupported_entries: unsupported_entries::UnsupportedEntriesState::new(cx),
@@ -924,6 +968,7 @@ impl Browser {
             playback_monitor_generation: 0,
             playback_monitor_running: false,
             playback: None,
+            tempo_audition: tempo_audition::State::new(cx),
             file_drag: file_drag::FileDragState::default(),
             directory_open: directory_open::DirectoryOpenState::default(),
             handoff_task: None,
@@ -984,12 +1029,14 @@ impl Browser {
         let Some(core_region) = region.core() else {
             return false;
         };
-        let Some(original_text) = playmark_selection_label(
-            core_region,
-            preview.total_frames,
-            preview.sample_rate,
-            self.beat_guides_enabled.then_some(self.beat_guide_count),
-        ) else {
+        let Some(original_text) = self.painted_tempo_label().or_else(|| {
+            playmark_selection_label(
+                core_region,
+                preview.total_frames,
+                preview.sample_rate,
+                self.beat_guides_enabled.then_some(self.beat_guide_count),
+            )
+        }) else {
             return false;
         };
         self.playmark_timing_editor = Some(PlaymarkTimingEditorState {
@@ -1016,6 +1063,9 @@ impl Browser {
     }
 
     fn theme_changed_inputs(&self, cx: &mut Context<Self>) {
+        self.bpm_snap_entry
+            .input
+            .update(cx, |input, cx| input.theme_changed(cx));
         self.search_input
             .update(cx, |input, cx| input.theme_changed(cx));
         self.playmark_timing_input
@@ -1061,8 +1111,8 @@ impl Browser {
             self.beat_guide_count,
             current,
         );
-        let (start_frame, end_frame) = match parsed {
-            Ok(range) => range,
+        let timing = match parsed {
+            Ok(timing) => timing,
             Err(error) => {
                 if let Some(editor) = self.playmark_timing_editor.as_mut() {
                     editor.error = Some(error.clone());
@@ -1074,8 +1124,9 @@ impl Browser {
                 return;
             }
         };
+        let (start_frame, end_frame) = timing.frame_range;
         if playmark_timing::frame_range_for_region(editor.region, preview.total_frames)
-            == Some((start_frame, end_frame))
+            == Some(timing.frame_range)
         {
             self.cancel_playmark_timing_edit();
             if restore_focus {
@@ -1092,18 +1143,44 @@ impl Browser {
             self.cancel_playmark_timing_edit();
             return;
         };
-        let path = editor.path.clone();
+        let tempo = timing
+            .authored_tempo
+            .then(|| {
+                SourcePlaymarkTempo::new(
+                    start_frame as u64,
+                    end_frame as u64,
+                    preview.total_frames as u64,
+                    preview.sample_rate,
+                    self.beat_guide_count,
+                )
+            })
+            .flatten();
         self.cancel_playmark_timing_edit();
+        if let Some(tempo) = tempo
+            && playmark_tempo::save_authored_tempo(self, tempo, cx)
+        {
+            if restore_focus {
+                window.focus(&self.waveform_focus_handle);
+            }
+            cx.notify();
+            return;
+        }
         self.set_waveform_play_region(Some(region));
         similar_sections::invalidate_if_stale(self);
-        match self.submit_playmark_timing_span(&path, region, cx) {
-            Some(Ok(())) => {
-                self.set_playback_status("Playmark timing applying to playback".to_string());
+        if timing.authored_tempo {
+            self.retarget_authored_playmark_tempo(region, self.beat_guide_count, cx);
+        } else {
+            match self.submit_playmark_timing_span(&editor.path, region, cx) {
+                Some(Ok(())) => {
+                    self.set_playback_status("Playmark timing applying to playback".to_string());
+                }
+                Some(Err(error)) => {
+                    self.set_playback_status(format!(
+                        "Playmark timing update unavailable: {error}"
+                    ));
+                }
+                None => {}
             }
-            Some(Err(error)) => {
-                self.set_playback_status(format!("Playmark timing update unavailable: {error}"));
-            }
-            None => {}
         }
         if restore_focus {
             window.focus(&self.waveform_focus_handle);
@@ -1438,9 +1515,18 @@ impl Browser {
                 }
                 view.scan_cancel = None;
                 match result {
+                    Ok(scan) if !view.dropped_scan_root_matches(generation, &scan.root) => {
+                        view.apply_scan_error(
+                            source_index,
+                            scan_root,
+                            "The dropped folder changed before scanning".into(),
+                            cx,
+                        );
+                    }
                     Ok(scan) => view.apply_scan_result(scan, source_index, cx),
                     Err(error) => view.apply_scan_error(source_index, scan_root, error, cx),
                 }
+                view.advance_external_source_drop(cx);
                 cx.notify();
             });
         }));
@@ -2167,6 +2253,8 @@ impl Browser {
                 match result {
                     Ok(preview) => {
                         view.waveform = Some(preview);
+                        playmark_tempo::load_for_waveform(view, cx);
+                        bpm_snap_persistence::load_for_waveform(view, cx);
                         transient_markers::schedule(view, cx);
                     }
                     Err(error) => {
@@ -2812,6 +2900,19 @@ impl Browser {
         cx.notify();
     }
 
+    fn release_playmark_slide(&mut self, event: &KeyUpEvent) {
+        let released = waveform::waveform_region_navigation_key(
+            &event.keystroke.key,
+            false,
+            false,
+            false,
+            false,
+        );
+        if self.held_playmark_slide == released {
+            self.held_playmark_slide = None;
+        }
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -2819,6 +2920,13 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+        let waveform_has_keys = self.waveform_focus_handle.is_focused(window)
+            && !self.theme_settings_open
+            && !self.audio_settings_open
+            && self.context_menu.is_none();
+        if !waveform_has_keys || self.waveform.is_none() || key == "escape" {
+            self.held_playmark_slide = None;
+        }
         if self.handle_unsupported_key(event, window, cx) {
             return;
         }
@@ -2929,6 +3037,14 @@ impl Browser {
             cx.stop_propagation();
             return;
         }
+        if !secondary
+            && !alt
+            && !function
+            && self.handle_metronome_settings_key(key, shift, event.is_held, window, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         if self.theme_settings_open && key == "escape" {
             self.close_general_settings(window, cx);
             cx.stop_propagation();
@@ -2938,7 +3054,7 @@ impl Browser {
         if !secondary
             && !alt
             && !function
-            && self.handle_settings_accessibility_key(key, shift, window, cx)
+            && self.handle_settings_accessibility_key(key, shift, event.is_held, window, cx)
         {
             cx.stop_propagation();
             return;
@@ -3057,6 +3173,9 @@ impl Browser {
             }
             return;
         }
+        if bpm_snap_entry::handle_key_down(self, event, window, cx) {
+            return;
+        }
         if key.eq_ignore_ascii_case("f") && secondary {
             self.invalidate_file_handoff();
             window.focus(&self.search_input.read(cx).focus_handle());
@@ -3129,13 +3248,27 @@ impl Browser {
                         .waveform_viewport
                         .is_effectively_equal(WaveformViewport::full())
                 {
-                    if self.reset_waveform_viewport() {
+                    if self.reset_waveform_viewport(cx) {
                         cx.notify();
                     }
                 } else {
                     self.toggle_focused_selection(cx);
                 }
             }
+            return;
+        }
+        if self.handle_playmark_resize_key(event, window, cx) {
+            return;
+        }
+        if waveform_has_keys
+            && secondary
+            && !alt
+            && !function
+            && !event.is_held
+            && key.eq_ignore_ascii_case("z")
+            && playmark_tempo::move_history(self, shift, cx)
+        {
+            cx.stop_propagation();
             return;
         }
         if self.waveform_focus_handle.is_focused(window)
@@ -3156,43 +3289,16 @@ impl Browser {
                 return;
             }
             if !shift && !alt && key.eq_ignore_ascii_case("z") {
-                if self.zoom_waveform_to_selection() {
+                if self.zoom_waveform_to_selection(cx) {
                     cx.notify();
                 }
                 return;
             }
-            if let Some(direction) =
-                waveform::waveform_region_navigation_key(key, secondary, shift, alt, function)
+            if waveform_has_keys
+                && let Some(direction) =
+                    waveform::waveform_region_navigation_key(key, secondary, shift, alt, function)
             {
-                let canceled = self.cancel_waveform_gestures(window, cx);
-                let moved = self.slide_waveform_region(direction);
-                if moved {
-                    if direction.is_fine() {
-                        if let (Some(path), Some(region)) = (
-                            self.selected
-                                .and_then(|index| self.entries.get(index))
-                                .map(|entry| entry.path.clone()),
-                            self.waveform_play_region,
-                        ) {
-                            match self.submit_playmark_timing_span(&path, region, cx) {
-                                Some(Ok(())) => {
-                                    self.playback_status =
-                                        "Fine selection nudge applying to playback".to_string();
-                                }
-                                Some(Err(error)) => {
-                                    self.playback_status =
-                                        format!("Fine selection nudge unavailable: {error}");
-                                }
-                                None => {}
-                            }
-                        }
-                    } else {
-                        zero_crossing::schedule_for_committed_region(self, cx);
-                    }
-                }
-                if moved || canceled {
-                    cx.notify();
-                }
+                self.handle_playmark_slide(direction, event.is_held, window, cx);
                 return;
             }
         }
@@ -3306,6 +3412,10 @@ impl Browser {
                 }
             }
             "escape" => {
+                if self.cancel_tempo_playmark_drag(window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 self.cancel_column_gesture(cx);
                 self.cancel_file_drag_with_window(window, cx);
                 self.cancel_waveform_region_drag(window, cx);

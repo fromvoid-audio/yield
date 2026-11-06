@@ -92,7 +92,10 @@ pub fn waveform_edit_intent(
             .map_err(|_| WaveformEditIntentAdapterError::FrameRangeOutOfRange)?,
     )?;
     let operation = operation_args(request.operation)?;
-    let output = WaveformOutputSpec::float32(source_spec.channels(), source_spec.sample_rate());
+    let output = WaveformOutputSpec::float32(
+        operation.output_channels(source_spec.channels())?,
+        source_spec.sample_rate(),
+    );
     let args = WaveformEditIntentArgs::new(
         source,
         file_revision(&request.context.file_revision)?,
@@ -213,6 +216,7 @@ fn operation_args(
         WavEditOperation::Mute => WaveformEditOperationArgs::Mute,
         WavEditOperation::Trim => WaveformEditOperationArgs::Trim,
         WavEditOperation::Crop => WaveformEditOperationArgs::Crop,
+        WavEditOperation::ConvertToMono => WaveformEditOperationArgs::ConvertToMono,
         WavEditOperation::Slide { frame_offset } => {
             WaveformEditOperationArgs::Slide { frame_offset }
         }
@@ -260,6 +264,7 @@ fn core_operation(
         WaveformEditOperationArgs::Mute => WavEditOperation::Mute,
         WaveformEditOperationArgs::Trim => WavEditOperation::Trim,
         WaveformEditOperationArgs::Crop => WavEditOperation::Crop,
+        WaveformEditOperationArgs::ConvertToMono => WavEditOperation::ConvertToMono,
         WaveformEditOperationArgs::Slide { frame_offset } => {
             WavEditOperation::Slide { frame_offset }
         }
@@ -395,7 +400,7 @@ mod tests {
         (endpoint, participants, context)
     }
 
-    fn requests() -> [WavEditPreparationRequest; 7] {
+    fn requests() -> [WavEditPreparationRequest; 8] {
         let (_, _, context) = fixture();
         let fade = WaveformEditFade::from_exact(-0.0, 0.25, -0.0, 0.75).expect("exact fade");
         let settings =
@@ -447,17 +452,29 @@ mod tests {
             )
             .expect("crop request"),
             WavEditPreparationRequest::with_slide(context.clone(), -3).expect("slide request"),
+            WavEditPreparationRequest::with_mono_conversion(context.clone())
+                .expect("mono conversion request"),
             WavEditPreparationRequest::with_padded_crop(context, -2, 12)
                 .expect("padded crop request"),
         ]
     }
 
     #[test]
-    fn all_seven_operations_round_trip_without_path_derivation() {
+    fn all_operations_round_trip_without_path_derivation() {
         let (endpoint, participants, context) = fixture();
         for request in requests() {
             let args = waveform_edit_intent(endpoint.clone(), &participants, &request)
                 .expect("intent adapts");
+            assert_eq!(args.source_spec().channels(), 2);
+            assert_eq!(
+                args.output().channels(),
+                if request.operation == WavEditOperation::ConvertToMono {
+                    1
+                } else {
+                    2
+                }
+            );
+            assert_eq!(args.output().sample_rate(), context.spec.sample_rate);
             let displayed = format!("{args:?}");
             assert!(!displayed.contains("should-not-be-persisted"));
             assert!(!displayed.contains("private/marker"));

@@ -1,7 +1,11 @@
 mod dispatcher;
+#[cfg(all(target_os = "linux", any(feature = "wayland", feature = "x11")))]
+mod file_clipboard;
 mod headless;
 mod keyboard;
 mod platform;
+#[cfg(any(feature = "wayland", feature = "x11"))]
+mod reveal_portal;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 mod text_system;
 #[cfg(feature = "wayland")]

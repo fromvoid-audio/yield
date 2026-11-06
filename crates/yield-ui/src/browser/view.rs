@@ -134,6 +134,7 @@ const MAX_WAVEFORM_HEIGHT: f32 = 512.0;
 const MIN_MAIN_PANE_WIDTH: f32 = 240.0;
 const MIN_LIST_ROWS: f32 = 4.0;
 const PANE_RESIZE_RAIL: f32 = 6.0;
+const WIDE_TOOLBAR_WIDTH: f32 = 1_440.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PaneAxis {
@@ -200,18 +201,42 @@ fn browser_toolbar_gap(window_width: f32, theme: &Theme) -> f32 {
     }
 }
 
-fn browser_toolbar_height(window_width: f32, theme: &Theme, enlarged: bool) -> f32 {
-    if !enlarged {
-        return theme.spacing.toolbar_height;
+fn browser_toolbar_row_count(window_width: f32, enlarged: bool, has_waveform: bool) -> u8 {
+    if enlarged {
+        if has_waveform && window_width < crate::WINDOW_WIDTH {
+            3
+        } else {
+            2
+        }
+    } else if (has_waveform && window_width < WIDE_TOOLBAR_WIDTH)
+        || window_width < crate::WINDOW_WIDTH
+    {
+        2
+    } else {
+        1
     }
-    let rows = 2.0;
-    theme.spacing.control_height * rows
-        + browser_toolbar_gap(window_width, theme) * (rows - 1.0)
-        + theme.spacing.panel_padding * 2.0
 }
 
-fn browser_status_bar_height(theme: &Theme, enlarged: bool) -> f32 {
-    theme.spacing.status_height * if enlarged { 2.0 } else { 1.0 }
+fn browser_toolbar_height(
+    window_width: f32,
+    theme: &Theme,
+    enlarged: bool,
+    has_waveform: bool,
+) -> f32 {
+    let rows = browser_toolbar_row_count(window_width, enlarged, has_waveform);
+    if rows == 1 {
+        return theme.spacing.toolbar_height;
+    }
+    let rows = f32::from(rows);
+    let edge_space = if enlarged {
+        theme.spacing.panel_padding * 2.0
+    } else {
+        theme.spacing.border_width * 2.0
+    };
+    (theme.spacing.control_height * rows
+        + browser_toolbar_gap(window_width, theme) * (rows - 1.0)
+        + edge_space)
+        .max(theme.spacing.toolbar_height)
 }
 
 fn waveform_height(
@@ -219,7 +244,7 @@ fn waveform_height(
     window_height: f32,
     theme: &Theme,
     toolbar_height: f32,
-    status_height: f32,
+    enlarged: bool,
 ) -> f32 {
     let minimum = MIN_WAVEFORM_HEIGHT.max(
         theme.waveform.title_height
@@ -229,16 +254,25 @@ fn waveform_height(
     );
     let maximum = (window_height
         - toolbar_height
-        - status_height
+        - theme.spacing.status_height
         - theme.spacing.row_height * MIN_LIST_ROWS
         - PANE_RESIZE_RAIL)
         .max(minimum)
         .min(MAX_WAVEFORM_HEIGHT.max(minimum));
-    bounded_size(
-        preferred.unwrap_or(theme.spacing.waveform_height),
-        minimum,
-        maximum,
-    )
+    let requested = preferred.unwrap_or_else(|| {
+        if enlarged {
+            return theme.spacing.waveform_height;
+        }
+        // At the minimum window, give the list one complete row plus the space
+        // needed by the wrapped toolbar. Ease back to the authored default as it grows.
+        let compact_fraction = ((crate::WINDOW_HEIGHT - window_height)
+            / (crate::WINDOW_HEIGHT - crate::MIN_WINDOW_HEIGHT))
+            .clamp(0.0, 1.0);
+        let toolbar_wrap_height = (toolbar_height - theme.spacing.toolbar_height).max(0.0);
+        theme.spacing.waveform_height
+            - compact_fraction * (theme.spacing.row_height + toolbar_wrap_height)
+    });
+    bounded_size(requested, minimum, maximum)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -593,25 +627,25 @@ impl Browser {
                 ),
                 self.preferred_filter_height,
             ),
-            PaneAxis::Waveform => (
-                waveform_height(
+            PaneAxis::Waveform => {
+                let enlarged = self.general_settings.text_scale_percent
+                    == yield_session::ENLARGED_TEXT_SCALE_PERCENT;
+                (
+                    waveform_height(
+                        self.preferred_waveform_height,
+                        f32::from(window.bounds().size.height),
+                        theme,
+                        browser_toolbar_height(
+                            f32::from(window.bounds().size.width),
+                            theme,
+                            enlarged,
+                            self.waveform.is_some(),
+                        ),
+                        enlarged,
+                    ),
                     self.preferred_waveform_height,
-                    f32::from(window.bounds().size.height),
-                    theme,
-                    browser_toolbar_height(
-                        f32::from(window.bounds().size.width),
-                        theme,
-                        self.general_settings.text_scale_percent
-                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
-                    ),
-                    browser_status_bar_height(
-                        theme,
-                        self.general_settings.text_scale_percent
-                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
-                    ),
-                ),
-                self.preferred_waveform_height,
-            ),
+                )
+            }
         };
         self.pane_resize_drag = Some(PaneResizeDrag {
             axis,
@@ -679,6 +713,8 @@ impl Browser {
             }
             PaneAxis::Waveform => {
                 let requested = drag.gesture.requested_size(f32::from(position.y));
+                let enlarged = self.general_settings.text_scale_percent
+                    == yield_session::ENLARGED_TEXT_SCALE_PERCENT;
                 self.preferred_waveform_height = Some(waveform_height(
                     Some(requested),
                     f32::from(window.bounds().size.height),
@@ -686,14 +722,10 @@ impl Browser {
                     browser_toolbar_height(
                         f32::from(window.bounds().size.width),
                         theme,
-                        self.general_settings.text_scale_percent
-                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
+                        enlarged,
+                        self.waveform.is_some(),
                     ),
-                    browser_status_bar_height(
-                        theme,
-                        self.general_settings.text_scale_percent
-                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
-                    ),
+                    enlarged,
                 ));
             }
         }
@@ -745,11 +777,12 @@ impl Browser {
                 cx.on_focus_out(&focus, window, |view, _, _, cx| view.cancel_pane_resize(cx)),
             ];
         }
-        if self.pane_resize_activation.is_none() {
-            self.pane_resize_activation =
+        if self.window_activation_subscription.is_none() {
+            self.window_activation_subscription =
                 Some(cx.observe_window_activation(window, |view, window, cx| {
                     if !window.is_window_active() {
                         view.cancel_pane_resize(cx);
+                        view.held_playmark_slide = None;
                     }
                 }));
         }
@@ -1462,8 +1495,18 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        super::bpm_snap_entry::sync_input(self, window, cx);
         super::harvest_filter::invalidate_if_stale(self, cx);
         self.reconcile_pane_resize(window, cx);
+        if self.playmark_slide_blur_subscription.is_none() {
+            self.playmark_slide_blur_subscription =
+                Some(
+                    cx.on_blur(&self.waveform_focus_handle, window, |view, window, cx| {
+                        view.held_playmark_slide = None;
+                        view.cancel_tempo_playmark_drag(window, cx);
+                    }),
+                );
+        }
         self.reconcile_shipped_visual_effect(window, cx);
         self.refresh_user_shader_review_token();
         #[cfg(target_os = "macos")]
@@ -1490,8 +1533,13 @@ impl Render for Browser {
             self.preferred_waveform_height,
             f32::from(window.bounds().size.height),
             &theme,
-            browser_toolbar_height(f32::from(window.bounds().size.width), &theme, enlarged_text),
-            browser_status_bar_height(&theme, enlarged_text),
+            browser_toolbar_height(
+                f32::from(window.bounds().size.width),
+                &theme,
+                enlarged_text,
+                self.waveform.is_some(),
+            ),
+            enlarged_text,
         );
         let motion_frame = self.motion_frame(theme.motion, window);
         let jobs = super::job_details::snapshot(self, cx);
@@ -1558,9 +1606,18 @@ impl Render for Browser {
         let toolbar_hover = theme.interaction.hover_fill;
         let toolbar_pressed = theme.interaction.pressed_fill;
         let toolbar_gap = browser_toolbar_gap(f32::from(window.bounds().size.width), &theme);
-        let toolbar_height =
-            browser_toolbar_height(f32::from(window.bounds().size.width), &theme, enlarged_text);
-        let status_bar_height = browser_status_bar_height(&theme, enlarged_text);
+        let toolbar_height = browser_toolbar_height(
+            f32::from(window.bounds().size.width),
+            &theme,
+            enlarged_text,
+            self.waveform.is_some(),
+        );
+        let wrap_toolbar = browser_toolbar_row_count(
+            f32::from(window.bounds().size.width),
+            enlarged_text,
+            self.waveform.is_some(),
+        ) > 1;
+        let status_bar_height = theme.spacing.status_height;
         let loop_enabled = self.loop_toolbar_enabled();
         let loop_label = self.loop_toolbar_label();
         let bpm_snap_enabled = self.bpm_snap_enabled;
@@ -1934,10 +1991,14 @@ impl Render for Browser {
             .text_size(px(theme.typography.body_size))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_key_up(cx.listener(|view, event, _, _| view.release_playmark_slide(event)))
             .on_action(cx.listener(Self::open_unsupported_action))
             .on_action(cx.listener(Self::close_unsupported_action))
             .on_action(cx.listener(Self::inspect_unsupported_action))
-            .capture_any_mouse_down(cx.listener(Self::cancel_file_drag_from_mouse_down))
+            .capture_any_mouse_down(cx.listener(|view, event, window, cx| {
+                view.held_playmark_slide = None;
+                view.cancel_file_drag_from_mouse_down(event, window, cx);
+            }))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
                 view.update_column_gesture(
                     f32::from(event.position.x),
@@ -1946,7 +2007,7 @@ impl Render for Browser {
                     cx,
                 );
                 let region_changed =
-                    view.update_waveform_region_drag(event.position, event.pressed_button);
+                    view.update_waveform_region_drag(event.position, event.pressed_button, cx);
                 if region_changed
                     && view
                         .waveform_region_drag
@@ -2017,7 +2078,7 @@ impl Render for Browser {
                     .flex_none()
                     .items_center()
                     .h(px(toolbar_height))
-                    .when(enlarged_text, |element| {
+                    .when(wrap_toolbar, |element| {
                         element.flex_wrap().content_start()
                     })
                     .gap(px(toolbar_gap))
@@ -2032,7 +2093,7 @@ impl Render for Browser {
                                 - theme.spacing.panel_padding)
                                 .max(0.0)))
                             .h_full()
-                            .when(enlarged_text, |element| {
+                            .when(wrap_toolbar, |element| {
                                 element.h(px(theme.spacing.control_height))
                             })
                             .window_control_area(WindowControlArea::Drag)
@@ -2227,6 +2288,16 @@ impl Render for Browser {
                             .on_click(cx.listener(Self::toggle_bpm_snap_from_toolbar))
                             .child(waveform::render_bpm_snap_icon(bpm_snap_color)),
                     )
+                    .when(self.waveform.is_some(), |toolbar| {
+                        toolbar.child(
+                            div()
+                                .id("bpm-snap-tempo-toolbar")
+                                .debug_selector(|| "bpm-snap-tempo-toolbar".into())
+                                .flex_none()
+                                .w(px(if enlarged_text { 110.0 } else { 66.0 }))
+                                .child(self.bpm_snap_entry.input.clone()),
+                        )
+                    })
                     .child(
                         div()
                             .id("zero-crossing-toolbar")
@@ -2315,6 +2386,42 @@ impl Render for Browser {
                             .text_color(transient_markers_color)
                             .child("I"),
                     )
+                    .when(self.waveform.is_some(), |toolbar| {
+                        toolbar.child(
+                            div()
+                                .id("transient-sensitivity-toolbar")
+                                .debug_selector(|| "transient-sensitivity-toolbar".into())
+                                .relative()
+                                .when_some(
+                                    self.ax_focus("transport-transient-sensitivity"),
+                                    |element, focus| element.track_focus(&focus),
+                                )
+                                .when_some(
+                                    self.ax_marker("transport-transient-sensitivity"),
+                                    |element, marker| element.child(marker),
+                                )
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(32.0))
+                                .h(px(theme.spacing.control_height))
+                                .cursor_pointer()
+                                .bg(color(theme.colors.surface_overlay))
+                                .border(px(theme.spacing.border_width))
+                                .border_color(color(theme.colors.border_emphasis))
+                                .hover(move |style| style.bg(color(toolbar_hover)))
+                                .active(move |style| style.bg(color(toolbar_pressed)))
+                                .when(self.hover_help_visible(), |control| {
+                                    control.tooltip(super::transient_markers::sensitivity_tooltip)
+                                })
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    super::transient_markers::cycle_sensitivity(view, cx);
+                                }))
+                                .text_size(px(theme.typography.small_size))
+                                .child(self.transient_markers.sensitivity_short_label()),
+                        )
+                    })
                     .child(
                         div()
                             .id("bpm-beat-count-toolbar")
@@ -2986,6 +3093,10 @@ impl Render for Browser {
             })
     }
 }
+
+#[cfg(test)]
+#[path = "density_layout_tests.rs"]
+mod density_layout_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3938,6 +4049,86 @@ mod tests {
     }
 
     #[gpui::test]
+    fn playmark_slide_repeat_is_owned_by_the_last_arrow_and_current_focus(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let initial = waveform::WaveformPlayRegion::new(0.05, 0.15).unwrap();
+        install_playmark_state(
+            &browser,
+            cx,
+            Path::new("/tmp/inert-playmark-slide-test.wav"),
+            initial,
+        );
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            browser.update(app, |view, _| {
+                view.waveform.as_mut().unwrap().total_frames = 100;
+                window.focus(&view.waveform_focus_handle);
+            });
+        });
+        cx.refresh().unwrap();
+        let press = |cx: &mut VisualTestContext, key, is_held| {
+            cx.simulate_event(KeyDownEvent {
+                keystroke: Keystroke::parse(key).unwrap(),
+                is_held,
+            });
+        };
+        let bounds = |cx: &VisualTestContext| {
+            cx.cx.read(|app| {
+                browser
+                    .read(app)
+                    .waveform_play_region
+                    .and_then(|region| region.frame_bounds(100))
+            })
+        };
+
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((5, 15)));
+        press(cx, "right", false);
+        assert_eq!(bounds(cx), Some((15, 25)));
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((25, 35)));
+        press(cx, "left", false);
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((15, 25)));
+        press(cx, "left", true);
+        assert_eq!(bounds(cx), Some((5, 15)));
+        press(cx, "left", true);
+        assert_eq!(bounds(cx), Some((5, 15)));
+
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: Keystroke::parse("left").unwrap(),
+        });
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((5, 15)));
+
+        press(cx, "right", false);
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: Keystroke::parse("right").unwrap(),
+        });
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((15, 25)));
+
+        press(cx, "right", false);
+        cx.update(|window, app| window.focus(&browser.read(app).focus_handle));
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        cx.update(|window, app| window.focus(&browser.read(app).waveform_focus_handle));
+        cx.refresh().unwrap();
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((25, 35)));
+
+        press(cx, "right", false);
+        browser.update(cx, |view, _| {
+            view.invalidate_waveform_generation();
+            view.set_waveform_play_region(Some(initial));
+        });
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((5, 15)));
+    }
+
+    #[gpui::test]
     fn playmark_timing_duration_and_bpm_commit_update_stopped_selection(cx: &mut TestAppContext) {
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
@@ -4396,6 +4587,7 @@ mod tests {
         browser.update(&mut cx, |view, cx| {
             view.general_settings.text_scale_percent = 200;
             let root = PathBuf::from("/tmp/opt1880-enlarged-layout");
+            view.waveform = Some(inert_preview());
             view.root = Some(root.clone());
             view.entries = vec![AudioFile {
                 path: root.join("selectable.wav"),
@@ -4416,6 +4608,7 @@ mod tests {
         let status = cx.debug_bounds("main-status-bar").expect("status bounds");
         let mut escaped_controls = Vec::new();
         for selector in [
+            "bpm-snap-tempo-toolbar",
             "browser-search-toolbar",
             "browser-name-filter-toggle",
             "source-root-label",
@@ -4455,9 +4648,15 @@ mod tests {
             status.bottom() <= px(560.0),
             "footer escaped the window: {status:?}"
         );
+        let status_details = cx
+            .debug_bounds("status-job-details")
+            .expect("status details action");
         assert!(
-            status.size.height > px(60.0),
-            "footer did not reserve wrapped text: {status:?}"
+            status_details.left() >= status.left()
+                && status_details.right() <= status.right()
+                && status_details.top() >= status.top()
+                && status_details.bottom() <= status.bottom(),
+            "status details {status_details:?} escaped {status:?}"
         );
 
         let viewport = cx
@@ -5182,7 +5381,7 @@ mod tests {
                 1_200.0,
                 &theme,
                 theme.spacing.toolbar_height,
-                theme.spacing.status_height,
+                false,
             ),
             512.0
         );
@@ -5192,7 +5391,7 @@ mod tests {
                 560.0,
                 &theme,
                 theme.spacing.toolbar_height,
-                theme.spacing.status_height,
+                false,
             ) < 512.0
         );
         assert_eq!(
@@ -5201,7 +5400,7 @@ mod tests {
                 1_200.0,
                 &theme,
                 theme.spacing.toolbar_height,
-                theme.spacing.status_height,
+                false,
             ),
             512.0
         );
@@ -5215,9 +5414,41 @@ mod tests {
                 Some(94.0),
                 560.0,
                 &enlarged,
-                browser_toolbar_height(960.0, &enlarged, true),
-                browser_status_bar_height(&enlarged, true),
+                browser_toolbar_height(960.0, &enlarged, true, false),
+                true,
             ) >= minimum
+        );
+    }
+
+    #[test]
+    fn compact_waveform_default_releases_space_and_preserves_an_explicit_size() {
+        let theme = Theme::default();
+        let compact_toolbar = browser_toolbar_height(960.0, &theme, false, true);
+        let compact = waveform_height(
+            None,
+            crate::MIN_WINDOW_HEIGHT,
+            &theme,
+            compact_toolbar,
+            false,
+        );
+        let reclaimed = theme.spacing.waveform_height - compact;
+        assert_eq!(
+            reclaimed,
+            theme.spacing.row_height + compact_toolbar - theme.spacing.toolbar_height
+        );
+        assert_eq!(
+            waveform_height(
+                Some(theme.spacing.waveform_height),
+                crate::MIN_WINDOW_HEIGHT,
+                &theme,
+                compact_toolbar,
+                false,
+            ),
+            theme.spacing.waveform_height
+        );
+        assert_eq!(
+            waveform_height(None, crate::WINDOW_HEIGHT, &theme, compact_toolbar, false),
+            theme.spacing.waveform_height
         );
     }
 

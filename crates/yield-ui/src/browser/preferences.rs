@@ -412,6 +412,11 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
         PreferencePatch::SetAudioOutput(audio_output) => {
             preferences.audio_output = audio_output.clone();
         }
+        PreferencePatch::SetMetronome(metronome) => {
+            if metronome.validate().is_ok() {
+                preferences.metronome = *metronome;
+            }
+        }
         PreferencePatch::SetCollectionName { slot, name } => {
             if let Some(current) = preferences.collection_names.get_mut(*slot) {
                 *current = Some(name.clone());
@@ -617,6 +622,7 @@ impl Browser {
             self.apply_loop_mode_change(self.playback_policy.enabled(), cx);
         }
         self.apply_preference_volume(effective.output_volume);
+        self.apply_metronome_preferences(effective.metronome);
         self.apply_preference_audio_output(
             &effective.audio_output,
             self.preferences.has_pending_reset(),
@@ -907,6 +913,30 @@ mod tests {
         assert!(state.has_pending());
         state.mark_persisted_for_test(1);
         assert!(!state.has_pending());
+    }
+
+    #[test]
+    fn metronome_projection_preserves_order_across_a_failed_newer_patch() {
+        use yield_session::{MetronomePreferences, MetronomeSoundPreference};
+
+        let mut state = PreferenceState::new();
+        let first = MetronomePreferences {
+            volume: 0.32,
+            beats: false,
+            ..MetronomePreferences::default()
+        };
+        let second = MetronomePreferences {
+            sound: MetronomeSoundPreference::Rimshot,
+            offbeats: false,
+            ..first
+        };
+        state.queue_for_test(1, PreferencePatch::SetMetronome(first));
+        state.queue_for_test(2, PreferencePatch::SetMetronome(second));
+        assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
+        assert_eq!(state.effective().metronome, second);
+        assert_eq!(state.effective().output_volume, 1.0);
+        assert!(state.fail_request_number(2, "refused".to_owned()).is_some());
+        assert_eq!(state.effective().metronome, first);
     }
 
     #[test]

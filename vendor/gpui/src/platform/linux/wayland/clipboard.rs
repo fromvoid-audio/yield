@@ -1,11 +1,10 @@
 use std::{
-    fs::File,
     io::{ErrorKind, Write},
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
 };
 
 use calloop::{LoopHandle, PostAction};
-use filedescriptor::Pipe;
+use filedescriptor::{FileDescriptor, Pipe};
 use strum::IntoEnumIterator;
 use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
@@ -161,6 +160,12 @@ impl Clipboard {
         self.contents = Some(item);
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn set_file_selection(&mut self) {
+        self.contents = None;
+        self.cached_read = None;
+    }
+
     pub fn set_primary(&mut self, item: ClipboardItem) {
         self.primary_contents = Some(item);
     }
@@ -231,32 +236,36 @@ impl Clipboard {
         Some(item)
     }
 
-    fn send_internal(&self, fd: OwnedFd, bytes: Vec<u8>) {
+    pub(super) fn send_internal(&self, fd: OwnedFd, bytes: impl AsRef<[u8]> + 'static) {
+        let mut file = FileDescriptor::new(fd);
+        if let Err(error) = file.set_non_blocking(true) {
+            log::error!("Could not make Wayland clipboard pipe nonblocking: {error}");
+            return;
+        }
         let mut written = 0;
-        self.loop_handle
-            .insert_source(
-                calloop::generic::Generic::new(
-                    File::from(fd),
-                    calloop::Interest::WRITE,
-                    calloop::Mode::Level,
-                ),
-                move |_, file, _| {
-                    let mut file = unsafe { file.get_mut() };
-                    loop {
-                        match file.write(&bytes[written..]) {
-                            Ok(n) if written + n == bytes.len() => {
-                                written += n;
-                                break Ok(PostAction::Remove);
-                            }
-                            Ok(n) => written += n,
-                            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                                break Ok(PostAction::Continue);
-                            }
-                            Err(_) => break Ok(PostAction::Remove),
+        if let Err(error) = self.loop_handle.insert_source(
+            calloop::generic::Generic::new(file, calloop::Interest::WRITE, calloop::Mode::Level),
+            move |_, file, _| {
+                let mut file = unsafe { file.get_mut() };
+                let bytes = bytes.as_ref();
+                loop {
+                    match file.write(&bytes[written..]) {
+                        Ok(n) if written + n == bytes.len() => {
+                            written += n;
+                            break Ok(PostAction::Remove);
                         }
+                        Ok(0) => break Ok(PostAction::Remove),
+                        Ok(n) => written += n,
+                        Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            break Ok(PostAction::Continue);
+                        }
+                        Err(_) => break Ok(PostAction::Remove),
                     }
-                },
-            )
-            .unwrap();
+                }
+            },
+        ) {
+            log::error!("Could not schedule Wayland clipboard pipe: {error}");
+        }
     }
 }

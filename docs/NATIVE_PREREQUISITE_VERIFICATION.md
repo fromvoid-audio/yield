@@ -13,6 +13,11 @@ passing counts without ignored tests. The profile suite's standalone process
 helper remains intentionally ignored while its parents launch and reap real
 native children.
 
+Current macOS runners write evidence to the local CI run's `evidence` directory
+outside the source checkout. The run JSON records its location, including partial
+evidence from a failed validation. Historical commits retain their original
+runner output paths and use the legacy evidence collection route.
+
 | Case | Native hosts | Acceptance scope |
 | --- | --- | --- |
 | profile-generations | macOS, Windows/MSVC | Original acquisition UUID/serial, clone-held OS lock, substitution/exhaustion and child-process release |

@@ -1147,7 +1147,7 @@ pub(super) fn span_for_playback_intent(
 #[cfg(test)]
 mod tests {
     use super::super::transport::{
-        PlaybackDesiredState, PlaybackRetargetAnchor, PlaybackRetargetRequest,
+        MetronomeGridTarget, PlaybackDesiredState, PlaybackRetargetAnchor, PlaybackRetargetRequest,
         PlaybackRetargetTarget,
     };
     use super::*;
@@ -1435,14 +1435,21 @@ mod tests {
                 metronome_beat_count: Some(4),
             },
             seek_if_outside: false,
+            metronome_grid: MetronomeGridTarget::Retain,
         };
         let latest_target = PlaybackRetargetTarget {
             span: WaveformPlayRegion::new(0.2, 0.8).expect("valid span"),
             desired: PlaybackDesiredState {
                 looped: false,
-                metronome_beat_count: None,
+                metronome_beat_count: Some(6),
             },
             seek_if_outside: true,
+            metronome_grid: MetronomeGridTarget::Set(Some(
+                super::super::metronome::PlaybackMetronomeGrid {
+                    frames: 60,
+                    origin_frame: 20,
+                },
+            )),
         };
         let active_request = make_retarget_request("one.wav", 1, active_target);
         let latest_request = make_retarget_request("one.wav", 2, latest_target);
@@ -1484,6 +1491,7 @@ mod tests {
                 metronome_beat_count: Some(6),
             },
             seek_if_outside: true,
+            metronome_grid: MetronomeGridTarget::Retain,
         };
         let retarget = make_retarget_request("one.wav", 9, target);
         let gain = PendingNormalizedAudition {
@@ -1529,6 +1537,7 @@ mod tests {
                         metronome_beat_count: None,
                     },
                     seek_if_outside: false,
+                    metronome_grid: MetronomeGridTarget::Retain,
                 },
             );
             let b = make_retarget_request(
@@ -1541,6 +1550,7 @@ mod tests {
                         metronome_beat_count: Some(4),
                     },
                     seek_if_outside: true,
+                    metronome_grid: MetronomeGridTarget::Retain,
                 },
             );
             let c = make_retarget_request(
@@ -1553,6 +1563,7 @@ mod tests {
                         metronome_beat_count: Some(8),
                     },
                     seek_if_outside: true,
+                    metronome_grid: MetronomeGridTarget::Retain,
                 },
             );
 

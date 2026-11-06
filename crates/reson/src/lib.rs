@@ -35,6 +35,10 @@ mod routing;
 mod source;
 #[cfg(feature = "native-audio")]
 mod telemetry;
+#[cfg(feature = "native-audio")]
+mod tempo_audition;
+#[cfg(feature = "native-audio")]
+mod tempo_wav;
 #[cfg(test)]
 mod test_support;
 #[cfg(feature = "native-audio")]
@@ -59,22 +63,32 @@ pub use output::{
 };
 #[cfg(feature = "native-audio")]
 pub use player::{
-    AudioPlayer, EditFadeRange, FadeParams, PlaybackChannelLayout, PlaybackMetronomeConfig,
-    PlaybackRequestId, PlaybackRuntime, PlaybackRuntimeCancellation, PlaybackRuntimeConfig,
-    PlaybackRuntimeEvent, PlaybackRuntimeEventIter, PlaybackRuntimeEventReceiver,
-    PlaybackRuntimeEventRecvError, PlaybackRuntimeEventRecvTimeoutError,
-    PlaybackRuntimeGainNormalization, PlaybackRuntimeHandle, PlaybackRuntimeMode,
-    PlaybackRuntimeProgress, PlaybackRuntimeReplacePolicy, PlaybackRuntimeRequest,
-    PlaybackRuntimeSource, PlaybackRuntimeSpanUpdate, PlaybackRuntimeStarted,
-    PlaybackRuntimeStreamPolicy, PlaybackRuntimeSubmitError, PlaybackSeekBehavior,
-    PlaybackSourceIdentity, PlaybackSourceKind, PlaybackSpanPlan, PlaybackSpanPlanError,
-    PlaybackSpanRequest,
+    AudioPlayer, EditFadeRange, FadeParams, MetronomeSound, PlaybackChannelLayout,
+    PlaybackMetronomeConfig, PlaybackMetronomeMix, PlaybackRequestId, PlaybackRuntime,
+    PlaybackRuntimeCancellation, PlaybackRuntimeConfig, PlaybackRuntimeEvent,
+    PlaybackRuntimeEventIter, PlaybackRuntimeEventReceiver, PlaybackRuntimeEventRecvError,
+    PlaybackRuntimeEventRecvTimeoutError, PlaybackRuntimeGainNormalization, PlaybackRuntimeHandle,
+    PlaybackRuntimeMode, PlaybackRuntimeProgress, PlaybackRuntimeReplacePolicy,
+    PlaybackRuntimeRequest, PlaybackRuntimeSource, PlaybackRuntimeSpanUpdate,
+    PlaybackRuntimeStarted, PlaybackRuntimeStreamPolicy, PlaybackRuntimeSubmitError,
+    PlaybackRuntimeTempoSpan, PlaybackSeekBehavior, PlaybackSourceIdentity, PlaybackSourceKind,
+    PlaybackSpanPlan, PlaybackSpanPlanError, PlaybackSpanRequest,
 };
 #[cfg(feature = "native-audio")]
 pub use recording::{AudioRecorder, InputMonitor, RecordingOutcome};
 pub use recording::{RecordingHealth, RecordingLimits, RecordingPrefixState, RecordingSink};
 #[cfg(feature = "native-audio")]
-pub use time_stretch::Wsola;
+pub use tempo_audition::{
+    PreparedTempoAudition, TempoAuditionFrameMap, TempoAuditionSkip, TempoAuditionTarget,
+    prepare_tempo_audition,
+};
+#[cfg(feature = "native-audio")]
+pub use tempo_wav::{TempoWavReadError, TempoWavSpan, read_tempo_wav_span};
+#[cfg(feature = "native-audio")]
+pub use time_stretch::{
+    MAX_TEMPO_INPUT_SAMPLES, MAX_TEMPO_SPAN_SECONDS, PreparedTempoStretch, StretchPreparationError,
+    Wsola,
+};
 
 #[cfg(feature = "native-audio")]
 pub(crate) use async_decode::AsyncSource;

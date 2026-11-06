@@ -4,6 +4,7 @@ mod prepared_subtree;
 pub use prepared_subtree::{
     PreparedSubtreeScan, SUBTREE_SCAN_MAX_ELAPSED, SUBTREE_SCAN_MAX_ENTRIES, prepare_subtree_scan,
 };
+mod audio_metadata;
 mod scan;
 mod scan_capability;
 mod scan_db_sync;
@@ -15,8 +16,8 @@ mod scan_index;
 mod scan_paths;
 mod scan_walk;
 mod scan_writer;
-mod wav_metadata;
 
+pub use audio_metadata::{AudioDisplayMetadata, read_audio_display_metadata_for_manifest};
 pub use prepared_exact::{
     EXACT_SCAN_MAX_ENTRIES, EXACT_SCAN_MAX_HASH_BYTES, EXACT_SCAN_MAX_PATH_BYTES,
     PreparedExactScan, prepare_exact_scan,
@@ -46,7 +47,6 @@ pub use scan_paths::{
     validate_exact_regular_paths,
 };
 pub use scan_writer::{ScanWritePhase, ScanWriter, UncoordinatedScanWriter};
-pub use wav_metadata::{WavDisplayMetadata, read_wav_display_metadata_for_manifest};
 
 #[cfg(test)]
 mod fixture_database {

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 /// Supported audio extensions for sample sources (lowercase, without dots).
-pub const SUPPORTED_AUDIO_EXTENSIONS: [&str; 1] = ["wav"];
+pub const SUPPORTED_AUDIO_EXTENSIONS: [&str; 3] = ["wav", "aif", "aiff"];
 
 /// Audio-container extensions recognized for unsupported-file diagnostics.
 ///
@@ -21,6 +21,16 @@ pub fn is_supported_audio(path: &Path) -> bool {
     SUPPORTED_AUDIO_EXTENSIONS
         .iter()
         .any(|supported| ext.eq_ignore_ascii_case(supported))
+}
+
+/// Check that a persisted supported extension matches the actual path extension.
+pub(crate) fn matches_indexed_audio_extension(path: &Path, extension: &str) -> bool {
+    !is_apple_double_sidecar(path)
+        && SUPPORTED_AUDIO_EXTENSIONS.contains(&extension)
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
 }
 
 /// Return true when a path has a recognized audio-container extension.
@@ -60,13 +70,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn supported_audio_is_wav_first_only() {
-        assert!(is_supported_audio(Path::new("kick.wav")));
-        assert!(is_supported_audio(Path::new("KICK.WAV")));
+    fn supported_audio_accepts_wav_and_both_aiff_extensions() {
+        for supported in ["kick.wav", "KICK.WAV", "loop.aif", "loop.AIFF"] {
+            assert!(is_supported_audio(Path::new(supported)));
+        }
         assert!(!is_supported_audio(Path::new("._kick.wav")));
         assert!(!is_supported_audio(Path::new("drums/._kick.wav")));
+        assert!(!is_supported_audio(Path::new("drums/._loop.AIF")));
 
-        for unsupported in ["loop.aif", "loop.aiff", "loop.flac", "loop.mp3"] {
+        for unsupported in ["loop.aifc", "loop.flac", "loop.mp3"] {
             assert!(
                 !is_supported_audio(Path::new(unsupported)),
                 "{unsupported} should not be treated as supported audio"
@@ -76,7 +88,7 @@ mod tests {
 
     #[test]
     fn recognized_audio_does_not_expand_supported_formats() {
-        for unsupported in ["loop.aif", "loop.aiff", "loop.flac", "loop.mp3"] {
+        for unsupported in ["loop.flac", "loop.mp3"] {
             let path = Path::new(unsupported);
             assert!(is_recognized_audio(path));
             assert!(!is_supported_audio(path));
@@ -86,10 +98,10 @@ mod tests {
     }
 
     #[test]
-    fn supported_audio_sql_filter_is_wav_only() {
+    fn supported_audio_sql_filter_covers_both_aiff_extensions() {
         assert_eq!(
             supported_audio_where_clause(),
-            "extension IN ('wav') AND path NOT GLOB '._*' AND path NOT GLOB '*/._*'"
+            "extension IN ('wav', 'aif', 'aiff') AND path NOT GLOB '._*' AND path NOT GLOB '*/._*'"
         );
     }
 

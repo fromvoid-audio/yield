@@ -16,6 +16,7 @@ mod playback_history;
 mod playback_loop_policy;
 mod playback_type_filter;
 mod played_range_history;
+mod playmark_grid;
 mod playmark_timing;
 mod random_audition;
 mod random_navigation;
@@ -53,8 +54,10 @@ pub use playback_history::{
 pub use playback_loop_policy::PlaybackLoopPolicy;
 pub use playback_type_filter::{PLAYBACK_TYPE_FILTERS, PlaybackType, PlaybackTypeFilter};
 pub use played_range_history::PlayedRangeHistory;
+pub use playmark_grid::{PlaymarkBeatGrid, SnappedPlaymark};
 pub use playmark_timing::{
-    MAX_PLAYMARK_TIMING_CHARACTERS, parse_playmark_frame_range, playmark_selection_label,
+    MAX_PLAYMARK_TIMING_CHARACTERS, ParsedPlaymarkTiming, parse_playmark_frame_range,
+    playmark_frame_tempo_label, playmark_selection_label,
 };
 pub use random_audition::{RandomAuditionUnits, random_audition_span_for_units};
 pub use random_navigation::RandomNavigationState;

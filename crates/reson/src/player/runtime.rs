@@ -16,8 +16,13 @@ use std::{
 #[cfg(test)]
 use std::sync::mpsc;
 
-use super::{AudioPlayer, EditFadeRange, PlaybackMetronomeConfig};
+use super::metronome::MetronomeMixOverride;
+use super::{AudioPlayer, EditFadeRange, PlaybackMetronomeConfig, PlaybackMetronomeMix};
 use crate::output::ResolvedOutput;
+
+mod tempo;
+pub use tempo::PlaybackRuntimeTempoSpan;
+use tempo::TempoPlaybackTimeline;
 
 #[cfg(all(test, target_os = "macos", feature = "native-audio"))]
 #[path = "../output/native_test_fixture.rs"]
@@ -114,6 +119,8 @@ pub enum PlaybackRuntimeSource {
     /// Hosts can submit this variant from latency-sensitive UI paths without
     /// opening the file or decoding audio before the command is enqueued.
     WavFile { path: PathBuf },
+    /// Uncompressed AIFF file with timing metadata probed on the runtime thread.
+    AiffFile { path: PathBuf },
     /// Original encoded bytes plus pre-decoded interleaved f32 playback samples.
     DecodedSamples {
         audio_bytes: Arc<[u8]>,
@@ -122,6 +129,11 @@ pub enum PlaybackRuntimeSource {
         sample_rate: u32,
         channels: usize,
     },
+    /// Tempo-adjusted PCM with exact original-file coordinates.
+    ///
+    /// The request's mode selects one-shot or looped playback. Span and loop offset come from
+    /// this payload. Edit previews and source-anchored metronomes require the ordinary source.
+    PreparedTempo(PlaybackRuntimeTempoSpan),
     /// Raw little-endian interleaved f32 file with caller-provided timing metadata.
     InterleavedF32File {
         path: PathBuf,
@@ -133,6 +145,15 @@ pub enum PlaybackRuntimeSource {
 }
 
 impl PlaybackRuntimeSource {
+    /// Select the background-probed WAV or AIFF file path without opening the source.
+    pub fn probe_file(path: PathBuf) -> Self {
+        if yield_aiff::is_aiff_path(&path) {
+            Self::AiffFile { path }
+        } else {
+            Self::WavFile { path }
+        }
+    }
+
     fn apply_to_player(self, player: &mut AudioPlayer) -> Result<(), String> {
         match self {
             Self::AudioBytes {
@@ -154,6 +175,7 @@ impl PlaybackRuntimeSource {
                 Ok(())
             }
             Self::WavFile { path } => player.set_wav_file(path),
+            Self::AiffFile { path } => player.set_aiff_file(path),
             Self::DecodedSamples {
                 audio_bytes,
                 samples,
@@ -168,6 +190,10 @@ impl PlaybackRuntimeSource {
                     sample_rate,
                     channels,
                 );
+                Ok(())
+            }
+            Self::PreparedTempo(tempo) => {
+                player.set_prepared_tempo_samples(tempo.original_path, tempo.prepared);
                 Ok(())
             }
             Self::InterleavedF32File {
@@ -382,6 +408,7 @@ pub enum PlaybackRuntimeSubmitError {
 pub struct PlaybackRuntimeHandle {
     commands: Arc<PlaybackRuntimeCommandQueue>,
     next_id: Arc<AtomicU64>,
+    metronome_mix: MetronomeMixOverride,
 }
 
 impl Clone for PlaybackRuntimeHandle {
@@ -390,6 +417,7 @@ impl Clone for PlaybackRuntimeHandle {
         Self {
             commands: Arc::clone(&self.commands),
             next_id: Arc::clone(&self.next_id),
+            metronome_mix: self.metronome_mix.clone(),
         }
     }
 }
@@ -437,6 +465,14 @@ impl PlaybackRuntimeHandle {
     /// Submit a volume update for current and future playback without waiting for the runtime thread.
     pub fn try_set_volume(&self, volume: f32) -> Result<(), PlaybackRuntimeSubmitError> {
         self.submit(PlaybackRuntimeCommand::SetVolume { volume })
+    }
+
+    /// Set the click mix for current and future playback without queuing or seeking.
+    ///
+    /// The audio source reads the latest mix at frame boundaries. The update leaves each
+    /// request's enabled state and beat grid intact.
+    pub fn set_metronome_mix(&self, mix: PlaybackMetronomeMix) {
+        self.metronome_mix.set(mix);
     }
 
     /// Submit a playback-gain update for current and future playback without waiting for the runtime thread.
@@ -600,12 +636,15 @@ impl PlaybackRuntime {
         player: AudioPlayer,
         config: PlaybackRuntimeConfig,
     ) -> Result<Self, std::io::Error> {
-        spawn_executor(
+        let metronome_mix = player.metronome_mix_override.clone();
+        spawn_executor_with_mix(
             AudioPlayerPlaybackExecutor {
                 player,
                 configured_metronome_beat_count: None,
+                tempo: None,
             },
             config,
+            metronome_mix,
         )
     }
 }
@@ -1152,6 +1191,7 @@ struct AudioPlayerPlaybackExecutor {
     // successful control-thread boundary. AudioPlayer's public readback stays
     // focused on live span controls, which lazy sources intentionally lack.
     configured_metronome_beat_count: Option<u16>,
+    tempo: Option<TempoPlaybackTimeline>,
 }
 
 impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
@@ -1162,6 +1202,20 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
         // A replacement attempt must not report a metronome configuration from
         // the previous playback lifetime if setup fails.
         self.configured_metronome_beat_count = None;
+        self.tempo = None;
+        let tempo_start = if let PlaybackRuntimeSource::PreparedTempo(tempo) = &request.source {
+            if request.edit_fade.is_some() || request.metronome.is_some() {
+                return Err(String::from(
+                    "Prepared tempo playback requires ordinary playback for edit previews or metronome",
+                ));
+            }
+            let plan = tempo
+                .playback_plan(request.mode)
+                .map_err(|error| error.to_string())?;
+            Some((tempo.timeline(), plan))
+        } else {
+            None
+        };
         let configured_metronome_beat_count = request.metronome.map(|config| config.beat_count());
         self.player
             .set_anti_clip_settings(request.anti_click_enabled, request.anti_click_fade_ms);
@@ -1176,11 +1230,19 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
         let output = self.player.output_details().clone();
         request.source.apply_to_player(&mut self.player)?;
         self.player.set_edit_fade_state(request.edit_fade);
-        let playback_start = request.mode.start_player(
-            &mut self.player,
-            request.replace_policy,
-            request.metronome,
-        )?;
+        let playback_start = if let Some((timeline, plan)) = tempo_start {
+            self.player
+                .play_prepared_tempo_span(plan, request.replace_policy)?;
+            let start = timeline.source_progress(plan.seek_offset_frames());
+            self.tempo = Some(timeline);
+            start
+        } else {
+            request.mode.start_player(
+                &mut self.player,
+                request.replace_policy,
+                request.metronome,
+            )?
+        };
         self.configured_metronome_beat_count = configured_metronome_beat_count;
         Ok(PlaybackRuntimeStartedData {
             output,
@@ -1191,10 +1253,16 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
     fn stop(&mut self) -> Result<(), String> {
         self.player.stop();
         self.configured_metronome_beat_count = None;
+        self.tempo = None;
         Ok(())
     }
 
     fn retarget_span(&mut self, update: PlaybackRuntimeSpanUpdate) -> Result<f32, String> {
+        if self.tempo.is_some() {
+            return Err(String::from(
+                "Prepared tempo playback requires a new span request",
+            ));
+        }
         let configured_metronome_beat_count = update.metronome.map(|config| config.beat_count());
         self.player
             .set_playback_gain(runtime_playback_gain_for_player(
@@ -1239,12 +1307,21 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
         gain: f32,
         normalization: Option<PlaybackRuntimeGainNormalization>,
     ) {
-        self.player
-            .set_playback_gain(runtime_playback_gain_for_player(
-                gain,
-                normalization,
-                &self.player,
-            ));
+        let gain = if let Some(timeline) = &self.tempo {
+            let normalized = normalization
+                .zip(self.player.playback_samples.as_ref())
+                .and_then(|(normalization, samples)| {
+                    timeline.normalized_gain(
+                        samples,
+                        usize::from(self.player.track_channels?),
+                        normalization,
+                    )
+                });
+            sanitize_playback_gain(gain * normalized.unwrap_or(1.0))
+        } else {
+            runtime_playback_gain_for_player(gain, normalization, &self.player)
+        };
+        self.player.set_playback_gain(gain);
     }
 
     fn progress(&mut self) -> PlaybackRuntimeProgress {
@@ -1259,7 +1336,7 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
             self.configured_metronome_beat_count = None;
             (None, None, None)
         };
-        PlaybackRuntimeProgress {
+        let mut progress = PlaybackRuntimeProgress {
             active,
             elapsed: self.player.playback_elapsed(),
             looping: self.player.is_looping(),
@@ -1270,7 +1347,11 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
             configured_span_request_id: None,
             metronome_beat_count,
             playback_request_id: None,
+        };
+        if let Some(timeline) = &self.tempo {
+            timeline.apply_progress(&mut progress, self.player.progress_frame());
         }
+        progress
     }
 }
 
@@ -1328,9 +1409,18 @@ fn apply_dispatch_time_progress(
     }
 }
 
+#[cfg(test)]
 fn spawn_executor(
     executor: impl PlaybackRuntimeExecutor,
     config: PlaybackRuntimeConfig,
+) -> Result<PlaybackRuntime, std::io::Error> {
+    spawn_executor_with_mix(executor, config, MetronomeMixOverride::default())
+}
+
+fn spawn_executor_with_mix(
+    executor: impl PlaybackRuntimeExecutor,
+    config: PlaybackRuntimeConfig,
+    metronome_mix: MetronomeMixOverride,
 ) -> Result<PlaybackRuntime, std::io::Error> {
     let queue_capacity = config.queue_capacity.max(1);
     let command_queue = Arc::new(PlaybackRuntimeCommandQueue::new(queue_capacity));
@@ -1338,6 +1428,7 @@ fn spawn_executor(
     let handle = PlaybackRuntimeHandle {
         commands: Arc::clone(&command_queue),
         next_id: Arc::new(AtomicU64::new(1)),
+        metronome_mix,
     };
     let runtime_event_queue = Arc::clone(&event_queue);
     thread::Builder::new()
@@ -1856,6 +1947,11 @@ fn normalized_gain_for_runtime_source(
             normalization.start,
             normalization.end,
         ),
+        PlaybackRuntimeSource::PreparedTempo(tempo) => tempo.timeline().normalized_gain(
+            &tempo.prepared.samples,
+            tempo.prepared.channels,
+            normalization,
+        ),
         PlaybackRuntimeSource::InterleavedF32File {
             path,
             sample_count,
@@ -1870,6 +1966,7 @@ fn normalized_gain_for_runtime_source(
         ),
         PlaybackRuntimeSource::AudioBytes { .. }
         | PlaybackRuntimeSource::AudioFile { .. }
+        | PlaybackRuntimeSource::AiffFile { .. }
         | PlaybackRuntimeSource::WavFile { .. } => None,
     }
 }
@@ -2063,6 +2160,7 @@ mod tests {
         let mut executor = AudioPlayerPlaybackExecutor {
             player,
             configured_metronome_beat_count: None,
+            tempo: None,
         };
 
         let root = tempfile::tempdir().expect("temporary WAV root");
@@ -2407,6 +2505,7 @@ mod tests {
         let mut executor = AudioPlayerPlaybackExecutor {
             player: default_player,
             configured_metronome_beat_count: None,
+            tempo: None,
         };
         let teardown_complete = executor.player.native_stream_teardown_complete();
         guard.track_stream_teardown(Arc::clone(&teardown_complete));
@@ -3666,12 +3765,68 @@ mod tests {
         let handle = PlaybackRuntimeHandle {
             commands,
             next_id: Arc::new(AtomicU64::new(1)),
+            metronome_mix: MetronomeMixOverride::default(),
         };
 
         assert_eq!(
             handle.try_play(test_request(0.0)),
             Err(PlaybackRuntimeSubmitError::Closed)
         );
+    }
+
+    #[test]
+    fn metronome_mix_update_is_queue_independent_and_stereo_frame_coherent() {
+        use crate::player::metronome::MetronomeSource;
+        use crate::{MetronomeSound, SamplesBuffer};
+
+        let handle = PlaybackRuntimeHandle {
+            commands: Arc::new(PlaybackRuntimeCommandQueue::new(1)),
+            next_id: Arc::new(AtomicU64::new(1)),
+            metronome_mix: MetronomeMixOverride::default(),
+        };
+        handle.try_set_volume(0.5).expect("fill the command queue");
+        let config = PlaybackMetronomeConfig::new(1).with_mix(PlaybackMetronomeMix::new(
+            50,
+            true,
+            false,
+            MetronomeSound::Classic,
+        ));
+        let source = || {
+            MetronomeSource::new(
+                SamplesBuffer::from_arc(2, 48_000, Arc::from([0.0; 4])),
+                config,
+                48_000,
+                0,
+                0,
+            )
+            .with_mix_override(handle.metronome_mix.clone())
+        };
+
+        let mut active = source();
+        assert_eq!(active.next(), Some(0.11)); // Unset override preserves the request mix.
+        handle.clone().set_metronome_mix(PlaybackMetronomeMix::new(
+            0,
+            true,
+            false,
+            MetronomeSound::Classic,
+        ));
+        assert_eq!(active.next(), Some(0.11)); // Second channel of the original frame.
+        assert_eq!(active.next(), Some(0.0));
+        assert_eq!(source().next(), Some(0.0));
+
+        handle.set_metronome_mix(PlaybackMetronomeMix::new(
+            25,
+            true,
+            false,
+            MetronomeSound::Classic,
+        ));
+        assert_eq!(source().next(), Some(0.055));
+        let state = handle.commands.state.lock().expect("command queue");
+        assert!(matches!(
+            state.commands.front(),
+            Some(PlaybackRuntimeCommand::SetVolume { volume: 0.5 })
+        ));
+        assert_eq!(state.commands.len(), 1);
     }
 
     #[test]

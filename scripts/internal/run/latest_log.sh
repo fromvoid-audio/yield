@@ -13,6 +13,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+invocation_dir="$PWD"
+os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
 cd "$ROOT_DIR"
 
 LINES=200
@@ -28,12 +30,22 @@ Prints:
 - resolved logs dir
 - newest *.log file under logs dir (if any)
 - tail snippet from that newest log (default: 200 lines)
+EOF
+  if [[ "$os_name" == linux ]]; then
+    cat <<EOF
+Linux installed profile:
+- Use YIELD_CONFIG_HOME, absolute XDG_CONFIG_HOME, or ~/.config.
+- Pass --sandbox for the sandbox profile and its repo-local base unless overridden.
+EOF
+  else
+    cat <<EOF
 
 Sandbox behavior:
 - If YIELD_CONFIG_HOME is set, it is always used.
 - Otherwise, if <repo>/.sandbox/yield exists, this script prefers it.
 - Pass --sandbox to force using <repo>/.sandbox/yield.
 EOF
+  fi
 }
 
 while (( $# > 0 )); do
@@ -51,7 +63,6 @@ while (( $# > 0 )); do
   esac
 done
 
-os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
 sandbox_config_home="${ROOT_DIR}/.sandbox/yield"
 
 default_config_base_dir() {
@@ -88,12 +99,6 @@ current_persistence_profile() {
   fi
   printf "%s" "live"
 }
-
-config_base_dir="$(default_config_base_dir)"
-used_sandbox_config_home="false"
-if [[ -z "${YIELD_CONFIG_HOME:-}" ]] && [[ "$config_base_dir" == "$sandbox_config_home" ]]; then
-  used_sandbox_config_home="true"
-fi
 
 extract_app_data_dir_from_config() {
   local config_path="$1"
@@ -139,11 +144,22 @@ resolve_app_root_dir() {
   printf "%s" "$default_root"
 }
 
-app_root="$(resolve_app_root_dir)"
-logs_dir="${app_root}/logs"
+if [[ "$os_name" == linux ]]; then
+  source "$ROOT_DIR/scripts/internal/run/linux_diagnostics_paths.sh"
+  resolve_linux_diagnostics_paths "$invocation_dir" "$sandbox_config_home" "$USE_SANDBOX"
+else
+  config_base_dir="$(default_config_base_dir)"
+  used_sandbox_config_home="false"
+  if [[ -z "${YIELD_CONFIG_HOME:-}" ]] && [[ "$config_base_dir" == "$sandbox_config_home" ]]; then
+    used_sandbox_config_home="true"
+  fi
+  app_root="$(resolve_app_root_dir)"
+  logs_dir="${app_root}/logs"
+  resolved_profile="$(current_persistence_profile)"
+fi
 
 echo "[latest_log] config_base_dir=$config_base_dir"
-echo "[latest_log] persistence_profile=$(current_persistence_profile)"
+echo "[latest_log] persistence_profile=$resolved_profile"
 echo "[latest_log] preferred_sandbox_config_home=$sandbox_config_home"
 echo "[latest_log] used_sandbox_config_home=$used_sandbox_config_home"
 echo "[latest_log] app_root=$app_root"

@@ -8,12 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use gpui::{BorrowAppContext, Context};
 use yield_core::{AudioFile, AudioFileCuration, AudioFileId, FolderTree, PlaybackType};
 use yield_library::sample_sources::{
-    BrowserFileMetadata, SourceId, SourcePlaybackType, SourcePublicationFence,
+    BrowserFileMetadata, SourceId, SourceManifestEntry, SourcePlaybackType, SourcePublicationFence,
     reconciliation::RootIdentity,
 };
+use yield_media::WaveformDetailContext;
 use yield_session::{
     CatalogCommand, CatalogDelivery, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
-    CatalogStatus, CatalogSubmitError, VerifiedSourceRoot,
+    CatalogStatus, CatalogSubmitError, SourceContentDigestOrigin, SourceContentDigestScope,
+    VerifiedSourceRoot,
 };
 
 use super::source_registry::SourceRegistryGlobal;
@@ -70,6 +72,10 @@ pub(super) enum CatalogCommandIntent {
         source_id: SourceId,
         lifecycle_generation: u64,
     },
+    ReadSnapshot {
+        source_id: SourceId,
+        lifecycle_generation: u64,
+    },
     Remove {
         source_id: SourceId,
         lifecycle_generation: u64,
@@ -82,6 +88,7 @@ impl CatalogCommandIntent {
             Self::Register { source_id, .. }
             | Self::RegisterVerified { source_id, .. }
             | Self::Audit { source_id, .. }
+            | Self::ReadSnapshot { source_id, .. }
             | Self::Remove { source_id, .. } => source_id,
         }
     }
@@ -97,6 +104,10 @@ impl CatalogCommandIntent {
                 ..
             }
             | Self::Audit {
+                lifecycle_generation,
+                ..
+            }
+            | Self::ReadSnapshot {
                 lifecycle_generation,
                 ..
             }
@@ -133,6 +144,10 @@ impl CatalogCommandIntent {
             } => CatalogCommand::RequestAudit {
                 source_id,
                 lifecycle_generation,
+            },
+            Self::ReadSnapshot { source_id, .. } => CatalogCommand::ReadSnapshot {
+                source_id,
+                expected_revision: None,
             },
             Self::Remove {
                 source_id,
@@ -572,7 +587,9 @@ impl Browser {
                     lifecycle_generation,
                     ..
                 } => Some((source_id.clone(), *lifecycle_generation)),
-                CatalogCommandIntent::Audit { .. } | CatalogCommandIntent::Remove { .. } => None,
+                CatalogCommandIntent::Audit { .. }
+                | CatalogCommandIntent::ReadSnapshot { .. }
+                | CatalogCommandIntent::Remove { .. } => None,
             };
             match submit_catalog(intent, cx) {
                 Ok(()) => {
@@ -610,6 +627,8 @@ impl Browser {
             }
         }
         let mut changed = self.retry_catalog_metadata(cx);
+        changed |= super::playmark_tempo::load_for_waveform(self, cx);
+        changed |= super::bpm_snap_persistence::load_for_waveform(self, cx);
         changed |= super::rating_decay::retry(self, cx);
         changed |= super::unsupported_entries::retry(self, cx);
         changed
@@ -683,6 +702,31 @@ impl Browser {
         publication_fence: Option<SourcePublicationFence>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if let CatalogEvent::SourceContentDigestFailed { request, error, .. } = &event {
+            super::playmark_tempo::fail_digest(self, request, *error, cx);
+            super::bpm_snap_persistence::fail_digest(self, request, *error, cx);
+            return true;
+        }
+        if super::playmark_tempo::apply_catalog_event(self, &event, publication_fence.as_ref(), cx)
+        {
+            return true;
+        }
+        if super::bpm_snap_persistence::apply_catalog_event(
+            self,
+            &event,
+            publication_fence.as_ref(),
+            cx,
+        ) {
+            return true;
+        }
+        if super::transient_markers::apply_catalog_event(
+            self,
+            &mut event,
+            publication_fence.clone(),
+            cx,
+        ) {
+            return true;
+        }
         if super::similarity_list::apply_catalog_event(
             self,
             &mut event,
@@ -833,6 +877,29 @@ impl Browser {
                 self.start_catalog_projection(event, publication_fence, cx);
                 true
             }
+            CatalogEvent::SourceContentDigestCommitted {
+                scope,
+                origin,
+                committed_revision,
+                entry,
+            } => {
+                if publication_fence
+                    .as_ref()
+                    .is_some_and(SourcePublicationFence::is_live)
+                {
+                    self.apply_digest_revision(
+                        scope,
+                        match origin {
+                            SourceContentDigestOrigin::Transients(id) => Some(*id),
+                            SourceContentDigestOrigin::DigestOnly(_) => None,
+                        },
+                        *committed_revision,
+                        entry,
+                        cx,
+                    );
+                }
+                true
+            }
             CatalogEvent::ReplayCommitted { .. } => {
                 super::unsupported_entries::cancel_for_source_change(self, cx);
                 self.job_action = None;
@@ -946,8 +1013,134 @@ impl Browser {
             CatalogEvent::CollectionHistoryCompleted { .. }
             | CatalogEvent::CollectionHistoryGroupCompleted { .. }
             | CatalogEvent::SimilarityCompleted { .. }
+            | CatalogEvent::PlaymarkTempoCompleted { .. }
+            | CatalogEvent::PlaymarkGridTempoCompleted { .. }
+            | CatalogEvent::SourceContentDigestFailed { .. }
+            | CatalogEvent::TransientMarkersCompleted { .. }
             | CatalogEvent::Closed => false,
         }
+    }
+
+    fn apply_digest_revision(
+        &mut self,
+        scope: &SourceContentDigestScope,
+        transient_request_id: Option<u64>,
+        revision: u64,
+        entry: &SourceManifestEntry,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.catalog_metadata.context();
+        if let Some(context) = &previous {
+            if context.revision == revision {
+                super::playmark_tempo::adopt_digest_revision(self, scope, revision, cx);
+                super::bpm_snap_persistence::adopt_digest_revision(self, scope, revision, cx);
+                return;
+            }
+            if context.revision > revision {
+                super::playmark_tempo::reject_digest_revision(self, scope, cx);
+                super::bpm_snap_persistence::reject_digest_revision(self, scope, cx);
+                return;
+            }
+        }
+        let key = super::curation::CurationLifecycleKey {
+            source_id: scope.source_id.clone(),
+            lifecycle_generation: scope.lifecycle_generation,
+        };
+        let exact = previous.filter(|context| {
+            context.source_id == key.source_id
+                && context.lifecycle_generation == key.lifecycle_generation
+                && context.revision == scope.previous_revision
+                && context.revision.checked_add(1) == Some(revision)
+        });
+        let keep_tag_mask = super::tag_filter::capture_ready_mask(self).is_some();
+        let session = self
+            .active_source
+            .and_then(|index| self.source_sessions.get_mut(index));
+        let patched = exact
+            .as_ref()
+            .zip(session)
+            .is_some_and(|(context, session)| {
+                let Some(facts) = session.catalog_facts.get(&entry.relative_path) else {
+                    return false;
+                };
+                if session.root != context.root
+                    || session.source_id.as_ref() != Some(&key.source_id)
+                    || session.catalog_lifecycle_generation != Some(key.lifecycle_generation)
+                    || entry.relative_path != scope.relative_path.as_path()
+                    || facts.file_size != entry.file_size
+                    || facts.modified_ns != entry.modified_ns
+                    || facts.file_identity != entry.file_identity
+                    || facts.content_hash.is_some()
+                    || entry.content_hash.is_none()
+                    || !self
+                        .curation_state
+                        .advance_digest_revision(&key, context, revision)
+                {
+                    return false;
+                }
+                if let Some(facts) =
+                    Arc::make_mut(&mut session.catalog_facts).get_mut(&entry.relative_path)
+                {
+                    facts.content_hash = entry.content_hash.clone();
+                }
+                true
+            });
+        let Some(previous) = exact.filter(|_| patched) else {
+            super::playmark_tempo::reject_digest_revision(self, scope, cx);
+            super::bpm_snap_persistence::reject_digest_revision(self, scope, cx);
+            self.catalog_pending_command
+                .get_or_insert(CatalogCommandIntent::ReadSnapshot {
+                    source_id: key.source_id,
+                    lifecycle_generation: key.lifecycle_generation,
+                });
+            return;
+        };
+        self.catalog_metadata.advance_projection_revision(revision);
+        let pending = self.curation_state.has_pending_for_lifecycle(&key);
+        if pending {
+            self.catalog_metadata.pause_for_curation();
+        }
+        let display_context = self
+            .catalog_metadata
+            .context()
+            .map(super::display_labels::display_context_from_metadata);
+        if !display_context.clone().is_some_and(|context| {
+            self.display_labels.rebase_after_curation(
+                context,
+                previous.revision,
+                revision,
+                &previous.root_identity,
+                previous.directory_generation,
+                pending,
+            )
+        }) {
+            self.display_labels
+                .invalidate_after_curation(display_context, pending);
+        }
+        if !keep_tag_mask
+            || !super::tag_filter::rebase_ready_context(
+                self,
+                revision,
+                &previous.root_identity,
+                previous.directory_generation,
+            )
+        {
+            super::tag_filter::invalidate_after_curation(
+                self,
+                super::tag_filter::FilterOrigin::PassiveMetadata,
+                cx,
+            );
+        }
+        super::transient_markers::accept_digest_revision(
+            self,
+            scope,
+            transient_request_id,
+            revision,
+            cx,
+        );
+        super::playmark_tempo::adopt_digest_revision(self, scope, revision, cx);
+        super::bpm_snap_persistence::adopt_digest_revision(self, scope, revision, cx);
+        cx.notify();
     }
 
     fn start_catalog_projection(
@@ -1237,6 +1430,7 @@ impl Browser {
             },
         );
         self.restore_projection_focus(restore_id, restore_position, cx);
+        super::transient_markers::schedule(self, cx);
         if audit_ready {
             let _ = self.maybe_start_rating_decay(cx);
         }
@@ -1257,6 +1451,7 @@ impl Browser {
             return;
         }
         self.similarity_list.cancel();
+        self.transient_markers.invalidate();
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::invalidate_for_source_publication(self, status);
         super::unsupported_entries::cancel_for_source_change(self, cx);
@@ -1276,6 +1471,30 @@ impl Browser {
         }
         self.set_scan_status(status.to_string());
     }
+}
+
+pub(super) fn audited_waveform_source(
+    browser: &Browser,
+) -> Option<(
+    &AudioFile,
+    &WaveformDetailContext,
+    &catalog_metadata::CatalogMetadataContext,
+)> {
+    let selected = browser.selected?;
+    let entry = browser.entries.get(selected)?;
+    let detail = browser.waveform.as_ref()?.detail_context.as_ref()?;
+    let source = browser.catalog_metadata.context_ref()?;
+    let activation = browser.catalog_activation.as_ref()?;
+    if entry.path != detail.path
+        || browser.root.as_ref() != Some(&source.root)
+        || source.entry_indices.get(&entry.relative_path) != Some(&selected)
+        || activation.source_id != source.source_id
+        || activation.lifecycle_generation != source.lifecycle_generation
+        || activation.root_identity.as_ref() != Some(&source.root_identity)
+    {
+        return None;
+    }
+    Some((entry, detail, source))
 }
 
 pub(super) fn catalog_status(cx: &Context<Browser>) -> Option<CatalogStatus> {
@@ -1316,6 +1535,22 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
         CatalogEvent::SimilarityCompleted { request, .. } => {
+            Some((request.source_id().clone(), request.lifecycle_generation()))
+        }
+        CatalogEvent::TransientMarkersCompleted { request, .. } => {
+            Some((request.source_id().clone(), request.lifecycle_generation()))
+        }
+        CatalogEvent::SourceContentDigestCommitted { scope, .. } => {
+            Some((scope.source_id.clone(), scope.lifecycle_generation))
+        }
+        CatalogEvent::SourceContentDigestFailed { request, .. } => {
+            let scope = request.scope();
+            Some((scope.source_id.clone(), scope.lifecycle_generation))
+        }
+        CatalogEvent::PlaymarkTempoCompleted { request, .. } => {
+            Some((request.source_id().clone(), request.lifecycle_generation()))
+        }
+        CatalogEvent::PlaymarkGridTempoCompleted { request, .. } => {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
         CatalogEvent::Registered {

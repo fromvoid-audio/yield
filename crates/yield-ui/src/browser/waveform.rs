@@ -12,15 +12,19 @@ use gpui::{
     ScrollDelta, ScrollWheelEvent, Window, canvas, div, fill, point, prelude::*, px,
 };
 use yield_core::{
-    WaveformEditFade, WaveformEditFadeDrag, WaveformEditFadeHandle, WaveformEditRegion,
-    WaveformEditSettings, WaveformRegion, WaveformViewport, snap_resize_ratio_to_whole_bpm,
+    PlaymarkBeatGrid, SnappedPlaymark, WaveformEditFade, WaveformEditFadeDrag,
+    WaveformEditFadeHandle, WaveformEditRegion, WaveformEditSettings, WaveformRegion,
+    WaveformViewport, snap_resize_ratio_to_whole_bpm,
 };
 use yield_design::Theme;
+use yield_session::SourcePlaymarkTempo;
 
 use crate::theme::color;
 
 use super::Browser;
+use super::bpm_snap_entry;
 use super::played_ranges;
+use super::playmark_tempo;
 use super::playmark_timing;
 use super::similar_sections;
 use super::transient_markers;
@@ -185,7 +189,7 @@ impl Render for BpmSnapTooltip {
             .text_size(px(theme.typography.small_size))
             .text_color(crate::theme::color(theme.colors.text_primary))
             .child(
-                "Snap resized play and edit selections to whole BPM values using the beat guide count.",
+                "Paint new playmarks in whole beats when a BPM is set. Snap resized selections to whole BPM values.",
             )
     }
 }
@@ -208,7 +212,7 @@ impl Render for BeatCountTooltip {
             .border_color(crate::theme::color(theme.colors.border_emphasis))
             .text_size(px(theme.typography.small_size))
             .text_color(crate::theme::color(theme.colors.text_primary))
-            .child("Beat guide divisions.")
+            .child("Beat guide divisions. Drag up or down to adjust.")
     }
 }
 
@@ -269,33 +273,35 @@ impl WaveformPlayRegion {
         WaveformRegion::new(self.start, self.end)
     }
 
-    fn slide_left(self) -> Option<Self> {
-        self.core()
-            .map(|region| Self::from_core(region.slide_left()))
-    }
-
-    fn slide_right(self) -> Option<Self> {
-        self.core()
-            .map(|region| Self::from_core(region.slide_right()))
-    }
-
-    fn nudged_by_frame(self, direction: WaveformRegionSlide, total_frames: usize) -> Option<Self> {
+    pub(super) fn frame_bounds(self, total_frames: usize) -> Option<(usize, usize)> {
         if total_frames == 0 || !self.is_valid() {
             return None;
         }
-        // Playback rounds normalized span endpoints to frames. Nudge those same frames instead
+        // Playback rounds normalized span endpoints to frames. Use those same frames instead
         // of using the outward-rounded range used for timing labels.
         let total = total_frames as f64;
-        let start = (self.start * total)
-            .round()
-            .clamp(0.0, (total_frames - 1) as f64) as usize;
-        let end = (self.end * total).round().clamp((start + 1) as f64, total) as usize;
+        let start = ((self.start * total).round() as usize).min(total_frames - 1);
+        let end = ((self.end * total).round() as usize).clamp(start + 1, total_frames);
+        Some((start, end))
+    }
+
+    fn shifted_by_frames(
+        self,
+        direction: WaveformRegionSlide,
+        total_frames: usize,
+    ) -> Option<Self> {
+        let (start, end) = self.frame_bounds(total_frames)?;
         let width = end - start;
         let next_start = match direction {
+            WaveformRegionSlide::Left => start.checked_sub(width)?,
+            WaveformRegionSlide::Right => {
+                let next = start + width;
+                (next <= total_frames - width).then_some(next)?
+            }
             WaveformRegionSlide::FineLeft => start.saturating_sub(1),
             WaveformRegionSlide::FineRight => start.saturating_add(1).min(total_frames - width),
-            _ => return None,
         };
+        let total = total_frames as f64;
         Self::new(
             next_start as f64 / total,
             (next_start + width) as f64 / total,
@@ -357,6 +363,13 @@ enum WaveformRegionDragMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct PlaymarkTempoResize {
+    total_frames: usize,
+    sample_rate: u32,
+    beat_count: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct WaveformRegionDrag {
     anchor: f64,
     current: f64,
@@ -370,6 +383,8 @@ pub(super) struct WaveformRegionDrag {
     button: MouseButton,
     mode: WaveformRegionDragMode,
     edit_settings: Option<WaveformEditSettings>,
+    tempo_resize: Option<PlaymarkTempoResize>,
+    paint_grid: Option<PlaymarkBeatGrid>,
 }
 
 impl WaveformRegionDrag {
@@ -600,7 +615,64 @@ impl WaveformRegionDrag {
             button,
             mode,
             edit_settings,
+            tempo_resize: None,
+            paint_grid: None,
         }
+    }
+
+    fn capture_tempo_resize(&mut self, total_frames: usize, sample_rate: u32, beat_count: u8) {
+        if total_frames > 0
+            && sample_rate > 0
+            && beat_count > 0
+            && matches!(
+                self.mode,
+                WaveformRegionDragMode::ResizePlayStart { .. }
+                    | WaveformRegionDragMode::ResizePlayEnd { .. }
+            )
+        {
+            self.tempo_resize = Some(PlaymarkTempoResize {
+                total_frames,
+                sample_rate,
+                beat_count,
+            });
+        }
+    }
+
+    fn capture_paint_grid(&mut self, total_frames: usize, sample_rate: u32, bpm: f64) {
+        if matches!(
+            self.mode,
+            WaveformRegionDragMode::Create {
+                kind: WaveformSelectionKind::Play
+            }
+        ) {
+            let anchor = (self.anchor.clamp(0.0, 1.0) * total_frames as f64).round() as usize;
+            self.paint_grid = PlaymarkBeatGrid::new(anchor, total_frames, sample_rate, bpm);
+        }
+    }
+
+    pub(super) fn snapped_paint(self) -> Option<SnappedPlaymark> {
+        let grid = self.paint_grid.filter(|_| self.moved)?;
+        let total = grid.total_frames() as f64;
+        let pointer = (self.current.clamp(0.0, 1.0) * total).round() as usize;
+        grid.snap(pointer, self.current < self.anchor)
+    }
+
+    fn tempo_resize_region(self, capture: PlaymarkTempoResize) -> Option<WaveformPlayRegion> {
+        let (baseline, leading) = match self.mode {
+            WaveformRegionDragMode::ResizePlayStart { baseline } => (baseline, true),
+            WaveformRegionDragMode::ResizePlayEnd { baseline } => (baseline, false),
+            _ => return None,
+        };
+        let baseline = WaveformPlayRegion::from_core(baseline);
+        let (start, end) = baseline.frame_bounds(capture.total_frames)?;
+        let total = capture.total_frames as f64;
+        let moving = (self.current.clamp(0.0, 1.0) * total).round() as usize;
+        let (start, end) = if leading {
+            (moving.min(end - 1), end)
+        } else {
+            (start, moving.max(start + 1).min(capture.total_frames))
+        };
+        WaveformPlayRegion::new(start as f64 / total, end as f64 / total)
     }
 
     fn update(&mut self, position: Point<Pixels>) {
@@ -628,6 +700,11 @@ impl WaveformRegionDrag {
         self,
         bpm_snap: BpmSnapSettings,
     ) -> Option<WaveformPlayRegion> {
+        if self.moved
+            && let Some(capture) = self.tempo_resize
+        {
+            return self.tempo_resize_region(capture);
+        }
         if !self.moved {
             match self.mode {
                 WaveformRegionDragMode::Create {
@@ -644,7 +721,16 @@ impl WaveformRegionDrag {
         match self.mode {
             WaveformRegionDragMode::Create {
                 kind: WaveformSelectionKind::Play,
-            } => WaveformPlayRegion::new(self.anchor, self.current),
+            } => {
+                if self.paint_grid.is_some() {
+                    let snapped = self.snapped_paint()?;
+                    let (first, end) = snapped.frames();
+                    let total = snapped.total_frames() as f64;
+                    WaveformPlayRegion::new(first as f64 / total, end as f64 / total)
+                } else {
+                    WaveformPlayRegion::new(self.anchor, self.current)
+                }
+            }
             WaveformRegionDragMode::MovePlay { baseline } => baseline
                 .moved_by(self.current - self.anchor)
                 .map(WaveformPlayRegion::from_core),
@@ -838,7 +924,11 @@ impl WaveformRegionDrag {
     }
 
     pub(super) fn zero_crossing_applies(self, bpm_snap: BpmSnapSettings) -> bool {
-        self.moved && !self.is_edit_effect_handle() && (!self.is_resize() || !bpm_snap.enabled)
+        self.moved
+            && self.tempo_resize.is_none()
+            && self.paint_grid.is_none()
+            && !self.is_edit_effect_handle()
+            && (!self.is_resize() || !bpm_snap.enabled)
     }
 
     fn is_resize(self) -> bool {
@@ -954,8 +1044,8 @@ impl WaveformPanDrag {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct WaveformDragToken;
+#[derive(Clone)]
+struct WaveformDragToken(gpui::WeakEntity<Browser>);
 
 struct WaveformDragGhost;
 
@@ -1835,10 +1925,21 @@ pub(super) fn render_waveform(
     );
     bars = bars.child(similar_sections::overlay(browser, theme.clone()));
     bars = bars.child(transient_markers::render_overlay(browser, &theme));
-    let beat_guides = browser.beat_guides_enabled.then_some((
-        browser.beat_guide_count,
-        color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
-    ));
+    let tempo_resize = browser
+        .waveform_region_drag
+        .and_then(|drag| drag.tempo_resize);
+    let snapped_paint = drag.is_some_and(|drag| drag.moved && drag.paint_grid.is_some());
+    let paint = match drag {
+        Some(drag) if snapped_paint => drag.snapped_paint(),
+        None if browser.beat_guides_enabled => browser.waveform_play_grid,
+        _ => None,
+    };
+    let beat_count = tempo_resize.map_or(browser.beat_guide_count, |capture| capture.beat_count);
+    let beat_guides = (!snapped_paint && (browser.beat_guides_enabled || tempo_resize.is_some()))
+        .then_some((
+            beat_count,
+            color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
+        ));
     let active_selection_kind = browser
         .waveform_region_drag
         .map(|drag| drag.selection_kind());
@@ -1848,21 +1949,38 @@ pub(super) fn render_waveform(
             browser.waveform_viewport,
             color(theme.colors.selection_fill),
             color(theme.colors.waveform_playhead),
-            beat_guides_for_region(
-                beat_guides,
-                active_selection_kind,
-                WaveformSelectionKind::Play,
-            ),
+            if let Some(paint) = paint {
+                Some((
+                    RegionBeatGuides::Snapped(paint),
+                    color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
+                ))
+            } else {
+                beat_guides_for_region(
+                    beat_guides,
+                    active_selection_kind,
+                    WaveformSelectionKind::Play,
+                )
+                .map(|(count, color)| (RegionBeatGuides::Uniform(count), color))
+            },
         ));
         if let Some(preview) = browser.waveform.as_ref() {
+            let tempo_label = paint.map(paint_tempo_label).or_else(|| {
+                tempo_resize.and_then(|capture| {
+                    let (start, end) = region.frame_bounds(capture.total_frames)?;
+                    yield_core::playmark_frame_tempo_label(
+                        end - start,
+                        capture.sample_rate,
+                        capture.beat_count,
+                    )
+                })
+            });
             bars = bars.child(playmark_timing::render_overlay(
                 region,
                 browser.waveform_viewport,
                 preview.total_frames,
                 preview.sample_rate,
-                browser
-                    .beat_guides_enabled
-                    .then_some(browser.beat_guide_count),
+                (browser.beat_guides_enabled && !snapped_paint).then_some(browser.beat_guide_count),
+                tempo_label,
                 color(theme.colors.waveform_playmark_label_background),
                 color(theme.colors.text_primary),
                 browser
@@ -1981,7 +2099,7 @@ pub(super) fn render_waveform(
             cx.listener(move |view, event: &ScrollWheelEvent, window, cx| {
                 let bounds = click_bounds_for_wheel.borrow().as_ref().copied();
                 window.focus(&view.waveform_focus_handle);
-                if view.handle_waveform_wheel(event, bounds) {
+                if view.handle_waveform_wheel(event, bounds, cx) {
                     cx.notify();
                 }
             }),
@@ -2042,7 +2160,7 @@ pub(super) fn render_waveform(
                 view.clear_waveform_fade_hover();
                 view.waveform_zoom_anchor_ratio =
                     view.waveform_viewport.absolute_ratio_from_visible(ratio);
-                let drag = begin_primary_waveform_drag_with_settings(
+                let mut drag = begin_primary_waveform_drag_with_settings(
                     view.waveform_play_region,
                     view.waveform_edit_region,
                     view.waveform_edit_settings,
@@ -2052,6 +2170,30 @@ pub(super) fn render_waveform(
                     view.waveform_viewport,
                     view.waveform_generation,
                 );
+                let modifiers = event.modifiers;
+                let tempo_modifier = if cfg!(target_os = "macos") {
+                    modifiers.platform
+                } else {
+                    modifiers.control
+                };
+                if tempo_modifier
+                    && !modifiers.shift
+                    && !modifiers.alt
+                    && !modifiers.function
+                    && let Some(preview) = view.waveform.as_ref()
+                {
+                    drag.capture_tempo_resize(
+                        preview.total_frames,
+                        preview.sample_rate,
+                        view.beat_guide_count,
+                    );
+                }
+                if view.bpm_snap_enabled
+                    && let Some(preview) = view.waveform.as_ref()
+                    && let Some(bpm) = bpm_snap_entry::effective_bpm(view)
+                {
+                    drag.capture_paint_grid(preview.total_frames, preview.sample_rate, bpm);
+                }
                 if matches!(drag.mode, WaveformRegionDragMode::Create { .. })
                     && let Some(preview) = view.waveform.as_ref()
                     && let Some(region) = view.waveform_play_region
@@ -2062,6 +2204,7 @@ pub(super) fn render_waveform(
                         preview.total_frames,
                         preview.sample_rate,
                         view.beat_guides_enabled.then_some(view.beat_guide_count),
+                        view.painted_tempo_label(),
                     )
                     && layout.rect.contains(&event.position)
                     && view.begin_playmark_timing_edit(window, cx)
@@ -2079,6 +2222,9 @@ pub(super) fn render_waveform(
                     )
                 {
                     return;
+                }
+                if drag.tempo_resize.is_some() {
+                    view.begin_playmark_tempo_audition();
                 }
                 view.waveform_region_drag = Some(drag);
                 cx.notify();
@@ -2127,12 +2273,25 @@ pub(super) fn render_waveform(
                 cx.notify();
             }),
         )
-        .on_drag(WaveformDragToken, |_, _, _, cx| {
-            cx.new(|_| WaveformDragGhost)
-        })
+        .on_drag(
+            WaveformDragToken(cx.entity().downgrade()),
+            |token, _, window, cx| {
+                // GPUI consumes the move that starts its active drag.
+                let position = window.mouse_position();
+                let _ = token.0.update(cx, |view, cx| {
+                    if view.waveform_region_drag.is_some_and(|drag| {
+                        drag.tempo_resize.is_some() || drag.paint_grid.is_some()
+                    }) && view.update_waveform_region_drag(position, Some(MouseButton::Left), cx)
+                    {
+                        cx.notify();
+                    }
+                });
+                cx.new(|_| WaveformDragGhost)
+            },
+        )
         .on_drag_move::<WaveformDragToken>(cx.listener(
             |view, event: &DragMoveEvent<WaveformDragToken>, _, cx| {
-                view.update_waveform_region_drag(event.event.position, Some(MouseButton::Left));
+                view.update_waveform_region_drag(event.event.position, Some(MouseButton::Left), cx);
                 zero_crossing::schedule_for_drag(view, cx);
                 cx.notify();
             },
@@ -2161,6 +2320,12 @@ pub(super) fn render_waveform(
 }
 
 impl Browser {
+    pub(super) fn painted_tempo_label(&self) -> Option<String> {
+        self.waveform_play_grid
+            .filter(|_| self.beat_guides_enabled)
+            .map(paint_tempo_label)
+    }
+
     pub(super) fn update_waveform_fade_hover(
         &mut self,
         position: Point<Pixels>,
@@ -2222,20 +2387,28 @@ impl Browser {
     }
 
     pub(super) fn clear_waveform_region(&mut self) {
+        self.held_playmark_slide = None;
+        self.playmark_resize_anchor = None;
         self.cancel_playmark_timing_edit();
         self.similar_sections.cancel();
         zero_crossing::cancel_for_interruption(self);
         self.waveform_play_region = None;
+        self.waveform_play_grid = None;
         self.waveform_edit_region = None;
         self.waveform_edit_settings = default_edit_settings();
         self.clear_waveform_fade_hover();
         self.waveform_region_drag = None;
+        self.playmark_tempo_audition = None;
         self.waveform_pan_drag = None;
         self.waveform_scrollbar_drag = None;
     }
 
     pub(super) fn set_waveform_play_region(&mut self, region: Option<WaveformPlayRegion>) {
+        self.waveform_play_grid = None;
         if self.waveform_play_region != region {
+            self.playmark_tempo.preserve_local_edit();
+            self.held_playmark_slide = None;
+            self.playmark_resize_anchor = None;
             self.cancel_playmark_timing_edit();
         }
         self.waveform_play_region = region;
@@ -2247,7 +2420,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> bool {
         let canceled_timing = self.cancel_playmark_timing_edit();
-        let had_region_drag = self.waveform_region_drag.take().is_some();
+        let had_region_drag = self.abandon_waveform_region_drag(cx);
         if had_region_drag {
             self.clear_waveform_fade_hover();
             cx.stop_active_drag(window);
@@ -2262,7 +2435,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> bool {
         let canceled_timing = self.cancel_playmark_timing_edit();
-        let had_region_drag = self.waveform_region_drag.take().is_some();
+        let had_region_drag = self.abandon_waveform_region_drag(cx);
         let had_pan_drag = self.waveform_pan_drag.take().is_some();
         let had_scrollbar_drag = self.waveform_scrollbar_drag.take().is_some();
         if had_region_drag {
@@ -2282,8 +2455,31 @@ impl Browser {
         canceled
     }
 
+    pub(super) fn abandon_waveform_region_drag(&mut self, cx: &mut Context<Self>) -> bool {
+        let abandoned = self.waveform_region_drag.take().is_some();
+        self.finish_playmark_tempo_audition(None, cx);
+        abandoned
+    }
+
+    pub(super) fn cancel_tempo_playmark_drag(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let canceled = self
+            .waveform_region_drag
+            .is_some_and(|drag| drag.tempo_resize.is_some() || drag.paint_grid.is_some())
+            && self.cancel_waveform_gestures(window, cx);
+        if canceled {
+            cx.notify();
+        }
+        canceled
+    }
+
     pub(super) fn invalidate_waveform_generation(&mut self) {
         played_ranges::clear_history(self);
+        self.bpm_snap_entry.invalidate();
+        self.playmark_tempo.invalidate();
         self.transient_markers.invalidate();
         self.waveform_generation = self.waveform_generation.wrapping_add(1);
         self.waveform_hover_cursor = None;
@@ -2354,6 +2550,7 @@ impl Browser {
         &mut self,
         event: &ScrollWheelEvent,
         bounds: Option<Bounds<Pixels>>,
+        cx: &mut Context<Self>,
     ) -> bool {
         let Some(preview) = self.waveform.as_ref() else {
             return false;
@@ -2394,13 +2591,13 @@ impl Browser {
         }
         self.cancel_playmark_timing_edit();
         self.waveform_viewport = next;
-        self.waveform_region_drag = None;
+        self.abandon_waveform_region_drag(cx);
         self.waveform_pan_drag = None;
         zero_crossing::cancel_for_interruption(self);
         true
     }
 
-    pub(super) fn zoom_waveform_to_selection(&mut self) -> bool {
+    pub(super) fn zoom_waveform_to_selection(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(preview) = self.waveform.as_ref() else {
             return false;
         };
@@ -2429,13 +2626,13 @@ impl Browser {
         }
         self.cancel_playmark_timing_edit();
         self.waveform_viewport = next;
-        self.waveform_region_drag = None;
+        self.abandon_waveform_region_drag(cx);
         self.waveform_pan_drag = None;
         zero_crossing::cancel_for_interruption(self);
         true
     }
 
-    pub(super) fn reset_waveform_viewport(&mut self) -> bool {
+    pub(super) fn reset_waveform_viewport(&mut self, cx: &mut Context<Self>) -> bool {
         if self.waveform.is_none() {
             return false;
         }
@@ -2445,38 +2642,46 @@ impl Browser {
         }
         self.cancel_playmark_timing_edit();
         self.waveform_viewport = next;
-        self.waveform_region_drag = None;
+        self.abandon_waveform_region_drag(cx);
         self.waveform_pan_drag = None;
         zero_crossing::cancel_for_interruption(self);
         true
     }
 
-    pub(super) fn slide_waveform_region(&mut self, direction: WaveformRegionSlide) -> bool {
-        zero_crossing::cancel_for_interruption(self);
-        let Some(region) = self.waveform_play_region else {
-            return false;
-        };
-        let Some(next) = (match direction {
-            WaveformRegionSlide::Left => region.slide_left(),
-            WaveformRegionSlide::Right => region.slide_right(),
-            WaveformRegionSlide::FineLeft | WaveformRegionSlide::FineRight => {
-                let Some(preview) = self.waveform.as_ref() else {
-                    return false;
-                };
-                region.nudged_by_frame(direction, preview.total_frames)
-            }
-        }) else {
-            return false;
-        };
-        if next == region {
-            return false;
+    pub(super) fn handle_playmark_slide(
+        &mut self,
+        direction: WaveformRegionSlide,
+        held: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fine = direction.is_fine();
+        if !fine
+            && held
+            && (!window.is_window_active() || self.held_playmark_slide != Some(direction))
+        {
+            return;
         }
-        self.cancel_playmark_timing_edit();
-        self.set_waveform_play_region(Some(next));
-        similar_sections::invalidate_if_stale(self);
-        let Some(preview) = self.waveform.as_ref() else {
-            return true;
+        let Some((region, preview)) = self.waveform_play_region.zip(self.waveform.as_ref()) else {
+            self.held_playmark_slide = None;
+            return;
         };
+        let total_frames = preview.total_frames;
+        let active_direction = (!fine).then_some(direction);
+        let Some(next) = region
+            .shifted_by_frames(direction, total_frames)
+            .filter(|next| *next != region)
+        else {
+            self.held_playmark_slide = None;
+            if !held && self.cancel_waveform_gestures(window, cx) {
+                cx.notify();
+            }
+            return;
+        };
+        self.cancel_waveform_gestures(window, cx);
+        self.set_waveform_play_region(Some(next));
+        self.held_playmark_slide = active_direction;
+        similar_sections::invalidate_if_stale(self);
         let viewport = self.waveform_viewport;
         let viewport_shift = if next.start < viewport.start {
             next.start - viewport.start
@@ -2486,34 +2691,56 @@ impl Browser {
             0.0
         };
         if viewport_shift.abs() > WAVEFORM_WHEEL_EPSILON {
-            self.waveform_viewport = viewport
-                .pan_by_visible_fraction(preview.total_frames, viewport_shift / viewport.width());
+            self.waveform_viewport =
+                viewport.pan_by_visible_fraction(total_frames, viewport_shift / viewport.width());
         }
-        true
+        if let Some(path) = self.playing_path.clone() {
+            match self.submit_playmark_timing_span(&path, next, cx) {
+                Some(Ok(())) if fine => {
+                    self.playback_status = "Fine selection nudge applying to playback".into();
+                }
+                Some(Err(error)) if fine => {
+                    self.playback_status = format!("Fine selection nudge unavailable: {error}");
+                }
+                Some(Err(error)) => {
+                    self.playback_status = format!("Selection move unavailable: {error}");
+                }
+                _ => {}
+            }
+        }
+        cx.notify();
     }
 
     pub(super) fn update_waveform_region_drag(
         &mut self,
         position: Point<Pixels>,
         pressed_button: Option<MouseButton>,
+        cx: &mut Context<Self>,
     ) -> bool {
         let Some(drag) = self.waveform_region_drag else {
             return false;
         };
-        if !waveform_drag_button_is_pressed(drag, pressed_button) {
-            self.waveform_region_drag = None;
+        if !waveform_drag_button_is_pressed(drag, pressed_button)
+            || !waveform_drag_is_current(drag, self.waveform_generation, self.waveform.is_some())
+        {
+            self.abandon_waveform_region_drag(cx);
             self.clear_waveform_fade_hover();
             zero_crossing::cancel_for_interruption(self);
             return true;
         }
-        if !waveform_drag_is_current(drag, self.waveform_generation, self.waveform.is_some()) {
-            self.waveform_region_drag = None;
-            self.clear_waveform_fade_hover();
-            zero_crossing::cancel_for_interruption(self);
-            return true;
-        }
-        if let Some(drag) = self.waveform_region_drag.as_mut() {
-            drag.update(position);
+        let mut drag = drag;
+        drag.update(position);
+        self.waveform_region_drag = Some(drag);
+        if drag.moved
+            && let Some(capture) = drag.tempo_resize
+        {
+            let baseline = self
+                .waveform_play_region
+                .and_then(|span| span.frame_bounds(capture.total_frames));
+            let preview = drag
+                .tempo_resize_region(capture)
+                .filter(|span| span.frame_bounds(capture.total_frames) != baseline);
+            self.preview_playmark_tempo_span(preview, capture.beat_count, cx);
         }
         true
     }
@@ -2533,6 +2760,7 @@ impl Browser {
             return;
         }
         if !waveform_drag_is_current(drag, self.waveform_generation, self.waveform.is_some()) {
+            self.finish_playmark_tempo_audition(None, cx);
             return;
         }
         let mut drag = drag;
@@ -2578,17 +2806,44 @@ impl Browser {
         } else if drag.is_handle_drag() {
             if drag.moved {
                 if let Some(region) = drag.preview_region_with_bpm(bpm_snap) {
+                    let tempo_span_changed = drag.tempo_resize.is_some_and(|capture| {
+                        self.waveform_play_region
+                            .and_then(|previous| previous.frame_bounds(capture.total_frames))
+                            != region.frame_bounds(capture.total_frames)
+                    });
+                    if tempo_span_changed
+                        && let Some(capture) = drag.tempo_resize
+                        && let Some((first, end)) = region.frame_bounds(capture.total_frames)
+                        && let Some(tempo) = SourcePlaymarkTempo::new(
+                            first as u64,
+                            end as u64,
+                            capture.total_frames as u64,
+                            capture.sample_rate,
+                            capture.beat_count,
+                        )
+                        && playmark_tempo::save_authored_tempo(self, tempo, cx)
+                    {
+                        self.finish_playmark_tempo_audition(None, cx);
+                        cx.notify();
+                        return;
+                    }
                     self.set_waveform_play_region(Some(region));
                     similar_sections::invalidate_if_stale(self);
-                    if drag.zero_crossing_applies(bpm_snap) {
+                    if tempo_span_changed && let Some(capture) = drag.tempo_resize {
+                        self.finish_playmark_tempo_audition(Some((region, capture.beat_count)), cx);
+                    } else if drag.zero_crossing_applies(bpm_snap) {
                         zero_crossing::commit_or_schedule(self, region, cx);
                     }
                 }
             }
         } else if drag.moved {
-            self.stop_playback();
-            if let Some(region) = drag.preview_region() {
+            let region = drag.preview_region();
+            if drag.paint_grid.is_none() || region.is_some() {
+                self.stop_playback();
+            }
+            if let Some(region) = region {
                 self.set_waveform_play_region(Some(region));
+                self.waveform_play_grid = drag.snapped_paint();
                 similar_sections::invalidate_if_stale(self);
                 if drag.zero_crossing_applies(bpm_snap) {
                     zero_crossing::commit_or_schedule(self, region, cx);
@@ -2599,6 +2854,7 @@ impl Browser {
             similar_sections::invalidate_if_stale(self);
             self.start_playback_from_position(ratio, cx);
         }
+        self.finish_playmark_tempo_audition(None, cx);
         cx.notify();
     }
 }
@@ -3186,12 +3442,35 @@ pub(super) fn waveform_region_navigation_key(
     }
 }
 
+#[derive(Clone, Copy)]
+enum RegionBeatGuides {
+    Uniform(u8),
+    Snapped(SnappedPlaymark),
+}
+
+fn paint_tempo_label(paint: SnappedPlaymark) -> String {
+    format!("{} BPM", paint.bpm())
+}
+
+fn snapped_guide_projection(
+    paint: SnappedPlaymark,
+    viewport: WaveformViewport,
+    limit: usize,
+) -> impl Iterator<Item = f64> {
+    let total = paint.total_frames() as f64;
+    let first = (viewport.start * total).floor() as usize;
+    let last = (viewport.end * total).ceil() as usize;
+    paint
+        .guide_frames((first, last), limit)
+        .filter_map(move |frame| viewport.visible_ratio_from_absolute(frame as f64 / total))
+}
+
 fn waveform_region_overlay(
     region: WaveformPlayRegion,
     viewport: WaveformViewport,
     selection_color: gpui::Hsla,
     edge_color: gpui::Hsla,
-    beat_guides: Option<(u8, gpui::Hsla)>,
+    beat_guides: Option<(RegionBeatGuides, gpui::Hsla)>,
 ) -> impl IntoElement {
     waveform_selection_overlay(
         region.start,
@@ -3241,7 +3520,7 @@ fn waveform_edit_region_overlay(
         EDIT_REGION_RESIZE_HANDLE_HEIGHT,
         EDIT_REGION_MOVE_GRIP_HEIGHT,
         EDIT_REGION_MOVE_GRIP_INSET,
-        beat_guides,
+        beat_guides.map(|(count, color)| (RegionBeatGuides::Uniform(count), color)),
     )
 }
 
@@ -3284,7 +3563,7 @@ fn waveform_selection_overlay(
     resize_handle_height: f32,
     move_grip_height: f32,
     move_grip_inset: f32,
-    beat_guides: Option<(u8, gpui::Hsla)>,
+    beat_guides: Option<(RegionBeatGuides, gpui::Hsla)>,
 ) -> impl IntoElement {
     canvas(
         move |_, _, _| (),
@@ -3309,15 +3588,13 @@ fn waveform_selection_overlay(
                 point(bounds.left() + px(end), bounds.bottom()),
             );
             window.paint_quad(fill(selection_bounds, selection_color));
-            if let Some((beat_count, guide_color)) = beat_guides {
+            if let Some((guides, guide_color)) = beat_guides {
                 let guide_width = BEAT_GUIDE_WIDTH.min(width);
                 let guide_height = (height * BEAT_GUIDE_HEIGHT_FRACTION)
                     .round()
                     .clamp(guide_width.min(height), height);
                 let guide_top = (height - guide_height) * 0.5;
-                for visible_ratio in
-                    beat_guide_projection(start_ratio, end_ratio, viewport, beat_count)
-                {
+                let paint_guide = |visible_ratio: f64| {
                     let center = width * visible_ratio as f32;
                     let left =
                         (center - guide_width * 0.5).clamp(0.0, (width - guide_width).max(0.0));
@@ -3329,6 +3606,16 @@ fn waveform_selection_overlay(
                         ),
                     );
                     window.paint_quad(fill(guide_bounds, guide_color));
+                };
+                match guides {
+                    RegionBeatGuides::Uniform(count) => {
+                        beat_guide_projection(start_ratio, end_ratio, viewport, count)
+                            .for_each(paint_guide);
+                    }
+                    RegionBeatGuides::Snapped(paint) => {
+                        let limit = (((end - start) / 3.0).floor() as usize).clamp(1, 1024);
+                        snapped_guide_projection(paint, viewport, limit).for_each(paint_guide);
+                    }
                 }
             }
             let edge_width = WAVEFORM_SELECTION_EDGE_WIDTH.min(width);
@@ -4603,6 +4890,153 @@ mod tests {
     }
 
     #[test]
+    fn tempo_resize_keeps_the_opposite_frame_and_skips_old_grid_snapping() {
+        let bounds = test_bounds(1000.0, 100.0);
+        let baseline = WaveformPlayRegion::new(0.25, 0.65).unwrap();
+        let snap = BpmSnapSettings {
+            enabled: true,
+            beat_count: 12,
+            audio_duration_seconds: 4.0,
+            constrain_to_audio: true,
+        };
+        for (handle, origin, target, expected) in [
+            (
+                WaveformRegionHandle::ResizeStart,
+                0.25,
+                0.15,
+                (28_800, 124_800),
+            ),
+            (
+                WaveformRegionHandle::ResizeEnd,
+                0.65,
+                0.75,
+                (48_000, 144_000),
+            ),
+        ] {
+            let mut drag = WaveformRegionDrag::begin_handle(
+                point(px((origin * 1000.0) as f32), px(50.0)),
+                origin,
+                bounds,
+                WaveformViewport::full(),
+                baseline,
+                handle,
+                1,
+            )
+            .unwrap();
+            drag.capture_tempo_resize(192_000, 48_000, 4);
+            drag.update(point(px((target * 1000.0) as f32), px(50.0)));
+            assert_eq!(
+                drag.preview_region_with_bpm(snap)
+                    .unwrap()
+                    .frame_bounds(192_000),
+                Some(expected)
+            );
+            assert_eq!(drag.tempo_resize.unwrap().beat_count, 4);
+            assert!(!drag.zero_crossing_applies(snap));
+        }
+    }
+
+    #[gpui::test]
+    fn command_handle_previews_without_committing_until_release(cx: &mut gpui::TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, _| window.activate_window());
+        let baseline = WaveformPlayRegion::new(0.25, 0.5).unwrap();
+        browser.update(cx, |view, _| {
+            view.waveform = Some(yield_media::WaveformPreview {
+                peaks: vec![0.5; 8],
+                bands: Vec::new(),
+                duration_seconds: 4.0,
+                sample_rate: 48_000,
+                total_frames: 192_000,
+                detail_context: None,
+            });
+            view.waveform_play_region = Some(baseline);
+            view.beat_guide_count = 4;
+        });
+        cx.refresh().unwrap();
+        let bounds = cx.debug_bounds("waveform").unwrap();
+        let at = |fraction: f32| {
+            point(
+                bounds.left() + bounds.size.width * fraction,
+                bounds.top() + px(2.0),
+            )
+        };
+        let mut modifier = gpui::Modifiers::none();
+        if cfg!(target_os = "macos") {
+            modifier.platform = true;
+        } else {
+            modifier.control = true;
+        }
+        for abort in [
+            Some("escape"),
+            Some("blur"),
+            Some("pointer loss"),
+            Some("viewport"),
+            None,
+        ] {
+            cx.simulate_mouse_down(at(0.5), MouseButton::Left, modifier);
+            // Render the newly focused waveform before exercising the keyboard/focus routes.
+            cx.refresh().unwrap();
+            cx.simulate_mouse_move(at(0.75), MouseButton::Left, gpui::Modifiers::none());
+            browser.read_with(cx, |view, _| {
+                let drag = view.waveform_region_drag.unwrap();
+                assert_eq!(drag.tempo_resize.unwrap().beat_count, 4);
+                assert_eq!(
+                    drag.preview_region_with_bpm(view.bpm_snap_settings())
+                        .unwrap()
+                        .frame_bounds(192_000),
+                    Some((48_000, 144_000))
+                );
+                assert_eq!(view.waveform_play_region, Some(baseline));
+                assert!(view.playmark_tempo_audition.is_none());
+                assert!(view.playback_init_intent.is_none());
+            });
+            match abort {
+                Some("escape") => cx.simulate_keystrokes("escape"),
+                Some("blur") => {
+                    cx.update(|window, app| {
+                        window.focus(&browser.read(app).search_input.read(app).focus_handle());
+                    });
+                    cx.refresh().unwrap();
+                }
+                Some("pointer loss") => {
+                    browser.update(cx, |view, cx| {
+                        assert!(view.update_waveform_region_drag(at(0.75), None, cx));
+                    });
+                }
+                Some("viewport") => {
+                    browser.update(cx, |view, cx| {
+                        assert!(view.zoom_waveform_to_selection(cx));
+                        assert!(view.reset_waveform_viewport(cx));
+                    });
+                }
+                _ => {}
+            }
+            if let Some(reason) = abort {
+                browser.read_with(cx, |view, _| {
+                    assert!(
+                        view.waveform_region_drag.is_none(),
+                        "{reason} should cancel"
+                    );
+                });
+            }
+            cx.simulate_mouse_up(at(0.75), MouseButton::Left, gpui::Modifiers::none());
+            browser.read_with(cx, |view, _| {
+                assert!(view.waveform_region_drag.is_none());
+                assert_eq!(
+                    view.waveform_play_region.unwrap().frame_bounds(192_000),
+                    Some(if abort.is_some() {
+                        (48_000, 96_000)
+                    } else {
+                        (48_000, 144_000)
+                    })
+                );
+            });
+        }
+    }
+
+    #[test]
     fn beat_guide_projection_returns_bounded_internal_divisions() {
         let region = WaveformPlayRegion::new(0.0, 1.0).unwrap();
         let viewport = WaveformViewport::full();
@@ -4637,6 +5071,20 @@ mod tests {
             beat_guide_projection(outside_region.start, outside_region.end, viewport, 4,).count(),
             0
         );
+    }
+
+    #[test]
+    fn snapped_guide_projection_uses_exact_frames_in_a_zoomed_viewport() {
+        let grid = PlaymarkBeatGrid::new(100, 200, 17, 300.0).unwrap();
+        let paint = grid.snap(117, false).unwrap();
+        let viewport = WaveformViewport {
+            start: 106.0 / 200.0,
+            end: 112.0 / 200.0,
+        };
+        let positions: Vec<_> = snapped_guide_projection(paint, viewport, 8).collect();
+        assert_eq!(positions.len(), 2);
+        assert!((positions[0] - 1.0 / 6.0).abs() < 1e-12);
+        assert!((positions[1] - 4.0 / 6.0).abs() < 1e-12);
     }
 
     #[test]
@@ -4808,30 +5256,58 @@ mod tests {
     }
 
     #[test]
+    fn playmark_slide_takes_only_full_width_steps_in_playback_frames() {
+        let total = 103;
+        let mut region = WaveformPlayRegion::new(5.0 / 103.0, 14.0 / 103.0).unwrap();
+        assert!(
+            region
+                .shifted_by_frames(WaveformRegionSlide::Left, total)
+                .is_none()
+        );
+        for start in (1..=9).map(|step| 5 + 9 * step) {
+            region = region
+                .shifted_by_frames(WaveformRegionSlide::Right, total)
+                .expect("one full playmark-width slide");
+            assert_eq!(playback_frames(region, total), (start, start + 9));
+        }
+        assert!(
+            region
+                .shifted_by_frames(WaveformRegionSlide::Right, total)
+                .is_none()
+        );
+        for start in (0..9).rev().map(|step| 5 + 9 * step) {
+            region = region
+                .shifted_by_frames(WaveformRegionSlide::Left, total)
+                .expect("one full playmark-width slide");
+            assert_eq!(playback_frames(region, total), (start, start + 9));
+        }
+    }
+
+    #[test]
     fn fine_region_nudges_preserve_exact_frames_and_clamp_without_repeat_drift() {
         let mut region = WaveformPlayRegion::new(0.2, 0.4).expect("play region");
         for start in 201..=800 {
             region = region
-                .nudged_by_frame(WaveformRegionSlide::FineRight, 1_000)
+                .shifted_by_frames(WaveformRegionSlide::FineRight, 1_000)
                 .expect("one-frame nudge");
             assert_eq!(playback_frames(region, 1_000), (start, start + 200));
         }
         let right_edge = region
-            .nudged_by_frame(WaveformRegionSlide::FineRight, 1_000)
+            .shifted_by_frames(WaveformRegionSlide::FineRight, 1_000)
             .expect("clamped nudge");
         assert_eq!(right_edge, region);
         for start in (0..800).rev() {
             region = region
-                .nudged_by_frame(WaveformRegionSlide::FineLeft, 1_000)
+                .shifted_by_frames(WaveformRegionSlide::FineLeft, 1_000)
                 .expect("one-frame nudge");
             assert_eq!(playback_frames(region, 1_000), (start, start + 200));
         }
         assert_eq!(
-            region.nudged_by_frame(WaveformRegionSlide::FineLeft, 1_000),
+            region.shifted_by_frames(WaveformRegionSlide::FineLeft, 1_000),
             Some(region)
         );
         assert_eq!(
-            region.nudged_by_frame(WaveformRegionSlide::FineRight, 0),
+            region.shifted_by_frames(WaveformRegionSlide::FineRight, 0),
             None
         );
 
@@ -4845,7 +5321,7 @@ mod tests {
             .expect("frame-aligned region");
             let before = playback_frames(region, total_frames);
             let nudged = region
-                .nudged_by_frame(WaveformRegionSlide::FineRight, total_frames)
+                .shifted_by_frames(WaveformRegionSlide::FineRight, total_frames)
                 .expect("one-frame nudge");
             let after = playback_frames(nudged, total_frames);
             assert_eq!(after.0, before.0 + 1);

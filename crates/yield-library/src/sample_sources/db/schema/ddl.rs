@@ -282,6 +282,42 @@ const BASE_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS metadata (
         duration_seconds REAL NOT NULL,
         sr_used INTEGER NOT NULL
     ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS source_transient_cache (
+        insertion_order INTEGER PRIMARY KEY,
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        detector_version TEXT NOT NULL CHECK(length(detector_version) BETWEEN 1 AND 64),
+        preset TEXT NOT NULL CHECK(length(preset) BETWEEN 1 AND 32),
+        payload BLOB NOT NULL CHECK(length(payload) BETWEEN 4 AND 8196 AND length(payload) % 4 = 0),
+        digest BLOB NOT NULL CHECK(length(digest) = 32),
+        UNIQUE(content_hash, detector_version, preset)
+    );
+    CREATE TABLE IF NOT EXISTS source_playmark_tempo (
+        path TEXT PRIMARY KEY,
+        file_identity TEXT NOT NULL CHECK(length(file_identity) BETWEEN 1 AND 512),
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        first_frame INTEGER NOT NULL CHECK(first_frame >= 0),
+        end_frame INTEGER NOT NULL CHECK(end_frame > first_frame),
+        source_frames INTEGER NOT NULL CHECK(source_frames >= end_frame),
+        sample_rate INTEGER NOT NULL CHECK(sample_rate BETWEEN 1 AND 4294967295),
+        beat_count INTEGER NOT NULL CHECK(beat_count BETWEEN 1 AND 255),
+        FOREIGN KEY(path) REFERENCES wav_files(path) ON UPDATE CASCADE ON DELETE CASCADE
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS source_playmark_grid_tempo (
+        path TEXT PRIMARY KEY,
+        file_identity TEXT NOT NULL CHECK(length(file_identity) BETWEEN 1 AND 512),
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        milli_bpm INTEGER NOT NULL CHECK(typeof(milli_bpm) = 'integer' AND milli_bpm BETWEEN 1000 AND 1000000),
+        FOREIGN KEY(path) REFERENCES wav_files(path) ON UPDATE CASCADE ON DELETE CASCADE
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS source_keep_promotion_candidates (
+        path TEXT PRIMARY KEY,
+        file_identity TEXT CHECK(length(CAST(file_identity AS BLOB)) BETWEEN 1 AND 1024),
+        content_hash TEXT CHECK(length(CAST(content_hash AS BLOB)) = 64),
+        file_size INTEGER NOT NULL,
+        modified_ns INTEGER NOT NULL,
+        accepted_source_revision INTEGER NOT NULL CHECK(accepted_source_revision > 0),
+        FOREIGN KEY(path) REFERENCES wav_files(path) ON DELETE CASCADE
+    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS analysis_cache_embeddings (
         content_hash TEXT NOT NULL,
         analysis_version TEXT NOT NULL,
@@ -397,12 +433,6 @@ const INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_wav_files_missing
          ON wav_files(extension);
      CREATE INDEX IF NOT EXISTS idx_source_index_entries_classification_path
          ON source_index_entries(classification, path);
-     CREATE INDEX IF NOT EXISTS idx_source_content_audit_forward_path
-         ON wav_files(path)
-         WHERE missing = 0
-           AND extension IN ('wav')
-           AND path NOT GLOB '._*'
-           AND path NOT GLOB '*/._*';
      CREATE INDEX IF NOT EXISTS idx_source_content_audit_retry_due
          ON source_content_audit_entries(COALESCE(retry_at, 0), path)
          WHERE skip_reason IS NOT NULL;
@@ -471,5 +501,14 @@ pub(super) fn apply_base_schema(connection: &Connection) -> Result<(), SourceDbE
 /// Create all supporting indices used by the source database.
 pub(super) fn apply_indices(connection: &Connection) -> Result<(), SourceDbError> {
     connection.execute_batch(INDEX_SQL).map_err(map_sql_error)?;
+    // The existing audit index can contain a previous format predicate.
+    let filter =
+        crate::sample_sources::supported_audio_where_clause().replace(" AND ", "\n           AND ");
+    connection
+        .execute_batch(&format!(
+            "DROP INDEX IF EXISTS idx_source_content_audit_forward_path;
+             CREATE INDEX idx_source_content_audit_forward_path\n         ON wav_files(path)\n         WHERE missing = 0\n           AND {filter};"
+        ))
+        .map_err(map_sql_error)?;
     Ok(())
 }

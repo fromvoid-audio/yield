@@ -122,9 +122,12 @@ The Name header's Disk/Label control switches between filename stems and ordered
 tag labels. Labels load for visible rows and fall back to the filename when absent.
 This display choice does not rename files or change their selection or sort order.
 
-The normal browser, audition, and waveform previews support WAV files. Waveforms
-cover the full file with cancellable, bounded-memory decoding, zoom and pan,
-play-region selection, and a playback cursor. Play regions can be moved, resized,
+The browser, audition, and waveform overview support WAV and uncompressed
+8-, 16-, 24-, and 32-bit AIFF PCM (`.aiff` and `.aif`). Overview decoding covers
+the full file with bounded memory and supports cancellation, zoom, pan,
+play-region selection, and a playback cursor. Fine waveform detail, random
+sections that use fine detail, and waveform edits currently require WAV.
+Play regions can be moved, resized,
 or shifted with the keyboard. The BPM toggle snaps resized regions to whole BPM
 values, using the adjacent beat-count field (2–32 beats). The separate beat-guide
 toggle divides the selected region visually, including during resizing and zoom.

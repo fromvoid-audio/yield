@@ -830,6 +830,32 @@ that validation did not leak fixture sources into the real startup profile.
    so the session writes to the dedicated `sandbox` profile instead of the live
    profile.
 
+### Linux installed desktop qualification
+
+Use the exact optimized [Linux test artifact](LINUX_TEST_BUILD.md) in an isolated
+desktop session. Record
+its Yield version, commit and SHA-256, plus the distribution, architecture,
+session type, desktop environment, filesystem, credential provider and audio
+output device. Use a disposable `YIELD_CONFIG_HOME` and a copied WAV fixture
+folder. Record a result and evidence for each row. If a prerequisite is
+unavailable, record which operation was blocked and its reported status.
+
+| Check | Expected evidence |
+| --- | --- |
+| Install and first launch | Verify the package checksum and launch through the installed desktop entry. Record the visible app version and the disposable profile resolved by `scripts/doctor.sh --installed`. |
+| Source add and scan | Add the fixture folder, wait for its samples to appear and reopen Yield. Confirm the same source and sample count return. Add a new fixture WAV externally and confirm the list refreshes. |
+| Audio and waveform | Audition a mono and stereo WAV on the selected output. Listen for start, stop and loop behavior. Drag a waveform selection and compare extraction with the selected range. Record any operation that reports unavailable. |
+| File manager and handoff | Reveal and open a fixture file in the system file manager. Paste one supported clipboard payload and drop one file into an eligible Yield target. Drag a selected sample out to the file manager and confirm the resulting file opens. |
+| Trash and recovery | Trash only a fixture copy. Confirm the file lands in the configured trash location, the browser updates and restoration recovers the expected bytes. |
+| Secure storage and support | Use the synthetic Linux Secret Service probe in [Troubleshooting](TROUBLESHOOTING.md#keyring-failures). Generate a Linux support archive, verify its single status member and inspect the latest log locally. |
+| Update and uninstall | Check the installed version against the intended channel. Follow the package removal steps and confirm the launcher is removed while the disposable settings and source fixture remain. |
+
+Use [GPUI local CI](GPUI_LOCAL_CI.md) for source-build and headless regression
+checks. Keep those results separate from the installed desktop evidence above.
+Record pending packaging and public download verification in
+[Yield #2083](https://pulse.iocore.dev/#/issues/2083) and
+[Yield #2084](https://pulse.iocore.dev/#/issues/2084).
+
 ### Windows ZIP Distribution Lifecycle
 
 Windows releases are distributed as downloadable ZIP artifacts. A supported

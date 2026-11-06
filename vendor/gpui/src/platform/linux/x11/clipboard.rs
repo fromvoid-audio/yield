@@ -49,6 +49,9 @@ use x11rb::{
 
 use crate::{ClipboardItem, Image, ImageFormat, hash};
 
+#[cfg(target_os = "linux")]
+use super::super::file_clipboard::FileClipboardPayload;
+
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 static CLIPBOARD: Mutex<Option<GlobalClipboard>> = parking_lot::const_mutex(None);
@@ -77,7 +80,8 @@ x11rb::atom_manager! {
         TEXT_MIME_UNKNOWN: b"text/plain",
 
         // HTML: b"text/html",
-        // URI_LIST: b"text/uri-list",
+        URI_LIST: b"text/uri-list",
+        GNOME_COPIED_FILES: b"x-special/gnome-copied-files",
 
         PNG__MIME: ImageFormat::mime_type(ImageFormat::Png ).as_bytes(),
         JPEG_MIME: ImageFormat::mime_type(ImageFormat::Jpeg).as_bytes(),
@@ -238,6 +242,9 @@ impl Inner {
         }
 
         let server_win = self.server.win_id;
+        let selection_state = self.selection_of(selection);
+        // A request delivered immediately after SetSelectionOwner must wait for the new bytes.
+        let mut data_guard = selection_state.data.write();
 
         // ICCCM version 2, section 2.6.1.3 states that we should re-assert ownership whenever data
         // changes.
@@ -249,28 +256,26 @@ impl Inner {
         self.server.conn.flush().map_err(into_unknown)?;
 
         // Just setting the data, and the `serve_requests` will take care of the rest.
-        let selection = self.selection_of(selection);
-        let mut data_guard = selection.data.write();
         *data_guard = Some(data);
 
         // Lock the mutex to both ensure that no wakers of `data_changed` can wake us between
         // dropping the `data_guard` and calling `wait[_for]` and that we don't we wake other
         // threads in that position.
-        let mut guard = selection.mutex.lock();
+        let mut guard = selection_state.mutex.lock();
 
         // Notify any existing waiting threads that we have changed the data in the selection.
         // It is important that the mutex is locked to prevent this notification getting lost.
-        selection.data_changed.notify_all();
+        selection_state.data_changed.notify_all();
 
         match wait {
             WaitConfig::None => {}
             WaitConfig::Forever => {
                 drop(data_guard);
-                selection.data_changed.wait(&mut guard);
+                selection_state.data_changed.wait(&mut guard);
             }
             WaitConfig::Until(deadline) => {
                 drop(data_guard);
-                selection.data_changed.wait_until(&mut guard, deadline);
+                selection_state.data_changed.wait_until(&mut guard, deadline);
             }
         }
 
@@ -862,9 +867,13 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
                 // notifying us that we should delete our data now.
                 log::trace!("Somebody else owns the clipboard now");
 
-                if let Some(selection) = context.kind_of(event.selection) {
-                    let selection = context.selection_of(selection);
+                if let Some(kind) = context.kind_of(event.selection) {
+                    let selection = context.selection_of(kind);
                     let mut data_guard = selection.data.write();
+                    // A queued clear for the previous copy cannot erase a reacquired selection.
+                    if context.is_owner(kind)? {
+                        continue;
+                    }
                     *data_guard = None;
 
                     // It is important that this mutex is locked at the time of calling
@@ -986,6 +995,30 @@ impl Clipboard {
             format: self.inner.atoms.UTF8_STRING,
         }];
         self.inner.write(data, selection, wait)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn set_file_list(&self, payload: FileClipboardPayload) -> Result<()> {
+        // Clipboard replies use one ChangeProperty request. Leave room for its header and
+        // padding within the server's core request limit.
+        let max_request_bytes =
+            usize::from(self.inner.server.conn.setup().maximum_request_length) * 4;
+        let max_property_bytes = max_request_bytes.saturating_sub(28);
+        if payload.uri_list.len().max(payload.gnome_copied_files.len()) > max_property_bytes {
+            return Err(Error::unknown("File clipboard URLs exceed the X11 server limit"));
+        }
+        let data = vec![
+            ClipboardData {
+                bytes: payload.uri_list,
+                format: self.inner.atoms.URI_LIST,
+            },
+            ClipboardData {
+                bytes: payload.gnome_copied_files,
+                format: self.inner.atoms.GNOME_COPIED_FILES,
+            },
+        ];
+        self.inner
+            .write(data, ClipboardKind::Clipboard, WaitConfig::None)
     }
 
     #[allow(unused)]

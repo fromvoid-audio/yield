@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use gpui::{
-    ClickEvent, Context, DragMoveEvent, Entity, MouseButton, MouseDownEvent, MouseUpEvent, Render,
-    Window, div, prelude::*, px, uniform_list,
+    ClickEvent, Context, DragMoveEvent, Entity, ExternalPaths, MouseButton, MouseDownEvent,
+    MouseUpEvent, Render, Window, div, prelude::*, px, uniform_list,
 };
 use yield_design::Theme;
 use yield_library::sample_sources::SourceId;
@@ -241,7 +241,7 @@ pub(super) fn render(
                 .justify_center()
                 .text_size(px(theme.typography.body_size))
                 .text_color(color(theme.colors.text_muted))
-                .child("No sources")
+                .child("Drop source folders here")
         }
     } else {
         let pending_slots = usize::from(pending_source.is_some());
@@ -936,7 +936,17 @@ pub(super) fn render(
                         ),
                 ),
         )
-        .child(source_list)
+        .child(
+            source_list
+                .id("external-source-drop")
+                .drag_over::<ExternalPaths>({
+                    let fill = color(theme.colors.selection_hover_fill);
+                    move |style, _, _, _| style.bg(fill)
+                })
+                .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
+                    view.accept_external_source_drop(paths.paths(), cx);
+                })),
+        )
         .child(
             div()
                 .flex_none()

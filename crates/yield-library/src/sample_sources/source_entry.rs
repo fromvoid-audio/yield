@@ -7,6 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use super::db::{DB_FILE_NAME, LEGACY_DB_FILE_NAME};
 use super::{is_apple_double_sidecar, is_recognized_audio, is_supported_audio};
 
 /// Version of the source format-classification policy persisted with index-only rows.
@@ -277,13 +278,13 @@ fn is_source_database_artifact(relative_path: &Path) -> bool {
     let Some(name) = relative_path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    [".yield.db", ".yield_samples.db"]
-        .iter()
+    [DB_FILE_NAME, LEGACY_DB_FILE_NAME, ".wavecrate.db"]
+        .into_iter()
         .any(|database_name| {
-            name == *database_name
-                || ["-wal", "-shm", "-journal"]
-                    .iter()
-                    .any(|suffix| name == format!("{database_name}{suffix}"))
+            matches!(
+                name.strip_prefix(database_name),
+                Some("" | "-wal" | "-shm" | "-journal")
+            )
         })
 }
 
@@ -464,10 +465,17 @@ mod tests {
             ".yield.db",
             ".yield.db-wal",
             ".yield_samples.db-shm",
+            ".wavecrate.db",
+            ".wavecrate.db-wal",
+            "nested/.wavecrate.db-shm",
+            ".wavecrate.db-journal",
             "nested/._loop.flac",
         ] {
             assert!(is_rejected_source_file_path(Path::new(path)), "{path}");
         }
         assert!(!is_rejected_source_file_path(Path::new("nested/loop.flac")));
+        assert!(!is_rejected_source_file_path(Path::new(
+            ".wavecrate.db.wav"
+        )));
     }
 }

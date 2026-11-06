@@ -10,6 +10,18 @@ pub const MAX_PLAYMARK_TIMING_CHARACTERS: usize = 64;
 
 const PLAYMARK_LENGTH_USAGE: &str = "Use a value such as 1000ms, 1.5s, 1min, or 142bpm";
 
+/// Format the tempo implied by a positive beat count and exact sample-frame span.
+pub fn playmark_frame_tempo_label(frames: usize, sample_rate: u32, beats: u8) -> Option<String> {
+    if frames == 0 || sample_rate == 0 || beats == 0 {
+        return None;
+    }
+    let bpm = f64::from(beats) * 60.0 * f64::from(sample_rate) / frames as f64;
+    if bpm < 0.01 {
+        return Some(format!("{bpm} BPM"));
+    }
+    format_waveform_bpm_input(bpm).map(|bpm| format!("{bpm} BPM"))
+}
+
 /// Format a playmark's duration, or its beat-guide tempo when beat_count is enabled.
 ///
 /// The duration calculation intentionally uses f32 arithmetic to match the native waveform
@@ -28,13 +40,22 @@ pub fn playmark_selection_label(
 
     if let Some(beat_count) = beat_count.filter(|count| *count > 0) {
         let bpm = f32::from(beat_count) * 60.0 / duration_seconds;
-        return format_waveform_bpm_input(bpm).map(|bpm| format!("{bpm} BPM"));
+        return format_waveform_bpm_input(f64::from(bpm)).map(|bpm| format!("{bpm} BPM"));
     }
 
     Some(format_selection_duration(duration_seconds))
 }
 
-/// Parse a playmark duration and return frame bounds anchored at the current start edge.
+/// A playmark timing edit resolved to source frames.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ParsedPlaymarkTiming {
+    /// First frame and exclusive end frame.
+    pub frame_range: (usize, usize),
+    /// Whether the user entered a tempo in BPM.
+    pub authored_tempo: bool,
+}
+
+/// Parse a playmark duration or tempo and return frame bounds anchored at the current start edge.
 ///
 /// Supported inputs are milliseconds (ms), seconds (s), minutes (m or min), compound values such
 /// as 2m 5s, and beats-per-minute (bpm) when beat_count is positive. Whitespace and letter case
@@ -46,7 +67,7 @@ pub fn parse_playmark_frame_range(
     total_frames: usize,
     beat_count: u8,
     current: WaveformRegion,
-) -> Result<(usize, usize), String> {
+) -> Result<ParsedPlaymarkTiming, String> {
     if text.chars().nth(MAX_PLAYMARK_TIMING_CHARACTERS).is_some() {
         return Err(format!(
             "Playmark length must be {MAX_PLAYMARK_TIMING_CHARACTERS} characters or fewer"
@@ -56,7 +77,7 @@ pub fn parse_playmark_frame_range(
         return Err(String::from("The loaded sample has no audio frames"));
     }
 
-    let seconds = parse_length_seconds(text, beat_count)?;
+    let (seconds, authored_tempo) = parse_length_seconds(text, beat_count)?;
     let requested_frames = (seconds * f64::from(sample_rate.max(1))).round();
     if !requested_frames.is_finite() || requested_frames < 1.0 {
         return Err(String::from(
@@ -66,10 +87,13 @@ pub fn parse_playmark_frame_range(
     let requested_frames = requested_frames as usize;
     let (start, _) = normalized_frame_bounds(current, total_frames);
     let end = start.saturating_add(requested_frames).min(total_frames);
-    Ok((start, end))
+    Ok(ParsedPlaymarkTiming {
+        frame_range: (start, end),
+        authored_tempo,
+    })
 }
 
-fn parse_length_seconds(text: &str, beat_count: u8) -> Result<f64, String> {
+fn parse_length_seconds(text: &str, beat_count: u8) -> Result<(f64, bool), String> {
     let compact = text
         .chars()
         .filter(|character| !character.is_whitespace())
@@ -82,7 +106,7 @@ fn parse_length_seconds(text: &str, beat_count: u8) -> Result<f64, String> {
                 "Set a positive beat count before entering BPM",
             ));
         }
-        return Ok(f64::from(beat_count) * 60.0 / bpm);
+        return Ok((f64::from(beat_count) * 60.0 / bpm, true));
     }
 
     let mut remaining = compact.as_str();
@@ -118,7 +142,7 @@ fn parse_length_seconds(text: &str, beat_count: u8) -> Result<f64, String> {
     if components == 0 || !seconds.is_finite() || seconds <= 0.0 {
         return Err(String::from("Playmark length must be positive and finite"));
     }
-    Ok(seconds)
+    Ok((seconds, false))
 }
 
 fn positive_number(text: &str) -> Result<f64, String> {
@@ -175,7 +199,7 @@ fn format_selection_duration(seconds: f32) -> String {
     format!("{minutes}m {remaining:05.2}s")
 }
 
-fn format_waveform_bpm_input(value: f32) -> Option<String> {
+fn format_waveform_bpm_input(value: f64) -> Option<String> {
     if !value.is_finite() || value <= 0.0 {
         return None;
     }
@@ -193,6 +217,25 @@ mod tests {
 
     fn region(start: f64, end: f64) -> WaveformRegion {
         WaveformRegion::new(start, end).expect("non-empty region")
+    }
+
+    #[test]
+    fn frame_tempo_formats_precisely_and_rejects_empty_inputs() {
+        assert_eq!(
+            playmark_frame_tempo_label(96_000, 48_000, 4).as_deref(),
+            Some("120 BPM")
+        );
+        assert_eq!(
+            playmark_frame_tempo_label(192_000, 48_000, 8).as_deref(),
+            Some("120 BPM")
+        );
+        assert_eq!(
+            playmark_frame_tempo_label(80_640, 48_000, 4).as_deref(),
+            Some("142.86 BPM")
+        );
+        assert_eq!(playmark_frame_tempo_label(0, 48_000, 4), None);
+        assert_eq!(playmark_frame_tempo_label(1, 0, 4), None);
+        assert_eq!(playmark_frame_tempo_label(1, 48_000, 0), None);
     }
 
     #[test]
@@ -233,30 +276,39 @@ mod tests {
 
     #[test]
     fn parses_supported_time_and_bpm_forms_case_insensitively() {
-        assert_eq!(parse_length_seconds(" 1000 MS ", 4), Ok(1.0));
-        assert_eq!(parse_length_seconds("1.5s", 4), Ok(1.5));
-        assert_eq!(parse_length_seconds("1 MIN", 4), Ok(60.0));
-        assert_eq!(parse_length_seconds("2m 05.00s", 4), Ok(125.0));
-        assert_eq!(parse_length_seconds("120 bpm", 4), Ok(2.0));
+        assert_eq!(parse_length_seconds(" 1000 MS ", 4), Ok((1.0, false)));
+        assert_eq!(parse_length_seconds("1.5s", 4), Ok((1.5, false)));
+        assert_eq!(parse_length_seconds("1 MIN", 4), Ok((60.0, false)));
+        assert_eq!(parse_length_seconds("2m 05.00s", 4), Ok((125.0, false)));
+        assert_eq!(parse_length_seconds("120 bpm", 4), Ok((2.0, true)));
     }
 
     #[test]
     fn parses_duration_from_the_floored_current_start_and_clamps_eof() {
         assert_eq!(
             parse_playmark_frame_range("0.4s", 1_000, 1_000, 4, region(0.2505, 0.95)),
-            Ok((250, 650))
+            Ok(ParsedPlaymarkTiming {
+                frame_range: (250, 650),
+                authored_tempo: false,
+            })
         );
         assert_eq!(
             parse_playmark_frame_range("2s", 1_000, 1_000, 4, region(0.85, 0.95)),
-            Ok((850, 1_000))
+            Ok(ParsedPlaymarkTiming {
+                frame_range: (850, 1_000),
+                authored_tempo: false,
+            })
         );
     }
 
     #[test]
     fn bpm_duration_rounds_to_nearest_frame() {
         assert_eq!(
-            parse_playmark_frame_range("120bpm", 1_000, 2_000, 4, region(0.1, 0.2)),
-            Ok((200, 2_000))
+            parse_playmark_frame_range(" 140 BpM ", 1_000, 2_000, 4, region(0.1, 0.2)),
+            Ok(ParsedPlaymarkTiming {
+                frame_range: (200, 1_914),
+                authored_tempo: true,
+            })
         );
     }
 
@@ -309,7 +361,10 @@ mod tests {
                 4,
                 current
             ),
-            Ok((200, 1_000))
+            Ok(ParsedPlaymarkTiming {
+                frame_range: (200, 1_000),
+                authored_tempo: false,
+            })
         );
     }
 }

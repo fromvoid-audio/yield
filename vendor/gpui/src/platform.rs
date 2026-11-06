@@ -372,6 +372,10 @@ pub(crate) trait Platform: 'static {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn write_to_primary(&self, item: ClipboardItem);
     fn write_to_clipboard(&self, item: ClipboardItem);
+    #[cfg(target_os = "linux")]
+    fn write_files_to_clipboard(&self, _paths: &[PathBuf]) -> Result<()> {
+        Err(anyhow::anyhow!("File copy is unavailable on this Linux desktop backend"))
+    }
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
