@@ -120,7 +120,8 @@ pub use similarity_query::{
 };
 pub use transient_dispatch::{SourceTransientRequest, TransientRequestFailure};
 pub use transient_job::{
-    ComputedTransientJob, PreparedTransientJob, TransientJobError, prepare_transient_job,
+    ComputedTransientJob, PreparedTransientJob, TransientCacheUse, TransientJobError,
+    TransientJobOutcome, prepare_transient_job,
 };
 pub use yield_analysis::aspects::SimilarityAspect;
 pub use yield_analysis::transients::{TransientMarkers, TransientPreset};
@@ -1560,7 +1561,7 @@ pub enum CatalogEvent {
         /// Retained cancellation through queued delivery.
         cancellation: FeatureAnalysisCancellation,
         /// Frame-domain result or refusal from the retained Source.
-        result: Result<yield_analysis::transients::TransientMarkers, TransientRequestFailure>,
+        result: Result<TransientJobOutcome, TransientRequestFailure>,
     },
     /// One request's truthful state; ready requires validated durable feature bytes.
     FeatureAnalysisState {

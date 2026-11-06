@@ -3,10 +3,9 @@ mod fixtures {
     use super::super::*;
     use yield_analysis::transients::TransientPreset;
 
-    fn setup() -> (Fixture, CatalogService, SourceId, u64) {
-        let fixture = Fixture::new("transient-dispatch");
+    fn write_attacks(path: &Path, total_frames: u32, attacks: [u32; 2]) {
         let mut writer = hound::WavWriter::create(
-            fixture.root.path().join("attacks.wav"),
+            path,
             hound::WavSpec {
                 channels: 1,
                 sample_rate: 16_000,
@@ -15,15 +14,20 @@ mod fixtures {
             },
         )
         .unwrap();
-        for frame in 0..16_000 {
-            let sample: i16 = match frame {
-                1237 => 24_000,
-                9673 => -24_000,
-                _ => 0,
-            };
+        for frame in 0..total_frames {
+            let sample: i16 = if attacks.contains(&frame) { 24_000 } else { 0 };
             writer.write_sample(sample).unwrap();
         }
         writer.finalize().unwrap();
+    }
+
+    fn setup() -> (Fixture, CatalogService, SourceId, u64) {
+        let fixture = Fixture::new("transient-dispatch");
+        write_attacks(
+            &fixture.root.path().join("attacks.wav"),
+            16_000,
+            [1237, 9673],
+        );
         let source = SourceId::from_string("transient-dispatch");
         let service = CatalogService::start(&fixture.guard).unwrap();
         let snapshot = register_and_audit(&service, fixture.root.path(), &source);
@@ -54,6 +58,94 @@ mod fixtures {
         .unwrap()
     }
 
+    fn run_request(
+        service: &CatalogService,
+        source: &SourceId,
+        revision: u64,
+        id: u64,
+        preset: TransientPreset,
+    ) -> TransientJobOutcome {
+        let request =
+            SourceTransientRequest::new(source, 1, revision, id, Path::new("attacks.wav"), preset)
+                .unwrap();
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request,
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        let CatalogEvent::TransientMarkersCompleted { result, .. } =
+            delivery(service, id).into_event_if_live().unwrap()
+        else {
+            panic!("expected transient completion");
+        };
+        result.unwrap()
+    }
+
+    #[test]
+    fn transient_cache_hits_after_reopen_and_misses_for_a_new_preset() {
+        let (fixture, service, source, revision) = setup();
+        let first = run_request(&service, &source, revision, 1, TransientPreset::Normal);
+        assert_eq!(first.cache, TransientCacheUse::MissStored);
+        assert_eq!(first.markers.frames(), [1237, 9673]);
+        service.shutdown();
+
+        let reopened = CatalogService::start(&fixture.guard).unwrap();
+        let snapshot = register_and_audit(&reopened, fixture.root.path(), &source);
+        let same = run_request(
+            &reopened,
+            &source,
+            snapshot.committed_revision,
+            2,
+            TransientPreset::Normal,
+        );
+        assert_eq!(same.cache, TransientCacheUse::Hit);
+        assert_eq!(same.markers.frames(), first.markers.frames());
+        let high = run_request(
+            &reopened,
+            &source,
+            snapshot.committed_revision,
+            3,
+            TransientPreset::High,
+        );
+        assert_eq!(high.cache, TransientCacheUse::MissStored);
+        assert_eq!(high.markers.preset(), TransientPreset::High);
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn transient_cache_recomputes_after_audited_content_changes() {
+        let (fixture, service, source, revision) = setup();
+        let first = run_request(&service, &source, revision, 1, TransientPreset::Normal);
+        assert_eq!(first.cache, TransientCacheUse::MissStored);
+        let file = fixture.root.path().join("attacks.wav");
+        write_attacks(&file, 17_000, [2041, 10_779]);
+        let new_bytes = fs::read(&file).unwrap();
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id: source.clone(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        let CatalogEvent::AuditCommitted { snapshot } = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::AuditCommitted { .. })
+        }) else {
+            unreachable!();
+        };
+        assert!(snapshot.committed_revision > revision);
+        let result = run_request(
+            &service,
+            &source,
+            snapshot.committed_revision,
+            2,
+            TransientPreset::Normal,
+        );
+        assert_eq!(result.cache, TransientCacheUse::MissStored);
+        assert_eq!(result.markers.frames(), [2041, 10_779]);
+        assert_eq!(fs::read(&file).unwrap(), new_bytes);
+        service.shutdown();
+    }
+
     #[test]
     fn transient_dispatch_returns_exact_frames_and_refunds_payload_credit() {
         let (_fixture, service, source, revision) = setup();
@@ -74,7 +166,7 @@ mod fixtures {
             panic!("expected transient completion");
         };
         assert_eq!(delivered, request);
-        assert_eq!(result.unwrap().frames(), [1237, 9673]);
+        assert_eq!(result.unwrap().markers.frames(), [1237, 9673]);
         wait_for_tag_read_payload(&service, 0);
         wait_for_tag_page_input_release(&service);
         service.shutdown();

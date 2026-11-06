@@ -212,7 +212,9 @@ mod fixtures {
         )
         .unwrap();
         let computed = thread::spawn(move || job.compute()).join().unwrap();
-        let markers = computed.finish(&writer).unwrap();
+        let outcome = computed.finish(&writer).unwrap();
+        assert_eq!(outcome.cache, crate::TransientCacheUse::MissStored);
+        let markers = outcome.markers;
         assert_eq!(markers.frames(), [1237, 9673]);
         assert_eq!(markers.source_frames(), 16_000);
         assert_eq!(markers.preset(), TransientPreset::Normal);

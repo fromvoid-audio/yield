@@ -1,7 +1,7 @@
 //! One bounded transient request on the retained Catalog background worker.
 
 use super::*;
-use yield_analysis::transients::{MAX_TRANSIENT_MARKERS, TransientMarkers, TransientPreset};
+use yield_analysis::transients::{MAX_TRANSIENT_MARKERS, TransientPreset};
 use yield_library::sample_sources::readiness::SourceFeatureInputError;
 
 const MAX_SOURCE_BYTES: usize = 256;
@@ -196,7 +196,7 @@ fn execute(
     writer: &SourceWriter,
     request: &SourceTransientRequest,
     cancellation: &FeatureAnalysisCancellation,
-) -> Result<TransientMarkers, TransientRequestFailure> {
+) -> Result<TransientJobOutcome, TransientRequestFailure> {
     let revision = writer
         .current_revision()
         .map_err(|_| TransientRequestFailure::StaleSource)?;

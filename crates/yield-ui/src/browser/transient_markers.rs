@@ -11,7 +11,7 @@ use yield_library::sample_sources::SourcePublicationFence;
 use yield_media::{WaveformDetailContext, WaveformFileRevision};
 use yield_session::{
     CatalogCommand, CatalogEvent, FeatureAnalysisCancellation, SourceTransientRequest,
-    TransientMarkers, TransientPreset, TransientRequestFailure,
+    TransientCacheUse, TransientMarkers, TransientPreset, TransientRequestFailure,
 };
 
 use super::{Browser, catalog, catalog_metadata::CatalogMetadataContext};
@@ -268,22 +268,39 @@ pub(super) fn apply_catalog_event(
                 && matches!(active.result, ResultState::Pending)
         });
     if !current || cancellation.is_cancelled() {
+        tracing::debug!(
+            request_id = request.request_id(),
+            "Discarded stale transient result"
+        );
         return true;
     }
     let result = std::mem::replace(result, Err(TransientRequestFailure::Cancelled));
     let (state, status) = match result {
-        Ok(markers)
-            if markers.preset() == request.preset()
+        Ok(outcome)
+            if outcome.markers.preset() == request.preset()
                 && browser.waveform.as_ref().is_some_and(|waveform| {
-                    waveform.total_frames == markers.source_frames() as usize
+                    waveform.total_frames == outcome.markers.source_frames() as usize
                 }) =>
         {
             if let Some(fence) = fence.filter(SourcePublicationFence::is_live) {
-                let status = if markers.frames().is_empty() {
+                let markers = outcome.markers;
+                let mut status = if markers.frames().is_empty() {
                     String::from("No transients found")
                 } else {
                     format!("{} transient markers", markers.frames().len())
                 };
+                match outcome.cache {
+                    TransientCacheUse::Hit => status.push_str(" · cached"),
+                    TransientCacheUse::MissStored => {}
+                    TransientCacheUse::MissUnstored => status.push_str(" · cache unavailable"),
+                }
+                tracing::debug!(
+                    request_id = request.request_id(),
+                    cache = ?outcome.cache,
+                    marker_count = markers.frames().len(),
+                    elapsed_ms = outcome.elapsed.as_millis() as u64,
+                    "Transient analysis ready"
+                );
                 (
                     ResultState::Ready {
                         markers: Arc::new(markers),
@@ -296,7 +313,14 @@ pub(super) fn apply_catalog_event(
             }
         }
         Ok(_) => unavailable(TransientRequestFailure::StaleSource),
-        Err(error) => unavailable(error),
+        Err(error) => {
+            tracing::debug!(
+                request_id = request.request_id(),
+                ?error,
+                "Transient analysis unavailable"
+            );
+            unavailable(error)
+        }
     };
     if let Some(active) = browser.transient_markers.active.as_mut() {
         active.result = state;
@@ -611,6 +635,14 @@ mod tests {
             let markers = current_markers(view).unwrap();
             assert_eq!(markers.preset(), TransientPreset::High);
             assert_eq!(markers.frames(), [2000, 7000, 12000]);
+            assert_eq!(view.playback_status, "3 transient markers");
+            toggle(view, cx);
+            toggle(view, cx);
+        });
+        let cached = next_delivery(cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(cached, cx));
+            assert_eq!(view.playback_status, "3 transient markers · cached");
             view.catalog_metadata
                 .advance_projection_revision(snapshot.committed_revision + 1);
             assert!(current_markers(view).is_none());

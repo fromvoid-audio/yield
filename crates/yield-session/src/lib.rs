@@ -79,7 +79,8 @@ use maintenance::{
 };
 use vocabulary::VocabularySlot;
 pub use yield_catalog::{
-    SourceTransientRequest, TransientMarkers, TransientPreset, TransientRequestFailure,
+    SourceTransientRequest, TransientCacheUse, TransientMarkers, TransientPreset,
+    TransientRequestFailure,
 };
 
 pub use maintenance::{
