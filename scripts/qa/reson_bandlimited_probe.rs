@@ -1,4 +1,7 @@
-// Standalone qualification for the exact Reson filter and streaming state.
+// Standalone qualification for the exact Reson filter, stream and output routing.
+#[allow(dead_code)]
+#[path = "../../crates/reson/src/source/output_adapter.rs"]
+mod output_adapter;
 #[path = "../../crates/reson/src/source/resample_kernel.rs"]
 mod resample_kernel;
 #[path = "../../crates/reson/src/source/streaming_resampler.rs"]
@@ -8,10 +11,77 @@ mod streaming_resampler;
 #[path = "../../crates/reson/src/test_support.rs"]
 mod test_support;
 
+use output_adapter::{BandLimitedOutputAdapter, StereoOutputPair};
 #[cfg(test)]
 use resample_kernel::ResampleKernel;
 use std::f64::consts::TAU;
+#[cfg(test)]
 use streaming_resampler::StreamingResampler;
+
+// The adapter's Source boundary, so the probe can compile without a device backend.
+#[allow(dead_code)]
+trait Source: Iterator<Item = f32> + Send {
+    fn current_frame_len(&self) -> Option<usize>;
+    fn channels(&self) -> u16;
+    fn sample_rate(&self) -> u32;
+    fn total_duration(&self) -> Option<std::time::Duration>;
+    fn last_error(&self) -> Option<String> {
+        None
+    }
+}
+
+struct StereoPcm<'a> {
+    rate: u32,
+    frames: &'a [[f32; 2]],
+    sample: usize,
+}
+
+impl Iterator for StereoPcm<'_> {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let frame = self.frames.get(self.sample / 2)?;
+        let sample = frame[self.sample % 2];
+        self.sample += 1;
+        Some(sample)
+    }
+}
+
+impl Source for StereoPcm<'_> {
+    fn current_frame_len(&self) -> Option<usize> {
+        Some(self.frames.len() * 2 - self.sample)
+    }
+
+    fn channels(&self) -> u16 {
+        2
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+fn stereo_output(
+    input: &[[f32; 2]],
+    source_rate: u32,
+    target_rate: u32,
+) -> BandLimitedOutputAdapter<StereoPcm<'_>> {
+    BandLimitedOutputAdapter::new(
+        StereoPcm {
+            rate: source_rate,
+            frames: input,
+            sample: 0,
+        },
+        target_rate,
+        2,
+        StereoOutputPair::default(),
+    )
+    .unwrap()
+}
 
 const RATE_PAIRS: [(u32, u32); 6] = [
     (44_100, 48_000),
@@ -34,11 +104,16 @@ fn sine(source_rate: u32, hz: f64) -> Vec<[f32; 2]> {
 
 fn measure_tone(source_rate: u32, target_rate: u32, hz: f64) -> (f64, f64, f64) {
     let input = sine(source_rate, hz);
-    let stream = StreamingResampler::new(input.into_iter(), source_rate, target_rate).unwrap();
+    let mut output = stereo_output(&input, source_rate, target_rate);
     let count = target_rate as usize / 20;
     let skip = target_rate as usize / 10;
     let (mut power, mut sine_sum, mut cosine_sum) = (0.0, 0.0, 0.0);
-    for (frame, [left, right]) in stream.enumerate().skip(skip).take(count) {
+    for frame in 0..skip + count {
+        let left = output.next().unwrap();
+        let right = output.next().unwrap();
+        if frame < skip {
+            continue;
+        }
         assert_eq!(left, -right);
         let sample = f64::from(left);
         let phase = TAU * hz * frame as f64 / f64::from(target_rate);
@@ -85,24 +160,23 @@ fn main() {
         let mut cpu = [0.0; 20];
         for (preparation, rendering) in prep.iter_mut().zip(&mut cpu) {
             let start = Instant::now();
-            let mut stream =
-                StreamingResampler::new(input.iter().copied(), source_rate, target_rate).unwrap();
+            let mut output = stereo_output(&input, source_rate, target_rate);
             *preparation = start.elapsed().as_secs_f64() * 1_000.0;
+            let position = output.rendered_position();
             let start = Instant::now();
             let mut count = 0;
-            for frame in stream.by_ref() {
-                black_box(frame);
+            for sample in output.by_ref() {
+                black_box(sample);
                 count += 1;
             }
             *rendering = start.elapsed().as_secs_f64() * 1_000.0;
-            assert_eq!(count, target_rate);
-            assert_eq!(stream.next_source_position(), (u64::from(source_rate), 0));
-            assert_eq!(stream.input().len(), 0);
+            assert_eq!(count, 2 * target_rate);
+            assert_eq!(position.source_frame(), u64::from(source_rate));
         }
         prep.sort_by(f64::total_cmp);
         cpu.sort_by(f64::total_cmp);
         println!(
-            "{source_rate}->{target_rate} deviation={deviation:.5} dB residual={residual:.2} dB stop={stop:.2} dB prep_p95={:.3} ms stream_p95={:.3} ms per 1 s",
+            "{source_rate}->{target_rate} deviation={deviation:.5} dB residual={residual:.2} dB stop={stop:.2} dB prep_p95={:.3} ms routed_p95={:.3} ms per 1 s",
             prep[18], cpu[18]
         );
     }
@@ -113,7 +187,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stream_meets_spectral_targets_across_common_and_interpolated_pairs() {
+    fn routed_output_meets_spectral_targets_across_common_and_interpolated_pairs() {
         for (source_rate, target_rate) in RATE_PAIRS.into_iter().chain([(48_001, 44_100)]) {
             let (deviation, residual, stop) = spectral_limits(source_rate, target_rate);
             assert!(
