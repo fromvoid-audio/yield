@@ -17,6 +17,7 @@ use gpui::{
     prelude::*,
 };
 use yield_core::{AudioFile, AudioFileId, BrowserRow, BrowserSelection};
+use yield_library::sample_sources::is_rejected_source_file_path;
 use yield_library::sample_sources::reconciliation::RootIdentity;
 use yield_platform::{
     FileDragCompletion, FileDragError, FileDragHandle, MAX_FILE_DRAG_FILES,
@@ -250,6 +251,7 @@ enum PreparationError {
     OutsideRoot,
     MissingFile,
     NonRegularFile,
+    ReservedSourceArtifact,
     RelativePath,
     TooMany { actual: usize },
     PathBytesTooLarge { actual: usize },
@@ -265,6 +267,9 @@ impl std::fmt::Display for PreparationError {
             }
             Self::MissingFile => formatter.write_str("one or more dragged files disappeared"),
             Self::NonRegularFile => formatter.write_str("a dragged entry is not a regular file"),
+            Self::ReservedSourceArtifact => {
+                formatter.write_str("a dragged path is reserved for source bookkeeping")
+            }
             Self::RelativePath => formatter.write_str("a dragged path is not absolute"),
             Self::TooMany { actual } => write!(
                 formatter,
@@ -1107,6 +1112,9 @@ fn prepare_drag(
 }
 
 fn validate_drag_target(target: &DragTarget, root: &Path) -> Result<(), PreparationError> {
+    if is_rejected_source_file_path(&target.path) {
+        return Err(PreparationError::ReservedSourceArtifact);
+    }
     let metadata = fs::symlink_metadata(&target.path).map_err(|_| PreparationError::MissingFile)?;
     if !metadata.file_type().is_file() {
         return Err(PreparationError::NonRegularFile);
@@ -1347,6 +1355,20 @@ mod tests {
         assert_eq!(
             prepare_drag(intent, Arc::new(AtomicBool::new(false))),
             Err(PreparationError::MissingFile)
+        );
+    }
+
+    #[test]
+    fn preparation_rejects_a_reserved_source_database_artifact() {
+        let directory = tempdir().unwrap();
+        let metadata = directory.path().join(".wavecrate.db-shm");
+        fs::write(&metadata, b"private fixture").unwrap();
+        let entries = vec![audio_file(metadata)];
+        let intent = intent_for_entries(&entries, 1, directory.path());
+
+        assert_eq!(
+            prepare_drag(intent, Arc::new(AtomicBool::new(false))),
+            Err(PreparationError::ReservedSourceArtifact)
         );
     }
 
