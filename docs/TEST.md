@@ -832,7 +832,8 @@ that validation did not leak fixture sources into the real startup profile.
 
 ### Linux installed desktop qualification
 
-Use the exact optimized Linux artifact in an isolated desktop session. Record
+Use the exact optimized [Linux test artifact](LINUX_TEST_BUILD.md) in an isolated
+desktop session. Record
 its Yield version, commit and SHA-256, plus the distribution, architecture,
 session type, desktop environment, filesystem, credential provider and audio
 output device. Use a disposable `YIELD_CONFIG_HOME` and a copied WAV fixture
