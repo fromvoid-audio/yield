@@ -21,6 +21,7 @@ pub(crate) use self::output_adapter::{
 };
 pub use self::repeat::RepeatInfinite;
 pub use self::samples_buffer::SamplesBuffer;
+pub(crate) use self::streaming_resampler::supports_band_limited_rate_conversion;
 
 /// Trait for audio sources that can provide interleaved samples.
 ///

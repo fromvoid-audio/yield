@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::SamplesBuffer;
 use crate::async_decode::AsyncDecodeDiagnostics;
+use crate::source::supports_band_limited_rate_conversion;
 use crate::telemetry;
 use crate::timebase::{frames_to_seconds, seconds_to_frames_round};
 use crate::{AsyncSource, Source};
@@ -24,7 +25,7 @@ mod loop_mode;
 mod span_edge_fade;
 mod span_samples;
 use loop_mode::LiveLoopModeSource;
-pub(super) use loop_mode::LoopModeHandle;
+pub(super) use loop_mode::{LoopModeHandle, ResampledLoopModeSource};
 use span_edge_fade::StaticSpanEdgeFadeSource;
 use span_samples::{SpanSamplesMode, SpanSamplesSource};
 #[cfg(test)]
@@ -472,6 +473,10 @@ impl AudioPlayer {
         let mut active_playback_span = None;
         let mut diagnostics = None;
         let mode = LoopModeHandle::new(looped, plan.frame_count(), plan.seek_offset_frames());
+        let rate_conversion = match rate_conversion {
+            PlaybackRateConversion::Linear => self.lazy_rate_conversion(sample_rate, &mode),
+            conversion => conversion,
+        };
         let final_source: Box<dyn Source<Item = f32> + Send> = if looped {
             let diagnostic: Box<dyn Source<Item = f32> + Send> = if let Some(samples) =
                 self.playback_samples.as_ref().cloned()
@@ -554,7 +559,9 @@ impl AudioPlayer {
             active_playback_span.clone(),
             self.metronome_mix_override.clone(),
         );
-        let final_source: Box<dyn Source<Item = f32> + Send> = if self.playback_samples.is_none() {
+        let final_source: Box<dyn Source<Item = f32> + Send> = if self.playback_samples.is_none()
+            && matches!(rate_conversion, PlaybackRateConversion::Linear)
+        {
             Box::new(LiveLoopModeSource::new(final_source, mode.clone()))
         } else {
             final_source
@@ -689,6 +696,7 @@ impl AudioPlayer {
         let mut active_playback_span = None;
         let mut diagnostics = None;
         let mode = LoopModeHandle::new(true, plan.frame_count(), plan.seek_offset_frames());
+        let rate_conversion = self.lazy_rate_conversion(sample_rate, &mode);
         let diagnostic: Box<dyn Source<Item = f32> + Send> = if let Some(samples) =
             self.playback_samples.as_ref().cloned()
         {
@@ -739,19 +747,17 @@ impl AudioPlayer {
             active_playback_span.clone(),
             self.metronome_mix_override.clone(),
         );
-        let diagnostic: Box<dyn Source<Item = f32> + Send> = if self.playback_samples.is_none() {
+        let diagnostic: Box<dyn Source<Item = f32> + Send> = if self.playback_samples.is_none()
+            && matches!(rate_conversion, PlaybackRateConversion::Linear)
+        {
             Box::new(LiveLoopModeSource::new(diagnostic, mode.clone()))
         } else {
             diagnostic
         };
         log_playback_stage("source_construction", source_started_at, source_kind, true);
 
-        let (handle, format) = self.build_sink_with_fade(
-            diagnostic,
-            replace_policy,
-            diagnostics,
-            PlaybackRateConversion::Linear,
-        )?;
+        let (handle, format) =
+            self.build_sink_with_fade(diagnostic, replace_policy, diagnostics, rate_conversion)?;
         let finish_started_at = playback_stage_started();
         self.finish_span_playback(&plan, Some(plan.seek_offset_frames()));
         self.active_playback_span = active_playback_span;
@@ -816,6 +822,22 @@ impl AudioPlayer {
             .as_ref()
             .map(AudioPlaybackSource::kind)
             .unwrap_or("none")
+    }
+
+    fn lazy_rate_conversion(
+        &self,
+        source_rate: u32,
+        mode: &LoopModeHandle,
+    ) -> PlaybackRateConversion {
+        let target_rate = self.output.sample_rate.max(1);
+        if self.playback_samples.is_none()
+            && source_rate != target_rate
+            && supports_band_limited_rate_conversion(source_rate, target_rate)
+        {
+            PlaybackRateConversion::BandLimitedTransport(mode.clone())
+        } else {
+            PlaybackRateConversion::Linear
+        }
     }
 
     fn prepare_async_source<S: Source + 'static>(
