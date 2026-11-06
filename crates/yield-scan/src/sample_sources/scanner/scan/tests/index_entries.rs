@@ -18,10 +18,23 @@ fn full_scan_persists_typed_index_only_entries_across_restart() {
     std::fs::write(directory.path().join("unsupported.flac"), b"flac").unwrap();
     std::fs::write(directory.path().join("notes.txt"), b"notes").unwrap();
     std::fs::write(directory.path().join("._sidecar.flac"), b"sidecar").unwrap();
+    std::fs::write(directory.path().join(".wavecrate.db"), b"private fixture").unwrap();
+    std::fs::write(
+        directory.path().join(".wavecrate.db-wal"),
+        b"private sidecar",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join(".wavecrate.db.wav"), b"wav").unwrap();
 
     let database = open_maintained_scan_database(directory.path()).unwrap();
     scan_once(&database).unwrap();
-    assert_eq!(database.list_files().unwrap().len(), 1);
+    assert_eq!(database.list_files().unwrap().len(), 2);
+    assert!(
+        database
+            .entry_for_path(Path::new(".wavecrate.db.wav"))
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(
         typed_paths(&database),
         vec![
