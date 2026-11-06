@@ -149,6 +149,79 @@ fn async_source_returns_silence_on_underrun() {
     assert_eq!(second, 0.5);
 }
 
+fn controlled_stereo_ring() -> (ringbuf::HeapProd<f32>, AsyncSource<TestSource>) {
+    let (producer, consumer) = HeapRb::<f32>::new(4).split();
+    let source = AsyncSource {
+        consumer: Some(consumer),
+        sample_rate: 48_000,
+        channels: 2,
+        total_duration: None,
+        worker: None,
+        done: Arc::new(AtomicBool::new(false)),
+        stop: Arc::new(AtomicBool::new(false)),
+        last_error: Arc::new(Mutex::new(None)),
+        output_remaining: 0,
+        output_silence: false,
+        _marker: PhantomData,
+    };
+    (producer, source)
+}
+
+#[test]
+fn async_source_recovers_a_partial_stereo_frame_in_channel_order() {
+    let (mut producer, mut source) = controlled_stereo_ring();
+    let allocation_counts = crate::test_support::count_thread_allocations_and_deallocations(|| {
+        producer.try_push(0.25).unwrap();
+        assert_eq!(source.next(), Some(0.0));
+        producer.try_push(-0.25).unwrap();
+        assert_eq!(source.next(), Some(0.0));
+        assert_eq!(source.next(), Some(0.25));
+        assert_eq!(source.next(), Some(-0.25));
+    });
+    assert_eq!(allocation_counts, (0, 0));
+}
+
+#[test]
+fn async_source_finishes_silence_then_drains_final_frames_and_partial_tail() {
+    let (mut producer, mut source) = controlled_stereo_ring();
+    assert_eq!(source.next(), Some(0.0));
+    for sample in [0.25, -0.25, 0.5] {
+        producer.try_push(sample).unwrap();
+    }
+    source.done.store(true, Ordering::Release);
+    assert_eq!(source.current_frame_len(), Some(4));
+    assert_eq!(source.next(), Some(0.0));
+    assert_eq!(source.current_frame_len(), Some(3));
+    assert_eq!(source.next(), Some(0.25));
+    assert_eq!(source.next(), Some(-0.25));
+    assert_eq!(source.next(), Some(0.5));
+    assert_eq!(source.current_frame_len(), Some(0));
+    assert_eq!(source.next(), None);
+}
+
+#[test]
+fn async_source_tiny_buffer_still_prefills_one_stereo_frame() {
+    let source = TestSource {
+        samples: vec![0.25, -0.25],
+        pos: 0,
+        sample_rate: 1,
+        channels: 2,
+        delay: Duration::ZERO,
+        error: None,
+        panic_at: None,
+        start_barrier: None,
+        start_barrier_waited: false,
+        dropped: None,
+    };
+    let mut source = AsyncSource::with_buffer_seconds(source, 0.01);
+    assert_eq!(
+        source.prefill_for_duration(Duration::from_secs(1), Duration::from_millis(100)),
+        2
+    );
+    assert_eq!(source.next(), Some(0.25));
+    assert_eq!(source.next(), Some(-0.25));
+}
+
 #[test]
 fn async_source_prefill_waits_for_samples() {
     let source = TestSource {
