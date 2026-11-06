@@ -1,16 +1,18 @@
 use std::{
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Weak},
 };
 
 use rusqlite::params;
 
+use super::super::curation::validate_curation_preconditions;
 use super::{
-    RootRelativePath, SourceRevision, SourceWriter, SourceWriterError, map_sql_error,
-    normalize_relative_path,
+    RootRelativePath, SourceDatabase, SourceDbError, SourceRevision, SourceWriter,
+    SourceWriterError, map_sql_error, normalize_relative_path,
 };
 use crate::sample_sources::{
-    db::SourceIndexInspectionError,
+    db::{META_LAST_AUTHORITATIVE_AUDIT_REVISION, SourceIndexInspectionError, SourceManifestEntry},
     readiness::{
         FEATURE_INPUT_MAX_BYTES, FeatureArtifactClaim, InputPermit, PendingSourceContentInput,
         PreparedSourceContentDigest, SourceFeatureInput, SourceFeatureInputError as InputError,
@@ -124,6 +126,90 @@ impl SourceWriter {
             return Err(InputError::Changed.into());
         }
         Ok(())
+    }
+
+    /// Enrich a live pending manifest row using only a digest from its held input.
+    ///
+    /// The directory generation and audit remain authoritative at the new
+    /// revision because the path, identity and observed file facts are unchanged.
+    pub fn commit_pending_content_digest(
+        &self,
+        proof: PreparedSourceContentDigest,
+        cancel: &AtomicBool,
+    ) -> Result<(SourceRevision, SourceManifestEntry), SourceWriterError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(InputError::Cancelled.into());
+        }
+        let input = &proof.input;
+        self.validate_audio_input(input)?;
+        let mut revision = input.revision.clone();
+        let path = normalize_relative_path(proof.relative_path().as_path())?;
+        let hash = proof.digest().to_string();
+        let previous = revision.revision;
+        let next = previous.checked_add(1).ok_or(SourceDbError::Unexpected)?;
+        let next_sql = i64::try_from(next).map_err(|_| SourceDbError::Unexpected)?;
+        let previous_sql = i64::try_from(previous).map_err(|_| SourceDbError::Unexpected)?;
+
+        let batch = self.database.write_batch()?;
+        let tx = batch.curation_transaction();
+        crate::sqlite_wal::enforce_wal_admission(tx).map_err(SourceDbError::from)?;
+        let generation = validate_curation_preconditions(
+            tx,
+            previous,
+            &revision.root_identity,
+            std::slice::from_ref(&path),
+        )?;
+        let generation = i64::try_from(generation).map_err(|_| SourceDbError::Unexpected)?;
+        let updated = tx
+            .execute(
+                "UPDATE wav_files SET content_hash = ?1
+                 WHERE path = ?2 AND missing = 0 AND file_identity = ?3
+                   AND file_size = ?4 AND modified_ns = ?5 AND content_hash IS NULL",
+                params![hash, path, input.identity, input.size, input.modified],
+            )
+            .map_err(map_sql_error)?;
+        if updated != 1 {
+            return Err(InputError::Changed.into());
+        }
+        SourceDatabase::bump_revision(tx)?;
+        SourceDatabase::bump_wav_identities_revision(tx)?;
+        let directory_updated = tx
+            .execute(
+                "UPDATE source_directory_generations SET published_source_revision = ?1
+                 WHERE generation = ?2 AND status = 'active' AND published_source_revision = ?3",
+                params![next_sql, generation, previous_sql],
+            )
+            .map_err(map_sql_error)?;
+        let audit_updated = tx
+            .execute(
+                "UPDATE metadata SET value = ?1 WHERE key = ?2 AND value = ?3",
+                params![
+                    next.to_string(),
+                    META_LAST_AUTHORITATIVE_AUDIT_REVISION,
+                    previous.to_string()
+                ],
+            )
+            .map_err(map_sql_error)?;
+        if directory_updated != 1 || audit_updated != 1 || batch.get_revision()? != next {
+            return Err(SourceDbError::Unexpected.into());
+        }
+        input.validate()?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(InputError::Cancelled.into());
+        }
+        batch.commit_curation_prepared()?;
+
+        revision.revision = next;
+        Ok((
+            revision,
+            SourceManifestEntry {
+                relative_path: proof.relative_path().as_path().to_path_buf(),
+                file_identity: Some(input.identity.clone()),
+                content_hash: Some(hash),
+                file_size: input.size,
+                modified_ns: input.modified,
+            },
+        ))
     }
 
     fn prepare_audited_audio_input(
