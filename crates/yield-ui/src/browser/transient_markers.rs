@@ -826,6 +826,8 @@ mod tests {
         let (browser, cx) = install(cx, &path, preview);
         browser.update(cx, |view, cx| {
             install_source(view, root, &snapshot);
+            // This fixture holds raw marker deliveries while changing presets.
+            view.playmark_tempo.preserve_local_edit();
             toggle(view, cx);
         });
         let old = next_delivery(cx);
