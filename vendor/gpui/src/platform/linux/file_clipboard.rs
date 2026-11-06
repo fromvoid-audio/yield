@@ -1,3 +1,5 @@
+#[cfg(feature = "wayland")]
+use std::sync::Arc;
 use std::{
     os::unix::ffi::OsStrExt,
     path::{Component, PathBuf},
@@ -12,6 +14,30 @@ const MAX_BYTES: usize = 1024 * 1024;
 pub(super) struct FileClipboardPayload {
     pub(super) uri_list: Vec<u8>,
     pub(super) gnome_copied_files: Vec<u8>,
+}
+
+#[cfg(feature = "wayland")]
+pub(super) struct WaylandFileOffer([(&'static str, Arc<[u8]>); 2]);
+
+#[cfg(feature = "wayland")]
+impl WaylandFileOffer {
+    pub(super) const MIME_TYPES: [&'static str; 2] =
+        ["text/uri-list", "x-special/gnome-copied-files"];
+
+    pub(super) fn new(payload: FileClipboardPayload) -> Self {
+        let [uri, gnome] = Self::MIME_TYPES;
+        Self([
+            (uri, payload.uri_list.into()),
+            (gnome, payload.gnome_copied_files.into()),
+        ])
+    }
+
+    pub(super) fn bytes_for(&self, mime: &str) -> Option<Arc<[u8]>> {
+        self.0
+            .iter()
+            .find(|(offered, _)| *offered == mime)
+            .map(|(_, bytes)| Arc::clone(bytes))
+    }
 }
 
 impl FileClipboardPayload {
@@ -79,5 +105,28 @@ mod tests {
         assert!(FileClipboardPayload::from_paths(&vec!["/a".into(); MAX_FILES + 1]).is_err());
         let encoded_too_large = PathBuf::from(format!("/{}", " ".repeat(MAX_BYTES / 2)));
         assert!(FileClipboardPayload::from_paths(&[encoded_too_large]).is_err());
+    }
+
+    #[cfg(feature = "wayland")]
+    #[test]
+    fn wayland_clipboard_sources_keep_their_own_exact_mime_bytes() {
+        let first = WaylandFileOffer::new(
+            FileClipboardPayload::from_paths(&["/audio/one.wav".into()]).unwrap(),
+        );
+        let second = WaylandFileOffer::new(
+            FileClipboardPayload::from_paths(&["/audio/two.wav".into()]).unwrap(),
+        );
+        assert_eq!(
+            first.bytes_for("text/uri-list").unwrap().as_ref(),
+            b"file:///audio/one.wav\r\n"
+        );
+        assert_eq!(
+            second
+                .bytes_for("x-special/gnome-copied-files")
+                .unwrap()
+                .as_ref(),
+            b"copy\nfile:///audio/two.wav"
+        );
+        assert!(first.bytes_for("text/plain").is_none());
     }
 }
