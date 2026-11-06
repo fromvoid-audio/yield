@@ -20,6 +20,10 @@ use yield_library::sample_sources::reconciliation::RootIdentity;
 /// Bounded capture of native replay candidates; it never grants continuity authority.
 pub mod replay;
 
+/// Checked native macOS live observation for a supervised watcher process.
+#[cfg(target_os = "macos")]
+pub mod macos_live;
+
 /// Filename prefixes for source-local files which must not feed an audit back into itself.
 ///
 /// These names are compared lexically in the callback. The callback does not inspect metadata or
