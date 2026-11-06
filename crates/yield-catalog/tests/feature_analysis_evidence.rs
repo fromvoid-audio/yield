@@ -17,6 +17,117 @@ use yield_library::{
 const EVENT_LIMIT: usize = 64;
 const PREFIX: &str = "YIELD_CATALOG_ANALYSIS_EVIDENCE=";
 
+// Run the explicit workload with `--config 'profile.dev.package.yield-analysis.opt-level=3'`
+// so the DSP path is optimized. Measure process RSS outside the test executable.
+#[test]
+#[ignore = "explicit native long-recording workload"]
+fn dense_stereo_transient_stream_evidence() {
+    use yield_analysis::transients::{STREAM_DETECTOR_VERSION, TransientPreset};
+    use yield_catalog::{SourceTransientRequest, TransientCacheUse};
+
+    let config = tempfile::tempdir().unwrap();
+    let media = tempfile::tempdir().unwrap();
+    let root = media.path().canonicalize().unwrap();
+    let _base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
+    let _profile = PersistenceProfileGuard::named("long-transient-evidence");
+    let guard = WritableProfileGuard::acquire_current().unwrap();
+    let path = Path::new("dense.wav");
+    let frames = 2_098_176_u32;
+    let sample_rate = 48_000;
+    let period = 8191;
+    let mut wav = hound::WavWriter::create(
+        root.join(path),
+        hound::WavSpec {
+            channels: 2,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    for frame in 0..frames {
+        let sample = if frame > 0 && frame % period == 0 {
+            24_000
+        } else {
+            16 + (frame % 64) as i16
+        };
+        wav.write_sample(sample).unwrap();
+        wav.write_sample(-sample).unwrap();
+    }
+    wav.finalize().unwrap();
+
+    let source = SourceId::from_string("dense-stereo-transient-evidence");
+    let service = CatalogService::start(&guard).unwrap();
+    let audit_revision = register(
+        &service,
+        &source,
+        &root,
+        Instant::now() + Duration::from_secs(5),
+    );
+    let request = |revision, id| {
+        SourceTransientRequest::new(&source, 1, revision, id, path, TransientPreset::Normal)
+            .unwrap()
+            .with_pending_digest()
+    };
+    let submit = |request| {
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request,
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+    };
+    let completion = |id| {
+        let delivery = event(
+            &service,
+            Instant::now() + Duration::from_secs(5),
+            |event| matches!(event, CatalogEvent::TransientMarkersCompleted { request, .. } if request.request_id() == id),
+        );
+        let CatalogEvent::TransientMarkersCompleted { result, .. } = delivery else {
+            unreachable!()
+        };
+        result.unwrap()
+    };
+    let started = Instant::now();
+    submit(request(audit_revision, 1));
+    let CatalogEvent::SourceContentDigestCommitted {
+        committed_revision, ..
+    } = event(&service, started + Duration::from_secs(5), |event| {
+        matches!(event, CatalogEvent::SourceContentDigestCommitted { .. })
+    })
+    else {
+        unreachable!()
+    };
+    assert_eq!(committed_revision, audit_revision + 1);
+    let first = completion(1);
+    let first_elapsed = started.elapsed();
+    let expected: Vec<_> = (period..frames).step_by(period as usize).collect();
+    assert_eq!(first.detector_version, STREAM_DETECTOR_VERSION);
+    assert_eq!(first.markers.source_frames(), frames);
+    assert_eq!(first.markers.frames(), expected);
+    assert_eq!(first.cache, TransientCacheUse::MissStored);
+
+    let started = Instant::now();
+    submit(request(committed_revision, 2));
+    let cached = completion(2);
+    let cached_elapsed = started.elapsed();
+    assert_eq!(cached.cache, TransientCacheUse::Hit);
+    assert_eq!(cached.markers.frames(), expected);
+    service.shutdown();
+    println!(
+        "YIELD_DENSE_TRANSIENT_EVIDENCE={}",
+        json!({
+            "wav_bytes": std::fs::metadata(root.join(path)).unwrap().len(),
+            "sample_rate": sample_rate,
+            "channels": 2,
+            "frames": frames,
+            "exact_markers": expected.len(),
+            "first_request_ms": first_elapsed.as_millis(),
+            "cached_request_ms": cached_elapsed.as_millis(),
+        })
+    );
+}
+
 fn deadline(total: Instant) -> Instant {
     total.min(Instant::now() + Duration::from_secs(5))
 }
