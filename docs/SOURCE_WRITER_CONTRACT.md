@@ -231,9 +231,10 @@ mutation. The same key with a changed payload, source identity, or fence is a ty
 conflict and leaves the prior state unchanged.
 
 Receipts are stored by the source participant with the implemented bounded versioned
-codec and migration rule described above. The source schema is now version 13; both
-`Fast` and `Full` opens run the additive receipt relation assurance, while `Full` also
-performs invalid-path cleanup. The source-local
+codec and schema assurance described above. Source schema version 14 adds AIFF
+to the partial content-audit index. Owned schema assurance installs that index
+and stamps the current version in one transaction. `Fast` and `Full` opens run
+receipt relation assurance, and `Full` also performs invalid-path cleanup. The source-local
 `file_ops_journal` has recovery semantics and is not a source participant receipt table.
 The volatile catalog request ID and the existing in-memory curation lineage do not supply
 the durable duplicate identity; `SourceWriter` supplies that identity and readback path

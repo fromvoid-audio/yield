@@ -501,12 +501,13 @@ pub(super) fn apply_base_schema(connection: &Connection) -> Result<(), SourceDbE
 /// Create all supporting indices used by the source database.
 pub(super) fn apply_indices(connection: &Connection) -> Result<(), SourceDbError> {
     connection.execute_batch(INDEX_SQL).map_err(map_sql_error)?;
-    // Keep the current schema image byte-for-byte stable while the format set is unchanged.
+    // The existing audit index can contain a previous format predicate.
     let filter =
         crate::sample_sources::supported_audio_where_clause().replace(" AND ", "\n           AND ");
     connection
         .execute_batch(&format!(
-            "CREATE INDEX IF NOT EXISTS idx_source_content_audit_forward_path\n         ON wav_files(path)\n         WHERE missing = 0\n           AND {filter};"
+            "DROP INDEX IF EXISTS idx_source_content_audit_forward_path;
+             CREATE INDEX idx_source_content_audit_forward_path\n         ON wav_files(path)\n         WHERE missing = 0\n           AND {filter};"
         ))
         .map_err(map_sql_error)?;
     Ok(())

@@ -11385,7 +11385,7 @@ mod tests {
     }
 
     #[test]
-    fn audited_snapshot_includes_descriptor_checked_wav_metadata() {
+    fn audited_snapshot_includes_descriptor_checked_wav_and_aiff_metadata() {
         let fixture = Fixture::new("catalog-wav-metadata");
         let path = fixture.root.path().join("stereo.wav");
         let spec = hound::WavSpec {
@@ -11400,6 +11400,14 @@ mod tests {
             writer.write_sample(-frame).expect("right sample");
         }
         writer.finalize().expect("finalize WAV");
+        std::fs::write(
+            fixture.root.path().join("clip.aiff"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../test-fixtures/stereo-pcm16.aiff"
+            )),
+        )
+        .unwrap();
 
         let service = CatalogService::start(&fixture.guard).expect("catalog service");
         let source_id = SourceId::from_string("source-wav-metadata");
@@ -11409,6 +11417,13 @@ mod tests {
             Some(&CatalogWavMetadata {
                 frames: 7,
                 sample_rate: 44_100,
+            })
+        );
+        assert_eq!(
+            snapshot.wav_metadata.get(Path::new("clip.aiff")),
+            Some(&CatalogWavMetadata {
+                frames: 2,
+                sample_rate: 48_000,
             })
         );
         service.shutdown();

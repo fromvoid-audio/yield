@@ -1131,7 +1131,7 @@ impl Browser {
         self.playback_policy
             .prepare(entry.stable_id(), entry.playback_type);
         if !yield_library::sample_sources::is_supported_audio(&path) {
-            self.set_playback_status("Audition currently supports WAV files".to_string());
+            self.set_playback_status("Audition supports WAV and uncompressed AIFF files");
             return None;
         }
         let Some(start) = normalized_playback_start(start) else {
@@ -2446,7 +2446,7 @@ mod tests {
         should_queue_initialized_playback, should_record_last_played,
         should_record_playback_history,
     };
-    use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
+    use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress, PlaybackRuntimeSource};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -2494,6 +2494,16 @@ mod tests {
                 .selected_playback_intent(0.6, PlaybackIntentOrigin::Explicit)
                 .expect("selected WAV playback intent");
             assert_eq!(intent.start, 0.2);
+            view.entries[0].path = PathBuf::from("/tmp/current-playhead.AIF");
+            view.entries[0].relative_path = PathBuf::from("current-playhead.AIF");
+            let intent = view
+                .selected_playback_intent(0.6, PlaybackIntentOrigin::Explicit)
+                .expect("selected AIFF playback intent");
+            assert_eq!(intent.start, 0.2);
+            assert!(matches!(
+                PlaybackRuntimeSource::probe_file(intent.path),
+                PlaybackRuntimeSource::AiffFile { .. }
+            ));
             view.waveform_hover_cursor = Some(0.4);
             view.waveform_last_play_start = Some(0.3);
             view.invalidate_waveform_generation();
