@@ -576,29 +576,6 @@ mod tests {
 
     fn install_source(view: &mut Browser, root: &Path, snapshot: &yield_catalog::CatalogSnapshot) {
         view.root = Some(root.to_path_buf());
-        let mut session = super::super::SourceSession::new(root.to_path_buf());
-        session.source_id = Some(snapshot.source_id.clone());
-        session.catalog_lifecycle_generation = Some(snapshot.lifecycle_generation);
-        session.catalog_facts = Arc::new(
-            snapshot
-                .manifest
-                .iter()
-                .map(|entry| {
-                    (
-                        entry.relative_path.clone(),
-                        catalog::CatalogFileFacts {
-                            relative_path: entry.relative_path.clone(),
-                            file_size: entry.file_size,
-                            modified_ns: entry.modified_ns,
-                            file_identity: entry.file_identity.clone(),
-                            content_hash: entry.content_hash.clone(),
-                        },
-                    )
-                })
-                .collect(),
-        );
-        view.source_sessions = vec![session];
-        view.active_source = Some(0);
         view.catalog_activation = Some(catalog::CatalogActivation {
             source_id: snapshot.source_id.clone(),
             root: root.to_path_buf(),
@@ -622,6 +599,37 @@ mod tests {
                 revision: snapshot.committed_revision,
                 entry_indices: Arc::new(HashMap::from([(PathBuf::from("transients.wav"), 0)])),
             });
+    }
+
+    fn install_digest_projection(
+        view: &mut Browser,
+        root: &Path,
+        snapshot: &yield_catalog::CatalogSnapshot,
+    ) {
+        install_source(view, root, snapshot);
+        let mut session = super::super::SourceSession::new(root.to_path_buf());
+        session.source_id = Some(snapshot.source_id.clone());
+        session.catalog_lifecycle_generation = Some(snapshot.lifecycle_generation);
+        session.catalog_facts = Arc::new(
+            snapshot
+                .manifest
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.relative_path.clone(),
+                        catalog::CatalogFileFacts {
+                            relative_path: entry.relative_path.clone(),
+                            file_size: entry.file_size,
+                            modified_ns: entry.modified_ns,
+                            file_identity: entry.file_identity.clone(),
+                            content_hash: entry.content_hash.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+        view.source_sessions = vec![session];
+        view.active_source = Some(0);
         view.curation_state.install_projection(
             super::super::curation::CurationLifecycleKey {
                 source_id: snapshot.source_id.clone(),
@@ -673,7 +681,7 @@ mod tests {
         cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
         let (browser, cx) = install(cx, &path, preview);
         browser.update(cx, |view, cx| {
-            install_source(view, root, &snapshot);
+            install_digest_projection(view, root, &snapshot);
             toggle(view, cx);
         });
         for _ in 0..2 {
