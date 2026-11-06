@@ -69,6 +69,20 @@ pub(super) struct PlaybackRetargetRequest {
     pub(super) anchor: PlaybackRetargetAnchor,
 }
 
+/// The accepted loop span owned by one Command-resize gesture.
+pub(super) struct PlaymarkTempoAudition {
+    anchor: PlaybackRetargetAnchor,
+    original: WaveformPlayRegion,
+    latest: WaveformPlayRegion,
+}
+
+impl PlaymarkTempoAudition {
+    fn changed_span(&self, span: Option<WaveformPlayRegion>) -> Option<WaveformPlayRegion> {
+        let span = span.unwrap_or(self.original);
+        (span != self.latest).then_some(span)
+    }
+}
+
 /// One admitted live playback-mode change awaiting an authoritative runtime snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct PendingLoopRetarget {
@@ -551,6 +565,84 @@ impl Browser {
         }
     }
 
+    pub(super) fn begin_playmark_tempo_audition(&mut self) {
+        self.playmark_tempo_audition = self.capture_playmark_tempo_audition();
+    }
+
+    fn capture_playmark_tempo_audition(&self) -> Option<PlaymarkTempoAudition> {
+        let desired = self.current_playback_desired_state();
+        if !desired.looped {
+            return None;
+        }
+        let anchor = self.current_playback_retarget_anchor()?;
+        if !self.playback_retarget_anchor_is_current(&anchor)
+            || self.selected_audio_path() != Some(anchor.path.as_path())
+        {
+            return None;
+        }
+        let original = self.accepted_playback_retarget_target(desired)?.span;
+        Some(PlaymarkTempoAudition {
+            anchor,
+            original,
+            latest: original,
+        })
+    }
+
+    pub(super) fn preview_playmark_tempo_span(
+        &mut self,
+        span: Option<WaveformPlayRegion>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut audition) = self.playmark_tempo_audition.take() else {
+            return;
+        };
+        if self.current_playback_desired_state().looped
+            && let Some(span) = audition.changed_span(span)
+            && self
+                .retarget_playmark_tempo_audition(&audition.anchor, span, cx)
+                .is_some_and(|result| result.is_ok())
+        {
+            audition.latest = span;
+        }
+        self.playmark_tempo_audition = Some(audition);
+    }
+
+    pub(super) fn finish_playmark_tempo_audition(
+        &mut self,
+        committed: Option<WaveformPlayRegion>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(audition) = self.playmark_tempo_audition.take() {
+            if let Some(span) = audition.changed_span(committed)
+                && let Some(Err(error)) =
+                    self.retarget_playmark_tempo_audition(&audition.anchor, span, cx)
+                && committed.is_none()
+            {
+                // A preview may already be audible. Do not leave that temporary span running.
+                self.stop_playback();
+                self.set_playback_status(format!("Playmark loop restore failed: {error}"));
+            }
+        } else if let Some(span) = committed {
+            self.retarget_committed_playmark_resize(span, cx);
+        }
+    }
+
+    fn retarget_playmark_tempo_audition(
+        &mut self,
+        anchor: &PlaybackRetargetAnchor,
+        span: WaveformPlayRegion,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(), String>> {
+        if !self.playback_retarget_anchor_is_current(anchor) {
+            return None;
+        }
+        let result = self.submit_playmark_timing_span(&anchor.path, span, cx);
+        if let Some(Err(error)) = &result {
+            self.set_playback_status(format!("Playmark loop update unavailable: {error}"));
+        }
+        result
+    }
+
     fn accepted_playmark_timing_target(
         &self,
         path: &Path,
@@ -759,20 +851,23 @@ impl Browser {
         &mut self,
         target: PlaybackRetargetTarget,
     ) -> Option<PlaybackRetargetRequest> {
-        let playback_id = self.latest_playback_request_id?;
-        let path = self.playing_path.clone()?;
+        let anchor = self.current_playback_retarget_anchor()?;
         self.next_playback_retarget_generation =
             self.next_playback_retarget_generation.wrapping_add(1);
         Some(PlaybackRetargetRequest {
             generation: self.next_playback_retarget_generation,
             target,
-            anchor: PlaybackRetargetAnchor {
-                playback_id: playback_id.get(),
-                playback_epoch: self.playback_epoch,
-                waveform_generation: self.waveform_generation,
-                output_open_generation: self.audio_output_open_generation,
-                path,
-            },
+            anchor,
+        })
+    }
+
+    fn current_playback_retarget_anchor(&self) -> Option<PlaybackRetargetAnchor> {
+        Some(PlaybackRetargetAnchor {
+            playback_id: self.latest_playback_request_id?.get(),
+            playback_epoch: self.playback_epoch,
+            waveform_generation: self.waveform_generation,
+            output_open_generation: self.audio_output_open_generation,
+            path: self.playing_path.clone()?,
         })
     }
 
@@ -1556,6 +1651,7 @@ impl Browser {
     }
 
     pub(super) fn reconfigure_audio_output(&mut self, cx: &mut Context<Self>) {
+        self.abandon_waveform_region_drag(cx);
         let resume = self.capture_audio_output_resume_intent();
         self.stop_playback();
         if let Some(runtime) = self.playback.take() {
@@ -2339,6 +2435,26 @@ mod tests {
             view.waveform = None;
             assert!(view.accepted_playmark_timing_target(path, span).is_none());
         });
+    }
+
+    #[test]
+    fn tempo_audition_suppresses_duplicate_spans_and_restores_the_original_loop() {
+        let original = WaveformPlayRegion::new(0.25, 0.5).unwrap();
+        let first = WaveformPlayRegion::new(0.25, 0.625).unwrap();
+        let final_span = WaveformPlayRegion::new(0.25, 0.75).unwrap();
+        let mut audition = super::PlaymarkTempoAudition {
+            anchor: sample_pending_retarget(Path::new("loop.wav"), 1, true)
+                .request
+                .anchor,
+            original,
+            latest: original,
+        };
+        assert_eq!(audition.changed_span(None), None);
+        assert_eq!(audition.changed_span(Some(first)), Some(first));
+        audition.latest = first;
+        assert_eq!(audition.changed_span(Some(first)), None);
+        assert_eq!(audition.changed_span(Some(final_span)), Some(final_span));
+        assert_eq!(audition.changed_span(None), Some(original));
     }
 
     fn sample_pending_retarget(

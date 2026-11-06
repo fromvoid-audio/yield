@@ -1011,8 +1011,8 @@ impl WaveformPanDrag {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct WaveformDragToken;
+#[derive(Clone)]
+struct WaveformDragToken(gpui::WeakEntity<Browser>);
 
 struct WaveformDragGhost;
 
@@ -2051,7 +2051,7 @@ pub(super) fn render_waveform(
             cx.listener(move |view, event: &ScrollWheelEvent, window, cx| {
                 let bounds = click_bounds_for_wheel.borrow().as_ref().copied();
                 window.focus(&view.waveform_focus_handle);
-                if view.handle_waveform_wheel(event, bounds) {
+                if view.handle_waveform_wheel(event, bounds, cx) {
                     cx.notify();
                 }
             }),
@@ -2168,6 +2168,9 @@ pub(super) fn render_waveform(
                 {
                     return;
                 }
+                if drag.tempo_resize.is_some() {
+                    view.begin_playmark_tempo_audition();
+                }
                 view.waveform_region_drag = Some(drag);
                 cx.notify();
             }),
@@ -2215,12 +2218,26 @@ pub(super) fn render_waveform(
                 cx.notify();
             }),
         )
-        .on_drag(WaveformDragToken, |_, _, _, cx| {
-            cx.new(|_| WaveformDragGhost)
-        })
+        .on_drag(
+            WaveformDragToken(cx.entity().downgrade()),
+            |token, _, window, cx| {
+                // GPUI consumes the move that starts its active drag.
+                let position = window.mouse_position();
+                let _ = token.0.update(cx, |view, cx| {
+                    if view
+                        .waveform_region_drag
+                        .is_some_and(|drag| drag.tempo_resize.is_some())
+                        && view.update_waveform_region_drag(position, Some(MouseButton::Left), cx)
+                    {
+                        cx.notify();
+                    }
+                });
+                cx.new(|_| WaveformDragGhost)
+            },
+        )
         .on_drag_move::<WaveformDragToken>(cx.listener(
             |view, event: &DragMoveEvent<WaveformDragToken>, _, cx| {
-                view.update_waveform_region_drag(event.event.position, Some(MouseButton::Left));
+                view.update_waveform_region_drag(event.event.position, Some(MouseButton::Left), cx);
                 zero_crossing::schedule_for_drag(view, cx);
                 cx.notify();
             },
@@ -2320,6 +2337,7 @@ impl Browser {
         self.waveform_edit_settings = default_edit_settings();
         self.clear_waveform_fade_hover();
         self.waveform_region_drag = None;
+        self.playmark_tempo_audition = None;
         self.waveform_pan_drag = None;
         self.waveform_scrollbar_drag = None;
     }
@@ -2340,7 +2358,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> bool {
         let canceled_timing = self.cancel_playmark_timing_edit();
-        let had_region_drag = self.waveform_region_drag.take().is_some();
+        let had_region_drag = self.abandon_waveform_region_drag(cx);
         if had_region_drag {
             self.clear_waveform_fade_hover();
             cx.stop_active_drag(window);
@@ -2355,7 +2373,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> bool {
         let canceled_timing = self.cancel_playmark_timing_edit();
-        let had_region_drag = self.waveform_region_drag.take().is_some();
+        let had_region_drag = self.abandon_waveform_region_drag(cx);
         let had_pan_drag = self.waveform_pan_drag.take().is_some();
         let had_scrollbar_drag = self.waveform_scrollbar_drag.take().is_some();
         if had_region_drag {
@@ -2373,6 +2391,12 @@ impl Browser {
             }
         }
         canceled
+    }
+
+    pub(super) fn abandon_waveform_region_drag(&mut self, cx: &mut Context<Self>) -> bool {
+        let abandoned = self.waveform_region_drag.take().is_some();
+        self.finish_playmark_tempo_audition(None, cx);
+        abandoned
     }
 
     pub(super) fn cancel_playmark_tempo_resize(
@@ -2463,6 +2487,7 @@ impl Browser {
         &mut self,
         event: &ScrollWheelEvent,
         bounds: Option<Bounds<Pixels>>,
+        cx: &mut Context<Self>,
     ) -> bool {
         let Some(preview) = self.waveform.as_ref() else {
             return false;
@@ -2503,13 +2528,13 @@ impl Browser {
         }
         self.cancel_playmark_timing_edit();
         self.waveform_viewport = next;
-        self.waveform_region_drag = None;
+        self.abandon_waveform_region_drag(cx);
         self.waveform_pan_drag = None;
         zero_crossing::cancel_for_interruption(self);
         true
     }
 
-    pub(super) fn zoom_waveform_to_selection(&mut self) -> bool {
+    pub(super) fn zoom_waveform_to_selection(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(preview) = self.waveform.as_ref() else {
             return false;
         };
@@ -2538,13 +2563,13 @@ impl Browser {
         }
         self.cancel_playmark_timing_edit();
         self.waveform_viewport = next;
-        self.waveform_region_drag = None;
+        self.abandon_waveform_region_drag(cx);
         self.waveform_pan_drag = None;
         zero_crossing::cancel_for_interruption(self);
         true
     }
 
-    pub(super) fn reset_waveform_viewport(&mut self) -> bool {
+    pub(super) fn reset_waveform_viewport(&mut self, cx: &mut Context<Self>) -> bool {
         if self.waveform.is_none() {
             return false;
         }
@@ -2554,7 +2579,7 @@ impl Browser {
         }
         self.cancel_playmark_timing_edit();
         self.waveform_viewport = next;
-        self.waveform_region_drag = None;
+        self.abandon_waveform_region_drag(cx);
         self.waveform_pan_drag = None;
         zero_crossing::cancel_for_interruption(self);
         true
@@ -2627,24 +2652,32 @@ impl Browser {
         &mut self,
         position: Point<Pixels>,
         pressed_button: Option<MouseButton>,
+        cx: &mut Context<Self>,
     ) -> bool {
         let Some(drag) = self.waveform_region_drag else {
             return false;
         };
-        if !waveform_drag_button_is_pressed(drag, pressed_button) {
-            self.waveform_region_drag = None;
+        if !waveform_drag_button_is_pressed(drag, pressed_button)
+            || !waveform_drag_is_current(drag, self.waveform_generation, self.waveform.is_some())
+        {
+            self.abandon_waveform_region_drag(cx);
             self.clear_waveform_fade_hover();
             zero_crossing::cancel_for_interruption(self);
             return true;
         }
-        if !waveform_drag_is_current(drag, self.waveform_generation, self.waveform.is_some()) {
-            self.waveform_region_drag = None;
-            self.clear_waveform_fade_hover();
-            zero_crossing::cancel_for_interruption(self);
-            return true;
-        }
-        if let Some(drag) = self.waveform_region_drag.as_mut() {
-            drag.update(position);
+        let mut drag = drag;
+        drag.update(position);
+        self.waveform_region_drag = Some(drag);
+        if drag.moved
+            && let Some(capture) = drag.tempo_resize
+        {
+            let baseline = self
+                .waveform_play_region
+                .and_then(|span| span.frame_bounds(capture.total_frames));
+            let preview = drag
+                .tempo_resize_region(capture)
+                .filter(|span| span.frame_bounds(capture.total_frames) != baseline);
+            self.preview_playmark_tempo_span(preview, cx);
         }
         true
     }
@@ -2664,6 +2697,7 @@ impl Browser {
             return;
         }
         if !waveform_drag_is_current(drag, self.waveform_generation, self.waveform.is_some()) {
+            self.finish_playmark_tempo_audition(None, cx);
             return;
         }
         let mut drag = drag;
@@ -2726,13 +2760,14 @@ impl Browser {
                         )
                         && playmark_tempo::save_authored_tempo(self, tempo, cx)
                     {
+                        self.finish_playmark_tempo_audition(None, cx);
                         cx.notify();
                         return;
                     }
                     self.set_waveform_play_region(Some(region));
                     similar_sections::invalidate_if_stale(self);
                     if tempo_span_changed {
-                        self.retarget_committed_playmark_resize(region, cx);
+                        self.finish_playmark_tempo_audition(Some(region), cx);
                     } else if drag.zero_crossing_applies(bpm_snap) {
                         zero_crossing::commit_or_schedule(self, region, cx);
                     }
@@ -2752,6 +2787,7 @@ impl Browser {
             similar_sections::invalidate_if_stale(self);
             self.start_playback_from_position(ratio, cx);
         }
+        self.finish_playmark_tempo_audition(None, cx);
         cx.notify();
     }
 }
@@ -4834,11 +4870,16 @@ mod tests {
         } else {
             modifier.control = true;
         }
-        for abort in [Some("escape"), Some("blur"), None] {
+        for abort in [
+            Some("escape"),
+            Some("blur"),
+            Some("pointer loss"),
+            Some("viewport"),
+            None,
+        ] {
             cx.simulate_mouse_down(at(0.5), MouseButton::Left, modifier);
             // Render the newly focused waveform before exercising the keyboard/focus routes.
             cx.refresh().unwrap();
-            cx.simulate_mouse_move(at(0.6), MouseButton::Left, gpui::Modifiers::none());
             cx.simulate_mouse_move(at(0.75), MouseButton::Left, gpui::Modifiers::none());
             browser.read_with(cx, |view, _| {
                 let drag = view.waveform_region_drag.unwrap();
@@ -4850,6 +4891,8 @@ mod tests {
                     Some((48_000, 144_000))
                 );
                 assert_eq!(view.waveform_play_region, Some(baseline));
+                assert!(view.playmark_tempo_audition.is_none());
+                assert!(view.playback_init_intent.is_none());
             });
             match abort {
                 Some("escape") => cx.simulate_keystrokes("escape"),
@@ -4858,6 +4901,17 @@ mod tests {
                         window.focus(&browser.read(app).search_input.read(app).focus_handle());
                     });
                     cx.refresh().unwrap();
+                }
+                Some("pointer loss") => {
+                    browser.update(cx, |view, cx| {
+                        assert!(view.update_waveform_region_drag(at(0.75), None, cx));
+                    });
+                }
+                Some("viewport") => {
+                    browser.update(cx, |view, cx| {
+                        assert!(view.zoom_waveform_to_selection(cx));
+                        assert!(view.reset_waveform_viewport(cx));
+                    });
                 }
                 _ => {}
             }
