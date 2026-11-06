@@ -10,10 +10,13 @@ use std::{
 
 use gpui::Context;
 use yield_library::sample_sources::SourcePublicationFence;
+use yield_library::sample_sources::readiness::SourceFeatureInputError;
 use yield_media::WaveformFileRevision;
 use yield_session::{
-    CatalogCommand, CatalogEvent, CatalogPublicationStatus, PlaymarkTempoFailure,
-    PlaymarkTempoOperation, SourcePlaymarkTempo, SourcePlaymarkTempoRequest,
+    CatalogCommand, CatalogEvent, CatalogPublicationStatus, FeatureAnalysisCancellation,
+    PlaymarkTempoFailure, PlaymarkTempoOperation, SourceContentDigestFailure,
+    SourceContentDigestRequest, SourceContentDigestScope, SourcePlaymarkTempo,
+    SourcePlaymarkTempoRequest,
 };
 
 use super::{Browser, catalog, similar_sections, waveform::WaveformPlayRegion};
@@ -54,7 +57,19 @@ struct Save {
     next: Option<SourcePlaymarkTempo>,
     action: Action,
     request: Option<SourcePlaymarkTempoRequest>,
+    digest: Option<PendingDigest>,
     cancellation: Arc<AtomicBool>,
+}
+
+struct PendingDigest {
+    request: SourceContentDigestRequest,
+    cancellation: FeatureAnalysisCancellation,
+}
+
+impl Drop for PendingDigest {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 impl Drop for Save {
@@ -76,14 +91,29 @@ struct Load {
 
 impl Load {
     fn matches(&self, browser: &Browser) -> bool {
+        self.matches_waveform(browser, Some(self.request.revision()))
+    }
+
+    fn matches_waveform(&self, browser: &Browser, revision: Option<u64>) -> bool {
         catalog::audited_waveform_source(browser).is_some_and(|(entry, detail, source)| {
             self.generation == browser.waveform_generation
                 && self.file_revision == detail.file_revision
                 && self.request.source_id() == &source.source_id
                 && self.request.lifecycle_generation() == source.lifecycle_generation
-                && self.request.revision() == source.revision
+                && revision.is_none_or(|revision| revision == source.revision)
                 && self.request.relative_path() == entry.relative_path
         })
+    }
+
+    fn awaits_digest(&self, scope: &SourceContentDigestScope) -> bool {
+        self.request.source_id() == &scope.source_id
+            && self.request.lifecycle_generation() == scope.lifecycle_generation
+            && self.request.revision() == scope.previous_revision
+            && self.request.relative_path() == scope.relative_path.as_path()
+            && self
+                .save
+                .as_ref()
+                .is_some_and(|save| save.request.is_none())
     }
 }
 
@@ -212,6 +242,7 @@ fn queue_save(
         next,
         action,
         request: None,
+        digest: None,
         cancellation: Arc::new(AtomicBool::new(false)),
     });
     browser.set_playback_status("Saving playmark tempo…");
@@ -277,6 +308,10 @@ fn submit_ready_save(browser: &mut Browser, cx: &mut Context<Browser>) {
     };
     let previous = match result {
         Ok(previous) => previous,
+        Err(PlaymarkTempoFailure::Input(SourceFeatureInputError::ContentPending)) => {
+            request_digest(browser, cx);
+            return;
+        }
         Err(error) => {
             fail_save(browser, error);
             return;
@@ -324,6 +359,119 @@ fn submit_ready_save(browser: &mut Browser, cx: &mut Context<Browser>) {
     }
 }
 
+fn request_digest(browser: &mut Browser, cx: &mut Context<Browser>) {
+    let Some(load) = browser
+        .playmark_tempo
+        .load
+        .as_ref()
+        .filter(|load| load.matches(browser))
+    else {
+        fail_save(browser, PlaymarkTempoFailure::StaleSource);
+        return;
+    };
+    if load.save.as_ref().is_some_and(|save| save.digest.is_some()) {
+        return;
+    }
+    let Some(id) = browser.playmark_tempo.next_request_id.checked_add(1) else {
+        fail_save(browser, PlaymarkTempoFailure::InvalidInput);
+        return;
+    };
+    let request = SourceContentDigestRequest::new(
+        load.request.source_id(),
+        load.request.lifecycle_generation(),
+        load.request.revision(),
+        id,
+        load.request.relative_path(),
+    );
+    let Ok(request) = request else {
+        fail_save(browser, PlaymarkTempoFailure::InvalidInput);
+        return;
+    };
+    let digest = PendingDigest {
+        request,
+        cancellation: FeatureAnalysisCancellation::new(),
+    };
+    if catalog::submit_catalog_command(
+        CatalogCommand::RequestSourceContentDigest {
+            request: digest.request.clone(),
+            cancellation: digest.cancellation.clone(),
+        },
+        cx,
+    )
+    .is_err()
+    {
+        fail_save(browser, PlaymarkTempoFailure::Store);
+        return;
+    }
+    browser.playmark_tempo.next_request_id = id;
+    if let Some(save) = browser
+        .playmark_tempo
+        .load
+        .as_mut()
+        .and_then(|load| load.save.as_mut())
+    {
+        save.digest = Some(digest);
+    }
+    browser.set_playback_status("Verifying Source audio for playmark tempo…");
+    browser.start_source_registry_poll(cx);
+}
+
+/// Continue a saved authoring intent only after Browser has adopted the exact digest revision.
+pub(super) fn adopt_digest_revision(
+    browser: &mut Browser,
+    scope: &SourceContentDigestScope,
+    revision: u64,
+    cx: &mut Context<Browser>,
+) {
+    let Some(load) = browser
+        .playmark_tempo
+        .load
+        .as_ref()
+        .filter(|load| load.awaits_digest(scope))
+    else {
+        return;
+    };
+    if !load.matches_waveform(browser, Some(revision)) {
+        fail_save(browser, PlaymarkTempoFailure::StaleSource);
+        cx.notify();
+        return;
+    }
+    let Some(mut save) = browser
+        .playmark_tempo
+        .load
+        .as_mut()
+        .and_then(|load| load.save.take())
+    else {
+        return;
+    };
+    save.digest = None;
+    if ensure_load(browser, cx)
+        && let Some(load) = browser.playmark_tempo.load.as_mut()
+    {
+        load.save = Some(save);
+        browser.set_playback_status("Saving playmark tempo…");
+    } else {
+        fail_save(browser, PlaymarkTempoFailure::Store);
+    }
+    cx.notify();
+}
+
+pub(super) fn reject_digest_revision(
+    browser: &mut Browser,
+    scope: &SourceContentDigestScope,
+    cx: &mut Context<Browser>,
+) {
+    if browser
+        .playmark_tempo
+        .load
+        .as_ref()
+        .is_some_and(|load| load.awaits_digest(scope))
+    {
+        fail_save(browser, PlaymarkTempoFailure::StaleSource);
+        cx.notify();
+    }
+}
+
 fn fail_save(browser: &mut Browser, error: PlaymarkTempoFailure) {
     browser.playmark_tempo.load = None;
     let message = match error {
@@ -341,6 +489,37 @@ pub(super) fn apply_catalog_event(
     fence: Option<&SourcePublicationFence>,
     cx: &mut Context<Browser>,
 ) -> bool {
+    if let CatalogEvent::SourceContentDigestFailed { request, error, .. } = event {
+        let current = browser.playmark_tempo.load.as_ref().is_some_and(|load| {
+            load.matches_waveform(browser, None)
+                && load
+                    .save
+                    .as_ref()
+                    .and_then(|save| save.digest.as_ref())
+                    .is_some_and(|digest| digest.request == *request)
+        });
+        if current {
+            browser.playmark_tempo.load = None;
+            let message = match error {
+                SourceContentDigestFailure::Busy => {
+                    "Source audio verification is busy. Try the tempo edit again"
+                }
+                SourceContentDigestFailure::Input(SourceFeatureInputError::ByteLimit) => {
+                    "Source audio exceeds the playmark verification limit"
+                }
+                SourceContentDigestFailure::Input(_) => {
+                    "Source audio could not be verified for playmark tempo"
+                }
+                SourceContentDigestFailure::StaleSource => {
+                    "Playmark tempo verification lost its current Source"
+                }
+                _ => "Playmark tempo verification unavailable",
+            };
+            browser.set_playback_status(message);
+            cx.notify();
+        }
+        return true;
+    }
     let CatalogEvent::PlaymarkTempoCompleted {
         request,
         publication,
