@@ -474,21 +474,23 @@ mod tests {
     ) -> (gpui::Entity<Browser>, &'a mut gpui::VisualTestContext) {
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
-        browser.update(cx, |view, _| {
-            view.entries = vec![AudioFile {
-                path: path.to_path_buf(),
-                relative_path: PathBuf::from("transients.wav"),
-                byte_len: fs::metadata(path).expect("metadata").len(),
-                duration_seconds: Some(1.0),
-                sample_rate: Some(16_000),
-                playback_type: None,
-                curation: None,
-            }];
-            view.selected = Some(0);
-            view.waveform_generation = 7;
-            view.waveform = Some(preview);
-        });
+        browser.update(cx, |view, _| install_waveform(view, path, preview));
         (browser, cx)
+    }
+
+    fn install_waveform(view: &mut Browser, path: &Path, preview: yield_media::WaveformPreview) {
+        view.entries = vec![AudioFile {
+            path: path.to_path_buf(),
+            relative_path: PathBuf::from("transients.wav"),
+            byte_len: fs::metadata(path).expect("metadata").len(),
+            duration_seconds: Some(1.0),
+            sample_rate: Some(16_000),
+            playback_type: None,
+            curation: None,
+        }];
+        view.selected = Some(0);
+        view.waveform_generation = 7;
+        view.waveform = Some(preview);
     }
 
     #[test]
@@ -650,6 +652,7 @@ mod tests {
         use super::super::{
             playmark_tempo, source_registry::SourceRegistryGlobal, waveform::WaveformPlayRegion,
         };
+        use gpui::AppContext;
         use std::sync::atomic::AtomicBool;
         use yield_session::{
             PlaymarkTempoOperation, SourcePlaymarkTempo, SourcePlaymarkTempoRequest,
@@ -688,30 +691,48 @@ mod tests {
             _ => None,
         });
         cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
-        let (browser, cx) = install(cx, &path, preview);
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(Browser::new);
+        let next = |cx: &mut TestAppContext| {
+            wait_for(|| {
+                cx.update(|app| {
+                    let mut deliveries = Vec::new();
+                    app.global::<SourceRegistryGlobal>()
+                        .drain_catalog_deliveries(&mut deliveries);
+                    assert!(deliveries.len() <= 1);
+                    deliveries.pop()
+                })
+            })
+        };
         browser.update(cx, |view, cx| {
+            install_waveform(view, &path, preview);
             install_source(view, root, &snapshot);
             assert!(playmark_tempo::load_for_waveform(view, cx));
             assert!(!playmark_tempo::load_for_waveform(view, cx));
         });
-        let stale = next_delivery(cx);
-        browser.update(cx, |view, cx| {
-            view.invalidate_waveform_generation();
-            assert!(view.apply_catalog_delivery(stale, cx));
-            assert!(view.waveform_play_region.is_none());
-            assert!(playmark_tempo::load_for_waveform(view, cx));
-        });
-        let while_editing = next_delivery(cx);
+        let (older, fence) = next(cx).into_parts_if_live().unwrap();
         browser.update(cx, |view, cx| {
             view.set_waveform_play_region(WaveformPlayRegion::new(0.1, 0.2));
             view.set_waveform_play_region(None);
-            assert!(view.apply_catalog_delivery(while_editing, cx));
+            assert!(playmark_tempo::apply_catalog_event(
+                view,
+                &older,
+                fence.as_ref(),
+                cx
+            ));
             assert!(view.waveform_play_region.is_none());
             assert!(!playmark_tempo::load_for_waveform(view, cx));
             view.invalidate_waveform_generation();
             assert!(playmark_tempo::load_for_waveform(view, cx));
+            assert!(playmark_tempo::apply_catalog_event(
+                view,
+                &older,
+                fence.as_ref(),
+                cx
+            ));
+            assert!(view.waveform_play_region.is_none());
         });
-        let current = next_delivery(cx);
+        let current = next(cx);
         browser.update(cx, |view, cx| {
             assert!(view.apply_catalog_delivery(current, cx));
             assert_eq!(
@@ -722,7 +743,7 @@ mod tests {
             assert!(view.playing_path.is_none());
             assert!(view.playback_init_intent.is_none());
         });
-        cx.update(|_, app| {
+        cx.update(|app| {
             app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
         });
     }
