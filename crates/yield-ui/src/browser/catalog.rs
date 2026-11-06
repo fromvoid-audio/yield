@@ -14,7 +14,8 @@ use yield_library::sample_sources::{
 use yield_media::WaveformDetailContext;
 use yield_session::{
     CatalogCommand, CatalogDelivery, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
-    CatalogStatus, CatalogSubmitError, SourceContentDigestScope, VerifiedSourceRoot,
+    CatalogStatus, CatalogSubmitError, SourceContentDigestOrigin, SourceContentDigestScope,
+    VerifiedSourceRoot,
 };
 
 use super::source_registry::SourceRegistryGlobal;
@@ -864,7 +865,7 @@ impl Browser {
             }
             CatalogEvent::SourceContentDigestCommitted {
                 scope,
-                transient_request_id,
+                origin,
                 committed_revision,
                 entry,
             } => {
@@ -874,7 +875,10 @@ impl Browser {
                 {
                     self.apply_digest_revision(
                         scope,
-                        *transient_request_id,
+                        match origin {
+                            SourceContentDigestOrigin::Transients(id) => Some(*id),
+                            SourceContentDigestOrigin::DigestOnly(_) => None,
+                        },
                         *committed_revision,
                         entry,
                         cx,
@@ -996,6 +1000,7 @@ impl Browser {
             | CatalogEvent::CollectionHistoryGroupCompleted { .. }
             | CatalogEvent::SimilarityCompleted { .. }
             | CatalogEvent::PlaymarkTempoCompleted { .. }
+            | CatalogEvent::SourceContentDigestFailed { .. }
             | CatalogEvent::TransientMarkersCompleted { .. }
             | CatalogEvent::Closed => false,
         }
@@ -1511,6 +1516,10 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
         CatalogEvent::SourceContentDigestCommitted { scope, .. } => {
+            Some((scope.source_id.clone(), scope.lifecycle_generation))
+        }
+        CatalogEvent::SourceContentDigestFailed { request, .. } => {
+            let scope = request.scope();
             Some((scope.source_id.clone(), scope.lifecycle_generation))
         }
         CatalogEvent::PlaymarkTempoCompleted { request, .. } => {

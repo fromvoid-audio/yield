@@ -123,7 +123,10 @@ pub use similarity_query::{
     SimilarityCandidateOutcome, SimilarityQueryError, SourceSimilarityQuery,
     SourceSimilarityResult, SourceSimilarityRow, query_source_similarity,
 };
-pub use source_content_digest::SourceContentDigestScope;
+pub use source_content_digest::{
+    SourceContentDigestFailure, SourceContentDigestOrigin, SourceContentDigestRequest,
+    SourceContentDigestScope,
+};
 pub use transient_dispatch::{SourceTransientRequest, TransientRequestFailure};
 pub use transient_job::{
     ComputedTransientJob, PreparedTransientJob, TransientCacheUse, TransientJobError,
@@ -660,6 +663,13 @@ pub enum CatalogCommand {
         /// Exact Source and detector request.
         request: SourceTransientRequest,
         /// Retained cancellation through compute and queued delivery.
+        cancellation: FeatureAnalysisCancellation,
+    },
+    /// Verify and acquire the digest for an exact pending Source entry.
+    RequestSourceContentDigest {
+        /// Captured Source generation, file and request identity.
+        request: SourceContentDigestRequest,
+        /// Cancellation through held verification and owner settlement.
         cancellation: FeatureAnalysisCancellation,
     },
     /// Read or atomically replace the authored tempo of one exact Source entry.
@@ -1581,12 +1591,21 @@ pub enum CatalogEvent {
     SourceContentDigestCommitted {
         /// Source lifecycle and previous revision that admitted the write.
         scope: SourceContentDigestScope,
-        /// Original transient request when Catalog retries the detector automatically.
-        transient_request_id: Option<u64>,
+        /// The request that caused the digest to be computed.
+        origin: SourceContentDigestOrigin,
         /// New authoritative revision. The directory generation is unchanged.
         committed_revision: u64,
         /// Exact manifest entry with its digest filled in.
         entry: SourceManifestEntry,
+    },
+    /// A standalone digest request could not enrich the exact Source entry.
+    SourceContentDigestFailed {
+        /// Original request and correlation.
+        request: SourceContentDigestRequest,
+        /// Cancellation retained through queued delivery.
+        cancellation: FeatureAnalysisCancellation,
+        /// Observed refusal.
+        error: SourceContentDigestFailure,
     },
     /// Exact owner-validated transient markers or a bounded failure.
     TransientMarkersCompleted {
@@ -2078,8 +2097,11 @@ impl CatalogDelivery {
         {
             return None;
         }
-        if matches!(&event, CatalogEvent::TransientMarkersCompleted { cancellation, .. } if cancellation.is_cancelled())
-        {
+        if matches!(&event,
+            CatalogEvent::TransientMarkersCompleted { cancellation, .. }
+            | CatalogEvent::SourceContentDigestFailed { cancellation, .. }
+            if cancellation.is_cancelled()
+        ) {
             return None;
         }
         if let CatalogEvent::PlaymarkTempoCompleted {
@@ -2718,6 +2740,7 @@ fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> 
     match command {
         CatalogCommand::RequestSimilarity { .. }
         | CatalogCommand::RequestTransientMarkers { .. }
+        | CatalogCommand::RequestSourceContentDigest { .. }
         | CatalogCommand::PlaymarkTempo { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. } => {}
@@ -3130,6 +3153,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::RequestSimilarity { .. }
+        | CatalogCommand::RequestSourceContentDigest { .. }
         | CatalogCommand::PlaymarkTempo { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestIndexPage { .. }
@@ -3197,6 +3221,7 @@ fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
         CatalogCommand::RequestCollectionHistoryGroup { request, .. } => request.input_bytes(),
         CatalogCommand::RequestSimilarity { request, .. } => request.input_bytes(),
         CatalogCommand::RequestTransientMarkers { request, .. } => request.input_bytes(),
+        CatalogCommand::RequestSourceContentDigest { request, .. } => request.input_bytes(),
         CatalogCommand::PlaymarkTempo { request, .. } => request.input_bytes(),
         CatalogCommand::ConsumeReplay { submission } => submission.input_bytes(),
         CatalogCommand::RequestIndexInspection { handle, .. } => handle.input_bytes(),
@@ -3281,6 +3306,7 @@ fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, Cat
         }
         CatalogCommand::RequestSimilarity { .. } => Ok(similarity_dispatch::MAX_RESULT_BYTES),
         CatalogCommand::RequestTransientMarkers { request, .. } => Ok(request.result_bytes()),
+        CatalogCommand::RequestSourceContentDigest { .. } => Ok(source_content_digest::EVENT_BYTES),
         CatalogCommand::PlaymarkTempo { request, .. } => {
             Ok(request.input_bytes() + std::mem::size_of::<CatalogEvent>())
         }
@@ -3377,6 +3403,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestFeatureAnalysis { .. }
         | CatalogCommand::RequestTransientMarkers { .. }
+        | CatalogCommand::RequestSourceContentDigest { .. }
         | CatalogCommand::PlaymarkTempo { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. }
@@ -4433,7 +4460,23 @@ fn run_worker_with_sources(
             } => {
                 transients.submit(
                     transient_dispatch::Submission {
-                        request,
+                        request: transient_dispatch::Demand::Transients(request),
+                        cancellation,
+                        reservation,
+                    },
+                    &admission,
+                    &sources,
+                    test_gate.as_ref(),
+                );
+                continue;
+            }
+            CatalogCommand::RequestSourceContentDigest {
+                request,
+                cancellation,
+            } => {
+                transients.submit(
+                    transient_dispatch::Submission {
+                        request: transient_dispatch::Demand::DigestOnly(request),
                         cancellation,
                         reservation,
                     },
@@ -4697,8 +4740,9 @@ fn handle_command(
             similarity_dispatch::dispatch(request, cancellation, reservation, admission, sources);
             false
         }
-        CatalogCommand::RequestTransientMarkers { .. } => {
-            unreachable!("transient requests are handled by the compute slot");
+        CatalogCommand::RequestTransientMarkers { .. }
+        | CatalogCommand::RequestSourceContentDigest { .. } => {
+            unreachable!("audio read requests are handled by the compute slot");
         }
         CatalogCommand::PlaymarkTempo {
             request,

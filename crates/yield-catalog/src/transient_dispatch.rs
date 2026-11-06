@@ -1,4 +1,4 @@
-//! One bounded transient request on the retained Catalog background worker.
+//! Bounded digest and transient requests on the retained Catalog background worker.
 
 use super::source_content_digest::{MAX_PATH_BYTES, MAX_SOURCE_BYTES};
 use super::*;
@@ -15,11 +15,8 @@ pub(super) const MAX_RESULT_BYTES: usize = MAX_SOURCE_BYTES
 /// Exact bounded source file and detector configuration requested by one caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceTransientRequest {
-    source_id: SourceId,
-    lifecycle_generation: u64,
-    revision: u64,
+    scope: SourceContentDigestScope,
     request_id: u64,
-    relative_path: RootRelativePath,
     preset: TransientPreset,
     allow_pending_digest: bool,
 }
@@ -34,25 +31,17 @@ impl SourceTransientRequest {
         relative_path: &Path,
         preset: TransientPreset,
     ) -> Result<Self, TransientRequestFailure> {
-        let id = source_id.as_str();
-        if id.is_empty()
-            || id.len() > MAX_SOURCE_BYTES
-            || lifecycle_generation == 0
-            || request_id == 0
-            || relative_path
-                .to_str()
-                .is_none_or(|path| path.len() > MAX_PATH_BYTES)
-        {
-            return Err(TransientRequestFailure::InvalidInput);
-        }
-        let relative_path = RootRelativePath::try_from_path(relative_path.to_path_buf())
-            .map_err(|_| TransientRequestFailure::InvalidInput)?;
-        Ok(Self {
-            source_id: SourceId::from_string(id),
+        let scope = SourceContentDigestScope::capture(
+            source_id,
             lifecycle_generation,
             revision,
             request_id,
             relative_path,
+        )
+        .ok_or(TransientRequestFailure::InvalidInput)?;
+        Ok(Self {
+            scope,
+            request_id,
             preset,
             allow_pending_digest: false,
         })
@@ -66,17 +55,17 @@ impl SourceTransientRequest {
 
     /// Exact registered source.
     pub fn source_id(&self) -> &SourceId {
-        &self.source_id
+        &self.scope.source_id
     }
 
     /// Registered lifecycle captured by the caller.
     pub fn lifecycle_generation(&self) -> u64 {
-        self.lifecycle_generation
+        self.scope.lifecycle_generation
     }
 
     /// Audited manifest revision captured by the caller.
     pub fn revision(&self) -> u64 {
-        self.revision
+        self.scope.previous_revision
     }
 
     /// Caller-supplied identity for rejecting late completions.
@@ -86,15 +75,12 @@ impl SourceTransientRequest {
 
     /// Native path relative to the registered source.
     pub fn relative_path(&self) -> &Path {
-        self.relative_path.as_path()
+        self.scope.relative_path.as_path()
     }
 
     /// Check whether an enrichment belongs to this request's exact audited input.
     pub fn matches_digest_scope(&self, scope: &SourceContentDigestScope) -> bool {
-        self.source_id == scope.source_id
-            && self.lifecycle_generation == scope.lifecycle_generation
-            && self.revision == scope.previous_revision
-            && self.relative_path == scope.relative_path
+        self.scope == *scope
     }
 
     /// Detector preset captured by the request.
@@ -103,9 +89,7 @@ impl SourceTransientRequest {
     }
 
     pub(super) fn input_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.source_id.as_str().len()
-            + encoded_path_len(self.relative_path())
+        std::mem::size_of::<Self>() + self.scope.input_bytes()
     }
 
     pub(super) fn event_budget(&self) -> usize {
@@ -153,9 +137,34 @@ impl From<TransientJobError> for TransientRequestFailure {
 }
 
 pub(super) struct Submission<'a> {
-    pub(super) request: SourceTransientRequest,
+    pub(super) request: Demand,
     pub(super) cancellation: FeatureAnalysisCancellation,
     pub(super) reservation: EventReservation<'a>,
+}
+
+pub(super) enum Demand {
+    Transients(SourceTransientRequest),
+    DigestOnly(SourceContentDigestRequest),
+}
+
+impl Demand {
+    fn scope(&self) -> &SourceContentDigestScope {
+        match self {
+            Self::Transients(request) => &request.scope,
+            Self::DigestOnly(request) => request.scope(),
+        }
+    }
+
+    fn origin(&self) -> SourceContentDigestOrigin {
+        match self {
+            Self::Transients(request) => {
+                SourceContentDigestOrigin::Transients(request.request_id())
+            }
+            Self::DigestOnly(request) => {
+                SourceContentDigestOrigin::DigestOnly(request.request_id())
+            }
+        }
+    }
 }
 
 struct Running<'a> {
@@ -256,39 +265,71 @@ impl<'a> Worker<'a> {
                     .join()
                     .map_err(|_| TransientRequestFailure::Computation)
             };
-            let source_id = submission.request.source_id().clone();
+            let source_id = submission.request.scope().source_id.clone();
             let result = match computed {
                 Ok(Computed::Markers(computed)) => sources
                     .get(&source_id)
                     .ok_or(TransientRequestFailure::StaleSource)
-                    .and_then(|source| {
-                        computed.finish(&source.database.writer).map_err(Into::into)
-                    }),
+                    .and_then(|source| computed.finish(&source.database.writer).map_err(Into::into))
+                    .map(Some),
                 Ok(Computed::Digest(digest)) => {
-                    let retry = digest
-                        .map_err(TransientRequestFailure::Input)
-                        .and_then(|digest| {
-                            let source = sources
-                                .get_mut(&source_id)
-                                .ok_or(TransientRequestFailure::StaleSource)?;
-                            commit_digest_and_retry(&mut submission, digest, source, admission)
-                        })
-                        .and_then(|job| spawn(Work::Markers(job), test_gate));
-                    match retry {
-                        Ok(compute) => {
-                            self.running = Some(Running {
-                                submission,
-                                compute,
+                    let committed =
+                        digest
+                            .map_err(TransientRequestFailure::Input)
+                            .and_then(|digest| {
+                                let source = sources
+                                    .get_mut(&source_id)
+                                    .ok_or(TransientRequestFailure::StaleSource)?;
+                                source_content_digest::commit(
+                                    submission.request.scope().clone(),
+                                    submission.request.origin(),
+                                    digest,
+                                    submission.cancellation.flag(),
+                                    source,
+                                    &mut submission.reservation,
+                                    admission,
+                                )
+                                .map_err(TransientJobError::from)
+                                .map_err(TransientRequestFailure::from)
                             });
-                            return;
+                    match (committed, &submission.request) {
+                        (Ok(revision), Demand::Transients(request)) => {
+                            let retry = sources
+                                .get(&source_id)
+                                .ok_or(TransientRequestFailure::StaleSource)
+                                .and_then(|source| {
+                                    prepare_transient_job(
+                                        &source.database.writer,
+                                        &revision,
+                                        &request.scope.relative_path,
+                                        request.preset(),
+                                        submission.cancellation.clone(),
+                                    )
+                                    .map_err(Into::into)
+                                })
+                                .and_then(|job| spawn(Work::Markers(job), test_gate));
+                            match retry {
+                                Ok(compute) => {
+                                    self.running = Some(Running {
+                                        submission,
+                                        compute,
+                                    });
+                                    return;
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
-                        Err(error) => Err(error),
+                        (Ok(_), Demand::DigestOnly(_)) => Ok(None),
+                        (Err(error), _) => Err(error),
                     }
                 }
                 Err(error) => Err(error),
             };
             clear_active(admission);
-            submission.complete(result, admission, sources.get(&source_id));
+            match result {
+                Ok(None) => submission.reservation.finish(),
+                result => submission.complete(result, admission, sources.get(&source_id)),
+            }
         }
         if self.running.is_none()
             && let Some(waiting) = self.waiting.take()
@@ -304,13 +345,14 @@ impl<'a> Worker<'a> {
         sources: &HashMap<SourceId, RegisteredSource>,
         test_gate: Option<&Arc<CatalogTestGate>>,
     ) {
+        let scope = submission.request.scope();
         {
             let mut state = admission.lock().unwrap_or_else(|error| error.into_inner());
             if submission.cancellation.is_cancelled()
                 || !publication_is_current_state(
                     &state,
-                    submission.request.source_id(),
-                    submission.request.lifecycle_generation(),
+                    &scope.source_id,
+                    scope.lifecycle_generation,
                     None,
                 )
             {
@@ -318,12 +360,10 @@ impl<'a> Worker<'a> {
                 submission.reservation.finish();
                 return;
             }
-            state.active_transient = Some((
-                submission.request.source_id().clone(),
-                submission.cancellation.clone(),
-            ));
+            state.active_transient =
+                Some((scope.source_id.clone(), submission.cancellation.clone()));
         }
-        let source = sources.get(submission.request.source_id());
+        let source = sources.get(&scope.source_id);
         let prepared = source
             .ok_or(TransientRequestFailure::StaleSource)
             .and_then(|source| {
@@ -374,7 +414,7 @@ fn clear_active(admission: &Arc<Mutex<AdmissionState>>) {
 impl Submission<'_> {
     fn complete(
         mut self,
-        result: Result<TransientJobOutcome, TransientRequestFailure>,
+        result: Result<Option<TransientJobOutcome>, TransientRequestFailure>,
         admission: &Arc<Mutex<AdmissionState>>,
         source: Option<&RegisteredSource>,
     ) {
@@ -382,19 +422,42 @@ impl Submission<'_> {
             self.reservation.finish();
             return;
         }
+        let request = match self.request {
+            Demand::Transients(request) => request,
+            Demand::DigestOnly(request) => {
+                if let Err(error) = result {
+                    let source_id = request.scope().source_id.clone();
+                    let lifecycle_generation = request.scope().lifecycle_generation;
+                    publish_if_current(
+                        admission,
+                        &mut self.reservation,
+                        &source_id,
+                        lifecycle_generation,
+                        None,
+                        CatalogEvent::SourceContentDigestFailed {
+                            request,
+                            cancellation: self.cancellation.clone(),
+                            error: digest_failure(error),
+                        },
+                    );
+                }
+                self.reservation.finish();
+                return;
+            }
+        };
         let event = |result| CatalogEvent::TransientMarkersCompleted {
-            request: self.request.clone(),
+            request: request.clone(),
             cancellation: self.cancellation.clone(),
             result,
         };
         let failure = match result {
-            Ok(markers) => {
+            Ok(Some(markers)) => {
                 if let Some(source) = source
                     && publish_source_if_current(
                         admission,
                         &mut self.reservation,
-                        self.request.source_id(),
-                        self.request.lifecycle_generation(),
+                        request.source_id(),
+                        request.lifecycle_generation(),
                         None,
                         source,
                         event(Ok(markers)),
@@ -405,13 +468,14 @@ impl Submission<'_> {
                 }
                 TransientRequestFailure::StaleSource
             }
+            Ok(None) => unreachable!("only a digest-only request completes without markers"),
             Err(error) => error,
         };
         publish_if_current(
             admission,
             &mut self.reservation,
-            self.request.source_id(),
-            self.request.lifecycle_generation(),
+            request.source_id(),
+            request.lifecycle_generation(),
             None,
             event(Err(failure)),
         );
@@ -421,22 +485,32 @@ impl Submission<'_> {
 
 fn prepare(
     writer: &SourceWriter,
-    request: &SourceTransientRequest,
+    request: &Demand,
     cancellation: &FeatureAnalysisCancellation,
 ) -> Result<Work, TransientRequestFailure> {
+    let scope = request.scope();
     let revision = writer
         .current_revision()
         .map_err(|_| TransientRequestFailure::StaleSource)?;
-    if revision.source_id() != request.source_id()
-        || revision.lifecycle_generation() != request.lifecycle_generation()
-        || revision.revision() != request.revision()
+    if revision.source_id() != &scope.source_id
+        || revision.lifecycle_generation() != scope.lifecycle_generation
+        || revision.revision() != scope.previous_revision
     {
         return Err(TransientRequestFailure::StaleSource);
     }
+    let pending_digest = || {
+        let input = writer
+            .prepare_pending_content_digest(&revision, &scope.relative_path)
+            .map_err(TransientJobError::from)?;
+        Ok(Work::Digest(input, cancellation.clone()))
+    };
+    let Demand::Transients(request) = request else {
+        return pending_digest();
+    };
     match prepare_transient_job(
         writer,
         &revision,
-        &request.relative_path,
+        &scope.relative_path,
         request.preset(),
         cancellation.clone(),
     )
@@ -446,42 +520,23 @@ fn prepare(
         Err(TransientRequestFailure::Input(SourceFeatureInputError::ContentPending))
             if request.allow_pending_digest =>
         {
-            let input = writer
-                .prepare_pending_content_digest(&revision, &request.relative_path)
-                .map_err(TransientJobError::from)?;
-            Ok(Work::Digest(input, cancellation.clone()))
+            pending_digest()
         }
         Err(error) => Err(error),
     }
 }
 
-fn commit_digest_and_retry(
-    submission: &mut Submission<'_>,
-    digest: PreparedSourceContentDigest,
-    source: &mut RegisteredSource,
-    admission: &Arc<Mutex<AdmissionState>>,
-) -> Result<PreparedTransientJob, TransientRequestFailure> {
-    let request = &submission.request;
-    let revision = source_content_digest::commit(
-        SourceContentDigestScope {
-            source_id: request.source_id.clone(),
-            lifecycle_generation: request.lifecycle_generation,
-            previous_revision: request.revision,
-            relative_path: request.relative_path.clone(),
-        },
-        Some(request.request_id),
-        digest,
-        submission.cancellation.flag(),
-        source,
-        &mut submission.reservation,
-        admission,
-    )
-    .map_err(TransientJobError::from)?;
-    Ok(prepare_transient_job(
-        &source.database.writer,
-        &revision,
-        &request.relative_path,
-        request.preset(),
-        submission.cancellation.clone(),
-    )?)
+fn digest_failure(error: TransientRequestFailure) -> SourceContentDigestFailure {
+    match error {
+        TransientRequestFailure::InvalidInput => SourceContentDigestFailure::InvalidInput,
+        TransientRequestFailure::StaleSource => SourceContentDigestFailure::StaleSource,
+        TransientRequestFailure::Input(error) => SourceContentDigestFailure::Input(error),
+        TransientRequestFailure::Busy => SourceContentDigestFailure::Busy,
+        TransientRequestFailure::Computation | TransientRequestFailure::Decode(_) => {
+            SourceContentDigestFailure::Computation
+        }
+        TransientRequestFailure::Cancelled => {
+            SourceContentDigestFailure::Input(SourceFeatureInputError::Cancelled)
+        }
+    }
 }

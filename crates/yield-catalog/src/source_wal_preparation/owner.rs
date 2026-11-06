@@ -356,6 +356,9 @@ pub(crate) fn deferred(command: &CatalogCommand, slots: &WorkerReservations) -> 
         CatalogCommand::RequestTransientMarkers { request, .. } => {
             slots.is_held(request.source_id())
         }
+        CatalogCommand::RequestSourceContentDigest { request, .. } => {
+            slots.is_held(&request.scope().source_id)
+        }
         CatalogCommand::PlaymarkTempo { request, .. } => slots.is_held(request.source_id()),
         CatalogCommand::ConsumeReplay { submission } => slots.is_held(submission.source_id()),
         CatalogCommand::RequestIndexInspection { handle, .. } => slots.is_held(&handle.source_id),
@@ -380,6 +383,7 @@ pub(crate) fn interrupts_preparation(command: &CatalogCommand) -> bool {
         | CatalogCommand::ApplyPreparedCollectionOperation { .. }
         | CatalogCommand::RequestSimilarity { .. }
         | CatalogCommand::RequestTransientMarkers { .. }
+        | CatalogCommand::RequestSourceContentDigest { .. }
         | CatalogCommand::ConsumeReplay { .. }
         | CatalogCommand::ApplyCuration { .. }
         | CatalogCommand::ApplyCurationOperation { .. }
