@@ -101,9 +101,12 @@ its actual history, routing, and callback integration.
 
 The standalone probe uses the kernel and streaming state intended for Reson.
 It runs the common-rate matrix and an interpolated 48,001 → 44,100 Hz pair.
-The kernel caps future support at 512 frames, uses up to 320 exact phase intervals or
-128 interpolated intervals, and stores one additional row for the phase-wrap
-endpoint. The stream prepares fixed mirrored history off-thread, then reads
+The kernel caps future support at 512 frames and 2 ms of source audio. It
+keeps a minimum of one source frame when a frame itself exceeds 2 ms. The
+first output consumes the source center frame plus this future support. The
+kernel uses up to 320 exact phase intervals or 128 interpolated intervals
+and stores one additional row for the phase-wrap endpoint. The stream
+prepares fixed mirrored history off-thread, then reads
 on demand. It repeats the first and last source frames at finite edges and
 reports the next output frame's exact source coordinate independently of
 the read head. Decimation is limited to 64:1 so the render step has a fixed
