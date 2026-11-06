@@ -2677,7 +2677,7 @@ impl Browser {
             let preview = drag
                 .tempo_resize_region(capture)
                 .filter(|span| span.frame_bounds(capture.total_frames) != baseline);
-            self.preview_playmark_tempo_span(preview, cx);
+            self.preview_playmark_tempo_span(preview, capture.beat_count, cx);
         }
         true
     }
@@ -2766,8 +2766,8 @@ impl Browser {
                     }
                     self.set_waveform_play_region(Some(region));
                     similar_sections::invalidate_if_stale(self);
-                    if tempo_span_changed {
-                        self.finish_playmark_tempo_audition(Some(region), cx);
+                    if tempo_span_changed && let Some(capture) = drag.tempo_resize {
+                        self.finish_playmark_tempo_audition(Some((region, capture.beat_count)), cx);
                     } else if drag.zero_crossing_applies(bpm_snap) {
                         zero_crossing::commit_or_schedule(self, region, cx);
                     }

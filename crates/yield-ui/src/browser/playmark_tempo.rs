@@ -441,7 +441,7 @@ fn apply_presentation(
     browser.set_waveform_play_region(presentation.region);
     similar_sections::invalidate_if_stale(browser);
     if let Some(region) = presentation.region {
-        browser.retarget_committed_playmark_resize(region, cx);
+        browser.retarget_authored_playmark_tempo(region, presentation.beats, cx);
     }
     browser.beat_guide_count = presentation.beats;
     browser
