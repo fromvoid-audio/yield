@@ -101,6 +101,7 @@ pub use history_selection::{
 };
 mod similarity_dispatch;
 mod similarity_query;
+mod transient_job;
 pub use feature_job::{
     ComputedFeatureJob, FeatureJobFailure, FeatureJobOutcome, PreparedFeatureJob,
     prepare_feature_job,
@@ -115,6 +116,9 @@ pub use similarity_dispatch::{
 pub use similarity_query::{
     SimilarityCandidateOutcome, SimilarityQueryError, SourceSimilarityQuery,
     SourceSimilarityResult, SourceSimilarityRow, query_source_similarity,
+};
+pub use transient_job::{
+    ComputedTransientJob, PreparedTransientJob, TransientJobError, prepare_transient_job,
 };
 pub use yield_analysis::aspects::SimilarityAspect;
 mod index_pages;

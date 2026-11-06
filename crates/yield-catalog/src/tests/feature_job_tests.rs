@@ -2,6 +2,8 @@
 mod fixtures {
     use super::super::*;
     use crate::{FeatureJobFailure, FeatureJobOutcome, prepare_feature_job};
+    use crate::{TransientJobError, prepare_transient_job};
+    use yield_analysis::transients::TransientPreset;
     use yield_library::sample_sources::readiness::{
         FeatureArtifactPublication, ReadinessClassification, ReadinessDeficit, ReadinessTarget,
         SourceFeatureInputError,
@@ -13,6 +15,15 @@ mod fixtures {
     }
 
     fn setup_relative(relative: &Path) -> (Fixture, SourceWriter, ReadinessTarget) {
+        setup_signal(relative, |frame| {
+            ((frame as f32 * 0.1).sin() * 12_000.0) as i16
+        })
+    }
+
+    fn setup_signal(
+        relative: &Path,
+        sample: impl Fn(usize) -> i16,
+    ) -> (Fixture, SourceWriter, ReadinessTarget) {
         let fixture = Fixture::new("feature-job-tests");
         let file = fixture.root.path().join(relative);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -26,9 +37,8 @@ mod fixtures {
             },
         )
         .unwrap();
-        for i in 0..16_000 {
-            wav.write_sample::<i16>(((i as f32 * 0.1).sin() * 12_000.0) as i16)
-                .unwrap();
+        for frame in 0..16_000 {
+            wav.write_sample(sample(frame)).unwrap();
         }
         wav.finalize().unwrap();
         let bytes = fs::read(&file).unwrap();
@@ -108,6 +118,72 @@ mod fixtures {
                 r.get(0)
             })
             .unwrap()
+    }
+
+    #[test]
+    fn transient_job_returns_exact_markers_from_an_audited_wav() {
+        let relative = Path::new("nested/attacks.wav");
+        let (fixture, writer, _) = setup_signal(relative, |frame| match frame {
+            1237 => 24_000,
+            9673 => -24_000,
+            _ => 0,
+        });
+        let revision = writer.current_revision().unwrap();
+        let path = RootRelativePath::try_from_path(relative.into()).unwrap();
+        let job = prepare_transient_job(
+            &writer,
+            &revision,
+            &path,
+            TransientPreset::Normal,
+            FeatureAnalysisCancellation::new(),
+        )
+        .unwrap();
+        let computed = thread::spawn(move || job.compute()).join().unwrap();
+        let markers = computed.finish(&writer).unwrap();
+        assert_eq!(markers.frames(), [1237, 9673]);
+        assert_eq!(markers.source_frames(), 16_000);
+        assert_eq!(markers.preset(), TransientPreset::Normal);
+        assert_eq!(status(&fixture), "pending");
+        assert_eq!(artifact_count(&fixture), 0);
+    }
+
+    #[test]
+    fn transient_job_rejects_cancellation_and_file_replacement_after_compute() {
+        let (fixture, writer, _) = setup();
+        let revision = writer.current_revision().unwrap();
+        let path = RootRelativePath::try_from_path("tone.wav".into()).unwrap();
+        let compute = |cancellation| {
+            prepare_transient_job(
+                &writer,
+                &revision,
+                &path,
+                TransientPreset::High,
+                cancellation,
+            )
+            .unwrap()
+            .compute()
+        };
+        let cancellation = FeatureAnalysisCancellation::new();
+        let computed = compute(cancellation.clone());
+        cancellation.cancel();
+        assert!(matches!(
+            computed.finish(&writer),
+            Err(TransientJobError::Cancelled)
+        ));
+
+        let computed = compute(FeatureAnalysisCancellation::new());
+        let file = fixture.root.path().join(path.as_path());
+        let displaced = file.with_extension("old");
+        fs::rename(&file, &displaced).unwrap();
+        fs::copy(&displaced, &file).unwrap();
+        assert!(matches!(
+            computed.finish(&writer),
+            Err(TransientJobError::Source(SourceWriterError::FeatureInput(
+                SourceFeatureInputError::Changed
+            )))
+        ));
+        assert_eq!(status(&fixture), "pending");
+        assert_eq!(artifact_count(&fixture), 0);
     }
 
     #[test]
