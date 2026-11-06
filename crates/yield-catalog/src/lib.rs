@@ -123,6 +123,7 @@ pub use transient_job::{
     ComputedTransientJob, PreparedTransientJob, TransientJobError, prepare_transient_job,
 };
 pub use yield_analysis::aspects::SimilarityAspect;
+pub use yield_analysis::transients::{TransientMarkers, TransientPreset};
 mod index_pages;
 mod index_reveal;
 mod index_reveal_contract;

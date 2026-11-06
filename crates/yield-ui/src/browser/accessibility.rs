@@ -1303,7 +1303,7 @@ impl Browser {
                 button(
                     TRANSIENT_SENSITIVITY,
                     "Transient sensitivity",
-                    Some(self.transient_markers.sensitivity().label().into()),
+                    Some(self.transient_markers.sensitivity_label().into()),
                     has_waveform,
                 ),
                 toggle(
