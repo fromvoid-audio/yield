@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use gpui::{
     App, AppContext, BorrowAppContext, Bounds, ClickEvent, Context, FocusHandle, Focusable,
-    KeyDownEvent, PathPromptOptions, Pixels, ScrollHandle, ScrollStrategy, Task,
+    KeyDownEvent, KeyUpEvent, PathPromptOptions, Pixels, ScrollHandle, ScrollStrategy, Task,
     UniformListScrollHandle, Window,
 };
 use reson::{PlaybackRequestId, PlaybackRuntime};
@@ -114,6 +114,7 @@ mod panel_focus;
 mod panel_resize;
 mod playback_age;
 mod played_ranges;
+mod playmark_resize;
 mod playmark_timing;
 mod preferences;
 mod random_audition;
@@ -414,10 +415,13 @@ pub(crate) struct Browser {
     preferred_metadata_height: Option<f32>,
     preferred_collections_height: Option<f32>,
     pane_resize_drag: Option<view::PaneResizeDrag>,
-    pane_resize_activation: Option<gpui::Subscription>,
+    window_activation_subscription: Option<gpui::Subscription>,
     pane_resize_environment_subscriptions: Vec<gpui::Subscription>,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
+    playmark_resize_anchor: Option<playmark_resize::ResizeAnchor>,
+    held_playmark_slide: Option<waveform::WaveformRegionSlide>,
+    playmark_slide_blur_subscription: Option<gpui::Subscription>,
     waveform_edit_region: Option<WaveformEditRegion>,
     waveform_edit_settings: WaveformEditSettings,
     waveform_fade_hover: Option<waveform_fades::WaveformEditFadeHit>,
@@ -662,7 +666,9 @@ impl Browser {
             &beat_count_input,
             |view, _input, event: &BeatCountChanged, cx| {
                 view.beat_guide_count = event.count;
-                view.apply_metronome_count_change(event.count, cx);
+                if event.committed {
+                    view.apply_metronome_count_change(event.count, cx);
+                }
                 cx.notify();
             },
         );
@@ -775,10 +781,13 @@ impl Browser {
             preferred_metadata_height: None,
             preferred_collections_height: None,
             pane_resize_drag: None,
-            pane_resize_activation: None,
+            window_activation_subscription: None,
             pane_resize_environment_subscriptions: Vec::new(),
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
+            playmark_resize_anchor: None,
+            held_playmark_slide: None,
+            playmark_slide_blur_subscription: None,
             waveform_edit_region: None,
             waveform_edit_settings: waveform::default_edit_settings(),
             waveform_fade_hover: None,
@@ -2812,6 +2821,19 @@ impl Browser {
         cx.notify();
     }
 
+    fn release_playmark_slide(&mut self, event: &KeyUpEvent) {
+        let released = waveform::waveform_region_navigation_key(
+            &event.keystroke.key,
+            false,
+            false,
+            false,
+            false,
+        );
+        if self.held_playmark_slide == released {
+            self.held_playmark_slide = None;
+        }
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -2819,6 +2841,13 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+        let waveform_has_keys = self.waveform_focus_handle.is_focused(window)
+            && !self.theme_settings_open
+            && !self.audio_settings_open
+            && self.context_menu.is_none();
+        if !waveform_has_keys || self.waveform.is_none() || key == "escape" {
+            self.held_playmark_slide = None;
+        }
         if self.handle_unsupported_key(event, window, cx) {
             return;
         }
@@ -3138,6 +3167,9 @@ impl Browser {
             }
             return;
         }
+        if self.handle_playmark_resize_key(event, window, cx) {
+            return;
+        }
         if self.waveform_focus_handle.is_focused(window)
             && !secondary
             && !function
@@ -3161,38 +3193,11 @@ impl Browser {
                 }
                 return;
             }
-            if let Some(direction) =
-                waveform::waveform_region_navigation_key(key, secondary, shift, alt, function)
+            if waveform_has_keys
+                && let Some(direction) =
+                    waveform::waveform_region_navigation_key(key, secondary, shift, alt, function)
             {
-                let canceled = self.cancel_waveform_gestures(window, cx);
-                let moved = self.slide_waveform_region(direction);
-                if moved {
-                    if direction.is_fine() {
-                        if let (Some(path), Some(region)) = (
-                            self.selected
-                                .and_then(|index| self.entries.get(index))
-                                .map(|entry| entry.path.clone()),
-                            self.waveform_play_region,
-                        ) {
-                            match self.submit_playmark_timing_span(&path, region, cx) {
-                                Some(Ok(())) => {
-                                    self.playback_status =
-                                        "Fine selection nudge applying to playback".to_string();
-                                }
-                                Some(Err(error)) => {
-                                    self.playback_status =
-                                        format!("Fine selection nudge unavailable: {error}");
-                                }
-                                None => {}
-                            }
-                        }
-                    } else {
-                        zero_crossing::schedule_for_committed_region(self, cx);
-                    }
-                }
-                if moved || canceled {
-                    cx.notify();
-                }
+                self.handle_playmark_slide(direction, event.is_held, window, cx);
                 return;
             }
         }
