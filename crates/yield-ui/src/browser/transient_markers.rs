@@ -1,37 +1,74 @@
-//! Bounded, cancellable transient markers derived from the loaded waveform preview.
+//! Source-authorized, native-frame transient markers for the loaded waveform.
 
-use std::{
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::{sync::Arc, time::Duration};
+
+use gpui::{
+    AnyView, App, Bounds, Context, Render, Task, Window, canvas, div, fill, point, prelude::*, px,
+    size,
+};
+use yield_core::{AudioFile, WaveformViewport};
+use yield_library::sample_sources::SourcePublicationFence;
+use yield_media::{WaveformDetailContext, WaveformFileRevision};
+use yield_session::{
+    CatalogCommand, CatalogEvent, FeatureAnalysisCancellation, SourceTransientRequest,
+    TransientMarkers, TransientPreset, TransientRequestFailure,
 };
 
-use gpui::{Bounds, Context, Task, canvas, div, fill, point, prelude::*, px, size};
-use yield_core::WaveformViewport;
-use yield_media::{MAX_WAVEFORM_BAND_POINTS, WaveformFileRevision};
+use super::{Browser, catalog, catalog_metadata::CatalogMetadataContext};
 
-use super::Browser;
+const PRESET_DEBOUNCE: Duration = Duration::from_millis(30);
+const MIN_MARKER_SPACING_PX: f32 = 3.0;
 
-const MAX_MARKERS: usize = 512;
-const MIN_GAP_SECONDS: f32 = 0.035;
+enum ResultState {
+    Pending,
+    Unavailable,
+    Ready {
+        markers: Arc<TransientMarkers>,
+        fence: SourcePublicationFence,
+    },
+}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Intent {
-    generation: u64,
-    path: PathBuf,
-    revision: WaveformFileRevision,
+struct ActiveRequest {
+    request: SourceTransientRequest,
+    waveform_generation: u64,
+    file_revision: WaveformFileRevision,
+    cancellation: FeatureAnalysisCancellation,
+    result: ResultState,
+}
+
+impl ActiveRequest {
+    fn is_current(&self, browser: &Browser) -> bool {
+        if !browser.transient_markers.enabled
+            || self.cancellation.is_cancelled()
+            || self.waveform_generation != browser.waveform_generation
+            || self.request.preset() != browser.transient_markers.sensitivity
+        {
+            return false;
+        }
+        let Some((entry, detail, source)) = current_source(browser) else {
+            return false;
+        };
+        self.file_revision == detail.file_revision
+            && self.request.relative_path() == entry.relative_path
+            && self.request.source_id() == &source.source_id
+            && self.request.lifecycle_generation() == source.lifecycle_generation
+            && self.request.revision() == source.revision
+    }
+}
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 #[derive(Default)]
 pub(super) struct TransientMarkersState {
     enabled: bool,
-    wanted: Option<Intent>,
-    queued: Option<Intent>,
-    cancellation: Option<Arc<AtomicBool>>,
-    task: Option<Task<()>>,
-    positions: Arc<[f32]>,
+    sensitivity: TransientPreset,
+    next_request_id: u64,
+    active: Option<ActiveRequest>,
+    submission: Option<Task<()>>,
 }
 
 impl TransientMarkersState {
@@ -39,34 +76,46 @@ impl TransientMarkersState {
         self.enabled
     }
 
-    pub(super) fn invalidate(&mut self) {
-        if let Some(cancellation) = &self.cancellation {
-            cancellation.store(true, Ordering::Release);
+    pub(super) fn sensitivity_label(&self) -> &'static str {
+        match self.sensitivity {
+            TransientPreset::Low => "Low",
+            TransientPreset::Normal => "Normal",
+            TransientPreset::High => "High",
         }
-        self.wanted = None;
-        self.queued = None;
-        self.positions = Arc::from([]);
+    }
+
+    pub(super) fn sensitivity_short_label(&self) -> &'static str {
+        match self.sensitivity {
+            TransientPreset::Low => "Lo",
+            TransientPreset::Normal => "Mid",
+            TransientPreset::High => "Hi",
+        }
+    }
+
+    pub(super) fn invalidate(&mut self) {
+        self.submission = None;
+        self.active = None;
     }
 }
 
-impl Drop for TransientMarkersState {
-    fn drop(&mut self) {
-        self.invalidate();
-    }
-}
-
-fn current_intent(browser: &Browser) -> Option<Intent> {
-    let preview = browser.waveform.as_ref()?;
-    let path = browser.entries.get(browser.selected?)?.path.clone();
-    let context = preview.detail_context.as_ref()?;
-    if context.path != path {
+fn current_source(
+    browser: &Browser,
+) -> Option<(&AudioFile, &WaveformDetailContext, &CatalogMetadataContext)> {
+    let selected = browser.selected?;
+    let entry = browser.entries.get(selected)?;
+    let detail = browser.waveform.as_ref()?.detail_context.as_ref()?;
+    let source = browser.catalog_metadata.context_ref()?;
+    let activation = browser.catalog_activation.as_ref()?;
+    if entry.path != detail.path
+        || browser.root.as_ref() != Some(&source.root)
+        || source.entry_indices.get(&entry.relative_path) != Some(&selected)
+        || activation.source_id != source.source_id
+        || activation.lifecycle_generation != source.lifecycle_generation
+        || activation.root_identity.as_ref() != Some(&source.root_identity)
+    {
         return None;
     }
-    Some(Intent {
-        generation: browser.waveform_generation,
-        path,
-        revision: context.file_revision.clone(),
-    })
+    Some((entry, detail, source))
 }
 
 pub(super) fn toggle(browser: &mut Browser, cx: &mut Context<Browser>) {
@@ -83,169 +132,219 @@ pub(super) fn toggle(browser: &mut Browser, cx: &mut Context<Browser>) {
     cx.notify();
 }
 
+pub(super) fn cycle_sensitivity(browser: &mut Browser, cx: &mut Context<Browser>) {
+    if browser.waveform.is_none() {
+        return;
+    }
+    browser.transient_markers.sensitivity = match browser.transient_markers.sensitivity {
+        TransientPreset::Low => TransientPreset::Normal,
+        TransientPreset::Normal => TransientPreset::High,
+        TransientPreset::High => TransientPreset::Low,
+    };
+    if browser.transient_markers.enabled {
+        schedule(browser, cx);
+    } else {
+        browser.playback_status = format!(
+            "Transient sensitivity: {}",
+            browser.transient_markers.sensitivity_label()
+        );
+    }
+    cx.notify();
+}
+
+struct SensitivityTooltip;
+
+impl Render for SensitivityTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = crate::theme::active(cx);
+        div()
+            .px(px(theme.spacing.control_gap))
+            .py(px(theme.spacing.control_gap))
+            .bg(crate::theme::color(theme.colors.surface_raised))
+            .text_size(px(theme.typography.small_size))
+            .text_color(crate::theme::color(theme.colors.text_primary))
+            .child("Transient sensitivity. Click to cycle Low, Normal, and High.")
+    }
+}
+
+pub(super) fn sensitivity_tooltip(_: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|_| SensitivityTooltip).into()
+}
+
 pub(super) fn schedule(browser: &mut Browser, cx: &mut Context<Browser>) {
-    if !browser.transient_markers.enabled {
+    if !browser.transient_markers.enabled
+        || browser.waveform.is_none()
+        || browser
+            .transient_markers
+            .active
+            .as_ref()
+            .is_some_and(|active| active.is_current(browser))
+    {
         return;
     }
-    let Some(intent) = current_intent(browser) else {
-        browser.transient_markers.enabled = false;
-        browser.transient_markers.invalidate();
-        browser.playback_status = String::from("Transient markers unavailable for this waveform");
+    browser.transient_markers.invalidate();
+    let Some((entry, detail, source)) = current_source(browser) else {
+        browser.playback_status =
+            String::from("Transient markers unavailable until this waveform has an audited Source");
         return;
     };
-    if browser.transient_markers.wanted.as_ref() == Some(&intent) {
+    let Some(id) = browser.transient_markers.next_request_id.checked_add(1) else {
+        browser.playback_status = String::from("Transient request limit reached");
         return;
-    }
-    browser.transient_markers.wanted = Some(intent.clone());
-    browser.transient_markers.positions = Arc::from([]);
+    };
+    let Ok(request) = SourceTransientRequest::new(
+        &source.source_id,
+        source.lifecycle_generation,
+        source.revision,
+        id,
+        &entry.relative_path,
+        browser.transient_markers.sensitivity,
+    ) else {
+        browser.playback_status =
+            String::from("Transient markers unavailable for this audio entry");
+        return;
+    };
+    let file_revision = detail.file_revision.clone();
+    browser.transient_markers.next_request_id = id;
+    browser.transient_markers.active = Some(ActiveRequest {
+        request,
+        waveform_generation: browser.waveform_generation,
+        file_revision,
+        cancellation: FeatureAnalysisCancellation::new(),
+        result: ResultState::Pending,
+    });
     browser.playback_status = String::from("Finding transient markers…");
-    if browser.transient_markers.task.is_some() {
-        if let Some(cancellation) = &browser.transient_markers.cancellation {
-            cancellation.store(true, Ordering::Release);
-        }
-        browser.transient_markers.queued = Some(intent);
-    } else {
-        launch(browser, intent, cx);
-    }
-}
-
-fn launch(browser: &mut Browser, intent: Intent, cx: &mut Context<Browser>) {
-    let Some(preview) = browser.waveform.as_ref() else {
-        return;
-    };
-    let bands = preview.bands.clone();
-    let duration = preview.duration_seconds;
-    let cancellation = Arc::new(AtomicBool::new(false));
-    browser.transient_markers.cancellation = Some(Arc::clone(&cancellation));
-    browser.transient_markers.task = Some(cx.spawn(async move |this, cx| {
-        let (intent, cancellation, result) = cx
-            .background_executor()
-            .spawn(async move {
-                let result = detect(&bands, duration, &cancellation);
-                (intent, cancellation, result)
-            })
-            .await;
-        let _ = this.update(cx, |browser, cx| {
-            browser.transient_markers.task = None;
-            browser.transient_markers.cancellation = None;
-            accept_result(
-                browser,
-                &intent,
-                cancellation.load(Ordering::Acquire),
-                result,
-            );
-            if let Some(next) = browser.transient_markers.queued.take()
-                && browser.transient_markers.enabled
-                && browser.transient_markers.wanted.as_ref() == Some(&next)
-                && current_intent(browser).as_ref() == Some(&next)
-            {
-                launch(browser, next, cx);
-            }
-            cx.notify();
-        });
+    // Coalesce rapid preset changes before spending a Catalog queue slot.
+    browser.transient_markers.submission = Some(cx.spawn(async move |this, cx| {
+        cx.background_executor().timer(PRESET_DEBOUNCE).await;
+        let _ =
+            this.update(cx, |browser, cx| {
+                let Some(active) = browser.transient_markers.active.as_ref().filter(|active| {
+                    active.request.request_id() == id && active.is_current(browser)
+                }) else {
+                    return;
+                };
+                let command = CatalogCommand::RequestTransientMarkers {
+                    request: active.request.clone(),
+                    cancellation: active.cancellation.clone(),
+                };
+                browser.transient_markers.submission = None;
+                match catalog::submit_catalog_command(command, cx) {
+                    Ok(()) => browser.start_source_registry_poll(cx),
+                    Err(error) => {
+                        if let Some(active) = browser.transient_markers.active.as_mut() {
+                            active.result = ResultState::Unavailable;
+                        }
+                        browser.playback_status = format!("Transient markers unavailable: {error}");
+                    }
+                }
+                cx.notify();
+            });
     }));
+    cx.notify();
 }
 
-fn accept_result(
+pub(super) fn apply_catalog_event(
     browser: &mut Browser,
-    intent: &Intent,
-    canceled: bool,
-    result: Result<Vec<f32>, &'static str>,
-) {
-    if canceled
-        || !browser.transient_markers.enabled
-        || browser.transient_markers.wanted.as_ref() != Some(intent)
-        || current_intent(browser).as_ref() != Some(intent)
-    {
-        return;
+    event: &mut CatalogEvent,
+    fence: Option<SourcePublicationFence>,
+    cx: &mut Context<Browser>,
+) -> bool {
+    let CatalogEvent::TransientMarkersCompleted {
+        request,
+        cancellation,
+        result,
+    } = event
+    else {
+        return false;
+    };
+    let current = browser
+        .transient_markers
+        .active
+        .as_ref()
+        .is_some_and(|active| {
+            active.request == *request
+                && active.is_current(browser)
+                && matches!(active.result, ResultState::Pending)
+        });
+    if !current || cancellation.is_cancelled() {
+        return true;
     }
-    match result {
-        Ok(positions) => {
-            browser.playback_status = format!("{} transient markers", positions.len());
-            browser.transient_markers.positions = positions.into();
+    let result = std::mem::replace(result, Err(TransientRequestFailure::Cancelled));
+    let (state, status) = match result {
+        Ok(markers)
+            if markers.preset() == request.preset()
+                && browser.waveform.as_ref().is_some_and(|waveform| {
+                    waveform.total_frames == markers.source_frames() as usize
+                }) =>
+        {
+            if let Some(fence) = fence.filter(SourcePublicationFence::is_live) {
+                let status = if markers.frames().is_empty() {
+                    String::from("No transients found")
+                } else {
+                    format!("{} transient markers", markers.frames().len())
+                };
+                (
+                    ResultState::Ready {
+                        markers: Arc::new(markers),
+                        fence,
+                    },
+                    status,
+                )
+            } else {
+                unavailable(TransientRequestFailure::StaleSource)
+            }
         }
-        Err(error) => {
-            browser.transient_markers.enabled = false;
-            browser.transient_markers.invalidate();
-            browser.playback_status = format!("Transient markers unavailable: {error}");
-        }
+        Ok(_) => unavailable(TransientRequestFailure::StaleSource),
+        Err(error) => unavailable(error),
+    };
+    if let Some(active) = browser.transient_markers.active.as_mut() {
+        active.result = state;
     }
+    browser.playback_status = status;
+    cx.notify();
+    true
 }
 
-fn detect(
-    bands: &[[f32; 4]],
-    duration: f32,
-    cancellation: &AtomicBool,
-) -> Result<Vec<f32>, &'static str> {
-    if bands.len() < 3 || bands.len() > MAX_WAVEFORM_BAND_POINTS {
-        return Err("invalid preview band count");
-    }
-    if !duration.is_finite() || duration <= 0.0 {
-        return Err("invalid waveform duration");
-    }
-    let mut novelty = Vec::with_capacity(bands.len());
-    novelty.push(0.0);
-    for (index, pair) in bands.windows(2).enumerate() {
-        if index % 128 == 0 && cancellation.load(Ordering::Acquire) {
-            return Err("canceled");
-        }
-        if pair.iter().flatten().any(|value| !value.is_finite()) {
-            return Err("invalid preview bands");
-        }
-        let flux = (0..3)
-            .map(|lane| (pair[1][lane] - pair[0][lane]).max(0.0))
-            .sum::<f32>()
-            + (pair[1][3] - pair[0][3]).max(0.0) * 0.5;
-        novelty.push(flux);
-    }
-    let mut sorted = novelty.clone();
-    sorted.sort_by(f32::total_cmp);
-    let median = sorted[sorted.len() / 2];
-    let threshold = (median * 2.5).max(0.045);
-    let min_gap = ((MIN_GAP_SECONDS / duration) * bands.len() as f32)
-        .ceil()
-        .max((bands.len() as f32 / MAX_MARKERS as f32).ceil())
-        .max(1.0) as usize;
-    let mut positions = Vec::new();
-    let mut last_index = None;
-    for index in 1..novelty.len() - 1 {
-        if index % 128 == 0 && cancellation.load(Ordering::Acquire) {
-            return Err("canceled");
-        }
-        let value = novelty[index];
-        if value < threshold || value < novelty[index - 1] || value < novelty[index + 1] {
-            continue;
-        }
-        if last_index.is_some_and(|previous| index - previous < min_gap) {
-            continue;
-        }
-        positions.push(index as f32 / bands.len() as f32);
-        last_index = Some(index);
-        if positions.len() >= MAX_MARKERS {
-            break;
-        }
-    }
-    Ok(positions)
+fn unavailable(error: TransientRequestFailure) -> (ResultState, String) {
+    let reason = match error {
+        TransientRequestFailure::InvalidInput => "invalid audio entry".into(),
+        TransientRequestFailure::StaleSource => "the Source or waveform changed".into(),
+        TransientRequestFailure::Input(error) => error.to_string(),
+        TransientRequestFailure::Decode(reason) => reason.into(),
+        TransientRequestFailure::Computation => "analysis failed".into(),
+        TransientRequestFailure::Cancelled => "analysis cancelled".into(),
+    };
+    (
+        ResultState::Unavailable,
+        format!("Transient markers unavailable: {reason}"),
+    )
 }
 
-fn positions(browser: &Browser) -> Arc<[f32]> {
-    if browser.transient_markers.enabled
-        && browser.transient_markers.wanted.as_ref() == current_intent(browser).as_ref()
-    {
-        Arc::clone(&browser.transient_markers.positions)
-    } else {
-        Arc::from([])
-    }
+fn current_markers(browser: &Browser) -> Option<Arc<TransientMarkers>> {
+    let active = browser.transient_markers.active.as_ref()?;
+    let ResultState::Ready { markers, fence } = &active.result else {
+        return None;
+    };
+    (fence.is_live() && active.is_current(browser)).then(|| Arc::clone(markers))
 }
 
 fn visible_positions(
-    positions: &[f32],
+    frames: &[u32],
+    source_frames: u32,
     viewport: WaveformViewport,
+    width_px: f32,
 ) -> impl Iterator<Item = f32> + '_ {
-    positions.iter().filter_map(move |ratio| {
-        viewport
-            .visible_ratio_from_absolute(f64::from(*ratio))
-            .map(|visible| visible as f32)
+    let mut last_x = f32::NEG_INFINITY;
+    frames.iter().filter_map(move |frame| {
+        let visible =
+            viewport.visible_ratio_from_absolute(f64::from(*frame) / f64::from(source_frames))?;
+        let x = visible as f32 * width_px;
+        if x - last_x < MIN_MARKER_SPACING_PX {
+            return None;
+        }
+        last_x = x;
+        Some(x)
     })
 }
 
@@ -253,7 +352,7 @@ pub(super) fn render_overlay(
     browser: &Browser,
     theme: &yield_design::Theme,
 ) -> impl gpui::IntoElement {
-    let positions = positions(browser);
+    let markers = current_markers(browser);
     let viewport = browser.waveform_viewport;
     let tint = crate::theme::color(theme.colors.waveform_playhead).opacity(0.5);
     div()
@@ -266,11 +365,18 @@ pub(super) fn render_overlay(
             canvas(
                 |_, _, _| (),
                 move |bounds, _, window, _| {
-                    for visible in visible_positions(&positions, viewport) {
-                        let x = bounds.origin.x + bounds.size.width * visible;
+                    let Some(markers) = markers.as_ref() else {
+                        return;
+                    };
+                    for x in visible_positions(
+                        markers.frames(),
+                        markers.source_frames(),
+                        viewport,
+                        f32::from(bounds.size.width),
+                    ) {
                         window.paint_quad(fill(
                             Bounds::new(
-                                point(x, bounds.origin.y),
+                                point(bounds.origin.x + px(x), bounds.origin.y),
                                 size(px(1.0), bounds.size.height),
                             ),
                             tint,
@@ -286,13 +392,22 @@ pub(super) fn render_overlay(
 mod tests {
     use super::*;
     use gpui::{KeyDownEvent, Keystroke, TestAppContext};
-    use std::{fs, path::Path};
-    use yield_core::AudioFile;
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+        time::Instant,
+    };
+    use yield_library::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
 
     fn fixture() -> (tempfile::TempDir, PathBuf, yield_media::WaveformPreview) {
         let directory = tempfile::tempdir().expect("fixture directory");
-        let path = directory.path().join("transients.wav");
-        let frames = 256_u32;
+        let path = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("transients.wav");
+        let frames = 16_000_u32;
         let mut bytes = Vec::with_capacity(44 + frames as usize * 4);
         bytes.extend_from_slice(b"RIFF");
         bytes.extend_from_slice(&(36 + frames * 4).to_le_bytes());
@@ -300,19 +415,23 @@ mod tests {
         bytes.extend_from_slice(&16_u32.to_le_bytes());
         bytes.extend_from_slice(&3_u16.to_le_bytes());
         bytes.extend_from_slice(&1_u16.to_le_bytes());
-        bytes.extend_from_slice(&48_000_u32.to_le_bytes());
-        bytes.extend_from_slice(&192_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&64_000_u32.to_le_bytes());
         bytes.extend_from_slice(&4_u16.to_le_bytes());
         bytes.extend_from_slice(&32_u16.to_le_bytes());
         bytes.extend_from_slice(b"data");
         bytes.extend_from_slice(&(frames * 4).to_le_bytes());
-        bytes.resize(44 + frames as usize * 4, 0);
+        for frame in 0..frames {
+            let sample: f32 = match frame {
+                2000 => 0.025,
+                7000 => 0.06,
+                12000 => 0.8,
+                _ => 0.0,
+            };
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
         fs::write(&path, bytes).expect("fixture WAV");
-        let mut preview = yield_media::load_waveform_preview(&path).expect("load preview");
-        preview.bands = vec![[0.0; 4]; 100];
-        preview.bands[20] = [1.0, 0.8, 0.7, 1.0];
-        preview.bands[70] = [0.8, 1.0, 0.9, 1.0];
-        preview.duration_seconds = 1.0;
+        let preview = yield_media::load_waveform_preview(&path).expect("load preview");
         (directory, path, preview)
     }
 
@@ -329,7 +448,7 @@ mod tests {
                 relative_path: PathBuf::from("transients.wav"),
                 byte_len: fs::metadata(path).expect("metadata").len(),
                 duration_seconds: Some(1.0),
-                sample_rate: Some(48_000),
+                sample_rate: Some(16_000),
                 playback_type: None,
                 curation: None,
             }];
@@ -341,161 +460,165 @@ mod tests {
     }
 
     #[test]
-    fn detects_bounded_positions_for_two_spectral_attacks() {
-        let mut bands = vec![[0.0; 4]; 100];
-        bands[20] = [1.0, 0.8, 0.7, 1.0];
-        bands[70] = [0.8, 1.0, 0.9, 1.0];
-        let positions = detect(&bands, 1.0, &AtomicBool::new(false)).expect("transients");
-        assert_eq!(positions, [0.2, 0.7]);
-    }
-
-    #[test]
-    fn loaded_wav_preview_produces_markers_near_audible_attacks() {
-        let directory = tempfile::tempdir().expect("fixture directory");
-        let path = directory.path().join("attacks.wav");
-        let frames = 48_000_u32;
-        let mut bytes = Vec::with_capacity(44 + frames as usize * 4);
-        bytes.extend_from_slice(b"RIFF");
-        bytes.extend_from_slice(&(36 + frames * 4).to_le_bytes());
-        bytes.extend_from_slice(b"WAVEfmt ");
-        bytes.extend_from_slice(&16_u32.to_le_bytes());
-        bytes.extend_from_slice(&3_u16.to_le_bytes());
-        bytes.extend_from_slice(&1_u16.to_le_bytes());
-        bytes.extend_from_slice(&48_000_u32.to_le_bytes());
-        bytes.extend_from_slice(&192_000_u32.to_le_bytes());
-        bytes.extend_from_slice(&4_u16.to_le_bytes());
-        bytes.extend_from_slice(&32_u16.to_le_bytes());
-        bytes.extend_from_slice(b"data");
-        bytes.extend_from_slice(&(frames * 4).to_le_bytes());
-        for frame in 0..frames {
-            let sample: f32 =
-                if (9_600..10_112).contains(&frame) || (33_600..34_112).contains(&frame) {
-                    if frame % 2 == 0 { 0.8 } else { -0.8 }
-                } else {
-                    0.0
-                };
-            bytes.extend_from_slice(&sample.to_le_bytes());
+    fn projection_thins_close_pixels_and_reveals_exact_frames_on_zoom() {
+        let frames = [1000, 1001, 1500, 1999];
+        let overview =
+            visible_positions(&frames, 2000, WaveformViewport::full(), 200.0).collect::<Vec<_>>();
+        assert_eq!(overview.len(), 3);
+        for (actual, expected) in overview.into_iter().zip([100.0, 150.0, 199.9]) {
+            assert!((actual - expected).abs() < 0.001);
         }
-        fs::write(&path, bytes).expect("fixture WAV");
-        let preview = yield_media::load_waveform_preview(&path).expect("load preview");
-        let positions = detect(
-            &preview.bands,
-            preview.duration_seconds,
-            &AtomicBool::new(false),
-        )
-        .expect("transients");
-        assert!(
-            positions
-                .iter()
-                .any(|position| (position - 0.2).abs() < 0.05)
-        );
-        assert!(
-            positions
-                .iter()
-                .any(|position| (position - 0.7).abs() < 0.05)
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_input_and_cancellation() {
-        assert!(detect(&[[0.0; 4]; 2], 1.0, &AtomicBool::new(false)).is_err());
-        let bands = vec![[0.0; 4]; 256];
-        assert_eq!(detect(&bands, 1.0, &AtomicBool::new(true)), Err("canceled"));
-    }
-
-    #[test]
-    fn dense_preview_keeps_marker_count_and_order_bounded() {
-        let mut bands = vec![[0.0; 4]; MAX_WAVEFORM_BAND_POINTS];
-        for index in (2..bands.len()).step_by(3) {
-            bands[index] = [1.0; 4];
-        }
-        let positions = detect(&bands, 20.0, &AtomicBool::new(false)).expect("dense preview");
-        assert!(!positions.is_empty());
-        assert!(positions.len() <= MAX_MARKERS);
-        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-    }
-
-    #[test]
-    fn marker_projection_tracks_zoomed_viewport() {
-        let viewport = WaveformViewport {
-            start: 0.25,
-            end: 0.75,
+        let detail = WaveformViewport {
+            start: 0.499,
+            end: 0.501,
         };
-        let projected = visible_positions(&[0.1, 0.375, 0.625, 0.9], viewport).collect::<Vec<_>>();
-        assert_eq!(projected, [0.25, 0.75]);
+        let zoomed = visible_positions(&frames, 2000, detail, 200.0).collect::<Vec<_>>();
+        assert_eq!(zoomed, [100.0, 150.0]);
+    }
+
+    fn wait_for<T>(mut poll: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(value) = poll() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for Catalog");
+            std::thread::yield_now();
+        }
+    }
+
+    fn audited_owner(
+        guard: &WritableProfileGuard,
+        root: &Path,
+    ) -> (
+        yield_catalog::CatalogService,
+        yield_catalog::CatalogSnapshot,
+    ) {
+        let service = yield_catalog::CatalogService::start(guard).unwrap();
+        let source_id = yield_library::sample_sources::SourceId::from_string("gpui-transients");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: root.to_path_buf(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        wait_for(|| {
+            matches!(
+                service.try_recv_event(),
+                Ok(CatalogEvent::Registered { .. })
+            )
+            .then_some(())
+        });
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id,
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        let snapshot = wait_for(|| match service.try_recv_event() {
+            Ok(CatalogEvent::AuditCommitted { snapshot }) => Some(snapshot),
+            Ok(CatalogEvent::Failed { error, .. }) => panic!("audit failed: {error}"),
+            _ => None,
+        });
+        (service, snapshot)
+    }
+
+    fn install_source(view: &mut Browser, root: &Path, snapshot: &yield_catalog::CatalogSnapshot) {
+        view.root = Some(root.to_path_buf());
+        view.catalog_activation = Some(catalog::CatalogActivation {
+            source_id: snapshot.source_id.clone(),
+            root: root.to_path_buf(),
+            lifecycle_generation: snapshot.lifecycle_generation,
+            registered: true,
+            registration_admitted: true,
+            root_identity: Some(snapshot.root_identity.clone()),
+            audit_finished: true,
+            audit_error: None,
+            audit_retryable: false,
+            force_reload: false,
+            fallback_to_scan: false,
+        });
+        view.catalog_metadata
+            .install_projection(CatalogMetadataContext {
+                source_id: snapshot.source_id.clone(),
+                lifecycle_generation: snapshot.lifecycle_generation,
+                root: root.to_path_buf(),
+                root_identity: snapshot.root_identity.clone(),
+                directory_generation: snapshot.directory_generation,
+                revision: snapshot.committed_revision,
+                entry_indices: Arc::new(HashMap::from([(PathBuf::from("transients.wav"), 0)])),
+            });
+    }
+
+    fn next_delivery(cx: &mut gpui::VisualTestContext) -> yield_session::CatalogDelivery {
+        use super::super::source_registry::SourceRegistryGlobal;
+        cx.run_until_parked();
+        cx.executor().advance_clock(PRESET_DEBOUNCE);
+        cx.run_until_parked();
+        wait_for(|| {
+            cx.update(|_, app| {
+                let mut deliveries = Vec::new();
+                app.global::<SourceRegistryGlobal>()
+                    .drain_catalog_deliveries(&mut deliveries);
+                deliveries.into_iter().next()
+            })
+        })
     }
 
     #[gpui::test]
-    fn toggle_reload_and_stale_generation_hide_old_markers(cx: &mut TestAppContext) {
+    fn toolbar_projects_exact_owner_frames_and_rejects_the_old_preset(cx: &mut TestAppContext) {
+        use super::super::source_registry::SourceRegistryGlobal;
         let (_directory, path, preview) = fixture();
+        let root = path.parent().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
+        let _profile = PersistenceProfileGuard::named("gpui-transients");
+        let guard = WritableProfileGuard::acquire_current().unwrap();
+        let (service, snapshot) = audited_owner(&guard, root);
+        cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
         let (browser, cx) = install(cx, &path, preview);
-        browser.update(cx, |view, cx| toggle(view, cx));
-        cx.run_until_parked();
         browser.update(cx, |view, cx| {
-            assert_eq!(positions(view).as_ref(), [0.2, 0.7]);
-            toggle(view, cx);
-            assert!(positions(view).is_empty());
+            install_source(view, root, &snapshot);
             toggle(view, cx);
         });
-        cx.run_until_parked();
-        browser.update(cx, |view, _| {
-            assert_eq!(positions(view).as_ref(), [0.2, 0.7]);
-            view.waveform_generation += 1;
-            assert!(
-                positions(view).is_empty(),
-                "stale generation must not paint"
-            );
-            view.waveform_generation -= 1;
-            view.entries[0].path = PathBuf::from("/different-source.wav");
-            assert!(positions(view).is_empty(), "stale source must not paint");
-            view.entries[0].path = path.clone();
-            view.waveform
-                .as_mut()
-                .expect("preview")
-                .detail_context
-                .as_mut()
-                .expect("revision context")
-                .file_revision
-                .change_marker
-                .push_str("-changed");
-            assert!(positions(view).is_empty(), "stale revision must not paint");
+        let old = next_delivery(cx);
+        let token = browser.read_with(cx, |view, _| {
+            view.transient_markers
+                .active
+                .as_ref()
+                .unwrap()
+                .cancellation
+                .clone()
         });
-    }
+        cx.refresh().expect("loaded waveform layout");
+        let toolbar = cx.debug_bounds("main-toolbar").expect("toolbar");
+        let button = cx
+            .debug_bounds("transient-sensitivity-toolbar")
+            .expect("sensitivity button");
+        assert!(button.left() >= toolbar.left() && button.right() <= toolbar.right());
+        assert!(button.top() >= toolbar.top() && button.bottom() <= toolbar.bottom());
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        assert!(token.is_cancelled());
+        browser.update(cx, |view, cx| {
+            assert!(!view.apply_catalog_delivery(old, cx));
+            assert!(current_markers(view).is_none());
+        });
 
-    #[gpui::test]
-    fn hiding_during_preparation_cancels_results(cx: &mut TestAppContext) {
-        let (_directory, path, preview) = fixture();
-        let (browser, cx) = install(cx, &path, preview);
+        let completion = next_delivery(cx);
         browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(completion, cx));
+            let markers = current_markers(view).unwrap();
+            assert_eq!(markers.preset(), TransientPreset::High);
+            assert_eq!(markers.frames(), [2000, 7000, 12000]);
+            view.catalog_metadata
+                .advance_projection_revision(snapshot.committed_revision + 1);
+            assert!(current_markers(view).is_none());
             toggle(view, cx);
-            toggle(view, cx);
-        });
-        cx.run_until_parked();
-        browser.update(cx, |view, _| {
-            assert!(!view.transient_markers.enabled());
-            assert!(positions(view).is_empty());
             assert_eq!(view.playback_status, "Transient markers hidden");
         });
-    }
-
-    #[gpui::test]
-    fn stale_worker_completion_cannot_replace_current_markers(cx: &mut TestAppContext) {
-        let (_directory, path, preview) = fixture();
-        let (browser, cx) = install(cx, &path, preview);
-        browser.update(cx, |view, _| {
-            let old = current_intent(view).expect("old intent");
-            view.transient_markers.enabled = true;
-            view.transient_markers.wanted = Some(old.clone());
-            view.waveform_generation += 1;
-            let current = current_intent(view).expect("current intent");
-            view.transient_markers.wanted = Some(current.clone());
-            accept_result(view, &old, false, Ok(vec![0.1]));
-            assert!(positions(view).is_empty());
-            accept_result(view, &current, false, Ok(vec![0.2, 0.7]));
-            assert_eq!(positions(view).as_ref(), [0.2, 0.7]);
-            accept_result(view, &old, false, Err("old failure"));
-            assert!(view.transient_markers.enabled());
-            assert_eq!(positions(view).as_ref(), [0.2, 0.7]);
+        cx.update(|_, app| {
+            app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
         });
     }
 

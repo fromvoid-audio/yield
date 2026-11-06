@@ -101,6 +101,8 @@ pub use history_selection::{
 };
 mod similarity_dispatch;
 mod similarity_query;
+mod transient_dispatch;
+mod transient_job;
 pub use feature_job::{
     ComputedFeatureJob, FeatureJobFailure, FeatureJobOutcome, PreparedFeatureJob,
     prepare_feature_job,
@@ -116,7 +118,12 @@ pub use similarity_query::{
     SimilarityCandidateOutcome, SimilarityQueryError, SourceSimilarityQuery,
     SourceSimilarityResult, SourceSimilarityRow, query_source_similarity,
 };
+pub use transient_dispatch::{SourceTransientRequest, TransientRequestFailure};
+pub use transient_job::{
+    ComputedTransientJob, PreparedTransientJob, TransientJobError, prepare_transient_job,
+};
 pub use yield_analysis::aspects::SimilarityAspect;
+pub use yield_analysis::transients::{TransientMarkers, TransientPreset};
 mod index_pages;
 mod index_reveal;
 mod index_reveal_contract;
@@ -630,6 +637,13 @@ pub enum CatalogCommand {
         request: SourceSimilarityRequest,
         /// Cancellation retained through queued delivery.
         cancellation: SimilarityCancellation,
+    },
+    /// Compute one bounded native-frame transient result for an audited audio entry.
+    RequestTransientMarkers {
+        /// Exact Source and detector request.
+        request: SourceTransientRequest,
+        /// Retained cancellation through compute and queued delivery.
+        cancellation: FeatureAnalysisCancellation,
     },
     /// Compute one bounded WAV feature job at an exact retained source revision.
     RequestFeatureAnalysis {
@@ -1539,6 +1553,15 @@ pub enum CatalogEvent {
         /// Owner-validated existing descriptor result.
         result: Result<SourceSimilarityResult, SimilarityDispatchFailure>,
     },
+    /// Exact owner-validated transient markers or a bounded failure.
+    TransientMarkersCompleted {
+        /// Original immutable request and caller correlation.
+        request: SourceTransientRequest,
+        /// Retained cancellation through queued delivery.
+        cancellation: FeatureAnalysisCancellation,
+        /// Frame-domain result or refusal from the retained Source.
+        result: Result<yield_analysis::transients::TransientMarkers, TransientRequestFailure>,
+    },
     /// One request's truthful state; ready requires validated durable feature bytes.
     FeatureAnalysisState {
         /// Stable source.
@@ -2009,6 +2032,10 @@ impl CatalogDelivery {
         {
             return None;
         }
+        if matches!(&event, CatalogEvent::TransientMarkersCompleted { cancellation, .. } if cancellation.is_cancelled())
+        {
+            return None;
+        }
         if let CatalogEvent::CollectionHistoryCompleted {
             cancellation,
             result,
@@ -2252,6 +2279,7 @@ struct AdmissionState {
     tag_read_payload_bytes: usize,
     sources: HashMap<SourceId, DesiredSource>,
     active_audits: HashMap<SourceId, (u64, Arc<AtomicBool>)>,
+    active_transient: Option<(SourceId, FeatureAnalysisCancellation)>,
     index_queries: HashMap<SourceId, (u64, u64, Arc<AtomicBool>)>,
     index_inspections: HashMap<SourceId, IndexInspectionCancellation>,
 }
@@ -2279,13 +2307,28 @@ impl AdmissionState {
             tag_read_payload_bytes: 0,
             sources: HashMap::new(),
             active_audits: HashMap::new(),
+            active_transient: None,
             index_queries: HashMap::new(),
             index_inspections: HashMap::new(),
         }
     }
 
+    fn cancel_transient(&mut self, source: &SourceId) {
+        if self
+            .active_transient
+            .as_ref()
+            .is_some_and(|(id, _)| id == source)
+            && let Some((_, cancellation)) = self.active_transient.take()
+        {
+            cancellation.cancel();
+        }
+    }
+
     fn invalidate_all(&mut self) {
         self.retained_harvest.cancel_all();
+        if let Some((_, cancellation)) = self.active_transient.take() {
+            cancellation.cancel();
+        }
         #[cfg(feature = "test-support")]
         {
             self.compound_batch_fault = None;
@@ -2589,6 +2632,7 @@ impl EventReservation<'_> {
 fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> {
     match command {
         CatalogCommand::RequestSimilarity { .. }
+        | CatalogCommand::RequestTransientMarkers { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. } => {}
         CatalogCommand::RequestFeatureAnalysis {
@@ -2999,6 +3043,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::RequestSimilarity { .. }
+        | CatalogCommand::RequestTransientMarkers { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestIndexPage { .. }
         | CatalogCommand::RequestIndexInspection { .. }
@@ -3064,6 +3109,7 @@ fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
         CatalogCommand::RequestCollectionHistory { request, .. } => request.input_bytes(),
         CatalogCommand::RequestCollectionHistoryGroup { request, .. } => request.input_bytes(),
         CatalogCommand::RequestSimilarity { request, .. } => request.input_bytes(),
+        CatalogCommand::RequestTransientMarkers { request, .. } => request.input_bytes(),
         CatalogCommand::ConsumeReplay { submission } => submission.input_bytes(),
         CatalogCommand::RequestIndexInspection { handle, .. } => handle.input_bytes(),
         CatalogCommand::RequestIndexPage {
@@ -3146,6 +3192,7 @@ fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, Cat
             Ok(request.charged_bytes())
         }
         CatalogCommand::RequestSimilarity { .. } => Ok(similarity_dispatch::MAX_RESULT_BYTES),
+        CatalogCommand::RequestTransientMarkers { .. } => Ok(transient_dispatch::MAX_RESULT_BYTES),
         CatalogCommand::RequestIndexPage { .. } | CatalogCommand::RequestIndexInspection { .. } => {
             Ok(MAX_INDEX_PAGE_PAYLOAD_BYTES)
         }
@@ -3238,6 +3285,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         },
         CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestFeatureAnalysis { .. }
+        | CatalogCommand::RequestTransientMarkers { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::RequestSimilarity { .. } => AdmissionAction::RequestWavMetadata,
@@ -3362,6 +3410,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .is_none_or(|source| lifecycle_generation > source.lifecycle_generation);
             if replace {
                 state.retained_harvest.cancel_source(&source_id);
+                state.cancel_transient(&source_id);
                 #[cfg(feature = "test-support")]
                 test_support::clear_source(state, &source_id);
                 state.active_audits.remove(&source_id);
@@ -3397,6 +3446,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .is_none_or(|source| lifecycle_generation >= source.lifecycle_generation);
             if replace {
                 state.retained_harvest.cancel_source(&source_id);
+                state.cancel_transient(&source_id);
                 #[cfg(feature = "test-support")]
                 test_support::clear_source(state, &source_id);
                 state.active_audits.remove(&source_id);
@@ -3428,6 +3478,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
         }
         AdmissionAction::RequestAudit { source_id } => {
             state.retained_harvest.cancel_source(&source_id);
+            state.cancel_transient(&source_id);
             if let Some(cancellation) = state.index_inspections.remove(&source_id) {
                 cancellation.cancel();
             }
@@ -4528,6 +4579,13 @@ fn handle_command(
             cancellation,
         } => {
             similarity_dispatch::dispatch(request, cancellation, reservation, admission, sources);
+            false
+        }
+        CatalogCommand::RequestTransientMarkers {
+            request,
+            cancellation,
+        } => {
+            transient_dispatch::dispatch(request, cancellation, reservation, admission, sources);
             false
         }
         CatalogCommand::RequestFeatureAnalysis {
@@ -17466,4 +17524,6 @@ mod tests {
     mod history_selection_tests;
     mod similarity_dispatch_tests;
     mod similarity_query_tests;
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    mod transient_dispatch_tests;
 }

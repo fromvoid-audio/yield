@@ -2328,6 +2328,42 @@ impl Render for Browser {
                             .text_color(transient_markers_color)
                             .child("I"),
                     )
+                    .when(self.waveform.is_some(), |toolbar| {
+                        toolbar.child(
+                            div()
+                                .id("transient-sensitivity-toolbar")
+                                .debug_selector(|| "transient-sensitivity-toolbar".into())
+                                .relative()
+                                .when_some(
+                                    self.ax_focus("transport-transient-sensitivity"),
+                                    |element, focus| element.track_focus(&focus),
+                                )
+                                .when_some(
+                                    self.ax_marker("transport-transient-sensitivity"),
+                                    |element, marker| element.child(marker),
+                                )
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(32.0))
+                                .h(px(theme.spacing.control_height))
+                                .cursor_pointer()
+                                .bg(color(theme.colors.surface_overlay))
+                                .border(px(theme.spacing.border_width))
+                                .border_color(color(theme.colors.border_emphasis))
+                                .hover(move |style| style.bg(color(toolbar_hover)))
+                                .active(move |style| style.bg(color(toolbar_pressed)))
+                                .when(self.hover_help_visible(), |control| {
+                                    control.tooltip(super::transient_markers::sensitivity_tooltip)
+                                })
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    super::transient_markers::cycle_sensitivity(view, cx);
+                                }))
+                                .text_size(px(theme.typography.small_size))
+                                .child(self.transient_markers.sensitivity_short_label()),
+                        )
+                    })
                     .child(
                         div()
                             .id("bpm-beat-count-toolbar")

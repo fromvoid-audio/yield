@@ -3372,6 +3372,7 @@ impl Browser {
                 self.catalog_metadata
                     .advance_projection_revision(application.revision);
             }
+            super::transient_markers::schedule(self, cx);
             let display_curation_pending = self.curation_state.has_pending_for_lifecycle(&key);
             let display_context = self
                 .catalog_metadata

@@ -2,6 +2,9 @@
 mod fixtures {
     use super::super::*;
     use crate::{FeatureJobFailure, FeatureJobOutcome, prepare_feature_job};
+    use crate::{TransientJobError, prepare_transient_job};
+    use yield_analysis::transients::TransientPreset;
+    use yield_library::sample_sources::db::transient_cache::CachedTransientMarkers;
     use yield_library::sample_sources::readiness::{
         FeatureArtifactPublication, ReadinessClassification, ReadinessDeficit, ReadinessTarget,
         SourceFeatureInputError,
@@ -13,6 +16,15 @@ mod fixtures {
     }
 
     fn setup_relative(relative: &Path) -> (Fixture, SourceWriter, ReadinessTarget) {
+        setup_signal(relative, |frame| {
+            ((frame as f32 * 0.1).sin() * 12_000.0) as i16
+        })
+    }
+
+    fn setup_signal(
+        relative: &Path,
+        sample: impl Fn(usize) -> i16,
+    ) -> (Fixture, SourceWriter, ReadinessTarget) {
         let fixture = Fixture::new("feature-job-tests");
         let file = fixture.root.path().join(relative);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -26,9 +38,8 @@ mod fixtures {
             },
         )
         .unwrap();
-        for i in 0..16_000 {
-            wav.write_sample::<i16>(((i as f32 * 0.1).sin() * 12_000.0) as i16)
-                .unwrap();
+        for frame in 0..16_000 {
+            wav.write_sample(sample(frame)).unwrap();
         }
         wav.finalize().unwrap();
         let bytes = fs::read(&file).unwrap();
@@ -108,6 +119,201 @@ mod fixtures {
                 r.get(0)
             })
             .unwrap()
+    }
+
+    #[test]
+    fn transient_cache_reopens_by_exact_config_and_refuses_a_stale_input() {
+        let (fixture, writer, _) = setup();
+        let relative = RootRelativePath::try_from_path("tone.wav".into()).unwrap();
+        let media = fixture.root.path().join(relative.as_path());
+        let original = fs::read(&media).unwrap();
+        let current = writer.current_revision().unwrap();
+        let held = writer.prepare_audio_input(&current, &relative).unwrap();
+        let markers = CachedTransientMarkers::new(16_000, vec![1237, 9673]).unwrap();
+        let cancel = AtomicBool::new(false);
+        assert_eq!(held.read_verified_bytes(&cancel).unwrap(), original);
+        assert!(
+            writer
+                .lookup_transient_cache(&held, "detector-v1", "normal")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            writer
+                .store_transient_cache(&held, "detector-v1", "normal", &markers, &cancel)
+                .unwrap()
+        );
+        assert!(
+            !writer
+                .store_transient_cache(
+                    &held,
+                    "detector-v1",
+                    "low",
+                    &markers,
+                    &AtomicBool::new(true)
+                )
+                .unwrap()
+        );
+        drop(held);
+        drop(writer);
+
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            Path::new("feature-job-db"),
+        )
+        .unwrap();
+        let writer =
+            SourceWriter::new(database, SourceId::from_string("feature-job-source"), 2).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let held = writer.prepare_audio_input(&revision, &relative).unwrap();
+        assert_eq!(
+            writer
+                .lookup_transient_cache(&held, "detector-v1", "normal")
+                .unwrap(),
+            Some(markers)
+        );
+        for (version, preset) in [("detector-v2", "normal"), ("detector-v1", "low")] {
+            assert!(
+                writer
+                    .lookup_transient_cache(&held, version, preset)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(fs::read(&media).unwrap(), original);
+        assert_eq!(status(&fixture), "pending");
+        let displaced = media.with_extension("old");
+        fs::rename(&media, &displaced).unwrap();
+        fs::copy(&displaced, &media).unwrap();
+        assert!(
+            writer
+                .lookup_transient_cache(&held, "detector-v1", "normal")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn transient_job_returns_exact_markers_from_an_audited_wav() {
+        let relative = Path::new("nested/attacks.wav");
+        let (fixture, writer, _) = setup_signal(relative, |frame| match frame {
+            1237 => 24_000,
+            9673 => -24_000,
+            _ => 0,
+        });
+        let revision = writer.current_revision().unwrap();
+        let path = RootRelativePath::try_from_path(relative.into()).unwrap();
+        let job = prepare_transient_job(
+            &writer,
+            &revision,
+            &path,
+            TransientPreset::Normal,
+            FeatureAnalysisCancellation::new(),
+        )
+        .unwrap();
+        let computed = thread::spawn(move || job.compute()).join().unwrap();
+        let markers = computed.finish(&writer).unwrap();
+        assert_eq!(markers.frames(), [1237, 9673]);
+        assert_eq!(markers.source_frames(), 16_000);
+        assert_eq!(markers.preset(), TransientPreset::Normal);
+        assert_eq!(status(&fixture), "pending");
+        assert_eq!(artifact_count(&fixture), 0);
+    }
+
+    #[test]
+    fn transient_job_rejects_cancellation_and_file_replacement_after_compute() {
+        let (fixture, writer, _) = setup();
+        let revision = writer.current_revision().unwrap();
+        let path = RootRelativePath::try_from_path("tone.wav".into()).unwrap();
+        let compute = |cancellation| {
+            prepare_transient_job(
+                &writer,
+                &revision,
+                &path,
+                TransientPreset::High,
+                cancellation,
+            )
+            .unwrap()
+            .compute()
+        };
+        let cancellation = FeatureAnalysisCancellation::new();
+        let computed = compute(cancellation.clone());
+        cancellation.cancel();
+        assert!(matches!(
+            computed.finish(&writer),
+            Err(TransientJobError::Cancelled)
+        ));
+
+        let computed = compute(FeatureAnalysisCancellation::new());
+        let file = fixture.root.path().join(path.as_path());
+        let displaced = file.with_extension("old");
+        fs::rename(&file, &displaced).unwrap();
+        fs::copy(&displaced, &file).unwrap();
+        assert!(matches!(
+            computed.finish(&writer),
+            Err(TransientJobError::Source(SourceWriterError::FeatureInput(
+                SourceFeatureInputError::Changed
+            )))
+        ));
+        assert_eq!(status(&fixture), "pending");
+        assert_eq!(artifact_count(&fixture), 0);
+    }
+
+    #[test]
+    fn audited_audio_input_reads_exact_bytes_without_claiming_a_job() {
+        let relative = Path::new("nested/tone.wav");
+        let (fixture, writer, _) = setup_relative(relative);
+        let revision = writer.current_revision().unwrap();
+        let path = RootRelativePath::try_from_path(relative.into()).unwrap();
+        let held = writer.prepare_audio_input(&revision, &path).unwrap();
+        let expected = fs::read(fixture.root.path().join(relative)).unwrap();
+        assert_eq!(
+            held.read_verified_bytes(&AtomicBool::new(false)).unwrap(),
+            expected,
+        );
+        writer.validate_audio_input(&held).unwrap();
+        assert_eq!(writer.current_revision().unwrap(), revision);
+        assert_eq!(status(&fixture), "pending");
+        assert_eq!(artifact_count(&fixture), 0);
+
+        drop(writer);
+        assert_eq!(held.validate(), Err(SourceFeatureInputError::Changed));
+    }
+
+    #[test]
+    fn audited_audio_input_rejects_changed_manifest_before_publication() {
+        let (_fixture, writer, _) = setup();
+        let path = RootRelativePath::try_from_path("tone.wav".into()).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let held = writer.prepare_audio_input(&revision, &path).unwrap();
+        let fence = writer.current_scan_fence().unwrap();
+        let mut batch = writer.catalog_database().write_batch().unwrap();
+        batch.set_missing(path.as_path(), true).unwrap();
+        writer.commit_scan_manifest_batch(&fence, batch).unwrap();
+
+        assert!(writer.prepare_audio_input(&revision, &path).is_err());
+        assert!(writer.validate_audio_input(&held).is_err());
+    }
+
+    #[test]
+    fn audited_audio_input_rejects_replaced_file_before_publication() {
+        let (fixture, writer, _) = setup();
+        let path = RootRelativePath::try_from_path("tone.wav".into()).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let held = writer.prepare_audio_input(&revision, &path).unwrap();
+        let file = fixture.root.path().join(path.as_path());
+        let displaced = file.with_extension("old");
+        fs::rename(&file, &displaced).unwrap();
+        fs::copy(&displaced, &file).unwrap();
+
+        assert!(matches!(
+            writer.validate_audio_input(&held),
+            Err(SourceWriterError::FeatureInput(
+                SourceFeatureInputError::Changed
+            ))
+        ));
+        assert!(writer.prepare_audio_input(&revision, &path).is_err());
+        assert_eq!(status(&fixture), "pending");
     }
 
     #[test]

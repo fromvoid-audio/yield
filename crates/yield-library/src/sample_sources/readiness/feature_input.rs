@@ -1,5 +1,6 @@
 //! Held, bounded, content-verified source input for a feature job.
 
+use crate::sample_sources::SourceRevision;
 use crate::sample_sources::db::{
     SourcePublicationFence,
     file_ops_journal::{BoundDatabaseRoot, HeldIndexFile},
@@ -60,6 +61,7 @@ pub struct SourceFeatureInput {
     pub(crate) root: Arc<BoundDatabaseRoot>,
     pub(crate) fence: SourcePublicationFence,
     pub(crate) owner: Weak<()>,
+    pub(crate) revision: SourceRevision,
     pub(crate) identity: String,
     pub(crate) size: u64,
     pub(crate) modified: i64,

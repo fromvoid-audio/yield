@@ -683,6 +683,14 @@ impl Browser {
         publication_fence: Option<SourcePublicationFence>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if super::transient_markers::apply_catalog_event(
+            self,
+            &mut event,
+            publication_fence.clone(),
+            cx,
+        ) {
+            return true;
+        }
         if super::similarity_list::apply_catalog_event(
             self,
             &mut event,
@@ -946,6 +954,7 @@ impl Browser {
             CatalogEvent::CollectionHistoryCompleted { .. }
             | CatalogEvent::CollectionHistoryGroupCompleted { .. }
             | CatalogEvent::SimilarityCompleted { .. }
+            | CatalogEvent::TransientMarkersCompleted { .. }
             | CatalogEvent::Closed => false,
         }
     }
@@ -1237,6 +1246,7 @@ impl Browser {
             },
         );
         self.restore_projection_focus(restore_id, restore_position, cx);
+        super::transient_markers::schedule(self, cx);
         if audit_ready {
             let _ = self.maybe_start_rating_decay(cx);
         }
@@ -1257,6 +1267,7 @@ impl Browser {
             return;
         }
         self.similarity_list.cancel();
+        self.transient_markers.invalidate();
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::invalidate_for_source_publication(self, status);
         super::unsupported_entries::cancel_for_source_change(self, cx);
@@ -1316,6 +1327,9 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
         CatalogEvent::SimilarityCompleted { request, .. } => {
+            Some((request.source_id().clone(), request.lifecycle_generation()))
+        }
+        CatalogEvent::TransientMarkersCompleted { request, .. } => {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
         CatalogEvent::Registered {
