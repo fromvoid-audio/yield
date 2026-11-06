@@ -982,6 +982,7 @@ impl Browser {
             CatalogEvent::CollectionHistoryCompleted { .. }
             | CatalogEvent::CollectionHistoryGroupCompleted { .. }
             | CatalogEvent::SimilarityCompleted { .. }
+            | CatalogEvent::PlaymarkTempoCompleted { .. }
             | CatalogEvent::TransientMarkersCompleted { .. }
             | CatalogEvent::Closed => false,
         }
@@ -1464,6 +1465,9 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
         }
         CatalogEvent::TransientMarkersCompleted { request, .. }
         | CatalogEvent::SourceContentDigestCommitted { request, .. } => {
+            Some((request.source_id().clone(), request.lifecycle_generation()))
+        }
+        CatalogEvent::PlaymarkTempoCompleted { request, .. } => {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
         CatalogEvent::Registered {

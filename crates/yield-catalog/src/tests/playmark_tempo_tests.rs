@@ -5,27 +5,34 @@ mod fixtures {
         db::SourcePlaymarkTempo, readiness::SourceFeatureInputError,
     };
 
-    #[test]
-    fn authored_playmark_tempo_is_atomic_and_bound_to_the_audited_file_across_reopen() {
-        let fixture = Fixture::new("authored-playmark-tempo");
-        let path = RootRelativePath::try_from_path("loop.wav".into()).unwrap();
-        let media = fixture.root.path().join(path.as_path());
-        let frames = 16_000;
-        let sample_rate = 16_000;
+    const FRAMES: u64 = 16_000;
+    const SAMPLE_RATE: u32 = 16_000;
+
+    fn write_audio(media: &Path) {
         let mut wav = hound::WavWriter::create(
-            &media,
+            media,
             hound::WavSpec {
                 channels: 1,
-                sample_rate,
+                sample_rate: SAMPLE_RATE,
                 bits_per_sample: 16,
                 sample_format: hound::SampleFormat::Int,
             },
         )
         .unwrap();
-        for _ in 0..frames {
+        for _ in 0..FRAMES {
             wav.write_sample(0_i16).unwrap();
         }
         wav.finalize().unwrap();
+    }
+
+    #[test]
+    fn authored_playmark_tempo_is_atomic_and_bound_to_the_audited_file_across_reopen() {
+        let fixture = Fixture::new("authored-playmark-tempo");
+        let path = RootRelativePath::try_from_path("loop.wav".into()).unwrap();
+        let media = fixture.root.path().join(path.as_path());
+        let frames = FRAMES;
+        let sample_rate = SAMPLE_RATE;
+        write_audio(&media);
         let original_bytes = fs::read(&media).unwrap();
         let source = SourceId::from_string("authored-playmark-tempo");
         let audit = || {
@@ -120,5 +127,119 @@ mod fixtures {
         let current = writer.current_revision().unwrap();
         assert_eq!(writer.read_playmark_tempo(&current, &path).unwrap(), None);
         assert_eq!(fs::read(&media).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn catalog_tempo_requests_settle_conflicts_and_preserve_retired_commit_receipts() {
+        let fixture = Fixture::new("catalog-playmark-tempo");
+        let path = Path::new("loop.wav");
+        write_audio(&fixture.root.path().join(path));
+        let source = SourceId::from_string("catalog-playmark-tempo");
+        let service = CatalogService::start(&fixture.guard).unwrap();
+        let revision =
+            register_and_audit(&service, fixture.root.path(), &source).committed_revision;
+        let tempo = SourcePlaymarkTempo::new(1_000, 13_000, FRAMES, SAMPLE_RATE, 2).unwrap();
+        let submit = |id, expected, operation, cancellation| {
+            let request =
+                SourcePlaymarkTempoRequest::new(&source, 1, expected, id, path, operation).unwrap();
+            service
+                .submit(CatalogCommand::PlaymarkTempo {
+                    request,
+                    cancellation,
+                })
+                .unwrap();
+            service
+                .recv_delivery_timeout(Duration::from_secs(2))
+                .unwrap()
+        };
+        let unpack = |delivery: CatalogDelivery, id| {
+            let CatalogEvent::PlaymarkTempoCompleted {
+                request,
+                publication,
+                result,
+                ..
+            } = delivery.into_event_if_live().unwrap()
+            else {
+                panic!("expected tempo completion")
+            };
+            assert_eq!(request.request_id(), id);
+            assert_eq!(request.source_id(), &source);
+            assert_eq!(request.relative_path(), path);
+            (publication, result)
+        };
+        let active = || Arc::new(AtomicBool::new(false));
+        let read = PlaymarkTempoOperation::Read;
+        let save = PlaymarkTempoOperation::Replace {
+            previous: None,
+            next: Some(tempo),
+        };
+        assert_eq!(
+            unpack(submit(1, revision, read, active()), 1),
+            (CatalogPublicationStatus::Current, Ok(None))
+        );
+        let token = active();
+        let committed = submit(2, revision, save, token.clone());
+        token.store(true, Ordering::Release);
+        assert_eq!(
+            unpack(committed, 2),
+            (CatalogPublicationStatus::NonProjectable, Ok(Some(tempo)))
+        );
+        assert_eq!(
+            unpack(submit(3, revision, read, active()), 3),
+            (CatalogPublicationStatus::Current, Ok(Some(tempo)))
+        );
+        assert_eq!(
+            unpack(submit(4, revision, save, active()), 4).1,
+            Err(PlaymarkTempoFailure::Conflict)
+        );
+        assert_eq!(
+            unpack(submit(5, revision + 1, read, active()), 5).1,
+            Err(PlaymarkTempoFailure::StaleSource)
+        );
+        let clear = PlaymarkTempoOperation::Replace {
+            previous: Some(tempo),
+            next: None,
+        };
+        assert_eq!(
+            unpack(
+                submit(6, revision, clear, Arc::new(AtomicBool::new(true))),
+                6
+            )
+            .1,
+            Err(PlaymarkTempoFailure::Cancelled)
+        );
+        assert_eq!(
+            unpack(submit(7, revision, clear, active()), 7),
+            (CatalogPublicationStatus::Current, Ok(None))
+        );
+        assert_eq!(unpack(submit(8, revision, read, active()), 8).1, Ok(None));
+        let committed = submit(9, revision, save, active());
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source.clone(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        receive_until(&service, |event| {
+            matches!(event, CatalogEvent::Removed { .. })
+        });
+        assert_eq!(
+            unpack(committed, 9),
+            (CatalogPublicationStatus::NonProjectable, Ok(Some(tempo))),
+        );
+        assert!(matches!(
+            SourcePlaymarkTempoRequest::new(
+                &source,
+                1,
+                revision,
+                10,
+                Path::new("../loop.wav"),
+                read
+            ),
+            Err(PlaymarkTempoFailure::InvalidInput),
+        ));
+        wait_for_tag_read_payload(&service, 0);
+        wait_for_tag_page_input_release(&service);
+        service.shutdown();
     }
 }
