@@ -209,6 +209,48 @@ scroll range. Reversing a transition starts from its current opacity; a settled
 fade must not keep requesting frames. Gradient overlays must remain inside the
 list viewport and leave pointer and scroll input available to the list.
 
+### Compact browser layout
+
+The normal window opens at 1120×720 logical points and can shrink to 960×560.
+The default theme starts with a 260-point sidebar, a 226-point waveform pane,
+42 points for the toolbar, and 30 points for status. Sample rows are 22 points
+high, controls are 26 points high, and the standard control gap and panel inset
+are 6 and 10 points. These values describe the theme inputs. Expanded panels,
+window bounds, and text scale determine the rendered space available for rows.
+The waveform allocation already reserves four list rows in its height
+calculation. Existing enlarged-text checks cover toolbar wrapping, the browser
+columns, the status bar, and scrolling to the last settings action.
+
+Use the sample list and waveform as the primary work area. At the minimum
+window size, first reduce unused space in the default pane allocations or
+between controls. Preserve user-resized preferences, the theme's default row
+and control sizes, waveform controls, and resize rails. The compact target is
+room for at least one more complete default sample row or a comparable gain
+in Name-column width. Confirm the gain against the rendered baseline.
+
+Keep the loaded sample, its waveform, and passive row focus distinguishable
+through filtering, scrolling, and context menus. Keep source and folder
+navigation and active filters reachable. Give the Name column remaining width
+after required fixed columns, and preserve access to optional columns through
+the existing column and scroll behavior. The toolbar should keep common
+transport and search actions together, reserve the native title-bar controls,
+and wrap at enlarged text sizes. Use the same spacing tokens in the sidebar,
+filter controls, and toolbar wherever their roles agree.
+
+Use the status bar for the current operation and reserve expanded details,
+settings, help, and context actions for their respective panels. Keep those
+panels within the viewport and allow their contents to scroll. Truncated visual
+labels need their full accessible name. Avoid position-only indicators for
+active modes or focus.
+
+Measure 960×560, 1120×720, and 1440×900 at 100% and 200% text scale with the
+same synthetic rows, selected sample, and panel state. Compare list viewport
+height, complete visible rows, Name width, waveform area, and reachability of
+transport, filters, settings, status, and menu actions. Capture matched
+screenshots separately from optimized native builds with the same fixture and
+window bounds. Verify browse, filter, audition, waveform editing, extraction
+where enabled, and menu actions before accepting the full layout change.
+
 ## Work and lifecycle
 
 The browser keeps selected relative folders, expansion sets, direct or descendant
