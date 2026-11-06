@@ -136,9 +136,7 @@ impl<'a> SourceLayoutGeneration<'a> {
                     .ok()
                     .as_deref()
                     != Some(path)
-                || !Path::new(path)
-                    .extension()
-                    .is_some_and(|v| v.eq_ignore_ascii_case("wav"))
+                || !crate::sample_sources::is_supported_audio(Path::new(path))
                 || rows.last().is_some_and(|row| row.path >= path)
                 || rows.iter().any(|row| row.file_identity == file_identity)
             {

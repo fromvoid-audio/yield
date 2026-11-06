@@ -222,9 +222,7 @@ pub(in crate::sample_sources::readiness::store) fn publish(
         for (path, identity, hash) in manifest {
             checkpoint(cancel, deadline)?;
             all_membership.add(&identity, &hash);
-            let wav = Path::new(&path)
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+            let supported = crate::sample_sources::is_supported_audio(Path::new(&path));
             for (stage, version) in [
                 (ReadinessStage::IndexedIdentity, "audited-identity-v1"),
                 (ReadinessStage::AnalysisFeatures, "features-v1"),
@@ -234,14 +232,14 @@ pub(in crate::sample_sources::readiness::store) fn publish(
                     source, &identity, &path, stage, version, generation, &hash,
                 );
                 if stage == ReadinessStage::EmbeddingAspects
-                    || (stage == ReadinessStage::AnalysisFeatures && !wav)
+                    || (stage == ReadinessStage::AnalysisFeatures && !supported)
                 {
                     target.eligibility = ReadinessEligibility::Unsupported;
                 }
                 if path == requested.to_str().unwrap_or_default()
                     && stage == ReadinessStage::AnalysisFeatures
                 {
-                    if !wav {
+                    if !supported {
                         return Err(invalid_persisted_value(
                             "input",
                             "unsupported feature format",
