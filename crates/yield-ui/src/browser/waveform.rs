@@ -16,11 +16,13 @@ use yield_core::{
     WaveformEditSettings, WaveformRegion, WaveformViewport, snap_resize_ratio_to_whole_bpm,
 };
 use yield_design::Theme;
+use yield_session::SourcePlaymarkTempo;
 
 use crate::theme::color;
 
 use super::Browser;
 use super::played_ranges;
+use super::playmark_tempo;
 use super::playmark_timing;
 use super::similar_sections;
 use super::transient_markers;
@@ -2712,6 +2714,21 @@ impl Browser {
                             .and_then(|previous| previous.frame_bounds(capture.total_frames))
                             != region.frame_bounds(capture.total_frames)
                     });
+                    if tempo_span_changed
+                        && let Some(capture) = drag.tempo_resize
+                        && let Some((first, end)) = region.frame_bounds(capture.total_frames)
+                        && let Some(tempo) = SourcePlaymarkTempo::new(
+                            first as u64,
+                            end as u64,
+                            capture.total_frames as u64,
+                            capture.sample_rate,
+                            capture.beat_count,
+                        )
+                        && playmark_tempo::save_released_tempo(self, tempo, cx)
+                    {
+                        cx.notify();
+                        return;
+                    }
                     self.set_waveform_play_region(Some(region));
                     similar_sections::invalidate_if_stale(self);
                     if tempo_span_changed {

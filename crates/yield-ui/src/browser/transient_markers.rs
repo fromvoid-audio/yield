@@ -647,6 +647,19 @@ mod tests {
         })
     }
 
+    fn next_tempo_delivery(cx: &mut TestAppContext) -> yield_session::CatalogDelivery {
+        use super::super::source_registry::SourceRegistryGlobal;
+        wait_for(|| {
+            cx.update(|app| {
+                let mut deliveries = Vec::new();
+                app.global::<SourceRegistryGlobal>()
+                    .drain_catalog_deliveries(&mut deliveries);
+                assert!(deliveries.len() <= 1);
+                deliveries.pop()
+            })
+        })
+    }
+
     #[gpui::test]
     fn saved_playmark_tempo_restores_only_the_current_unedited_waveform(cx: &mut TestAppContext) {
         use super::super::{
@@ -693,24 +706,13 @@ mod tests {
         cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
         cx.set_global(crate::theme::ActiveTheme::default());
         let browser = cx.new(Browser::new);
-        let next = |cx: &mut TestAppContext| {
-            wait_for(|| {
-                cx.update(|app| {
-                    let mut deliveries = Vec::new();
-                    app.global::<SourceRegistryGlobal>()
-                        .drain_catalog_deliveries(&mut deliveries);
-                    assert!(deliveries.len() <= 1);
-                    deliveries.pop()
-                })
-            })
-        };
         browser.update(cx, |view, cx| {
             install_waveform(view, &path, preview);
             install_source(view, root, &snapshot);
             assert!(playmark_tempo::load_for_waveform(view, cx));
             assert!(!playmark_tempo::load_for_waveform(view, cx));
         });
-        let (older, fence) = next(cx).into_parts_if_live().unwrap();
+        let (older, fence) = next_tempo_delivery(cx).into_parts_if_live().unwrap();
         browser.update(cx, |view, cx| {
             view.set_waveform_play_region(WaveformPlayRegion::new(0.1, 0.2));
             view.set_waveform_play_region(None);
@@ -732,7 +734,7 @@ mod tests {
             ));
             assert!(view.waveform_play_region.is_none());
         });
-        let current = next(cx);
+        let current = next_tempo_delivery(cx);
         browser.update(cx, |view, cx| {
             assert!(view.apply_catalog_delivery(current, cx));
             assert_eq!(
@@ -741,6 +743,71 @@ mod tests {
             );
             assert_eq!(view.beat_count_input.read(cx).count(), 6);
             assert!(view.playing_path.is_none());
+            assert!(view.playback_init_intent.is_none());
+        });
+        cx.update(|app| {
+            app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
+        });
+    }
+
+    #[gpui::test]
+    fn tempo_save_waits_for_the_receipt_and_preserves_newer_local_edits(cx: &mut TestAppContext) {
+        use super::super::{
+            playmark_tempo, source_registry::SourceRegistryGlobal, waveform::WaveformPlayRegion,
+        };
+        use gpui::AppContext;
+        use yield_session::SourcePlaymarkTempo;
+        let (_directory, path, preview) = fixture();
+        let root = path.parent().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
+        let _profile = PersistenceProfileGuard::named("gpui-playmark-save");
+        let guard = WritableProfileGuard::acquire_current().unwrap();
+        let (service, snapshot) = audited_owner(&guard, root);
+        cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(Browser::new);
+        let baseline = WaveformPlayRegion::new(0.125, 0.25);
+        let first = SourcePlaymarkTempo::new(2_000, 8_000, 16_000, 16_000, 6).unwrap();
+        let second = SourcePlaymarkTempo::new(2_000, 12_000, 16_000, 16_000, 6).unwrap();
+        browser.update(cx, |view, cx| {
+            install_waveform(view, &path, preview);
+            install_source(view, root, &snapshot);
+            view.set_waveform_play_region(baseline);
+            assert!(playmark_tempo::save_released_tempo(view, first, cx));
+            assert_eq!(view.waveform_play_region, baseline);
+            assert_eq!(view.playback_status, "Saving playmark tempo…");
+        });
+        let prior = next_tempo_delivery(cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(prior, cx));
+            assert_eq!(view.waveform_play_region, baseline);
+        });
+        let first_receipt = next_tempo_delivery(cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(first_receipt, cx));
+            assert_eq!(
+                view.waveform_play_region.unwrap().frame_bounds(16_000),
+                Some((2_000, 8_000))
+            );
+            assert_eq!(view.beat_count_input.read(cx).count(), 6);
+            assert!(playmark_tempo::save_released_tempo(view, second, cx));
+        });
+        let second_receipt = next_tempo_delivery(cx);
+        browser.update(cx, |view, cx| {
+            view.set_waveform_play_region(baseline);
+            assert!(view.apply_catalog_delivery(second_receipt, cx));
+            assert_eq!(view.waveform_play_region, baseline);
+            view.invalidate_waveform_generation();
+            assert!(playmark_tempo::load_for_waveform(view, cx));
+        });
+        let reopened = next_tempo_delivery(cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(reopened, cx));
+            assert_eq!(
+                view.waveform_play_region.unwrap().frame_bounds(16_000),
+                Some((2_000, 12_000))
+            );
             assert!(view.playback_init_intent.is_none());
         });
         cx.update(|app| {
