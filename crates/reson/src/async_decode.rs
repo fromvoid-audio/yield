@@ -1,18 +1,77 @@
 use std::marker::PhantomData;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ringbuf::{HeapRb, traits::*};
 
 use crate::Source;
+use crate::output::ResolvedOutput;
 use crate::telemetry;
 
 const PRODUCER_BACKOFF: Duration = Duration::from_millis(1);
 const PREFILL_POLL: Duration = Duration::from_millis(1);
 const DECODER_WORKER_CAPACITY: usize = 512;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UnderrunCounts {
+    episodes: u64,
+    inserted_frames: u64,
+    last_queued_samples: usize,
+}
+
+/// The source and its admission owner both retain this report until they finish.
+/// An output source is retired on the stream owner, outside the device callback.
+pub(crate) struct AsyncDecodeDiagnostics {
+    source_kind: &'static str,
+    source_rate: u32,
+    source_channels: u16,
+    ring_capacity_samples: usize,
+    prefilled_samples: usize,
+    output: ResolvedOutput,
+    admitted: AtomicBool,
+    retired: OnceLock<UnderrunCounts>,
+}
+
+impl AsyncDecodeDiagnostics {
+    pub(crate) fn mark_admitted(&self) {
+        self.admitted.store(true, Ordering::Relaxed);
+    }
+
+    fn reportable_counts(&self) -> Option<&UnderrunCounts> {
+        self.retired
+            .get()
+            .filter(|counts| counts.inserted_frames > 0 && self.admitted.load(Ordering::Relaxed))
+    }
+}
+
+impl Drop for AsyncDecodeDiagnostics {
+    fn drop(&mut self) {
+        if let Some(counts) = self.reportable_counts() {
+            tracing::warn!(
+                target: "perf::audio_start",
+                module = "reson_async_source",
+                stage = "decode_underrun",
+                source_kind = self.source_kind,
+                source_rate = self.source_rate,
+                source_channels = self.source_channels,
+                ring_capacity_samples = self.ring_capacity_samples,
+                prefilled_samples = self.prefilled_samples,
+                episodes = counts.episodes,
+                inserted_source_frames = counts.inserted_frames,
+                last_queued_samples = counts.last_queued_samples,
+                output_host = self.output.host_id.as_str(),
+                output_device = self.output.device_name.as_str(),
+                output_rate = self.output.sample_rate,
+                output_channels = self.output.channel_count,
+                output_buffer_frames = ?self.output.buffer_size_frames,
+                "Async decode substituted silence during source playback or preparation"
+            );
+        }
+    }
+}
 
 struct DecoderWorkerPool {
     active: AtomicUsize,
@@ -88,6 +147,8 @@ pub(crate) struct AsyncSource<S> {
     last_error: Arc<Mutex<Option<String>>>,
     output_remaining: usize,
     output_silence: bool,
+    underruns: UnderrunCounts,
+    diagnostics: Option<Arc<AsyncDecodeDiagnostics>>,
     _marker: PhantomData<S>,
 }
 
@@ -126,6 +187,8 @@ where
                 )))),
                 output_remaining: 0,
                 output_silence: false,
+                underruns: UnderrunCounts::default(),
+                diagnostics: None,
                 _marker: PhantomData,
             };
         };
@@ -234,6 +297,8 @@ where
             last_error,
             output_remaining: 0,
             output_silence: false,
+            underruns: UnderrunCounts::default(),
+            diagnostics: None,
             _marker: PhantomData,
         };
         if let Some(construct_started_at) = construct_started_at {
@@ -250,6 +315,27 @@ where
             );
         }
         created
+    }
+
+    pub(crate) fn attach_diagnostics(
+        &mut self,
+        source_kind: &'static str,
+        prefilled_samples: usize,
+        output: &ResolvedOutput,
+    ) -> Option<Arc<AsyncDecodeDiagnostics>> {
+        let consumer = self.consumer.as_ref()?;
+        let diagnostics = Arc::new(AsyncDecodeDiagnostics {
+            source_kind,
+            source_rate: self.sample_rate,
+            source_channels: self.channels,
+            ring_capacity_samples: consumer.capacity().get(),
+            prefilled_samples,
+            output: output.clone(),
+            admitted: AtomicBool::new(false),
+            retired: OnceLock::new(),
+        });
+        self.diagnostics = Some(Arc::clone(&diagnostics));
+        Some(diagnostics)
     }
 
     /// Join the worker once it is known to be finished.
@@ -378,6 +464,7 @@ where
         if self.output_remaining == 0 {
             let channels = usize::from(self.channels.max(1));
             let available = consumer.occupied_len();
+            let was_silent = self.output_silence;
             self.output_silence = false;
             self.output_remaining = if available >= channels {
                 // The producer can only append. These complete frames remain available
@@ -389,6 +476,12 @@ where
                 consumer.occupied_len()
             } else {
                 // Leave partial data queued and finish this silent frame even if it refills.
+                // These counters belong to the consumer until it retires off-thread.
+                self.underruns.inserted_frames = self.underruns.inserted_frames.saturating_add(1);
+                if !was_silent {
+                    self.underruns.episodes = self.underruns.episodes.saturating_add(1);
+                }
+                self.underruns.last_queued_samples = available;
                 self.output_silence = true;
                 channels
             };
@@ -447,6 +540,9 @@ where
 impl<S> Drop for AsyncSource<S> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(diagnostics) = self.diagnostics.take() {
+            let _ = diagnostics.retired.set(self.underruns);
+        }
         let can_join = self.done.load(Ordering::Acquire)
             || self
                 .worker
