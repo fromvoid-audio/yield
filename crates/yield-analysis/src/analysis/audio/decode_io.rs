@@ -29,7 +29,7 @@ pub struct AudioProbe {
 
 /// Probe source metadata without running the full analysis decode path.
 pub fn probe_metadata(path: &Path) -> Result<AudioProbe, String> {
-    if crate::analysis::aiff::is_aiff_path(path) {
+    if yield_aiff::is_aiff_path(path) {
         return crate::analysis::aiff::probe(path).map_err(|error| error.to_string());
     }
     if path

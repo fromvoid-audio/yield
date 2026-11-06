@@ -8877,10 +8877,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "yield-aiff"
+version = "0.1.0"
+dependencies = [
+ "aifc",
+ "tempfile",
+]
+
+[[package]]
 name = "yield-analysis"
 version = "0.19.1"
 dependencies = [
- "aifc",
  "blake3",
  "directories",
  "hdbscan",
@@ -8900,6 +8907,7 @@ dependencies = [
  "symphonia",
  "tempfile",
  "thiserror 2.0.20",
+ "yield-aiff",
 ]
 
 [[package]]
@@ -8978,6 +8986,7 @@ dependencies = [
  "hound",
  "tempfile",
  "windows 0.62.2",
+ "yield-aiff",
  "yield-analysis",
  "yield-core",
  "yield-library",

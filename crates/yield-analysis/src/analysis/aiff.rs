@@ -1,182 +1,17 @@
-use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use aifc::{AifcError, AifcReader, FileFormat, Sample};
+use yield_aiff::{AiffPcmReader, AiffReadError};
 
 use super::audio::AudioProbe;
 use super::audio_decode::{AnalysisDecodeError, DecodedAudio};
 
-const MAX_HEADER_READ_BYTES: usize = 64 * 1024;
-
-/// Match the two supported AIFF filename extensions, ignoring ASCII case.
-pub fn is_aiff_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("aif") || extension.eq_ignore_ascii_case("aiff")
-        })
-}
-
-/// Validated, seekable reader for uncompressed AIFF PCM.
-pub struct AiffPcmReader {
-    reader: AifcReader<HeaderBudget>,
-    path: PathBuf,
-    sample_rate: u32,
-    channels: u16,
-    bits_per_sample: u32,
-    frames: u64,
-}
-
-impl AiffPcmReader {
-    fn open(path: &Path) -> Result<Self, AnalysisDecodeError> {
-        let file = File::open(path).map_err(|error| io_error(path, error))?;
-        Self::from_file(file, path)
-    }
-
-    /// Validate an already opened source descriptor positioned at the start of the AIFF file.
-    ///
-    /// The path is used for diagnostics. This method only reads from the supplied file.
-    pub fn from_file(file: File, path: &Path) -> Result<Self, AnalysisDecodeError> {
-        let file_len = file
-            .metadata()
-            .map_err(|error| io_error(path, error))?
-            .len();
-        let mut reader = AifcReader::new(HeaderBudget {
-            stream: BufReader::new(file),
-            remaining: Some(MAX_HEADER_READ_BYTES),
-        })
-        .map_err(|error| read_error(path, error))?;
-        reader.get_mut().remaining = None;
-        let info = reader.info();
-        if info.file_format != FileFormat::Aiff
-            || !matches!(info.comm_sample_size, 8 | 16 | 24 | 32)
-        {
-            return Err(AnalysisDecodeError::Unsupported(format!(
-                "{} requires 8-, 16-, 24-, or 32-bit uncompressed AIFF PCM",
-                path.display()
-            )));
-        }
-        if !(1.0..=f64::from(u32::MAX)).contains(&info.sample_rate)
-            || info.sample_rate.fract() != 0.0
-        {
-            return Err(AnalysisDecodeError::Invalid(format!(
-                "{} has an invalid AIFF sample rate",
-                path.display()
-            )));
-        }
-
-        let channels = info.channels as u16;
-        let bits_per_sample = info.comm_sample_size as u32;
-        let frames = u64::from(info.comm_num_sample_frames);
-        let expected_bytes = frames * u64::from(channels) * u64::from(bits_per_sample / 8);
-        let data_start = reader
-            .get_mut()
-            .stream_position()
-            .map_err(|error| io_error(path, error))?;
-        if frames == 0
-            || expected_bytes != u64::from(info.sample_byte_len)
-            || expected_bytes > file_len.saturating_sub(data_start)
-        {
-            return Err(AnalysisDecodeError::Corrupt(format!(
-                "{} has missing, incomplete, or inconsistent AIFF sample data",
-                path.display()
-            )));
-        }
-
-        Ok(Self {
-            reader,
-            path: path.to_path_buf(),
-            sample_rate: info.sample_rate as u32,
-            channels,
-            bits_per_sample,
-            frames,
-        })
-    }
-
-    /// Return the integer sample rate in Hz.
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    /// Return the number of interleaved channels.
-    pub fn channels(&self) -> u16 {
-        self.channels
-    }
-
-    /// Return the number of complete frames in the sound chunk.
-    pub fn frames(&self) -> u64 {
-        self.frames
-    }
-
-    /// Seek back to the first sample.
-    pub fn rewind(&mut self) -> Result<(), AnalysisDecodeError> {
-        self.reader
-            .seek(0)
-            .map_err(|error| read_error(&self.path, error))
-    }
-
-    /// Read the next normalized, interleaved sample.
-    pub fn read_sample(&mut self) -> Result<Option<f32>, AnalysisDecodeError> {
-        let sample = self
-            .reader
-            .read_sample()
-            .map_err(|error| read_error(&self.path, error))?;
-        let value = match sample {
-            Some(Sample::I8(value)) => f32::from(value) / 128.0,
-            Some(Sample::I16(value)) => f32::from(value) / 32_768.0,
-            Some(Sample::I24(value)) => value as f32 / 8_388_608.0,
-            Some(Sample::I32(value)) => value as f32 / 2_147_483_648.0,
-            None => return Ok(None),
-            _ => {
-                return Err(AnalysisDecodeError::Corrupt(format!(
-                    "{} contains unexpected AIFF sample data",
-                    self.path.display()
-                )));
-            }
-        };
-        Ok(Some(value))
-    }
-}
-
-// Seek past chunk payloads while bounding the total bytes the parser can read
-// during discovery. Decoding is limited by the validated frame count instead.
-struct HeaderBudget {
-    stream: BufReader<File>,
-    remaining: Option<usize>,
-}
-
-impl Read for HeaderBudget {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let Some(remaining) = &mut self.remaining else {
-            return self.stream.read(bytes);
-        };
-        if *remaining == 0 && !bytes.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "AIFF header exceeds read budget",
-            ));
-        }
-        let requested = bytes.len().min(*remaining);
-        let read = self.stream.read(&mut bytes[..requested])?;
-        *remaining -= read;
-        Ok(read)
-    }
-}
-
-impl Seek for HeaderBudget {
-    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        self.stream.seek(position)
-    }
-}
-
 pub(super) fn probe(path: &Path) -> Result<AudioProbe, AnalysisDecodeError> {
     let audio = AiffPcmReader::open(path)?;
     Ok(AudioProbe {
-        duration_seconds: Some((audio.frames as f64 / f64::from(audio.sample_rate)) as f32),
-        sample_rate: Some(audio.sample_rate),
-        channels: Some(audio.channels),
-        bits_per_sample: Some(audio.bits_per_sample),
+        duration_seconds: Some((audio.frames() as f64 / f64::from(audio.sample_rate())) as f32),
+        sample_rate: Some(audio.sample_rate()),
+        channels: Some(audio.channels()),
+        bits_per_sample: Some(audio.bits_per_sample()),
     })
 }
 
@@ -188,12 +23,12 @@ pub(super) fn decode(
     let frames = max_seconds
         .filter(|limit| *limit > 0.0)
         .map(|limit| {
-            let limited = (f64::from(limit) * f64::from(audio.sample_rate)).ceil() as u64;
-            limited.min(audio.frames)
+            let limited = (f64::from(limit) * f64::from(audio.sample_rate())).ceil() as u64;
+            limited.min(audio.frames())
         })
-        .unwrap_or(audio.frames);
+        .unwrap_or(audio.frames());
     let mut samples = Vec::new();
-    for _ in 0..frames * u64::from(audio.channels) {
+    for _ in 0..frames * u64::from(audio.channels()) {
         let value = audio.read_sample()?.ok_or_else(|| {
             AnalysisDecodeError::Corrupt(format!("{} ended during AIFF decode", path.display()))
         })?;
@@ -201,33 +36,19 @@ pub(super) fn decode(
     }
     Ok(DecodedAudio {
         samples,
-        sample_rate: audio.sample_rate,
-        channels: audio.channels,
+        sample_rate: audio.sample_rate(),
+        channels: audio.channels(),
     })
 }
 
-fn read_error(path: &Path, error: AifcError) -> AnalysisDecodeError {
-    let detail = format!("AIFF read failed for {}: {error:?}", path.display());
-    match error {
-        AifcError::Unsupported | AifcError::UnrecognizedFormat => {
-            AnalysisDecodeError::Unsupported(detail)
+impl From<AiffReadError> for AnalysisDecodeError {
+    fn from(error: AiffReadError) -> Self {
+        match error {
+            AiffReadError::Unsupported(detail) => Self::Unsupported(detail),
+            AiffReadError::Corrupt(detail) => Self::Corrupt(detail),
+            AiffReadError::Invalid(detail) => Self::Invalid(detail),
+            AiffReadError::Io { kind, detail } => Self::Io { kind, detail },
         }
-        AifcError::StdIoError(error)
-            if !matches!(
-                error.kind(),
-                io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
-            ) =>
-        {
-            io_error(path, error)
-        }
-        _ => AnalysisDecodeError::Corrupt(detail),
-    }
-}
-
-fn io_error(path: &Path, error: io::Error) -> AnalysisDecodeError {
-    AnalysisDecodeError::Io {
-        kind: error.kind(),
-        detail: format!("AIFF I/O failed for {}: {error}", path.display()),
     }
 }
 
@@ -295,20 +116,5 @@ mod tests {
             decode_audio_typed(&path, None),
             Err(AnalysisDecodeError::Unsupported(_))
         ));
-    }
-
-    #[test]
-    fn aiff_probe_bounds_header_reads_across_many_chunks() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("many-chunks.aif");
-        let mut bytes = FIXTURE[..12].to_vec();
-        for _ in 0..=(MAX_HEADER_READ_BYTES / 8) {
-            bytes.extend_from_slice(b"JUNK\0\0\0\0");
-        }
-        bytes.extend_from_slice(&FIXTURE[12..]);
-        let form_len = (bytes.len() - 8) as u32;
-        bytes[4..8].copy_from_slice(&form_len.to_be_bytes());
-        std::fs::write(&path, bytes).unwrap();
-        assert!(probe_metadata(&path).unwrap_err().contains("read budget"));
     }
 }

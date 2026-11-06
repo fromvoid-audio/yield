@@ -8,7 +8,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-use yield_analysis::{AiffPcmReader, is_aiff_path, probe_metadata};
+use yield_aiff::{AiffPcmReader, is_aiff_path};
+use yield_analysis::probe_metadata;
 use yield_core::AudioFile;
 use yield_library::sample_sources::{is_apple_double_sidecar, is_recognized_audio};
 
@@ -352,7 +353,7 @@ fn load_aiff_overview_from_file(
     if is_cancelled(cancellation) {
         return Err(String::from("waveform preview canceled"));
     }
-    reader.rewind().map_err(|error| error.to_string())?;
+    reader.seek_frame(0).map_err(|error| error.to_string())?;
     let mut projector =
         OverviewProjector::new(sample_rate, total_frames, overview_gain(global_peak));
     stream_aiff_frames(
