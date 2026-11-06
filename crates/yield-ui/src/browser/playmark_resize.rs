@@ -125,17 +125,7 @@ impl Browser {
             self.set_waveform_play_region(Some(region));
             self.playmark_resize_anchor = Some(anchor);
             similar_sections::invalidate_if_stale(self);
-            if let Some(path) = self
-                .selected
-                .and_then(|index| self.entries.get(index))
-                .map(|entry| entry.path.clone())
-            {
-                if let Some(Err(error)) = self.submit_playmark_timing_span(&path, region, cx) {
-                    self.set_playback_status(format!(
-                        "Playmark resize update unavailable: {error}"
-                    ));
-                }
-            }
+            self.retarget_committed_playmark_resize(region, cx);
             cx.notify();
         }
         cx.stop_propagation();
