@@ -96,6 +96,7 @@ const GENERAL_STATUS: &str = "settings-general-status";
 const MAINTENANCE_STATUS: &str = "settings-maintenance-status";
 const LINK: &str = super::link_settings::CONTROL;
 const LINK_STATUS: &str = super::link_settings::STATUS;
+const AUDITION_TEMPO: &str = super::tempo_audition::CONTROL;
 
 const SETTINGS_ORDER: &[&str] = &[
     THEME_CHOOSE,
@@ -116,6 +117,7 @@ const SETTINGS_ORDER: &[&str] = &[
     METRONOME_SOUNDS[2].0,
     METRONOME_SOUNDS[3].0,
     LINK,
+    AUDITION_TEMPO,
     HELP_TIPS,
     VISUAL_EFFECT_PRESET,
     VISUAL_EFFECT_TOGGLE,
@@ -423,6 +425,8 @@ impl BrowserAccessibility {
                             view.beat_count_input.read(cx).focus_handle()
                         } else if event.id == PLAYMARK_TIMING {
                             view.playmark_timing_input.read(cx).focus_handle()
+                        } else if event.id == AUDITION_TEMPO {
+                            view.tempo_audition.input.read(cx).focus_handle()
                         } else if event.id == COLLECTION_RENAME {
                             view.collection_rename_input.read(cx).focus_handle()
                         } else if event.id == VOLUME {
@@ -702,7 +706,7 @@ impl BrowserAccessibility {
                             if let Some(value) = value {
                                 view.set_metronome_volume(value, cx);
                             }
-                        } else if settings_action {
+                        } else if settings_action && event.id != AUDITION_TEMPO {
                             match event.action {
                                 AxAction::Focus => {}
                                 AxAction::Press => {
@@ -714,6 +718,7 @@ impl BrowserAccessibility {
                             || event.id == TAG_FILTER_INPUT
                             || event.id == PLAYMARK_TIMING
                             || event.id == COLLECTION_RENAME
+                            || event.id == AUDITION_TEMPO
                         {
                             match event.action {
                                 AxAction::SetValue(value) => {
@@ -723,6 +728,8 @@ impl BrowserAccessibility {
                                         view.playmark_timing_input.clone()
                                     } else if event.id == COLLECTION_RENAME {
                                         view.collection_rename_input.clone()
+                                    } else if event.id == AUDITION_TEMPO {
+                                        view.tempo_audition.input.clone()
                                     } else {
                                         view.tag_filter_input.clone()
                                     };
@@ -924,10 +931,17 @@ impl Browser {
         let Some(ax) = self.accessibility.as_ref() else {
             return false;
         };
-        let current = SETTINGS_ORDER.iter().copied().find(|id| {
-            ax.focus_handle(id)
-                .is_some_and(|focus| focus.is_focused(window))
-        });
+        let focus_for = |id| {
+            if id == AUDITION_TEMPO {
+                Some(self.tempo_audition.input.read(cx).focus_handle())
+            } else {
+                ax.focus_handle(id)
+            }
+        };
+        let current = SETTINGS_ORDER
+            .iter()
+            .copied()
+            .find(|id| focus_for(id).is_some_and(|focus| focus.is_focused(window)));
         if key.eq_ignore_ascii_case("tab") {
             let available = SETTINGS_ORDER
                 .iter()
@@ -947,7 +961,7 @@ impl Browser {
                     }
                 })
                 .unwrap_or(if shift { available.len() - 1 } else { 0 });
-            if let Some(focus) = ax.focus_handle(available[next]) {
+            if let Some(focus) = focus_for(available[next]) {
                 window.focus(&focus);
                 cx.notify();
                 return true;
@@ -957,7 +971,7 @@ impl Browser {
             key.to_ascii_lowercase().as_str(),
             "enter" | "return" | "space"
         ) {
-            if let Some(id) = current {
+            if let Some(id) = current.filter(|id| *id != AUDITION_TEMPO) {
                 if id != LINK || !is_held {
                     self.perform_settings_action(id, window, cx);
                 }
@@ -984,7 +998,7 @@ impl Browser {
             id if METRONOME_SOUNDS.iter().any(|(option, _, _)| *option == id) => {
                 editable && self.metronome_settings.menu_open()
             }
-            SETTINGS_CLOSE | THEME_RESET | LINK => true,
+            SETTINGS_CLOSE | THEME_RESET | LINK | AUDITION_TEMPO => true,
             THEME_CHOOSE | MOTION | TEXT_SCALE | AUTOPLAY | ANTI_CLICK | HELP_TIPS => editable,
             ANTI_CLICK_FADE_DECREASE => editable && self.preferences.anti_click_settings().1 > 0.0,
             ANTI_CLICK_FADE_INCREASE => {
@@ -1604,6 +1618,13 @@ impl Browser {
                         role: AxRole::StaticText,
                         label: "Ableton Link status".into(),
                         value: Some(self.link_settings.label()),
+                        enabled: true,
+                    },
+                    AxChild {
+                        id: AUDITION_TEMPO.into(),
+                        role: AxRole::TextField,
+                        label: "Audition target BPM".into(),
+                        value: Some(self.tempo_audition.input.read(cx).content().to_owned()),
                         enabled: true,
                     },
                     toggle(HELP_TIPS, "Help tips", self.help_tooltips_enabled, editable),
@@ -2277,6 +2298,10 @@ impl Browser {
                 self.playmark_timing_input.read(cx).focus_handle(),
             ),
             (VOLUME, self.volume_focus_handle.clone()),
+            (
+                AUDITION_TEMPO,
+                self.tempo_audition.input.read(cx).focus_handle(),
+            ),
             (WAVEFORM, self.waveform_focus_handle.clone()),
         ] {
             if registry.contains(id) {

@@ -133,12 +133,16 @@ impl PlaymarkTempoState {
 }
 
 pub(super) fn authored_bpm(browser: &Browser) -> Option<f64> {
+    authored_value(browser).map(SourcePlaymarkTempo::bpm)
+}
+
+pub(super) fn authored_value(browser: &Browser) -> Option<SourcePlaymarkTempo> {
     let load = browser
         .playmark_tempo
         .load
         .as_ref()
         .filter(|load| load.matches(browser))?;
-    load.result?.ok().flatten().map(SourcePlaymarkTempo::bpm)
+    load.result?.ok().flatten()
 }
 
 pub(super) fn load_for_waveform(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {

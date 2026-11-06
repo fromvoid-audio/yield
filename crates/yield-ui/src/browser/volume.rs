@@ -382,6 +382,7 @@ impl Browser {
                 return;
             }
             self.volume = value;
+            self.tempo_audition.set_pending_volume(value);
             if let Some(intent) = self.playback_init_intent.as_mut() {
                 intent.set_volume(value);
             }
@@ -414,6 +415,7 @@ impl Browser {
         let value = quantize_volume(value);
         let changed = self.volume.to_bits() != value.to_bits();
         self.volume = value;
+        self.tempo_audition.set_pending_volume(value);
         if let Some(intent) = self.playback_init_intent.as_mut() {
             intent.set_volume(value);
         }
