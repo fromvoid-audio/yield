@@ -1047,13 +1047,15 @@ def build(args: argparse.Namespace) -> None:
                     if COORDINATOR_FD is not None:
                         env["YIELD_LOCAL_CI_COORDINATOR_FD"] = str(COORDINATOR_FD)
                     if args.channel == "test":
-                        command = ["cargo", "build", "--locked", "-p", "yield", "--features", "development-state"]
+                        command = ["cargo", "build", "--locked", "--features", "yield/development-state"]
                         binary = pathlib.Path(env["CARGO_TARGET_DIR"]) / "debug" / "yield"
                         namespace = ".yield-development"
                     else:
-                        command = ["cargo", "build", "--locked", "--profile", "release-local", "-p", "yield"]
+                        command = ["cargo", "build", "--locked", "--profile", "release-local"]
                         binary = pathlib.Path(env["CARGO_TARGET_DIR"]) / "release-local" / "yield"
                         namespace = ".yield"
+                    targets, watcher_helper = _packager.bundle_build_targets(checkout, binary)
+                    command.extend(targets)
                     pass_fds = (COORDINATOR_FD,) if COORDINATOR_FD is not None else ()
 
                     active_phase = "cargo-build"
@@ -1134,7 +1136,8 @@ def build(args: argparse.Namespace) -> None:
                             "YieldChannel": args.channel,
                         }
                         signature_details = _packager.create_signed_bundle(
-                            binary, app_bundle, icon, font_license, info, cwd=checkout, log=log
+                            binary, app_bundle, icon, font_license, info, cwd=checkout, log=log,
+                            watcher_helper=watcher_helper,
                         )
                         log.write("ad-hoc signature verified\n")
                         files = sorted(path for path in (staged / "Yield.app").rglob("*") if path.is_file())

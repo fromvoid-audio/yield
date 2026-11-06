@@ -353,6 +353,9 @@ class ManagedBinaryProbeTests(unittest.TestCase):
             state_dir.mkdir()
             checkout = root / "checkout"
             checkout.mkdir()
+            helper_source = checkout / "crates/yield-source-watcher/src/bin/yield-live-watch-helper/main.rs"
+            helper_source.parent.mkdir(parents=True)
+            helper_source.touch()
             run_managed = MODULE.run_managed
 
             @contextmanager
@@ -397,6 +400,14 @@ class ManagedBinaryProbeTests(unittest.TestCase):
             self.assertEqual(record["status"], "failed")
             self.assertEqual(record["phase"], "cargo-build")
             self.assertEqual(record["commands"][0]["exit_code"], 17)
+            self.assertEqual(
+                record["commands"][0]["command"],
+                [
+                    "cargo", "build", "--locked", "--features", "yield/development-state",
+                    "-p", "yield", "-p", "yield-source-watcher",
+                    "--bin", "yield", "--bin", "yield-live-watch-helper",
+                ],
+            )
             log = pathlib.Path(record["log"]).read_text(encoding="utf-8")
             self.assertIn("fake cargo stdout", log)
             self.assertIn("fake cargo stderr", log)

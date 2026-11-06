@@ -18,6 +18,7 @@ from typing import TextIO
 
 BUNDLE_NAME = "Yield.app"
 BUNDLE_ID = "org.portalsurfer.yield.dev"
+WATCHER_HELPER = "yield-live-watch-helper"
 
 
 def command(*args: str, cwd: Path) -> str:
@@ -32,6 +33,16 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def bundle_build_targets(checkout: Path, binary: Path) -> tuple[list[str], Path | None]:
+    """Select the exact checkout's app and any declared native helper target."""
+    bin_source = checkout / "crates/yield-source-watcher/src/bin"
+    if (bin_source / f"{WATCHER_HELPER}.rs").is_file() or (bin_source / WATCHER_HELPER / "main.rs").is_file():
+        return [
+            "-p", "yield", "-p", "yield-source-watcher", "--bin", "yield", "--bin", WATCHER_HELPER
+        ], binary.with_name(WATCHER_HELPER)
+    return ["-p", "yield"], None
+
+
 def create_signed_bundle(
     binary: Path,
     app_bundle: Path,
@@ -41,14 +52,23 @@ def create_signed_bundle(
     *,
     cwd: Path,
     log: TextIO | None = None,
+    watcher_helper: Path | None = None,
 ) -> str:
     """Assemble and ad-hoc sign the shared local-review Yield.app layout."""
+    if watcher_helper is not None and (
+        watcher_helper.is_symlink()
+        or not watcher_helper.is_file()
+        or not os.access(watcher_helper, os.X_OK)
+    ):
+        raise RuntimeError(f"missing or invalid macOS watcher helper: {watcher_helper}")
     contents = app_bundle / "Contents"
     executable = contents / "MacOS" / "yield"
     resources = contents / "Resources"
     resources.mkdir(parents=True)
     executable.parent.mkdir(parents=True)
     shutil.copy2(binary, executable)
+    if watcher_helper is not None:
+        shutil.copy2(watcher_helper, executable.with_name(WATCHER_HELPER))
     shutil.copy2(icon, resources / "Yield.icns")
     shutil.copy2(font_license, resources / "IoskeleyMono-LICENSE.txt")
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
@@ -71,6 +91,8 @@ def create_signed_bundle(
 
     run_codesign("codesign", "--force", "--deep", "--sign", "-", str(app_bundle))
     run_codesign("codesign", "--verify", "--strict", "--deep", str(app_bundle))
+    if watcher_helper is not None:
+        run_codesign("codesign", "--verify", "--strict", str(executable.with_name(WATCHER_HELPER)))
     signature = run_codesign("codesign", "--display", "--verbose=4", str(app_bundle))
     if "Signature=adhoc" not in signature:
         raise RuntimeError("local review bundle did not receive an ad-hoc signature")
@@ -116,8 +138,9 @@ def main() -> int:
         if not required.is_file():
             parser.error(f"missing bundle asset: {required}")
 
+    targets, watcher_helper = bundle_build_targets(root, binary)
     subprocess.run(
-        ["cargo", "build", "--locked", "--profile", "release-local", "-p", "yield"],
+        ["cargo", "build", "--locked", "--profile", "release-local", *targets],
         cwd=root,
         check=True,
     )
@@ -146,6 +169,7 @@ def main() -> int:
                 "YieldSourceCommit": args.sha,
             },
             cwd=root,
+            watcher_helper=watcher_helper,
         )
         files = sorted(path for path in staged.rglob("*") if path.is_file())
         manifest = {
