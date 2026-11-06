@@ -84,6 +84,7 @@ NATIVE_EVIDENCE_OUTPUT = "YIELD_NATIVE_VERIFICATION_OUTPUT"
 NATIVE_EVIDENCE_REDIRECT_MARKER = "${" + NATIVE_EVIDENCE_OUTPUT + ":-"
 FULL_FROZEN_RUNNER = "scripts/internal/ci/run_full_ci.py"
 FULL_FROZEN_SUPPORT_MARKER = "YIELD_FULL_CI_EXTERNAL_OUTPUT_V1"
+VALIDATION_ROOT_OVERRIDE = "YIELD_LOCAL_CI_VALIDATION_ROOT"
 ADMISSION_MARKER = b"YIELD_ADMISSION_PROTOCOL_V1"
 # A full check can contain the runner's 40-second nested-validator cleanup.
 MANAGED_COMMAND_TERMINATION_GRACE_SECONDS = (40.0, 10.0, 5.0)
@@ -568,7 +569,46 @@ def validation_worktree(
         yield checkout, "temporary", rejected
 
 
-def cargo_env(state_dir: pathlib.Path, channel: str, checkout: pathlib.Path) -> dict[str, str]:
+def external_validation_root(
+    checkout: pathlib.Path, state_dir: pathlib.Path
+) -> tuple[pathlib.Path, dict[str, object]] | None:
+    configured = os.environ.get(VALIDATION_ROOT_OVERRIDE)
+    if not configured:
+        return None
+    root = pathlib.Path(configured)
+    if not root.is_absolute():
+        raise CiError(f"{VALIDATION_ROOT_OVERRIDE} must be an absolute path")
+    try:
+        if root.resolve(strict=True) != root:
+            raise CiError(f"{VALIDATION_ROOT_OVERRIDE} must be a canonical, nonsymlink path")
+        entry = root.stat()
+        if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid() or entry.st_mode & 0o077:
+            raise CiError(f"{VALIDATION_ROOT_OVERRIDE} must be a private current-user-owned directory")
+        protected = [p.stat() for p in (ROOT, checkout, state_dir)]
+        for ancestor in (root, *root.parents):
+            identity = ancestor.stat()
+            if any(os.path.samestat(identity, directory) for directory in protected):
+                raise CiError(f"{VALIDATION_ROOT_OVERRIDE} must be outside source and coordinator directories")
+    except CiError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise CiError(f"cannot inspect {VALIDATION_ROOT_OVERRIDE}: {exc}") from exc
+    filesystem = filesystem_probe(root)
+    if (
+        str(filesystem["filesystem"]).lower() != "apfs"
+        or not filesystem["writable"]
+        or not os.access(root, os.W_OK | os.X_OK)
+    ):
+        raise CiError(f"{VALIDATION_ROOT_OVERRIDE} requires a writable APFS directory")
+    return root, filesystem
+
+
+def cargo_env(
+    state_dir: pathlib.Path,
+    channel: str,
+    checkout: pathlib.Path,
+    external_root: pathlib.Path | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     if env.get("RUSTFLAGS") or env.get("CARGO_ENCODED_RUSTFLAGS"):
         raise CiError("clear RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS so the pinned channel feature set is reproducible")
@@ -581,11 +621,26 @@ def cargo_env(state_dir: pathlib.Path, channel: str, checkout: pathlib.Path) -> 
     )
     repository_root = state_dir.parent.parent
     shared_root = repository_root.parent / "yield-native-target" / cache_lane
+    external = external_root if cache_lane == "validation" else None
+    if external is not None:
+        shared_root = external
     rust = command_output("rustc", "-vV", cwd=checkout).splitlines()
     identity = "-".join(line.split(": ", 1)[1] for line in rust if line.startswith(("release: ", "host: ")))
     lock_hash = hashlib.sha256((checkout / "Cargo.lock").read_bytes()).hexdigest()[:12]
     target = shared_root / f"{identity}-{lock_hash}"
-    target.mkdir(parents=True, exist_ok=True)
+    if external is not None:
+        try:
+            target.mkdir(mode=0o700, exist_ok=True)
+            entry = target.lstat()
+            external_device = external.stat().st_dev
+        except OSError as exc:
+            raise CiError(f"cannot prepare the external Cargo cache key: {exc}") from exc
+        if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid() or entry.st_mode & 0o077:
+            raise CiError("external Cargo cache key must be a private current-user-owned directory")
+        if entry.st_dev != external_device:
+            raise CiError("external Cargo cache key must be on the configured validation volume")
+    else:
+        target.mkdir(parents=True, exist_ok=True)
     env["CARGO_TARGET_DIR"] = str(target)
     env["YIELD_VALIDATION_TARGET_ROOT"] = str(shared_root)
     env["CARGO_BUILD_JOBS"] = "2"
@@ -625,14 +680,14 @@ def doctor(lane: str) -> dict[str, str]:
 def filesystem_probe(path: pathlib.Path) -> dict[str, object]:
     try:
         output = subprocess.check_output(["df", "-P", str(path)], text=True, stderr=subprocess.STDOUT)
-        fields = output.splitlines()[-1].split()
+        fields = output.splitlines()[-1].split(maxsplit=5)
         if len(fields) < 6:
             raise CiError("df returned an incomplete filesystem record")
         device = fields[0]
         plist = subprocess.check_output(["diskutil", "info", "-plist", device], stderr=subprocess.STDOUT)
         info = plistlib.loads(plist)
     except (OSError, subprocess.CalledProcessError, plistlib.InvalidFileException) as exc:
-        raise CiError(f"cannot qualify the home filesystem with df and diskutil: {exc}") from exc
+        raise CiError(f"cannot qualify the filesystem with df and diskutil: {exc}") from exc
     filesystem = str(info.get("FilesystemType", info.get("FilesystemName", "unknown")))
     writable = info.get("WritableVolume")
     if not isinstance(writable, bool):
@@ -730,7 +785,8 @@ def _check(args: argparse.Namespace) -> None:
         )
         if args.lane in {"full", "native"}:
             require_maintenance_protocol(checkout, full_lane=args.lane == "full")
-        env = cargo_env(state_dir, "check", checkout)
+        external_target = external_validation_root(checkout, state_dir)
+        env = cargo_env(state_dir, "check", checkout, external_target[0] if external_target else None)
         if cached_identity is not None:
             env["PYTHONDONTWRITEBYTECODE"] = "1"
         if COORDINATOR_FD is not None:
@@ -772,6 +828,14 @@ def _check(args: argparse.Namespace) -> None:
             commands = [["bash", str(runner)]]
         details = {"schema": 1, "run_id": run_id, "sha": sha, "lane": args.lane, "case": args.case, "platform": facts, "commands": commands, "results": []}
         details["checkout"] = {"path": str(checkout), "disposition": disposition}
+        if external_target is not None:
+            root, filesystem = external_target
+            details["validation_target"] = {
+                "root": str(root),
+                "path": env["CARGO_TARGET_DIR"],
+                "filesystem": filesystem,
+                "free_bytes": shutil.disk_usage(root).free,
+            }
         if cache_rejection is not None:
             details["checkout"]["cache_rejection"] = cache_rejection
         with log_path.with_suffix(".log").open("w", encoding="utf-8") as log:
