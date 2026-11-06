@@ -13,7 +13,7 @@ use crate::sample_sources::{
     db::SourceIndexInspectionError,
     readiness::{
         FEATURE_INPUT_MAX_BYTES, FeatureArtifactClaim, InputPermit, SourceFeatureInput,
-        SourceFeatureInputError as InputError,
+        SourceFeatureInputError as InputError, TRANSIENT_STREAM_MAX_BYTES,
     },
 };
 
@@ -35,6 +35,7 @@ impl SourceWriter {
             path,
             Some(&target.scope_id),
             Some(&target.content_generation),
+            FEATURE_INPUT_MAX_BYTES,
         )
     }
 
@@ -47,6 +48,25 @@ impl SourceWriter {
         expected: &SourceRevision,
         relative: &RootRelativePath,
     ) -> Result<SourceFeatureInput, SourceWriterError> {
+        self.prepare_audited_audio_input(expected, relative, FEATURE_INPUT_MAX_BYTES)
+    }
+
+    /// Hold one current audited entry under the larger bounded streaming admission.
+    /// Consume it through the verified reader. Whole-file allocation keeps its normal limit.
+    pub fn prepare_transient_stream_input(
+        &self,
+        expected: &SourceRevision,
+        relative: &RootRelativePath,
+    ) -> Result<SourceFeatureInput, SourceWriterError> {
+        self.prepare_audited_audio_input(expected, relative, TRANSIENT_STREAM_MAX_BYTES)
+    }
+
+    fn prepare_audited_audio_input(
+        &self,
+        expected: &SourceRevision,
+        relative: &RootRelativePath,
+        byte_limit: u64,
+    ) -> Result<SourceFeatureInput, SourceWriterError> {
         self.validate_readiness_revision(expected)?;
         let path = normalize_relative_path(relative.as_path())?;
         if Path::new(&path) != relative.as_path() {
@@ -54,7 +74,7 @@ impl SourceWriter {
                 "audio input path differs from its manifest key",
             ));
         }
-        self.hold_audio_input(expected, &path, None, None)
+        self.hold_audio_input(expected, &path, None, None, byte_limit)
     }
 
     /// Confirm that a computed read still belongs to this exact owner, audit and file.
@@ -75,6 +95,7 @@ impl SourceWriter {
         path: &str,
         identity: Option<&str>,
         content: Option<&str>,
+        byte_limit: u64,
     ) -> Result<SourceFeatureInput, SourceWriterError> {
         let relative = RootRelativePath::try_from_path(path.into())
             .map_err(|_| SourceWriterError::InvalidRequest("invalid audio input path"))?;
@@ -92,7 +113,7 @@ impl SourceWriter {
             .map_err(map_sql_error)?;
         let size = u64::try_from(size)
             .map_err(|_| SourceWriterError::InvalidRequest("invalid audio input size"))?;
-        if size > FEATURE_INPUT_MAX_BYTES {
+        if size > byte_limit {
             return Err(InputError::ByteLimit.into());
         }
         let permit = InputPermit::acquire()?;
