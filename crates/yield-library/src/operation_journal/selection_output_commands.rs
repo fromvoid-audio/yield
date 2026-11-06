@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub use crate::sample_sources::SourcePlaybackType;
+use crate::sample_sources::SourcePlaymarkGridTempo;
 
 use super::coordinator::{
     CopyEndpoint, CopyEndpointRole, CopyIntentValidationError, FiniteF32Bits,
@@ -46,7 +47,7 @@ pub enum RawWavEdgeFadePolicy {
 /// value and an unlocked state. This policy is deliberately not serialized in the
 /// intent: it is a fixed consequence of this workflow, while the selected source's playback
 /// behavior is captured in [`SelectionExtractIntentArgs::playback_type`]. This contract performs
-/// no metadata writes and carries no arbitrary tags or BPM values.
+/// no metadata writes. A separate captured beat count can support derived tempo.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionExtractMetadataPolicy {
     /// Keep the extracted file at rating 1 and leave it unlocked.
@@ -238,6 +239,7 @@ pub struct SelectionExtractIntentArgs {
     range: WaveformEditFrameRange,
     recipe: SelectionOutputRecipe,
     playback_type: SourcePlaybackType,
+    playmark_beats: Option<u8>,
     destination: CopyEndpoint,
     collision_policy: super::coordinator::CopyCollisionPolicy,
 }
@@ -266,6 +268,7 @@ impl SelectionExtractIntentArgs {
             range,
             recipe,
             playback_type,
+            playmark_beats: None,
             destination,
             collision_policy,
         };
@@ -349,6 +352,25 @@ impl SelectionExtractIntentArgs {
         self.playback_type
     }
 
+    /// Attach a whole beat count observed for this exact selection.
+    /// If it cannot yield a supported tempo, leave the extraction untagged.
+    pub fn with_playmark_beats(mut self, beats: u8) -> Self {
+        self.playmark_beats = Some(beats);
+        if self.derived_tempo().is_none() {
+            self.playmark_beats = None;
+        }
+        self
+    }
+
+    /// Derive destination tempo from the captured beats and half-open frame range.
+    pub fn derived_tempo(&self) -> Option<SourcePlaymarkGridTempo> {
+        tempo_from_beats(
+            self.playmark_beats?,
+            self.source_spec.sample_rate(),
+            self.selected_frames().ok()?,
+        )
+    }
+
     /// Return the concrete destination endpoint observation.
     pub fn destination(&self) -> &CopyEndpoint {
         &self.destination
@@ -398,6 +420,11 @@ impl SelectionExtractIntentArgs {
         let selected_frames = checked_selected_frames(self.total_frames, self.range)?;
         self.recipe
             .validate_for_source(self.source_spec, selected_frames)?;
+        if self.playmark_beats.is_some_and(|beats| {
+            tempo_from_beats(beats, self.source_spec.sample_rate(), selected_frames).is_none()
+        }) {
+            return Err(SelectionOutputValidationError::InvalidPlaymarkBeats);
+        }
         if self.collision_policy != super::coordinator::CopyCollisionPolicy::NoReplace {
             return Err(SelectionOutputValidationError::UnsupportedCollisionPolicy);
         }
@@ -565,6 +592,9 @@ pub enum SelectionOutputValidationError {
     /// The selected range extends beyond the complete source.
     #[error("selection output frame range is outside the source")]
     SelectedRangeOutsideSource,
+    /// The stored whole beat count cannot produce a supported destination tempo.
+    #[error("selection output playmark beat count cannot produce a supported tempo")]
+    InvalidPlaymarkBeats,
     /// The observed raw `fmt ` chunk length is outside the native bound.
     #[error("selection output raw WAV fmt chunk length is invalid")]
     InvalidFmtChunkBytes,
@@ -736,6 +766,18 @@ fn checked_selected_frames(
     Ok(selected_frames)
 }
 
+fn tempo_from_beats(
+    beats: u8,
+    sample_rate: u32,
+    selected_frames: u64,
+) -> Option<SourcePlaymarkGridTempo> {
+    // Both callers have validated that the range contains at least one frame.
+    let frames = u128::from(selected_frames);
+    let numerator = u128::from(beats) * u128::from(sample_rate) * 60_000;
+    let rounded = (numerator + frames / 2) / frames;
+    SourcePlaymarkGridTempo::from_milli_bpm(u32::try_from(rounded).ok()?)
+}
+
 fn checked_raw_wav_arithmetic(
     source_spec: WaveformSourceSpec,
     fmt_chunk_bytes: u32,
@@ -847,6 +889,7 @@ fn validate_persisted_extract_value(
             "range",
             "recipe",
             "playback_type",
+            "playmark_beats",
             "destination",
             "collision_policy",
         ],
@@ -860,6 +903,7 @@ fn validate_persisted_extract_value(
         "range",
         "recipe",
         "playback_type",
+        "playmark_beats",
         "destination",
         "collision_policy",
     ] {
@@ -877,6 +921,14 @@ fn validate_persisted_extract_value(
     validate_frame_count_raw(total_frames)?;
     let range = parse_persisted_range(required_field(object, "range")?)?;
     let selected_frames = checked_selected_frames_raw(total_frames, range)?;
+    let beats = required_field(object, "playmark_beats")?;
+    if !beats.is_null() {
+        beats
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .and_then(|beats| tempo_from_beats(beats, source_spec.sample_rate(), selected_frames))
+            .ok_or("persisted selection output playmark beat count is invalid")?;
+    }
     validate_persisted_recipe(
         required_field(object, "recipe")?,
         source_spec,
@@ -1298,6 +1350,48 @@ mod tests {
             args.metadata_policy(),
             SelectionExtractMetadataPolicy::Keep1Unlocked
         );
+    }
+
+    #[test]
+    fn extraction_tempo_uses_exact_frames_and_rejects_invalid_stored_provenance() {
+        let (_, mut args) = fixture();
+        args.total_frames = 200_000_000;
+        args.range = WaveformEditFrameRange::new(100, 72_100).expect("range");
+        assert_eq!(args.derived_tempo(), None);
+        assert_eq!(args.clone().with_playmark_beats(0).derived_tempo(), None);
+        args = args.with_playmark_beats(3);
+        assert_eq!(
+            args.derived_tempo().map(SourcePlaymarkGridTempo::bpm),
+            Some(120.0)
+        );
+
+        args.range = WaveformEditFrameRange::new(100, 72_101).expect("fractional range");
+        assert_eq!(
+            args.derived_tempo().map(SourcePlaymarkGridTempo::bpm),
+            Some(119.998)
+        );
+        let valid = serde_json::to_value(SelectionOutputCommandArgs::Extract(args.clone()))
+            .expect("command JSON");
+        validate_persisted_selection_output_command_args_value(&valid)
+            .expect("strict command with captured beats");
+        for invalid in [
+            Value::from(0),
+            Value::from(256),
+            Value::from(2.5),
+            Value::from("3"),
+        ] {
+            let mut malformed = valid.clone();
+            malformed["Extract"]["playmark_beats"] = invalid;
+            assert!(validate_persisted_selection_output_command_args_value(&malformed).is_err());
+        }
+        args.range = WaveformEditFrameRange::new(100, 140).expect("short range");
+        assert_eq!(
+            args.validate(),
+            Err(SelectionOutputValidationError::InvalidPlaymarkBeats)
+        );
+        assert_eq!(args.clone().with_playmark_beats(1).derived_tempo(), None);
+        args.range = WaveformEditFrameRange::new(100, 100_000_000).expect("long range");
+        assert_eq!(args.with_playmark_beats(1).derived_tempo(), None);
     }
 
     #[test]
