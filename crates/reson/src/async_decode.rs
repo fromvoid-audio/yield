@@ -14,6 +14,7 @@ use crate::telemetry;
 const PRODUCER_BACKOFF: Duration = Duration::from_millis(1);
 const PREFILL_POLL: Duration = Duration::from_millis(1);
 const DECODER_WORKER_CAPACITY: usize = 512;
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct UnderrunCounts {
@@ -145,6 +146,7 @@ pub(crate) struct AsyncSource<S> {
     done: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
+    refill_samples: usize,
     output_remaining: usize,
     output_silence: bool,
     underruns: UnderrunCounts,
@@ -185,6 +187,7 @@ where
                 last_error: Arc::new(Mutex::new(Some(String::from(
                     "Async decode worker capacity reached",
                 )))),
+                refill_samples: 0,
                 output_remaining: 0,
                 output_silence: false,
                 underruns: UnderrunCounts::default(),
@@ -295,6 +298,7 @@ where
             done,
             stop,
             last_error,
+            refill_samples: 0,
             output_remaining: 0,
             output_silence: false,
             underruns: UnderrunCounts::default(),
@@ -361,9 +365,15 @@ where
         }
     }
 
-    /// Prefill the ring buffer for at least `duration`, waiting up to `timeout`.
+    /// Prefill up to the ring capacity and use the same watermark after starvation.
+    /// Only startup waits here. Recovery on the sample consumer substitutes silence.
     pub(crate) fn prefill_for_duration(&mut self, duration: Duration, timeout: Duration) -> usize {
-        let target_samples = prefill_samples(self.sample_rate, self.channels, duration);
+        let capacity = self
+            .consumer
+            .as_ref()
+            .map_or(0, |ring| ring.capacity().get());
+        let target_samples = prefill_samples(self.sample_rate, self.channels, duration, capacity);
+        self.refill_samples = target_samples;
         self.prefill_samples(target_samples, timeout)
     }
 
@@ -465,8 +475,13 @@ where
             let channels = usize::from(self.channels.max(1));
             let available = consumer.occupied_len();
             let was_silent = self.output_silence;
+            let watermark = if was_silent {
+                self.refill_samples.max(channels)
+            } else {
+                channels
+            };
             self.output_silence = false;
-            self.output_remaining = if available >= channels {
+            self.output_remaining = if available >= watermark {
                 // The producer can only append. These complete frames remain available
                 // to the sole consumer, so we can drain them without another size probe.
                 available - available % channels
@@ -475,7 +490,8 @@ where
                 // Preserve the existing drain behavior for a decoder's partial terminal frame.
                 consumer.occupied_len()
             } else {
-                // Leave partial data queued and finish this silent frame even if it refills.
+                // Leave the queued data in place so a slow producer can rebuild a cushion.
+                // Finish this silent frame even if the buffer refills in the meantime.
                 // These counters belong to the consumer until it retires off-thread.
                 self.underruns.inserted_frames = self.underruns.inserted_frames.saturating_add(1);
                 if !was_silent {
@@ -574,12 +590,11 @@ fn buffer_samples(sample_rate: u32, channels: u16, buffer_seconds: f32) -> usize
     (sample_rate * channels * buffer_seconds).ceil() as usize
 }
 
-/// Convert a prefill duration into the number of interleaved samples to wait for.
-fn prefill_samples(sample_rate: u32, channels: u16, duration: Duration) -> usize {
-    let channels = channels.max(1) as f64;
-    let sample_rate = sample_rate.max(1) as f64;
-    let seconds = duration.as_secs_f64();
-    (sample_rate * channels * seconds).ceil() as usize
+/// Round to a complete source frame, bounded by the ring's whole-frame capacity.
+fn prefill_samples(sample_rate: u32, channels: u16, duration: Duration, capacity: usize) -> usize {
+    let channels = usize::from(channels.max(1));
+    let frames = (u128::from(sample_rate.max(1)) * duration.as_nanos()).div_ceil(NANOS_PER_SECOND);
+    frames.min((capacity / channels) as u128) as usize * channels
 }
 
 /// Render a human-readable panic payload for the decoder worker.

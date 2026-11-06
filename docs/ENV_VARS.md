@@ -643,6 +643,12 @@ silence episodes, inserted source frames, the last ring fill at starvation,
 initial prefill, and the source and device formats. The count is measured
 before output resampling and includes adapter preparation. The event omits
 media paths and covers decoder starvation only.
+File playback targets 5 ms of source audio for startup and recovery. Rapid
+transient navigation uses 3 ms to keep replacements responsive. Both targets
+round up to complete source frames and fit within the decoder ring. The
+startup wait uses the same respective time budgets. After starvation the
+audio callback emits whole silent frames while the worker refills the ring,
+and drains any remaining samples once the decoder finishes.
 
 - `YIELD_BROWSER_SEARCH_OFFLOAD_THRESHOLD`
 Wav-entry threshold used by browser search to switch from synchronous layout
