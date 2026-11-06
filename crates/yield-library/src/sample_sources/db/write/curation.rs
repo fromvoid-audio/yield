@@ -203,7 +203,9 @@ impl SourceDatabase {
 
         crate::sqlite_wal::enforce_wal_admission(batch.curation_transaction())?;
 
-        apply_curation_updates(&mut batch, updates)?;
+        let next_revision_sql =
+            i64::try_from(next_source_revision).map_err(|_| SourceDbError::Unexpected)?;
+        apply_curation_updates(&mut batch, updates, next_revision_sql)?;
 
         SourceDatabase::bump_revision(batch.curation_transaction())?;
         let committed_source_revision = source_revision(batch.curation_transaction())?;
@@ -211,8 +213,6 @@ impl SourceDatabase {
             return Err(SourceDbError::Unexpected);
         }
 
-        let next_revision_sql =
-            i64::try_from(next_source_revision).map_err(|_| SourceDbError::Unexpected)?;
         let expected_revision_sql =
             i64::try_from(expected_source_revision).map_err(|_| SourceDbError::Unexpected)?;
         let changed = batch
@@ -451,6 +451,7 @@ pub(super) fn validate_curation_preconditions(
 pub(super) fn apply_curation_updates(
     batch: &mut super::super::SourceWriteBatch<'_>,
     updates: &[SourceCurationUpdate],
+    next_source_revision: i64,
 ) -> Result<(), SourceDbError> {
     for update in updates {
         match update {
@@ -491,6 +492,11 @@ pub(super) fn apply_curation_updates(
                     });
                 }
                 batch.set_locked(path.as_path(), true)?;
+                record_keep_promotion_candidate(
+                    batch.curation_transaction(),
+                    &normalized,
+                    next_source_revision,
+                )?;
             }
             SourceCurationUpdate::AddCollection { path, collection } => {
                 batch.add_collection(path.as_path(), *collection)?;
@@ -512,6 +518,42 @@ pub(super) fn apply_curation_updates(
             }
         }
     }
+    Ok(())
+}
+
+/// Freeze the accepted observation. Ordinary scans can update the live manifest while the
+/// candidate retains its original evidence. An explicit keep of a changed observation can
+/// supersede it, while reaccepting the same observation preserves the pending revision.
+fn record_keep_promotion_candidate(
+    transaction: &Transaction<'_>,
+    normalized_path: &str,
+    accepted_source_revision: i64,
+) -> Result<(), SourceDbError> {
+    transaction
+        .execute(
+            "INSERT INTO source_keep_promotion_candidates (
+                path, file_identity, content_hash, file_size, modified_ns, accepted_source_revision
+             )
+             SELECT path,
+                CASE WHEN typeof(file_identity) = 'text'
+                    AND length(CAST(file_identity AS BLOB)) BETWEEN 1 AND 1024 THEN file_identity END,
+                CASE WHEN typeof(content_hash) = 'text'
+                    AND length(CAST(content_hash AS BLOB)) = 64 THEN content_hash END,
+                file_size, modified_ns, ?2
+             FROM wav_files WHERE path = ?1
+             ON CONFLICT(path) DO UPDATE SET
+                file_identity = excluded.file_identity,
+                content_hash = excluded.content_hash,
+                file_size = excluded.file_size,
+                modified_ns = excluded.modified_ns,
+                accepted_source_revision = excluded.accepted_source_revision
+             WHERE source_keep_promotion_candidates.file_identity IS NOT excluded.file_identity
+                OR source_keep_promotion_candidates.content_hash IS NOT excluded.content_hash
+                OR source_keep_promotion_candidates.file_size != excluded.file_size
+                OR source_keep_promotion_candidates.modified_ns != excluded.modified_ns",
+            rusqlite::params![normalized_path, accepted_source_revision],
+        )
+        .map_err(map_sql_error)?;
     Ok(())
 }
 

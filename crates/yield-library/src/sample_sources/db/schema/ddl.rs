@@ -309,6 +309,15 @@ const BASE_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS metadata (
         milli_bpm INTEGER NOT NULL CHECK(typeof(milli_bpm) = 'integer' AND milli_bpm BETWEEN 1000 AND 1000000),
         FOREIGN KEY(path) REFERENCES wav_files(path) ON UPDATE CASCADE ON DELETE CASCADE
     ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS source_keep_promotion_candidates (
+        path TEXT PRIMARY KEY,
+        file_identity TEXT CHECK(length(CAST(file_identity AS BLOB)) BETWEEN 1 AND 1024),
+        content_hash TEXT CHECK(length(CAST(content_hash AS BLOB)) = 64),
+        file_size INTEGER NOT NULL,
+        modified_ns INTEGER NOT NULL,
+        accepted_source_revision INTEGER NOT NULL CHECK(accepted_source_revision > 0),
+        FOREIGN KEY(path) REFERENCES wav_files(path) ON DELETE CASCADE
+    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS analysis_cache_embeddings (
         content_hash TEXT NOT NULL,
         analysis_version TEXT NOT NULL,
