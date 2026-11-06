@@ -5,11 +5,12 @@ use yield_library::sample_sources::SourcePlaymarkGridTempo;
 
 use crate::search_input::{MAX_PLAYMARK_GRID_TEMPO_INPUT_BYTES, SearchInput, SearchInputOptions};
 
-use super::{Browser, playmark_tempo};
+use super::{Browser, bpm_snap_persistence, playmark_tempo};
 
 pub(super) struct BpmSnapEntry {
     pub(super) input: Entity<SearchInput>,
-    tempo: Option<SourcePlaymarkGridTempo>,
+    pub(super) tempo: Option<SourcePlaymarkGridTempo>,
+    pub(super) persistence: bpm_snap_persistence::GridTempoPersistence,
     displayed_generation: Option<u64>,
     blur: Option<Subscription>,
 }
@@ -21,6 +22,7 @@ impl BpmSnapEntry {
                 SearchInput::new_with_options(cx, SearchInputOptions::playmark_grid_tempo())
             }),
             tempo: None,
+            persistence: bpm_snap_persistence::GridTempoPersistence::default(),
             displayed_generation: None,
             blur: None,
         }
@@ -28,6 +30,7 @@ impl BpmSnapEntry {
 
     pub(super) fn invalidate(&mut self) {
         self.tempo = None;
+        self.persistence.invalidate();
         self.displayed_generation = None;
     }
 }
@@ -92,10 +95,8 @@ pub(super) fn handle_key_down(
                 && browser.bpm_snap_entry.displayed_generation == Some(browser.waveform_generation)
             {
                 if let Some(tempo) = SourcePlaymarkGridTempo::parse(input.content()) {
-                    browser.bpm_snap_entry.tempo = Some(tempo);
+                    bpm_snap_persistence::commit_tempo(browser, tempo, cx);
                     reset_draft(browser, cx);
-                    browser
-                        .set_playback_status(format!("BPM Snap tempo set to {} BPM", tempo.bpm()));
                     window.focus(&browser.waveform_focus_handle);
                 } else {
                     browser.set_playback_status("Enter 1–1000 BPM with up to three decimal places");

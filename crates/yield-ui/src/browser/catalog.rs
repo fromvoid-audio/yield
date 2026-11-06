@@ -628,6 +628,7 @@ impl Browser {
         }
         let mut changed = self.retry_catalog_metadata(cx);
         changed |= super::playmark_tempo::load_for_waveform(self, cx);
+        changed |= super::bpm_snap_persistence::load_for_waveform(self, cx);
         changed |= super::rating_decay::retry(self, cx);
         changed |= super::unsupported_entries::retry(self, cx);
         changed
@@ -703,6 +704,14 @@ impl Browser {
     ) -> bool {
         if super::playmark_tempo::apply_catalog_event(self, &event, publication_fence.as_ref(), cx)
         {
+            return true;
+        }
+        if super::bpm_snap_persistence::apply_catalog_event(
+            self,
+            &event,
+            publication_fence.as_ref(),
+            cx,
+        ) {
             return true;
         }
         if super::transient_markers::apply_catalog_event(
