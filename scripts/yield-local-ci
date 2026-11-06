@@ -693,6 +693,7 @@ def _check(args: argparse.Namespace) -> None:
                 "profile-generations",
                 "source-release-policy",
                 "source-registration-generation",
+                "registered-retirement-inventory",
                 "startup-production",
                 "startup-control-failure",
                 "startup-namespace-failure",
