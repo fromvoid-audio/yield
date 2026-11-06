@@ -102,7 +102,7 @@ into separate tasks. If those primitives are unavailable, the macOS release
 scope requires an explicit contract/product decision; this proof does not
 silently weaken invariants 19–22.
 
-## Managed destination option
+## Approved scope for the first managed extraction route
 
 The [follow-up review](https://pulse.iocore.dev/#/issues/6022) found no
 supported descriptor operation that both atomically publishes a complete
@@ -114,16 +114,32 @@ visibility gap. [Apple's open manual](https://github.com/apple-oss-distributions
 and [XNU guard definitions](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/guarded.h)
 describe those interfaces.
 
-A narrower product scope could publish on a qualified local APFS volume into
-a dedicated managed output source. A separately authorized service under a
-different identity would have exclusive namespace write authority over both
-the staging and final directories. Yield and other processes of the interactive
-user could read published media. Both directories and their protected ancestors
-would need live no-follow verification. A private single writer would have to
-exclude competing name mutations throughout each effect. A same-user process,
-an ordinary 0700 directory, or a helper that accepts arbitrary client paths
-would leave the substitution problem intact. Apple provides an approval path
-for a bundled helper through [Service Management](https://developer.apple.com/documentation/servicemanagement/smappservice).
+The [approved scope](https://pulse.iocore.dev/#/issues/6023) is one dedicated
+managed output source on a qualified local APFS volume. A separately
+authorized, unprivileged service identity would own the staging and final
+namespaces. Yield and DAWs running as the interactive user could read finished
+media. The interactive identity has no staging access or permission to edit
+or remove managed outputs. Existing arbitrary destinations and in-place edits
+require their own qualification.
+
+The service would bind a configured output root and traverse the protected
+ancestors without following links. All path components would need ownership,
+permission, ACL and volume checks. The service needs one writer per root
+across restarts and must retain directory descriptors through each effect.
+The threat includes an ordinary process of the interactive user, including
+one that tries to replace a directory by changing its parent. Root, an
+administrator who has elevated privileges, and compromise of the authorized
+writer fall outside this boundary.
+
+The client would send bounded requests with a destination leaf and a
+read-only payload descriptor. The service must validate one leaf, reject
+caller-supplied destination paths, copy into its private stage under its own
+allocation budget, and validate the exact result before publication. A
+mutating call needs both the expected signed app identity and its configured
+local account. Apple provides an approval path for a bundled helper and an
+XPC peer signing requirement. [Service Management](https://developer.apple.com/documentation/servicemanagement/smappservice)
+and [XPC peer signing requirements](https://developer.apple.com/documentation/foundation/nsxpcconnection/setcodesigningrequirement%28_%3A%29)
+describe those APIs.
 
 With that boundary established, a candidate can keep the validated staged
 descriptor through the same-volume exclusive rename and compare the reopened
@@ -136,7 +152,36 @@ absence within the protected namespace. A collision, unknown outcome, stale
 root or unproved absence retains the applicable files, charge and journal
 evidence. This candidate has no native helper or qualification evidence yet.
 
-The release decision is whether to allow that restricted managed destination
-and its separate service, or keep macOS extraction unavailable while retaining
-arbitrary destinations as a requirement. The existing macOS writer remains
-unsupported under the current scope.
+The design proof begins with a disposable APFS fixture and two actual local
+identities. The reader must be able to open the finished media while the
+filesystem denies changes to both leaf names and the protected directories.
+The writer must show exact identity through exclusive publication, collision
+preservation and separately checked cleanup. The profile-owned metadata
+writer can register the committed destination after the filesystem
+checkpoint. [Yield #6031](https://pulse.iocore.dev/#/issues/6031)
+
+This approval covers the design and isolated proof. Service installation,
+production enablement and use against a real library require separate evidence
+and authorization.
+
+### Run the two-identity fixture
+
+On a local APFS Mac, run from the repository as an ordinary account with
+permission to launch a command as the built-in unprivileged `nobody` account.
+The probe creates a disposable directory under `/private/tmp` and invokes the
+peer with noninteractive sudo. If needed, authenticate in the same terminal
+before running it.
+
+```sh
+sudo -v
+/usr/bin/python3 -I scripts/qa/macos_managed_output_probe.py
+```
+
+The writer line confirms exact staged/final identity, no-replace collision,
+owned staging cleanup and readable WAV data. A separate peer line must confirm
+that the WAV was readable and filesystem mutations were refused. Add
+`--writer-only` to exercise the writer in a shell without peer access.
+Only the two-identity run can establish peer refusal. The probe uses ordinary
+file sync and a temporary sticky parent. The installed service, its production
+ancestor permissions, crash recovery and directory durability require
+separate qualification. [Yield #6031](https://pulse.iocore.dev/#/issues/6031)
