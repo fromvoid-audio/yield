@@ -96,3 +96,20 @@ recorded single preparation was 0.921 ms. The worst of ten optimized runs per
 ratio for the isolated stereo dot-product workload was 7.193 ms per second
 of output. The production streaming adapter must verify these targets with
 its actual history, routing, and callback integration.
+
+## Kernel qualification
+
+The standalone probe uses the same kernel source intended for Reson. It runs
+the common-rate matrix and an interpolated 48,001 → 44,100 Hz pair. The kernel
+caps future support at 512 frames, uses up to 320 exact phase intervals or
+128 interpolated intervals, and stores one additional row for the phase-wrap
+endpoint. The render call only reads the prepared coefficients and source
+window.
+
+```sh
+scratch=$(mktemp -d)
+rustc +1.93.0 --edition=2024 -C opt-level=3 -C target-cpu=native --test scripts/qa/reson_bandlimited_probe.rs -o "$scratch/test"
+"$scratch/test" --test-threads=1
+rustc +1.93.0 --edition=2024 -C opt-level=3 -C target-cpu=native scripts/qa/reson_bandlimited_probe.rs -o "$scratch/probe"
+"$scratch/probe"
+```
