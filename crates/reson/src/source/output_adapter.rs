@@ -2,6 +2,10 @@
 
 use super::Source;
 use super::streaming_resampler::StreamingResampler;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 /// Identifies an interleaved stereo output pair by its zero-based pair index.
@@ -225,11 +229,22 @@ where
 /// Route a filtered stereo program to the requested device channels.
 pub(crate) struct BandLimitedOutputAdapter<S> {
     stream: StreamingResampler<ProgramFrames<S>>,
+    position: RenderedSourcePosition,
     target_rate: u32,
     target_channels: usize,
     output_pair: StereoOutputPair,
     pending: [f32; 2],
     pending_index: usize,
+}
+
+/// Complete device frames rendered by one resampled source, in source frames.
+#[derive(Clone, Default)]
+pub(crate) struct RenderedSourcePosition(Arc<AtomicU64>);
+
+impl RenderedSourcePosition {
+    pub(crate) fn source_frame(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 impl<S: Source> BandLimitedOutputAdapter<S> {
@@ -249,12 +264,17 @@ impl<S: Source> BandLimitedOutputAdapter<S> {
         };
         Some(Self {
             stream: StreamingResampler::new(frames, source_rate, target_rate)?,
+            position: RenderedSourcePosition::default(),
             target_rate,
             target_channels,
             output_pair: output_pair.for_output_channels(target_channels),
             pending: [0.0; 2],
             pending_index: target_channels,
         })
+    }
+
+    pub(crate) fn rendered_position(&self) -> RenderedSourcePosition {
+        self.position.clone()
     }
 }
 
@@ -268,6 +288,11 @@ impl<S: Source> Iterator for BandLimitedOutputAdapter<S> {
         }
         let channel = self.pending_index;
         self.pending_index += 1;
+        if self.pending_index == self.target_channels {
+            self.position
+                .0
+                .store(self.stream.next_source_position().0, Ordering::Relaxed);
+        }
         Some(
             channel
                 .checked_sub(self.output_pair.first_channel())
@@ -354,6 +379,7 @@ fn interpolate_channel(
 
 #[cfg(test)]
 mod tests {
+    use super::BandLimitedOutputAdapter;
     use super::OutputAdapter;
     use super::StereoOutputPair;
     use crate::Source;
@@ -534,5 +560,37 @@ mod tests {
 
         assert!(emitted > frames * 2);
         assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn band_limited_position_uses_complete_device_frames_and_is_source_owned() {
+        let source = || FrameSource::new(2, 44_100, vec![0.5; 882]);
+        let mut current =
+            BandLimitedOutputAdapter::new(source(), 48_000, 4, StereoOutputPair::default())
+                .unwrap();
+        let position = current.rendered_position();
+        let replacement =
+            BandLimitedOutputAdapter::new(source(), 48_000, 4, StereoOutputPair::default())
+                .unwrap();
+        let replacement_position = replacement.rendered_position();
+
+        let counts = crate::test_support::count_thread_allocations_and_deallocations(|| {
+            assert_eq!(position.source_frame(), 0);
+            assert!(current.next().is_some());
+            assert_eq!(current.stream.input().source.index, 162);
+            assert_eq!(position.source_frame(), 0);
+            for channel in 1..8 {
+                assert!(current.next().is_some());
+                assert_eq!(position.source_frame(), u64::from(channel == 7));
+            }
+            for _ in 2..160 {
+                for _ in 0..4 {
+                    assert!(current.next().is_some());
+                }
+            }
+            assert_eq!(position.source_frame(), 147);
+            assert_eq!(replacement_position.source_frame(), 0);
+        });
+        assert_eq!(counts, (0, 0));
     }
 }

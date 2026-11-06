@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::async_decode::AsyncDecodeDiagnostics;
-use crate::source::{BandLimitedOutputAdapter, StereoOutputPair};
+use crate::source::{BandLimitedOutputAdapter, RenderedSourcePosition, StereoOutputPair};
 use crate::telemetry;
 use crate::{OutputAdapter, Source};
 use tracing::warn;
@@ -21,6 +21,8 @@ pub(super) enum PlaybackRateConversion {
     BandLimited,
 }
 
+type RoutedSource = (Box<dyn Source + Send>, Option<RenderedSourcePosition>);
+
 impl PlaybackRateConversion {
     fn adapt<S: Source + 'static>(
         self,
@@ -28,7 +30,7 @@ impl PlaybackRateConversion {
         target_rate: u32,
         target_channels: u16,
         output_pair: StereoOutputPair,
-    ) -> Result<Box<dyn Source + Send>, String> {
+    ) -> Result<RoutedSource, String> {
         let source_rate = source.sample_rate().max(1);
         if matches!(self, Self::BandLimited) && source_rate != target_rate {
             let adapter = BandLimitedOutputAdapter::new(
@@ -42,14 +44,18 @@ impl PlaybackRateConversion {
                     "Unsupported audition rate conversion from {source_rate} Hz to {target_rate} Hz"
                 )
             })?;
-            Ok(Box::new(adapter))
+            let position = adapter.rendered_position();
+            Ok((Box::new(adapter), Some(position)))
         } else {
-            Ok(Box::new(OutputAdapter::with_output_pair(
-                source,
-                target_rate,
-                target_channels,
-                output_pair,
-            )))
+            Ok((
+                Box::new(OutputAdapter::with_output_pair(
+                    source,
+                    target_rate,
+                    target_channels,
+                    output_pair,
+                )),
+                None,
+            ))
         }
     }
 }
@@ -71,13 +77,15 @@ mod rate_conversion_tests {
             SamplesBuffer::new(2, 96_000, samples)
         };
         let pair = StereoOutputPair::new(1);
-        let mut prepared = PlaybackRateConversion::BandLimited
+        let (mut prepared, prepared_position) = PlaybackRateConversion::BandLimited
             .adapt(input(), 48_000, 4, pair)
             .unwrap();
-        let mut regular = PlaybackRateConversion::Linear
+        let (mut regular, regular_position) = PlaybackRateConversion::Linear
             .adapt(input(), 48_000, 4, pair)
             .unwrap();
         assert_eq!((prepared.sample_rate(), prepared.channels()), (48_000, 4));
+        assert!(prepared_position.is_some());
+        assert!(regular_position.is_none());
 
         let counts = crate::test_support::count_thread_allocations_and_deallocations(|| {
             for frame in 0..512 {
@@ -102,9 +110,10 @@ mod rate_conversion_tests {
     #[test]
     fn prepared_rate_route_bypasses_matching_rates_and_folds_multichannel_to_mono() {
         let samples = SamplesBuffer::new(2, 48_000, vec![-0.0, f32::MAX]);
-        let mut exact = PlaybackRateConversion::BandLimited
+        let (mut exact, position) = PlaybackRateConversion::BandLimited
             .adapt(samples, 48_000, 4, StereoOutputPair::new(1))
             .unwrap();
+        assert!(position.is_none());
         for expected in [0.0_f32, 0.0, -0.0, f32::MAX] {
             assert_eq!(exact.next().map(f32::to_bits), Some(expected.to_bits()));
         }
@@ -114,6 +123,7 @@ mod rate_conversion_tests {
         let mono = PlaybackRateConversion::BandLimited
             .adapt(samples, 96_000, 1, StereoOutputPair::default())
             .unwrap()
+            .0
             .collect::<Vec<_>>();
         assert_eq!(mono.len(), 3);
         assert!(mono.into_iter().all(|value| (value - 0.5).abs() < 1e-6));
@@ -138,6 +148,7 @@ impl AudioPlayer {
         self.active_playback_span = None;
         self.active_loop_mode = None;
         self.active_metronome = None;
+        self.rendered_source_position = None;
         self.loop_offset = None;
         self.loop_offset_frames = None;
         #[cfg(test)]
@@ -163,8 +174,8 @@ impl AudioPlayer {
         let adapted = input_sample_rate != target_sample_rate
             || input_channels != target_channels
             || !output_pair.can_bypass(input_channels.max(1) as usize, target_channels as usize);
-        let source: Box<dyn Source + Send> = if !adapted {
-            Box::new(source)
+        let (source, rendered_source_position): RoutedSource = if !adapted {
+            (Box::new(source), None)
         } else {
             rate_conversion.adapt(source, target_sample_rate, target_channels, output_pair)?
         };
@@ -190,6 +201,7 @@ impl AudioPlayer {
         if let Some(diagnostics) = diagnostics {
             diagnostics.mark_admitted();
         }
+        self.rendered_source_position = rendered_source_position;
         if let Some(append_started_at) = append_started_at {
             tracing::info!(
                 target: "perf::audio_start",

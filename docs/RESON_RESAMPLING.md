@@ -111,8 +111,10 @@ upper bound on source reads.
 
 The app uses this converter when prepared-tempo audition needs a different
 device rate. That path starts a new source for each prepared span and already
-requires a new audition for live edits. Ordinary audition continues to use
-its existing rate converter while live transport integration is qualified.
+requires a new audition for live edits. Prepared-tempo progress follows
+complete frames delivered to the device mixer and ignores the filter's
+read-ahead. Ordinary audition continues to use its existing rate converter
+while live transport integration is qualified.
 
 ```sh
 scratch=$(mktemp -d)
