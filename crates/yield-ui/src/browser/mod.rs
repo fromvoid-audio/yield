@@ -109,6 +109,7 @@ mod handoff;
 mod harvest_filter;
 mod history;
 mod job_details;
+mod link_settings;
 mod metadata_panel;
 mod metronome;
 mod metronome_settings;
@@ -543,6 +544,7 @@ pub(crate) struct Browser {
     theme_settings_open: bool,
     general_settings: general_settings::GeneralSettings,
     metronome_settings: metronome_settings::State,
+    link_settings: link_settings::State,
     audio_settings_open: bool,
     shortcut_help: shortcut_help::ShortcutHelpState,
     unsupported_entries: unsupported_entries::UnsupportedEntriesState,
@@ -929,6 +931,7 @@ impl Browser {
             theme_settings_open: false,
             general_settings: general_settings::GeneralSettings::default(),
             metronome_settings: metronome_settings::State::new(cx),
+            link_settings: link_settings::State::new(cx),
             audio_settings_open: false,
             shortcut_help: shortcut_help::ShortcutHelpState::new(cx),
             unsupported_entries: unsupported_entries::UnsupportedEntriesState::new(cx),
@@ -3048,7 +3051,7 @@ impl Browser {
         if !secondary
             && !alt
             && !function
-            && self.handle_settings_accessibility_key(key, shift, window, cx)
+            && self.handle_settings_accessibility_key(key, shift, event.is_held, window, cx)
         {
             cx.stop_propagation();
             return;

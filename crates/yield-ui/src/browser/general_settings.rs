@@ -1698,6 +1698,7 @@ impl Browser {
                     ),
             )
             .child(super::metronome_settings::render(self, &theme, cx))
+            .child(super::link_settings::render(self, &theme, cx))
             .child(
                 div()
                     .flex()
