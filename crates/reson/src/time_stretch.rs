@@ -62,6 +62,19 @@ impl fmt::Display for StretchPreparationError {
 
 impl std::error::Error for StretchPreparationError {}
 
+pub(super) fn preparation_checkpoint(
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<(), StretchPreparationError> {
+    if cancel.load(Ordering::Acquire) {
+        Err(StretchPreparationError::Canceled)
+    } else if Instant::now() >= deadline {
+        Err(StretchPreparationError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
+}
+
 /// WSOLA time-stretcher for interleaved audition PCM.
 pub struct Wsola {
     sample_rate: u32,
@@ -124,15 +137,7 @@ impl Wsola {
         cancel: &AtomicBool,
         deadline: Instant,
     ) -> Result<PreparedTempoStretch, StretchPreparationError> {
-        let checkpoint = || {
-            if cancel.load(Ordering::Acquire) {
-                Err(StretchPreparationError::Canceled)
-            } else if Instant::now() >= deadline {
-                Err(StretchPreparationError::DeadlineExceeded)
-            } else {
-                Ok(())
-            }
-        };
+        let checkpoint = || preparation_checkpoint(cancel, deadline);
         checkpoint()?;
         if channels == 0
             || self.sample_rate == 0

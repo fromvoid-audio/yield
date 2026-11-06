@@ -35,6 +35,8 @@ mod routing;
 mod source;
 #[cfg(feature = "native-audio")]
 mod telemetry;
+#[cfg(feature = "native-audio")]
+mod tempo_audition;
 #[cfg(test)]
 mod test_support;
 #[cfg(feature = "native-audio")]
@@ -73,6 +75,11 @@ pub use player::{
 #[cfg(feature = "native-audio")]
 pub use recording::{AudioRecorder, InputMonitor, RecordingOutcome};
 pub use recording::{RecordingHealth, RecordingLimits, RecordingPrefixState, RecordingSink};
+#[cfg(feature = "native-audio")]
+pub use tempo_audition::{
+    PreparedTempoAudition, TempoAuditionFrameMap, TempoAuditionSkip, TempoAuditionTarget,
+    prepare_tempo_audition,
+};
 #[cfg(feature = "native-audio")]
 pub use time_stretch::{
     MAX_TEMPO_INPUT_SAMPLES, MAX_TEMPO_SPAN_SECONDS, PreparedTempoStretch, StretchPreparationError,
