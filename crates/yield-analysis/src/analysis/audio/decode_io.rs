@@ -297,66 +297,17 @@ pub(crate) fn decode_feature_wav_bytes(
     bytes: &[u8],
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<AnalysisAudio, String> {
-    use std::sync::atomic::Ordering;
-    if bytes.len() > 8 * 1024 * 1024 {
-        return Err("WAV input byte limit".into());
-    }
-    let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))
-        .map_err(|_| "Invalid WAV input".to_owned())?;
-    let spec = reader.spec();
-    if spec.channels == 0
-        || spec.channels > 8
-        || spec.sample_rate == 0
-        || spec.sample_rate > 192_000
-        || spec.bits_per_sample == 0
-        || spec.bits_per_sample > 32
-    {
-        return Err("Unsupported WAV parameters".into());
-    }
-    let window_samples = (spec.sample_rate as usize)
-        .checked_mul(spec.channels as usize)
-        .and_then(|n| n.checked_mul(8))
-        .ok_or("WAV sample limit")?;
-    let limit = window_samples.min(reader.len() as usize);
-    if limit > 2_000_000 || limit == 0 {
-        return Err("WAV sample limit".into());
-    }
-    let mut samples = Vec::with_capacity(limit);
-    match spec.sample_format {
-        hound::SampleFormat::Float => {
-            if spec.bits_per_sample != 32 {
-                return Err("Unsupported WAV float format".into());
-            }
-            for sample in reader.samples::<f32>().take(limit) {
-                if cancel.load(Ordering::Acquire) {
-                    return Err("Cancelled".into());
-                }
-                samples.push(sample.map_err(|_| "Invalid WAV sample")?);
-            }
-        }
-        hound::SampleFormat::Int => {
-            let scale = 2.0f32.powi(i32::from(spec.bits_per_sample) - 1);
-            for sample in reader.samples::<i32>().take(limit) {
-                if cancel.load(Ordering::Acquire) {
-                    return Err("Cancelled".into());
-                }
-                samples.push(sample.map_err(|_| "Invalid WAV sample")? as f32 / scale);
-            }
-        }
-    }
-    if samples.is_empty() || samples.len() % usize::from(spec.channels) != 0 {
-        return Err("Incomplete WAV frame".into());
-    }
+    let pcm = super::wav_pcm::decode_pcm(bytes, Some(8), cancel)?;
     let mut mono = Vec::new();
-    downmix_to_mono_into(&mut mono, &samples, spec.channels);
+    downmix_to_mono_into(&mut mono, pcm.samples(), pcm.channels());
     let mut resampled = Vec::new();
     resample_linear_into(
         &mut resampled,
         &mono,
-        spec.sample_rate,
+        pcm.sample_rate(),
         ANALYSIS_SAMPLE_RATE,
     );
-    if cancel.load(Ordering::Acquire) {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
         return Err("Cancelled".into());
     }
     Ok(prepare_mono_for_analysis_from_slice(
