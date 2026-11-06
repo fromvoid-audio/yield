@@ -16,7 +16,8 @@ use std::{
 #[cfg(test)]
 use std::sync::mpsc;
 
-use super::{AudioPlayer, EditFadeRange, PlaybackMetronomeConfig};
+use super::metronome::MetronomeMixOverride;
+use super::{AudioPlayer, EditFadeRange, PlaybackMetronomeConfig, PlaybackMetronomeMix};
 use crate::output::ResolvedOutput;
 
 #[cfg(all(test, target_os = "macos", feature = "native-audio"))]
@@ -382,6 +383,7 @@ pub enum PlaybackRuntimeSubmitError {
 pub struct PlaybackRuntimeHandle {
     commands: Arc<PlaybackRuntimeCommandQueue>,
     next_id: Arc<AtomicU64>,
+    metronome_mix: MetronomeMixOverride,
 }
 
 impl Clone for PlaybackRuntimeHandle {
@@ -390,6 +392,7 @@ impl Clone for PlaybackRuntimeHandle {
         Self {
             commands: Arc::clone(&self.commands),
             next_id: Arc::clone(&self.next_id),
+            metronome_mix: self.metronome_mix.clone(),
         }
     }
 }
@@ -437,6 +440,14 @@ impl PlaybackRuntimeHandle {
     /// Submit a volume update for current and future playback without waiting for the runtime thread.
     pub fn try_set_volume(&self, volume: f32) -> Result<(), PlaybackRuntimeSubmitError> {
         self.submit(PlaybackRuntimeCommand::SetVolume { volume })
+    }
+
+    /// Set the click mix for current and future playback without queuing or seeking.
+    ///
+    /// The audio source reads the latest mix at frame boundaries. The update leaves each
+    /// request's enabled state and beat grid intact.
+    pub fn set_metronome_mix(&self, mix: PlaybackMetronomeMix) {
+        self.metronome_mix.set(mix);
     }
 
     /// Submit a playback-gain update for current and future playback without waiting for the runtime thread.
@@ -600,12 +611,14 @@ impl PlaybackRuntime {
         player: AudioPlayer,
         config: PlaybackRuntimeConfig,
     ) -> Result<Self, std::io::Error> {
-        spawn_executor(
+        let metronome_mix = player.metronome_mix_override.clone();
+        spawn_executor_with_mix(
             AudioPlayerPlaybackExecutor {
                 player,
                 configured_metronome_beat_count: None,
             },
             config,
+            metronome_mix,
         )
     }
 }
@@ -1328,9 +1341,18 @@ fn apply_dispatch_time_progress(
     }
 }
 
+#[cfg(test)]
 fn spawn_executor(
     executor: impl PlaybackRuntimeExecutor,
     config: PlaybackRuntimeConfig,
+) -> Result<PlaybackRuntime, std::io::Error> {
+    spawn_executor_with_mix(executor, config, MetronomeMixOverride::default())
+}
+
+fn spawn_executor_with_mix(
+    executor: impl PlaybackRuntimeExecutor,
+    config: PlaybackRuntimeConfig,
+    metronome_mix: MetronomeMixOverride,
 ) -> Result<PlaybackRuntime, std::io::Error> {
     let queue_capacity = config.queue_capacity.max(1);
     let command_queue = Arc::new(PlaybackRuntimeCommandQueue::new(queue_capacity));
@@ -1338,6 +1360,7 @@ fn spawn_executor(
     let handle = PlaybackRuntimeHandle {
         commands: Arc::clone(&command_queue),
         next_id: Arc::new(AtomicU64::new(1)),
+        metronome_mix,
     };
     let runtime_event_queue = Arc::clone(&event_queue);
     thread::Builder::new()
@@ -3666,12 +3689,68 @@ mod tests {
         let handle = PlaybackRuntimeHandle {
             commands,
             next_id: Arc::new(AtomicU64::new(1)),
+            metronome_mix: MetronomeMixOverride::default(),
         };
 
         assert_eq!(
             handle.try_play(test_request(0.0)),
             Err(PlaybackRuntimeSubmitError::Closed)
         );
+    }
+
+    #[test]
+    fn metronome_mix_update_is_queue_independent_and_stereo_frame_coherent() {
+        use crate::player::metronome::MetronomeSource;
+        use crate::{MetronomeSound, SamplesBuffer};
+
+        let handle = PlaybackRuntimeHandle {
+            commands: Arc::new(PlaybackRuntimeCommandQueue::new(1)),
+            next_id: Arc::new(AtomicU64::new(1)),
+            metronome_mix: MetronomeMixOverride::default(),
+        };
+        handle.try_set_volume(0.5).expect("fill the command queue");
+        let config = PlaybackMetronomeConfig::new(1).with_mix(PlaybackMetronomeMix::new(
+            50,
+            true,
+            false,
+            MetronomeSound::Classic,
+        ));
+        let source = || {
+            MetronomeSource::new(
+                SamplesBuffer::from_arc(2, 48_000, Arc::from([0.0; 4])),
+                config,
+                48_000,
+                0,
+                0,
+            )
+            .with_mix_override(handle.metronome_mix.clone())
+        };
+
+        let mut active = source();
+        assert_eq!(active.next(), Some(0.11)); // Unset override preserves the request mix.
+        handle.clone().set_metronome_mix(PlaybackMetronomeMix::new(
+            0,
+            true,
+            false,
+            MetronomeSound::Classic,
+        ));
+        assert_eq!(active.next(), Some(0.11)); // Second channel of the original frame.
+        assert_eq!(active.next(), Some(0.0));
+        assert_eq!(source().next(), Some(0.0));
+
+        handle.set_metronome_mix(PlaybackMetronomeMix::new(
+            25,
+            true,
+            false,
+            MetronomeSound::Classic,
+        ));
+        assert_eq!(source().next(), Some(0.055));
+        let state = handle.commands.state.lock().expect("command queue");
+        assert!(matches!(
+            state.commands.front(),
+            Some(PlaybackRuntimeCommand::SetVolume { volume: 0.5 })
+        ));
+        assert_eq!(state.commands.len(), 1);
     }
 
     #[test]

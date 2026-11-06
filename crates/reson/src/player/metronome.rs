@@ -1,4 +1,11 @@
-use std::{f32::consts::TAU, time::Duration};
+use std::{
+    f32::consts::TAU,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
+    time::Duration,
+};
 
 use crate::Source;
 
@@ -73,6 +80,30 @@ impl PlaybackMetronomeMix {
             bits & (1 << 9) != 0,
             sound,
         )
+    }
+}
+
+/// One optional mix for current and future sources owned by a playback runtime.
+#[derive(Clone, Debug)]
+pub(super) struct MetronomeMixOverride(Arc<AtomicU16>);
+
+impl Default for MetronomeMixOverride {
+    fn default() -> Self {
+        Self(Arc::new(AtomicU16::new(Self::UNSET)))
+    }
+}
+
+impl MetronomeMixOverride {
+    const UNSET: u16 = u16::MAX;
+
+    pub(super) fn set(&self, mix: PlaybackMetronomeMix) {
+        // The entire update fits in one word and is independent of grid or source lifetime.
+        self.0.store(mix.encode(), Ordering::Relaxed);
+    }
+
+    fn get(&self) -> Option<PlaybackMetronomeMix> {
+        let bits = self.0.load(Ordering::Relaxed);
+        (bits != Self::UNSET).then(|| PlaybackMetronomeMix::decode(bits))
     }
 }
 
@@ -203,6 +234,7 @@ pub(super) struct MetronomeSource<S> {
     sample_rate: u32,
     live_control: Option<PlaybackSpanHandle>,
     live_revision: u64,
+    mix_override: Option<MetronomeMixOverride>,
 }
 
 impl<S> MetronomeSource<S>
@@ -232,6 +264,7 @@ where
             sample_rate,
             live_control: None,
             live_revision: 0,
+            mix_override: None,
         }
     }
 
@@ -251,7 +284,13 @@ where
             sample_rate,
             live_control: Some(live_control),
             live_revision: applied.revision(),
+            mix_override: None,
         }
+    }
+
+    pub(super) fn with_mix_override(mut self, mix_override: MetronomeMixOverride) -> Self {
+        self.mix_override = Some(mix_override);
+        self
     }
 
     fn refresh_live_control(&mut self) {
@@ -273,8 +312,15 @@ where
     }
 
     fn click_value(&self, frame_index: u64) -> f32 {
-        let mix = self.config.mix();
-        if !self.enabled || mix.volume_percent == 0 || !(mix.beats || mix.offbeats) {
+        if !self.enabled {
+            return 0.0;
+        }
+        let mix = self
+            .mix_override
+            .as_ref()
+            .and_then(MetronomeMixOverride::get)
+            .unwrap_or_else(|| self.config.mix());
+        if mix.volume_percent == 0 || !(mix.beats || mix.offbeats) {
             return 0.0;
         }
         let cycle = self.cycle_frames;
