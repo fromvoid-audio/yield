@@ -61,6 +61,21 @@ describe('Yield issue gateway', () => {
     expect(await response.text()).not.toContain('private-secret-never-show');
   });
 
+  it('does not route an authenticated issue to a misconfigured repository', async () => {
+    let calls = 0;
+    const { call, env, sessions } = fixture(async () => { calls += 1; throw new Error('unexpected'); });
+    env.GITHUB_OWNER = 'other-owner';
+    env.GITHUB_REPO = 'other-project';
+    sessions.values.set(`sess:${sessionId}`, 'github-private-token');
+    const response = await call('/issue', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${sessionId}` },
+      body: JSON.stringify({ title: 'Valid report', body: 'Details' }),
+    });
+    expect(response.status).toBe(503);
+    expect(calls).toBe(0);
+  });
+
   it('requires an unguessable request ID and emits no token in the auth page', async () => {
     let exchanges = 0;
     const { call, sessions } = fixture(async () => {
@@ -128,13 +143,13 @@ describe('Yield issue gateway', () => {
     expect((await call('/issue', {
       method: 'POST',
       headers: { authorization: `Bearer ${sessionId}` },
-      body: JSON.stringify({ title: 'Valid report' }),
+      body: JSON.stringify({ title: 'Valid report', body: 'Details' }),
     })).status).toBe(200);
     sessions.advance(7 * 24 * 60 * 60);
     expect((await call('/issue', {
       method: 'POST',
       headers: { authorization: `Bearer ${sessionId}` },
-      body: JSON.stringify({ title: 'Valid report' }),
+      body: JSON.stringify({ title: 'Valid report', body: 'Details' }),
     })).status).toBe(401);
   });
 
@@ -146,8 +161,24 @@ describe('Yield issue gateway', () => {
     sessions.values.set(`sess:${sessionId}`, 'github-private-token');
     const headers = { authorization: `Bearer ${sessionId}` };
     expect((await call('/issue', { method: 'POST', headers, body: '{' })).status).toBe(400);
-    expect((await call('/issue', { method: 'POST', headers, body: JSON.stringify({ title: 'x' }) })).status).toBe(400);
-    expect((await call('/issue', { method: 'POST', headers, body: JSON.stringify({ title: 'Valid', body: 'x'.repeat(70_000) }) })).status).toBe(400);
+    const invalid = [
+      { title: 'x', body: 'Details' },
+      { title: 'Valid', body: 'é'.repeat(30_001) },
+      { title: 'é'.repeat(101), body: 'Details' },
+      { title: 'Title\nsecond line', body: 'Details' },
+      { title: 'Valid', body: 'Details\u0000' },
+      { title: 'Valid', body: ' \r\n\t' },
+      { title: 'Valid' },
+      { title: 'Valid', body: 'Details', project: 'other/target' },
+      { title: 'Valid', body: '\\'.repeat(70_000) },
+    ];
+    for (const payload of invalid) {
+      const result = await call('/issue', { method: 'POST', headers, body: JSON.stringify(payload) });
+      expect(result.status).toBe(400);
+    }
+    const badUtf8 = new TextEncoder().encode('{"title":"Valid","body":"?"}');
+    badUtf8[badUtf8.indexOf(0x3f)] = 0xff;
+    expect((await call('/issue', { method: 'POST', headers, body: badUtf8.buffer })).status).toBe(400);
     expect(calls).toBe(0);
   });
 
@@ -158,6 +189,7 @@ describe('Yield issue gateway', () => {
       expect(String(input)).toBe('https://api.github.com/repos/PORTALSURFER/yield/issues');
       expect(init?.method).toBe('POST');
       expect(new Headers(init?.headers).get('authorization')).toBe('Bearer github-private-token');
+      expect(JSON.parse(String(init?.body))).toEqual({ title: 'Bug: sample', body: 'Details' });
       return Response.json({ number: 42, html_url: 'https://github.com/PORTALSURFER/yield/issues/42' });
     });
     sessions.values.set(`sess:${sessionId}`, 'github-private-token');
@@ -171,6 +203,22 @@ describe('Yield issue gateway', () => {
     expect(calls).toBe(1);
   });
 
+  it('allows a bounded native body whose JSON escaping expands the request', async () => {
+    const text = '"'.repeat(59_997);
+    const { call, sessions } = fixture(async (_, init) => {
+      expect(JSON.parse(String(init?.body))).toEqual({ title: 'Valid report', body: `${text}\nx` });
+      return Response.json({ number: 42, html_url: 'https://github.com/PORTALSURFER/yield/issues/42' });
+    });
+    sessions.values.set(`sess:${sessionId}`, 'github-private-token');
+    const body = JSON.stringify({ title: 'Valid report', body: `${text}\r\nx` });
+    expect(new TextEncoder().encode(body).byteLength).toBeGreaterThan(64 * 1024);
+    expect((await call('/issue', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${sessionId}` },
+      body,
+    })).status).toBe(200);
+  });
+
   it('does not retry an uncertain GitHub POST or expose token and server text', async () => {
     let calls = 0;
     const { call, sessions } = fixture(async () => {
@@ -181,7 +229,7 @@ describe('Yield issue gateway', () => {
     const response = await call('/issue', {
       method: 'POST',
       headers: { authorization: `Bearer ${sessionId}` },
-      body: JSON.stringify({ title: 'Bug: uncertain' }),
+      body: JSON.stringify({ title: 'Bug: uncertain', body: 'Details' }),
     });
     expect(response.status).toBe(502);
     const text = await response.text();
@@ -197,7 +245,7 @@ describe('Yield issue gateway', () => {
     const response = await call('/issue', {
       method: 'POST',
       headers: { authorization: `Bearer ${sessionId}` },
-      body: JSON.stringify({ title: 'Bug: rejected' }),
+      body: JSON.stringify({ title: 'Bug: rejected', body: 'Details' }),
     });
     expect(response.status).toBe(422);
     expect(await response.text()).not.toContain('github-private-token');

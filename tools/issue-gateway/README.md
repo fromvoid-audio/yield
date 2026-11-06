@@ -13,6 +13,12 @@ If the user denies GitHub authorization, the callback records a short-lived deni
 
 The Worker emits generic errors without OAuth codes, GitHub tokens, gateway session IDs, issue bodies, or upstream response bodies. The browser callback never shows a token. Request/response bodies are bounded.
 
+Issue creation accepts exactly the native title and body fields. The Worker
+requires both and applies UTF-8 limits of 200 bytes for the title and 60,000
+bytes for the body after line-ending normalization. The 128 KiB JSON cap
+allows for escaping. The approved destination is pinned to
+`PORTALSURFER/yield`. Other repository or OAuth scope settings fail closed.
+
 ## Deployment prerequisites
 
 - The approved feedback destination is the existing private `PORTALSURFER/yield` repository. GitHub's OAuth `repo` scope grants access to all private repositories the authorizing user can access, not just Yield. Review that broad grant in the GitHub consent screen before connecting; the Worker only creates issues in `PORTALSURFER/yield`.
