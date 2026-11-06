@@ -102,6 +102,7 @@ pub use history_selection::{
 mod playmark_tempo_dispatch;
 mod similarity_dispatch;
 mod similarity_query;
+mod source_content_digest;
 mod transient_dispatch;
 mod transient_job;
 pub use feature_job::{
@@ -122,6 +123,7 @@ pub use similarity_query::{
     SimilarityCandidateOutcome, SimilarityQueryError, SourceSimilarityQuery,
     SourceSimilarityResult, SourceSimilarityRow, query_source_similarity,
 };
+pub use source_content_digest::SourceContentDigestScope;
 pub use transient_dispatch::{SourceTransientRequest, TransientRequestFailure};
 pub use transient_job::{
     ComputedTransientJob, PreparedTransientJob, TransientCacheUse, TransientJobError,
@@ -1578,7 +1580,9 @@ pub enum CatalogEvent {
     /// One audited manifest entry acquired its previously deferred scanner digest.
     SourceContentDigestCommitted {
         /// Source lifecycle and previous revision that admitted the write.
-        request: SourceTransientRequest,
+        scope: SourceContentDigestScope,
+        /// Original transient request when Catalog retries the detector automatically.
+        transient_request_id: Option<u64>,
         /// New authoritative revision. The directory generation is unchanged.
         committed_revision: u64,
         /// Exact manifest entry with its digest filled in.

@@ -14,7 +14,7 @@ use yield_library::sample_sources::{
 use yield_media::WaveformDetailContext;
 use yield_session::{
     CatalogCommand, CatalogDelivery, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
-    CatalogStatus, CatalogSubmitError, SourceTransientRequest, VerifiedSourceRoot,
+    CatalogStatus, CatalogSubmitError, SourceContentDigestScope, VerifiedSourceRoot,
 };
 
 use super::source_registry::SourceRegistryGlobal;
@@ -863,7 +863,8 @@ impl Browser {
                 true
             }
             CatalogEvent::SourceContentDigestCommitted {
-                request,
+                scope,
+                transient_request_id,
                 committed_revision,
                 entry,
             } => {
@@ -871,7 +872,13 @@ impl Browser {
                     .as_ref()
                     .is_some_and(SourcePublicationFence::is_live)
                 {
-                    self.apply_digest_revision(request, *committed_revision, entry, cx);
+                    self.apply_digest_revision(
+                        scope,
+                        *transient_request_id,
+                        *committed_revision,
+                        entry,
+                        cx,
+                    );
                 }
                 true
             }
@@ -996,7 +1003,8 @@ impl Browser {
 
     fn apply_digest_revision(
         &mut self,
-        request: &SourceTransientRequest,
+        scope: &SourceContentDigestScope,
+        transient_request_id: Option<u64>,
         revision: u64,
         entry: &SourceManifestEntry,
         cx: &mut Context<Self>,
@@ -1009,13 +1017,13 @@ impl Browser {
             return;
         }
         let key = super::curation::CurationLifecycleKey {
-            source_id: request.source_id().clone(),
-            lifecycle_generation: request.lifecycle_generation(),
+            source_id: scope.source_id.clone(),
+            lifecycle_generation: scope.lifecycle_generation,
         };
         let exact = previous.filter(|context| {
             context.source_id == key.source_id
                 && context.lifecycle_generation == key.lifecycle_generation
-                && context.revision == request.revision()
+                && context.revision == scope.previous_revision
                 && context.revision.checked_add(1) == Some(revision)
         });
         let keep_tag_mask = super::tag_filter::capture_ready_mask(self).is_some();
@@ -1032,7 +1040,7 @@ impl Browser {
                 if session.root != context.root
                     || session.source_id.as_ref() != Some(&key.source_id)
                     || session.catalog_lifecycle_generation != Some(key.lifecycle_generation)
-                    || entry.relative_path != request.relative_path()
+                    || entry.relative_path != scope.relative_path.as_path()
                     || facts.file_size != entry.file_size
                     || facts.modified_ns != entry.modified_ns
                     || facts.file_identity != entry.file_identity
@@ -1095,7 +1103,13 @@ impl Browser {
                 cx,
             );
         }
-        super::transient_markers::accept_digest_revision(self, request, revision, cx);
+        super::transient_markers::accept_digest_revision(
+            self,
+            scope,
+            transient_request_id,
+            revision,
+            cx,
+        );
         cx.notify();
     }
 
@@ -1493,9 +1507,11 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
         CatalogEvent::SimilarityCompleted { request, .. } => {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
-        CatalogEvent::TransientMarkersCompleted { request, .. }
-        | CatalogEvent::SourceContentDigestCommitted { request, .. } => {
+        CatalogEvent::TransientMarkersCompleted { request, .. } => {
             Some((request.source_id().clone(), request.lifecycle_generation()))
+        }
+        CatalogEvent::SourceContentDigestCommitted { scope, .. } => {
+            Some((scope.source_id.clone(), scope.lifecycle_generation))
         }
         CatalogEvent::PlaymarkTempoCompleted { request, .. } => {
             Some((request.source_id().clone(), request.lifecycle_generation()))
