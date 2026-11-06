@@ -11,6 +11,28 @@ use riff::{WavChunkItem, WavChunkIter};
 const MAX_SANITIZED_WAV_BYTES: u64 = 64 * 1024 * 1024;
 const SANITIZE_PROBE_BYTES: u64 = 256 * 1024;
 
+/// Read the stored block alignment from a RIFF prefix ending just before its data chunk.
+#[cfg(feature = "native-audio")]
+pub(crate) fn wav_prefix_block_alignment(prefix: &[u8]) -> Option<u16> {
+    let mut block_alignment = None;
+    for chunk in WavChunkIter::new(prefix, prefix.len() as u64).ok()? {
+        let WavChunkItem::Chunk(chunk) = chunk else {
+            return None;
+        };
+        if chunk.next_offset() > prefix.len() {
+            return None;
+        }
+        if chunk.id() == b"fmt " {
+            if block_alignment.is_some() || chunk.data_size() < 16 {
+                return None;
+            }
+            let offset = chunk.offset() + 8 + 12;
+            block_alignment = Some(u16::from_le_bytes([prefix[offset], prefix[offset + 1]]));
+        }
+    }
+    block_alignment
+}
+
 /// A WAV reader that exposes a logically repaired byte stream.
 ///
 /// The reader inspects only the first `SANITIZE_PROBE_BYTES` bytes and repairs
