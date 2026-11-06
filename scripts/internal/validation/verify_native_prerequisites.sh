@@ -102,6 +102,12 @@ case "$CASE" in
       run_tests foreign-family retirement_original_consumer_refuses_another_valid_source_release_family 1
     fi
     ;;
+  source-registration-generation)
+    [[ "$PLATFORM" == macos ]] || exit 1
+    run_tests registration-generation registration_generation 7
+    run_tests retained-source-rollback preaudit_denied_rollback_retry_retains_registered_count_and_original_policy 1
+    run_tests foreign-owner-decision genuine_foreign_source_registration_cannot_fill_original_decision_slot 1
+    ;;
   startup-production)
     [[ "$PLATFORM" == macos ]] || exit 1
     run_tests production operation_journal::owner::tests::capacity_startup_tests::capacity_startup_native_production_rebuilds_original_descriptor_bound_image 1 --exact
