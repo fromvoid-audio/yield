@@ -517,7 +517,7 @@ mod tests {
                 return value;
             }
             assert!(Instant::now() < deadline, "timed out waiting for Catalog");
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
