@@ -231,6 +231,7 @@ mod integration {
                     WatcherMode::Detached,
                     None,
                     sources,
+                    None,
                 );
             });
             let (revisions, lease_inputs) = startup.recv_timeout(Duration::from_secs(5)).unwrap();

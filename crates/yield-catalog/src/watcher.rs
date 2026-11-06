@@ -10,6 +10,8 @@ use super::{
 };
 
 mod native_replay;
+#[cfg(target_os = "macos")]
+pub(super) mod supervised;
 
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
 const WATCHER_MAX_DELAY: Duration = Duration::from_secs(2);
@@ -24,6 +26,30 @@ const ROOT_PROBE_MISSING: Duration = Duration::from_secs(30);
 pub(super) enum WatcherMode {
     Native,
     Detached,
+    #[cfg(target_os = "macos")]
+    MacosSupervised,
+}
+
+impl WatcherMode {
+    #[cfg(not(test))]
+    pub(super) fn runtime() -> Self {
+        #[cfg(target_os = "macos")]
+        return Self::MacosSupervised;
+        #[cfg(not(target_os = "macos"))]
+        return Self::Native;
+    }
+
+    pub(super) fn uses_native_replay(self) -> bool {
+        cfg!(target_os = "macos") && !matches!(self, Self::Detached)
+    }
+
+    pub(super) fn uses_helper(self) -> bool {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::MacosSupervised => true,
+            _ => false,
+        }
+    }
 }
 
 pub(super) struct WatcherSchedule {
@@ -407,36 +433,66 @@ fn refresh_source_watchers(
     watcher_mode: WatcherMode,
     now: Instant,
 ) {
+    if watcher_mode.uses_helper() {
+        return;
+    }
     for (source_id, source) in sources.iter_mut() {
         if source.watcher.is_some() || !source.watcher_schedule.watcher_can_retry(now) {
             continue;
         }
-        let spec = SourceWatchSpec::new(
+        start_local_watcher(source_id, source, test_gate, watcher_mode, now);
+    }
+}
+
+pub(super) fn start_local_watcher(
+    source_id: &super::SourceId,
+    source: &mut RegisteredSource,
+    test_gate: Option<&Arc<CatalogTestGate>>,
+    mode: WatcherMode,
+    now: Instant,
+) {
+    let spec = || watcher_spec(source_id, source);
+    let watcher = match mode {
+        WatcherMode::Native => SourceWatcher::start(spec()),
+        WatcherMode::Detached => Ok(SourceWatcher::detached(spec())),
+        #[cfg(target_os = "macos")]
+        WatcherMode::MacosSupervised => {
+            source.watcher_schedule.watcher_continuity_lost = true;
+            source.watcher_schedule.fallback_audit_after = Some(now + WATCHER_FALLBACK_INTERVAL);
+            return;
+        }
+    };
+    match watcher {
+        Ok(watcher) => install_watcher(source_id, source, watcher, test_gate, now),
+        Err(_) => source.watcher_schedule.watcher_start_failed(now),
+    }
+}
+
+fn watcher_spec(source_id: &super::SourceId, source: &RegisteredSource) -> SourceWatchSpec {
+    SourceWatchSpec::new(
+        source_id.clone(),
+        source.lifecycle_generation,
+        source.root.clone(),
+        source.known_root_identity.clone(),
+    )
+}
+
+fn install_watcher(
+    source_id: &super::SourceId,
+    source: &mut RegisteredSource,
+    watcher: SourceWatcher,
+    test_gate: Option<&Arc<CatalogTestGate>>,
+    now: Instant,
+) {
+    if let Some(test_gate) = test_gate {
+        test_gate.install_watcher_signal(
             source_id.clone(),
             source.lifecycle_generation,
-            source.root.clone(),
-            source.known_root_identity.clone(),
+            watcher.signal(),
         );
-        let watcher = match watcher_mode {
-            WatcherMode::Native => SourceWatcher::start(spec),
-            WatcherMode::Detached => Ok(SourceWatcher::detached(spec)),
-        };
-        match watcher {
-            Ok(watcher) => {
-                let signal = watcher.signal();
-                source.watcher = Some(watcher);
-                source.watcher_schedule.watcher_started(now);
-                if let Some(test_gate) = test_gate {
-                    test_gate.install_watcher_signal(
-                        source_id.clone(),
-                        source.lifecycle_generation,
-                        signal,
-                    );
-                }
-            }
-            Err(_) => source.watcher_schedule.watcher_start_failed(now),
-        }
     }
+    source.watcher = Some(watcher);
+    source.watcher_schedule.watcher_started(now);
 }
 
 fn drain_source_watcher_hints(

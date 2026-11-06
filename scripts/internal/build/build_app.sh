@@ -54,9 +54,13 @@ while (( $# > 0 )); do
 done
 
 cd "$ROOT_DIR"
+host_os="$(uname -s)"
 
 if (( SKIP_BUILD == 0 )); then
-  cargo_command=(cargo build --bin yield)
+  cargo_command=(cargo build -p yield --bin yield)
+  if [[ "$host_os" == Darwin ]]; then
+    cargo_command+=(-p yield-source-watcher --bin yield-live-watch-helper)
+  fi
   if [[ "$PROFILE" == "release" ]]; then
     cargo_command+=(--release)
   fi
@@ -76,10 +80,15 @@ binary_path="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/${profile_dir}/yield"
   exit 1
 }
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
+if [[ "$host_os" != Darwin ]]; then
   echo "[build] binary=$binary_path"
   exit 0
 fi
+watcher_helper="$(dirname "$binary_path")/yield-live-watch-helper"
+[[ -f "$watcher_helper" && ! -L "$watcher_helper" && -x "$watcher_helper" ]] || {
+  echo "[build][error] native watcher helper missing at $watcher_helper" >&2
+  exit 1
+}
 
 if [[ -z "$VARIANT" ]]; then
   branch="$(git branch --show-current 2>/dev/null || true)"
@@ -109,6 +118,7 @@ info_path="$contents_path/Info.plist"
 
 mkdir -p "$contents_path/MacOS"
 install -m 755 "$binary_path" "$executable_path"
+install -m 755 "$watcher_helper" "$contents_path/MacOS/yield-live-watch-helper"
 
 package_version="$(awk '
   /^\[package\][[:space:]]*$/ { in_package = 1; next }

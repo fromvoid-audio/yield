@@ -325,7 +325,7 @@ the existing contract.
 
 ### macOS live registration capability
 
-The pinned live backend, `notify` 6.1.1, synchronously starts its stream once
+The legacy live backend, `notify` 6.1.1, synchronously starts its stream once
 for the recursive source root and restarts it to add the nonrecursive parent.
 Its worker sends the run-loop handle only after the Apple registration call
 returns. Both initial registration and retry use this path, and the backend
@@ -343,16 +343,14 @@ One registration call reduces duplicate work and still leaves the caller
 exposed to that call's latency. Current in-process startup and retirement are
 therefore unqualified for a hard deadline.
 
-A follow-on should first qualify an owned process boundary on macOS. The
-catalog can fail closed at its deadline, retain its audit obligation, and
-continue to own the retiring process until exit is confirmed. The process
-boundary must bind each result to the exact source, root identity, and
-generation. Keep one in-flight start per source across retry, rebind, removal,
-and shutdown, with no retry while the previous process is retiring. Verify
-that stale starts cannot publish, late exit does not advance a checkpoint, and
-both observation scopes survive recovery. The existing two-second production
-bootstrap capture and authoritative-audit fallback remain required. Deployment
-of a helper would require its own packaging and lifecycle qualification.
+The macOS catalog uses the helper beside the application executable. Build a
+local app with `scripts/build.sh` or use the exact-source bundle builder to
+include the helper. The catalog owns at most 32 helper processes and retains
+one slot per Source through removal, supersession, or failed readiness until
+the original process is reaped. Checked readiness is tied to the Source,
+physical root and generation. A missing or delayed helper leaves an
+authoritative audit obligation. The two-second replay bootstrap and existing
+durable checkpoint admission remain separate from live watcher hints.
 
 The [disposable native registration probe](../scripts/qa/README.md#macos-live-watcher-start-probe)
 measures successful registration and teardown. Its timings give no guarantee

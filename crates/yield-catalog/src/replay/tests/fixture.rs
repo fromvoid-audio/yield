@@ -226,6 +226,7 @@ impl Fixture {
                 WatcherMode::Detached,
                 None,
                 HashMap::from([(id, source)]),
+                None,
             )
         });
         startup.recv_timeout(Duration::from_secs(5)).unwrap();
