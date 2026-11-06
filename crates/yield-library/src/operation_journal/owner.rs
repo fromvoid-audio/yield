@@ -185,6 +185,10 @@ const CONTROL_RESULT_CAPACITY: usize = 4;
 const ORDINARY_RESULT_CAPACITY: usize =
     OPERATION_JOURNAL_OWNER_RESULT_CAPACITY - CONTROL_RESULT_CAPACITY;
 const CONTROL_RECEIVE_POLL: Duration = Duration::from_millis(50);
+// An active WAL collector advances ordered original owners and a fresh validation round.
+// Owner replies do not wake the command queues; do not charge the ordinary idle interval
+// to every handshake stage. This remains a bounded wait, with the original deadline intact.
+const WAL_PREPARATION_RECEIVE_POLL: Duration = Duration::from_millis(10);
 
 impl InputClass {
     fn result_limit(self) -> usize {
@@ -309,11 +313,11 @@ impl OwnerCommandReceivers {
     // control check may follow one selected ordinary command. No running SQL is preempted.
     #[cfg(test)]
     fn recv(&self) -> Option<JournalCommand> {
-        self.recv_with_idle(|| {})
+        self.recv_with_idle(|| CONTROL_RECEIVE_POLL)
     }
-    fn recv_with_idle(&self, mut idle: impl FnMut()) -> Option<JournalCommand> {
+    fn recv_with_idle(&self, mut idle: impl FnMut() -> Duration) -> Option<JournalCommand> {
         loop {
-            idle();
+            let receive_poll = idle();
             let control_disconnected = match self.control.try_recv() {
                 Ok(command) => return Some(command),
                 Err(TryRecvError::Disconnected) => true,
@@ -334,7 +338,7 @@ impl OwnerCommandReceivers {
             } else {
                 &self.control
             };
-            match receiver.recv_timeout(CONTROL_RECEIVE_POLL) {
+            match receiver.recv_timeout(receive_poll) {
                 Ok(command) => return Some(command),
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
             }
@@ -1985,11 +1989,16 @@ impl OwnerRuntime {
         self.poll_wal_preparation();
         Ok(handle)
     }
-    fn poll_original_work(&mut self) {
+    fn poll_original_work(&mut self) -> Duration {
         self.poll_recording_custody();
         self.poll_recording_restart_audit();
         self.poll_publication_completions();
         self.poll_wal_preparation();
+        if self.wal_preparation.is_some() {
+            WAL_PREPARATION_RECEIVE_POLL
+        } else {
+            CONTROL_RECEIVE_POLL
+        }
     }
     fn poll_publication_completions(&self) {
         self.publication_fences.poll_completions();

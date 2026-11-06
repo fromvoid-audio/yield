@@ -854,24 +854,27 @@ Focused validation for Windows release distribution changes:
 - Inspect the release ZIP and confirm it preserves the archive root and required
   runtime files declared by `release_contract.toml`
 
-### Database migration and compatibility
+### Database format validation
 
 Use this lane when changing `.yield.db`, `library.db`, source metadata
 queries, schema DDL, schema version stamps, or migration code.
 
-- source DB contract and migration fixtures:
+- source DB current-format contract fixtures (historical module name):
   - `cargo test -p yield-library source_db_migration_tests`
-- read-only source query compatibility:
+- current-format read-only source queries:
   - `cargo test -p yield-library sample_sources::db::read`
-- global library DB contract and migrations:
+- global library current-format contract:
   - `cargo test -p yield-library sample_sources::library`
 - compile check for the storage crate:
   - `cargo check -p yield-library`
 
-See `docs/DATABASE_MIGRATIONS.md` for the schema-change contract. Source DB
-additive repairs must run even when `PRAGMA user_version` already matches the
-current schema, and read-only source opens must tolerate pre-migration database
-shapes by projecting safe defaults or avoiding missing optional tables.
+See `docs/DATABASE_MIGRATIONS.md` and the active alpha policy in `AGENTS.md`.
+Current-format structure, read-only behavior, round trips, recovery and transaction
+correctness remain required. Earlier alpha migration/repair/read compatibility
+is out of scope; existing compatibility-only fixtures do not create continuing
+requirements. Adapt affected checks for intentional format breaks without
+disabling current-format safety assertions. Choose checks proportionate to the
+actual change; no database reset is performed by this documentation update.
 
 ### Debug log workflow
 

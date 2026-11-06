@@ -314,9 +314,9 @@ Documentation should cover implementation details such as source database update
 
 If the operating system, permissions, file locks, or external tools prevent Yield from writing to a source, Yield should report that as a source/file write limitation rather than treating it as an intentional read-only library mode.
 
-Source database schema changes must be migratable through the explicit source-write or maintenance open path. Additive tables and columns should be repaired even when a database already carries the current schema stamp, because development and prerelease builds may leave current-stamped files with incomplete structure. Every runtime caller must select a role-specific open for UI reads, background reads/jobs, source writes, user metadata writes, playback history, or maintenance; general `open` aliases are not part of the supported API. Read-only source database opens must not mutate the database and must tolerate older schema shapes through safe default projections or feature-specific query avoidance.
+Under the [active alpha policy](../AGENTS.md#active-alpha-compatibility-policy), source database formats may break without legacy migrations, additive repairs or read-only compatibility projections. Fresh/recreated alpha databases are acceptable when needed for development, with explicit handling rather than silent state loss. Every runtime caller must select a role-specific open for UI reads, background reads/jobs, source writes, user metadata writes, playback history, or maintenance; general `open` aliases are not part of the supported API. Read-only opens must not mutate the database. Validate current structure independently of its version stamp and report unsupported formats explicitly.
 
-Browser metadata hydration should read ratings, locks, collection memberships, and playback/curation timestamps from one coherent typed snapshot with a statement count that is independent of source size. Capability discovery happens once per snapshot so legacy read-only compatibility cannot regress into per-file schema inspection. A failed hydration preserves the last good browser metadata projection and reports the failure; opportunistic mutations such as rating decay run later through bounded background maintenance and explicitly refresh affected metadata.
+Browser metadata hydration should read ratings, locks, collection memberships, and playback/curation timestamps from one coherent typed snapshot with a statement count that is independent of source size. Current-format validation happens once per snapshot, not through per-file schema inspection. A failed hydration preserves the last good browser metadata projection and reports the failure; opportunistic mutations such as rating decay run later through bounded background maintenance and explicitly refresh affected metadata.
 
 The source database should store information that belongs to that source and its files, such as:
 
@@ -2120,12 +2120,12 @@ The database and indexing system should support:
 * responsive queries for large sample libraries
 * fast tag filtering, rating filtering, age filtering, text filtering, metadata filtering, and similarity lookup
 * efficient updates when tags, ratings, age state, metadata, names, analysis results, source contents, embedded IDs, or edit state change
-* clear schema ownership and migration behavior
+* clear current-format schema ownership and explicit unsupported-format behavior
 * transactional or recovery-safe updates for user-trust surfaces
 * consistency between persisted state and UI projection
-* diagnostic information for failed writes, stale records, migration issues, metadata embedding failures, and indexing problems
+* diagnostic information for failed writes, stale records, invalid/unsupported formats, metadata embedding failures, and indexing problems
 
-Schema ownership should include explicit base DDL, idempotent migrations, schema contract tests, read-only compatibility coverage where applicable, and versioned migration tests for non-additive changes. A database schema version stamp is an optimization hint, not the only source of truth for structural compatibility.
+Schema ownership includes explicit current base DDL, coherent readers/writers and meaningful current-format validation, round-trip and recovery tests. A database schema version stamp is not the only source of truth for structural validity. Earlier alpha migrations and read-only compatibility coverage are out of scope under the active alpha policy, including non-additive changes.
 
 Tag, rating, aging, naming, and metadata workflows should remain fast as the library grows. Filtering should feel interactive, and persistence should be treated as part of the product performance surface rather than a passive storage detail.
 

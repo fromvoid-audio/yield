@@ -8,10 +8,12 @@ import sys
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from local_state import (
     StateError,
+    archive,
     clean,
     convert_clean_handoff_to_validator_lease,
     maintenance_locks,
@@ -59,6 +61,106 @@ class LocalStateTests(unittest.TestCase):
             with self.assertRaises(StateError):
                 clean("development", self.support)
         self.assertEqual((self.root / "dirty.marker").read_text(encoding="utf-8"), "retained evidence")
+
+    def test_explicit_archive_preserves_remounted_backup_without_restoration_authority(self) -> None:
+        transaction = str(clean("development", self.support)["transaction"])
+        tx_dir = self.control / "backups" / ".yield-development" / transaction
+        record_path = tx_dir / "transaction.json"
+        record = json.loads(record_path.read_text())
+        record["original_identity"]["device"] += 100
+        record_path.write_text(json.dumps(record))
+        original_record = record_path.read_bytes()
+        original_marker = tx_dir / "original-root" / "dirty.marker"
+        original_marker_identity = original_marker.stat().st_ino
+        self.root.mkdir()
+        (self.root / "current").write_text("current profile")
+        current_identity = self.root.stat().st_ino
+        with self.assertRaisesRegex(StateError, "original filesystem"):
+            restore(transaction, self.support)
+        result = archive(transaction, "Owner chose historical evidence", self.support)
+        destination = pathlib.Path(result["archive"])
+        self.assertFalse(tx_dir.exists())
+        self.assertEqual((destination / "transaction.json").read_bytes(), original_record)
+        marker = destination / "original-root" / "dirty.marker"
+        self.assertEqual(marker.stat().st_ino, original_marker_identity)
+        self.assertEqual(marker.read_text(), "retained evidence")
+        self.assertEqual(self.root.stat().st_ino, current_identity)
+        self.assertEqual((self.root / "current").read_text(), "current profile")
+        self.assertFalse(json.loads(pathlib.Path(result["receipt"]).read_text())["restoration_authority"])
+        with self.assertRaisesRegex(StateError, "unknown or ambiguous"):
+            restore(transaction, self.support)
+        next_transaction = str(clean("development", self.support)["transaction"])
+        restore(next_transaction, self.support)
+        self.assertEqual(self.root.stat().st_ino, current_identity)
+
+    def test_archive_refuses_missing_current_root_live_owner_and_ambiguous_original(self) -> None:
+        transaction = str(clean("development", self.support)["transaction"])
+        with self.assertRaisesRegex(StateError, "distinct current normal root"):
+            archive(transaction, "Historical", self.support)
+        self.root.mkdir()
+        with maintenance_locks(self.control, "development", exclusive=False):
+            with self.assertRaisesRegex(StateError, "live owner"):
+                archive(transaction, "Historical", self.support)
+        tx_dir = self.control / "backups" / ".yield-development" / transaction
+        record_path = tx_dir / "transaction.json"
+        record = json.loads(record_path.read_text())
+        record["original_identity"]["inode"] += 1
+        record_path.write_text(json.dumps(record))
+        with self.assertRaisesRegex(StateError, "inode differs"):
+            archive(transaction, "Historical", self.support)
+        self.assertTrue((tx_dir / "original-root" / "dirty.marker").exists())
+        self.assertFalse((self.control / "history").exists())
+
+    def test_archive_retries_interrupted_reservation_without_replacing_evidence(self) -> None:
+        for boundary in ("before_receipt", "temporary_receipt", "before_move"):
+            with self.subTest(boundary=boundary):
+                support = self.support / boundary
+                support.mkdir()
+                root, control = namespace_paths("development", support)
+                root.mkdir()
+                (root / "evidence").write_bytes(b"original")
+                transaction = str(clean("development", support)["transaction"])
+                tx = control / "backups" / ".yield-development" / transaction
+                record = (tx / "transaction.json").read_bytes()
+                original_inode = (tx / "original-root" / "evidence").stat().st_ino
+                root.mkdir()
+                current_inode = root.stat().st_ino
+                target = {"before_receipt": "local_state._write_record",
+                          "temporary_receipt": "local_state.os.replace",
+                          "before_move": "local_state.os.rename"}[boundary]
+                with mock.patch(target, side_effect=OSError("interrupted archive")):
+                    with self.assertRaisesRegex(OSError, "interrupted archive"):
+                        archive(transaction, "Retain history", support)
+                slot = control / "history" / ".yield-development" / transaction
+                retained = {p.name: (p.stat().st_ino, p.read_bytes()) for p in slot.iterdir()}
+                self.assertTrue(tx.is_dir())
+                result = archive(transaction, "Retain history", support)
+                destination = pathlib.Path(result["archive"])
+                self.assertFalse(tx.exists())
+                self.assertEqual((destination / "transaction.json").read_bytes(), record)
+                self.assertEqual((destination / "original-root" / "evidence").stat().st_ino, original_inode)
+                self.assertEqual((destination / "original-root" / "evidence").read_bytes(), b"original")
+                self.assertEqual(root.stat().st_ino, current_inode)
+                for name, identity_and_bytes in retained.items():
+                    self.assertEqual(((slot / name).stat().st_ino, (slot / name).read_bytes()), identity_and_bytes)
+
+    def test_archive_retry_refuses_conflicting_receipt_or_occupied_slot(self) -> None:
+        transaction = str(clean("development", self.support)["transaction"])
+        self.root.mkdir()
+        tx = self.control / "backups" / ".yield-development" / transaction
+        with mock.patch("local_state.os.rename", side_effect=OSError("interrupted archive")):
+            with self.assertRaises(OSError):
+                archive(transaction, "Retain history", self.support)
+        slot = self.control / "history" / ".yield-development" / transaction
+        receipt = (slot / "archive.json").read_bytes()
+        with self.assertRaisesRegex(StateError, "no longer matches"):
+            archive(transaction, "Different decision", self.support)
+        (slot / "transaction").mkdir()
+        with self.assertRaisesRegex(StateError, "retained custody or unknown evidence"):
+            archive(transaction, "Retain history", self.support)
+        self.assertTrue(tx.is_dir())
+        self.assertEqual((slot / "archive.json").read_bytes(), receipt)
+        self.assertTrue((tx / "original-root" / "dirty.marker").is_file())
 
     def test_validator_lease_allows_successive_admitting_children_and_blocks_reset(self) -> None:
         result, namespace_fd, transition_fd = prepare_clean_launch("development", self.support)

@@ -2244,6 +2244,60 @@ pub(crate) fn run_native_window_selector_probe() -> std::result::Result<(), &'st
         );
         let view_class = declaration.register();
 
+        static REENTERED_WITHOUT_LOCK: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        extern "C" fn probe_not_key(_: &Object, _: Sel) -> BOOL {
+            NO
+        }
+        extern "C" fn probe_resign_key(this: &Object, _: Sel) {
+            let state = unsafe { *this.get_ivar::<usize>("probeState") } as *const Mutex<usize>;
+            // This is the synchronous delegate re-entry boundary observed in the hang sample.
+            let unlocked = unsafe { &*state }.try_lock().is_some();
+            REENTERED_WITHOUT_LOCK.store(unlocked, std::sync::atomic::Ordering::SeqCst);
+        }
+        let Some(mut key_declaration) =
+            ClassDecl::new("YieldKeyReentryRegressionWindow", class!(NSWindow))
+        else {
+            let _: () = msg_send![pool, drain];
+            return Err("could not declare key re-entry regression window");
+        };
+        key_declaration.add_ivar::<usize>("probeState");
+        key_declaration.add_method(
+            sel!(isKeyWindow),
+            probe_not_key as extern "C" fn(&Object, Sel) -> BOOL,
+        );
+        key_declaration.add_method(
+            sel!(resignKeyWindow),
+            probe_resign_key as extern "C" fn(&Object, Sel),
+        );
+        let key_class = key_declaration.register();
+        let key_window: id = msg_send![key_class, alloc];
+        let key_window: id = msg_send![key_window, initWithContentRect: NSRect::new(
+            NSPoint::new(0.0, 0.0), NSSize::new(120.0, 80.0))
+            styleMask: NSWindowStyleMask::NSTitledWindowMask
+            backing: NSBackingStoreBuffered defer: NO];
+        if key_window.is_null() {
+            let _: () = msg_send![pool, drain];
+            return Err("AppKit returned a nil key re-entry regression window");
+        }
+        let key_state = Mutex::new(key_window as usize);
+        (*key_window).set_ivar("probeState", &key_state as *const Mutex<usize> as usize);
+        REENTERED_WITHOUT_LOCK.store(false, std::sync::atomic::Ordering::SeqCst);
+        let corrected = native_key_status(&key_state, sel!(windowDidBecomeKey:), |window| {
+            *window as id
+        });
+        let reentered = REENTERED_WITHOUT_LOCK.load(std::sync::atomic::Ordering::SeqCst);
+        let inactive = native_key_status(&key_state, sel!(windowDidResignKey:), |window| {
+            *window as id
+        });
+        let _: () = msg_send![key_window, release];
+        if corrected.is_some() || !reentered || inactive != Some(false) {
+            let _: () = msg_send![pool, drain];
+            return Err(
+                "key-status correction held state ownership during synchronous AppKit re-entry",
+            );
+        }
+
         let frame = NSRect::new(NSPoint::new(20.0, 20.0), NSSize::new(120.0, 80.0));
         let style = NSWindowStyleMask::NSTitledWindowMask
             | NSWindowStyleMask::NSFullSizeContentViewWindowMask;
@@ -2549,33 +2603,39 @@ extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
     lock.start_display_link();
 }
 
+// AppKit's key-state queries and resignation may synchronously notify the delegate again.
+// Extract the native handle under the state lock, then release it before calling AppKit.
+fn native_key_status<T>(
+    state: &Mutex<T>,
+    selector: Sel,
+    native_window: impl FnOnce(&T) -> id,
+) -> Option<bool> {
+    let native_window = {
+        let state = state.lock();
+        native_window(&state)
+    };
+    let is_active = unsafe { native_window.isKeyWindow() == YES };
+    // Preserve the correction for a spurious become-key notification from an inactive popup.
+    if selector == sel!(windowDidBecomeKey:) && !is_active {
+        unsafe {
+            let _: () = msg_send![native_window, resignKeyWindow];
+        }
+        return None;
+    }
+    Some(is_active)
+}
+
 extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     if selector == sel!(windowDidResignKey:) {
         let native_window = window_state.lock().native_window;
         restore_window_movable(&window_state, native_window);
     }
-    let mut lock = window_state.lock();
-    let is_active = unsafe { lock.native_window.isKeyWindow() == YES };
-
-    // When opening a pop-up while the application isn't active, Cocoa sends a spurious
-    // `windowDidBecomeKey` message to the previous key window even though that window
-    // isn't actually key. This causes a bug if the application is later activated while
-    // the pop-up is still open, making it impossible to activate the previous key window
-    // even if the pop-up gets closed. The only way to activate it again is to de-activate
-    // the app and re-activate it, which is a pretty bad UX.
-    // The following code detects the spurious event and invokes `resignKeyWindow`:
-    // in theory, we're not supposed to invoke this method manually but it balances out
-    // the spurious `becomeKeyWindow` event and helps us work around that bug.
-    if selector == sel!(windowDidBecomeKey:) && !is_active {
-        unsafe {
-            let _: () = msg_send![lock.native_window, resignKeyWindow];
-            return;
-        }
-    }
-
-    let executor = lock.executor.clone();
-    drop(lock);
+    let Some(is_active) = native_key_status(&window_state, selector, |state| state.native_window)
+    else {
+        return;
+    };
+    let executor = window_state.lock().executor.clone();
 
     // When a window becomes active, trigger an immediate synchronous frame request to prevent
     // tab flicker when switching between windows in native tabs mode.

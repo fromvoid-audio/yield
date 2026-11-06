@@ -1,5 +1,30 @@
 # Yield engineering workflow
 
+## Active alpha compatibility policy
+
+Yield is active alpha software; prioritize getting the features in place. Until
+the user explicitly declares release readiness or a compatibility commitment,
+breaking source, model, schema and database-format changes are allowed. Backward
+compatibility is out of scope, including incompatible unpublished branch formats.
+Do not add legacy readers, historical conversions, schema migrations or tests
+solely to support earlier alpha formats. Fresh or recreated alpha databases are
+acceptable when needed for development; make that handling explicit and scoped.
+Do not infer a compatibility freeze from an alpha version or schema number.
+
+This policy supersedes older backward-compatibility and migration requirements
+in repository documents and existing task descriptions for future Yield changes.
+Existing compatibility-only checks and historical verification do not create
+ongoing requirements. It does not require removing all existing migration code
+or unrelated cleanup; adapt affected checks when intentionally changing formats.
+
+Active features must coexist in one coherent current format. Preserve strict
+current-format validation, save/reopen and recovery correctness, transaction and
+ownership integrity, media correctness, and runtime/audio safety. Report unsupported
+formats explicitly; do not silently reset user state or delete/modify user media.
+This documentation change performs no database reset or file deletion. Historical
+implementation and verification evidence remains factual. PR, proportionate
+validation and delivery requirements remain in force.
+
 ## Continuous integration and merging
 
 - Develop features and fixes on a `codex/` branch in a pull request. Preserve
