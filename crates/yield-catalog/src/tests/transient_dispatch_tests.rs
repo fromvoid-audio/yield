@@ -1,32 +1,41 @@
 #[cfg(test)]
 mod fixtures {
     use super::super::*;
-    use yield_analysis::transients::TransientPreset;
+    use std::io::{Seek, SeekFrom, Write};
+    use yield_analysis::transients::{DETECTOR_VERSION, STREAM_DETECTOR_VERSION, TransientPreset};
 
     fn write_attacks(path: &Path, total_frames: u32, attacks: [u32; 2]) {
-        let mut writer = hound::WavWriter::create(
-            path,
-            hound::WavSpec {
-                channels: 1,
-                sample_rate: 16_000,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            },
-        )
-        .unwrap();
-        for frame in 0..total_frames {
-            let sample: i16 = if attacks.contains(&frame) { 24_000 } else { 0 };
-            writer.write_sample(sample).unwrap();
+        // Standard mono 16-bit PCM at 16 kHz. Sparse silence keeps test
+        // provisioning small while the reader still consumes every frame.
+        let data_bytes = total_frames * 2;
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(b"RIFF").unwrap();
+        file.write_all(&(data_bytes + 36).to_le_bytes()).unwrap();
+        file.write_all(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data")
+            .unwrap();
+        file.write_all(&data_bytes.to_le_bytes()).unwrap();
+        file.set_len(u64::from(data_bytes) + 44).unwrap();
+        for attack in attacks {
+            assert!(attack < total_frames);
+            file.seek(SeekFrom::Start(44 + u64::from(attack) * 2))
+                .unwrap();
+            file.write_all(&24_000_i16.to_le_bytes()).unwrap();
         }
-        writer.finalize().unwrap();
     }
 
     fn setup() -> (Fixture, CatalogService, SourceId, u64) {
+        setup_attacks(16_000, [1237, 9673])
+    }
+
+    fn setup_attacks(
+        total_frames: u32,
+        attacks: [u32; 2],
+    ) -> (Fixture, CatalogService, SourceId, u64) {
         let fixture = Fixture::new("transient-dispatch");
         write_attacks(
             &fixture.root.path().join("attacks.wav"),
-            16_000,
-            [1237, 9673],
+            total_frames,
+            attacks,
         );
         let source = SourceId::from_string("transient-dispatch");
         let service = CatalogService::start(&fixture.guard).unwrap();
@@ -149,6 +158,7 @@ mod fixtures {
         let (fixture, service, source, revision) = setup();
         let first = run_request(&service, &source, revision, 1, TransientPreset::Normal);
         assert_eq!(first.cache, TransientCacheUse::MissStored);
+        assert_eq!(first.detector_version, DETECTOR_VERSION);
         assert_eq!(first.markers.frames(), [1237, 9673]);
         service.shutdown();
 
@@ -173,6 +183,74 @@ mod fixtures {
         assert_eq!(high.cache, TransientCacheUse::MissStored);
         assert_eq!(high.markers.preset(), TransientPreset::High);
         reopened.shutdown();
+    }
+
+    #[test]
+    fn transient_stream_routes_and_reuses_a_wav_above_the_encoded_limit() {
+        let frames =
+            (yield_library::sample_sources::readiness::FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        let attacks = [32_767, 3_500_073];
+        let (fixture, service, source, _) = setup_attacks(frames, attacks);
+        service.shutdown();
+        // Quick audit defers this file's digest. Complete the existing targeted
+        // scanner hash under the same profile before reopening the Catalog.
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source),
+        )
+        .unwrap();
+        yield_scan::complete_pending_deep_hash_for_path(&database, Path::new("attacks.wav"), None)
+            .unwrap();
+        drop(database);
+        let service = CatalogService::start(&fixture.guard).unwrap();
+        let revision =
+            register_and_audit(&service, fixture.root.path(), &source).committed_revision;
+        let first = run_request(&service, &source, revision, 1, TransientPreset::Normal);
+        assert_eq!(first.cache, TransientCacheUse::MissStored);
+        assert_eq!(first.detector_version, STREAM_DETECTOR_VERSION);
+        assert_eq!(first.markers.source_frames(), frames);
+        assert_eq!(first.markers.frames(), attacks);
+        let cached = run_request(&service, &source, revision, 2, TransientPreset::Normal);
+        assert_eq!(cached.cache, TransientCacheUse::Hit);
+        assert_eq!(cached.detector_version, STREAM_DETECTOR_VERSION);
+        assert_eq!(cached.markers.frames(), attacks);
+        service.shutdown();
+    }
+
+    #[test]
+    fn transient_stream_reports_a_pending_quick_audit_digest() {
+        use yield_library::sample_sources::readiness::{
+            FEATURE_INPUT_MAX_BYTES, SourceFeatureInputError,
+        };
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        let (_fixture, service, source, revision) = setup_attacks(frames, [32_767, 3_500_073]);
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request(&source, revision, 1),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            delivery(&service, 1).into_event_if_live(),
+            Some(CatalogEvent::TransientMarkersCompleted {
+                result: Err(TransientRequestFailure::Input(
+                    SourceFeatureInputError::ContentPending
+                )),
+                ..
+            })
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn transient_stream_falls_back_when_small_encoded_input_exceeds_the_pcm_limit() {
+        let attacks = [32_768, 1_950_073];
+        let (_fixture, service, source, revision) = setup_attacks(2_000_200, attacks);
+        let result = run_request(&service, &source, revision, 1, TransientPreset::Normal);
+        assert_eq!(result.detector_version, STREAM_DETECTOR_VERSION);
+        assert_eq!(result.markers.frames(), attacks);
+        service.shutdown();
     }
 
     #[test]

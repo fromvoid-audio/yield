@@ -56,6 +56,9 @@ pub enum SourceFeatureInputError {
     /// Current committed content hash differs from the held file bytes.
     #[error("feature input content changed")]
     ContentChanged,
+    /// The current audited row has no completed content digest.
+    #[error("Source content digest is pending")]
+    ContentPending,
 }
 
 /// Failure while reading or processing a held Source audio stream.
@@ -87,6 +90,11 @@ pub struct SourceFeatureInput {
     pub(crate) _permit: InputPermit,
 }
 impl SourceFeatureInput {
+    /// Encoded length admitted by the audited held file.
+    pub fn encoded_len(&self) -> u64 {
+        self.size
+    }
+
     /// Revalidate owner, root and every named descriptor edge before publication.
     pub fn validate(&self) -> Result<(), SourceFeatureInputError> {
         if self.owner.upgrade().is_none() {

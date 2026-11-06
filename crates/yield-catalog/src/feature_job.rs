@@ -174,6 +174,10 @@ fn diagnostic(failure: FeatureJobFailure) -> (&'static str, &'static str) {
         FeatureJobFailure::Input(SourceFeatureInputError::ContentChanged) => {
             ("feature_content_changed", "Source content changed")
         }
+        FeatureJobFailure::Input(SourceFeatureInputError::ContentPending) => (
+            "feature_content_pending",
+            "Source content digest is pending",
+        ),
         FeatureJobFailure::Input(SourceFeatureInputError::UnsupportedPlatform) => (
             "feature_platform_unavailable",
             "Source input unavailable on this platform",
