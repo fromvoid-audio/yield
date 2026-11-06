@@ -4,12 +4,17 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use yield_source_watcher::macos_live::{HELPER_READY_V1, MacosWatcherProcess};
+use yield_library::filesystem_identity::stable_filesystem_identity;
+use yield_library::sample_sources::{SourceId, reconciliation::RootIdentity};
+use yield_source_watcher::SourceWatchSpec;
+use yield_source_watcher::macos_live::{
+    HELPER_READY_V1, MacosSourceWatcherSlot, WatcherSlotProgress,
+};
 
 const EXECUTABLE: &str = env!("CARGO_BIN_EXE_yield-live-watch-helper");
 
@@ -21,38 +26,125 @@ fn child_process_returns_native_hint_and_exits_when_requests_close() {
     assert_refusals(&parent.join("missing"));
     let root = parent.join("source");
     fs::create_dir(&root).expect("disposable source");
-    let mut child = MacosWatcherProcess::spawn(
+    let metadata = fs::metadata(&root).expect("source metadata");
+    let identity = stable_filesystem_identity(&root, &metadata).expect("original source identity");
+    let original = SourceWatchSpec::new(
+        SourceId::from_string("bound-native-helper"),
+        7,
+        root.clone(),
+        Some(RootIdentity::from_bytes(identity.into_bytes())),
+    );
+    let mut child = MacosSourceWatcherSlot::start(
         Path::new(EXECUTABLE),
-        &root,
+        original.clone(),
         Instant::now() + Duration::from_secs(2),
     )
     .expect("launch actual watcher helper");
-    while !child.poll_ready().expect("checked native readiness") {
-        thread::sleep(Duration::from_millis(5));
-    }
+    let watcher = loop {
+        match child
+            .poll(Some(&original))
+            .expect("checked native readiness")
+        {
+            WatcherSlotProgress::Ready(watcher) => break watcher,
+            WatcherSlotProgress::Pending => thread::sleep(Duration::from_millis(5)),
+            _ => panic!("unexpected watcher slot state"),
+        }
+    };
     fs::write(root.join("kick.wav"), b"disposable fixture").expect("write native descendant");
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        if child
-            .poll_hint()
-            .expect("bounded helper evidence")
-            .is_some_and(|evidence| evidence.has_descendant_change())
+        assert!(matches!(
+            child
+                .poll(Some(&original))
+                .expect("bounded helper evidence"),
+            WatcherSlotProgress::Active
+        ));
+        if let Some(hint) = watcher.take_hint()
+            && hint.evidence().has_descendant_change()
         {
+            assert_eq!(hint.source_id(), original.source_id());
+            assert_eq!(hint.lifecycle_generation(), 7);
+            assert_eq!(hint.root_identity(), original.root_identity());
             break;
         }
         assert!(Instant::now() < deadline, "missing native descendant hint");
         thread::sleep(Duration::from_millis(5));
     }
-    child.begin_retirement();
+    assert!(matches!(
+        child.poll(None).unwrap(),
+        WatcherSlotProgress::Retiring
+    ));
+    assert!(watcher.is_closed());
+    assert!(reap(&mut child).success());
+}
+
+fn spec(root: PathBuf, generation: u64) -> SourceWatchSpec {
+    SourceWatchSpec::new(
+        SourceId::from_string("bound-native-helper"),
+        generation,
+        root,
+        None,
+    )
+}
+
+fn reap(child: &mut MacosSourceWatcherSlot) -> std::process::ExitStatus {
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
         if let Some(status) = child.try_reap().expect("reap helper") {
-            assert!(status.success());
-            break;
+            return status;
         }
         assert!(Instant::now() < deadline, "watcher helper did not retire");
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn late_readiness_cannot_admit_a_replacement_or_superseded_source() {
+    let fixture = tempfile::tempdir().expect("disposable parent");
+    let parent = fixture.path().canonicalize().expect("canonical parent");
+    let root = parent.join("source");
+    fs::create_dir(&root).unwrap();
+    let original = spec(root.clone(), 7);
+    let mut child = MacosSourceWatcherSlot::start(
+        Path::new(EXECUTABLE),
+        original.clone(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    let replacement = spec(root.clone(), 8);
+    assert!(matches!(
+        child.poll(Some(&replacement)).unwrap(),
+        WatcherSlotProgress::Retiring
+    ));
+    let _original_status = reap(&mut child);
+
+    let mut child = MacosSourceWatcherSlot::start(
+        Path::new(EXECUTABLE),
+        original.clone(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    fs::rename(&root, parent.join("displaced")).unwrap();
+    fs::create_dir(&root).unwrap();
+    loop {
+        match child.poll(Some(&original)) {
+            Ok(WatcherSlotProgress::Pending) => thread::sleep(Duration::from_millis(5)),
+            Err(error) => {
+                assert!(
+                    error.kind() == io::ErrorKind::UnexpectedEof
+                        || error.to_string() == "source root changed before watcher admission",
+                    "{error:?}"
+                );
+                break;
+            }
+            Ok(_) => panic!("replacement root became eligible"),
+        }
+    }
+    assert!(matches!(
+        child.poll(Some(&original)).unwrap(),
+        WatcherSlotProgress::Retiring
+    ));
+    let _original_status = reap(&mut child);
 }
 
 fn assert_refusals(missing: &Path) {
