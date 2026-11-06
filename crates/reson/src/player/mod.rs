@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::fade::FadeOutHandle;
 use super::output::{CpalAudioStream, ResolvedOutput};
+use crate::source::RenderedSourcePosition;
 
 mod edit_fade_impl;
 mod helpers;
@@ -80,6 +81,7 @@ pub struct AudioPlayer {
     active_playback_span: Option<PlaybackSpanHandle>,
     active_loop_mode: Option<playback::LoopModeHandle>,
     active_metronome: Option<PlaybackMetronomeConfig>,
+    rendered_source_position: Option<RenderedSourcePosition>,
     metronome_mix_override: metronome::MetronomeMixOverride,
     loop_offset: Option<f32>,
     loop_offset_frames: Option<u64>,
