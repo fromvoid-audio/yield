@@ -346,7 +346,7 @@ class NativeCheckCleanupTests(unittest.TestCase):
             evidence = (
                 checkout / "artifacts/macos-audition-coreaudio"
                 if case == "audition-coreaudio"
-                else checkout / "artifacts/native-prerequisites/macos-source-release-policy"
+                else checkout / "artifacts/native-prerequisites" / f"macos-{case.partition(':')[2]}"
             )
             evidence.mkdir(parents=True)
             (evidence / "native.log").write_text("native evidence", encoding="utf-8")
@@ -454,6 +454,11 @@ class NativeCheckCleanupTests(unittest.TestCase):
             self.assertEqual(restore.call_count, 1)
             self.assertEqual(run.call_count, 1)
             self.assertEqual(run.call_args.args[0], ["bash", str(runner)])
+            if case.startswith("prerequisite:"):
+                self.assertEqual(
+                    run.call_args.kwargs["env"]["YIELD_NATIVE_PREREQUISITE_CASE"],
+                    case.partition(":")[2],
+                )
             self.assertEqual(
                 run.call_args.kwargs["env"].get("YIELD_TEST_AUDIO_OUTPUT"),
                 "1" if case == "audition-coreaudio" else None,
@@ -524,6 +529,9 @@ class NativeCheckCleanupTests(unittest.TestCase):
 
     def test_native_redirect_rejects_a_pass_without_fresh_evidence(self) -> None:
         self.run_native_check(0, redirect_evidence=True, write_redirected_evidence=False)
+
+    def test_registration_generation_case_uses_native_handoff_and_retains_evidence(self) -> None:
+        self.run_native_check(0, case="prerequisite:source-registration-generation", redirect_evidence=True)
 
     def test_audition_refuses_before_coordinator_or_clean_state_without_opt_in(self) -> None:
         args = type(

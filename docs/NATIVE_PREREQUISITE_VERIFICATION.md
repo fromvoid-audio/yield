@@ -23,6 +23,7 @@ runner output paths and use the legacy evidence collection route.
 | profile-generations | macOS, Windows/MSVC | Original acquisition UUID/serial, clone-held OS lock, substitution/exhaustion and child-process release |
 | source-release-policy | macOS, Windows/MSVC | Two original Registered policy cases, generic missing-policy compatibility and two separate arithmetic cases |
 | source-release-policy integration | macOS | Three original all-owner graph/missing-policy/foreign-family refusal cases |
+| source-registration-generation | macOS | Seven registration-generation checks plus original Source rollback custody and foreign journal decision refusal |
 | startup-production | macOS | Original production bootstrap and exact descriptor-bound historical rebuild |
 | startup-control-failure | macOS | Original production BEGIN-denial diagnostic, preserved journal and retained credits |
 | startup-namespace-failure | macOS | Original production namespace failure and reply/worker lifetime |

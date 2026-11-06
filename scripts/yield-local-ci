@@ -692,6 +692,7 @@ def _check(args: argparse.Namespace) -> None:
             prerequisite_cases = {
                 "profile-generations",
                 "source-release-policy",
+                "source-registration-generation",
                 "startup-production",
                 "startup-control-failure",
                 "startup-namespace-failure",
