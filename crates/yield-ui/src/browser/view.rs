@@ -244,7 +244,7 @@ fn waveform_height(
     window_height: f32,
     theme: &Theme,
     toolbar_height: f32,
-    status_height: f32,
+    enlarged: bool,
 ) -> f32 {
     let minimum = MIN_WAVEFORM_HEIGHT.max(
         theme.waveform.title_height
@@ -254,16 +254,25 @@ fn waveform_height(
     );
     let maximum = (window_height
         - toolbar_height
-        - status_height
+        - theme.spacing.status_height
         - theme.spacing.row_height * MIN_LIST_ROWS
         - PANE_RESIZE_RAIL)
         .max(minimum)
         .min(MAX_WAVEFORM_HEIGHT.max(minimum));
-    bounded_size(
-        preferred.unwrap_or(theme.spacing.waveform_height),
-        minimum,
-        maximum,
-    )
+    let requested = preferred.unwrap_or_else(|| {
+        if enlarged {
+            return theme.spacing.waveform_height;
+        }
+        // At the minimum window, give the list one complete row plus the space
+        // needed by the wrapped toolbar. Ease back to the authored default as it grows.
+        let compact_fraction = ((crate::WINDOW_HEIGHT - window_height)
+            / (crate::WINDOW_HEIGHT - crate::MIN_WINDOW_HEIGHT))
+            .clamp(0.0, 1.0);
+        let toolbar_wrap_height = (toolbar_height - theme.spacing.toolbar_height).max(0.0);
+        theme.spacing.waveform_height
+            - compact_fraction * (theme.spacing.row_height + toolbar_wrap_height)
+    });
+    bounded_size(requested, minimum, maximum)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -618,22 +627,25 @@ impl Browser {
                 ),
                 self.preferred_filter_height,
             ),
-            PaneAxis::Waveform => (
-                waveform_height(
-                    self.preferred_waveform_height,
-                    f32::from(window.bounds().size.height),
-                    theme,
-                    browser_toolbar_height(
-                        f32::from(window.bounds().size.width),
+            PaneAxis::Waveform => {
+                let enlarged = self.general_settings.text_scale_percent
+                    == yield_session::ENLARGED_TEXT_SCALE_PERCENT;
+                (
+                    waveform_height(
+                        self.preferred_waveform_height,
+                        f32::from(window.bounds().size.height),
                         theme,
-                        self.general_settings.text_scale_percent
-                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
-                        self.waveform.is_some(),
+                        browser_toolbar_height(
+                            f32::from(window.bounds().size.width),
+                            theme,
+                            enlarged,
+                            self.waveform.is_some(),
+                        ),
+                        enlarged,
                     ),
-                    theme.spacing.status_height,
-                ),
-                self.preferred_waveform_height,
-            ),
+                    self.preferred_waveform_height,
+                )
+            }
         };
         self.pane_resize_drag = Some(PaneResizeDrag {
             axis,
@@ -701,6 +713,8 @@ impl Browser {
             }
             PaneAxis::Waveform => {
                 let requested = drag.gesture.requested_size(f32::from(position.y));
+                let enlarged = self.general_settings.text_scale_percent
+                    == yield_session::ENLARGED_TEXT_SCALE_PERCENT;
                 self.preferred_waveform_height = Some(waveform_height(
                     Some(requested),
                     f32::from(window.bounds().size.height),
@@ -708,11 +722,10 @@ impl Browser {
                     browser_toolbar_height(
                         f32::from(window.bounds().size.width),
                         theme,
-                        self.general_settings.text_scale_percent
-                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
+                        enlarged,
                         self.waveform.is_some(),
                     ),
-                    theme.spacing.status_height,
+                    enlarged,
                 ));
             }
         }
@@ -1526,7 +1539,7 @@ impl Render for Browser {
                 enlarged_text,
                 self.waveform.is_some(),
             ),
-            theme.spacing.status_height,
+            enlarged_text,
         );
         let motion_frame = self.motion_frame(theme.motion, window);
         let jobs = super::job_details::snapshot(self, cx);
@@ -5368,7 +5381,7 @@ mod tests {
                 1_200.0,
                 &theme,
                 theme.spacing.toolbar_height,
-                theme.spacing.status_height,
+                false,
             ),
             512.0
         );
@@ -5378,7 +5391,7 @@ mod tests {
                 560.0,
                 &theme,
                 theme.spacing.toolbar_height,
-                theme.spacing.status_height,
+                false,
             ) < 512.0
         );
         assert_eq!(
@@ -5387,7 +5400,7 @@ mod tests {
                 1_200.0,
                 &theme,
                 theme.spacing.toolbar_height,
-                theme.spacing.status_height,
+                false,
             ),
             512.0
         );
@@ -5402,8 +5415,40 @@ mod tests {
                 560.0,
                 &enlarged,
                 browser_toolbar_height(960.0, &enlarged, true, false),
-                enlarged.spacing.status_height,
+                true,
             ) >= minimum
+        );
+    }
+
+    #[test]
+    fn compact_waveform_default_releases_space_and_preserves_an_explicit_size() {
+        let theme = Theme::default();
+        let compact_toolbar = browser_toolbar_height(960.0, &theme, false, true);
+        let compact = waveform_height(
+            None,
+            crate::MIN_WINDOW_HEIGHT,
+            &theme,
+            compact_toolbar,
+            false,
+        );
+        let reclaimed = theme.spacing.waveform_height - compact;
+        assert_eq!(
+            reclaimed,
+            theme.spacing.row_height + compact_toolbar - theme.spacing.toolbar_height
+        );
+        assert_eq!(
+            waveform_height(
+                Some(theme.spacing.waveform_height),
+                crate::MIN_WINDOW_HEIGHT,
+                &theme,
+                compact_toolbar,
+                false,
+            ),
+            theme.spacing.waveform_height
+        );
+        assert_eq!(
+            waveform_height(None, crate::WINDOW_HEIGHT, &theme, compact_toolbar, false),
+            theme.spacing.waveform_height
         );
     }
 
