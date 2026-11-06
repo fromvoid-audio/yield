@@ -19,9 +19,15 @@ type Fetcher = typeof fetch;
 const SESSION_SECONDS = 7 * 24 * 60 * 60;
 const STATE_SECONDS = 10 * 60;
 const POLL_SECONDS = 5 * 60;
-const MAX_REQUEST_BYTES = 64 * 1024;
+const APPROVED_OWNER = 'PORTALSURFER';
+const APPROVED_REPO = 'yield';
+const MAX_TITLE_BYTES = 200;
+const MAX_BODY_BYTES = 60_000;
+// Allow the native JSON encoder to escape quotes, backslashes, tabs and newlines.
+const MAX_REQUEST_BYTES = 128 * 1024;
 const REQUEST_ID = /^[A-Za-z0-9_-]{32,128}$/;
 const SESSION_ID = /^[A-Za-z0-9_-]{32,128}$/;
+const UTF8 = new TextEncoder();
 
 function json(value: object, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -43,9 +49,9 @@ function configured(env: GatewayEnv): boolean {
   return Boolean(
     env.GITHUB_CLIENT_ID &&
     env.GITHUB_CLIENT_SECRET &&
-    env.GITHUB_OWNER &&
-    env.GITHUB_REPO &&
-    (env.GITHUB_OAUTH_SCOPE === 'public_repo' || env.GITHUB_OAUTH_SCOPE === 'repo') &&
+    env.GITHUB_OWNER === APPROVED_OWNER &&
+    env.GITHUB_REPO === APPROVED_REPO &&
+    env.GITHUB_OAUTH_SCOPE === 'repo' &&
     env.SESSIONS,
   );
 }
@@ -71,7 +77,22 @@ async function boundedText(response: Request | Response, maxBytes: number): Prom
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return new TextDecoder().decode(bytes);
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+}
+
+function issuePayload(payload: unknown): { title: string; body: string } | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).length !== 2)
+    return null;
+  const fields = payload as Record<string, unknown>;
+  if (typeof fields.title !== 'string' || typeof fields.body !== 'string') return null;
+  const title = fields.title.trim();
+  const body = fields.body.replace(/\r\n?/g, '\n');
+  const titleBytes = UTF8.encode(title).byteLength;
+  if (titleBytes < 3 || titleBytes > MAX_TITLE_BYTES || /[\x00-\x1f\x7f\u2028\u2029]/.test(title))
+    return null;
+  if (!body.trim() || UTF8.encode(body).byteLength > MAX_BODY_BYTES || /[\x00-\x08\x0b-\x1f\x7f]/.test(body))
+    return null;
+  return { title, body };
 }
 
 function bearer(request: Request): string | null {
@@ -163,13 +184,9 @@ export function createWorker(fetcher: Fetcher) {
         } catch {
           return json({ error: 'Invalid or oversized issue request' }, 400);
         }
-        if (!payload || typeof payload !== 'object') return json({ error: 'Invalid issue request' }, 400);
-        const { title, body } = payload as Record<string, unknown>;
-        if (typeof title !== 'string' || title.trim().length < 3 || title.trim().length > 200 ||
-            (body !== undefined && (typeof body !== 'string' || body.length > 60_000))) {
-          return json({ error: 'Invalid issue title or body' }, 400);
-        }
-        const issueUrl = `https://api.github.com/repos/${encodeURIComponent(env.GITHUB_OWNER)}/${encodeURIComponent(env.GITHUB_REPO)}/issues`;
+        const draft = issuePayload(payload);
+        if (!draft) return json({ error: 'Invalid issue title or body' }, 400);
+        const issueUrl = `https://api.github.com/repos/${APPROVED_OWNER}/${APPROVED_REPO}/issues`;
         let response: Response;
         try {
           // Deliberately one POST. A network/5xx outcome may have created the issue.
@@ -182,7 +199,7 @@ export function createWorker(fetcher: Fetcher) {
               'user-agent': 'yield-issue-gateway',
               'x-github-api-version': '2022-11-28',
             },
-            body: JSON.stringify({ title: title.trim(), body: body ?? '' }),
+            body: JSON.stringify(draft),
           });
         } catch {
           return json({ error: 'Submission outcome unknown; check the repository before retrying', outcome: 'unknown' }, 502);
@@ -195,7 +212,7 @@ export function createWorker(fetcher: Fetcher) {
           return json({ error: 'Submission outcome unknown; check the repository before retrying', outcome: 'unknown' }, 502);
         try {
           const issue = JSON.parse(await boundedText(response, 32 * 1024));
-          const expected = `https://github.com/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/issues/`;
+          const expected = `https://github.com/${APPROVED_OWNER}/${APPROVED_REPO}/issues/`;
           if (!Number.isSafeInteger(issue.number) || issue.number <= 0 ||
               issue.html_url !== `${expected}${issue.number}`) throw new Error('invalid response');
           return json({ ok: true, issue_url: issue.html_url, number: issue.number });
