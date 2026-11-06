@@ -411,6 +411,16 @@ impl NoEffectCompletion {
     }
 }
 impl PendingFence {
+    /// An unconfirmed durable write must retain the operation fence after issuer Drop.
+    pub(super) fn quarantine_uncertain_write(&self) {
+        let mut state = self
+            .fence
+            .state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        quarantine(&mut state);
+    }
+
     pub(super) fn bind_reserved_output(
         &self,
         output: uuid::Uuid,

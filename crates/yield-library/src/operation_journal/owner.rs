@@ -3018,7 +3018,7 @@ impl OwnerRuntime {
             .store()
             .checkpoint_staging_result_funded(validation, &input);
         let checkpoint: StagingCheckpointAck = self
-            .publication_write_result(checkpoint_result)?
+            .publication_write_result(&fence, checkpoint_result)?
             .ok_or_else(|| OperationJournalOwnerError::StagingGrant {
                 reason: String::from("replayed staging checkpoint cannot issue a grant"),
             })?;
@@ -3027,7 +3027,7 @@ impl OwnerRuntime {
         let grant_result = self
             .store()
             .reserve_staging_grant(checkpoint, validation, binding, &input);
-        self.publication_write_result(grant_result)?;
+        self.publication_write_result(&fence, grant_result)?;
         let output = match validation.outcome() {
             crate::file_operation_owner::EffectOutcome::Applied { evidence } => evidence
                 .validated_staging()
@@ -3070,6 +3070,7 @@ impl OwnerRuntime {
 
     fn publication_write_result<T>(
         &self,
+        fence: &publication_fence::PendingFence,
         result: Result<T, OperationJournalStoreError>,
     ) -> Result<T, OperationJournalOwnerError> {
         if matches!(
@@ -3078,6 +3079,7 @@ impl OwnerRuntime {
                 | OperationJournalStoreError::StagingNamespaceOutcomeUncertain)
         ) {
             self.resource_admission.invalidate();
+            fence.quarantine_uncertain_write();
         }
         result.map_err(Into::into)
     }
@@ -8420,29 +8422,6 @@ mod tests {
         _runtime: TestRuntimeGuard,
     }
 
-    #[test]
-    fn publication_namespace_exhaustion_after_commit_quarantines_original_runtime() {
-        let fixture = fixture("publication-namespace-uncertain-original-runtime");
-        let store = OperationJournalStore::open(&fixture.owner).unwrap();
-        let runtime = OwnerRuntime::new(store).unwrap();
-        assert!(runtime.resource_admission.activate(|| true));
-        let result: Result<(), OperationJournalStoreError> =
-            Err(OperationJournalStoreError::StagingNamespaceOutcomeUncertain);
-        assert!(matches!(
-            runtime.publication_write_result(result),
-            Err(OperationJournalOwnerError::Store(
-                OperationJournalStoreError::StagingNamespaceOutcomeUncertain
-            ))
-        ));
-        assert!(matches!(
-            runtime.resource_admission.validate_open(),
-            Err(resource_custody::UseError::Unknown)
-        ));
-        runtime.publication_write_result(Ok(())).unwrap();
-        assert!(!runtime.resource_admission.activate(|| true));
-        assert!(!runtime.resource_admission.close_and_wait());
-    }
-
     fn fixture(name: &str) -> Fixture {
         let runtime = TestRuntimeGuard::acquire();
         let base = tempfile::tempdir().expect("temporary config base");
@@ -12166,7 +12145,7 @@ mod tests {
             );
             return;
         }
-        let unused_for_release = release_after_entry.map(|_| {
+        let unused_for_release = (release_after_entry.is_some() || fault.is_some()).then(|| {
             let request = ChunkClaimRequest::new(ChunkId::new(), operation_id,
                 AdmissionClaim::new(AdmissionClaimId::new(), claim.claim().volume().clone(),
                     crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
@@ -12181,6 +12160,22 @@ mod tests {
             let unused = issued.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
             (request, unused.into_unused_permit())
         });
+        let cancellation_input = || {
+            let mut scan = client.scan_recovery_page(None).unwrap();
+            let page = scan.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+            let sequence = page
+                .entries()
+                .iter()
+                .find(|entry| {
+                    matches!(entry.key(),
+                        super::super::store::recovery::RecoveryKey::OperationId(id) if *id == operation_id)
+                })
+                .unwrap()
+                .sequence();
+            let observation =
+                CancellationRequestObservation::new(operation.updated_unix_ms + 1).unwrap();
+            (sequence, observation)
+        };
         if let Some((nth, _)) = fault {
             armed.store(nth, Ordering::Release);
         }
@@ -12207,6 +12202,32 @@ mod tests {
                 owner.shared.resource_admission.validate_open(),
                 Err(resource_custody::UseError::Unknown)
             ));
+            let (sequence, observation) = cancellation_input();
+            let mut cancel = client
+                .request_cancel_before_publish(operation_id, sequence, observation)
+                .unwrap();
+            assert!(matches!(
+                cancel.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Err(OperationJournalOwnerError::PublicationCancellationPending {
+                    operation_id: retained
+                }) if retained == operation_id
+            ));
+            let (request, unused) = unused_for_release.unwrap();
+            let release_id = Uuid::new_v4();
+            let mut release = client.release_chunk(unused, release_id).unwrap();
+            assert!(matches!(
+                release.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Err(OperationJournalOwnerError::PublicationChargeReleasePending {
+                    operation_id: retained
+                }) if retained == operation_id
+            ));
+            let mut retry = client
+                .retry_chunk_release(request.chunk_id(), operation_id, release_id)
+                .unwrap();
+            assert!(matches!(
+                retry.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Err(OperationJournalOwnerError::PublicationChargeReleasePending { .. })
+            ));
             let mut refused = client
                 .checkpoint_and_grant_staging(
                     prepare_target(),
@@ -12223,6 +12244,16 @@ mod tests {
             let _ = file_owner.shutdown();
             drop(database);
             assert!(!owner.shutdown());
+            let reopened = OperationJournalStore::open(&fixture.owner).unwrap();
+            assert_eq!(reopened.get(operation_id).unwrap(), Some(operation));
+            assert_eq!(
+                reopened
+                    .read_chunk_claim(request.chunk_id())
+                    .unwrap()
+                    .unwrap()
+                    .state(),
+                ChunkClaimState::Issued
+            );
             return;
         }
         let publication = publication_result.expect("acknowledged publication grant");
@@ -12286,20 +12317,8 @@ mod tests {
             return;
         }
         if let Some(entered) = cancel_after_entry {
-            let mut scan = client.scan_recovery_page(None).unwrap();
-            let page = scan.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
-            let sequence = page
-                .entries()
-                .iter()
-                .find(|entry| {
-                    matches!(entry.key(),
-                super::super::store::recovery::RecoveryKey::OperationId(id) if *id == operation_id)
-                })
-                .unwrap()
-                .sequence();
+            let (sequence, observation) = cancellation_input();
             let before = encode(&operation).unwrap();
-            let observation =
-                CancellationRequestObservation::new(operation.updated_unix_ms + 1).unwrap();
             if entered {
                 let permit = publication.begin_publication().unwrap();
                 assert_eq!(owner.shared.resource_admission.snapshot().1, 1);
