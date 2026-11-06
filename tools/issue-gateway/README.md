@@ -19,11 +19,21 @@ bytes for the body after line-ending normalization. The 128 KiB JSON cap
 allows for escaping. The approved destination is pinned to
 `PORTALSURFER/yield`. Other repository or OAuth scope settings fail closed.
 
+The Worker requires separate Cloudflare rate-limit bindings. Each public auth
+endpoint and `/issue` gets a 60-per-minute edge bucket keyed by endpoint and
+connecting IP. Authenticated issue creation also has a five-per-minute
+bucket keyed by a SHA-256 digest of the gateway session. A denied request
+returns HTTP 429 before GitHub receives an issue POST. The app retains the
+draft and permits an explicit retry. Cloudflare applies these abuse limits
+per location, with approximate counters.
+[Cloudflare Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
+
 ## Deployment prerequisites
 
 - The approved feedback destination is the existing private `PORTALSURFER/yield` repository. GitHub's OAuth `repo` scope grants access to all private repositories the authorizing user can access, not just Yield. Review that broad grant in the GitHub consent screen before connecting; the Worker only creates issues in `PORTALSURFER/yield`.
 - Create a separate GitHub OAuth app with callback `https://<new-yield-worker-host>/auth/callback`. Store its client secret using Wrangler secrets, never in this repo.
 - Create a new Yield KV namespace for `SESSIONS`. Do not reuse the legacy namespace or its sessions. Copy `wrangler.example.jsonc` to `wrangler.jsonc` and fill the new namespace ID; keep the approved repository and scope. The client ID is a deployment variable; the client secret is a secret.
+- Choose two distinct unused positive numeric Cloudflare rate-limit namespace IDs for `EDGE_RATE_LIMIT` and `ISSUE_SESSION_RATE_LIMIT` and fill both placeholders in the deployment config.
 - Review the Worker target and run its tests/typecheck. Run an OAuth connect, expiry, rejection, and confirmed issue-creation session against the approved target before pointing a release build at the Worker. Deployment and live issue creation require explicit approval.
 - Set the app's `YIELD_ISSUE_GATEWAY_URL` to the approved HTTPS Worker base URL. Without it, the Rust client reports that feedback is unconfigured. The GPUI prompt integration remains OPT-1896.
 

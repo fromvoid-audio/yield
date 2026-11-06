@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createWorker, type GatewayEnv, type SessionStore } from '../src/index';
+import { createWorker, type GatewayEnv, type RateLimiter, type SessionStore } from '../src/index';
 
 class MemoryStore implements SessionStore {
   values = new Map<string, string>();
@@ -23,8 +23,21 @@ class MemoryStore implements SessionStore {
   }
 }
 
+class MemoryLimiter implements RateLimiter {
+  keys: string[] = [];
+  allowed = true;
+  unavailable = false;
+  async limit({ key }: { key: string }) {
+    this.keys.push(key);
+    if (this.unavailable) throw new Error('private limiter error');
+    return { success: this.allowed };
+  }
+}
+
 function fixture(fetcher: typeof fetch = async () => { throw new Error('unexpected network'); }) {
   const sessions = new MemoryStore();
+  const edgeLimit = new MemoryLimiter();
+  const issueLimit = new MemoryLimiter();
   const env: GatewayEnv = {
     GITHUB_CLIENT_ID: 'public-client',
     GITHUB_CLIENT_SECRET: 'private-secret-never-show',
@@ -32,10 +45,12 @@ function fixture(fetcher: typeof fetch = async () => { throw new Error('unexpect
     GITHUB_REPO: 'yield',
     GITHUB_OAUTH_SCOPE: 'repo',
     SESSIONS: sessions,
+    EDGE_RATE_LIMIT: edgeLimit,
+    ISSUE_SESSION_RATE_LIMIT: issueLimit,
   };
   const worker = createWorker(fetcher);
   const call = (path: string, init?: RequestInit) => worker.fetch(new Request(`https://gateway.test${path}`, init), env);
-  return { sessions, env, call };
+  return { sessions, env, call, edgeLimit, issueLimit };
 }
 
 const requestId = 'a'.repeat(43);
@@ -74,6 +89,66 @@ describe('Yield issue gateway', () => {
     });
     expect(response.status).toBe(503);
     expect(calls).toBe(0);
+  });
+
+  it('throttles all OAuth paths and unauthenticated issue requests at the edge', async () => {
+    let calls = 0;
+    const { call, sessions, edgeLimit, issueLimit } = fixture(async () => {
+      calls += 1;
+      throw new Error('unexpected upstream');
+    });
+    edgeLimit.allowed = false;
+    const headers = { 'cf-connecting-ip': '203.0.113.7', 'x-forwarded-for': '198.51.100.3' };
+    for (const path of ['start', 'callback', 'poll']) {
+      const response = await call(`/auth/${path}?requestId=${requestId}`, { headers });
+      expect(response.status).toBe(429);
+      expect(response.headers.get('retry-after')).toBe('60');
+    }
+    expect((await call('/issue', { method: 'POST', headers })).status).toBe(429);
+    expect(edgeLimit.keys).toEqual([
+      '/auth/start:203.0.113.7', '/auth/callback:203.0.113.7',
+      '/auth/poll:203.0.113.7', '/issue:203.0.113.7',
+    ]);
+    expect(sessions.values.size).toBe(0);
+    expect(issueLimit.keys).toEqual([]);
+    expect(calls).toBe(0);
+  });
+
+  it('throttles authenticated issues by a stable digest without exposing the bearer', async () => {
+    let calls = 0;
+    const { call, sessions, issueLimit } = fixture(async () => {
+      calls += 1;
+      throw new Error('unexpected upstream');
+    });
+    sessions.values.set(`sess:${sessionId}`, 'github-private-token');
+    issueLimit.allowed = false;
+    const init = {
+      method: 'POST',
+      headers: { authorization: `Bearer ${sessionId}` },
+      body: JSON.stringify({ title: 'Valid report', body: 'Details' }),
+    };
+    for (let i = 0; i < 2; i += 1) {
+      const response = await call('/issue', init);
+      expect(response.status).toBe(429);
+      expect(await response.text()).not.toContain(sessionId);
+    }
+    expect(issueLimit.keys[0]).toMatch(/^[0-9a-f]{64}$/);
+    expect(issueLimit.keys[1]).toBe(issueLimit.keys[0]);
+    expect(issueLimit.keys[0]).not.toContain(sessionId);
+    expect(calls).toBe(0);
+  });
+
+  it('fails closed for missing or unavailable rate bindings without leaking errors', async () => {
+    const { call, env, sessions, edgeLimit } = fixture();
+    edgeLimit.unavailable = true;
+    const response = await call(`/auth/start?requestId=${requestId}`);
+    expect(response.status).toBe(503);
+    expect(await response.text()).not.toContain('private limiter error');
+    expect(sessions.values.size).toBe(0);
+    edgeLimit.unavailable = false;
+    Reflect.deleteProperty(env, 'ISSUE_SESSION_RATE_LIMIT');
+    expect((await call(`/auth/start?requestId=${requestId}`)).status).toBe(503);
+    expect(sessions.values.size).toBe(0);
   });
 
   it('requires an unguessable request ID and emits no token in the auth page', async () => {
