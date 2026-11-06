@@ -111,6 +111,63 @@ mod fixtures {
     }
 
     #[test]
+    fn audited_audio_input_reads_exact_bytes_without_claiming_a_job() {
+        let relative = Path::new("nested/tone.wav");
+        let (fixture, writer, _) = setup_relative(relative);
+        let revision = writer.current_revision().unwrap();
+        let path = RootRelativePath::try_from_path(relative.into()).unwrap();
+        let held = writer.prepare_audio_input(&revision, &path).unwrap();
+        let expected = fs::read(fixture.root.path().join(relative)).unwrap();
+        assert_eq!(
+            held.read_verified_bytes(&AtomicBool::new(false)).unwrap(),
+            expected,
+        );
+        writer.validate_audio_input(&held).unwrap();
+        assert_eq!(writer.current_revision().unwrap(), revision);
+        assert_eq!(status(&fixture), "pending");
+        assert_eq!(artifact_count(&fixture), 0);
+
+        drop(writer);
+        assert_eq!(held.validate(), Err(SourceFeatureInputError::Changed));
+    }
+
+    #[test]
+    fn audited_audio_input_rejects_changed_manifest_before_publication() {
+        let (_fixture, writer, _) = setup();
+        let path = RootRelativePath::try_from_path("tone.wav".into()).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let held = writer.prepare_audio_input(&revision, &path).unwrap();
+        let fence = writer.current_scan_fence().unwrap();
+        let mut batch = writer.catalog_database().write_batch().unwrap();
+        batch.set_missing(path.as_path(), true).unwrap();
+        writer.commit_scan_manifest_batch(&fence, batch).unwrap();
+
+        assert!(writer.prepare_audio_input(&revision, &path).is_err());
+        assert!(writer.validate_audio_input(&held).is_err());
+    }
+
+    #[test]
+    fn audited_audio_input_rejects_replaced_file_before_publication() {
+        let (fixture, writer, _) = setup();
+        let path = RootRelativePath::try_from_path("tone.wav".into()).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let held = writer.prepare_audio_input(&revision, &path).unwrap();
+        let file = fixture.root.path().join(path.as_path());
+        let displaced = file.with_extension("old");
+        fs::rename(&file, &displaced).unwrap();
+        fs::copy(&displaced, &file).unwrap();
+
+        assert!(matches!(
+            writer.validate_audio_input(&held),
+            Err(SourceWriterError::FeatureInput(
+                SourceFeatureInputError::Changed
+            ))
+        ));
+        assert!(writer.prepare_audio_input(&revision, &path).is_err());
+        assert_eq!(status(&fixture), "pending");
+    }
+
+    #[test]
     fn feature_job_computes_real_vector_on_thread_before_atomic_ready() {
         let (fixture, mut writer, target) = setup();
         assert_eq!(status(&fixture), "pending");
