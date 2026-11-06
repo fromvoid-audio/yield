@@ -5,6 +5,7 @@ use crate::sample_sources::db::{
     SourcePublicationFence,
     file_ops_journal::{BoundDatabaseRoot, HeldIndexFile},
 };
+use crate::sample_sources::reconciliation::RootRelativePath;
 use std::{
     io::{self, BufReader, Read},
     sync::{
@@ -56,6 +57,9 @@ pub enum SourceFeatureInputError {
     /// Current committed content hash differs from the held file bytes.
     #[error("feature input content changed")]
     ContentChanged,
+    /// The current audited row has no completed content digest.
+    #[error("Source content digest is pending")]
+    ContentPending,
 }
 
 /// Failure while reading or processing a held Source audio stream.
@@ -83,10 +87,21 @@ pub struct SourceFeatureInput {
     pub(crate) identity: String,
     pub(crate) size: u64,
     pub(crate) modified: i64,
-    pub(crate) content: String,
+    pub(crate) content: Option<String>,
     pub(crate) _permit: InputPermit,
 }
 impl SourceFeatureInput {
+    pub(crate) fn content_hash(&self) -> Result<&str, SourceFeatureInputError> {
+        self.content
+            .as_deref()
+            .ok_or(SourceFeatureInputError::ContentPending)
+    }
+
+    /// Encoded length admitted by the audited held file.
+    pub fn encoded_len(&self) -> u64 {
+        self.size
+    }
+
     /// Revalidate owner, root and every named descriptor edge before publication.
     pub fn validate(&self) -> Result<(), SourceFeatureInputError> {
         if self.owner.upgrade().is_none() {
@@ -137,6 +152,19 @@ impl SourceFeatureInput {
         cancel: &AtomicBool,
         process: impl FnOnce(&mut dyn Read) -> Result<T, E>,
     ) -> Result<T, SourceAudioStreamError<E>> {
+        let expected = self.content_hash()?;
+        let (output, digest) = self.with_held_audio_reader(cancel, process)?;
+        if digest.to_hex().as_str() != expected {
+            return Err(SourceFeatureInputError::ContentChanged.into());
+        }
+        Ok(output)
+    }
+
+    fn with_held_audio_reader<T, E>(
+        &self,
+        cancel: &AtomicBool,
+        process: impl FnOnce(&mut dyn Read) -> Result<T, E>,
+    ) -> Result<(T, blake3::Hash), SourceAudioStreamError<E>> {
         if cancel.load(Ordering::Acquire) {
             return Err(SourceFeatureInputError::Cancelled.into());
         }
@@ -174,10 +202,56 @@ impl SourceFeatureInput {
         if cancel.load(Ordering::Acquire) {
             return Err(SourceFeatureInputError::Cancelled.into());
         }
-        if checked.remaining != 0 || checked.digest.finalize().to_hex().as_str() != self.content {
+        if checked.remaining != 0 {
             return Err(SourceFeatureInputError::ContentChanged.into());
         }
-        Ok(output)
+        Ok((output, checked.digest.finalize()))
+    }
+}
+
+/// Held input for an audited entry whose scanner digest is still pending.
+pub struct PendingSourceContentInput {
+    pub(crate) input: SourceFeatureInput,
+    pub(crate) relative_path: RootRelativePath,
+}
+
+/// Complete digest observation retaining the original file and Source custody.
+pub struct PreparedSourceContentDigest {
+    pub(crate) input: SourceFeatureInput,
+    pub(crate) relative_path: RootRelativePath,
+    digest: String,
+}
+
+impl PendingSourceContentInput {
+    /// Hash all encoded bytes on a compute worker. No Source mutation occurs.
+    pub fn compute(
+        self,
+        cancel: &AtomicBool,
+    ) -> Result<PreparedSourceContentDigest, SourceFeatureInputError> {
+        let (_, digest) = self
+            .input
+            .with_held_audio_reader(cancel, |_| Ok::<_, std::convert::Infallible>(()))
+            .map_err(|error| match error {
+                SourceAudioStreamError::Input(error) => error,
+                SourceAudioStreamError::Processing(never) => match never {},
+            })?;
+        Ok(PreparedSourceContentDigest {
+            input: self.input,
+            relative_path: self.relative_path,
+            digest: digest.to_hex().to_string(),
+        })
+    }
+}
+
+impl PreparedSourceContentDigest {
+    /// Scanner-format BLAKE3 digest of the complete held input.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Original audited entry locator.
+    pub fn relative_path(&self) -> &RootRelativePath {
+        &self.relative_path
     }
 }
 

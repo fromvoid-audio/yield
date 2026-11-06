@@ -7,7 +7,7 @@ mod normalize;
 mod resample;
 mod silence;
 pub(crate) mod wav_pcm;
-pub use wav_pcm::{WavPcm, decode_wav_pcm};
+pub use wav_pcm::{WavPcm, WavPcmDecodeError, decode_wav_pcm};
 
 /// Fixed sample rate used during analysis.
 pub const ANALYSIS_SAMPLE_RATE: u32 = 16_000;
