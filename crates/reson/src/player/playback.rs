@@ -3,7 +3,7 @@ use crate::telemetry;
 use crate::timebase::{frames_to_seconds, seconds_to_frames_round};
 use crate::{AsyncSource, Source};
 
-use super::metronome::MetronomeSource;
+use super::metronome::{MetronomeMixOverride, MetronomeSource};
 use super::playback_span_handle::plan_anchor_frame;
 use super::{
     AudioPlaybackSource, AudioPlayer, EditFadeSource, PlaybackChannelLayout,
@@ -12,8 +12,8 @@ use super::{
 };
 
 use lazy_sources::{
-    InterleavedF32FileRepeatingSpanSource, InterleavedF32FileSpanSource, LazyRepeatingSpanSource,
-    LazySpanSource, PcmWavFileRepeatingSpanSource, PcmWavFileSpanSource,
+    AiffSpanSource, InterleavedF32FileRepeatingSpanSource, InterleavedF32FileSpanSource,
+    LazyRepeatingSpanSource, LazySpanSource, PcmWavFileRepeatingSpanSource, PcmWavFileSpanSource,
 };
 mod lazy_sources;
 mod loop_mode;
@@ -127,6 +127,24 @@ impl AudioPlayer {
             offset_seconds,
             replace_policy,
             metronome,
+        )
+    }
+
+    pub(super) fn play_prepared_tempo_span(
+        &mut self,
+        plan: PlaybackSpanPlan,
+        replace_policy: PlaybackRuntimeReplacePolicy,
+    ) -> Result<(), String> {
+        let duration = plan.end_seconds();
+        self.start_with_span_plan(
+            0.0,
+            duration,
+            duration,
+            plan.looped(),
+            replace_policy,
+            None,
+            Some(plan),
+            plan.seek_offset_frames() != 0,
         )
     }
 
@@ -429,13 +447,16 @@ impl AudioPlayer {
         }
 
         let plan_started_at = playback_stage_started();
-        let plan = planned.unwrap_or(self.playback_span_plan(
-            start_seconds,
-            end_seconds,
-            duration,
-            looped,
-            PlaybackSeekBehavior::SpanStart,
-        )?);
+        let plan = match planned {
+            Some(plan) => plan,
+            None => self.playback_span_plan(
+                start_seconds,
+                end_seconds,
+                duration,
+                looped,
+                PlaybackSeekBehavior::SpanStart,
+            )?,
+        };
         log_playback_stage("span_plan", plan_started_at, source_kind, looped);
         let sample_rate = plan.layout().sample_rate();
         let channels = plan.layout().channels();
@@ -454,7 +475,7 @@ impl AudioPlayer {
                     samples,
                     playback_span.clone(),
                     SpanSamplesMode::Looped,
-                    plan.start_sample(),
+                    plan.seek_sample(),
                 )
                 .with_edge_fade(self.anti_clip_fade())
                 .with_live_loop_mode(mode.clone());
@@ -485,7 +506,7 @@ impl AudioPlayer {
                 self.edit_fade_handle.clone(),
                 plan.start_seconds(),
                 plan.frame_count(),
-                0,
+                plan.seek_offset_frames(),
             );
             Box::new(editable)
         } else {
@@ -530,8 +551,13 @@ impl AudioPlayer {
             );
             Box::new(editable)
         };
-        let final_source =
-            source_with_metronome(final_source, metronome, &plan, active_playback_span.clone());
+        let final_source = source_with_metronome(
+            final_source,
+            metronome,
+            &plan,
+            active_playback_span.clone(),
+            self.metronome_mix_override.clone(),
+        );
         let final_source: Box<dyn Source<Item = f32> + Send> = if self.playback_samples.is_none() {
             Box::new(LiveLoopModeSource::new(final_source, mode.clone()))
         } else {
@@ -564,7 +590,8 @@ impl AudioPlayer {
         );
         let (handle, format) = self.build_sink_with_fade(final_source, replace_policy)?;
         let finish_started_at = playback_stage_started();
-        let initial_offset = (!looped).then_some(plan.seek_offset_frames());
+        let offset = plan.seek_offset_frames();
+        let initial_offset = (!looped || offset != 0).then_some(offset);
         self.finish_span_playback(&plan, initial_offset);
         self.active_playback_span = active_playback_span;
         self.active_loop_mode = Some(mode);
@@ -710,8 +737,13 @@ impl AudioPlayer {
                 plan.sample_count(),
             ))
         };
-        let diagnostic =
-            source_with_metronome(diagnostic, metronome, &plan, active_playback_span.clone());
+        let diagnostic = source_with_metronome(
+            diagnostic,
+            metronome,
+            &plan,
+            active_playback_span.clone(),
+            self.metronome_mix_override.clone(),
+        );
         let diagnostic: Box<dyn Source<Item = f32> + Send> = if self.playback_samples.is_none() {
             Box::new(LiveLoopModeSource::new(diagnostic, mode.clone()))
         } else {
@@ -751,12 +783,15 @@ impl AudioPlayer {
             self.sample_rate.unwrap_or(44_100).max(1),
         )
         .map_err(|err| err.to_string())?;
-        PlaybackSpanPlan::new(
-            source.identity(),
-            layout,
-            PlaybackSpanRequest::new(start_seconds, end_seconds, duration, looped, seek),
-        )
-        .map_err(|err| err.to_string())
+        let mut request =
+            PlaybackSpanRequest::new(start_seconds, end_seconds, duration, looped, seek);
+        if let AudioPlaybackSource::File(path) = &source
+            && yield_aiff::is_aiff_path(path)
+            && let Some(frames) = self.track_total_frames
+        {
+            request = request.with_exact_track_frames(frames);
+        }
+        PlaybackSpanPlan::new(source.identity(), layout, request).map_err(|err| err.to_string())
     }
 
     fn finish_span_playback(&mut self, span: &PlaybackSpanPlan, offset_frames: Option<u64>) {
@@ -898,18 +933,20 @@ fn source_with_metronome(
     metronome: Option<PlaybackMetronomeConfig>,
     plan: &PlaybackSpanPlan,
     live_control: Option<PlaybackSpanHandle>,
+    mix_override: MetronomeMixOverride,
 ) -> Box<dyn Source<Item = f32> + Send> {
-    match (live_control, metronome) {
-        (Some(control), _) => Box::new(MetronomeSource::new_live(source, control)),
-        (None, Some(config)) => Box::new(MetronomeSource::new(
+    let metronome_source = match (live_control, metronome) {
+        (Some(control), _) => MetronomeSource::new_live(source, control),
+        (None, Some(config)) => MetronomeSource::new(
             source,
             config,
             plan.frame_count(),
             plan.seek_offset_frames(),
             plan_anchor_frame(plan),
-        )),
-        (None, None) => source,
-    }
+        ),
+        (None, None) => return source,
+    };
+    Box::new(metronome_source.with_mix_override(mix_override))
 }
 
 fn playback_stage_started() -> Option<std::time::Instant> {
@@ -944,6 +981,9 @@ fn span_source_for_audio_source(
         AudioPlaybackSource::InterleavedF32File { path, sample_count } => Ok(Box::new(
             InterleavedF32FileSpanSource::new(path, plan, sample_count),
         )),
+        AudioPlaybackSource::File(path) if yield_aiff::is_aiff_path(&path) => {
+            Ok(Box::new(AiffSpanSource::try_new(&path, plan, false)?))
+        }
         AudioPlaybackSource::File(path) => {
             match PcmWavFileSpanSource::try_new(path.clone(), plan) {
                 Ok(source) => Ok(Box::new(source)),
@@ -965,6 +1005,9 @@ fn repeating_source_for_audio_source(
         AudioPlaybackSource::InterleavedF32File { path, sample_count } => Ok(Box::new(
             InterleavedF32FileRepeatingSpanSource::new(path, plan, sample_count),
         )),
+        AudioPlaybackSource::File(path) if yield_aiff::is_aiff_path(&path) => {
+            Ok(Box::new(AiffSpanSource::try_new(&path, plan, true)?))
+        }
         AudioPlaybackSource::File(path) => {
             match PcmWavFileRepeatingSpanSource::try_new(path.clone(), plan) {
                 Ok(source) => Ok(Box::new(source)),

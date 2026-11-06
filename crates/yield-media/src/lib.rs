@@ -8,9 +8,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+use yield_aiff::{AiffPcmReader, is_aiff_path};
 use yield_analysis::probe_metadata;
 use yield_core::AudioFile;
-use yield_library::sample_sources::is_recognized_audio;
+use yield_library::sample_sources::{is_apple_double_sidecar, is_recognized_audio};
 
 mod detail;
 mod edit_intent;
@@ -27,7 +28,7 @@ mod zero_crossing;
 pub use detail::{
     MAX_WAVEFORM_DETAIL_COLUMNS, MAX_WAVEFORM_DETAIL_VISIBLE_FRAMES, WaveformDetailContext,
     WaveformDetailRange, WaveformDetailRequest, WaveformDetailResult, WaveformFileRevision,
-    WaveformSpec, load_waveform_detail, load_waveform_detail_with_cancel,
+    WaveformSpec, load_waveform_detail, load_waveform_detail_with_cancel, with_fenced_wav_read,
 };
 pub use edit_intent::{
     WaveformEditIntentAdapterError, waveform_edit_intent, waveform_edit_request,
@@ -235,7 +236,7 @@ pub fn load_waveform_preview(path: &Path) -> Result<WaveformPreview, String> {
     load_waveform_preview_with_cancel(path, None)
 }
 
-/// Decode a full-length WAV waveform while honoring an optional cancellation flag.
+/// Decode a full-length WAV or uncompressed AIFF overview with optional cancellation.
 pub fn load_waveform_preview_with_cancel(
     path: &Path,
     cancellation: Option<&AtomicBool>,
@@ -243,9 +244,12 @@ pub fn load_waveform_preview_with_cancel(
     if is_cancelled(cancellation) {
         return Err(String::from("waveform preview canceled"));
     }
+    if !is_apple_double_sidecar(path) && is_aiff_path(path) {
+        return load_aiff_overview(path, cancellation);
+    }
     if !is_wav_path(path) {
         return Err(format!(
-            "{} waveform preview currently requires WAV channel metadata",
+            "{} waveform preview requires WAV or uncompressed AIFF",
             path.display()
         ));
     }
@@ -267,36 +271,23 @@ pub fn load_waveform_preview_with_cancel(
         .reader
         .seek(0)
         .map_err(|error| format!("Failed to rewind WAV {}: {error}", path.display()))?;
-    let normalization_gain = if global_peak.is_finite() && global_peak >= f32::MIN_POSITIVE {
-        1.0 / global_peak
-    } else {
-        1.0
-    };
-    let peak_count = total_frames.min(MAX_WAVEFORM_POINTS);
-    let mut peaks = vec![0.0_f32; peak_count];
-    let mut bands = visual_bands::StreamingProjector::new(
-        spec.sample_rate,
-        total_frames,
-        MAX_WAVEFORM_BAND_POINTS,
-    );
+    let normalization_gain = overview_gain(global_peak);
+    let mut projector = OverviewProjector::new(spec.sample_rate, total_frames, normalization_gain);
     stream_wav_frames(
         &mut opened.reader,
         spec,
         channels,
         total_frames,
         cancellation,
-        |frame_index, mono| {
-            let normalized = sanitize_stream_sample(mono * normalization_gain);
-            let peak_index = column_index(frame_index, total_frames, peak_count);
-            peaks[peak_index] = peaks[peak_index].max(normalized.abs());
-            bands.push(frame_index, normalized);
+        |frame, mono| {
+            projector.push(frame, mono);
             Ok(())
         },
     )?;
     if is_cancelled(cancellation) {
         return Err(String::from("waveform preview canceled"));
     }
-    let (bands, visual_band_gains) = bands.finish();
+    let overview = projector.finish();
     let after = detail::recheck_wav(path, &opened, cancellation)?;
     detail::ensure_file_unchanged(&opened.observation, &after)?;
     let detail_context = detail::context_from_observations(
@@ -306,7 +297,7 @@ pub fn load_waveform_preview_with_cancel(
         spec,
         total_frames,
         normalization_gain,
-        visual_band_gains,
+        overview.visual_band_gains,
     );
     let duration_seconds = total_frames as f64 / spec.sample_rate as f64;
     let duration_seconds = duration_seconds as f32;
@@ -314,13 +305,151 @@ pub fn load_waveform_preview_with_cancel(
         return Err(format!("{} has an invalid WAV duration", path.display()));
     }
     Ok(WaveformPreview {
-        peaks,
-        bands,
+        peaks: overview.peaks,
+        bands: overview.bands,
         duration_seconds,
         sample_rate: spec.sample_rate,
         total_frames,
         detail_context,
     })
+}
+
+fn load_aiff_overview(
+    path: &Path,
+    cancellation: Option<&AtomicBool>,
+) -> Result<WaveformPreview, String> {
+    let file = detail::open_waveform_source(path)
+        .map_err(|error| format!("AIFF preview failed for {}: {error}", path.display()))?;
+    load_aiff_overview_from_file(path, file, cancellation)
+}
+
+fn load_aiff_overview_from_file(
+    path: &Path,
+    file: fs::File,
+    cancellation: Option<&AtomicBool>,
+) -> Result<WaveformPreview, String> {
+    let before = detail::observe_file(path, &file)?;
+    let reader_file = file
+        .try_clone()
+        .map_err(|error| format!("AIFF preview failed to retain {}: {error}", path.display()))?;
+    let mut reader =
+        AiffPcmReader::from_file(reader_file, path).map_err(|error| error.to_string())?;
+    detail::ensure_file_unchanged(&before, &detail::observe_file(path, &file)?)?;
+    let sample_rate = reader.sample_rate();
+    let total_frames = usize::try_from(reader.frames())
+        .map_err(|_| String::from("AIFF frame count exceeds platform limits"))?;
+    let channels = usize::from(reader.channels());
+    let mut global_peak = 0.0_f32;
+    stream_aiff_frames(
+        &mut reader,
+        channels,
+        total_frames,
+        cancellation,
+        |_, mono| {
+            global_peak = global_peak.max(mono.abs());
+            Ok(())
+        },
+    )?;
+    if is_cancelled(cancellation) {
+        return Err(String::from("waveform preview canceled"));
+    }
+    reader.seek_frame(0).map_err(|error| error.to_string())?;
+    let mut projector =
+        OverviewProjector::new(sample_rate, total_frames, overview_gain(global_peak));
+    stream_aiff_frames(
+        &mut reader,
+        channels,
+        total_frames,
+        cancellation,
+        |frame, mono| {
+            projector.push(frame, mono);
+            Ok(())
+        },
+    )?;
+    if is_cancelled(cancellation) {
+        return Err(String::from("waveform preview canceled"));
+    }
+    detail::ensure_file_unchanged(&before, &detail::observe_file(path, &file)?)?;
+    let overview = projector.finish();
+    Ok(WaveformPreview {
+        peaks: overview.peaks,
+        bands: overview.bands,
+        duration_seconds: (total_frames as f64 / f64::from(sample_rate)) as f32,
+        sample_rate,
+        total_frames,
+        detail_context: None,
+    })
+}
+
+fn stream_aiff_frames(
+    reader: &mut AiffPcmReader,
+    channels: usize,
+    total_frames: usize,
+    cancellation: Option<&AtomicBool>,
+    process: impl FnMut(usize, f32) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut samples = std::iter::from_fn(|| reader.read_sample().transpose());
+    stream_sample_frames(
+        &mut samples,
+        channels,
+        total_frames,
+        cancellation,
+        "AIFF PCM",
+        sanitize_stream_sample,
+        process,
+    )
+}
+
+fn overview_gain(global_peak: f32) -> f32 {
+    if global_peak.is_finite() && global_peak >= f32::MIN_POSITIVE {
+        1.0 / global_peak
+    } else {
+        1.0
+    }
+}
+
+struct OverviewColumns {
+    peaks: Vec<f32>,
+    bands: Vec<[f32; 4]>,
+    visual_band_gains: [f32; 3],
+}
+
+struct OverviewProjector {
+    peaks: Vec<f32>,
+    bands: visual_bands::StreamingProjector,
+    total_frames: usize,
+    normalization_gain: f32,
+}
+
+impl OverviewProjector {
+    fn new(sample_rate: u32, total_frames: usize, normalization_gain: f32) -> Self {
+        Self {
+            peaks: vec![0.0; total_frames.min(MAX_WAVEFORM_POINTS)],
+            bands: visual_bands::StreamingProjector::new(
+                sample_rate,
+                total_frames,
+                MAX_WAVEFORM_BAND_POINTS,
+            ),
+            total_frames,
+            normalization_gain,
+        }
+    }
+
+    fn push(&mut self, frame: usize, mono: f32) {
+        let normalized = sanitize_stream_sample(mono * self.normalization_gain);
+        let column = column_index(frame, self.total_frames, self.peaks.len());
+        self.peaks[column] = self.peaks[column].max(normalized.abs());
+        self.bands.push(frame, normalized);
+    }
+
+    fn finish(self) -> OverviewColumns {
+        let (bands, visual_band_gains) = self.bands.finish();
+        OverviewColumns {
+            peaks: self.peaks,
+            bands,
+            visual_band_gains,
+        }
+    }
 }
 
 fn stream_global_mono_peak<R: Read>(
@@ -398,7 +527,7 @@ where
     }
 }
 
-fn stream_sample_frames<T, I, D, F>(
+fn stream_sample_frames<T, I, D, F, E>(
     samples: &mut I,
     channels: usize,
     total_frames: usize,
@@ -408,7 +537,8 @@ fn stream_sample_frames<T, I, D, F>(
     mut process: F,
 ) -> Result<(), String>
 where
-    I: Iterator<Item = Result<T, hound::Error>>,
+    I: Iterator<Item = Result<T, E>>,
+    E: std::fmt::Display,
     D: FnMut(T) -> f32,
     F: FnMut(usize, f32) -> Result<(), String>,
 {
@@ -422,7 +552,7 @@ where
                 .next()
                 .transpose()
                 .map_err(|error| format!("failed to read {sample_kind} sample: {error}"))?
-                .ok_or_else(|| String::from("WAV ended before declared frame count"))?;
+                .ok_or_else(|| format!("{sample_kind} stream ended before declared frame count"))?;
             sum += decode(sample);
         }
         process(frame_index, sum / channels as f32)?;
@@ -453,7 +583,11 @@ pub(crate) fn is_cancelled(cancellation: Option<&AtomicBool>) -> bool {
 }
 
 fn is_wav_path(path: &Path) -> bool {
-    yield_library::sample_sources::is_supported_audio(path)
+    !is_apple_double_sidecar(path)
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
 }
 
 #[cfg(test)]
@@ -724,8 +858,8 @@ mod tests {
         for name in [
             "._kick.wav",
             "nested/._KICK.WAV",
-            "loop.aif",
-            "loop.aiff",
+            "nested/._loop.AIF",
+            "._loop.aiff",
             "loop.flac",
             "loop.mp3",
         ] {
@@ -738,6 +872,79 @@ mod tests {
                 .unwrap_err(),
             "waveform preview canceled"
         );
+    }
+
+    const AIFF_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-fixtures/stereo-pcm16.aiff"
+    ));
+
+    #[test]
+    fn aiff_overview_matches_wav_projection_for_equivalent_pcm() {
+        let directory = TempDir::new().unwrap();
+        let wav = directory.path().join("clip.wav");
+        let mut writer = WavWriter::create(
+            &wav,
+            WavSpec {
+                channels: 2,
+                sample_rate: 48_000,
+                bits_per_sample: 16,
+                sample_format: SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for sample in [-32768_i16, 16384, 0, -16384] {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        let expected = load_waveform_preview(&wav).unwrap();
+        let aiff = directory.path().join("clip.AIF");
+        fs::write(&aiff, AIFF_FIXTURE).unwrap();
+        let preview = load_waveform_preview(&aiff).unwrap();
+        assert_eq!(preview.sample_rate, 48_000);
+        assert_eq!(preview.total_frames, 2);
+        assert_eq!(preview.duration_seconds, 2.0 / 48_000.0);
+        assert_eq!(preview.peaks, expected.peaks);
+        assert_eq!(preview.bands, expected.bands);
+        assert!(preview.detail_context.is_none());
+    }
+
+    #[test]
+    fn aiff_overview_rejects_invalid_input_and_honors_stream_cancellation() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("clip.aiff");
+        fs::write(&path, &AIFF_FIXTURE[..AIFF_FIXTURE.len() - 1]).unwrap();
+        assert!(
+            load_waveform_preview(&path)
+                .unwrap_err()
+                .contains("sample data")
+        );
+        fs::write(&path, AIFF_FIXTURE).unwrap();
+        let mut reader = AiffPcmReader::from_file(fs::File::open(&path).unwrap(), &path).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut frames_read = 0;
+        let error = stream_aiff_frames(&mut reader, 2, 2, Some(&cancel), |_, _| {
+            frames_read += 1;
+            cancel.store(true, AtomicOrdering::Release);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error, "waveform preview canceled");
+        assert_eq!(frames_read, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aiff_overview_rejects_path_replaced_after_open() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("clip.aiff");
+        fs::write(&path, AIFF_FIXTURE).unwrap();
+        let file = detail::open_waveform_source(&path).unwrap();
+        let replacement = directory.path().join("replacement.aiff");
+        fs::write(&replacement, AIFF_FIXTURE).unwrap();
+        fs::rename(replacement, &path).unwrap();
+        let error = load_aiff_overview_from_file(&path, file, None).unwrap_err();
+        assert!(error.contains("source was replaced"));
     }
 
     #[test]

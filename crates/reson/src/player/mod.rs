@@ -16,7 +16,7 @@ mod runtime;
 mod state;
 pub(crate) use edit_fade_impl::{EditFadeHandle, EditFadeSource};
 pub use edit_fade_impl::{EditFadeRange, FadeParams};
-pub use metronome::PlaybackMetronomeConfig;
+pub use metronome::{MetronomeSound, PlaybackMetronomeConfig, PlaybackMetronomeMix};
 pub(crate) use playback_span_handle::PlaybackSpanHandle;
 pub use playback_span_plan::{
     PlaybackChannelLayout, PlaybackSeekBehavior, PlaybackSourceIdentity, PlaybackSourceKind,
@@ -29,7 +29,7 @@ pub use runtime::{
     PlaybackRuntimeGainNormalization, PlaybackRuntimeHandle, PlaybackRuntimeMode,
     PlaybackRuntimeProgress, PlaybackRuntimeReplacePolicy, PlaybackRuntimeRequest,
     PlaybackRuntimeSource, PlaybackRuntimeSpanUpdate, PlaybackRuntimeStarted,
-    PlaybackRuntimeStreamPolicy, PlaybackRuntimeSubmitError,
+    PlaybackRuntimeStreamPolicy, PlaybackRuntimeSubmitError, PlaybackRuntimeTempoSpan,
 };
 
 #[derive(Clone)]
@@ -80,6 +80,7 @@ pub struct AudioPlayer {
     active_playback_span: Option<PlaybackSpanHandle>,
     active_loop_mode: Option<playback::LoopModeHandle>,
     active_metronome: Option<PlaybackMetronomeConfig>,
+    metronome_mix_override: metronome::MetronomeMixOverride,
     loop_offset: Option<f32>,
     loop_offset_frames: Option<u64>,
     volume: f32,

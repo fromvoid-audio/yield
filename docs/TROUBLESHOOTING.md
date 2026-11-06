@@ -26,8 +26,10 @@ Do not broadly delete `target/` while another Cargo run is active.
 - environment sanity:
   - Windows PowerShell:
     `powershell -ExecutionPolicy Bypass -File scripts/doctor.ps1`
-  - macOS/Linux/WSL:
+  - macOS or a Linux/WSL development checkout:
     `bash scripts/doctor.sh`
+  - Linux installed profile:
+    `bash scripts/doctor.sh --installed`
 - latest logs:
   - Windows PowerShell:
     `powershell -ExecutionPolicy Bypass -File scripts/run.ps1 logs`
@@ -36,8 +38,23 @@ Do not broadly delete `target/` while another Cargo run is active.
 - bug bundle:
   - Windows PowerShell:
     `powershell -ExecutionPolicy Bypass -File scripts/run.ps1 bug-bundle`
-  - macOS/Linux/WSL:
+  - macOS:
     `bash scripts/run.sh bug-bundle`
+  - Linux/WSL:
+    `bash scripts/run.sh bug-bundle --out-dir ./yield-support`
+    writes a private archive with basic host facts, configuration presence and
+    a capped count of Yield log segments. It excludes configuration contents,
+    log bodies, filesystem paths and local filenames. The `logs` command
+    displays the latest log locally.
+
+On Linux, these three support commands resolve the same installed profile.
+The live logs are under `${XDG_CONFIG_HOME}/.yield/logs` when the XDG base is
+absolute, or `~/.config/.yield/logs` by default. If you launch Yield with
+`YIELD_CONFIG_HOME` or `YIELD_CONFIG_PROFILE`, set the same values when running
+the support command. Named profiles put logs under
+`<config-base>/.yield/profiles/<profile>/logs`. Use `--sandbox` for the explicit
+sandbox profile. An installed-layout `doctor.sh` defaults to the read-only
+profile check when there is no checkout manifest.
 
 ## Debug run logs
 
@@ -97,13 +114,29 @@ Symptoms:
 
 - issue-report token storage fails because the OS keyring is unavailable
 
-Fix:
+On Linux, run Yield in a desktop login session with an unlocked Secret Service
+provider, such as GNOME Keyring or a KWallet installation that exposes
+`org.freedesktop.secrets`. On macOS, check the login Keychain. On Windows, check
+Credential Manager. Yield disables feedback sign-in if the credential service
+is unavailable and has no disk fallback.
 
-- preferred: repair the local keyring backend
-- fallback:
-  - `YIELD_DISABLE_KEYRING=1`
-  - `YIELD_ALLOW_FALLBACK_TOKEN_STORAGE=1`
-  - `YIELD_FALLBACK_KEY=<base64 32-byte key>`
+For Linux keyring qualification, run the following from the exact Yield
+checkout in an unlocked desktop session. Each step starts a separate process
+and uses a synthetic credential under a unique test account.
+
+```bash
+export YIELD_KEYRING_TEST_ACCOUNT="yield-qa-$(cat /proc/sys/kernel/random/uuid)"
+for step in store load delete absent; do
+  YIELD_KEYRING_TEST_STEP="$step" cargo test --locked -p yield-issue-gateway --lib \
+    tests::linux_secret_service_probe -- --ignored --exact || break
+done
+DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null/yield-probe \
+  YIELD_KEYRING_TEST_STEP=unavailable cargo test --locked -p yield-issue-gateway --lib \
+  tests::linux_secret_service_probe -- --ignored --exact
+```
+
+If a run stops after storing its fixture, rerun the `delete` step with the same
+test account while the provider is available.
 
 ### Native font fallback issues
 

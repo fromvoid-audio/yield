@@ -2318,6 +2318,139 @@ fn valid_curation_commit_preserves_continuity_and_returns_bounded_rows() {
 }
 
 #[test]
+fn fourth_keep_checks_the_live_rating_and_rolls_back_conflicting_batches() {
+    let mut fixture = CurationFixture::new();
+    let accept = SourceCurationUpdate::AcceptKeep {
+        path: CurationFixture::path("one.wav"),
+    };
+    let seed = SourceCurationUpdate::SetRating {
+        path: CurationFixture::path("one.wav"),
+        rating: Rating::KEEP_3,
+    };
+    for updates in [vec![accept.clone()], vec![seed.clone(), accept.clone()]] {
+        assert!(matches!(
+            fixture.commit(&updates),
+            Err(SourceDbError::KeepAcceptanceConflict { .. })
+        ));
+        assert_eq!(fixture.database.get_revision().unwrap(), fixture.revision);
+    }
+
+    fixture.revision = fixture.commit(&[seed]).unwrap().source_revision();
+    let accepted = fixture
+        .commit(&[accept.clone()])
+        .expect("exact fourth keep");
+    assert_eq!(accepted.source_revision(), fixture.revision + 1);
+    assert_eq!(accepted.files()[0].rating, Rating::KEEP_3);
+    assert!(accepted.files()[0].locked);
+    assert!(accepted.files()[0].last_curated_at.is_some());
+    fixture.revision = accepted.source_revision();
+    let before = fixture.database.browser_metadata_snapshot().unwrap();
+    assert!(matches!(
+        fixture.commit(&[
+            SourceCurationUpdate::SetRating {
+                path: CurationFixture::path("two.wav"),
+                rating: Rating::KEEP_1,
+            },
+            accept,
+        ]),
+        Err(SourceDbError::KeepAcceptanceConflict { .. })
+    ));
+    let after = fixture.database.browser_metadata_snapshot().unwrap();
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.files, before.files);
+}
+
+#[test]
+fn fourth_keep_freezes_promotion_evidence_in_the_same_durable_commit() {
+    use rusqlite::OptionalExtension;
+
+    let mut fixture = CurationFixture::new();
+    let path = CurationFixture::path("one.wav");
+    let accepted_hash = "a".repeat(64);
+    let seed = fixture.database.write_batch().unwrap();
+    seed.curation_transaction()
+        .execute(
+            "UPDATE wav_files SET content_hash = ?1, file_identity = 'accepted-inode'
+             WHERE path = 'one.wav'",
+            [&accepted_hash],
+        )
+        .unwrap();
+    seed.commit_auxiliary_state().unwrap();
+    fixture.revision = fixture
+        .commit(&[SourceCurationUpdate::SetRating {
+            path: path.clone(),
+            rating: Rating::KEEP_3,
+        }])
+        .unwrap()
+        .source_revision();
+
+    let candidate = |database: &SourceDatabase| {
+        let batch = database.write_batch().unwrap();
+        batch
+            .curation_transaction()
+            .query_row(
+                "SELECT file_identity, content_hash, file_size, modified_ns, accepted_source_revision
+                 FROM source_keep_promotion_candidates WHERE path = 'one.wav'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, u64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .unwrap()
+    };
+    let lock = |locked| SourceCurationUpdate::SetLocked {
+        path: path.clone(),
+        locked,
+    };
+    let accept = SourceCurationUpdate::AcceptKeep { path: path.clone() };
+    fixture.revision = fixture.commit(&[lock(true)]).unwrap().source_revision();
+    assert_eq!(candidate(&fixture.database), None);
+    fixture.revision = fixture.commit(&[lock(false)]).unwrap().source_revision();
+    assert!(matches!(
+        fixture.commit(&[
+            accept.clone(),
+            SourceCurationUpdate::AcceptKeep {
+                path: CurationFixture::path("two.wav"),
+            },
+        ]),
+        Err(SourceDbError::KeepAcceptanceConflict { .. })
+    ));
+    assert_eq!(candidate(&fixture.database), None);
+
+    let accepted_revision = fixture.commit(&[accept.clone()]).unwrap().source_revision();
+    fixture.revision = accepted_revision;
+    fixture.revision = fixture.commit(&[lock(false)]).unwrap().source_revision();
+    fixture.commit(&[accept]).unwrap();
+    drop(fixture.database);
+    let reopened = SourceDatabase::open_for_source_write(fixture._source.path()).unwrap();
+    let expected = Some((
+        Some("accepted-inode".to_owned()),
+        Some(accepted_hash),
+        10,
+        1,
+        accepted_revision,
+    ));
+    assert_eq!(candidate(&reopened), expected);
+
+    let mut replacement = reopened.write_batch().unwrap();
+    replacement
+        .upsert_file_without_hash(path.as_path(), 30, 3)
+        .unwrap();
+    replacement
+        .set_file_identity(path.as_path(), Some("replacement-inode"))
+        .unwrap();
+    replacement.commit().unwrap();
+    assert_eq!(candidate(&reopened), expected);
+}
+
+#[test]
 fn curation_receipt_matches_browser_playback_type_projection() {
     let fixture = CurationFixture::new();
     let path = Path::new("one.wav");

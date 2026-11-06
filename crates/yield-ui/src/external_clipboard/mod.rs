@@ -2,10 +2,11 @@
 
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
+use yield_library::sample_sources::is_rejected_source_file_path;
 
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod unsupported;
 #[cfg(target_os = "windows")]
 mod windows;
@@ -30,6 +31,7 @@ impl PreparedFilePaths {
         &self.paths
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn is_empty(&self) -> bool {
         self.paths.is_empty()
     }
@@ -40,13 +42,13 @@ impl PreparedFilePaths {
 pub(crate) enum FileClipboardError {
     /// No paths were supplied by the browser command.
     NoPathsProvided,
-    /// The supplied paths contained no existing regular absolute files.
+    /// The supplied paths contained no eligible existing regular absolute files.
     NoExistingFiles,
     /// The current platform has no native file clipboard implementation.
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     UnsupportedPlatform,
     /// The native clipboard rejected the handoff.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     Platform(String),
 }
 
@@ -57,11 +59,11 @@ impl Display for FileClipboardError {
             Self::NoExistingFiles => {
                 formatter.write_str("No selected files are available for clipboard handoff")
             }
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
             Self::UnsupportedPlatform => {
                 formatter.write_str("Native file clipboard handoff is unsupported on this platform")
             }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             Self::Platform(message) => formatter.write_str(message),
         }
     }
@@ -83,7 +85,7 @@ pub(crate) fn prepare_file_paths(
 
     let valid_paths = paths
         .iter()
-        .filter(|path| path.is_absolute() && path.is_file())
+        .filter(|path| path.is_absolute() && !is_rejected_source_file_path(path) && path.is_file())
         .cloned()
         .collect::<Vec<_>>();
     if valid_paths.is_empty() {
@@ -99,6 +101,7 @@ pub(crate) fn prepare_file_paths(
 /// value returned by [`prepare_file_paths`] and invoke it from the GPUI UI
 /// thread so AppKit or Windows clipboard APIs run in the foreground window's
 /// thread.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn copy_file_paths(paths: &PreparedFilePaths) -> Result<(), FileClipboardError> {
     if paths.is_empty() {
         return Err(FileClipboardError::NoPathsProvided);
@@ -127,7 +130,7 @@ pub(crate) fn copy_text(text: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 use macos as platform;
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use unsupported as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
@@ -146,17 +149,20 @@ mod tests {
     }
 
     #[test]
-    fn prepare_filters_relative_missing_and_directory_paths() {
+    fn prepare_filters_ineligible_paths() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let existing = directory.path().join("existing sample.wav");
         std::fs::write(&existing, b"sample").expect("write sample");
         let nested_directory = directory.path().join("folder");
         std::fs::create_dir(&nested_directory).expect("create nested directory");
+        let metadata = directory.path().join(".wavecrate.db");
+        std::fs::write(&metadata, b"private fixture").expect("write source metadata");
 
         let paths = vec![
             PathBuf::from("relative.wav"),
             directory.path().join("missing.wav"),
             nested_directory,
+            metadata,
             existing.clone(),
         ];
 
@@ -177,6 +183,7 @@ mod tests {
         assert_eq!(prepared.as_slice(), &[second, first]);
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn copy_rejects_an_empty_prepared_value_before_platform_access() {
         let empty = super::PreparedFilePaths::new(Vec::new());

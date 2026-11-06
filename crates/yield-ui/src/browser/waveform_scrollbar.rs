@@ -257,7 +257,8 @@ pub(super) fn render(
                 cx.listener(move |view, event: &MouseDownEvent, window, cx| {
                     let bounds = track_bounds.borrow().as_ref().copied();
                     if let Some(bounds) = bounds {
-                        if view.begin_waveform_scrollbar_pointer(event.position, bounds, window) {
+                        if view.begin_waveform_scrollbar_pointer(event.position, bounds, window, cx)
+                        {
                             cx.notify();
                             // The drag input has already recorded this press during bubble
                             // dispatch. Stop overlapping waveform hitboxes from also beginning
@@ -296,8 +297,9 @@ impl Browser {
         position: Point<Pixels>,
         bounds: Bounds<Pixels>,
         window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> bool {
-        let Some(preview) = self.waveform.as_ref() else {
+        let Some(total_frames) = self.waveform.as_ref().map(|preview| preview.total_frames) else {
             return false;
         };
         let Some(geometry) = scrollbar_geometry(bounds, self.waveform_viewport) else {
@@ -306,16 +308,17 @@ impl Browser {
         if !geometry.track.contains(&position) {
             return false;
         }
+        self.abandon_waveform_region_drag(cx);
         window.focus(&self.waveform_focus_handle);
         if geometry.thumb.contains(&position) {
             self.waveform_scrollbar_drag = WaveformScrollbarDrag::begin(
                 geometry,
                 position,
-                preview.total_frames,
+                total_frames,
                 self.waveform_generation,
             );
         } else if let Some(offset) = geometry.offset_for_track_pointer(position) {
-            self.set_waveform_scrollbar_offset(offset, preview.total_frames);
+            self.set_waveform_scrollbar_offset(offset, total_frames);
         }
         true
     }
@@ -381,7 +384,6 @@ impl Browser {
             return false;
         }
         self.waveform_viewport = next;
-        self.waveform_region_drag = None;
         self.waveform_pan_drag = None;
         true
     }

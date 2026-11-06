@@ -475,10 +475,19 @@ impl Browser {
                 self.reveal_context_file(target.absolute_path, cx)
             }
             (ContextMenuAction::CopyPath, ContextMenuTarget::Sample(target)) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(format_copy_path(
-                    &target.absolute_path,
-                )));
-                self.set_playback_status(String::from("Copied path"));
+                let linux = cfg!(target_os = "linux");
+                let status = match format_copy_path(&target.absolute_path, linux) {
+                    Some(text) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        if linux {
+                            "Path copy requested"
+                        } else {
+                            "Copied path"
+                        }
+                    }
+                    None => "This path cannot be copied as UTF-8 text",
+                };
+                self.set_playback_status(String::from(status));
                 cx.notify();
             }
             (ContextMenuAction::Unlock, ContextMenuTarget::Sample(target)) => {
@@ -803,21 +812,23 @@ fn directory_open_label() -> &'static str {
     }
 }
 
-fn format_copy_path(path: &Path) -> String {
+fn format_copy_path(path: &Path, literal_linux_path: bool) -> Option<String> {
+    if literal_linux_path {
+        return path.to_str().map(str::to_owned);
+    }
     let mut rendered = path.to_string_lossy().replace('\\', "/");
     if rendered.contains(' ') {
         rendered = format!("\"{rendered}\"");
     }
-    rendered
+    Some(rendered)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ContextMenuAction, ContextSelectionEffect, MenuKeyEffect, context_menu_actions,
-        context_selection_effect, dismiss_menu_state, format_copy_path, menu_key_effect,
-        next_action_index, previous_action_index, projection_fence_matches, unlock_paths,
-        view_filter_fence_matches,
+        context_selection_effect, format_copy_path, menu_key_effect, next_action_index,
+        previous_action_index, projection_fence_matches, unlock_paths, view_filter_fence_matches,
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -854,13 +865,29 @@ mod tests {
     #[test]
     fn copy_path_normalizes_separators_and_quotes_spaces() {
         assert_eq!(
-            format_copy_path(Path::new(r"C:\Samples\kick one.wav")),
-            "\"C:/Samples/kick one.wav\""
+            format_copy_path(Path::new(r"C:\Samples\kick one.wav"), false).as_deref(),
+            Some("\"C:/Samples/kick one.wav\"")
         );
         assert_eq!(
-            format_copy_path(Path::new("/tmp/kick.wav")),
-            "/tmp/kick.wav"
+            format_copy_path(Path::new("/tmp/kick.wav"), false).as_deref(),
+            Some("/tmp/kick.wav")
         );
+    }
+
+    #[test]
+    fn linux_copy_path_preserves_literal_utf8_text() {
+        let raw = r#"/tmp/drum\kit/é kick "$take".wav"#;
+        assert_eq!(format_copy_path(Path::new(raw), true).as_deref(), Some(raw));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_copy_path_refuses_invalid_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"/tmp/kick\xff.wav"));
+        assert_eq!(format_copy_path(path, true), None);
     }
 
     #[test]
@@ -977,12 +1004,120 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn dismissing_menu_state_leaves_focus_owned_by_browser() {
-        let mut menu = None;
-        assert!(!dismiss_menu_state(&mut menu));
-        menu = Some(());
-        assert!(dismiss_menu_state(&mut menu));
-        assert!(menu.is_none());
+    #[gpui::test]
+    fn sample_context_menu_escape_preserves_loaded_sample_and_passive_row_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{Modifiers, MouseButton, MouseDownEvent, point, px};
+        use yield_core::AudioFile;
+        use yield_library::sample_sources::reconciliation::RootIdentity;
+        use yield_media::WaveformPreview;
+
+        use crate::browser::Browser;
+        use crate::browser::catalog::CatalogActivation;
+        use crate::browser::catalog_metadata::CatalogMetadataContext;
+
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let source_root = tempfile::tempdir().unwrap();
+        let root = source_root.path().to_path_buf();
+        let source_id = SourceId::from_string("context-menu-fixture");
+        let identity = RootIdentity::from_bytes(b"fixture-root".to_vec());
+        let preview = WaveformPreview {
+            peaks: vec![0.5; 4],
+            bands: Vec::new(),
+            duration_seconds: 1.0,
+            sample_rate: 48_000,
+            total_frames: 48_000,
+            detail_context: None,
+        };
+        let event = MouseDownEvent {
+            button: MouseButton::Right,
+            position: point(px(160.0), px(110.0)),
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                view.root = Some(root.clone());
+                view.entries = ["loaded.wav", "pointed.wav"]
+                    .into_iter()
+                    .map(|relative| AudioFile {
+                        path: root.join(relative),
+                        relative_path: PathBuf::from(relative),
+                        byte_len: 0,
+                        duration_seconds: None,
+                        sample_rate: None,
+                        playback_type: None,
+                        curation: None,
+                    })
+                    .collect();
+                view.view_model.set_entries(&view.entries);
+                view.selected = Some(0);
+                view.waveform = Some(preview.clone());
+                view.catalog_activation = Some(CatalogActivation {
+                    source_id: source_id.clone(),
+                    root: root.clone(),
+                    lifecycle_generation: 2,
+                    registered: true,
+                    registration_admitted: true,
+                    root_identity: Some(identity.clone()),
+                    audit_finished: true,
+                    audit_error: None,
+                    audit_retryable: false,
+                    force_reload: false,
+                    fallback_to_scan: false,
+                });
+                view.catalog_metadata
+                    .install_projection(CatalogMetadataContext {
+                        source_id,
+                        lifecycle_generation: 2,
+                        root,
+                        root_identity: identity,
+                        directory_generation: 1,
+                        revision: 7,
+                        entry_indices: Arc::new(HashMap::from([
+                            (PathBuf::from("loaded.wav"), 0),
+                            (PathBuf::from("pointed.wav"), 1),
+                        ])),
+                    });
+                view.open_context_menu(1, &event, window, cx);
+                let menu = view
+                    .context_menu
+                    .as_ref()
+                    .expect("open sample context menu");
+                let super::ContextMenuTarget::Sample(target) = &menu.target else {
+                    panic!("expected sample row menu");
+                };
+                assert_eq!(target.id, view.entries[1].stable_id());
+                assert_eq!(view.selected_id(), Some(view.entries[0].stable_id()));
+                assert_eq!(view.browser_focus_id(), Some(view.entries[1].stable_id()));
+            });
+        });
+        cx.refresh().unwrap();
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                assert!(view.context_menu.is_none());
+                assert_eq!(view.selected_id(), Some(view.entries[0].stable_id()));
+                assert_eq!(view.waveform.as_ref(), Some(&preview));
+                assert_eq!(view.browser_focus_id(), Some(view.entries[1].stable_id()));
+                assert!(view.focus_handle.is_focused(window));
+
+                view.open_context_menu(1, &event, window, cx);
+                assert!(view.context_menu.is_some());
+                assert!(view.catalog_metadata.advance_projection_revision(8));
+            });
+        });
+        cx.refresh().unwrap();
+        cx.update(|_, app| {
+            let view = browser.read(app);
+            assert!(view.context_menu.is_none());
+            assert_eq!(view.selected_id(), Some(view.entries[0].stable_id()));
+            assert_eq!(view.waveform.as_ref(), Some(&preview));
+            assert!(view.browser_focus_override.is_none());
+            assert_eq!(view.playback_status, super::STALE_CONTEXT_MESSAGE);
+        });
     }
 }

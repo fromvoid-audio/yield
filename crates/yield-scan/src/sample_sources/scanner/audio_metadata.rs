@@ -1,10 +1,11 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufReader, Read, Seek, SeekFrom, Take},
+    io::{BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
+use yield_aiff::{AiffMetadata, is_aiff_path};
 use yield_library::sample_sources::db::SourceManifestEntry;
 use yield_library::sample_sources::reconciliation::RootIdentity;
 
@@ -13,8 +14,8 @@ use super::scan_capability::{SourcePathBinding, SourceRootCapability};
 use super::scan_fs::read_facts_from_open_file;
 
 const WAV_HEADER_READ_LIMIT: u64 = 1024 * 1024;
-const WAV_METADATA_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
-const WAV_METADATA_ENTRY_BUDGET: usize = 4096;
+const METADATA_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
+const METADATA_ENTRY_BUDGET: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HeaderReadStop {
@@ -31,7 +32,7 @@ struct MetadataReadBudget {
 
 impl Default for MetadataReadBudget {
     fn default() -> Self {
-        Self::new(WAV_METADATA_BYTE_BUDGET, WAV_METADATA_ENTRY_BUDGET)
+        Self::new(METADATA_BYTE_BUDGET, METADATA_ENTRY_BUDGET)
     }
 }
 
@@ -58,19 +59,15 @@ impl MetadataReadBudget {
     }
 }
 
-struct HeaderBudgetReader<'a, F> {
-    inner: Take<fs::File>,
+struct HeaderBudgetReader<'a, F, R> {
+    inner: R,
     budget: &'a mut MetadataReadBudget,
     should_cancel: &'a mut F,
     position: u64,
 }
 
-impl<'a, F: FnMut() -> bool> HeaderBudgetReader<'a, F> {
-    fn new(
-        inner: Take<fs::File>,
-        budget: &'a mut MetadataReadBudget,
-        should_cancel: &'a mut F,
-    ) -> Self {
+impl<'a, F, R> HeaderBudgetReader<'a, F, R> {
+    fn new(inner: R, budget: &'a mut MetadataReadBudget, should_cancel: &'a mut F) -> Self {
         Self {
             inner,
             budget,
@@ -80,7 +77,7 @@ impl<'a, F: FnMut() -> bool> HeaderBudgetReader<'a, F> {
     }
 }
 
-impl<F: FnMut() -> bool> Read for HeaderBudgetReader<'_, F> {
+impl<F: FnMut() -> bool, R: Read> Read for HeaderBudgetReader<'_, F, R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
@@ -111,16 +108,23 @@ impl<F: FnMut() -> bool> Read for HeaderBudgetReader<'_, F> {
     }
 }
 
-/// Header metadata used by catalog consumers to display a WAV duration and sample rate.
+impl<F, R: Seek> Seek for HeaderBudgetReader<'_, F, R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.position = self.inner.seek(position)?;
+        Ok(self.position)
+    }
+}
+
+/// Header metadata used by catalog consumers to display audio duration and sample rate.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WavDisplayMetadata {
-    /// Number of interleaved audio frames in the WAV data chunk.
+pub struct AudioDisplayMetadata {
+    /// Number of complete audio frames in the sample data.
     pub frames: u32,
-    /// WAV sample rate in samples per second.
+    /// Sample rate in samples per second.
     pub sample_rate: u32,
 }
 
-/// Read bounded WAV header metadata for an already committed source manifest.
+/// Read bounded WAV and uncompressed AIFF metadata for a committed source manifest.
 ///
 /// The helper opens only paths present in `manifest` through a retained source-root capability.
 /// Each descriptor is checked against its committed size, modification time, and identity both
@@ -129,14 +133,14 @@ pub struct WavDisplayMetadata {
 /// source-root identity or a cancellation stops the whole operation. Header reads are bounded to
 /// 64 MiB and 4096 manifest entries per call; exhausting either budget returns the coherent
 /// metadata collected so far.
-pub fn read_wav_display_metadata_for_manifest(
+pub fn read_audio_display_metadata_for_manifest(
     root: &Path,
     expected_root_identity: &RootIdentity,
     manifest: &[SourceManifestEntry],
     mut should_cancel: impl FnMut() -> bool,
-) -> Result<BTreeMap<PathBuf, WavDisplayMetadata>, ScanError> {
+) -> Result<BTreeMap<PathBuf, AudioDisplayMetadata>, ScanError> {
     let mut budget = MetadataReadBudget::default();
-    read_wav_display_metadata_for_manifest_with_budget(
+    read_audio_display_metadata_for_manifest_with_budget(
         root,
         expected_root_identity,
         manifest,
@@ -145,13 +149,13 @@ pub fn read_wav_display_metadata_for_manifest(
     )
 }
 
-fn read_wav_display_metadata_for_manifest_with_budget<F: FnMut() -> bool>(
+fn read_audio_display_metadata_for_manifest_with_budget<F: FnMut() -> bool>(
     root: &Path,
     expected_root_identity: &RootIdentity,
     manifest: &[SourceManifestEntry],
     should_cancel: &mut F,
     budget: &mut MetadataReadBudget,
-) -> Result<BTreeMap<PathBuf, WavDisplayMetadata>, ScanError> {
+) -> Result<BTreeMap<PathBuf, AudioDisplayMetadata>, ScanError> {
     if should_cancel() {
         return Err(ScanError::Canceled);
     }
@@ -166,7 +170,8 @@ fn read_wav_display_metadata_for_manifest_with_budget<F: FnMut() -> bool>(
         if should_cancel() {
             return Err(ScanError::Canceled);
         }
-        if !is_wav_path(&entry.relative_path) {
+        let is_aiff = is_aiff_path(&entry.relative_path);
+        if !is_aiff && !is_wav_path(&entry.relative_path) {
             continue;
         }
         let Some(file) = open_manifest_file(&source_root, &entry.relative_path) else {
@@ -183,7 +188,18 @@ fn read_wav_display_metadata_for_manifest_with_budget<F: FnMut() -> bool>(
             return Err(ScanError::Canceled);
         }
 
-        let wav_metadata = match read_wav_header(&file, budget, should_cancel) {
+        let header = if is_aiff {
+            read_aiff_header(
+                &file,
+                &absolute_path,
+                entry.file_size,
+                budget,
+                should_cancel,
+            )
+        } else {
+            read_wav_header(&file, budget, should_cancel)
+        };
+        let file_metadata = match header {
             Ok(Some(metadata)) => metadata,
             Ok(None) => continue,
             Err(HeaderReadStop::Budget) => break,
@@ -208,7 +224,7 @@ fn read_wav_display_metadata_for_manifest_with_budget<F: FnMut() -> bool>(
             continue;
         }
         ensure_expected_generation(&source_root, root, expected_root_identity)?;
-        metadata.insert(entry.relative_path.clone(), wav_metadata);
+        metadata.insert(entry.relative_path.clone(), file_metadata);
     }
 
     if should_cancel() {
@@ -248,11 +264,39 @@ fn is_wav_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
 }
 
+fn read_aiff_header<F: FnMut() -> bool>(
+    file: &fs::File,
+    path: &Path,
+    file_len: u64,
+    budget: &mut MetadataReadBudget,
+    should_cancel: &mut F,
+) -> Result<Option<AudioDisplayMetadata>, HeaderReadStop> {
+    let Some(mut header_file) = file.try_clone().ok() else {
+        return Ok(None);
+    };
+    if header_file.seek(SeekFrom::Start(0)).is_err() {
+        return Ok(None);
+    }
+    // Keep the aggregate budget around the actual file reads. Seeking past a chunk
+    // avoids reading its payload and doesn't replenish the budget.
+    let reader = HeaderBudgetReader::new(header_file, budget, should_cancel);
+    let metadata = AiffMetadata::probe(reader, file_len, path);
+    if let Some(stop) = budget.stop {
+        return Err(stop);
+    }
+    Ok(metadata.ok().and_then(|metadata| {
+        Some(AudioDisplayMetadata {
+            frames: u32::try_from(metadata.frames).ok()?,
+            sample_rate: metadata.sample_rate,
+        })
+    }))
+}
+
 fn read_wav_header<F: FnMut() -> bool>(
     file: &fs::File,
     budget: &mut MetadataReadBudget,
     should_cancel: &mut F,
-) -> Result<Option<WavDisplayMetadata>, HeaderReadStop> {
+) -> Result<Option<AudioDisplayMetadata>, HeaderReadStop> {
     let Some((data_start, data_len)) = read_data_chunk_bounds(file, budget, should_cancel)? else {
         return Ok(None);
     };
@@ -293,7 +337,7 @@ fn read_wav_header<F: FnMut() -> bool>(
     if file_len < data_end {
         return Ok(None);
     }
-    Ok(Some(WavDisplayMetadata {
+    Ok(Some(AudioDisplayMetadata {
         frames,
         sample_rate: spec.sample_rate,
     }))
@@ -376,6 +420,11 @@ mod tests {
     use yield_library::filesystem_identity::stable_filesystem_identity;
     use yield_library::timestamps::system_time_to_unix_nanos;
 
+    const AIFF_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-fixtures/stereo-pcm16.aiff"
+    ));
+
     fn root_identity(root: &Path) -> RootIdentity {
         let metadata = fs::metadata(root).unwrap();
         RootIdentity::from_bytes(
@@ -418,9 +467,9 @@ mod tests {
     fn read_metadata(
         root: &Path,
         manifest: &[SourceManifestEntry],
-    ) -> Result<BTreeMap<PathBuf, WavDisplayMetadata>, ScanError> {
+    ) -> Result<BTreeMap<PathBuf, AudioDisplayMetadata>, ScanError> {
         let identity = root_identity(root);
-        read_wav_display_metadata_for_manifest(root, &identity, manifest, || false)
+        read_audio_display_metadata_for_manifest(root, &identity, manifest, || false)
     }
 
     #[test]
@@ -436,14 +485,14 @@ mod tests {
         let metadata = read_metadata(source.path(), &manifest).unwrap();
         assert_eq!(
             metadata.get(Path::new("mono.wav")),
-            Some(&WavDisplayMetadata {
+            Some(&AudioDisplayMetadata {
                 frames: 3,
                 sample_rate: 8_000,
             })
         );
         assert_eq!(
             metadata.get(Path::new("stereo.wav")),
-            Some(&WavDisplayMetadata {
+            Some(&AudioDisplayMetadata {
                 frames: 5,
                 sample_rate: 44_100,
             })
@@ -470,6 +519,104 @@ mod tests {
         ];
 
         assert!(read_metadata(source.path(), &manifest).unwrap().is_empty());
+    }
+
+    #[test]
+    fn aiff_headers_report_exact_metadata_and_omit_truncated_files() {
+        let source = tempfile::tempdir().unwrap();
+        let valid = Path::new("clip.AIF");
+        let truncated = Path::new("truncated.aiff");
+        fs::write(source.path().join(valid), AIFF_FIXTURE).unwrap();
+        fs::write(
+            source.path().join(truncated),
+            &AIFF_FIXTURE[..AIFF_FIXTURE.len() - 1],
+        )
+        .unwrap();
+        let manifest = [
+            manifest_entry(source.path(), truncated),
+            manifest_entry(source.path(), valid),
+        ];
+        let metadata = read_metadata(source.path(), &manifest).unwrap();
+        assert_eq!(
+            metadata,
+            BTreeMap::from([(
+                valid.to_path_buf(),
+                AudioDisplayMetadata {
+                    frames: 2,
+                    sample_rate: 48_000
+                },
+            )])
+        );
+    }
+
+    #[test]
+    fn aiff_headers_consume_the_shared_byte_budget_and_honor_cancellation() {
+        let source = tempfile::tempdir().unwrap();
+        let first = Path::new("first.aif");
+        let second = Path::new("second.aiff");
+        for path in [first, second] {
+            fs::write(source.path().join(path), AIFF_FIXTURE).unwrap();
+        }
+        let manifest = [
+            manifest_entry(source.path(), first),
+            manifest_entry(source.path(), second),
+        ];
+        let identity = root_identity(source.path());
+        let mut budget = MetadataReadBudget::new(60, 2);
+        let metadata = read_audio_display_metadata_for_manifest_with_budget(
+            source.path(),
+            &identity,
+            &manifest,
+            &mut || false,
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.keys().map(PathBuf::as_path).collect::<Vec<_>>(),
+            [first]
+        );
+        assert_eq!(budget.consumed_bytes, 60);
+        assert_eq!(budget.stop, Some(HeaderReadStop::Budget));
+
+        let calls = Cell::new(0);
+        let result =
+            read_audio_display_metadata_for_manifest(source.path(), &identity, &manifest, || {
+                let call = calls.get();
+                calls.set(call + 1);
+                call >= 5
+            });
+        assert!(matches!(result, Err(ScanError::Canceled)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aiff_metadata_omits_a_path_replaced_during_the_header_read() {
+        let source = tempfile::tempdir().unwrap();
+        let path = Path::new("clip.aif");
+        let target = source.path().join(path);
+        fs::write(&target, AIFF_FIXTURE).unwrap();
+        let manifest = [manifest_entry(source.path(), path)];
+        let replacement = source.path().join("replacement.aif");
+        fs::write(&replacement, AIFF_FIXTURE).unwrap();
+        let original_mtime = FileTime::from_last_modification_time(&fs::metadata(&target).unwrap());
+        filetime::set_file_mtime(&replacement, original_mtime).unwrap();
+        let calls = Cell::new(0);
+        let metadata = read_audio_display_metadata_for_manifest(
+            source.path(),
+            &root_identity(source.path()),
+            &manifest,
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 5 {
+                    fs::rename(&replacement, &target).unwrap();
+                }
+                false
+            },
+        )
+        .unwrap();
+        assert!(calls.get() > 5);
+        assert!(metadata.is_empty());
     }
 
     #[test]
@@ -536,7 +683,7 @@ mod tests {
         let mut budget = MetadataReadBudget::new(WAV_HEADER_READ_LIMIT * 2, 16);
         let mut should_cancel = || false;
 
-        let metadata = read_wav_display_metadata_for_manifest_with_budget(
+        let metadata = read_audio_display_metadata_for_manifest_with_budget(
             source.path(),
             &identity,
             &manifest,
@@ -559,10 +706,10 @@ mod tests {
         let entry = manifest_entry(source.path(), Path::new("note.txt"));
         let manifest = vec![entry.clone(), entry.clone(), entry];
         let identity = root_identity(source.path());
-        let mut budget = MetadataReadBudget::new(WAV_METADATA_BYTE_BUDGET, 2);
+        let mut budget = MetadataReadBudget::new(METADATA_BYTE_BUDGET, 2);
         let mut should_cancel = || false;
 
-        let metadata = read_wav_display_metadata_for_manifest_with_budget(
+        let metadata = read_audio_display_metadata_for_manifest_with_budget(
             source.path(),
             &identity,
             &manifest,
@@ -592,7 +739,7 @@ mod tests {
         let calls = Cell::new(0usize);
 
         let result =
-            read_wav_display_metadata_for_manifest(source.path(), &identity, &manifest, || {
+            read_audio_display_metadata_for_manifest(source.path(), &identity, &manifest, || {
                 let call = calls.get();
                 calls.set(call + 1);
                 call >= 5
@@ -634,7 +781,7 @@ mod tests {
         let identity = root_identity(source.path());
         let calls = Cell::new(0usize);
         let result =
-            read_wav_display_metadata_for_manifest(source.path(), &identity, &manifest, || {
+            read_audio_display_metadata_for_manifest(source.path(), &identity, &manifest, || {
                 let call = calls.get();
                 calls.set(call + 1);
                 if call == 2 {
@@ -684,7 +831,7 @@ mod tests {
         fs::create_dir(source.path()).unwrap();
 
         let result =
-            read_wav_display_metadata_for_manifest(source.path(), &expected, &manifest, || false);
+            read_audio_display_metadata_for_manifest(source.path(), &expected, &manifest, || false);
         assert!(matches!(result, Err(ScanError::StaleRootGeneration { .. })));
         fs::remove_dir_all(old_root).unwrap();
     }
@@ -701,7 +848,7 @@ mod tests {
         let calls = Cell::new(0usize);
         let identity = root_identity(source.path());
         let result =
-            read_wav_display_metadata_for_manifest(source.path(), &identity, &manifest, || {
+            read_audio_display_metadata_for_manifest(source.path(), &identity, &manifest, || {
                 let count = calls.get();
                 calls.set(count + 1);
                 count >= 3

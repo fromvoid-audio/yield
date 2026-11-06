@@ -11361,7 +11361,9 @@ mod tests {
         )
     }
 
-    fn v7_waveform_edit_inputs() -> (
+    fn v7_waveform_edit_inputs(
+        mono: bool,
+    ) -> (
         OperationId,
         OperationIntent,
         UniversalIntent,
@@ -11386,15 +11388,26 @@ mod tests {
         .expect("waveform file revision");
         let source_spec = WaveformSourceSpec::new(2, 48_000, 16, WaveformSampleFormat::Integer)
             .expect("waveform source spec");
-        let range = WaveformEditFrameRange::new(2, 8).expect("waveform edit range");
-        let operation = WaveformEditOperationArgs::GainAndFades(
-            WaveformEditSettingsArgs::new(
-                FiniteF32Bits::new(-0.0).expect("signed zero gain"),
-                None,
-                None,
+        let (range, operation, output_channels) = if mono {
+            (
+                WaveformEditFrameRange::new(0, 10).expect("whole source range"),
+                WaveformEditOperationArgs::ConvertToMono,
+                1,
             )
-            .expect("waveform edit settings"),
-        );
+        } else {
+            (
+                WaveformEditFrameRange::new(2, 8).expect("waveform edit range"),
+                WaveformEditOperationArgs::GainAndFades(
+                    WaveformEditSettingsArgs::new(
+                        FiniteF32Bits::new(-0.0).expect("signed zero gain"),
+                        None,
+                        None,
+                    )
+                    .expect("waveform edit settings"),
+                ),
+                2,
+            )
+        };
         let edit_args = WaveformEditIntentArgs::new(
             copy_args.source().clone(),
             revision,
@@ -11402,7 +11415,7 @@ mod tests {
             10,
             range,
             operation,
-            WaveformOutputSpec::float32(2, 48_000),
+            WaveformOutputSpec::float32(output_channels, 48_000),
         )
         .expect("waveform edit arguments");
         (
@@ -11736,14 +11749,19 @@ mod tests {
             )
             .expect("selection output file revision"),
             source_spec,
-            10,
-            WaveformEditFrameRange::new(2, 8).expect("selection output range"),
+            150_000,
+            WaveformEditFrameRange::new(2, 72_003).expect("selection output range"),
             recipe,
             SourcePlaybackType::OneShot,
             copy_args.destination().clone(),
             CopyCollisionPolicy::NoReplace,
         )
-        .expect("selection output extraction");
+        .expect("selection output extraction")
+        .with_playmark_beats(3);
+        assert_eq!(
+            extraction.derived_tempo().map(|tempo| tempo.bpm()),
+            Some(119.998)
+        );
         let command_args = SelectionOutputCommandArgs::ExtractAndTrim(
             ExtractAndTrimIntentArgs::new(extraction, WaveformOutputSpec::float32(2, 48_000))
                 .expect("ExtractAndTrim arguments"),
@@ -15478,7 +15496,7 @@ mod tests {
         let fixture = fixture();
         let store = OperationJournalStore::open(&fixture.owner).expect("open store");
         let (operation_id, intent, universal_intent, edit_args, capacity_plan) =
-            v7_waveform_edit_inputs();
+            v7_waveform_edit_inputs(false);
         let inserted = store
             .persist_waveform_edit_intent(
                 operation_id,
@@ -15518,13 +15536,13 @@ mod tests {
         assert_eq!(retry_receipt.sequence(), 2);
 
         let (second_id, second_intent, second_universal, second_edit, second_capacity) =
-            v7_waveform_edit_inputs();
+            v7_waveform_edit_inputs(true);
         let second_inserted = store
             .persist_waveform_edit_intent(
                 second_id,
                 second_intent,
                 second_universal,
-                second_edit,
+                second_edit.clone(),
                 second_capacity,
                 60,
             )
@@ -15625,6 +15643,14 @@ mod tests {
         );
         assert_eq!(restarted.retry_observation(), Some(&next_retry));
         assert_eq!(restarted.cancellation_request(), Some(&cancellation));
+        let restarted_mono = reopened
+            .get(second_id)
+            .expect("get restarted mono conversion")
+            .expect("mono conversion row");
+        assert_eq!(
+            restarted_mono.universal_command_args(),
+            Some(&UniversalCommandArgs::WaveformEdit(second_edit))
+        );
     }
 
     #[test]

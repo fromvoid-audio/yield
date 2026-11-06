@@ -32,26 +32,31 @@ impl Global for SourceRegistryGlobal {}
 impl SourceRegistryGlobal {
     /// Start the GPUI development-profile service, retaining startup failures for the UI.
     pub(crate) fn start() -> Self {
-        match SourceRegistryService::start() {
-            Ok(service) => Self {
-                service: Some(service),
-                #[cfg(test)]
-                catalog_fixture: None,
-                #[cfg(test)]
-                harvest_fixture_profile: None,
-                start_error: None,
-                quit_subscription: None,
-            },
-            Err(error) => Self {
-                service: None,
-                #[cfg(test)]
-                catalog_fixture: None,
-                #[cfg(test)]
-                harvest_fixture_profile: None,
-                start_error: Some(error.to_string()),
-                quit_subscription: None,
-            },
+        Self::from_start(SourceRegistryService::start())
+    }
+
+    fn from_start(result: Result<SourceRegistryService, yield_session::StartError>) -> Self {
+        let (service, start_error) = match result {
+            Ok(service) => (Some(service), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        Self {
+            service,
+            #[cfg(test)]
+            catalog_fixture: None,
+            #[cfg(test)]
+            harvest_fixture_profile: None,
+            start_error,
+            quit_subscription: None,
         }
+    }
+
+    /// Start the isolated profile/SQLite preference owner for GPUI control tests.
+    #[cfg(test)]
+    pub(crate) fn for_preferences_fixture(profile: std::path::PathBuf) -> Self {
+        Self::from_start(SourceRegistryService::start_portable_registry_for_test(
+            profile,
+        ))
     }
 
     /// Exercise the real retained catalog owner without claiming native journal bootstrap.
@@ -467,6 +472,7 @@ impl Browser {
         for event in events {
             changed |= self.apply_source_registry_event(event, cx);
         }
+        self.advance_external_source_drop(cx);
         let mut catalog_deliveries = Vec::new();
         // Keep the next revision's bounded delivery on the catalog while its preceding
         // projection is still being built. Automatic replay then retains its original
@@ -632,6 +638,7 @@ impl Browser {
                 self.source_registry_loaded = true;
                 self.source_registry_revision = revision;
                 self.source_reorder_drag = None;
+                self.stop_external_source_drop(cx);
                 self.fail_pending_registry_mutations(error.to_string());
                 tracing::error!(
                     target: "yield::session",
@@ -645,6 +652,7 @@ impl Browser {
             RegistryEvent::Closed => {
                 self.source_registry_loaded = true;
                 self.source_reorder_drag = None;
+                self.stop_external_source_drop(cx);
                 self.fail_pending_registry_mutations("Source registry closed".to_string());
                 self.set_source_registry_status("Source registry closed".to_string());
                 true

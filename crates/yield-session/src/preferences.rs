@@ -23,7 +23,7 @@ pub const USER_SHADER_CONTRACT_VERSION: u32 = 1;
 const USER_SHADER_APPROVAL_DOMAIN_PREFIX: &[u8] = b"PORTALSURFER/Yield/WGSL-approval\0contract-v";
 /// Longest persisted custom collection label, measured in UTF-8 bytes.
 pub const MAX_COLLECTION_NAME_BYTES: usize = 128;
-const OUTPUT_VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
+const AUDIO_PREFERENCE_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Default interval between positive-rating decay steps, in weeks.
 pub const DEFAULT_RATING_DECAY_WEEKS: u16 = 4;
@@ -277,13 +277,60 @@ impl AudioOutputPreferences {
     }
 }
 
-/// Deadline gate used by the session worker to coalesce rapid output-volume edits.
+/// Stable metronome sound choices in the profile preference document.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetronomeSoundPreference {
+    /// The original short click.
+    #[default]
+    Classic,
+    /// A hollow struck tone.
+    Woodblock,
+    /// A short pitched beep.
+    ElectronicBeep,
+    /// A brief percussive noise and tone.
+    Rimshot,
+}
+
+/// Click-only settings, independent of audition volume and the active beat grid.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetronomePreferences {
+    /// Linear click level from zero through one.
+    pub volume: f32,
+    /// Click on each main beat.
+    pub beats: bool,
+    /// Click halfway between adjacent beats.
+    pub offbeats: bool,
+    /// The built-in sound used for both rhythmic layers.
+    pub sound: MetronomeSoundPreference,
+}
+
+impl Default for MetronomePreferences {
+    fn default() -> Self {
+        Self {
+            volume: default_output_volume(),
+            beats: true,
+            offbeats: true,
+            sound: MetronomeSoundPreference::Classic,
+        }
+    }
+}
+
+impl MetronomePreferences {
+    /// Validate the bounded click level before saving or previewing this mix.
+    pub fn validate(self) -> Result<(), PreferenceError> {
+        validate_output_volume(self.volume).map_err(|_| PreferenceError::InvalidMetronomeVolume)
+    }
+}
+
+/// Deadline gate used by the session worker to coalesce rapid audio preference edits.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PreferenceSaveDeadline(Option<Instant>);
 
 impl PreferenceSaveDeadline {
-    pub(crate) fn defer_output_volume(&mut self, now: Instant) {
-        self.0 = Some(now + OUTPUT_VOLUME_SAVE_DEBOUNCE);
+    pub(crate) fn defer_audio_preference(&mut self, now: Instant) {
+        self.0 = Some(now + AUDIO_PREFERENCE_SAVE_DEBOUNCE);
     }
 
     pub(crate) fn clear(&mut self) {
@@ -348,6 +395,9 @@ pub struct UiPreferences {
     /// Optional output routing requested by the user.
     #[serde(default)]
     pub audio_output: AudioOutputPreferences,
+    /// Independent metronome mix for current and future audition.
+    #[serde(default)]
+    pub metronome: MetronomePreferences,
     /// Profile-owned custom labels for the six stable collection slots.
     #[serde(default = "default_collection_names")]
     pub collection_names: [Option<String>; COLLECTION_COUNT],
@@ -377,6 +427,7 @@ impl Default for UiPreferences {
             anti_click_enabled: default_anti_click_enabled(),
             anti_click_fade_ms: default_anti_click_fade_ms(),
             audio_output: AudioOutputPreferences::default(),
+            metronome: MetronomePreferences::default(),
             collection_names: default_collection_names(),
             shipped_visual_effect: ShippedVisualEffectPreferences::default(),
             user_shader: None,
@@ -417,6 +468,7 @@ impl UiPreferences {
         validate_output_volume(self.output_volume)?;
         self.anti_click_fade_ms = sanitize_anti_click_fade_ms(self.anti_click_fade_ms);
         self.audio_output.validate()?;
+        self.metronome.validate()?;
         self.shipped_visual_effect.validate()?;
         if let Some(user_shader) = self.user_shader.as_ref() {
             user_shader.validate()?;
@@ -485,6 +537,9 @@ pub enum PreferenceError {
     /// The output volume was not a finite value in the inclusive 0..=1 range.
     #[error("output volume must be finite and between 0 and 1")]
     InvalidOutputVolume,
+    /// The metronome click level is outside the supported linear range.
+    #[error("metronome volume must be finite and between zero and one")]
+    InvalidMetronomeVolume,
     /// The in-app text scale is not one of the supported sizes.
     #[error("text scale must be 100% or 200%")]
     InvalidTextScale,
@@ -675,6 +730,8 @@ pub enum PreferencePatch {
     },
     /// Replace all optional audio output routing fields atomically.
     SetAudioOutput(AudioOutputPreferences),
+    /// Replace the metronome mix without touching audition or routing preferences.
+    SetMetronome(MetronomePreferences),
     /// Assign a custom display label to one stable collection slot.
     SetCollectionName {
         /// Zero-based slot identity, independent of active source.
@@ -753,6 +810,10 @@ impl PreferencePatch {
                 audio_output.validate()?;
                 preferences.audio_output = audio_output;
             }
+            Self::SetMetronome(metronome) => {
+                metronome.validate()?;
+                preferences.metronome = metronome;
+            }
             Self::SetCollectionName { slot, name } => {
                 validate_collection_name(&name)?;
                 let Some(current) = preferences.collection_names.get_mut(slot) else {
@@ -812,6 +873,10 @@ impl PreferencePatch {
 
     fn is_reset(&self) -> bool {
         matches!(self, Self::Reset)
+    }
+
+    pub(crate) fn debounces_save(&self) -> bool {
+        matches!(self, Self::SetOutputVolume(_) | Self::SetMetronome(_))
     }
 
     /// Return whether this is one of the explicit user-shader profile commands.
@@ -1050,14 +1115,12 @@ impl PreferenceCoordinator {
         edits
             .into_iter()
             .map(|edit| {
-                let output_volume_patch =
-                    matches!(&edit.patch, PreferencePatch::SetOutputVolume(_));
+                let debounce_save = edit.patch.debounces_save();
                 let result = self.apply_patch(edit.request, edit.patch);
-                let output_volume_changed = output_volume_patch && matches!(&result, Ok(true));
                 PreferenceOutcome {
                     request: edit.request,
                     result,
-                    output_volume_changed,
+                    debounce_save,
                 }
             })
             .collect()
@@ -1093,7 +1156,7 @@ impl PreferenceCoordinator {
 pub(crate) struct PreferenceOutcome {
     pub(crate) request: PreferenceRequestId,
     pub(crate) result: Result<bool, PreferenceError>,
-    pub(crate) output_volume_changed: bool,
+    pub(crate) debounce_save: bool,
 }
 
 #[cfg(test)]
@@ -1656,16 +1719,70 @@ mod tests {
     }
 
     #[test]
-    fn payload_omitting_audio_output_uses_empty_output_defaults() {
+    fn payload_omitting_audio_output_and_metronome_uses_defaults() {
         let mut payload = serde_json::to_value(UiPreferences::default()).expect("encode");
-        payload
-            .as_object_mut()
-            .expect("preferences object")
-            .remove("audio_output");
+        let object = payload.as_object_mut().expect("preferences object");
+        object.remove("audio_output");
+        object.remove("metronome");
         let payload = serde_json::to_string(&payload).expect("encode legacy payload");
 
         let preferences = UiPreferences::from_payload(&payload).expect("decode legacy payload");
         assert_eq!(preferences.audio_output, AudioOutputPreferences::default());
+        assert_eq!(preferences.metronome, MetronomePreferences::default());
+    }
+
+    #[test]
+    fn metronome_preference_round_trip_preserves_independent_layers_and_audio_output() {
+        let mut preferences = UiPreferences {
+            output_volume: 0.23,
+            audio_output: AudioOutputPreferences {
+                device: Some("External output".to_owned()),
+                ..AudioOutputPreferences::default()
+            },
+            ..UiPreferences::default()
+        };
+        for (beats, offbeats, sound) in [
+            (true, true, MetronomeSoundPreference::Classic),
+            (true, false, MetronomeSoundPreference::Woodblock),
+            (false, true, MetronomeSoundPreference::ElectronicBeep),
+            (false, false, MetronomeSoundPreference::Rimshot),
+        ] {
+            let metronome = MetronomePreferences {
+                volume: 0.37,
+                beats,
+                offbeats,
+                sound,
+            };
+            PreferencePatch::SetMetronome(metronome)
+                .apply(&mut preferences)
+                .expect("valid click mix");
+            let payload = preferences.to_payload().expect("encode");
+            let restored = UiPreferences::from_payload(&payload).expect("decode");
+            assert_eq!(restored.metronome, metronome);
+            assert_eq!(restored.output_volume, 0.23);
+            assert_eq!(
+                restored.audio_output.device.as_deref(),
+                Some("External output")
+            );
+        }
+        let before = preferences.clone();
+        for volume in [f32::NAN, -0.01, 1.01] {
+            let invalid = MetronomePreferences {
+                volume,
+                ..before.metronome
+            };
+            assert_eq!(
+                PreferencePatch::SetMetronome(invalid).apply(&mut preferences),
+                Err(PreferenceError::InvalidMetronomeVolume)
+            );
+            assert_eq!(preferences, before);
+        }
+        let mut malformed = serde_json::to_value(&before).expect("encode");
+        malformed["metronome"]["sound"] = serde_json::json!("unrecognized");
+        assert!(matches!(
+            UiPreferences::from_payload(&malformed.to_string()),
+            Err(PreferenceError::Json(_))
+        ));
     }
 
     #[test]
@@ -1766,10 +1883,10 @@ mod tests {
     }
 
     #[test]
-    fn output_volume_save_deadline_is_deterministic_without_sleeping() {
+    fn audio_preference_save_deadline_is_deterministic_without_sleeping() {
         let start = Instant::now();
         let mut deadline = PreferenceSaveDeadline::default();
-        deadline.defer_output_volume(start);
+        deadline.defer_audio_preference(start);
 
         assert!(!deadline.permits_save(start + Duration::from_millis(249), false));
         assert!(deadline.permits_save(start + Duration::from_millis(250), false));

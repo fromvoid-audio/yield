@@ -1,9 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Source;
 use crate::telemetry;
+use yield_aiff::AiffPcmReader;
 
 use super::super::DEFAULT_ANTI_CLIP_FADE;
 use super::super::output::{AudioOutputConfig, ResolvedOutput, open_output_stream};
@@ -13,6 +14,23 @@ use super::{
     AudioPlaybackSource, AudioPlayer, EditFadeHandle, EditFadeRange, PlaybackRuntimeReplacePolicy,
     PlaybackRuntimeStreamPolicy,
 };
+
+pub(super) fn open_aiff_file_for_playback(path: &Path) -> Result<AiffPcmReader, String> {
+    let reader = AiffPcmReader::open(path).map_err(|error| error.to_string())?;
+    let sample_rate = reader.sample_rate();
+    let channels = reader.channels();
+    // Bound decoder-ring sizing before constructing a playback source.
+    if sample_rate > 384_000
+        || channels > 32
+        || u64::from(sample_rate) * u64::from(channels) > 384_000 * 8
+    {
+        return Err(format!(
+            "{} AIFF layout exceeds playback limits ({sample_rate} Hz, {channels} channels)",
+            path.display()
+        ));
+    }
+    Ok(reader)
+}
 
 impl AudioPlayer {
     /// Create a new audio player using the default output device.
@@ -62,6 +80,7 @@ impl AudioPlayer {
             active_playback_span: None,
             active_loop_mode: None,
             active_metronome: None,
+            metronome_mix_override: Default::default(),
             loop_offset: None,
             loop_offset_frames: None,
             volume: 1.0,
@@ -176,6 +195,18 @@ impl AudioPlayer {
         }
     }
 
+    pub(super) fn set_prepared_tempo_samples(
+        &mut self,
+        path: PathBuf,
+        prepared: crate::PreparedTempoAudition,
+    ) {
+        let output_frames = prepared.frames.output_frames();
+        let duration = crate::timebase::frames_to_seconds(output_frames, prepared.sample_rate);
+        self.set_audio_file_with_metadata(path, duration, prepared.sample_rate, prepared.channels);
+        self.track_total_frames = Some(output_frames);
+        self.playback_samples = Some(prepared.samples);
+    }
+
     /// Probe a WAV file and store it as a lazy file-backed playback source.
     ///
     /// Playback runtime callers execute this method on the dedicated runtime
@@ -185,6 +216,25 @@ impl AudioPlayer {
         let path = path.into();
         let (duration, sample_rate, channels) = wav_file_metadata(&path)?;
         self.set_audio_file_with_metadata(path, duration, sample_rate, channels);
+        Ok(())
+    }
+
+    pub(super) fn set_aiff_file(&mut self, path: PathBuf) -> Result<(), String> {
+        if !yield_aiff::is_aiff_path(&path) {
+            return Err(format!(
+                "AIFF playback requires an .aiff or .aif path: {}",
+                path.display()
+            ));
+        }
+        let reader = open_aiff_file_for_playback(&path)?;
+        let duration = (reader.frames() as f64 / f64::from(reader.sample_rate())) as f32;
+        self.set_audio_file_with_metadata(
+            path,
+            duration,
+            reader.sample_rate(),
+            usize::from(reader.channels()),
+        );
+        self.track_total_frames = Some(reader.frames());
         Ok(())
     }
 
@@ -386,6 +436,7 @@ impl AudioPlayer {
             active_playback_span: None,
             active_loop_mode: None,
             active_metronome: None,
+            metronome_mix_override: Default::default(),
             loop_offset,
             loop_offset_frames: None,
             volume: 1.0,

@@ -294,24 +294,54 @@ fn scan_adds_duplicate_content_when_original_path_still_exists() {
 }
 
 #[test]
-fn scan_ignores_non_wav_and_counts_nested() {
+fn scan_indexes_wav_and_both_aiff_extensions_across_reopen() {
     let dir = tempdir().unwrap();
     let nested = dir.path().join("nested");
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(dir.path().join("one.wav"), b"one").unwrap();
     std::fs::write(nested.join("two.wav"), b"two").unwrap();
-    std::fs::write(dir.path().join("later.aif"), b"aif").unwrap();
-    std::fs::write(dir.path().join("later.aiff"), b"aiff").unwrap();
+    let aiff = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-fixtures/stereo-pcm16.aiff"
+    ));
+    std::fs::write(dir.path().join("clip.AIF"), aiff).unwrap();
+    std::fs::write(nested.join("stereo.aiff"), aiff).unwrap();
+    std::fs::write(nested.join("._stereo.aiff"), aiff).unwrap();
     std::fs::write(dir.path().join("unsupported.flac"), b"flac").unwrap();
     std::fs::write(dir.path().join("unsupported.mp3"), b"mp3").unwrap();
     std::fs::write(dir.path().join("ignore.txt"), b"text").unwrap();
 
     let db = open_maintained_scan_database(dir.path()).unwrap();
     let stats = scan_once(&db).unwrap();
-    assert_eq!(stats.added, 2);
-    assert_eq!(stats.total_files, 2);
-    let rows = db.list_files().unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(stats.added, 4);
+    assert_eq!(stats.total_files, 4);
+    drop(db);
+    let db = open_maintained_scan_database(dir.path()).unwrap();
+    let paths = db
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .map(|row| row.relative_path)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        paths,
+        [
+            "clip.AIF",
+            "nested/stereo.aiff",
+            "nested/two.wav",
+            "one.wav"
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    );
+    let audit_paths = db
+        .content_audit_forward_candidates(1, "", 8)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.entry.relative_path)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(audit_paths, paths);
 }
 
 #[test]

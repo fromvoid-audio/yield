@@ -13,7 +13,7 @@ fi
 
 AUDITION_REPO_ROOT="${YIELD_GPUI_CI_CHECKOUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 cd "$AUDITION_REPO_ROOT"
-AUDITION_EVIDENCE_DIR="$AUDITION_REPO_ROOT/artifacts/macos-audition-coreaudio"
+AUDITION_EVIDENCE_DIR="${YIELD_NATIVE_VERIFICATION_OUTPUT:-$AUDITION_REPO_ROOT/artifacts/macos-audition-coreaudio}"
 mkdir -p "$AUDITION_EVIDENCE_DIR"
 
 {

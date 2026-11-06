@@ -948,11 +948,19 @@ impl WaveformOutputSpec {
         source: WaveformSourceSpec,
     ) -> Result<(), WaveformEditValidationError> {
         source.validate()?;
+        self.validate_layout(source.channels, source.sample_rate)
+    }
+
+    fn validate_layout(
+        self,
+        channels: u16,
+        sample_rate: u32,
+    ) -> Result<(), WaveformEditValidationError> {
         if self.encoding != WaveformOutputEncoding::Float32
             || self.channels == 0
             || self.sample_rate == 0
-            || self.channels != source.channels
-            || self.sample_rate != source.sample_rate
+            || self.channels != channels
+            || self.sample_rate != sample_rate
         {
             return Err(WaveformEditValidationError::InvalidOutputSpec);
         }
@@ -1200,7 +1208,7 @@ impl WaveformEditSettingsArgs {
     }
 }
 
-/// One of the seven bounded waveform edit operations supported by the media editor.
+/// Bounded waveform edit operations supported by the media editor.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub enum WaveformEditOperationArgs {
@@ -1214,6 +1222,8 @@ pub enum WaveformEditOperationArgs {
     Trim,
     /// Retain only the selected range.
     Crop,
+    /// Downmix a complete stereo source to a single channel.
+    ConvertToMono,
     /// Cyclically slide the whole source by exact signed frames.
     Slide {
         /// Signed cyclic frame offset.
@@ -1229,6 +1239,17 @@ pub enum WaveformEditOperationArgs {
 }
 
 impl WaveformEditOperationArgs {
+    /// Return the output channel count for the observed source layout.
+    pub fn output_channels(self, source_channels: u16) -> Result<u16, WaveformEditValidationError> {
+        match (self, source_channels) {
+            (Self::ConvertToMono, 2) => Ok(1),
+            (Self::ConvertToMono, _) => {
+                Err(WaveformEditValidationError::InvalidMonoConversionSource)
+            }
+            (_, channels) => Ok(channels),
+        }
+    }
+
     fn output_frames(
         self,
         total_frames: u64,
@@ -1247,10 +1268,8 @@ impl WaveformEditOperationArgs {
                 Ok(total_frames)
             }
             Self::Reverse | Self::Mute => Ok(total_frames),
-            Self::Slide { .. } => {
-                if matches!(self, Self::Slide { .. })
-                    && (range.start_frame != 0 || range.end_frame != total_frames)
-                {
+            Self::Slide { .. } | Self::ConvertToMono => {
+                if range.start_frame != 0 || range.end_frame != total_frames {
                     return Err(WaveformEditValidationError::WholeSourceRequired);
                 }
                 Ok(total_frames)
@@ -1392,7 +1411,11 @@ impl WaveformEditIntentArgs {
         let output_frames = self
             .operation
             .output_frames(self.total_frames, self.range)?;
-        self.output.validate_against_source(self.source_spec)?;
+        let output_channels = self
+            .operation
+            .output_channels(self.source_spec.channels())?;
+        self.output
+            .validate_layout(output_channels, self.source_spec.sample_rate())?;
         let samples = output_frames
             .checked_mul(u64::from(self.output.channels()))
             .ok_or(WaveformEditValidationError::OutputArithmeticOverflow)?;
@@ -1422,9 +1445,12 @@ pub enum WaveformEditValidationError {
     /// The source WAV specification is unsupported or malformed.
     #[error("waveform edit source specification is invalid")]
     InvalidSourceSpec,
-    /// The output is not explicit Float32 matching the source rate/channels.
+    /// The output does not match the edit's Float32 layout.
     #[error("waveform edit output specification is invalid")]
     InvalidOutputSpec,
+    /// A mono conversion was requested for a source with fewer or more than two channels.
+    #[error("waveform edit mono conversion requires a stereo source")]
+    InvalidMonoConversionSource,
     /// The captured source frame count is outside its bound.
     #[error("waveform edit frame count is invalid")]
     InvalidFrameCount,
@@ -2085,7 +2111,16 @@ pub(crate) fn validate_persisted_waveform_edit_value(value: &Value) -> Result<()
     if start >= end || end > total_frames {
         return Err("waveform edit frame range is invalid");
     }
-    validate_persisted_waveform_operation_value(required_field(object, "operation")?)?;
+    let operation = required_field(object, "operation")?;
+    validate_persisted_waveform_operation_value(operation)?;
+    let output_channels = if operation.as_str() == Some("ConvertToMono") {
+        if channels != 2 || start != 0 || end != total_frames {
+            return Err("waveform edit mono conversion requires the whole stereo source");
+        }
+        1
+    } else {
+        channels
+    };
 
     let output = strict_object(
         required_field(object, "output")?,
@@ -2095,17 +2130,20 @@ pub(crate) fn validate_persisted_waveform_edit_value(value: &Value) -> Result<()
         required_field(output, field)?;
     }
     if required_field(output, "encoding")?.as_str() != Some("Float32")
-        || required_field(output, "channels")?.as_u64() != Some(channels)
+        || required_field(output, "channels")?.as_u64() != Some(output_channels)
         || required_field(output, "sample_rate")?.as_u64() != Some(sample_rate)
     {
-        return Err("waveform edit output specification does not match source");
+        return Err("waveform edit output specification does not match the operation");
     }
     Ok(())
 }
 
 fn validate_persisted_waveform_operation_value(value: &Value) -> Result<(), &'static str> {
     if let Some(variant) = value.as_str() {
-        return if matches!(variant, "Reverse" | "Mute" | "Trim" | "Crop") {
+        return if matches!(
+            variant,
+            "Reverse" | "Mute" | "Trim" | "Crop" | "ConvertToMono"
+        ) {
             Ok(())
         } else {
             Err("waveform edit operation unit variant is unsupported")

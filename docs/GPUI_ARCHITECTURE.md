@@ -209,6 +209,164 @@ scroll range. Reversing a transition starts from its current opacity; a settled
 fade must not keep requesting frames. Gradient overlays must remain inside the
 list viewport and leave pointer and scroll input available to the list.
 
+### Compact browser layout
+
+The normal window opens at 1120×720 logical points and can shrink to 960×560.
+The default theme starts with a 260-point sidebar, a 226-point waveform pane,
+42 points for the toolbar, and 30 points for status. Sample rows are 22 points
+high, controls are 26 points high, and the standard control gap and panel inset
+are 6 and 10 points. These values describe the theme inputs. Expanded panels,
+window bounds, and text scale determine the rendered space available for rows.
+The waveform allocation already reserves four list rows in its height
+calculation. Existing enlarged-text checks cover toolbar wrapping, the browser
+columns, the status bar, and scrolling to the last settings action.
+
+Use the sample list and waveform as the primary work area. At the minimum
+window size, first reduce unused space in the default pane allocations or
+between controls. Preserve user-resized preferences, the theme's default row
+and control sizes, waveform controls, and resize rails. The compact target is
+room for at least one more complete default sample row or a comparable gain
+in Name-column width. Confirm the gain against the rendered baseline.
+
+Keep the loaded sample, its waveform, and passive row focus distinguishable
+through filtering, scrolling, and context menus. Keep source and folder
+navigation and active filters reachable. Give the Name column remaining width
+after required fixed columns, and preserve access to optional columns through
+the existing column and scroll behavior. The toolbar should keep common
+transport and search actions together, reserve the native title-bar controls,
+and wrap at enlarged text sizes. Use the same spacing tokens in the sidebar,
+filter controls, and toolbar wherever their roles agree.
+
+Use the status bar for the current operation and reserve expanded details,
+settings, help, and context actions for their respective panels. Keep those
+panels within the viewport and allow their contents to scroll. Truncated visual
+labels need their full accessible name. Avoid position-only indicators for
+active modes or focus.
+
+Measure 960×560, 1120×720, and 1440×900 at 100% and 200% text scale with the
+same synthetic rows, selected sample, and panel state. Compare list viewport
+height, complete visible rows, Name width, waveform area, and reachability of
+transport, filters, settings, status, and menu actions. Capture matched
+screenshots separately from optimized native builds with the same fixture and
+window bounds. Verify browse, filter, audition, waveform editing, extraction
+where enabled, and menu actions before accepting the full layout change.
+
+#### Compact layout review
+
+Use the same default theme, sort order, loaded sample, and closed auxiliary
+panels in both runs. The geometry baseline is commit
+`23c847287b7122265eacb49e725a8e60d1d62022`. The candidate with the toolbar,
+status, and waveform allocation changes is
+`0846436098c9e8dff81b8220353add457cff1b99`. The GPUI test-platform results were
+as follows.
+
+| Window | Text scale | Complete rows before → after | Waveform drawing height before → after |
+| --- | ---: | ---: | ---: |
+| 960×560 | 100% | 10 → 11 | 181 → 143 |
+| 960×560 | 200% | 2 → 3 | 8 → 45 |
+| 1120×720 | 100% | 17 → 17 | 181 → 181 |
+| 1120×720 | 200% | 4 → 5 | 137 → 137 |
+| 1440×900 | 100% | 26 → 26 | 181 → 181 |
+| 1440×900 | 200% | 8 → 9 | 137 → 137 |
+
+For each source revision, use a separate empty configuration directory and a
+separate copy of the same synthetic WAV folder with at least 30 rows. Use an
+optimized local build. Run from the matching clean checkout and record the
+commit, Rust version, macOS build, and display scale with each screenshot set.
+Set `qa_root` to the absolute path of the new directory and put its synthetic
+audio in `$qa_root/samples` before running these commands.
+
+```sh
+git rev-parse HEAD
+rustc --version
+sw_vers
+YIELD_CONFIG_HOME="$qa_root" YIELD_CONFIG_PROFILE=sandbox \
+  cargo run --locked --profile release-local -p yield --bin yield -- "$qa_root/samples"
+```
+
+- [ ] Capture the minimum, default, and wide window at 100% and 200% text on
+  both builds. Match the loaded sample and viewport, and check toolbar
+  controls, the status action, the sample name, and waveform labels for
+  clipping or overlap.
+- [ ] In the candidate, browse the source tree, filter and clear the filter,
+  select and audition a sample, and move a waveform selection. Open and
+  dismiss a row menu while another sample is loaded.
+- [ ] Drag the waveform and sidebar dividers at the minimum size. Check that
+  Escape restores the previous size and a committed preference is honored
+  after resizing or reopening. Check settings, help, and the status panel
+  at enlarged text scale.
+- [ ] Exercise waveform edit and extraction controls that are enabled for the
+  fixture. Record unavailable routes separately. Repeat the review on other
+  supported native platforms when the identical candidate revision is available.
+
+Native screenshots, device playback, and hands-on acceptance are pending.
+
+## Tempo-aware audition
+
+### Link provider
+
+Start with a separately run Carabiner process on the same computer as Yield.
+Carabiner participates in the Link session and exposes a documented loopback
+TCP interface. Yield uses only its newline-delimited `status` request and the
+tempo and peer count from status messages. Use Carabiner 1.2.0 for the initial
+native acceptance. The default endpoint is `127.0.0.1:17000`. The upstream
+project provides downloads and build instructions for macOS, Windows, and
+Linux. [Carabiner protocol and downloads](https://github.com/Deep-Symmetry/carabiner)
+· [Carabiner 1.2.0](https://github.com/Deep-Symmetry/carabiner/releases/tag/v1.2.0)
+
+Yield's package keeps the bridge external. The Ableton SDK is offered under
+GPL-2.0-or-later, with Ableton directing proprietary integrators to contact
+them. The Rust SDK wrapper and the independent Rust protocol implementation
+also carry GPL terms. A linked SDK or a packaged bridge would need a separate
+distribution and license decision. The first client uses the platform's
+ordinary TCP support and keeps the dependency outside Yield's application
+bundle. [Ableton SDK license](https://github.com/Ableton/link/blob/master/LICENSE.md)
+· [Rust wrapper license](https://docs.rs/crate/rusty_link/0.4.6/source/README.md)
+· [Rust protocol implementation license](https://github.com/anweiss/ableton-link-rs#license)
+
+The provider starts disabled. Explicit enablement starts a bounded worker
+that connects to the loopback endpoint. The worker owns the socket, status
+polls, retry delay, and a monotonic observation timestamp. Limit each incoming
+line to 4 KiB and validate framing, peer count, and a finite positive tempo.
+Discard the snapshot after disconnection, expiry, or disablement. Use a
+500 ms status poll and treat observations older than 1.5 seconds as stale.
+The UI distinguishes disabled, bridge unavailable, connected with no peers,
+and following a tempo. The native acceptance matrix must confirm the helper
+and a real Link peer on each supported platform.
+
+### Playback boundary
+
+The first integration follows tempo at the next audition trigger. The
+request captures a validated source BPM and a fresh target BPM from a session
+with at least one peer. The selected span, mode, and tempo remain fixed for
+that request, including its loop cycles. Link phase and remote transport are
+outside this tempo-only contract. The ordinary playback path handles disabled
+mode, an unavailable or stale provider, a session with no peers, missing
+metadata, a ratio outside the supported range, or failed preparation.
+Report the fallback to the UI and keep the original source available.
+
+The first stretch worker uses the existing Reson WSOLA implementation for a
+bounded, uncompressed PCM audition span. The ratio is target BPM divided by
+source BPM. Admit ratios from 0.5 through 2.0 and at most eight seconds or
+1,048,576 interleaved input samples, whichever is reached first. The worker
+prepares immutable PCM and returns the exact source and emitted frame counts
+for the playback cursor and loop. Cancellation and the preparation deadline
+must be checked between synthesis blocks. Set the initial deadline to
+200 ms from admission and fall back to raw playback on expiry. File access,
+network access, preparation allocations, and stretch work belong off the UI
+and audio callback threads.
+
+WSOLA keeps this prototype portable and avoids a new bundled dependency.
+Signalsmith Stretch is an MIT-licensed C++ candidate for later comparison if
+WSOLA misses the quality or latency target. It adds a native build boundary
+and defines input and output latency that a caller must account for.
+Qualify pitch and duration against known tones and rhythmic loops before
+claiming the worker preserves pitch for the intended material. Record
+preparation latency and memory in an optimized build. The initial target is
+150 ms at the 95th percentile for two-second stereo loops at 48 kHz. Listening
+and real-peer timing remain native acceptance.
+[Signalsmith Stretch documentation](https://signalsmith-audio.co.uk/code/stretch/)
+
 ## Work and lifecycle
 
 The browser keeps selected relative folders, expansion sets, direct or descendant

@@ -572,6 +572,41 @@ mod tests {
     }
 
     #[test]
+    fn live_metronome_mix_follows_the_audible_frame_on_update() {
+        use crate::player::metronome::MetronomeSource;
+        use crate::{MetronomeSound, PlaybackMetronomeMix, SamplesBuffer};
+
+        let samples = Arc::<[f32]>::from(vec![0.0; 1_000]);
+        let plan = span_plan(0, 1_000, 0);
+        let initial = PlaybackMetronomeConfig::new(4).with_source_cycle(1_000, 0);
+        let handle = PlaybackSpanHandle::from_plan_with_metronome(&plan, Some(initial));
+        let source = SpanSamplesSource::new(
+            1,
+            1_000,
+            samples.clone(),
+            handle.clone(),
+            SpanSamplesMode::Looped,
+            0,
+        );
+        let mut live = MetronomeSource::new_live(source, handle.clone());
+        assert_eq!(live.next(), Some(0.22));
+        live.nth(123).expect("frame before the first offbeat");
+
+        let mix = PlaybackMetronomeMix::new(25, false, true, MetronomeSound::Woodblock);
+        let updated = initial.with_mix(mix);
+        handle.update_from_plan(&plan, None, Some(updated));
+        let reference = SamplesBuffer::from_arc(1, 1_000, samples);
+        let expected: Vec<_> = MetronomeSource::new(reference, updated, 1_000, 0, 125)
+            .take(130)
+            .collect();
+        assert_eq!(live.take(130).collect::<Vec<_>>(), expected);
+        assert_eq!(expected[0], 0.13 * 0.25);
+        assert_eq!(expected[125], 0.0); // Frame 250 is a disabled main beat.
+        assert_eq!(handle.applied_metronome().mix(), mix);
+        assert_eq!(handle.applied_metronome().phase_frames(), 125);
+    }
+
+    #[test]
     fn loop_wrap_reanchors_live_metronome_phase_to_the_audible_start() {
         let samples = Arc::<[f32]>::from(vec![0.0; 4]);
         let plan = span_plan(1, 3, 0);
@@ -626,15 +661,21 @@ mod tests {
 
     #[test]
     fn static_and_live_metronomes_resolve_source_cycles_identically() {
-        use crate::player::metronome::MetronomeSource;
+        use crate::player::metronome::MetronomeMixOverride;
 
         let samples = Arc::<[f32]>::from(vec![0.0; 16]);
         let config = PlaybackMetronomeConfig::new(4).with_source_cycle(10, 3);
         let plan = span_plan(1, 8, 2);
         let static_inner = SamplesBuffer::from_arc_span_at(1, 1_000, samples.clone(), 3, 8, 3);
         let static_inner: Box<dyn Source<Item = f32> + Send> = Box::new(static_inner);
-        let mut static_metronome =
-            super::super::source_with_metronome(static_inner, Some(config), &plan, None);
+        let mix_override = MetronomeMixOverride::default();
+        let mut static_metronome = super::super::source_with_metronome(
+            static_inner,
+            Some(config),
+            &plan,
+            None,
+            mix_override.clone(),
+        );
 
         let handle = PlaybackSpanHandle::from_plan_with_metronome(&plan, Some(config));
         let live_inner = SpanSamplesSource::new(
@@ -645,11 +686,72 @@ mod tests {
             SpanSamplesMode::Looped,
             3,
         );
-        let mut live_metronome = MetronomeSource::new_live(live_inner, handle);
+        let mut live_metronome = super::super::source_with_metronome(
+            Box::new(live_inner),
+            Some(config),
+            &plan,
+            Some(handle),
+            mix_override.clone(),
+        );
 
         for _ in 0..5 {
             assert_eq!(static_metronome.next(), live_metronome.next());
         }
+    }
+
+    #[test]
+    fn runtime_mix_override_reaches_static_and_live_sources_without_restarting_phase() {
+        use crate::player::metronome::MetronomeMixOverride;
+        use crate::{MetronomeSound, PlaybackMetronomeMix};
+
+        let samples = Arc::<[f32]>::from(vec![0.0; 1_000]);
+        let plan = span_plan(0, 1_000, 0);
+        let config = PlaybackMetronomeConfig::new(4).with_source_cycle(1_000, 0);
+        let mix = MetronomeMixOverride::default();
+        let mut static_source = super::super::source_with_metronome(
+            Box::new(SamplesBuffer::from_arc(1, 1_000, samples.clone())),
+            Some(config),
+            &plan,
+            None,
+            mix.clone(),
+        );
+        let handle = PlaybackSpanHandle::from_plan_with_metronome(&plan, Some(config));
+        let mut live_source = super::super::source_with_metronome(
+            Box::new(SpanSamplesSource::new(
+                1,
+                1_000,
+                samples,
+                handle.clone(),
+                SpanSamplesMode::Looped,
+                0,
+            )),
+            Some(config),
+            &plan,
+            Some(handle.clone()),
+            mix.clone(),
+        );
+        assert_eq!(static_source.next(), Some(0.22));
+        assert_eq!(live_source.next(), Some(0.22));
+        let revision = handle.applied_metronome().revision();
+
+        mix.set(PlaybackMetronomeMix::new(
+            0,
+            true,
+            true,
+            MetronomeSound::Classic,
+        ));
+        for source in [&mut static_source, &mut live_source] {
+            assert_eq!(source.nth(123), Some(0.0));
+        }
+        mix.set(PlaybackMetronomeMix::new(
+            50,
+            false,
+            true,
+            MetronomeSound::Classic,
+        ));
+        assert_eq!(static_source.next(), Some(0.13 * 0.5));
+        assert_eq!(live_source.next(), Some(0.13 * 0.5));
+        assert_eq!(handle.applied_metronome().revision(), revision);
     }
 
     fn span_plan(start_frame: u64, end_frame: u64, offset_frame: u64) -> PlaybackSpanPlan {

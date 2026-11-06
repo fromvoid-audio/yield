@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use gpui::{ClickEvent, Context, MouseDownEvent, Window};
 use yield_core::{AudioFile, AudioFileId, BrowserRow, BrowserSelection};
 
-use crate::external_clipboard::{
-    FileClipboardError, PreparedFilePaths, copy_file_paths, prepare_file_paths,
-};
+#[cfg(not(target_os = "linux"))]
+use crate::external_clipboard::copy_file_paths;
+use crate::external_clipboard::{FileClipboardError, PreparedFilePaths, prepare_file_paths};
 
 use super::{Browser, tag_filter};
 
@@ -139,23 +139,41 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         match command {
-            HandoffCommand::Copy => match copy_file_paths(&prepared) {
-                Ok(()) => {
-                    let count = prepared.as_slice().len();
-                    self.set_playback_status(format!(
-                        "Copied {count} file{}",
-                        if count == 1 { "" } else { "s" }
-                    ));
+            HandoffCommand::Copy => {
+                #[cfg(target_os = "linux")]
+                let result = cx
+                    .write_files_to_clipboard(prepared.as_slice())
+                    .map_err(|error| FileClipboardError::Platform(error.to_string()));
+                #[cfg(not(target_os = "linux"))]
+                let result = copy_file_paths(&prepared);
+                match result {
+                    Ok(()) => {
+                        let count = prepared.as_slice().len();
+                        let action = if cfg!(target_os = "linux") {
+                            "Copy requested for"
+                        } else {
+                            "Copied"
+                        };
+                        self.set_playback_status(format!(
+                            "{action} {count} file{}",
+                            if count == 1 { "" } else { "s" }
+                        ));
+                    }
+                    Err(error) => self.handoff_failed(command, error),
                 }
-                Err(error) => self.handoff_failed(command, error),
-            },
+            }
             HandoffCommand::Reveal => {
                 let Some(path) = prepared.as_slice().first() else {
                     self.handoff_failed(command, FileClipboardError::NoExistingFiles);
                     return;
                 };
                 cx.reveal_path(path);
-                self.set_playback_status(format!("Revealed {}", path.display()));
+                let status = if cfg!(target_os = "linux") {
+                    "Reveal requested:"
+                } else {
+                    "Revealed"
+                };
+                self.set_playback_status(format!("{status} {}", path.display()));
             }
         }
     }

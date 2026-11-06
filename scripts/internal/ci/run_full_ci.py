@@ -142,6 +142,7 @@ def _main() -> int:
             "scripts.internal.ci.test_full_ci_runner",
             "scripts.internal.ci.test_bundle_packager",
             "scripts.internal.ci.test_local_ci_contract",
+            "scripts.internal.ci.test_frozen_preflight",
             "scripts.internal.ci.test_managed_exec",
             "scripts.internal.ci.test_runtime_paths",
             "scripts.internal.release.test_release_wrapper",

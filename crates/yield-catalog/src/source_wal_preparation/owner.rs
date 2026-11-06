@@ -1,5 +1,6 @@
 //! Worker-local adapter. Genuine native custody and outcomes belong to the library.
 use super::*;
+use crate::PlaymarkTempoOperation;
 struct Slot {
     source: RegisteredSource<SourceWalProducerOwner>,
     lifecycle_generation: u64,
@@ -352,6 +353,14 @@ pub(crate) fn deferred(command: &CatalogCommand, slots: &WorkerReservations) -> 
                 .source_id(),
         ),
         CatalogCommand::RequestSimilarity { request, .. } => slots.is_held(request.source_id()),
+        CatalogCommand::RequestTransientMarkers { request, .. } => {
+            slots.is_held(request.source_id())
+        }
+        CatalogCommand::RequestSourceContentDigest { request, .. } => {
+            slots.is_held(&request.scope().source_id)
+        }
+        CatalogCommand::PlaymarkTempo { request, .. } => slots.is_held(request.source_id()),
+        CatalogCommand::PlaymarkGridTempo { request, .. } => slots.is_held(request.source_id()),
         CatalogCommand::ConsumeReplay { submission } => slots.is_held(submission.source_id()),
         CatalogCommand::RequestIndexInspection { handle, .. } => slots.is_held(&handle.source_id),
     }
@@ -362,6 +371,15 @@ pub(crate) fn deferred(command: &CatalogCommand, slots: &WorkerReservations) -> 
 // Bounded read pages on an unrelated source remain usable without touching parked owners.
 pub(crate) fn interrupts_preparation(command: &CatalogCommand) -> bool {
     match command {
+        CatalogCommand::PlaymarkTempo { request, .. } => {
+            matches!(request.operation(), PlaymarkTempoOperation::Replace { .. })
+        }
+        CatalogCommand::PlaymarkGridTempo { request, .. } => {
+            matches!(
+                request.operation(),
+                PlaymarkGridTempoOperation::Replace { .. }
+            )
+        }
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestFeatureAnalysis { .. }
         | CatalogCommand::RequestWavMetadata { .. }
@@ -371,6 +389,8 @@ pub(crate) fn interrupts_preparation(command: &CatalogCommand) -> bool {
         | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::ApplyPreparedCollectionOperation { .. }
         | CatalogCommand::RequestSimilarity { .. }
+        | CatalogCommand::RequestTransientMarkers { .. }
+        | CatalogCommand::RequestSourceContentDigest { .. }
         | CatalogCommand::ConsumeReplay { .. }
         | CatalogCommand::ApplyCuration { .. }
         | CatalogCommand::ApplyCurationOperation { .. }

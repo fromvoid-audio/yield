@@ -4798,6 +4798,11 @@ mod tests {
     fn v7_waveform_edit_fixture(operation: Value, range: (u64, u64)) -> Value {
         let mut fixture = v6_command_fixture("Copy");
         let source = fixture["universal_command_args"]["Copy"]["source"].clone();
+        let output_channels = if operation.as_str() == Some("ConvertToMono") {
+            1
+        } else {
+            2
+        };
         fixture["schema_version"] = Value::from(7_u64);
         fixture["universal_intent"]["command_kind"] = Value::from("DestructiveEdit");
         fixture["universal_command_args"] = serde_json::json!({
@@ -4823,7 +4828,7 @@ mod tests {
                 "operation": operation,
                 "output": {
                     "encoding": "Float32",
-                    "channels": 2,
+                    "channels": output_channels,
                     "sample_rate": 48000
                 }
             }
@@ -5146,6 +5151,7 @@ mod tests {
                 }
             },
             "playback_type": "OneShot",
+            "playmark_beats": null,
             "destination": destination,
             "collision_policy": "NoReplace"
         });
@@ -5828,6 +5834,7 @@ mod tests {
             (Value::from("Mute"), (2, 8)),
             (Value::from("Trim"), (2, 8)),
             (Value::from("Crop"), (2, 8)),
+            (Value::from("ConvertToMono"), (0, 10)),
             (serde_json::json!({"Slide": {"frame_offset": -3}}), (0, 10)),
             (
                 serde_json::json!({
@@ -5853,6 +5860,30 @@ mod tests {
             assert_eq!(
                 value(&encode(&record).expect("V7 fixture encodes")),
                 fixture
+            );
+        }
+    }
+
+    #[test]
+    fn v7_mono_conversion_rejects_a_wrong_source_range_or_output_layout() {
+        let fixture = v7_waveform_edit_fixture(Value::from("ConvertToMono"), (0, 10));
+        for (section, field, invalid) in [
+            ("source_spec", "channels", 1),
+            ("source_spec", "channels", 3),
+            ("range", "start_frame", 1),
+            ("range", "end_frame", 9),
+            ("output", "channels", 2),
+            ("output", "sample_rate", 44_100),
+        ] {
+            let mut malformed = fixture.clone();
+            malformed["universal_command_args"]["WaveformEdit"][section][field] =
+                Value::from(invalid);
+            assert!(
+                matches!(
+                    decode(&serde_json::to_vec(&malformed).expect("V7 mono bytes")),
+                    Err(DecodeError::Malformed { .. })
+                ),
+                "{section}.{field}={invalid}"
             );
         }
     }

@@ -224,16 +224,14 @@ impl SourceWriter {
                 let mut target = ReadinessTarget::file(
                     &source, &identity, &path, stage, version, generation, &content,
                 );
-                let wav = Path::new(&path)
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+                let supported = crate::sample_sources::is_supported_audio(Path::new(&path));
                 if stage == ReadinessStage::EmbeddingAspects
-                    || (stage == ReadinessStage::AnalysisFeatures && !wav)
+                    || (stage == ReadinessStage::AnalysisFeatures && !supported)
                 {
                     target.eligibility = ReadinessEligibility::Unsupported;
                 }
                 if path == requested && stage == ReadinessStage::AnalysisFeatures {
-                    if !wav {
+                    if !supported {
                         return Err(SourceWriterError::InvalidRequest(
                             "feature input format unsupported",
                         ));

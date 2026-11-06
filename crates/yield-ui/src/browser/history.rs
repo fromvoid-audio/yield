@@ -161,6 +161,7 @@ impl Browser {
 
     fn replay_loaded_history_entry(&mut self, entry: PlaybackHistoryEntry, cx: &mut Context<Self>) {
         let span = entry.span();
+        self.abandon_waveform_region_drag(cx);
         self.clear_waveform_region();
         self.set_waveform_play_region(WaveformPlayRegion::new(
             f64::from(span.start()),

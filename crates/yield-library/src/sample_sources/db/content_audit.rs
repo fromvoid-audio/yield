@@ -340,10 +340,12 @@ impl SourceDatabase {
                 )| {
                     let relative_path = parse_relative_path_from_db(&path).ok()?;
                     let entry = (missing == Some(0)
-                        && extension
-                            .as_deref()
-                            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
-                        && crate::sample_sources::is_supported_audio(&relative_path))
+                        && extension.as_deref().is_some_and(|extension| {
+                            crate::sample_sources::matches_indexed_audio_extension(
+                                &relative_path,
+                                extension,
+                            )
+                        }))
                     .then(|| SourceManifestEntry {
                         relative_path: relative_path.clone(),
                         file_identity,
@@ -753,6 +755,34 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn audit_forward_index_and_retries_share_persisted_extension_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = SourceDatabase::open_for_source_write(directory.path()).unwrap();
+        database
+            .connection
+            .execute_batch(
+                "INSERT INTO wav_files(path, file_size, modified_ns, extension) VALUES
+                    ('good.WAV', 64, 1, 'wav'), ('wrong.wav', 64, 1, 'WAV');
+                 INSERT INTO source_content_audit_entries(
+                    path, last_attempt_at, retry_at, skip_reason, attempts
+                 ) VALUES
+                    ('good.WAV', 1, 1, 'unavailable', 1),
+                    ('wrong.wav', 1, 1, 'unavailable', 1);",
+            )
+            .unwrap();
+        let forward = database.content_audit_forward_candidates(1, "", 2).unwrap();
+        assert_eq!(forward.len(), 1);
+        assert_eq!(forward[0].entry.relative_path, Path::new("good.WAV"));
+
+        let retries = database.content_audit_retry_candidates("", 2, 2).unwrap();
+        assert_eq!(retries.len(), 2);
+        assert_eq!(retries[0].relative_path, Path::new("good.WAV"));
+        assert!(retries[0].entry.is_some());
+        assert_eq!(retries[1].relative_path, Path::new("wrong.wav"));
+        assert!(retries[1].entry.is_none());
+    }
 
     #[test]
     fn legacy_cursor_is_imported_without_claiming_verification() {

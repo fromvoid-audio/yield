@@ -10,6 +10,7 @@ pub mod db;
 pub mod finalization;
 /// Global library database helpers.
 pub mod library;
+mod playmark_grid_tempo;
 /// Durable source-readiness and convergence coordination contracts.
 pub mod readiness;
 /// Backend-neutral Finder observation reconciliation contracts.
@@ -18,6 +19,7 @@ mod source_entry;
 /// Sealed bounded pre-intent transport on the genuine source producer.
 pub mod wal_transport;
 
+pub(crate) use audio_support::matches_indexed_audio_extension;
 pub use audio_support::{
     is_apple_double_sidecar, is_recognized_audio, is_supported_audio, supported_audio_where_clause,
 };
@@ -75,6 +77,7 @@ pub use library::{
     SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES, SourceRegistrySnapshot, UI_PREFERENCES_KEY,
     UI_PREFERENCES_MAX_BYTES,
 };
+pub use playmark_grid_tempo::SourcePlaymarkGridTempo;
 pub use source_entry::{
     HiddenDirectoryPolicy, SOURCE_FORMAT_POLICY_VERSION, SourceEntryClassification,
     SourceEntryFileType, SourceEntryKind, SourceEntryProbeError, SourceEntryRejection,

@@ -25,6 +25,7 @@ const MAX_NUMERIC_DIGITS: usize = 3;
 
 /// Maximum UTF-8 bytes accepted by the compact playmark timing editor.
 pub(crate) const MAX_PLAYMARK_TIMING_INPUT_BYTES: usize = 256;
+pub(crate) const MAX_PLAYMARK_GRID_TEMPO_INPUT_BYTES: usize = 12;
 
 actions!(
     search_input,
@@ -166,6 +167,19 @@ impl SearchInputOptions {
         }
     }
 
+    pub(crate) const fn playmark_grid_tempo() -> Self {
+        Self {
+            placeholder: "BPM",
+            max_bytes: Some(MAX_PLAYMARK_GRID_TEMPO_INPUT_BYTES),
+            max_characters: None,
+            paste_newlines: PasteNewlines::Preserve,
+            underlined: false,
+            ascii_digits_only: false,
+            compact_height: Some(24),
+            use_row_height: false,
+        }
+    }
+
     /// Options for one inline collection display-name editor.
     pub(crate) const fn collection_name() -> Self {
         Self {
@@ -201,6 +215,7 @@ pub(crate) struct SearchInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    pointer_cursor: CursorStyle,
 }
 
 impl EventEmitter<SearchChanged> for SearchInput {}
@@ -246,11 +261,16 @@ impl SearchInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            pointer_cursor: CursorStyle::IBeam,
         }
     }
 
     pub(crate) fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    pub(crate) fn enable_tab_stop(&mut self) {
+        self.focus_handle = self.focus_handle.clone().tab_stop(true);
     }
 
     pub(crate) fn content(&self) -> &str {
@@ -307,6 +327,12 @@ impl SearchInput {
         self.selected_range = 0..self.content.len();
         self.selection_reversed = false;
         self.marked_range = None;
+        cx.notify();
+    }
+
+    /// Override the text cursor while a surrounding control owns pointer input.
+    pub(crate) fn set_pointer_cursor(&mut self, cursor: CursorStyle, cx: &mut Context<Self>) {
+        self.pointer_cursor = cursor;
         cx.notify();
     }
 
@@ -947,7 +973,7 @@ impl Render for SearchInput {
             .flex()
             .key_context("SearchInput")
             .track_focus(&self.focus_handle)
-            .cursor(CursorStyle::IBeam)
+            .cursor(self.pointer_cursor)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))

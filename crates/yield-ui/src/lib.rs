@@ -39,6 +39,7 @@ actions!(
 
 const WINDOW_WIDTH: f32 = 1_120.0;
 const WINDOW_HEIGHT: f32 = 720.0;
+const MIN_WINDOW_HEIGHT: f32 = 560.0;
 
 /// Start the browser window.
 pub fn run(initial_root: Option<PathBuf>) {
@@ -175,7 +176,9 @@ pub fn run(initial_root: Option<PathBuf>) {
                 }),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 display_id: qa_display,
-                window_min_size: Some(size(px(960.0), px(560.0))),
+                window_min_size: Some(size(px(960.0), px(MIN_WINDOW_HEIGHT))),
+                #[cfg(target_os = "linux")]
+                app_id: Some("org.portalsurfer.yield".into()),
                 ..Default::default()
             },
             move |window, cx| {

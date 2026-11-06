@@ -382,6 +382,18 @@ const WAVEFORM_ROWS: &[ShortcutRow] = &[
         description: "Slide the play selection",
     },
     ShortcutRow {
+        keys: "Cmd/Ctrl-Left / Right (waveform)",
+        description: "Halve / double the play selection around its midpoint",
+    },
+    ShortcutRow {
+        keys: "Cmd/Ctrl-drag a play selection edge",
+        description: "Preview BPM from the new selection length and current beat count",
+    },
+    ShortcutRow {
+        keys: "Cmd/Ctrl-Z / Shift-Cmd/Ctrl-Z (waveform)",
+        description: "Undo / redo the saved playmark tempo",
+    },
+    ShortcutRow {
         keys: "Option or Shift + Left / Right",
         description: "Nudge the play selection by one audio frame",
     },

@@ -115,6 +115,10 @@ impl CatalogMetadataState {
         self.context.clone()
     }
 
+    pub(super) fn context_ref(&self) -> Option<&CatalogMetadataContext> {
+        self.context.as_ref()
+    }
+
     pub(super) fn observe_visible_demand(
         &mut self,
         context: CatalogMetadataContext,

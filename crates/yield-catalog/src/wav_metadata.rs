@@ -7,7 +7,7 @@ use yield_library::app_dirs::WritableProfileGuard;
 use yield_library::sample_sources::SourceId;
 use yield_library::sample_sources::db::SourceManifestEntry;
 use yield_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
-use yield_scan::sample_sources::scanner::read_wav_display_metadata_for_manifest;
+use yield_scan::sample_sources::scanner::read_audio_display_metadata_for_manifest;
 
 use super::{
     AdmissionState, CatalogError, CatalogSnapshot, CatalogWavMetadata, RegisteredSource,
@@ -114,7 +114,7 @@ pub(crate) fn read_patch(
         token.load(Ordering::Acquire)
             || !publication_is_current(admission, source_id, lifecycle_generation, Some(token))
     };
-    let scanner_metadata = read_wav_display_metadata_for_manifest(
+    let scanner_metadata = read_audio_display_metadata_for_manifest(
         &source.root,
         &expected_root_identity,
         &manifest,

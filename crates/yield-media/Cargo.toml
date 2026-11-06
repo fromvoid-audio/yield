@@ -17,9 +17,13 @@ development-state = [
 
 [dependencies]
 hound.workspace = true
+yield-aiff.workspace = true
 yield-analysis.workspace = true
 yield-core.workspace = true
 yield-library.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.176"
 
 [target.'cfg(windows)'.dependencies]
 blake3 = "1.6.1"
