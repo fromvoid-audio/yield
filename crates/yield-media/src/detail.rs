@@ -19,6 +19,9 @@ use crate::{
     is_cancelled, sanitize_stream_sample, stream_wav_frames, visual_bands::StreamingProjector,
 };
 
+mod fenced_read;
+pub use fenced_read::with_fenced_wav_read;
+
 /// Maximum number of source frames that one detail request may expose.
 pub const MAX_WAVEFORM_DETAIL_VISIBLE_FRAMES: usize = 8 * 1024 * 1024;
 
@@ -398,21 +401,41 @@ fn fingerprint_open_source(
     file: &mut File,
     cancellation: Option<&AtomicBool>,
 ) -> Result<String, String> {
+    fingerprint_open_source_with_checkpoint(file, None, || {
+        if is_cancelled(cancellation) {
+            Err(String::from("waveform preview canceled"))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(any(windows, test))]
+fn fingerprint_open_source_with_checkpoint(
+    file: &mut File,
+    mut remaining: Option<u64>,
+    checkpoint: impl Fn() -> Result<(), String>,
+) -> Result<String, String> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("failed to rewind WAV source for fingerprinting: {error}"))?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        if is_cancelled(cancellation) {
-            return Err(String::from("waveform preview canceled"));
+        checkpoint()?;
+        let block = remaining.unwrap_or(u64::MAX).min(buffer.len() as u64) as usize;
+        if block == 0 {
+            break;
         }
         let read = file
-            .read(&mut buffer)
+            .read(&mut buffer[..block])
             .map_err(|error| format!("failed to fingerprint WAV source: {error}"))?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        if let Some(remaining) = remaining.as_mut() {
+            *remaining -= read as u64;
+        }
     }
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("failed to rewind WAV source after fingerprinting: {error}"))?;
@@ -581,6 +604,10 @@ mod tests {
         let mut source = File::open(&path).expect("open fingerprint fixture");
         let fingerprint = fingerprint_open_source(&mut source, None).expect("fingerprint source");
         assert_eq!(fingerprint, blake3::hash(&original).to_hex().to_string());
+        assert_eq!(
+            fingerprint_open_source_with_checkpoint(&mut source, Some(2), || Ok(())).unwrap(),
+            blake3::hash(&original[..2]).to_hex().to_string()
+        );
         assert_eq!(source.stream_position().expect("read source offset"), 0);
         let mut prefix = [0_u8; 3];
         source.read_exact(&mut prefix).expect("read rewound source");

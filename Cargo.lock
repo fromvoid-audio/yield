@@ -8989,6 +8989,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "hound",
+ "libc",
  "tempfile",
  "windows 0.62.2",
  "yield-aiff",
