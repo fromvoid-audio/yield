@@ -14233,22 +14233,26 @@ mod tests {
             .expect("relative curation path");
         let collection =
             yield_library::sample_sources::SampleCollection::new(0).expect("collection slot");
+        let seeded = apply_curation_updates(
+            &service,
+            &source_id,
+            &snapshot,
+            500,
+            vec![SourceCurationUpdate::SetRating {
+                path: path.clone(),
+                rating: yield_library::sample_sources::Rating::KEEP_3,
+            }],
+        );
+        assert!(!seeded.files()[0].locked);
         service
             .submit(CatalogCommand::ApplyCuration {
                 source_id: source_id.clone(),
                 lifecycle_generation: 1,
-                expected_revision: snapshot.committed_revision,
+                expected_revision: seeded.source_revision(),
                 root_identity: snapshot.root_identity.clone(),
                 request_id: 501,
                 updates: vec![
-                    SourceCurationUpdate::SetRating {
-                        path: path.clone(),
-                        rating: yield_library::sample_sources::Rating::KEEP_3,
-                    },
-                    SourceCurationUpdate::SetLocked {
-                        path: path.clone(),
-                        locked: true,
-                    },
+                    SourceCurationUpdate::AcceptKeep { path: path.clone() },
                     SourceCurationUpdate::AddCollection { path, collection },
                 ],
             })
@@ -14266,7 +14270,7 @@ mod tests {
         let CatalogEvent::CurationCommitted { receipt, .. } = event else {
             unreachable!();
         };
-        assert_eq!(receipt.source_revision(), snapshot.committed_revision + 1);
+        assert_eq!(receipt.source_revision(), seeded.source_revision() + 1);
         assert_eq!(receipt.root_identity(), &snapshot.root_identity);
         assert_eq!(
             receipt.directory_generation(),

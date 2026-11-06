@@ -2904,6 +2904,9 @@ enum StoredCurationUpdate {
         path: String,
         locked: bool,
     },
+    AcceptKeep {
+        path: String,
+    },
     AddCollection {
         path: String,
         collection: u8,
@@ -2957,6 +2960,9 @@ impl StoredCurationUpdate {
             SourceCurationUpdate::SetLocked { path, locked } => Self::SetLocked {
                 path: Self::path(path)?,
                 locked: *locked,
+            },
+            SourceCurationUpdate::AcceptKeep { path } => Self::AcceptKeep {
+                path: Self::path(path)?,
             },
             SourceCurationUpdate::AddCollection { path, collection } => Self::AddCollection {
                 path: Self::path(path)?,
@@ -3021,6 +3027,9 @@ impl StoredCurationUpdate {
                 path: path(value)?,
                 locked: *locked,
             },
+            Self::AcceptKeep { path: value } => {
+                SourceCurationUpdate::AcceptKeep { path: path(value)? }
+            }
             Self::AddCollection {
                 path: value,
                 collection,
