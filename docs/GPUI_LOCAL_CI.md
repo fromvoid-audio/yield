@@ -107,6 +107,21 @@ inspection because the full runner can have separately owned subprocesses.
 Older runners, subsequent validation after an unconfirmed cleanup, and
 packaging use temporary exact checkouts.
 
+To place the managed Cargo validation cache on a dedicated writable APFS
+volume, create a directory owned by your user with mode `0700`. Pass its
+canonical path on the managed check invocation:
+
+```sh
+YIELD_LOCAL_CI_VALIDATION_ROOT=/Volumes/Scratch/yield-ci \
+  scripts/yield-local-ci check --lane preflight --sha "$FULL_SHA"
+```
+
+Managed preflight, native and full checks use the configured directory with
+the existing Rust toolchain and lockfile key. The run result records the
+selected path, filesystem and available bytes. Packaging uses its release
+cache. Full validation also needs enough space on the home volume for
+its reversible production-state transaction and disposable fixtures.
+
 For a private bundle from an exact validated commit, follow
 [GPUI macOS packaging](GPUI_MACOS_PACKAGING.md).
 

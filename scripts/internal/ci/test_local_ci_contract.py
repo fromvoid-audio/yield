@@ -8,6 +8,7 @@ from importlib.machinery import SourceFileLoader
 import json
 import os
 import pathlib
+import plistlib
 import signal
 import sys
 import tempfile
@@ -22,6 +23,92 @@ SPEC = importlib.util.spec_from_loader("yield_local_ci", SourceFileLoader("yield
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+
+class CargoValidationTargetTests(unittest.TestCase):
+    @contextmanager
+    def fixture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary).resolve()
+            state = base / "repo/.git/local-ci"
+            state.mkdir(parents=True)
+            checkout = state / "checkout"
+            checkout.mkdir()
+            (checkout / "Cargo.lock").write_text("validation cache input")
+            external = base / "external"
+            external.mkdir(mode=0o700)
+            with (
+                mock.patch.object(MODULE, "ROOT", state.parent.parent),
+                mock.patch.dict(os.environ, {MODULE.VALIDATION_ROOT_OVERRIDE: str(external)}, clear=True),
+                mock.patch.object(
+                    MODULE, "command_output", return_value="release: 1.93.0\nhost: aarch64-apple-darwin"
+                ),
+            ):
+                yield state, checkout, external
+
+    def test_validation_uses_external_lock_key_and_packaging_keeps_its_own_root(self):
+        with self.fixture() as (state, checkout, external):
+            default = MODULE.cargo_env(state, "check", checkout)
+            configured = MODULE.cargo_env(state, "check", checkout, external)
+            package = MODULE.cargo_env(state, "release", checkout, external)
+            default_target = pathlib.Path(default["CARGO_TARGET_DIR"])
+            target = pathlib.Path(configured["CARGO_TARGET_DIR"])
+            self.assertEqual(default_target.parent, external.parent / "yield-native-target/validation")
+            self.assertEqual(target, external / default_target.name)
+            self.assertEqual(configured["YIELD_VALIDATION_TARGET_ROOT"], str(external))
+            self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(pathlib.Path(package["CARGO_TARGET_DIR"]).parent, external.parent / "yield-native-target/release-local")
+            (checkout / "Cargo.lock").write_text("different lock contents")
+            self.assertNotEqual(MODULE.cargo_env(state, "check", checkout, external)["CARGO_TARGET_DIR"], str(target))
+
+    def test_configured_root_rejects_aliases_shared_directories_and_unsupported_filesystems(self):
+        with self.fixture() as (state, checkout, external):
+            symlink = external.with_name("alias")
+            symlink.symlink_to(external, target_is_directory=True)
+            shared = external.with_name("shared")
+            shared.mkdir(mode=0o755)
+            inside_checkout = checkout / "target"
+            inside_checkout.mkdir(mode=0o700)
+            valid = {"filesystem": "apfs", "writable": True, "mount": "/Volumes/Scratch Disk"}
+            with mock.patch.object(MODULE, "filesystem_probe", return_value=valid) as probe:
+                self.assertEqual(MODULE.external_validation_root(checkout, state), (external, valid))
+                probe.assert_called_once_with(external)
+                for invalid, message in (
+                    ("relative", "absolute"),
+                    (symlink, "nonsymlink"),
+                    (shared, "private"),
+                    (inside_checkout, "outside source"),
+                    (external.with_name("missing"), "cannot inspect"),
+                ):
+                    with (
+                        self.subTest(invalid=invalid),
+                        mock.patch.dict(os.environ, {MODULE.VALIDATION_ROOT_OVERRIDE: str(invalid)}),
+                        self.assertRaisesRegex(MODULE.CiError, message),
+                    ):
+                        MODULE.external_validation_root(checkout, state)
+                probe.return_value = {**valid, "filesystem": "exfat"}
+                with self.assertRaisesRegex(MODULE.CiError, "writable APFS"):
+                    MODULE.external_validation_root(checkout, state)
+            self.assertEqual(list(external.iterdir()), [])
+
+    def test_existing_key_symlink_is_rejected_without_writing_through_it(self):
+        with self.fixture() as (state, checkout, external):
+            target = pathlib.Path(MODULE.cargo_env(state, "check", checkout, external)["CARGO_TARGET_DIR"])
+            target.rmdir()
+            other = external.with_name("other")
+            other.mkdir(mode=0o700)
+            target.symlink_to(other, target_is_directory=True)
+            with self.assertRaisesRegex(MODULE.CiError, "cache key must be a private"):
+                MODULE.cargo_env(state, "check", checkout, external)
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(list(other.iterdir()), [])
+
+    def test_volume_mount_name_preserves_spaces(self):
+        df = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk4s1 2000 1 1999 1% /Volumes/Scratch Disk\n"
+        disk = plistlib.dumps({"FilesystemType": "apfs", "WritableVolume": True})
+        with mock.patch.object(MODULE.subprocess, "check_output", side_effect=[df, disk]):
+            facts = MODULE.filesystem_probe(pathlib.Path("/Volumes/Scratch Disk/yield"))
+        self.assertEqual(facts["mount"], "/Volumes/Scratch Disk")
 
 
 class DevelopmentResetTests(unittest.TestCase):
