@@ -94,6 +94,8 @@ const PAYLOAD_STATUS: &str = super::update_payload::STATUS_ID;
 const THEME_STATUS: &str = "settings-theme-status";
 const GENERAL_STATUS: &str = "settings-general-status";
 const MAINTENANCE_STATUS: &str = "settings-maintenance-status";
+const LINK: &str = super::link_settings::CONTROL;
+const LINK_STATUS: &str = super::link_settings::STATUS;
 
 const SETTINGS_ORDER: &[&str] = &[
     THEME_CHOOSE,
@@ -113,6 +115,7 @@ const SETTINGS_ORDER: &[&str] = &[
     METRONOME_SOUNDS[1].0,
     METRONOME_SOUNDS[2].0,
     METRONOME_SOUNDS[3].0,
+    LINK,
     HELP_TIPS,
     VISUAL_EFFECT_PRESET,
     VISUAL_EFFECT_TOGGLE,
@@ -911,6 +914,7 @@ impl Browser {
         &mut self,
         key: &str,
         shift: bool,
+        is_held: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -954,7 +958,9 @@ impl Browser {
             "enter" | "return" | "space"
         ) {
             if let Some(id) = current {
-                self.perform_settings_action(id, window, cx);
+                if id != LINK || !is_held {
+                    self.perform_settings_action(id, window, cx);
+                }
                 return true;
             }
         }
@@ -978,7 +984,7 @@ impl Browser {
             id if METRONOME_SOUNDS.iter().any(|(option, _, _)| *option == id) => {
                 editable && self.metronome_settings.menu_open()
             }
-            SETTINGS_CLOSE | THEME_RESET => true,
+            SETTINGS_CLOSE | THEME_RESET | LINK => true,
             THEME_CHOOSE | MOTION | TEXT_SCALE | AUTOPLAY | ANTI_CLICK | HELP_TIPS => editable,
             ANTI_CLICK_FADE_DECREASE => editable && self.preferences.anti_click_settings().1 > 0.0,
             ANTI_CLICK_FADE_INCREASE => {
@@ -1076,6 +1082,7 @@ impl Browser {
             METRONOME_BEATS => self.toggle_metronome_layer(false, cx),
             METRONOME_OFFBEATS => self.toggle_metronome_layer(true, cx),
             METRONOME_SOUND => self.toggle_metronome_sound_menu(window, cx),
+            LINK => self.toggle_link(cx),
             HELP_TIPS => self.toggle_help_tooltips_from_accessibility(cx),
             VISUAL_EFFECT_PRESET => self.cycle_visual_effect_preset(cx),
             VISUAL_EFFECT_TOGGLE => self.toggle_visual_effect_from_accessibility(window, cx),
@@ -1591,6 +1598,14 @@ impl Browser {
                         Some(super::metronome_settings::sound_label(metronome.sound).to_owned()),
                         editable,
                     ),
+                    toggle(LINK, "Ableton Link", self.link_settings.enabled(), true),
+                    AxChild {
+                        id: LINK_STATUS.into(),
+                        role: AxRole::StaticText,
+                        label: "Ableton Link status".into(),
+                        value: Some(self.link_settings.label()),
+                        enabled: true,
+                    },
                     toggle(HELP_TIPS, "Help tips", self.help_tooltips_enabled, editable),
                     button(
                         VISUAL_EFFECT_PRESET,

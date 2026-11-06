@@ -9099,6 +9099,7 @@ dependencies = [
  "yield-design",
  "yield-issue-gateway",
  "yield-library",
+ "yield-link",
  "yield-media",
  "yield-platform",
  "yield-session",
