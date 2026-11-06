@@ -59,16 +59,16 @@ pub use output::{
 };
 #[cfg(feature = "native-audio")]
 pub use player::{
-    AudioPlayer, EditFadeRange, FadeParams, PlaybackChannelLayout, PlaybackMetronomeConfig,
-    PlaybackRequestId, PlaybackRuntime, PlaybackRuntimeCancellation, PlaybackRuntimeConfig,
-    PlaybackRuntimeEvent, PlaybackRuntimeEventIter, PlaybackRuntimeEventReceiver,
-    PlaybackRuntimeEventRecvError, PlaybackRuntimeEventRecvTimeoutError,
-    PlaybackRuntimeGainNormalization, PlaybackRuntimeHandle, PlaybackRuntimeMode,
-    PlaybackRuntimeProgress, PlaybackRuntimeReplacePolicy, PlaybackRuntimeRequest,
-    PlaybackRuntimeSource, PlaybackRuntimeSpanUpdate, PlaybackRuntimeStarted,
-    PlaybackRuntimeStreamPolicy, PlaybackRuntimeSubmitError, PlaybackSeekBehavior,
-    PlaybackSourceIdentity, PlaybackSourceKind, PlaybackSpanPlan, PlaybackSpanPlanError,
-    PlaybackSpanRequest,
+    AudioPlayer, EditFadeRange, FadeParams, MetronomeSound, PlaybackChannelLayout,
+    PlaybackMetronomeConfig, PlaybackMetronomeMix, PlaybackRequestId, PlaybackRuntime,
+    PlaybackRuntimeCancellation, PlaybackRuntimeConfig, PlaybackRuntimeEvent,
+    PlaybackRuntimeEventIter, PlaybackRuntimeEventReceiver, PlaybackRuntimeEventRecvError,
+    PlaybackRuntimeEventRecvTimeoutError, PlaybackRuntimeGainNormalization, PlaybackRuntimeHandle,
+    PlaybackRuntimeMode, PlaybackRuntimeProgress, PlaybackRuntimeReplacePolicy,
+    PlaybackRuntimeRequest, PlaybackRuntimeSource, PlaybackRuntimeSpanUpdate,
+    PlaybackRuntimeStarted, PlaybackRuntimeStreamPolicy, PlaybackRuntimeSubmitError,
+    PlaybackSeekBehavior, PlaybackSourceIdentity, PlaybackSourceKind, PlaybackSpanPlan,
+    PlaybackSpanPlanError, PlaybackSpanRequest,
 };
 #[cfg(feature = "native-audio")]
 pub use recording::{AudioRecorder, InputMonitor, RecordingOutcome};

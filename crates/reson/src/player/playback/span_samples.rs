@@ -572,6 +572,41 @@ mod tests {
     }
 
     #[test]
+    fn live_metronome_mix_follows_the_audible_frame_on_update() {
+        use crate::player::metronome::MetronomeSource;
+        use crate::{MetronomeSound, PlaybackMetronomeMix, SamplesBuffer};
+
+        let samples = Arc::<[f32]>::from(vec![0.0; 1_000]);
+        let plan = span_plan(0, 1_000, 0);
+        let initial = PlaybackMetronomeConfig::new(4).with_source_cycle(1_000, 0);
+        let handle = PlaybackSpanHandle::from_plan_with_metronome(&plan, Some(initial));
+        let source = SpanSamplesSource::new(
+            1,
+            1_000,
+            samples.clone(),
+            handle.clone(),
+            SpanSamplesMode::Looped,
+            0,
+        );
+        let mut live = MetronomeSource::new_live(source, handle.clone());
+        assert_eq!(live.next(), Some(0.22));
+        live.nth(123).expect("frame before the first offbeat");
+
+        let mix = PlaybackMetronomeMix::new(25, false, true, MetronomeSound::Woodblock);
+        let updated = initial.with_mix(mix);
+        handle.update_from_plan(&plan, None, Some(updated));
+        let reference = SamplesBuffer::from_arc(1, 1_000, samples);
+        let expected: Vec<_> = MetronomeSource::new(reference, updated, 1_000, 0, 125)
+            .take(130)
+            .collect();
+        assert_eq!(live.take(130).collect::<Vec<_>>(), expected);
+        assert_eq!(expected[0], 0.13 * 0.25);
+        assert_eq!(expected[125], 0.0); // Frame 250 is a disabled main beat.
+        assert_eq!(handle.applied_metronome().mix(), mix);
+        assert_eq!(handle.applied_metronome().phase_frames(), 125);
+    }
+
+    #[test]
     fn loop_wrap_reanchors_live_metronome_phase_to_the_audible_start() {
         let samples = Arc::<[f32]>::from(vec![0.0; 4]);
         let plan = span_plan(1, 3, 0);
