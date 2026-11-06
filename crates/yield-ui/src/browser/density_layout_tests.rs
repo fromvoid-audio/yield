@@ -18,6 +18,7 @@ fn compact_browser_geometry_keeps_work_surfaces_reachable(cx: &mut TestAppContex
         for text_scale in [100, 200] {
             let theme = with_text_scale(&Theme::default(), text_scale);
             let row_height = theme.spacing.row_height;
+            let status_height = theme.spacing.status_height;
             cx.set_global(ActiveTheme(Arc::new(theme)));
             let window_size = size(px(width), px(height));
             let window = cx.update(|app| {
@@ -94,6 +95,15 @@ fn compact_browser_geometry_keeps_work_surfaces_reachable(cx: &mut TestAppContex
             assert!(waveform.bottom() <= table.top(), "{waveform:?}, {table:?}");
             assert!(table.bottom() <= status.top(), "{table:?}, {status:?}");
             assert!(status.bottom() <= px(height), "{status:?}");
+            assert_eq!(status.size.height, px(status_height));
+            let details = required_bounds(&mut view_cx, "status-job-details");
+            assert!(
+                details.left() >= status.left()
+                    && details.right() <= status.right()
+                    && details.top() >= status.top()
+                    && details.bottom() <= status.bottom(),
+                "status details {details:?} escaped {status:?} at {width}×{height}, {text_scale}%",
+            );
             let mut overflowing_controls = Vec::new();
             for selector in [
                 "bpm-snap-tempo-toolbar",
@@ -116,7 +126,10 @@ fn compact_browser_geometry_keeps_work_surfaces_reachable(cx: &mut TestAppContex
                     overflowing_controls.push(selector);
                 }
             }
-            println!("overflowing toolbar controls: {overflowing_controls:?}");
+            assert!(
+                overflowing_controls.is_empty(),
+                "{overflowing_controls:?} escaped toolbar {toolbar:?} at {width}×{height}, {text_scale}%",
+            );
             view_cx.update(|window, _| window.remove_window());
         }
     }
