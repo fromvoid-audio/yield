@@ -65,6 +65,8 @@ use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blu
 use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
 use xkbcommon::xkb::{self, KEYMAP_COMPILE_NO_FLAGS, Keycode};
 
+#[cfg(target_os = "linux")]
+use super::super::file_clipboard::{FileClipboardPayload, WaylandFileOffer};
 use super::{
     display::WaylandDisplay,
     window::{ImeInput, WaylandWindowStatePtr},
@@ -199,6 +201,8 @@ pub(crate) struct WaylandClientState {
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
     cursor_shape_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
     data_device: Option<wl_data_device::WlDataDevice>,
+    #[cfg(target_os = "linux")]
+    file_clipboard_seat: ObjectId,
     primary_selection: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
     text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     pre_edit_text: Option<String>,
@@ -554,6 +558,8 @@ impl WaylandClient {
             serial_tracker: SerialTracker::new(),
             globals,
             gpu_context,
+            #[cfg(target_os = "linux")]
+            file_clipboard_seat: seat.id(),
             wl_seat: seat,
             wl_pointer: None,
             wl_keyboard: None,
@@ -839,6 +845,31 @@ impl LinuxClient for WaylandClient {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn write_files_to_clipboard(&self, paths: &[PathBuf]) -> anyhow::Result<()> {
+        let offer = WaylandFileOffer::new(FileClipboardPayload::from_paths(paths)?);
+        let mut state = self.0.borrow_mut();
+        let (Some(manager), Some(device)) = (
+            state.globals.data_device_manager.clone(),
+            state.data_device.clone(),
+        ) else {
+            anyhow::bail!("This Wayland session has no file clipboard");
+        };
+        let Some(serial) = state.serial_tracker.clipboard_serial(
+            state.keyboard_focused_window.is_some(),
+            state.wl_seat.id() == state.file_clipboard_seat,
+        ) else {
+            anyhow::bail!("File copy needs recent input in the focused Wayland window");
+        };
+        let source = manager.create_data_source(&state.globals.qh, offer);
+        for mime in WaylandFileOffer::MIME_TYPES {
+            source.offer(mime.to_string());
+        }
+        device.set_selection(Some(&source), serial);
+        state.clipboard.set_file_selection();
+        Ok(())
+    }
+
     fn read_from_primary(&self) -> Option<crate::ClipboardItem> {
         self.0.borrow_mut().clipboard.read_primary()
     }
@@ -897,6 +928,8 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                 version,
             } => match &interface[..] {
                 "wl_seat" => {
+                    #[cfg(target_os = "linux")]
+                    state.serial_tracker.clear_clipboard_input();
                     if let Some(wl_pointer) = state.wl_pointer.take() {
                         wl_pointer.release();
                     }
@@ -1151,6 +1184,10 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
         {
             let client = state.get_client();
             let mut state = client.borrow_mut();
+            #[cfg(target_os = "linux")]
+            if !capabilities.contains(wl_seat::Capability::Keyboard) {
+                state.serial_tracker.clear_clipboard_input();
+            }
             if capabilities.contains(wl_seat::Capability::Keyboard) {
                 let keyboard = seat.get_keyboard(qh, ());
 
@@ -1230,6 +1267,8 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 this.handle_keyboard_layout_change();
             }
             wl_keyboard::Event::Enter { surface, .. } => {
+                #[cfg(target_os = "linux")]
+                state.serial_tracker.clear_clipboard_input();
                 state.keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.enter_token = Some(());
 
@@ -1241,6 +1280,8 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             wl_keyboard::Event::Leave { surface, .. } => {
                 let keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.keyboard_focused_window = None;
+                #[cfg(target_os = "linux")]
+                state.serial_tracker.clear_clipboard_input();
                 state.enter_token.take();
                 // Prevent keyboard events from repeating after opening e.g. a file chooser and closing it quickly
                 state.repeat.current_id += 1;
@@ -1298,6 +1339,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let Some(focused_window) = focused_window else {
                     return;
                 };
+                #[cfg(target_os = "linux")]
+                state
+                    .serial_tracker
+                    .update(SerialKind::ClipboardInput, serial);
 
                 let keymap_state = state.keymap_state.as_ref().unwrap();
                 let keycode = Keycode::from(key + MIN_KEYCODE);
@@ -1613,6 +1658,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 let Some(button) = button else { return };
                 if state.mouse_focused_window.is_none() {
                     return;
+                }
+                #[cfg(target_os = "linux")]
+                if let (Some(mouse), Some(keyboard)) =
+                    (&state.mouse_focused_window, &state.keyboard_focused_window)
+                    && mouse.ptr_eq(keyboard)
+                {
+                    state
+                        .serial_tracker
+                        .update(SerialKind::ClipboardInput, serial);
                 }
                 match button_state {
                     wl_pointer::ButtonState::Pressed => {
@@ -2067,6 +2121,31 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WaylandClientStatePtr {
             wl_data_source::Event::Cancelled => {
                 data_source.destroy();
             }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Dispatch<wl_data_source::WlDataSource, WaylandFileOffer> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        source: &wl_data_source::WlDataSource,
+        event: wl_data_source::Event,
+        offer: &WaylandFileOffer,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_source::Event::Send { mime_type, fd } => {
+                if let Some(bytes) = offer.bytes_for(&mime_type) {
+                    this.get_client()
+                        .borrow()
+                        .clipboard
+                        .send_internal(fd, bytes);
+                }
+            }
+            wl_data_source::Event::Cancelled => source.destroy(),
             _ => {}
         }
     }
