@@ -251,6 +251,56 @@ screenshots separately from optimized native builds with the same fixture and
 window bounds. Verify browse, filter, audition, waveform editing, extraction
 where enabled, and menu actions before accepting the full layout change.
 
+#### Compact layout review
+
+Use the same default theme, sort order, loaded sample, and closed auxiliary
+panels in both runs. The geometry baseline is commit
+`23c847287b7122265eacb49e725a8e60d1d62022`. The candidate with the toolbar,
+status, and waveform allocation changes is
+`0846436098c9e8dff81b8220353add457cff1b99`. The GPUI test-platform results were
+as follows.
+
+| Window | Text scale | Complete rows before → after | Waveform drawing height before → after |
+| --- | ---: | ---: | ---: |
+| 960×560 | 100% | 10 → 11 | 181 → 143 |
+| 960×560 | 200% | 2 → 3 | 8 → 45 |
+| 1120×720 | 100% | 17 → 17 | 181 → 181 |
+| 1120×720 | 200% | 4 → 5 | 137 → 137 |
+| 1440×900 | 100% | 26 → 26 | 181 → 181 |
+| 1440×900 | 200% | 8 → 9 | 137 → 137 |
+
+For each source revision, use a separate empty configuration directory and a
+separate copy of the same synthetic WAV folder with at least 30 rows. Use an
+optimized local build. Run from the matching clean checkout and record the
+commit, Rust version, macOS build, and display scale with each screenshot set.
+Set `qa_root` to the absolute path of the new directory and put its synthetic
+audio in `$qa_root/samples` before running these commands.
+
+```sh
+git rev-parse HEAD
+rustc --version
+sw_vers
+YIELD_CONFIG_HOME="$qa_root" YIELD_CONFIG_PROFILE=sandbox \
+  cargo run --locked --profile release-local -p yield --bin yield -- "$qa_root/samples"
+```
+
+- [ ] Capture the minimum, default, and wide window at 100% and 200% text on
+  both builds. Match the loaded sample and viewport, and check toolbar
+  controls, the status action, the sample name, and waveform labels for
+  clipping or overlap.
+- [ ] In the candidate, browse the source tree, filter and clear the filter,
+  select and audition a sample, and move a waveform selection. Open and
+  dismiss a row menu while another sample is loaded.
+- [ ] Drag the waveform and sidebar dividers at the minimum size. Check that
+  Escape restores the previous size and a committed preference is honored
+  after resizing or reopening. Check settings, help, and the status panel
+  at enlarged text scale.
+- [ ] Exercise waveform edit and extraction controls that are enabled for the
+  fixture. Record unavailable routes separately. Repeat the review on other
+  supported native platforms when the identical candidate revision is available.
+
+Native screenshots, device playback, and hands-on acceptance are pending.
+
 ## Work and lifecycle
 
 The browser keeps selected relative folders, expansion sets, direct or descendant
