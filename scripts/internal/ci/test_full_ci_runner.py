@@ -22,6 +22,38 @@ import run_full_ci as runner
 from process_tree import GroupCleanupUnconfirmed, terminate_owned_group
 
 
+class FullCiRunnerArgumentTests(unittest.TestCase):
+    def test_help_and_invalid_arguments_exit_before_runtime_effects(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yield-full-ci-arguments-") as temporary:
+            root = pathlib.Path(temporary)
+            script = root / "run_full_ci.py"
+            script.write_bytes((CI_DIR / "run_full_ci.py").read_bytes())
+            sentinel = root / "runtime-started"
+            # Fail on the first runtime import, before it can acquire locks,
+            # park state or launch validation. Run the real script entrypoint.
+            for module in ("runtime_paths", "local_state", "run_native_production_case", "process_tree"):
+                (root / f"{module}.py").write_text(
+                    "from pathlib import Path\n"
+                    f"Path({str(sentinel)!r}).write_text('runtime started')\n"
+                    "raise RuntimeError('CLI reached runtime setup')\n",
+                    encoding="utf-8",
+                )
+            env = os.environ.copy()
+            env["TMPDIR"] = str(root / "missing-temp-directory")
+            for arguments, expected_status in ((["--help"], 0), (["--unknown"], 2), (["full"], 2)):
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run(
+                        [sys.executable, str(script), *arguments],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
+                    self.assertIn("usage:", result.stdout if expected_status == 0 else result.stderr)
+                    self.assertFalse(sentinel.exists(), "argument handling reached runtime setup")
+
+
 class FullCiRunnerCancellationTests(unittest.TestCase):
     def test_process_group_probe_errors_are_not_treated_as_confirmed_exit(self) -> None:
         leader = mock.Mock()

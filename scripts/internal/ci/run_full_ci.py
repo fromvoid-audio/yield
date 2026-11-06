@@ -3,10 +3,16 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import pathlib
 import subprocess
 import sys
+
+# Validate CLI input before importing runtime helpers or changing temporary-path
+# state. This entrypoint only supports help or a no-argument full run.
+if __name__ == "__main__":
+    argparse.ArgumentParser(description=__doc__).parse_args()
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from runtime_paths import canonicalize_tmpdir  # noqa: E402
