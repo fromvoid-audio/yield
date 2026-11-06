@@ -49,14 +49,39 @@ pub fn is_aiff_path(path: &Path) -> bool {
         })
 }
 
+/// Verified sample layout from an uncompressed AIFF header and its sound chunk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AiffMetadata {
+    /// Integer sample rate in Hz.
+    pub sample_rate: u32,
+    /// Number of interleaved channels.
+    pub channels: u16,
+    /// Number of significant bits in each PCM sample.
+    pub bits_per_sample: u32,
+    /// Number of complete frames in the sound chunk.
+    pub frames: u64,
+}
+
+impl AiffMetadata {
+    /// Probe a stream positioned at the start of an AIFF file without decoding samples.
+    ///
+    /// The supplied byte length must describe that same stream. Reads are bounded internally;
+    /// callers can wrap the stream to impose a tighter shared budget or to honor cancellation.
+    pub fn probe(
+        stream: impl Read + Seek,
+        file_len: u64,
+        path: &Path,
+    ) -> Result<Self, AiffReadError> {
+        let (_, metadata) = open_header(stream, file_len, path)?;
+        Ok(metadata)
+    }
+}
+
 /// Validated, seekable reader for uncompressed AIFF PCM.
 pub struct AiffPcmReader {
-    reader: AifcReader<HeaderBudget>,
+    reader: AifcReader<HeaderBudget<BufReader<File>>>,
     path: PathBuf,
-    sample_rate: u32,
-    channels: u16,
-    bits_per_sample: u32,
-    frames: u64,
+    metadata: AiffMetadata,
 }
 
 impl AiffPcmReader {
@@ -74,90 +99,47 @@ impl AiffPcmReader {
             .metadata()
             .map_err(|error| io_error(path, error))?
             .len();
-        let mut reader = AifcReader::new(HeaderBudget {
-            stream: BufReader::new(file),
-            remaining: Some(MAX_HEADER_READ_BYTES),
-        })
-        .map_err(|error| read_error(path, error))?;
+        let (mut reader, metadata) = open_header(BufReader::new(file), file_len, path)?;
         reader.get_mut().remaining = None;
-        let info = reader.info();
-        if info.file_format != FileFormat::Aiff
-            || !matches!(info.comm_sample_size, 8 | 16 | 24 | 32)
-        {
-            return Err(AiffReadError::Unsupported(format!(
-                "{} requires 8-, 16-, 24-, or 32-bit uncompressed AIFF PCM",
-                path.display()
-            )));
-        }
-        if !(1.0..=f64::from(u32::MAX)).contains(&info.sample_rate)
-            || info.sample_rate.fract() != 0.0
-        {
-            return Err(AiffReadError::Invalid(format!(
-                "{} has an invalid AIFF sample rate",
-                path.display()
-            )));
-        }
-
-        let channels = info.channels as u16;
-        let bits_per_sample = info.comm_sample_size as u32;
-        let frames = u64::from(info.comm_num_sample_frames);
-        let expected_bytes = frames * u64::from(channels) * u64::from(bits_per_sample / 8);
-        let data_start = reader
-            .get_mut()
-            .stream_position()
-            .map_err(|error| io_error(path, error))?;
-        if frames == 0
-            || expected_bytes != u64::from(info.sample_byte_len)
-            || expected_bytes > file_len.saturating_sub(data_start)
-        {
-            return Err(AiffReadError::Corrupt(format!(
-                "{} has missing, incomplete, or inconsistent AIFF sample data",
-                path.display()
-            )));
-        }
-
         Ok(Self {
             reader,
             path: path.to_path_buf(),
-            sample_rate: info.sample_rate as u32,
-            channels,
-            bits_per_sample,
-            frames,
+            metadata,
         })
     }
 
     /// Return the integer sample rate in Hz.
     pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
+        self.metadata.sample_rate
     }
 
     /// Return the number of interleaved channels.
     pub fn channels(&self) -> u16 {
-        self.channels
+        self.metadata.channels
     }
 
     /// Return the number of complete frames in the sound chunk.
     pub fn frames(&self) -> u64 {
-        self.frames
+        self.metadata.frames
     }
 
     /// Seek to the first channel of an exact frame. The end frame positions the reader at EOF.
     pub fn seek_frame(&mut self, frame: u64) -> Result<(), AiffReadError> {
-        if frame > self.frames {
+        if frame > self.metadata.frames {
             return Err(AiffReadError::Invalid(format!(
                 "{} AIFF seek frame {frame} exceeds frame count {}",
                 self.path.display(),
-                self.frames
+                self.metadata.frames
             )));
         }
         self.reader
-            .seek(frame * u64::from(self.channels))
+            .seek(frame * u64::from(self.metadata.channels))
             .map_err(|error| read_error(&self.path, error))
     }
 
     /// Return the number of significant bits per PCM sample.
     pub fn bits_per_sample(&self) -> u32 {
-        self.bits_per_sample
+        self.metadata.bits_per_sample
     }
 
     /// Read the next normalized, interleaved sample.
@@ -183,14 +165,67 @@ impl AiffPcmReader {
     }
 }
 
+fn open_header<R: Read + Seek>(
+    stream: R,
+    file_len: u64,
+    path: &Path,
+) -> Result<(AifcReader<HeaderBudget<R>>, AiffMetadata), AiffReadError> {
+    let mut reader = AifcReader::new(HeaderBudget {
+        stream,
+        remaining: Some(MAX_HEADER_READ_BYTES),
+    })
+    .map_err(|error| read_error(path, error))?;
+    let info = reader.info();
+    if info.file_format != FileFormat::Aiff || !matches!(info.comm_sample_size, 8 | 16 | 24 | 32) {
+        return Err(AiffReadError::Unsupported(format!(
+            "{} requires 8-, 16-, 24-, or 32-bit uncompressed AIFF PCM",
+            path.display()
+        )));
+    }
+    if !(1.0..=f64::from(u32::MAX)).contains(&info.sample_rate) || info.sample_rate.fract() != 0.0 {
+        return Err(AiffReadError::Invalid(format!(
+            "{} has an invalid AIFF sample rate",
+            path.display()
+        )));
+    }
+
+    let channels = info.channels as u16;
+    let bits_per_sample = info.comm_sample_size as u32;
+    let frames = u64::from(info.comm_num_sample_frames);
+    let expected_bytes = frames * u64::from(channels) * u64::from(bits_per_sample / 8);
+    let data_start = reader
+        .get_mut()
+        .stream_position()
+        .map_err(|error| io_error(path, error))?;
+    if frames == 0
+        || expected_bytes != u64::from(info.sample_byte_len)
+        || expected_bytes > file_len.saturating_sub(data_start)
+    {
+        return Err(AiffReadError::Corrupt(format!(
+            "{} has missing, incomplete, or inconsistent AIFF sample data",
+            path.display()
+        )));
+    }
+
+    Ok((
+        reader,
+        AiffMetadata {
+            sample_rate: info.sample_rate as u32,
+            channels,
+            bits_per_sample,
+            frames,
+        },
+    ))
+}
+
 // Seek past chunk payloads while bounding the total bytes the parser can read
 // during discovery. Decoding is limited by the validated frame count instead.
-struct HeaderBudget {
-    stream: BufReader<File>,
+struct HeaderBudget<R> {
+    stream: R,
     remaining: Option<usize>,
 }
 
-impl Read for HeaderBudget {
+impl<R: Read> Read for HeaderBudget<R> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let Some(remaining) = &mut self.remaining else {
             return self.stream.read(bytes);
@@ -208,7 +243,7 @@ impl Read for HeaderBudget {
     }
 }
 
-impl Seek for HeaderBudget {
+impl<R: Seek> Seek for HeaderBudget<R> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         self.stream.seek(position)
     }
