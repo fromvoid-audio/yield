@@ -466,7 +466,28 @@ fn capture_live_on_worker(
     {
         context.ingress.mark_reason(ReplayUncertainty::ROOT_CHANGED);
     }
-    Ok(context.ingress.into_candidate())
+    Ok(check_live_root_coverage(
+        context.ingress.into_candidate(),
+        &metadata,
+        &final_metadata,
+    ))
+}
+
+fn check_live_root_coverage(
+    mut candidate: ReplayCandidate,
+    before: &fs::Metadata,
+    after: &fs::Metadata,
+) -> ReplayCandidate {
+    // A completed historical phase and a silent flush can coexist with a direct
+    // directory mutation. The modification time is negative evidence only.
+    if candidate.last_seen().is_none()
+        && (before.mtime(), before.mtime_nsec()) != (after.mtime(), after.mtime_nsec())
+    {
+        candidate
+            .uncertainty
+            .insert(ReplayUncertainty::SILENT_ROOT_CHANGE);
+    }
+    candidate
 }
 
 fn capture_on_worker(
@@ -936,12 +957,67 @@ mod tests {
             .finish(Duration::from_secs(5))
             .expect("bounded live capture");
         assert!(candidate.history_complete(), "{candidate:?}");
+        // A silent finish after this real directory mutation must withhold an
+        // empty checkpoint when the changed path has not been delivered.
+        if !candidate
+            .events()
+            .iter()
+            .any(|event| event.relative_path() == Path::new("kick.wav"))
+        {
+            assert!(
+                candidate
+                    .uncertainty()
+                    .contains(ReplayUncertainty::SILENT_ROOT_CHANGE),
+                "{candidate:?}"
+            );
+            assert!(
+                candidate
+                    .into_bootstrap_evidence(WatcherGeneration::new(1))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn silent_bootstrap_root_mutation_refuses_empty_checkpoint() {
+        let temp = tempfile::tempdir().expect("temporary source");
+        let root = fs::canonicalize(temp.path()).expect("canonical source");
+        fs::File::open(&root)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        let before = fs::metadata(&root).unwrap();
+        let identity = physical_root_identity(&root, &before).unwrap();
+        let spec = SourceWatchSpec::new(
+            SourceId::from_string("silent-root-change"),
+            1,
+            root.clone(),
+            Some(identity),
+        );
+        let silent_candidate = || {
+            let ingress = ReplayIngress::new(spec.clone(), before.dev(), [1; 16], 5).unwrap();
+            ingress.mark_history_complete();
+            ingress.into_candidate()
+        };
+        let quiet = check_live_root_coverage(silent_candidate(), &before, &before);
         assert!(
-            candidate
-                .events()
-                .iter()
-                .any(|event| event.relative_path() == Path::new("kick.wav")),
-            "{candidate:?}"
+            quiet
+                .into_bootstrap_evidence(WatcherGeneration::new(1))
+                .is_some()
+        );
+
+        fs::write(root.join("kick.wav"), b"sample").unwrap();
+        let after = fs::metadata(&root).unwrap();
+        let changed = check_live_root_coverage(silent_candidate(), &before, &after);
+        assert!(
+            changed
+                .uncertainty()
+                .contains(ReplayUncertainty::SILENT_ROOT_CHANGE)
+        );
+        assert!(
+            changed
+                .into_bootstrap_evidence(WatcherGeneration::new(1))
+                .is_none()
         );
     }
 
