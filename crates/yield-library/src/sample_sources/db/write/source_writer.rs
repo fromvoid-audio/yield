@@ -6,6 +6,7 @@
 //! owner; their persisted DTOs never construct or reacquire an authority.
 
 use super::super::{SourceReferenceFence, SourceReferenceFenceError};
+mod audio_input;
 mod collection_history_selection;
 pub use collection_history_selection::{
     SOURCE_COLLECTION_HISTORY_GROUP_MAX_BYTES, SOURCE_COLLECTION_HISTORY_GROUP_MAX_PATHS,
@@ -1290,68 +1291,6 @@ impl SourceWriter {
             return Err(SourceWriterError::StaleFence);
         }
         self.validate_readiness_command(expected, claim.readiness_claim().target())
-    }
-
-    /// Prepare held input from the exact current manifest/claim without data reads or SQL mutation.
-    pub fn prepare_feature_input(
-        &self,
-        expected: &SourceRevision,
-        claim: &crate::sample_sources::readiness::FeatureArtifactClaim,
-    ) -> Result<crate::sample_sources::readiness::SourceFeatureInput, SourceWriterError> {
-        use crate::sample_sources::readiness::{
-            FEATURE_INPUT_MAX_BYTES, InputPermit, SourceFeatureInput, SourceFeatureInputError as E,
-        };
-        self.validate_feature_artifact_claim(expected, claim)?;
-        let target = claim.readiness_claim().target();
-        let path = target
-            .relative_path
-            .as_ref()
-            .ok_or(SourceWriterError::InvalidRequest("feature path missing"))?;
-        let relative = RootRelativePath::try_from_path(std::path::PathBuf::from(path))
-            .map_err(|_| SourceWriterError::InvalidRequest("invalid feature path"))?;
-        let (size, modified, identity, content): (i64, i64, String, String) = self
-            .database
-            .connection
-            .query_row(
-                "SELECT file_size, modified_ns, file_identity, content_hash FROM wav_files
-             WHERE path = ?1 AND missing = 0 AND file_identity = ?2 AND content_hash = ?3
-             AND length(file_identity) <= 512 AND length(content_hash) = 64",
-                params![path, target.scope_id, target.content_generation],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .map_err(map_sql_error)?;
-        let size = u64::try_from(size)
-            .map_err(|_| SourceWriterError::InvalidRequest("invalid feature size"))?;
-        if size > FEATURE_INPUT_MAX_BYTES {
-            return Err(SourceWriterError::FeatureInput(E::ByteLimit));
-        }
-        let permit = InputPermit::acquire()?;
-        let fence = self.database.source_publication_fence()?;
-        let root = self
-            .database
-            .source_lease
-            .as_ref()
-            .ok_or(SourceWriterError::StaleFence)?
-            .media_root_binding();
-        let held = root
-            .inspect_index_file(relative.as_path())
-            .map_err(|e| match e {
-                super::super::SourceIndexInspectionError::Unsupported => E::UnsupportedPlatform,
-                _ => E::Changed,
-            })?;
-        let input = SourceFeatureInput {
-            held,
-            root,
-            fence,
-            owner: claim.owner.clone(),
-            identity,
-            size,
-            modified,
-            content,
-            _permit: permit,
-        };
-        input.validate()?;
-        Ok(input)
     }
 
     /// Claim one feature target and bind the work to this exact retained writer instance.
