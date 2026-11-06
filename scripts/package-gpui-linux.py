@@ -24,6 +24,7 @@ FILES = {
     "assets/yield-brand-icon.png": ("assets/yield-brand-icon.png", 0o644),
     "assets/IoskeleyMono-LICENSE.txt": ("assets/fonts/IoskeleyMono-LICENSE.txt", 0o644),
     "scripts/doctor.sh": ("scripts/doctor.sh", 0o755),
+    "scripts/register-linux-desktop.py": ("scripts/register-linux-desktop.py", 0o644),
     "scripts/run.sh": ("scripts/run.sh", 0o755),
     "scripts/internal/run/bug_bundle.sh": ("scripts/internal/run/bug_bundle.sh", 0o755),
     "scripts/internal/run/latest_log.sh": ("scripts/internal/run/latest_log.sh", 0o755),
