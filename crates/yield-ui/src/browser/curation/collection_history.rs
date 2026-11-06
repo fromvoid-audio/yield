@@ -146,6 +146,17 @@ impl History {
         *self = Self::default();
     }
 
+    pub(super) fn advance_digest_revision(
+        &mut self,
+        key: &CurationLifecycleKey,
+        previous: u64,
+        current: u64,
+    ) {
+        if self.pending.is_none() && self.revision == Some(previous) && self.key() == Some(key) {
+            self.revision = Some(current);
+        }
+    }
+
     pub(super) fn retire_except(
         &mut self,
         active: Option<&CurationLifecycleKey>,

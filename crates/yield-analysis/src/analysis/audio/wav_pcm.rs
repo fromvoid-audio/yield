@@ -1,10 +1,41 @@
 use std::{
-    io::Cursor,
+    io::{Cursor, Read},
     sync::atomic::{AtomicBool, Ordering},
 };
 
 const MAX_WAV_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PCM_SAMPLES: usize = 2_000_000;
+
+/// Rejection from the whole-buffer native WAV decoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum WavPcmDecodeError {
+    /// The encoded input exceeds the whole-buffer byte limit.
+    #[error("WAV input byte limit")]
+    ByteLimit,
+    /// The decoded input exceeds the whole-buffer sample limit.
+    #[error("WAV sample limit")]
+    SampleLimit,
+    /// The input was invalid, incomplete, unsupported or interrupted.
+    #[error("{0}")]
+    Input(&'static str),
+}
+
+impl WavPcmDecodeError {
+    /// Bounded diagnostic for the current WAV contract.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::ByteLimit => "WAV input byte limit",
+            Self::SampleLimit => "WAV sample limit",
+            Self::Input(reason) => reason,
+        }
+    }
+}
+
+impl From<&'static str> for WavPcmDecodeError {
+    fn from(reason: &'static str) -> Self {
+        Self::Input(reason)
+    }
+}
 
 /// Complete, interleaved WAV frames in their original channel order and sample rate.
 #[derive(Debug)]
@@ -15,6 +46,19 @@ pub struct WavPcm {
 }
 
 impl WavPcm {
+    pub(crate) fn from_complete_frames(samples: Vec<f32>, spec: hound::WavSpec) -> Self {
+        debug_assert!(samples.len().is_multiple_of(usize::from(spec.channels)));
+        Self {
+            samples,
+            channels: spec.channels,
+            sample_rate: spec.sample_rate,
+        }
+    }
+
+    pub(crate) fn into_samples(self) -> Vec<f32> {
+        self.samples
+    }
+
     /// Interleaved PCM. Integer input is scaled to full scale and float input is preserved.
     pub fn samples(&self) -> &[f32] {
         &self.samples
@@ -35,7 +79,7 @@ impl WavPcm {
 ///
 /// Admits at most 8 MiB and 2,000,000 interleaved samples. An input beyond
 /// either limit fails instead of returning a partial recording.
-pub fn decode_wav_pcm(bytes: &[u8], cancel: &AtomicBool) -> Result<WavPcm, &'static str> {
+pub fn decode_wav_pcm(bytes: &[u8], cancel: &AtomicBool) -> Result<WavPcm, WavPcmDecodeError> {
     decode_pcm(bytes, None, cancel)
 }
 
@@ -43,25 +87,15 @@ pub(super) fn decode_pcm(
     bytes: &[u8],
     prefix_seconds: Option<usize>,
     cancel: &AtomicBool,
-) -> Result<WavPcm, &'static str> {
+) -> Result<WavPcm, WavPcmDecodeError> {
     if cancel.load(Ordering::Acquire) {
-        return Err("Cancelled");
+        return Err("Cancelled".into());
     }
     if bytes.len() > MAX_WAV_BYTES {
-        return Err("WAV input byte limit");
+        return Err(WavPcmDecodeError::ByteLimit);
     }
-    let mut reader = hound::WavReader::new(Cursor::new(bytes)).map_err(|_| "Invalid WAV input")?;
+    let mut reader = open_wav(Cursor::new(bytes))?;
     let spec = reader.spec();
-    if spec.channels == 0
-        || spec.channels > 8
-        || spec.sample_rate == 0
-        || spec.sample_rate > 192_000
-        || spec.bits_per_sample == 0
-        || spec.bits_per_sample > 32
-        || (spec.sample_format == hound::SampleFormat::Float && spec.bits_per_sample != 32)
-    {
-        return Err("Unsupported WAV parameters");
-    }
     let channels = usize::from(spec.channels);
     // Hound validates that the declared data chunk contains complete frames.
     let source_samples = reader.len() as usize;
@@ -73,13 +107,44 @@ pub(super) fn decode_pcm(
         ),
         None => source_samples,
     };
-    if limit == 0 || limit > MAX_PCM_SAMPLES {
-        return Err("WAV sample limit");
+    if limit == 0 {
+        return Err("WAV input contains no samples".into());
+    }
+    if limit > MAX_PCM_SAMPLES {
+        return Err(WavPcmDecodeError::SampleLimit);
     }
     let mut samples = Vec::with_capacity(limit);
+    read_pcm_samples(&mut reader, &mut samples, limit, cancel)?;
+    Ok(WavPcm::from_complete_frames(samples, spec))
+}
+
+pub(crate) fn open_wav<R: Read>(input: R) -> Result<hound::WavReader<R>, &'static str> {
+    let reader = hound::WavReader::new(input).map_err(|_| "Invalid WAV input")?;
+    let spec = reader.spec();
+    if spec.channels == 0
+        || spec.channels > 8
+        || spec.sample_rate == 0
+        || spec.sample_rate > 192_000
+        || spec.bits_per_sample == 0
+        || spec.bits_per_sample > 32
+        || (spec.sample_format == hound::SampleFormat::Float && spec.bits_per_sample != 32)
+    {
+        return Err("Unsupported WAV parameters");
+    }
+    Ok(reader)
+}
+
+pub(crate) fn read_pcm_samples<R: Read>(
+    reader: &mut hound::WavReader<R>,
+    samples: &mut Vec<f32>,
+    count: usize,
+    cancel: &AtomicBool,
+) -> Result<(), &'static str> {
+    let spec = reader.spec();
+    let expected_len = samples.len() + count;
     match spec.sample_format {
         hound::SampleFormat::Float => {
-            for sample in reader.samples::<f32>().take(limit) {
+            for sample in reader.samples::<f32>().take(count) {
                 if cancel.load(Ordering::Acquire) {
                     return Err("Cancelled");
                 }
@@ -88,7 +153,7 @@ pub(super) fn decode_pcm(
         }
         hound::SampleFormat::Int => {
             let scale = 2.0f32.powi(i32::from(spec.bits_per_sample) - 1);
-            for sample in reader.samples::<i32>().take(limit) {
+            for sample in reader.samples::<i32>().take(count) {
                 if cancel.load(Ordering::Acquire) {
                     return Err("Cancelled");
                 }
@@ -96,17 +161,13 @@ pub(super) fn decode_pcm(
             }
         }
     }
-    if samples.len() != limit {
+    if samples.len() != expected_len {
         return Err("Incomplete WAV frame");
     }
     if cancel.load(Ordering::Acquire) {
         return Err("Cancelled");
     }
-    Ok(WavPcm {
-        samples,
-        channels: spec.channels,
-        sample_rate: spec.sample_rate,
-    })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -155,7 +216,7 @@ mod tests {
         assert!(decode_wav_pcm(b"not a WAV", &cancel).is_err());
         assert_eq!(
             decode_wav_pcm(&stereo, &AtomicBool::new(true)).unwrap_err(),
-            "Cancelled"
+            WavPcmDecodeError::Input("Cancelled")
         );
         stereo.pop();
         assert!(decode_wav_pcm(&stereo, &cancel).is_err());
@@ -169,12 +230,12 @@ mod tests {
         wav[40..44].copy_from_slice(&oversized_data_len.to_le_bytes());
         assert_eq!(
             decode_wav_pcm(&wav, &cancel).unwrap_err(),
-            "WAV sample limit"
+            WavPcmDecodeError::SampleLimit
         );
         wav.resize(MAX_WAV_BYTES + 1, 0);
         assert_eq!(
             decode_wav_pcm(&wav, &cancel).unwrap_err(),
-            "WAV input byte limit"
+            WavPcmDecodeError::ByteLimit
         );
     }
 

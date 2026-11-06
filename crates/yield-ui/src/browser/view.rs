@@ -2361,7 +2361,7 @@ impl Render for Browser {
                                     super::transient_markers::cycle_sensitivity(view, cx);
                                 }))
                                 .text_size(px(theme.typography.small_size))
-                                .child(self.transient_markers.sensitivity().short_label()),
+                                .child(self.transient_markers.sensitivity_short_label()),
                         )
                     })
                     .child(

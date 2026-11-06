@@ -120,9 +120,11 @@ pub use similarity_query::{
 };
 pub use transient_dispatch::{SourceTransientRequest, TransientRequestFailure};
 pub use transient_job::{
-    ComputedTransientJob, PreparedTransientJob, TransientJobError, prepare_transient_job,
+    ComputedTransientJob, PreparedTransientJob, TransientCacheUse, TransientJobError,
+    TransientJobOutcome, prepare_transient_job,
 };
 pub use yield_analysis::aspects::SimilarityAspect;
+pub use yield_analysis::transients::{TransientMarkers, TransientPreset};
 mod index_pages;
 mod index_reveal;
 mod index_reveal_contract;
@@ -185,6 +187,7 @@ struct CatalogTestGate {
     audit_state: Mutex<CatalogTestAuditState>,
     feature_terminal_state: Mutex<CatalogTestAuditState>,
     feature_terminal_wake: Condvar,
+    transient_compute: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
     watcher_signals: Mutex<HashMap<(SourceId, u64), WatcherSignal>>,
     watcher_install_counts: Mutex<HashMap<(SourceId, u64), usize>>,
     cancel_on_audit_progress: AtomicBool,
@@ -223,6 +226,7 @@ impl CatalogTestGate {
                 at_boundary: false,
             }),
             feature_terminal_wake: Condvar::new(),
+            transient_compute: Mutex::new(None),
             watcher_signals: Mutex::new(HashMap::new()),
             watcher_install_counts: Mutex::new(HashMap::new()),
             cancel_on_audit_progress: AtomicBool::new(false),
@@ -243,6 +247,14 @@ impl CatalogTestGate {
                 .unwrap_or_else(|p| p.into_inner());
         }
         state.at_boundary = false;
+    }
+
+    fn before_transient_compute(&self) {
+        let signal = self.transient_compute.lock().unwrap().take();
+        if let Some((entered, release)) = signal {
+            let _ = entered.send(());
+            let _ = release.recv_timeout(Duration::from_secs(5));
+        }
     }
     #[cfg(target_os = "linux")]
     fn arm_feature_terminal(&self) -> CatalogTestFeatureTerminalPause<'_> {
@@ -1552,6 +1564,15 @@ pub enum CatalogEvent {
         /// Owner-validated existing descriptor result.
         result: Result<SourceSimilarityResult, SimilarityDispatchFailure>,
     },
+    /// One audited manifest entry acquired its previously deferred scanner digest.
+    SourceContentDigestCommitted {
+        /// Source lifecycle and previous revision that admitted the write.
+        request: SourceTransientRequest,
+        /// New authoritative revision. The directory generation is unchanged.
+        committed_revision: u64,
+        /// Exact manifest entry with its digest filled in.
+        entry: SourceManifestEntry,
+    },
     /// Exact owner-validated transient markers or a bounded failure.
     TransientMarkersCompleted {
         /// Original immutable request and caller correlation.
@@ -1559,7 +1580,7 @@ pub enum CatalogEvent {
         /// Retained cancellation through queued delivery.
         cancellation: FeatureAnalysisCancellation,
         /// Frame-domain result or refusal from the retained Source.
-        result: Result<yield_analysis::transients::TransientMarkers, TransientRequestFailure>,
+        result: Result<TransientJobOutcome, TransientRequestFailure>,
     },
     /// One request's truthful state; ready requires validated durable feature bytes.
     FeatureAnalysisState {
@@ -2628,6 +2649,22 @@ impl EventReservation<'_> {
     }
 }
 
+impl<'a> EventReservation<'a> {
+    fn split_read_event(&mut self, bytes: usize) -> Self {
+        assert!(self.remaining > 0 && self.tag_read_payload_bytes >= bytes);
+        self.remaining -= 1;
+        self.tag_read_payload_bytes -= bytes;
+        Self {
+            hub: self.hub,
+            admission: self.admission,
+            remaining: 1,
+            curation_payload_bytes: 0,
+            curation_update_count: 0,
+            tag_read_payload_bytes: bytes,
+        }
+    }
+}
+
 fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> {
     match command {
         CatalogCommand::RequestSimilarity { .. }
@@ -3035,6 +3072,7 @@ fn encoded_path_len(path: &Path) -> usize {
 fn command_event_budget(command: &CatalogCommand) -> usize {
     match command {
         CatalogCommand::RequestFeatureAnalysis { .. } => 6,
+        CatalogCommand::RequestTransientMarkers { request, .. } => request.event_budget(),
         CatalogCommand::ConsumeReplay { .. } => 0,
 
         CatalogCommand::Register { .. } | CatalogCommand::RegisterVerified { .. } => 2,
@@ -3042,7 +3080,6 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::RequestSimilarity { .. }
-        | CatalogCommand::RequestTransientMarkers { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestIndexPage { .. }
         | CatalogCommand::RequestIndexInspection { .. }
@@ -3191,7 +3228,7 @@ fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, Cat
             Ok(request.charged_bytes())
         }
         CatalogCommand::RequestSimilarity { .. } => Ok(similarity_dispatch::MAX_RESULT_BYTES),
-        CatalogCommand::RequestTransientMarkers { .. } => Ok(transient_dispatch::MAX_RESULT_BYTES),
+        CatalogCommand::RequestTransientMarkers { request, .. } => Ok(request.result_bytes()),
         CatalogCommand::RequestIndexPage { .. } | CatalogCommand::RequestIndexInspection { .. } => {
             Ok(MAX_INDEX_PAGE_PAYLOAD_BYTES)
         }
@@ -4166,6 +4203,7 @@ fn run_worker_with_sources(
         .take()
         .expect("single original source worker inbox");
     let mut preparations = source_wal_preparation::WorkerReservations::new(control);
+    let mut transients = transient_dispatch::Worker::default();
     let mut deferred = VecDeque::<QueuedCatalogCommand>::new();
     let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
     let mut idle = idle_maintenance::Pacing::new(Instant::now());
@@ -4176,6 +4214,9 @@ fn run_worker_with_sources(
         let closing = admission_state(&admission, |state| state.shutdown || state.closed);
         if closing {
             preparations.close(&mut sources);
+        }
+        if !preparations.has_slots() {
+            transients.poll(&admission, &mut sources, test_gate.as_ref());
         }
         // Do not enter journal-facing commands or teardown while its original settlement
         // still owns any native reservation. Keep accepted packets/credits in existing bounds.
@@ -4329,6 +4370,25 @@ fn run_worker_with_sources(
             reservation.finish();
             continue;
         }
+        let command = match command {
+            CatalogCommand::RequestTransientMarkers {
+                request,
+                cancellation,
+            } => {
+                transients.submit(
+                    transient_dispatch::Submission {
+                        request,
+                        cancellation,
+                        reservation,
+                    },
+                    &admission,
+                    &sources,
+                    test_gate.as_ref(),
+                );
+                continue;
+            }
+            command => command,
+        };
         if handle_command(
             command,
             &profile_guard,
@@ -4347,6 +4407,7 @@ fn run_worker_with_sources(
         reservation.finish();
         idle.activity(Instant::now());
     }
+    drop(transients);
     preparations.close(&mut sources);
     preparations.retire_failed(journal.as_ref(), &mut pending_finalizations);
     if let Some(journal) = journal.as_ref() {
@@ -4580,12 +4641,8 @@ fn handle_command(
             similarity_dispatch::dispatch(request, cancellation, reservation, admission, sources);
             false
         }
-        CatalogCommand::RequestTransientMarkers {
-            request,
-            cancellation,
-        } => {
-            transient_dispatch::dispatch(request, cancellation, reservation, admission, sources);
-            false
+        CatalogCommand::RequestTransientMarkers { .. } => {
+            unreachable!("transient requests are handled by the compute slot");
         }
         CatalogCommand::RequestFeatureAnalysis {
             source_id,

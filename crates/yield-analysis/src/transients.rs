@@ -2,6 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{Complex32, FftPlan, WavPcm, fft_radix2_inplace_with_plan, hann_window};
 
+mod streaming;
+pub use streaming::{STREAM_DETECTOR_VERSION, detect_streaming_transients};
+
 const BAND_COUNT: usize = 24;
 const FLUX_HISTORY: usize = 5;
 const MAX_WINDOWS: usize = 32_000;
@@ -52,6 +55,26 @@ pub struct TransientMarkers {
 }
 
 impl TransientMarkers {
+    /// Restore a validated native-frame result from persisted frame positions.
+    pub fn from_ordered_frames(
+        source_frames: u32,
+        preset: TransientPreset,
+        frames: Vec<u32>,
+    ) -> Option<Self> {
+        if source_frames == 0
+            || frames.len() > MAX_TRANSIENT_MARKERS
+            || frames.last().is_some_and(|&frame| frame >= source_frames)
+            || frames.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return None;
+        }
+        Some(Self {
+            frames,
+            source_frames,
+            preset,
+        })
+    }
+
     /// Zero-based positions in the original audio, ordered and unique.
     pub fn frames(&self) -> &[u32] {
         &self.frames
@@ -97,9 +120,7 @@ pub fn detect_transients(
     let middle = sorted.len() / 2;
     let (_, baseline, _) = sorted.select_nth_unstable_by(middle, f32::total_cmp);
     let threshold = preset.threshold(*baseline);
-    let min_gap = (pcm.sample_rate() as usize * 35)
-        .div_ceil(1_000)
-        .max(frame_count.div_ceil(MAX_TRANSIENT_MARKERS));
+    let min_gap = marker_gap(pcm.sample_rate(), frame_count);
     let mut frames = Vec::new();
     for (index, &score) in novelty.iter().enumerate() {
         if index % 256 == 0 {
@@ -134,6 +155,12 @@ fn check_cancelled(cancel: &AtomicBool) -> Result<(), &'static str> {
         return Err("Cancelled");
     }
     Ok(())
+}
+
+fn marker_gap(sample_rate: u32, frame_count: usize) -> usize {
+    (sample_rate as usize * 35)
+        .div_ceil(1_000)
+        .max(frame_count.div_ceil(MAX_TRANSIENT_MARKERS))
 }
 
 // The reference Radiant detector uses log-spaced bands, log magnitude, and

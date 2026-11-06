@@ -53,6 +53,8 @@ pub use replay_authority::{
 pub mod schema;
 mod source_authority;
 pub(crate) mod source_registry_handoff;
+/// Bounded exact-frame payloads for the Source-owned transient cache.
+pub mod transient_cache;
 pub use source_registry_handoff::{
     SourceRegistryMetadataCandidate, SourceRegistryMetadataHandoffError,
     SourceRegistryMetadataPermit,

@@ -15,7 +15,11 @@ pub use feature_artifact::{
     FeatureArtifactRebuildAdmission,
 };
 pub(crate) use feature_input::InputPermit;
-pub use feature_input::{FEATURE_INPUT_MAX_BYTES, SourceFeatureInput, SourceFeatureInputError};
+pub use feature_input::{
+    FEATURE_INPUT_MAX_BYTES, PendingSourceContentInput, PreparedSourceContentDigest,
+    SourceAudioStreamError, SourceFeatureInput, SourceFeatureInputError,
+    TRANSIENT_STREAM_MAX_BYTES,
+};
 pub use model::{
     ClaimedReadinessWork, MAX_READINESS_CONTRACT_VERSION_BYTES, MAX_READINESS_TARGET_TEXT_BYTES,
     ReadinessArtifact, ReadinessClaimOrigin, ReadinessEligibility, ReadinessFailureClassification,
