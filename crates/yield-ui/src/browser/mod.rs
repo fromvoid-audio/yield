@@ -131,6 +131,7 @@ mod sidebar;
 mod similar_sections;
 mod similarity_list;
 mod source_digest;
+mod source_drop;
 mod source_recovery;
 mod source_registry;
 mod status_log;
@@ -481,6 +482,7 @@ pub(crate) struct Browser {
     waveform_last_play_start: Option<f32>,
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_task: Option<Task<()>>,
+    external_source_drop_task: Option<Task<()>>,
     source_registry_task: Option<Task<()>>,
     preferences_task: Option<Task<()>>,
     source_registry_loaded: bool,
@@ -859,6 +861,7 @@ impl Browser {
             waveform_last_play_start: None,
             scan_cancel: None,
             scan_task: None,
+            external_source_drop_task: None,
             source_registry_task: None,
             preferences_task: None,
             source_registry_loaded: false,
