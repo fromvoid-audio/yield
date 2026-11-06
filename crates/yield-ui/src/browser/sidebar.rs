@@ -241,7 +241,7 @@ pub(super) fn render(
                 .justify_center()
                 .text_size(px(theme.typography.body_size))
                 .text_color(color(theme.colors.text_muted))
-                .child("Drop a source folder here")
+                .child("Drop source folders here")
         }
     } else {
         let pending_slots = usize::from(pending_source.is_some());
