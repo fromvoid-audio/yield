@@ -10,7 +10,9 @@
 
 Yield works with ordinary local folders. It does not upload your samples or require a cloud library.
 
-Yield app builds currently support macOS and Windows. Linux is not currently supported for app installs.
+Public app downloads currently cover macOS and Windows. Linux desktop builds
+are in qualification. For a Linux test build, see [Troubleshooting](troubleshooting.md)
+for the config and log locations.
 
 On Windows, Yield is a manual ZIP install. Extract the `yield/` folder to
 a location you manage and run `yield.exe` from that folder. To update, close
