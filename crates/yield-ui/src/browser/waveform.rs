@@ -208,7 +208,7 @@ impl Render for BeatCountTooltip {
             .border_color(crate::theme::color(theme.colors.border_emphasis))
             .text_size(px(theme.typography.small_size))
             .text_color(crate::theme::color(theme.colors.text_primary))
-            .child("Beat guide divisions.")
+            .child("Beat guide divisions. Drag up or down to adjust.")
     }
 }
 
@@ -269,33 +269,35 @@ impl WaveformPlayRegion {
         WaveformRegion::new(self.start, self.end)
     }
 
-    fn slide_left(self) -> Option<Self> {
-        self.core()
-            .map(|region| Self::from_core(region.slide_left()))
-    }
-
-    fn slide_right(self) -> Option<Self> {
-        self.core()
-            .map(|region| Self::from_core(region.slide_right()))
-    }
-
-    fn nudged_by_frame(self, direction: WaveformRegionSlide, total_frames: usize) -> Option<Self> {
+    pub(super) fn frame_bounds(self, total_frames: usize) -> Option<(usize, usize)> {
         if total_frames == 0 || !self.is_valid() {
             return None;
         }
-        // Playback rounds normalized span endpoints to frames. Nudge those same frames instead
+        // Playback rounds normalized span endpoints to frames. Use those same frames instead
         // of using the outward-rounded range used for timing labels.
         let total = total_frames as f64;
-        let start = (self.start * total)
-            .round()
-            .clamp(0.0, (total_frames - 1) as f64) as usize;
-        let end = (self.end * total).round().clamp((start + 1) as f64, total) as usize;
+        let start = ((self.start * total).round() as usize).min(total_frames - 1);
+        let end = ((self.end * total).round() as usize).clamp(start + 1, total_frames);
+        Some((start, end))
+    }
+
+    fn shifted_by_frames(
+        self,
+        direction: WaveformRegionSlide,
+        total_frames: usize,
+    ) -> Option<Self> {
+        let (start, end) = self.frame_bounds(total_frames)?;
         let width = end - start;
         let next_start = match direction {
+            WaveformRegionSlide::Left => start.checked_sub(width)?,
+            WaveformRegionSlide::Right => {
+                let next = start + width;
+                (next <= total_frames - width).then_some(next)?
+            }
             WaveformRegionSlide::FineLeft => start.saturating_sub(1),
             WaveformRegionSlide::FineRight => start.saturating_add(1).min(total_frames - width),
-            _ => return None,
         };
+        let total = total_frames as f64;
         Self::new(
             next_start as f64 / total,
             (next_start + width) as f64 / total,
@@ -2222,6 +2224,8 @@ impl Browser {
     }
 
     pub(super) fn clear_waveform_region(&mut self) {
+        self.held_playmark_slide = None;
+        self.playmark_resize_anchor = None;
         self.cancel_playmark_timing_edit();
         self.similar_sections.cancel();
         zero_crossing::cancel_for_interruption(self);
@@ -2236,6 +2240,8 @@ impl Browser {
 
     pub(super) fn set_waveform_play_region(&mut self, region: Option<WaveformPlayRegion>) {
         if self.waveform_play_region != region {
+            self.held_playmark_slide = None;
+            self.playmark_resize_anchor = None;
             self.cancel_playmark_timing_edit();
         }
         self.waveform_play_region = region;
@@ -2451,32 +2457,40 @@ impl Browser {
         true
     }
 
-    pub(super) fn slide_waveform_region(&mut self, direction: WaveformRegionSlide) -> bool {
-        zero_crossing::cancel_for_interruption(self);
-        let Some(region) = self.waveform_play_region else {
-            return false;
-        };
-        let Some(next) = (match direction {
-            WaveformRegionSlide::Left => region.slide_left(),
-            WaveformRegionSlide::Right => region.slide_right(),
-            WaveformRegionSlide::FineLeft | WaveformRegionSlide::FineRight => {
-                let Some(preview) = self.waveform.as_ref() else {
-                    return false;
-                };
-                region.nudged_by_frame(direction, preview.total_frames)
-            }
-        }) else {
-            return false;
-        };
-        if next == region {
-            return false;
+    pub(super) fn handle_playmark_slide(
+        &mut self,
+        direction: WaveformRegionSlide,
+        held: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fine = direction.is_fine();
+        if !fine
+            && held
+            && (!window.is_window_active() || self.held_playmark_slide != Some(direction))
+        {
+            return;
         }
-        self.cancel_playmark_timing_edit();
-        self.set_waveform_play_region(Some(next));
-        similar_sections::invalidate_if_stale(self);
-        let Some(preview) = self.waveform.as_ref() else {
-            return true;
+        let Some((region, preview)) = self.waveform_play_region.zip(self.waveform.as_ref()) else {
+            self.held_playmark_slide = None;
+            return;
         };
+        let total_frames = preview.total_frames;
+        let active_direction = (!fine).then_some(direction);
+        let Some(next) = region
+            .shifted_by_frames(direction, total_frames)
+            .filter(|next| *next != region)
+        else {
+            self.held_playmark_slide = None;
+            if !held && self.cancel_waveform_gestures(window, cx) {
+                cx.notify();
+            }
+            return;
+        };
+        self.cancel_waveform_gestures(window, cx);
+        self.set_waveform_play_region(Some(next));
+        self.held_playmark_slide = active_direction;
+        similar_sections::invalidate_if_stale(self);
         let viewport = self.waveform_viewport;
         let viewport_shift = if next.start < viewport.start {
             next.start - viewport.start
@@ -2486,10 +2500,24 @@ impl Browser {
             0.0
         };
         if viewport_shift.abs() > WAVEFORM_WHEEL_EPSILON {
-            self.waveform_viewport = viewport
-                .pan_by_visible_fraction(preview.total_frames, viewport_shift / viewport.width());
+            self.waveform_viewport =
+                viewport.pan_by_visible_fraction(total_frames, viewport_shift / viewport.width());
         }
-        true
+        if let Some(path) = self.playing_path.clone() {
+            match self.submit_playmark_timing_span(&path, next, cx) {
+                Some(Ok(())) if fine => {
+                    self.playback_status = "Fine selection nudge applying to playback".into();
+                }
+                Some(Err(error)) if fine => {
+                    self.playback_status = format!("Fine selection nudge unavailable: {error}");
+                }
+                Some(Err(error)) => {
+                    self.playback_status = format!("Selection move unavailable: {error}");
+                }
+                _ => {}
+            }
+        }
+        cx.notify();
     }
 
     pub(super) fn update_waveform_region_drag(
@@ -4808,30 +4836,58 @@ mod tests {
     }
 
     #[test]
+    fn playmark_slide_takes_only_full_width_steps_in_playback_frames() {
+        let total = 103;
+        let mut region = WaveformPlayRegion::new(5.0 / 103.0, 14.0 / 103.0).unwrap();
+        assert!(
+            region
+                .shifted_by_frames(WaveformRegionSlide::Left, total)
+                .is_none()
+        );
+        for start in (1..=9).map(|step| 5 + 9 * step) {
+            region = region
+                .shifted_by_frames(WaveformRegionSlide::Right, total)
+                .expect("one full playmark-width slide");
+            assert_eq!(playback_frames(region, total), (start, start + 9));
+        }
+        assert!(
+            region
+                .shifted_by_frames(WaveformRegionSlide::Right, total)
+                .is_none()
+        );
+        for start in (0..9).rev().map(|step| 5 + 9 * step) {
+            region = region
+                .shifted_by_frames(WaveformRegionSlide::Left, total)
+                .expect("one full playmark-width slide");
+            assert_eq!(playback_frames(region, total), (start, start + 9));
+        }
+    }
+
+    #[test]
     fn fine_region_nudges_preserve_exact_frames_and_clamp_without_repeat_drift() {
         let mut region = WaveformPlayRegion::new(0.2, 0.4).expect("play region");
         for start in 201..=800 {
             region = region
-                .nudged_by_frame(WaveformRegionSlide::FineRight, 1_000)
+                .shifted_by_frames(WaveformRegionSlide::FineRight, 1_000)
                 .expect("one-frame nudge");
             assert_eq!(playback_frames(region, 1_000), (start, start + 200));
         }
         let right_edge = region
-            .nudged_by_frame(WaveformRegionSlide::FineRight, 1_000)
+            .shifted_by_frames(WaveformRegionSlide::FineRight, 1_000)
             .expect("clamped nudge");
         assert_eq!(right_edge, region);
         for start in (0..800).rev() {
             region = region
-                .nudged_by_frame(WaveformRegionSlide::FineLeft, 1_000)
+                .shifted_by_frames(WaveformRegionSlide::FineLeft, 1_000)
                 .expect("one-frame nudge");
             assert_eq!(playback_frames(region, 1_000), (start, start + 200));
         }
         assert_eq!(
-            region.nudged_by_frame(WaveformRegionSlide::FineLeft, 1_000),
+            region.shifted_by_frames(WaveformRegionSlide::FineLeft, 1_000),
             Some(region)
         );
         assert_eq!(
-            region.nudged_by_frame(WaveformRegionSlide::FineRight, 0),
+            region.shifted_by_frames(WaveformRegionSlide::FineRight, 0),
             None
         );
 
@@ -4845,7 +4901,7 @@ mod tests {
             .expect("frame-aligned region");
             let before = playback_frames(region, total_frames);
             let nudged = region
-                .nudged_by_frame(WaveformRegionSlide::FineRight, total_frames)
+                .shifted_by_frames(WaveformRegionSlide::FineRight, total_frames)
                 .expect("one-frame nudge");
             let after = playback_frames(nudged, total_frames);
             assert_eq!(after.0, before.0 + 1);

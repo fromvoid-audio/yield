@@ -201,6 +201,7 @@ pub(crate) struct SearchInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    pointer_cursor: CursorStyle,
 }
 
 impl EventEmitter<SearchChanged> for SearchInput {}
@@ -246,6 +247,7 @@ impl SearchInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            pointer_cursor: CursorStyle::IBeam,
         }
     }
 
@@ -307,6 +309,12 @@ impl SearchInput {
         self.selected_range = 0..self.content.len();
         self.selection_reversed = false;
         self.marked_range = None;
+        cx.notify();
+    }
+
+    /// Override the text cursor while a surrounding control owns pointer input.
+    pub(crate) fn set_pointer_cursor(&mut self, cursor: CursorStyle, cx: &mut Context<Self>) {
+        self.pointer_cursor = cursor;
         cx.notify();
     }
 
@@ -947,7 +955,7 @@ impl Render for SearchInput {
             .flex()
             .key_context("SearchInput")
             .track_focus(&self.focus_handle)
-            .cursor(CursorStyle::IBeam)
+            .cursor(self.pointer_cursor)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))

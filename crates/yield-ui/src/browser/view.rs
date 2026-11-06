@@ -745,11 +745,12 @@ impl Browser {
                 cx.on_focus_out(&focus, window, |view, _, _, cx| view.cancel_pane_resize(cx)),
             ];
         }
-        if self.pane_resize_activation.is_none() {
-            self.pane_resize_activation =
+        if self.window_activation_subscription.is_none() {
+            self.window_activation_subscription =
                 Some(cx.observe_window_activation(window, |view, window, cx| {
                     if !window.is_window_active() {
                         view.cancel_pane_resize(cx);
+                        view.held_playmark_slide = None;
                     }
                 }));
         }
@@ -1464,6 +1465,14 @@ impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         super::harvest_filter::invalidate_if_stale(self, cx);
         self.reconcile_pane_resize(window, cx);
+        if self.playmark_slide_blur_subscription.is_none() {
+            self.playmark_slide_blur_subscription =
+                Some(
+                    cx.on_blur(&self.waveform_focus_handle, window, |view, _, _| {
+                        view.held_playmark_slide = None;
+                    }),
+                );
+        }
         self.reconcile_shipped_visual_effect(window, cx);
         self.refresh_user_shader_review_token();
         #[cfg(target_os = "macos")]
@@ -1934,10 +1943,14 @@ impl Render for Browser {
             .text_size(px(theme.typography.body_size))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_key_up(cx.listener(|view, event, _, _| view.release_playmark_slide(event)))
             .on_action(cx.listener(Self::open_unsupported_action))
             .on_action(cx.listener(Self::close_unsupported_action))
             .on_action(cx.listener(Self::inspect_unsupported_action))
-            .capture_any_mouse_down(cx.listener(Self::cancel_file_drag_from_mouse_down))
+            .capture_any_mouse_down(cx.listener(|view, event, window, cx| {
+                view.held_playmark_slide = None;
+                view.cancel_file_drag_from_mouse_down(event, window, cx);
+            }))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
                 view.update_column_gesture(
                     f32::from(event.position.x),
@@ -3935,6 +3948,86 @@ mod tests {
                 );
             });
         });
+    }
+
+    #[gpui::test]
+    fn playmark_slide_repeat_is_owned_by_the_last_arrow_and_current_focus(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let initial = waveform::WaveformPlayRegion::new(0.05, 0.15).unwrap();
+        install_playmark_state(
+            &browser,
+            cx,
+            Path::new("/tmp/inert-playmark-slide-test.wav"),
+            initial,
+        );
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            browser.update(app, |view, _| {
+                view.waveform.as_mut().unwrap().total_frames = 100;
+                window.focus(&view.waveform_focus_handle);
+            });
+        });
+        cx.refresh().unwrap();
+        let press = |cx: &mut VisualTestContext, key, is_held| {
+            cx.simulate_event(KeyDownEvent {
+                keystroke: Keystroke::parse(key).unwrap(),
+                is_held,
+            });
+        };
+        let bounds = |cx: &VisualTestContext| {
+            cx.cx.read(|app| {
+                browser
+                    .read(app)
+                    .waveform_play_region
+                    .and_then(|region| region.frame_bounds(100))
+            })
+        };
+
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((5, 15)));
+        press(cx, "right", false);
+        assert_eq!(bounds(cx), Some((15, 25)));
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((25, 35)));
+        press(cx, "left", false);
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((15, 25)));
+        press(cx, "left", true);
+        assert_eq!(bounds(cx), Some((5, 15)));
+        press(cx, "left", true);
+        assert_eq!(bounds(cx), Some((5, 15)));
+
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: Keystroke::parse("left").unwrap(),
+        });
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((5, 15)));
+
+        press(cx, "right", false);
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: Keystroke::parse("right").unwrap(),
+        });
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((15, 25)));
+
+        press(cx, "right", false);
+        cx.update(|window, app| window.focus(&browser.read(app).focus_handle));
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        cx.update(|window, app| window.focus(&browser.read(app).waveform_focus_handle));
+        cx.refresh().unwrap();
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((25, 35)));
+
+        press(cx, "right", false);
+        browser.update(cx, |view, _| {
+            view.invalidate_waveform_generation();
+            view.set_waveform_play_region(Some(initial));
+        });
+        press(cx, "right", true);
+        assert_eq!(bounds(cx), Some((5, 15)));
     }
 
     #[gpui::test]
