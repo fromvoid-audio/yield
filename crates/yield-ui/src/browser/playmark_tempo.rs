@@ -1,8 +1,11 @@
 //! Read and commit the authored playmark of the exact waveform currently displayed.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use gpui::Context;
@@ -15,8 +18,41 @@ use yield_session::{
 
 use super::{Browser, catalog, similar_sections, waveform::WaveformPlayRegion};
 
+const MAX_HISTORY: usize = 32;
+
+#[derive(Clone, Copy, PartialEq)]
+struct Presentation {
+    region: Option<WaveformPlayRegion>,
+    beats: u8,
+}
+
+impl Presentation {
+    fn current(browser: &Browser) -> Self {
+        Self {
+            region: browser.waveform_play_region,
+            beats: browser.beat_guide_count,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HistoryEntry {
+    prior_tempo: Option<SourcePlaymarkTempo>,
+    tempo: SourcePlaymarkTempo,
+    before: Presentation,
+    after: Presentation,
+}
+
+#[derive(Clone, Copy)]
+enum Action {
+    Author { before: Presentation },
+    Undo(HistoryEntry),
+    Redo(HistoryEntry),
+}
+
 struct Save {
-    next: SourcePlaymarkTempo,
+    next: Option<SourcePlaymarkTempo>,
+    action: Action,
     request: Option<SourcePlaymarkTempoRequest>,
     cancellation: Arc<AtomicBool>,
 }
@@ -34,6 +70,8 @@ struct Load {
     cancellation: Arc<AtomicBool>,
     result: Option<Result<Option<SourcePlaymarkTempo>, PlaymarkTempoFailure>>,
     save: Option<Save>,
+    undo: VecDeque<HistoryEntry>,
+    redo: VecDeque<HistoryEntry>,
 }
 
 impl Load {
@@ -119,6 +157,8 @@ fn ensure_load(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
         cancellation: Arc::new(AtomicBool::new(false)),
         result: None,
         save: None,
+        undo: VecDeque::new(),
+        redo: VecDeque::new(),
     };
     if catalog::submit_catalog_command(
         CatalogCommand::PlaymarkTempo {
@@ -147,21 +187,81 @@ pub(super) fn save_released_tempo(
     }
     browser.playmark_tempo.restore_blocked = true;
     ensure_load(browser, cx);
+    let action = Action::Author {
+        before: Presentation::current(browser),
+    };
+    queue_save(browser, Some(tempo), action, cx);
+    true
+}
+
+fn queue_save(
+    browser: &mut Browser,
+    next: Option<SourcePlaymarkTempo>,
+    action: Action,
+    cx: &mut Context<Browser>,
+) {
     let Some(load) = browser.playmark_tempo.load.as_mut() else {
         browser.set_playback_status("Playmark tempo save unavailable");
-        return true;
+        return;
     };
     if load.save.is_some() {
         browser.set_playback_status("A playmark tempo save is already pending");
-        return true;
+        return;
     }
     load.save = Some(Save {
-        next: tempo,
+        next,
+        action,
         request: None,
         cancellation: Arc::new(AtomicBool::new(false)),
     });
     browser.set_playback_status("Saving playmark tempo…");
     submit_ready_save(browser, cx);
+}
+
+/// Submit undo or redo only for the matching current waveform and settled tempo.
+pub(super) fn move_history(browser: &mut Browser, redo: bool, cx: &mut Context<Browser>) -> bool {
+    let Some(load) = browser
+        .playmark_tempo
+        .load
+        .as_ref()
+        .filter(|load| load.matches(browser))
+    else {
+        return false;
+    };
+    if load.save.is_some() {
+        return true;
+    }
+    let entry = if redo {
+        load.redo.back()
+    } else {
+        load.undo.back()
+    };
+    let Some(&entry) = entry else {
+        return false;
+    };
+    let (expected, current, next, action) = if redo {
+        (
+            entry.prior_tempo,
+            entry.before,
+            Some(entry.tempo),
+            Action::Redo(entry),
+        )
+    } else {
+        (
+            Some(entry.tempo),
+            entry.after,
+            entry.prior_tempo,
+            Action::Undo(entry),
+        )
+    };
+    if browser.waveform_region_drag.is_some()
+        || current != Presentation::current(browser)
+        || load.result != Some(Ok(expected))
+    {
+        return false;
+    }
+    queue_save(browser, next, action, cx);
+    cx.notify();
     true
 }
 
@@ -194,7 +294,7 @@ fn submit_ready_save(browser: &mut Browser, cx: &mut Context<Browser>) {
         load.request.relative_path(),
         PlaymarkTempoOperation::Replace {
             previous,
-            next: Some(save.next),
+            next: save.next,
         },
     );
     let Ok(request) = request else {
@@ -227,9 +327,7 @@ fn submit_ready_save(browser: &mut Browser, cx: &mut Context<Browser>) {
 fn fail_save(browser: &mut Browser, error: PlaymarkTempoFailure) {
     browser.playmark_tempo.load = None;
     let message = match error {
-        PlaymarkTempoFailure::Conflict => {
-            "Playmark tempo changed in the Source. Resize again to retry"
-        }
+        PlaymarkTempoFailure::Conflict => "Playmark tempo changed in the Source",
         PlaymarkTempoFailure::Cancelled => "Playmark tempo save canceled",
         PlaymarkTempoFailure::StaleSource => "Playmark tempo save lost its current Source",
         _ => "Playmark tempo save unavailable",
@@ -279,15 +377,10 @@ pub(super) fn apply_catalog_event(
 
     if let Some(save) = save {
         match result {
-            Ok(Some(tempo)) if *tempo == save.next => {
-                if let Some(load) = browser.playmark_tempo.load.as_mut() {
-                    load.result = Some(*result);
-                    load.save = None;
-                }
-                browser.set_playback_status("Playmark tempo saved");
-                if browser.waveform_region_drag.is_none() {
-                    apply_tempo(browser, *tempo, cx);
-                }
+            Ok(tempo) if *tempo == save.next => {
+                let action = save.action;
+                let prior_tempo = load.result.and_then(Result::ok).flatten();
+                finish_save(browser, action, prior_tempo, *tempo, cx);
             }
             Ok(_) => fail_save(browser, PlaymarkTempoFailure::Store),
             Err(error) => fail_save(browser, *error),
@@ -318,27 +411,101 @@ pub(super) fn apply_catalog_event(
 }
 
 fn apply_tempo(browser: &mut Browser, tempo: SourcePlaymarkTempo, cx: &mut Context<Browser>) {
-    let Some(preview) = browser.waveform.as_ref() else {
-        return;
-    };
+    if let Some(presentation) = tempo_presentation(browser, tempo) {
+        apply_presentation(browser, presentation, cx);
+    }
+}
+
+fn tempo_presentation(browser: &Browser, tempo: SourcePlaymarkTempo) -> Option<Presentation> {
+    let preview = browser.waveform.as_ref()?;
     let (total, sample_rate, beats) = tempo.dimensions();
     if total != preview.total_frames as u64
         || sample_rate != preview.sample_rate
         || beats > crate::beat_count_input::MAX_BEAT_COUNT
     {
-        return;
+        return None;
     }
     let (first, end) = tempo.frame_range();
-    if let Some(region) =
-        WaveformPlayRegion::new(first as f64 / total as f64, end as f64 / total as f64)
-    {
-        browser.set_waveform_play_region(Some(region));
-        similar_sections::invalidate_if_stale(browser);
+    let region = WaveformPlayRegion::new(first as f64 / total as f64, end as f64 / total as f64)?;
+    Some(Presentation {
+        region: Some(region),
+        beats,
+    })
+}
+
+fn apply_presentation(
+    browser: &mut Browser,
+    presentation: Presentation,
+    cx: &mut Context<Browser>,
+) {
+    browser.set_waveform_play_region(presentation.region);
+    similar_sections::invalidate_if_stale(browser);
+    if let Some(region) = presentation.region {
         browser.retarget_committed_playmark_resize(region, cx);
-        browser.beat_guide_count = beats;
-        browser
-            .beat_count_input
-            .update(cx, |input, cx| input.set_count(beats, cx));
-        cx.notify();
+    }
+    browser.beat_guide_count = presentation.beats;
+    browser
+        .beat_count_input
+        .update(cx, |input, cx| input.set_count(presentation.beats, cx));
+    cx.notify();
+}
+
+fn finish_save(
+    browser: &mut Browser,
+    action: Action,
+    prior_tempo: Option<SourcePlaymarkTempo>,
+    tempo: Option<SourcePlaymarkTempo>,
+    cx: &mut Context<Browser>,
+) {
+    let presentation = match action {
+        Action::Author { .. } => tempo.and_then(|value| tempo_presentation(browser, value)),
+        Action::Undo(entry) => Some(entry.before),
+        Action::Redo(entry) => Some(entry.after),
+    }
+    .filter(|_| browser.waveform_region_drag.is_none());
+    let Some(load) = browser.playmark_tempo.load.as_mut() else {
+        return;
+    };
+    load.result = Some(Ok(tempo));
+    load.save = None;
+    let message = match action {
+        Action::Author { .. } => "Playmark tempo saved",
+        Action::Undo(_) => "Playmark tempo undone",
+        Action::Redo(_) => "Playmark tempo redone",
+    };
+    if let Some(presentation) = presentation {
+        match action {
+            Action::Author { before } => {
+                if let Some(tempo) = tempo {
+                    load.redo.clear();
+                    if load.undo.back().is_some_and(|entry| entry.after != before) {
+                        load.undo.clear();
+                    }
+                    if load.undo.len() == MAX_HISTORY {
+                        load.undo.pop_front();
+                    }
+                    load.undo.push_back(HistoryEntry {
+                        prior_tempo,
+                        tempo,
+                        before,
+                        after: presentation,
+                    });
+                }
+            }
+            Action::Undo(entry) => {
+                load.undo.pop_back();
+                load.redo.push_back(entry);
+            }
+            Action::Redo(entry) => {
+                load.redo.pop_back();
+                load.undo.push_back(entry);
+            }
+        }
+        browser.set_playback_status(message);
+        apply_presentation(browser, presentation, cx);
+    } else {
+        load.undo.clear();
+        load.redo.clear();
+        browser.set_playback_status(message);
     }
 }

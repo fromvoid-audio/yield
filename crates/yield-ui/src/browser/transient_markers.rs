@@ -816,6 +816,73 @@ mod tests {
     }
 
     #[gpui::test]
+    fn playmark_tempo_history_waits_for_the_source_and_restores_beats(cx: &mut TestAppContext) {
+        use super::super::{
+            playmark_tempo, source_registry::SourceRegistryGlobal, waveform::WaveformPlayRegion,
+        };
+        use gpui::AppContext;
+        use yield_session::{CatalogEvent, SourcePlaymarkTempo};
+
+        let (_directory, path, preview) = fixture();
+        let root = path.parent().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
+        let _profile = PersistenceProfileGuard::named("gpui-playmark-history");
+        let guard = WritableProfileGuard::acquire_current().unwrap();
+        let (service, snapshot) = audited_owner(&guard, root);
+        cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(Browser::new);
+        let baseline = WaveformPlayRegion::new(0.125, 0.25);
+        let authored = WaveformPlayRegion::new(0.125, 0.5);
+        let tempo = SourcePlaymarkTempo::new(2_000, 8_000, 16_000, 16_000, 6).unwrap();
+        browser.update(cx, |view, cx| {
+            install_waveform(view, &path, preview);
+            install_source(view, root, &snapshot);
+            view.set_waveform_play_region(baseline);
+            assert!(playmark_tempo::save_released_tempo(view, tempo, cx));
+        });
+        for _ in 0..2 {
+            let delivery = next_tempo_delivery(cx);
+            browser.update(cx, |view, cx| {
+                assert!(view.apply_catalog_delivery(delivery, cx))
+            });
+        }
+        for (redo, before, after, expected, beats) in [
+            (false, authored, baseline, None, 4),
+            (true, baseline, authored, Some(tempo), 6),
+        ] {
+            browser.update(cx, |view, cx| {
+                assert_eq!(view.waveform_play_region, before);
+                assert!(playmark_tempo::move_history(view, redo, cx));
+                assert_eq!(view.waveform_play_region, before);
+            });
+            let (event, fence) = next_tempo_delivery(cx).into_parts_if_live().unwrap();
+            assert!(matches!(
+                event,
+                CatalogEvent::PlaymarkTempoCompleted { result, .. } if result == Ok(expected)
+            ));
+            browser.update(cx, |view, cx| {
+                assert!(playmark_tempo::apply_catalog_event(
+                    view,
+                    &event,
+                    fence.as_ref(),
+                    cx
+                ));
+                assert_eq!(view.waveform_play_region, after);
+                assert_eq!(view.beat_count_input.read(cx).count(), beats);
+            });
+        }
+        browser.update(cx, |view, cx| {
+            view.invalidate_waveform_generation();
+            assert!(!playmark_tempo::move_history(view, false, cx));
+        });
+        cx.update(|app| {
+            app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
+        });
+    }
+
+    #[gpui::test]
     fn quick_audited_recording_advances_the_source_without_reloading_the_waveform(
         cx: &mut TestAppContext,
     ) {

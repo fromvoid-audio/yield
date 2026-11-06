@@ -3177,6 +3177,17 @@ impl Browser {
         if self.handle_playmark_resize_key(event, window, cx) {
             return;
         }
+        if waveform_has_keys
+            && secondary
+            && !alt
+            && !function
+            && !event.is_held
+            && key.eq_ignore_ascii_case("z")
+            && playmark_tempo::move_history(self, shift, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         if self.waveform_focus_handle.is_focused(window)
             && !secondary
             && !function
