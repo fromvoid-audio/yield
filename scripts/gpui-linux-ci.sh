@@ -37,11 +37,11 @@ if [[ "$scope" == "full" ]]; then
   run cargo check --locked --workspace --all-targets
   # Keep real owner/process fixtures and their original deadlines. Containers
   # without a reaping init need a subreaper for deliberately orphaned children.
-  if command -v tini >/dev/null 2>&1; then
-    run tini -s -- cargo test --workspace --locked --no-fail-fast -- --test-threads=1
-  else
-    run cargo test --workspace --locked --no-fail-fast -- --test-threads=1
-  fi
+  reaper=()
+  if command -v tini >/dev/null 2>&1; then reaper=(tini -s --); fi
+  run "${reaper[@]}" python3 -m unittest scripts.internal.ci.test_linux_ci_runner \
+    scripts.internal.ci.test_full_ci_runner scripts.internal.ci.test_runtime_paths
+  run "${reaper[@]}" cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 fi
 echo "[gpui-linux-ci] PASS head=$(git rev-parse HEAD) scope=$scope"
 echo "Desktop, audio-device and other-platform acceptance is recorded separately in Pulse."

@@ -22,6 +22,7 @@ class LinuxCiRunnerTests(unittest.TestCase):
                 "uname": 'echo Linux',
                 "git": 'echo fixture-source',
                 "cargo": 'echo "$*" >> "$YIELD_TEST_COMMAND_LOG"; exit "${YIELD_TEST_CARGO_EXIT:-0}"',
+                "python3": 'echo "python3 $*" >> "$YIELD_TEST_COMMAND_LOG"',
                 "tini": 'test "$1" = -s && test "$2" = -- || exit 99; shift 2; exec "$@"',
             }.items():
                 path = root / tool
@@ -42,6 +43,7 @@ class LinuxCiRunnerTests(unittest.TestCase):
                 "fmt --all --check",
                 "check --locked -p yield --bin yield",
                 "check --locked --workspace --all-targets",
+                "python3 -m unittest scripts.internal.ci.test_linux_ci_runner scripts.internal.ci.test_full_ci_runner scripts.internal.ci.test_runtime_paths",
                 "test --workspace --locked --no-fail-fast -- --test-threads=1",
             ])
             log.unlink()
