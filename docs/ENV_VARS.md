@@ -990,16 +990,5 @@ evaluate` exits non-zero if readiness criteria are not met. Default: `0`.
 
 ## Issue reporting token storage
 
-These variables affect the GitHub issue token storage backend in
-`src/issue_gateway/token_store.rs`.
-
-- `YIELD_DISABLE_KEYRING`
-Disables OS keyring usage when set to a truthy value.
-
-- `YIELD_ALLOW_FALLBACK_TOKEN_STORAGE`
-Opt-in switch that permits encrypted on-disk fallback token storage when keyring
-operations fail or are unavailable.
-
-- `YIELD_FALLBACK_KEY`
-Supplies the 32-byte fallback encryption key via an environment variable (useful
-when keyring storage is unavailable). This is expected to be base64-encoded.
+Yield stores feedback credentials in the operating system credential service.
+Secure storage must be available to connect a feedback account.

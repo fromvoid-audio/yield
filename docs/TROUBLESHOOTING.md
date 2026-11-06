@@ -114,13 +114,29 @@ Symptoms:
 
 - issue-report token storage fails because the OS keyring is unavailable
 
-Fix:
+On Linux, run Yield in a desktop login session with an unlocked Secret Service
+provider, such as GNOME Keyring or a KWallet installation that exposes
+`org.freedesktop.secrets`. On macOS, check the login Keychain. On Windows, check
+Credential Manager. Yield disables feedback sign-in if the credential service
+is unavailable and has no disk fallback.
 
-- preferred: repair the local keyring backend
-- fallback:
-  - `YIELD_DISABLE_KEYRING=1`
-  - `YIELD_ALLOW_FALLBACK_TOKEN_STORAGE=1`
-  - `YIELD_FALLBACK_KEY=<base64 32-byte key>`
+For Linux keyring qualification, run the following from the exact Yield
+checkout in an unlocked desktop session. Each step starts a separate process
+and uses a synthetic credential under a unique test account.
+
+```bash
+export YIELD_KEYRING_TEST_ACCOUNT="yield-qa-$(cat /proc/sys/kernel/random/uuid)"
+for step in store load delete absent; do
+  YIELD_KEYRING_TEST_STEP="$step" cargo test --locked -p yield-issue-gateway --lib \
+    tests::linux_secret_service_probe -- --ignored --exact || break
+done
+DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null/yield-probe \
+  YIELD_KEYRING_TEST_STEP=unavailable cargo test --locked -p yield-issue-gateway --lib \
+  tests::linux_secret_service_probe -- --ignored --exact
+```
+
+If a run stops after storing its fixture, rerun the `delete` step with the same
+test account while the provider is available.
 
 ### Native font fallback issues
 
