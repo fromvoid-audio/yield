@@ -1,0 +1,15 @@
+[package]
+name = "yield-aiff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aifc = "=0.7.0"
+
+[dev-dependencies]
+tempfile.workspace = true

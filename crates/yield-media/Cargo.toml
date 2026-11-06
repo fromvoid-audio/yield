@@ -17,6 +17,7 @@ development-state = [
 
 [dependencies]
 hound.workspace = true
+yield-aiff.workspace = true
 yield-analysis.workspace = true
 yield-core.workspace = true
 yield-library.workspace = true

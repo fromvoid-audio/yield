@@ -31,3 +31,4 @@ sha2 = "0.10.9"
 symphonia = { version = "0.5.4", features = ["wav", "pcm", "mp3", "flac"] }
 tempfile = "3.23.0"
 thiserror = "2.0.17"
+yield-aiff.workspace = true
