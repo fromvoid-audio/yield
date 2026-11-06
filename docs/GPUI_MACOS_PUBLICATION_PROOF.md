@@ -163,3 +163,25 @@ checkpoint. [Yield #6031](https://pulse.iocore.dev/#/issues/6031)
 This approval covers the design and isolated proof. Service installation,
 production enablement and use against a real library require separate evidence
 and authorization.
+
+### Run the two-identity fixture
+
+On a local APFS Mac, run from the repository as an ordinary account with
+permission to launch a command as the built-in unprivileged `nobody` account.
+The probe creates a disposable directory under `/private/tmp` and invokes the
+peer with noninteractive sudo. If needed, authenticate in the same terminal
+before running it.
+
+```sh
+sudo -v
+/usr/bin/python3 -I scripts/qa/macos_managed_output_probe.py
+```
+
+The writer line confirms exact staged/final identity, no-replace collision,
+owned staging cleanup and readable WAV data. A separate peer line must confirm
+that the WAV was readable and filesystem mutations were refused. Add
+`--writer-only` to exercise the writer in a shell without peer access.
+Only the two-identity run can establish peer refusal. The probe uses ordinary
+file sync and a temporary sticky parent. The installed service, its production
+ancestor permissions, crash recovery and directory durability require
+separate qualification. [Yield #6031](https://pulse.iocore.dev/#/issues/6031)
