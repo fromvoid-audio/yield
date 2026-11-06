@@ -1,5 +1,6 @@
 //! Worker-local adapter. Genuine native custody and outcomes belong to the library.
 use super::*;
+use crate::PlaymarkTempoOperation;
 struct Slot {
     source: RegisteredSource<SourceWalProducerOwner>,
     lifecycle_generation: u64,
@@ -355,6 +356,7 @@ pub(crate) fn deferred(command: &CatalogCommand, slots: &WorkerReservations) -> 
         CatalogCommand::RequestTransientMarkers { request, .. } => {
             slots.is_held(request.source_id())
         }
+        CatalogCommand::PlaymarkTempo { request, .. } => slots.is_held(request.source_id()),
         CatalogCommand::ConsumeReplay { submission } => slots.is_held(submission.source_id()),
         CatalogCommand::RequestIndexInspection { handle, .. } => slots.is_held(&handle.source_id),
     }
@@ -365,6 +367,9 @@ pub(crate) fn deferred(command: &CatalogCommand, slots: &WorkerReservations) -> 
 // Bounded read pages on an unrelated source remain usable without touching parked owners.
 pub(crate) fn interrupts_preparation(command: &CatalogCommand) -> bool {
     match command {
+        CatalogCommand::PlaymarkTempo { request, .. } => {
+            matches!(request.operation(), PlaymarkTempoOperation::Replace { .. })
+        }
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestFeatureAnalysis { .. }
         | CatalogCommand::RequestWavMetadata { .. }

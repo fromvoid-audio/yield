@@ -99,6 +99,7 @@ pub use history_selection::{
     CollectionHistoryGroupRequest, CollectionHistoryRequest, PreparedCollectionOperation,
     SourceCollectionHistorySelection,
 };
+mod playmark_tempo_dispatch;
 mod similarity_dispatch;
 mod similarity_query;
 mod transient_dispatch;
@@ -110,6 +111,9 @@ pub use feature_job::{
 pub use feature_progress::{FeatureAnalysisPhase, FeaturePhaseMeasurement};
 pub use feature_request::{
     FeatureAnalysisBlocker, FeatureAnalysisCancellation, FeatureAnalysisState,
+};
+pub use playmark_tempo_dispatch::{
+    PlaymarkTempoFailure, PlaymarkTempoOperation, SourcePlaymarkTempo, SourcePlaymarkTempoRequest,
 };
 pub use similarity_dispatch::{
     SimilarityCancellation, SimilarityDispatchFailure, SourceSimilarityRequest,
@@ -655,6 +659,13 @@ pub enum CatalogCommand {
         request: SourceTransientRequest,
         /// Retained cancellation through compute and queued delivery.
         cancellation: FeatureAnalysisCancellation,
+    },
+    /// Read or atomically replace the authored tempo of one exact Source entry.
+    PlaymarkTempo {
+        /// Exact audited file and bounded operation.
+        request: SourcePlaymarkTempoRequest,
+        /// Stop before committing when the caller or Source lifecycle retires.
+        cancellation: Arc<AtomicBool>,
     },
     /// Compute one bounded WAV feature job at an exact retained source revision.
     RequestFeatureAnalysis {
@@ -1582,6 +1593,17 @@ pub enum CatalogEvent {
         /// Frame-domain result or refusal from the retained Source.
         result: Result<TransientJobOutcome, TransientRequestFailure>,
     },
+    /// A tempo read, durable replacement receipt, or truthful refusal.
+    PlaymarkTempoCompleted {
+        /// Exact request and correlation identity.
+        request: SourcePlaymarkTempoRequest,
+        /// Retained cancellation can retire the projection while preserving the receipt.
+        cancellation: Arc<AtomicBool>,
+        /// Whether the result still belongs to a live projection.
+        publication: CatalogPublicationStatus,
+        /// Read or committed value, with `None` representing an absent record.
+        result: Result<Option<SourcePlaymarkTempo>, PlaymarkTempoFailure>,
+    },
     /// One request's truthful state; ready requires validated durable feature bytes.
     FeatureAnalysisState {
         /// Stable source.
@@ -2056,6 +2078,15 @@ impl CatalogDelivery {
         {
             return None;
         }
+        if let CatalogEvent::PlaymarkTempoCompleted {
+            cancellation,
+            publication,
+            ..
+        } = &mut event
+            && cancellation.load(Ordering::Acquire)
+        {
+            *publication = CatalogPublicationStatus::NonProjectable;
+        }
         if let CatalogEvent::CollectionHistoryCompleted {
             cancellation,
             result,
@@ -2104,6 +2135,7 @@ impl CatalogDelivery {
         let terminal = match &mut event {
             CatalogEvent::CurationCommitted { publication, .. }
             | CatalogEvent::RatingDecayProgress { publication, .. }
+            | CatalogEvent::PlaymarkTempoCompleted { publication, .. }
             | CatalogEvent::CurationOperationCompleted { publication, .. } => {
                 *publication = CatalogPublicationStatus::NonProjectable;
                 true
@@ -2300,6 +2332,7 @@ struct AdmissionState {
     sources: HashMap<SourceId, DesiredSource>,
     active_audits: HashMap<SourceId, (u64, Arc<AtomicBool>)>,
     active_transient: Option<(SourceId, FeatureAnalysisCancellation)>,
+    active_playmark_tempo: Option<(SourceId, Arc<AtomicBool>)>,
     index_queries: HashMap<SourceId, (u64, u64, Arc<AtomicBool>)>,
     index_inspections: HashMap<SourceId, IndexInspectionCancellation>,
 }
@@ -2328,12 +2361,13 @@ impl AdmissionState {
             sources: HashMap::new(),
             active_audits: HashMap::new(),
             active_transient: None,
+            active_playmark_tempo: None,
             index_queries: HashMap::new(),
             index_inspections: HashMap::new(),
         }
     }
 
-    fn cancel_transient(&mut self, source: &SourceId) {
+    fn cancel_active_file_requests(&mut self, source: &SourceId) {
         if self
             .active_transient
             .as_ref()
@@ -2342,12 +2376,23 @@ impl AdmissionState {
         {
             cancellation.cancel();
         }
+        if self
+            .active_playmark_tempo
+            .as_ref()
+            .is_some_and(|(id, _)| id == source)
+            && let Some((_, cancellation)) = self.active_playmark_tempo.take()
+        {
+            cancellation.store(true, Ordering::Release);
+        }
     }
 
     fn invalidate_all(&mut self) {
         self.retained_harvest.cancel_all();
         if let Some((_, cancellation)) = self.active_transient.take() {
             cancellation.cancel();
+        }
+        if let Some((_, cancellation)) = self.active_playmark_tempo.take() {
+            cancellation.store(true, Ordering::Release);
         }
         #[cfg(feature = "test-support")]
         {
@@ -2669,6 +2714,7 @@ fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> 
     match command {
         CatalogCommand::RequestSimilarity { .. }
         | CatalogCommand::RequestTransientMarkers { .. }
+        | CatalogCommand::PlaymarkTempo { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. } => {}
         CatalogCommand::RequestFeatureAnalysis {
@@ -3080,6 +3126,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::RequestSimilarity { .. }
+        | CatalogCommand::PlaymarkTempo { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestIndexPage { .. }
         | CatalogCommand::RequestIndexInspection { .. }
@@ -3146,6 +3193,7 @@ fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
         CatalogCommand::RequestCollectionHistoryGroup { request, .. } => request.input_bytes(),
         CatalogCommand::RequestSimilarity { request, .. } => request.input_bytes(),
         CatalogCommand::RequestTransientMarkers { request, .. } => request.input_bytes(),
+        CatalogCommand::PlaymarkTempo { request, .. } => request.input_bytes(),
         CatalogCommand::ConsumeReplay { submission } => submission.input_bytes(),
         CatalogCommand::RequestIndexInspection { handle, .. } => handle.input_bytes(),
         CatalogCommand::RequestIndexPage {
@@ -3229,6 +3277,9 @@ fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, Cat
         }
         CatalogCommand::RequestSimilarity { .. } => Ok(similarity_dispatch::MAX_RESULT_BYTES),
         CatalogCommand::RequestTransientMarkers { request, .. } => Ok(request.result_bytes()),
+        CatalogCommand::PlaymarkTempo { request, .. } => {
+            Ok(request.input_bytes() + std::mem::size_of::<CatalogEvent>())
+        }
         CatalogCommand::RequestIndexPage { .. } | CatalogCommand::RequestIndexInspection { .. } => {
             Ok(MAX_INDEX_PAGE_PAYLOAD_BYTES)
         }
@@ -3322,6 +3373,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestFeatureAnalysis { .. }
         | CatalogCommand::RequestTransientMarkers { .. }
+        | CatalogCommand::PlaymarkTempo { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::RequestSimilarity { .. } => AdmissionAction::RequestWavMetadata,
@@ -3446,7 +3498,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .is_none_or(|source| lifecycle_generation > source.lifecycle_generation);
             if replace {
                 state.retained_harvest.cancel_source(&source_id);
-                state.cancel_transient(&source_id);
+                state.cancel_active_file_requests(&source_id);
                 #[cfg(feature = "test-support")]
                 test_support::clear_source(state, &source_id);
                 state.active_audits.remove(&source_id);
@@ -3482,7 +3534,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .is_none_or(|source| lifecycle_generation >= source.lifecycle_generation);
             if replace {
                 state.retained_harvest.cancel_source(&source_id);
-                state.cancel_transient(&source_id);
+                state.cancel_active_file_requests(&source_id);
                 #[cfg(feature = "test-support")]
                 test_support::clear_source(state, &source_id);
                 state.active_audits.remove(&source_id);
@@ -3514,7 +3566,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
         }
         AdmissionAction::RequestAudit { source_id } => {
             state.retained_harvest.cancel_source(&source_id);
-            state.cancel_transient(&source_id);
+            state.cancel_active_file_requests(&source_id);
             if let Some(cancellation) = state.index_inspections.remove(&source_id) {
                 cancellation.cancel();
             }
@@ -4643,6 +4695,19 @@ fn handle_command(
         }
         CatalogCommand::RequestTransientMarkers { .. } => {
             unreachable!("transient requests are handled by the compute slot");
+        }
+        CatalogCommand::PlaymarkTempo {
+            request,
+            cancellation,
+        } => {
+            playmark_tempo_dispatch::dispatch(
+                request,
+                cancellation,
+                reservation,
+                admission,
+                sources,
+            );
+            false
         }
         CatalogCommand::RequestFeatureAnalysis {
             source_id,

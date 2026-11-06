@@ -303,9 +303,17 @@ fn lease_normal_deferral_preserves_32_command_queue_and_unrelated_audited_read_p
     let holder = held(&mut request);
     let id = source(&inputs[0]);
     service
-        .submit(CatalogCommand::ReadSnapshot {
-            source_id: id.clone(),
-            expected_revision: None,
+        .submit(CatalogCommand::PlaymarkTempo {
+            request: crate::SourcePlaymarkTempoRequest::new(
+                &id,
+                1,
+                0,
+                2259,
+                Path::new("one.wav"),
+                crate::PlaymarkTempoOperation::Read,
+            )
+            .unwrap(),
+            cancellation: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
     service
