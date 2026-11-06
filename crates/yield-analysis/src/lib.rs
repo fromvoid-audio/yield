@@ -42,6 +42,8 @@ pub use analysis::audio::detect_non_silent_ranges_for_slices;
 pub use analysis::audio::normalize_peak_in_place;
 /// Probe audio duration and sample rate metadata.
 pub use analysis::audio::probe_metadata;
+/// Bounded native-rate interleaved WAV decoding for already captured bytes.
+pub use analysis::audio::{WavPcm, decode_wav_pcm};
 
 /// FFT sample type used by analysis helpers.
 pub use analysis::fft::Complex32;
