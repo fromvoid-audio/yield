@@ -87,6 +87,7 @@ mod accessibility {
 mod analysis;
 mod audio_output;
 mod bpm_snap_entry;
+mod bpm_snap_persistence;
 mod catalog;
 mod catalog_metadata;
 mod collection_rename;
@@ -2226,6 +2227,7 @@ impl Browser {
                     Ok(preview) => {
                         view.waveform = Some(preview);
                         playmark_tempo::load_for_waveform(view, cx);
+                        bpm_snap_persistence::load_for_waveform(view, cx);
                         transient_markers::schedule(view, cx);
                     }
                     Err(error) => {

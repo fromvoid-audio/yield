@@ -1097,6 +1097,115 @@ mod tests {
     }
 
     #[gpui::test]
+    fn grid_tempo_saves_the_latest_input_and_restores_only_the_current_waveform(
+        cx: &mut TestAppContext,
+    ) {
+        use super::super::{
+            bpm_snap_entry, bpm_snap_persistence, source_registry::SourceRegistryGlobal,
+            waveform::WaveformPlayRegion,
+        };
+        use gpui::AppContext;
+        use std::sync::atomic::AtomicBool;
+        use yield_session::{
+            PlaymarkGridTempoOperation, SourcePlaymarkGridTempo, SourcePlaymarkGridTempoRequest,
+        };
+
+        let (_directory, path, preview) = fixture();
+        let root = path.parent().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
+        let _profile = PersistenceProfileGuard::named("gpui-grid-tempo-persistence");
+        let guard = WritableProfileGuard::acquire_current().unwrap();
+        let (service, snapshot) = audited_owner(&guard, root);
+        cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(Browser::new);
+        let first = SourcePlaymarkGridTempo::parse("123.145").unwrap();
+        let latest = SourcePlaymarkGridTempo::parse("129.5").unwrap();
+        let baseline = WaveformPlayRegion::new(0.125, 0.5);
+        browser.update(cx, |view, cx| {
+            install_waveform(view, &path, preview);
+            install_source(view, root, &snapshot);
+            view.set_waveform_play_region(baseline);
+            assert!(bpm_snap_persistence::load_for_waveform(view, cx));
+            bpm_snap_persistence::commit_tempo(view, first, cx);
+            assert_eq!(bpm_snap_entry::effective_bpm(view), Some(123.145));
+        });
+        let read = next_tempo_delivery(cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(read, cx));
+            assert_eq!(bpm_snap_entry::effective_bpm(view), Some(123.145));
+        });
+        let earlier = next_tempo_delivery(cx);
+        browser.update(cx, |view, cx| {
+            bpm_snap_persistence::commit_tempo(view, latest, cx);
+            assert!(view.apply_catalog_delivery(earlier, cx));
+            assert_eq!(bpm_snap_entry::effective_bpm(view), Some(129.5));
+            assert_eq!(view.playback_status, "Saving BPM Snap tempo…");
+        });
+        let saved = next_tempo_delivery(cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(saved, cx));
+            assert_eq!(view.playback_status, "BPM Snap tempo saved at 129.5 BPM");
+            assert_eq!(view.waveform_play_region, baseline);
+            view.invalidate_waveform_generation();
+            assert!(bpm_snap_persistence::load_for_waveform(view, cx));
+        });
+        let retired = next_tempo_delivery(cx);
+        browser.update(cx, |view, cx| {
+            view.invalidate_waveform_generation();
+            assert!(view.apply_catalog_delivery(retired, cx));
+            assert!(bpm_snap_entry::effective_bpm(view).is_none());
+            assert!(bpm_snap_persistence::load_for_waveform(view, cx));
+        });
+        let reopened = next_tempo_delivery(cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(reopened, cx));
+            assert_eq!(bpm_snap_entry::effective_bpm(view), Some(129.5));
+            assert!(view.waveform_play_region.is_none());
+            catalog::submit_catalog_command(
+                CatalogCommand::PlaymarkGridTempo {
+                    request: SourcePlaymarkGridTempoRequest::new(
+                        &snapshot.source_id,
+                        snapshot.lifecycle_generation,
+                        snapshot.committed_revision,
+                        900,
+                        Path::new("transients.wav"),
+                        PlaymarkGridTempoOperation::Replace {
+                            previous: Some(latest),
+                            next: Some(first),
+                        },
+                    )
+                    .unwrap(),
+                    cancellation: Arc::new(AtomicBool::new(false)),
+                },
+                cx,
+            )
+            .unwrap();
+        });
+        assert!(matches!(
+            next_tempo_delivery(cx).into_event_if_live(),
+            Some(CatalogEvent::PlaymarkGridTempoCompleted { result: Ok(Some(value)), .. }) if value == first
+        ));
+        browser.update(cx, |view, cx| {
+            bpm_snap_persistence::commit_tempo(
+                view,
+                SourcePlaymarkGridTempo::parse("130").unwrap(),
+                cx,
+            );
+        });
+        let conflict = next_tempo_delivery(cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(conflict, cx));
+            assert_eq!(bpm_snap_entry::effective_bpm(view), Some(130.0));
+            assert!(view.playback_status.contains("changed in the Source"));
+        });
+        cx.update(|app| {
+            app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
+        });
+    }
+
+    #[gpui::test]
     fn bpm_paint_captures_the_authored_tempo_until_release(cx: &mut TestAppContext) {
         use super::super::{
             playmark_tempo, source_registry::SourceRegistryGlobal, waveform::WaveformPlayRegion,
