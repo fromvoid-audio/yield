@@ -159,7 +159,7 @@ impl Browser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext, Keystroke, TestAppContext};
+    use gpui::{Keystroke, TestAppContext};
     use yield_media::WaveformPreview;
 
     #[test]
