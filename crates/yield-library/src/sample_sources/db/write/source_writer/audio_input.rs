@@ -82,6 +82,15 @@ impl SourceWriter {
         )
     }
 
+    // Metadata custody needs the same identity checks without a PCM read budget.
+    pub(super) fn hold_playmark_tempo_input(
+        &self,
+        expected: &SourceRevision,
+        relative: &RootRelativePath,
+    ) -> Result<SourceFeatureInput, SourceWriterError> {
+        self.prepare_audited_audio_input(expected, relative, DigestRequirement::Verified, u64::MAX)
+    }
+
     /// Hold one exact current audited entry that still lacks its scanner digest.
     pub fn prepare_pending_content_digest(
         &self,
