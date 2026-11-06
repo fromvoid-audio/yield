@@ -114,7 +114,9 @@ pub use feature_request::{
     FeatureAnalysisBlocker, FeatureAnalysisCancellation, FeatureAnalysisState,
 };
 pub use playmark_tempo_dispatch::{
-    PlaymarkTempoFailure, PlaymarkTempoOperation, SourcePlaymarkTempo, SourcePlaymarkTempoRequest,
+    PlaymarkGridTempoOperation, PlaymarkTempoFailure, PlaymarkTempoOperation,
+    SourcePlaymarkGridTempo, SourcePlaymarkGridTempoRequest, SourcePlaymarkTempo,
+    SourcePlaymarkTempoRequest,
 };
 pub use similarity_dispatch::{
     SimilarityCancellation, SimilarityDispatchFailure, SourceSimilarityRequest,
@@ -676,6 +678,13 @@ pub enum CatalogCommand {
     PlaymarkTempo {
         /// Exact audited file and bounded operation.
         request: SourcePlaymarkTempoRequest,
+        /// Stop before committing when the caller or Source lifecycle retires.
+        cancellation: Arc<AtomicBool>,
+    },
+    /// Read or replace the explicit BPM for one exact Source playmark grid.
+    PlaymarkGridTempo {
+        /// Exact audited file and bounded operation.
+        request: SourcePlaymarkGridTempoRequest,
         /// Stop before committing when the caller or Source lifecycle retires.
         cancellation: Arc<AtomicBool>,
     },
@@ -1627,6 +1636,17 @@ pub enum CatalogEvent {
         /// Read or committed value, with `None` representing an absent record.
         result: Result<Option<SourcePlaymarkTempo>, PlaymarkTempoFailure>,
     },
+    /// A grid tempo read, durable replacement receipt, or truthful refusal.
+    PlaymarkGridTempoCompleted {
+        /// Exact request and correlation identity.
+        request: SourcePlaymarkGridTempoRequest,
+        /// Retained cancellation can retire the projection while preserving the receipt.
+        cancellation: Arc<AtomicBool>,
+        /// Whether the result still belongs to a live projection.
+        publication: CatalogPublicationStatus,
+        /// Read or committed value, with `None` representing an absent record.
+        result: Result<Option<SourcePlaymarkGridTempo>, PlaymarkTempoFailure>,
+    },
     /// One request's truthful state; ready requires validated durable feature bytes.
     FeatureAnalysisState {
         /// Stable source.
@@ -2108,6 +2128,11 @@ impl CatalogDelivery {
             cancellation,
             publication,
             ..
+        }
+        | CatalogEvent::PlaymarkGridTempoCompleted {
+            cancellation,
+            publication,
+            ..
         } = &mut event
             && cancellation.load(Ordering::Acquire)
         {
@@ -2162,6 +2187,7 @@ impl CatalogDelivery {
             CatalogEvent::CurationCommitted { publication, .. }
             | CatalogEvent::RatingDecayProgress { publication, .. }
             | CatalogEvent::PlaymarkTempoCompleted { publication, .. }
+            | CatalogEvent::PlaymarkGridTempoCompleted { publication, .. }
             | CatalogEvent::CurationOperationCompleted { publication, .. } => {
                 *publication = CatalogPublicationStatus::NonProjectable;
                 true
@@ -2742,6 +2768,7 @@ fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> 
         | CatalogCommand::RequestTransientMarkers { .. }
         | CatalogCommand::RequestSourceContentDigest { .. }
         | CatalogCommand::PlaymarkTempo { .. }
+        | CatalogCommand::PlaymarkGridTempo { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. } => {}
         CatalogCommand::RequestFeatureAnalysis {
@@ -3155,6 +3182,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestSimilarity { .. }
         | CatalogCommand::RequestSourceContentDigest { .. }
         | CatalogCommand::PlaymarkTempo { .. }
+        | CatalogCommand::PlaymarkGridTempo { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestIndexPage { .. }
         | CatalogCommand::RequestIndexInspection { .. }
@@ -3223,6 +3251,7 @@ fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
         CatalogCommand::RequestTransientMarkers { request, .. } => request.input_bytes(),
         CatalogCommand::RequestSourceContentDigest { request, .. } => request.input_bytes(),
         CatalogCommand::PlaymarkTempo { request, .. } => request.input_bytes(),
+        CatalogCommand::PlaymarkGridTempo { request, .. } => request.input_bytes(),
         CatalogCommand::ConsumeReplay { submission } => submission.input_bytes(),
         CatalogCommand::RequestIndexInspection { handle, .. } => handle.input_bytes(),
         CatalogCommand::RequestIndexPage {
@@ -3308,6 +3337,9 @@ fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, Cat
         CatalogCommand::RequestTransientMarkers { request, .. } => Ok(request.result_bytes()),
         CatalogCommand::RequestSourceContentDigest { .. } => Ok(source_content_digest::EVENT_BYTES),
         CatalogCommand::PlaymarkTempo { request, .. } => {
+            Ok(request.input_bytes() + std::mem::size_of::<CatalogEvent>())
+        }
+        CatalogCommand::PlaymarkGridTempo { request, .. } => {
             Ok(request.input_bytes() + std::mem::size_of::<CatalogEvent>())
         }
         CatalogCommand::RequestIndexPage { .. } | CatalogCommand::RequestIndexInspection { .. } => {
@@ -3405,6 +3437,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         | CatalogCommand::RequestTransientMarkers { .. }
         | CatalogCommand::RequestSourceContentDigest { .. }
         | CatalogCommand::PlaymarkTempo { .. }
+        | CatalogCommand::PlaymarkGridTempo { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::RequestSimilarity { .. } => AdmissionAction::RequestWavMetadata,
@@ -4745,6 +4778,19 @@ fn handle_command(
             unreachable!("audio read requests are handled by the compute slot");
         }
         CatalogCommand::PlaymarkTempo {
+            request,
+            cancellation,
+        } => {
+            playmark_tempo_dispatch::dispatch(
+                request,
+                cancellation,
+                reservation,
+                admission,
+                sources,
+            );
+            false
+        }
+        CatalogCommand::PlaymarkGridTempo {
             request,
             cancellation,
         } => {

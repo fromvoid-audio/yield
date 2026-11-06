@@ -360,6 +360,7 @@ pub(crate) fn deferred(command: &CatalogCommand, slots: &WorkerReservations) -> 
             slots.is_held(&request.scope().source_id)
         }
         CatalogCommand::PlaymarkTempo { request, .. } => slots.is_held(request.source_id()),
+        CatalogCommand::PlaymarkGridTempo { request, .. } => slots.is_held(request.source_id()),
         CatalogCommand::ConsumeReplay { submission } => slots.is_held(submission.source_id()),
         CatalogCommand::RequestIndexInspection { handle, .. } => slots.is_held(&handle.source_id),
     }
@@ -372,6 +373,12 @@ pub(crate) fn interrupts_preparation(command: &CatalogCommand) -> bool {
     match command {
         CatalogCommand::PlaymarkTempo { request, .. } => {
             matches!(request.operation(), PlaymarkTempoOperation::Replace { .. })
+        }
+        CatalogCommand::PlaymarkGridTempo { request, .. } => {
+            matches!(
+                request.operation(),
+                PlaymarkGridTempoOperation::Replace { .. }
+            )
         }
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestFeatureAnalysis { .. }

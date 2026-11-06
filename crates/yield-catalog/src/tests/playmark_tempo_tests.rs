@@ -202,6 +202,98 @@ mod fixtures {
     }
 
     #[test]
+    fn catalog_grid_tempo_keeps_exact_values_and_retired_commit_receipts() {
+        let fixture = Fixture::new("catalog-grid-tempo");
+        let path = Path::new("loop.wav");
+        write_audio(&fixture.root.path().join(path));
+        let source = SourceId::from_string("catalog-grid-tempo");
+        let service = CatalogService::start(&fixture.guard).unwrap();
+        let revision =
+            register_and_audit(&service, fixture.root.path(), &source).committed_revision;
+        let tempo = SourcePlaymarkGridTempo::parse("123.145").unwrap();
+        let next = SourcePlaymarkGridTempo::parse("129.5").unwrap();
+        let submit = |id, expected, operation, cancelled| {
+            let request =
+                SourcePlaymarkGridTempoRequest::new(&source, 1, expected, id, path, operation)
+                    .unwrap();
+            service
+                .submit(CatalogCommand::PlaymarkGridTempo {
+                    request,
+                    cancellation: Arc::new(AtomicBool::new(cancelled)),
+                })
+                .unwrap();
+            service
+                .recv_delivery_timeout(Duration::from_secs(2))
+                .unwrap()
+        };
+        let unpack = |delivery: CatalogDelivery, id| {
+            let CatalogEvent::PlaymarkGridTempoCompleted {
+                request,
+                publication,
+                result,
+                ..
+            } = delivery.into_event_if_live().unwrap()
+            else {
+                panic!("expected grid tempo receipt")
+            };
+            assert_eq!(request.request_id(), id);
+            assert_eq!(request.source_id(), &source);
+            assert_eq!(request.relative_path(), path);
+            (publication, result)
+        };
+        let read = PlaymarkGridTempoOperation::Read;
+        let save = PlaymarkGridTempoOperation::Replace {
+            previous: None,
+            next: Some(tempo),
+        };
+        assert_eq!(
+            unpack(submit(1, revision, read, false), 1),
+            (CatalogPublicationStatus::Current, Ok(None))
+        );
+        assert_eq!(
+            unpack(submit(2, revision, save, false), 2),
+            (CatalogPublicationStatus::Current, Ok(Some(tempo)))
+        );
+        assert_eq!(
+            unpack(submit(3, revision, save, false), 3).1,
+            Err(PlaymarkTempoFailure::Conflict)
+        );
+        assert_eq!(
+            unpack(submit(4, revision + 1, read, false), 4).1,
+            Err(PlaymarkTempoFailure::StaleSource)
+        );
+        let replace = PlaymarkGridTempoOperation::Replace {
+            previous: Some(tempo),
+            next: Some(next),
+        };
+        assert_eq!(
+            unpack(submit(5, revision, replace, true), 5).1,
+            Err(PlaymarkTempoFailure::Cancelled)
+        );
+        assert_eq!(
+            unpack(submit(6, revision, read, false), 6).1,
+            Ok(Some(tempo))
+        );
+        let committed = submit(7, revision, replace, false);
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source.clone(),
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        receive_until(&service, |event| {
+            matches!(event, CatalogEvent::Removed { .. })
+        });
+        assert_eq!(
+            unpack(committed, 7),
+            (CatalogPublicationStatus::NonProjectable, Ok(Some(next)))
+        );
+        wait_for_tag_read_payload(&service, 0);
+        wait_for_tag_page_input_release(&service);
+        service.shutdown();
+    }
+
+    #[test]
     fn catalog_tempo_requests_settle_conflicts_and_preserve_retired_commit_receipts() {
         let fixture = Fixture::new("catalog-playmark-tempo");
         let path = Path::new("loop.wav");

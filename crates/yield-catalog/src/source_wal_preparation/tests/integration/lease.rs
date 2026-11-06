@@ -317,6 +317,20 @@ fn lease_normal_deferral_preserves_32_command_queue_and_unrelated_audited_read_p
         })
         .unwrap();
     service
+        .submit(CatalogCommand::PlaymarkGridTempo {
+            request: crate::SourcePlaymarkGridTempoRequest::new(
+                &id,
+                1,
+                0,
+                2258,
+                Path::new("one.wav"),
+                crate::PlaymarkGridTempoOperation::Read,
+            )
+            .unwrap(),
+            cancellation: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+    service
         .submit(CatalogCommand::RequestTagPage {
             source_id: revisions[0].source_id().clone(),
             lifecycle_generation: 1,
@@ -340,7 +354,7 @@ fn lease_normal_deferral_preserves_32_command_queue_and_unrelated_audited_read_p
         assert!(Instant::now() < end);
         thread::sleep(Duration::from_millis(2));
     }
-    for _ in 1..COMMAND_CAPACITY {
+    for _ in 2..COMMAND_CAPACITY {
         service
             .submit(CatalogCommand::ReadSnapshot {
                 source_id: id.clone(),

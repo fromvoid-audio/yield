@@ -1000,6 +1000,7 @@ impl Browser {
             | CatalogEvent::CollectionHistoryGroupCompleted { .. }
             | CatalogEvent::SimilarityCompleted { .. }
             | CatalogEvent::PlaymarkTempoCompleted { .. }
+            | CatalogEvent::PlaymarkGridTempoCompleted { .. }
             | CatalogEvent::SourceContentDigestFailed { .. }
             | CatalogEvent::TransientMarkersCompleted { .. }
             | CatalogEvent::Closed => false,
@@ -1529,6 +1530,9 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             Some((scope.source_id.clone(), scope.lifecycle_generation))
         }
         CatalogEvent::PlaymarkTempoCompleted { request, .. } => {
+            Some((request.source_id().clone(), request.lifecycle_generation()))
+        }
+        CatalogEvent::PlaymarkGridTempoCompleted { request, .. } => {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
         CatalogEvent::Registered {
