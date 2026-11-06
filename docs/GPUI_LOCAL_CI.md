@@ -98,8 +98,11 @@ command uses one private checkout under `<git-common-dir>/local-ci/frozen-prefli
 The repository coordinator holds it through each run and the result records
 whether the checkout was created, reused, or advanced. Every invocation runs
 preflight. If verification rejects the cached checkout, the command preserves
-it for inspection and uses a temporary exact checkout. Full and native
-validation and packaging still use temporary checkouts.
+it for inspection and uses a temporary exact checkout. Native cases share the
+same lease when the allowlisted runner in the requested commit supports
+redirecting evidence into the run directory. Older native runners use a
+temporary exact checkout. Full validation and packaging still use temporary
+checkouts.
 
 For a private bundle from an exact validated commit, follow
 [GPUI macOS packaging](GPUI_MACOS_PACKAGING.md).

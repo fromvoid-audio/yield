@@ -363,7 +363,8 @@ class NativeCheckCleanupTests(unittest.TestCase):
                 return {"transaction": "native-ci-test", "artifact": artifact}, descriptors["namespace"], descriptors["transition"]
 
             def tracking_close(fd: int) -> None:
-                close_calls.append(fd)
+                if fd in descriptors.values():
+                    close_calls.append(fd)
                 real_close(fd)
                 if fail_lease_close and fd == descriptors.get("namespace"):
                     raise OSError(9, "simulated close reporting error")
