@@ -293,6 +293,32 @@ class FrozenPreflightTests(unittest.TestCase):
             self.assertNotEqual(results[0]["run_id"], results[1]["run_id"])
             self.assertEqual([r["results"][0]["exit_code"] for r in results], [7, 0])
 
+    def test_preflight_records_the_configured_cache_before_running(self):
+        with self.fixture() as (repo, _):
+            (repo / "Cargo.lock").write_text("frozen lockfile")
+            self.git("add", "Cargo.lock")
+            self.git("commit", "-m", "Add the validation cache input")
+            sha = self.git("rev-parse", "HEAD")
+            external = repo.parent / "external"
+            external.mkdir(mode=0o700)
+            filesystem = {"device": "/dev/disk0", "filesystem": "apfs", "writable": True}
+            output = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {MODULE.VALIDATION_ROOT_OVERRIDE: str(external)}),
+                mock.patch.object(MODULE, "filesystem_probe", return_value=filesystem),
+                mock.patch.object(MODULE, "doctor", return_value={}),
+                mock.patch.object(MODULE, "run_managed", return_value=0) as runner,
+                redirect_stdout(output),
+            ):
+                MODULE._check(argparse.Namespace(sha=sha, lane="preflight", case=None))
+            result = json.loads(output.getvalue())
+            evidence = result["validation_target"]
+            self.assertEqual(evidence["filesystem"], filesystem)
+            self.assertGreater(evidence["free_bytes"], 0)
+            self.assertEqual(pathlib.Path(evidence["path"]).parent, external)
+            self.assertEqual(runner.call_args.kwargs["env"]["CARGO_TARGET_DIR"], evidence["path"])
+            self.assertEqual(runner.call_args.kwargs["env"]["YIELD_VALIDATION_TARGET_ROOT"], str(external))
+
 
 if __name__ == "__main__":
     unittest.main()
