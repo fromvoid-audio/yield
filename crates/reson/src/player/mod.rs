@@ -16,7 +16,7 @@ mod runtime;
 mod state;
 pub(crate) use edit_fade_impl::{EditFadeHandle, EditFadeSource};
 pub use edit_fade_impl::{EditFadeRange, FadeParams};
-pub use metronome::PlaybackMetronomeConfig;
+pub use metronome::{MetronomeSound, PlaybackMetronomeConfig, PlaybackMetronomeMix};
 pub(crate) use playback_span_handle::PlaybackSpanHandle;
 pub use playback_span_plan::{
     PlaybackChannelLayout, PlaybackSeekBehavior, PlaybackSourceIdentity, PlaybackSourceKind,
