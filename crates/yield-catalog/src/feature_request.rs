@@ -13,13 +13,17 @@ impl FeatureAnalysisCancellation {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Stop this request before durable publication; already committed evidence is retained.
+    /// Stop this pending analysis; already published evidence is retained.
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }
     /// Whether this request has been cancelled or retired.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
+    }
+
+    pub(super) fn flag(&self) -> &AtomicBool {
+        &self.0
     }
 }
 
