@@ -11736,14 +11736,19 @@ mod tests {
             )
             .expect("selection output file revision"),
             source_spec,
-            10,
-            WaveformEditFrameRange::new(2, 8).expect("selection output range"),
+            150_000,
+            WaveformEditFrameRange::new(2, 72_003).expect("selection output range"),
             recipe,
             SourcePlaybackType::OneShot,
             copy_args.destination().clone(),
             CopyCollisionPolicy::NoReplace,
         )
-        .expect("selection output extraction");
+        .expect("selection output extraction")
+        .with_playmark_beats(3);
+        assert_eq!(
+            extraction.derived_tempo().map(|tempo| tempo.bpm()),
+            Some(119.998)
+        );
         let command_args = SelectionOutputCommandArgs::ExtractAndTrim(
             ExtractAndTrimIntentArgs::new(extraction, WaveformOutputSpec::float32(2, 48_000))
                 .expect("ExtractAndTrim arguments"),

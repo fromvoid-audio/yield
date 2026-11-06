@@ -5146,6 +5146,7 @@ mod tests {
                 }
             },
             "playback_type": "OneShot",
+            "playmark_beats": null,
             "destination": destination,
             "collision_policy": "NoReplace"
         });

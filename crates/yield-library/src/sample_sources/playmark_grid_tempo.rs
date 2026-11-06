@@ -2,7 +2,7 @@
 
 const BPM_SCALE: u32 = 1_000;
 
-/// A valid user-entered grid tempo stored in thousandths of a BPM.
+/// A tempo in the supported 1–1000 BPM range, stored in thousandths of a BPM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourcePlaymarkGridTempo(u32);
 
@@ -30,7 +30,7 @@ impl SourcePlaymarkGridTempo {
         Self::from_milli_bpm(tempo)
     }
 
-    pub(super) fn from_milli_bpm(value: u32) -> Option<Self> {
+    pub(crate) fn from_milli_bpm(value: u32) -> Option<Self> {
         (BPM_SCALE..=1_000 * BPM_SCALE)
             .contains(&value)
             .then_some(Self(value))
