@@ -36,8 +36,14 @@ Do not broadly delete `target/` while another Cargo run is active.
 - bug bundle:
   - Windows PowerShell:
     `powershell -ExecutionPolicy Bypass -File scripts/run.ps1 bug-bundle`
-  - macOS/Linux/WSL:
+  - macOS:
     `bash scripts/run.sh bug-bundle`
+  - Linux/WSL:
+    `bash scripts/run.sh bug-bundle --out-dir ./yield-support`
+    writes a private archive with basic host facts, configuration presence and
+    a capped count of Yield log segments. It excludes configuration contents,
+    log bodies, filesystem paths and local filenames. The `logs` command
+    displays the latest log locally.
 
 ## Debug run logs
 
