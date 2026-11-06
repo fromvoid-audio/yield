@@ -86,6 +86,8 @@ pub(crate) struct AsyncSource<S> {
     done: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
+    output_remaining: usize,
+    output_silence: bool,
     _marker: PhantomData<S>,
 }
 
@@ -122,6 +124,8 @@ where
                 last_error: Arc::new(Mutex::new(Some(String::from(
                     "Async decode worker capacity reached",
                 )))),
+                output_remaining: 0,
+                output_silence: false,
                 _marker: PhantomData,
             };
         };
@@ -129,9 +133,10 @@ where
             source: Some(source),
             _permit: worker_permit,
         };
-        let buffer_samples = buffer_samples(sample_rate, channels, buffer_seconds);
+        let buffer_samples =
+            buffer_samples(sample_rate, channels, buffer_seconds).max(usize::from(channels.max(1)));
 
-        let rb = HeapRb::<f32>::new(buffer_samples.max(1));
+        let rb = HeapRb::<f32>::new(buffer_samples);
         let (mut producer, consumer) = rb.split();
 
         let done = Arc::new(AtomicBool::new(false));
@@ -227,6 +232,8 @@ where
             done,
             stop,
             last_error,
+            output_remaining: 0,
+            output_silence: false,
             _marker: PhantomData,
         };
         if let Some(construct_started_at) = construct_started_at {
@@ -367,17 +374,34 @@ where
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(sample) = self
-            .consumer
-            .as_mut()
-            .and_then(|consumer| consumer.try_pop())
-        {
-            return Some(sample);
+        let consumer = self.consumer.as_mut()?;
+        if self.output_remaining == 0 {
+            let channels = usize::from(self.channels.max(1));
+            let available = consumer.occupied_len();
+            self.output_silence = false;
+            self.output_remaining = if available >= channels {
+                // The producer can only append. These complete frames remain available
+                // to the sole consumer, so we can drain them without another size probe.
+                available - available % channels
+            } else if self.done.load(Ordering::Acquire) {
+                // Re-read after observing completion so a final concurrent push is visible.
+                // Preserve the existing drain behavior for a decoder's partial terminal frame.
+                consumer.occupied_len()
+            } else {
+                // Leave partial data queued and finish this silent frame even if it refills.
+                self.output_silence = true;
+                channels
+            };
+            if self.output_remaining == 0 {
+                return None;
+            }
         }
-        if self.done.load(Ordering::Acquire) {
-            return None;
+        self.output_remaining -= 1;
+        if self.output_silence {
+            Some(0.0)
+        } else {
+            consumer.try_pop()
         }
-        Some(0.0)
     }
 }
 
@@ -387,10 +411,16 @@ where
 {
     fn current_frame_len(&self) -> Option<usize> {
         if self.done.load(Ordering::Acquire) {
+            let silence = if self.output_silence {
+                self.output_remaining
+            } else {
+                0
+            };
             Some(
                 self.consumer
                     .as_ref()
-                    .map_or(0, |consumer| consumer.occupied_len()),
+                    .map_or(0, |consumer| consumer.occupied_len())
+                    .saturating_add(silence),
             )
         } else {
             None
