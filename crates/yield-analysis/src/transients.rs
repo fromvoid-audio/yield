@@ -52,6 +52,26 @@ pub struct TransientMarkers {
 }
 
 impl TransientMarkers {
+    /// Restore a validated native-frame result from persisted frame positions.
+    pub fn from_ordered_frames(
+        source_frames: u32,
+        preset: TransientPreset,
+        frames: Vec<u32>,
+    ) -> Option<Self> {
+        if source_frames == 0
+            || frames.len() > MAX_TRANSIENT_MARKERS
+            || frames.last().is_some_and(|&frame| frame >= source_frames)
+            || frames.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return None;
+        }
+        Some(Self {
+            frames,
+            source_frames,
+            preset,
+        })
+    }
+
     /// Zero-based positions in the original audio, ordered and unique.
     pub fn frames(&self) -> &[u32] {
         &self.frames
