@@ -94,8 +94,9 @@ pub use preferences::{
     AudioOutputPreferences, DEFAULT_ANTI_CLICK_FADE_MS, DEFAULT_RATING_DECAY_WEEKS,
     DEFAULT_TEXT_SCALE_PERCENT, ENLARGED_TEXT_SCALE_PERCENT, MAX_ANTI_CLICK_FADE_MS,
     MAX_COLLECTION_NAME_BYTES, MAX_RATING_DECAY_WEEKS, MAX_USER_SHADER_SOURCE_BYTES,
-    MAX_VISUAL_EFFECT_STRENGTH_PERCENT, MIN_RATING_DECAY_WEEKS, PreferenceError, PreferenceEvent,
-    PreferencePatch, PreferenceRequestId, PreferenceRevision, ShippedVisualEffectPreferences,
+    MAX_VISUAL_EFFECT_STRENGTH_PERCENT, MIN_RATING_DECAY_WEEKS, MetronomePreferences,
+    MetronomeSoundPreference, PreferenceError, PreferenceEvent, PreferencePatch,
+    PreferenceRequestId, PreferenceRevision, ShippedVisualEffectPreferences,
     ShippedVisualEffectPreset, UI_PREFERENCES_SCHEMA_VERSION, USER_SHADER_CONTRACT_VERSION,
     UiPreferences, UserShaderPreferences, sanitize_anti_click_fade_ms,
     user_shader_content_fingerprint,
@@ -857,7 +858,7 @@ struct PreferenceSaveInFlight {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreferenceSaveHint {
     None,
-    DebounceOutputVolume,
+    DebounceAudioPreference,
     Immediate,
 }
 
@@ -865,8 +866,8 @@ impl PreferenceSaveHint {
     fn merge(self, other: Self) -> Self {
         match (self, other) {
             (Self::Immediate, _) | (_, Self::Immediate) => Self::Immediate,
-            (Self::DebounceOutputVolume, _) | (_, Self::DebounceOutputVolume) => {
-                Self::DebounceOutputVolume
+            (Self::DebounceAudioPreference, _) | (_, Self::DebounceAudioPreference) => {
+                Self::DebounceAudioPreference
             }
             (Self::None, Self::None) => Self::None,
         }
@@ -1847,14 +1848,14 @@ fn run_worker(
                     );
                     continue;
                 }
-                let output_volume_patch = matches!(&patch, PreferencePatch::SetOutputVolume(_));
+                let debounce_save = patch.debounces_save();
                 match preference_coordinator.apply_loaded_patch(request, patch) {
                     Ok(changed) if preference_coordinator.loaded() => {
                         if changed {
                             apply_preference_save_hint(
                                 &mut persistence,
-                                if output_volume_patch {
-                                    PreferenceSaveHint::DebounceOutputVolume
+                                if debounce_save {
+                                    PreferenceSaveHint::DebounceAudioPreference
                                 } else {
                                     PreferenceSaveHint::Immediate
                                 },
@@ -2145,9 +2146,9 @@ fn drive_preferences(
 fn apply_preference_save_hint(persistence: &mut Persistence, hint: PreferenceSaveHint) {
     match hint {
         PreferenceSaveHint::None => {}
-        PreferenceSaveHint::DebounceOutputVolume => persistence
+        PreferenceSaveHint::DebounceAudioPreference => persistence
             .preference_save_deadline
-            .defer_output_volume(Instant::now()),
+            .defer_audio_preference(Instant::now()),
         PreferenceSaveHint::Immediate => persistence.preference_save_deadline.clear(),
     }
 }
@@ -2448,8 +2449,8 @@ fn emit_preference_outcomes(
         match outcome.result {
             Ok(changed) => {
                 if changed {
-                    hint = hint.merge(if outcome.output_volume_changed {
-                        PreferenceSaveHint::DebounceOutputVolume
+                    hint = hint.merge(if outcome.debounce_save {
+                        PreferenceSaveHint::DebounceAudioPreference
                     } else {
                         PreferenceSaveHint::Immediate
                     });
@@ -5528,7 +5529,7 @@ mod tests {
     }
 
     #[test]
-    fn immediate_shutdown_persists_latest_output_volume() {
+    fn immediate_shutdown_persists_latest_audio_preferences() {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
         let profile_root = profile_root(&temp);
@@ -5545,6 +5546,21 @@ mod tests {
         service
             .patch_preferences(PreferencePatch::SetOutputVolume(0.73))
             .expect("latest volume patch");
+        service
+            .patch_preferences(PreferencePatch::SetMetronome(MetronomePreferences {
+                volume: 0.28,
+                ..MetronomePreferences::default()
+            }))
+            .expect("first metronome patch");
+        let metronome = MetronomePreferences {
+            volume: 0.42,
+            beats: false,
+            offbeats: true,
+            sound: MetronomeSoundPreference::Woodblock,
+        };
+        service
+            .patch_preferences(PreferencePatch::SetMetronome(metronome))
+            .expect("latest metronome patch");
         service.shutdown().expect("immediate shutdown");
 
         let mut reopened = SourceRegistryService::start_portable_registry_for_test(profile_root)
@@ -5553,6 +5569,7 @@ mod tests {
             (preferences.output_volume - 0.73).abs() < f32::EPSILON
         });
         assert!((restored.output_volume - 0.73).abs() < f32::EPSILON);
+        assert_eq!(restored.metronome, metronome);
         reopened.shutdown().expect("reopen shutdown");
     }
 
