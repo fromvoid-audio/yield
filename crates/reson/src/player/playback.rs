@@ -3,7 +3,7 @@ use crate::telemetry;
 use crate::timebase::{frames_to_seconds, seconds_to_frames_round};
 use crate::{AsyncSource, Source};
 
-use super::metronome::MetronomeSource;
+use super::metronome::{MetronomeMixOverride, MetronomeSource};
 use super::playback_span_handle::plan_anchor_frame;
 use super::{
     AudioPlaybackSource, AudioPlayer, EditFadeSource, PlaybackChannelLayout,
@@ -530,8 +530,13 @@ impl AudioPlayer {
             );
             Box::new(editable)
         };
-        let final_source =
-            source_with_metronome(final_source, metronome, &plan, active_playback_span.clone());
+        let final_source = source_with_metronome(
+            final_source,
+            metronome,
+            &plan,
+            active_playback_span.clone(),
+            self.metronome_mix_override.clone(),
+        );
         let final_source: Box<dyn Source<Item = f32> + Send> = if self.playback_samples.is_none() {
             Box::new(LiveLoopModeSource::new(final_source, mode.clone()))
         } else {
@@ -710,8 +715,13 @@ impl AudioPlayer {
                 plan.sample_count(),
             ))
         };
-        let diagnostic =
-            source_with_metronome(diagnostic, metronome, &plan, active_playback_span.clone());
+        let diagnostic = source_with_metronome(
+            diagnostic,
+            metronome,
+            &plan,
+            active_playback_span.clone(),
+            self.metronome_mix_override.clone(),
+        );
         let diagnostic: Box<dyn Source<Item = f32> + Send> = if self.playback_samples.is_none() {
             Box::new(LiveLoopModeSource::new(diagnostic, mode.clone()))
         } else {
@@ -898,18 +908,20 @@ fn source_with_metronome(
     metronome: Option<PlaybackMetronomeConfig>,
     plan: &PlaybackSpanPlan,
     live_control: Option<PlaybackSpanHandle>,
+    mix_override: MetronomeMixOverride,
 ) -> Box<dyn Source<Item = f32> + Send> {
-    match (live_control, metronome) {
-        (Some(control), _) => Box::new(MetronomeSource::new_live(source, control)),
-        (None, Some(config)) => Box::new(MetronomeSource::new(
+    let metronome_source = match (live_control, metronome) {
+        (Some(control), _) => MetronomeSource::new_live(source, control),
+        (None, Some(config)) => MetronomeSource::new(
             source,
             config,
             plan.frame_count(),
             plan.seek_offset_frames(),
             plan_anchor_frame(plan),
-        )),
-        (None, None) => source,
-    }
+        ),
+        (None, None) => return source,
+    };
+    Box::new(metronome_source.with_mix_override(mix_override))
 }
 
 fn playback_stage_started() -> Option<std::time::Instant> {
