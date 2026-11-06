@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Run ordinary full validation under a reversible clean-state SH lease."""
 
+# YIELD_FULL_CI_EXTERNAL_OUTPUT_V1
+# The coordinator owns run logs and fixture state outside the checkout.
+# Cargo outputs go to its shared target and test outputs use temporary fixtures.
 from __future__ import annotations
 
 import argparse

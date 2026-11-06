@@ -100,9 +100,12 @@ whether the checkout was created, reused, or advanced. Every invocation runs
 preflight. If verification rejects the cached checkout, the command preserves
 it for inspection and uses a temporary exact checkout. Native cases share the
 same lease when the allowlisted runner in the requested commit supports
-redirecting evidence into the run directory. Older native runners use a
-temporary exact checkout. Full validation and packaging still use temporary
-checkouts.
+redirecting evidence into the run directory. Full validation shares the
+lease when the requested full runner supports out-of-checkout output.
+A failed full invocation leaves its lease and checkout available for
+inspection because the full runner can have separately owned subprocesses.
+Older runners, subsequent validation after an unconfirmed cleanup, and
+packaging use temporary exact checkouts.
 
 For a private bundle from an exact validated commit, follow
 [GPUI macOS packaging](GPUI_MACOS_PACKAGING.md).

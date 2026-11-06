@@ -82,6 +82,8 @@ FROZEN_PREFLIGHT_BRANCH = "codex/local-ci-frozen-preflight"
 FROZEN_PREFLIGHT_SLOT = "frozen-preflight"
 NATIVE_EVIDENCE_OUTPUT = "YIELD_NATIVE_VERIFICATION_OUTPUT"
 NATIVE_EVIDENCE_REDIRECT_MARKER = "${" + NATIVE_EVIDENCE_OUTPUT + ":-"
+FULL_FROZEN_RUNNER = "scripts/internal/ci/run_full_ci.py"
+FULL_FROZEN_SUPPORT_MARKER = "YIELD_FULL_CI_EXTERNAL_OUTPUT_V1"
 ADMISSION_MARKER = b"YIELD_ADMISSION_PROTOCOL_V1"
 # A full check can contain the runner's 40-second nested-validator cleanup.
 MANAGED_COMMAND_TERMINATION_GRACE_SECONDS = (40.0, 10.0, 5.0)
@@ -482,7 +484,7 @@ def prepare_frozen_preflight(sha: str, state_dir: pathlib.Path) -> tuple[pathlib
         if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid() or entry.st_mode & 0o077:
             raise CiError("frozen checkout slot is not a private current-user-owned directory")
         if os.path.lexists(slot / "active"):
-            raise CiError("frozen checkout has an unconfirmed previous process-group exit")
+            raise CiError("frozen checkout has unconfirmed previous validation cleanup")
         marker = owner.lstat()
         if not stat.S_ISREG(marker.st_mode) or marker.st_uid != os.geteuid() or marker.st_size > 4096:
             raise CiError("frozen checkout ownership marker is invalid")
@@ -526,6 +528,11 @@ def validation_worktree(
         reusable = NATIVE_EVIDENCE_REDIRECT_MARKER in runner_source
         if not reusable:
             rejected = "native runner lacks out-of-checkout evidence support at this commit"
+    elif lane == "full":
+        runner_source = command_output("git", "show", f"{sha}:{FULL_FROZEN_RUNNER}", required=False)
+        reusable = FULL_FROZEN_SUPPORT_MARKER in runner_source
+        if not reusable:
+            rejected = "full runner lacks out-of-checkout output support at this commit"
     if reusable:
         try:
             checkout, disposition = prepare_frozen_preflight(sha, state_dir)
@@ -542,8 +549,12 @@ def validation_worktree(
             try:
                 yield checkout, disposition, None
             except BaseException as error:
-                preserve_lease = isinstance(error, GroupCleanupUnconfirmed) or isinstance(
-                    error.__cause__, GroupCleanupUnconfirmed
+                # Only a successful full lane confirms its nested runners returned
+                # cleanly. A failed full lane may have left an independently owned child.
+                preserve_lease = (
+                    lane == "full"
+                    or isinstance(error, GroupCleanupUnconfirmed)
+                    or isinstance(error.__cause__, GroupCleanupUnconfirmed)
                 )
                 raise
             finally:

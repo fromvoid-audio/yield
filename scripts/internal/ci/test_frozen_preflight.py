@@ -138,6 +138,53 @@ class FrozenPreflightTests(unittest.TestCase):
                 self.assertFalse(temporary.exists())
                 self.assertEqual(self.git("rev-parse", "HEAD", cwd=path), latest)
 
+    def test_full_reuses_supported_commits_and_keeps_the_lease_after_failure(self):
+        with self.fixture() as (repo, _), MODULE.common_coordinator() as state_dir:
+            runner = MODULE.FULL_FROZEN_RUNNER
+            script = repo / runner
+            script.parent.mkdir(parents=True)
+            script.write_text("# Legacy full runner\n")
+            self.git("add", runner)
+            self.git("commit", "-m", "Legacy full runner")
+            legacy = self.git("rev-parse", "HEAD")
+
+            with MODULE.validation_worktree(legacy, state_dir, "full") as (temporary, how, reason):
+                self.assertEqual(how, "temporary")
+                self.assertIn("out-of-checkout output", reason)
+                self.assertEqual(self.git("rev-parse", "HEAD", cwd=temporary), legacy)
+            self.assertFalse(temporary.exists())
+
+            script.write_text(f"# {MODULE.FULL_FROZEN_SUPPORT_MARKER}\n")
+            self.git("commit", "-am", "Keep full outputs outside the checkout")
+            current = self.git("rev-parse", "HEAD")
+            with MODULE.validation_worktree(current, state_dir, "full") as (cached, how, warning):
+                self.assertEqual((how, warning), ("created", None))
+                lease = cached.parent / "active"
+                self.assertTrue(lease.is_file())
+            self.assertFalse(lease.exists())
+            with MODULE.validation_worktree(current, state_dir, "full") as reopened:
+                self.assertEqual(reopened, (cached, "reused", None))
+            self.assertFalse(lease.exists())
+
+            (repo / "source.txt").write_text("next source\n")
+            self.git("commit", "-am", "Advance full source")
+            latest = self.git("rev-parse", "HEAD")
+            with self.assertRaisesRegex(MODULE.CiError, "full lane failed"):
+                with MODULE.validation_worktree(latest, state_dir, "full") as advanced:
+                    self.assertEqual(advanced, (cached, "updated", None))
+                    self.assertEqual(self.git("rev-parse", "HEAD", cwd=cached), latest)
+                    raise MODULE.CiError("full lane failed")
+            self.assertTrue(lease.is_file())
+
+            for lane in ("full", "preflight"):
+                with MODULE.validation_worktree(current, state_dir, lane) as (temporary, how, reason):
+                    self.assertNotEqual(temporary, cached)
+                    self.assertEqual(how, "temporary")
+                    self.assertIn("unconfirmed", reason)
+                    self.assertEqual(self.git("rev-parse", "HEAD", cwd=temporary), current)
+            self.assertTrue(lease.is_file())
+            self.assertEqual(self.git("rev-parse", "HEAD", cwd=cached), latest)
+
     def test_reused_native_checkout_keeps_fresh_failure_evidence_outside_the_lease(self):
         with self.fixture() as (repo, _):
             case = "prerequisite:startup-production"
