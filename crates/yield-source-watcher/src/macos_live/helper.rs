@@ -2,13 +2,30 @@
 
 use std::io::{self, Read, Write};
 
-use super::{MacosLiveWatcher, SourceWatchSpec, WatcherSignal};
+use super::{MacosLiveWatcher, SourceWatchSpec, WatchHintEvidence, WatcherSignal};
 
 /// Request one coalesced watcher hint. EOF ends the helper.
 pub const HELPER_POLL: u8 = 1;
 
 /// Version 1 readiness byte emitted once after checked native registration.
 pub const HELPER_READY_V1: u8 = 0x80;
+
+/// Decode an exact evidence byte from a version 1 helper pull.
+///
+/// Empty evidence is valid. Reserved bits and backend errors without an audit obligation
+/// indicate a protocol error and must take the parent's fallback path.
+pub fn decode_helper_hint(byte: u8) -> Option<WatchHintEvidence> {
+    const KNOWN: u8 = WatchHintEvidence::DESCENDANT_CHANGED.0
+        | WatchHintEvidence::ROOT_METADATA_AMBIGUOUS.0
+        | WatchHintEvidence::FULL_RESCAN.0
+        | WatchHintEvidence::BACKEND_ERROR.0
+        | WatchHintEvidence::FINDER_METADATA_CHANGED.0;
+    let evidence = WatchHintEvidence(byte);
+    if byte & !KNOWN != 0 || (evidence.has_backend_error() && !evidence.requires_full_rescan()) {
+        return None;
+    }
+    Some(evidence)
+}
 
 /// Serve one supervised live watcher through private request and response streams.
 ///
@@ -69,8 +86,6 @@ mod tests {
     use yield_library::sample_sources::SourceId;
 
     use super::*;
-    use crate::WatchHintEvidence;
-
     fn spec(root: PathBuf) -> SourceWatchSpec {
         SourceWatchSpec::new(SourceId::from_string("watcher-helper"), 2, root, None)
     }
@@ -93,6 +108,13 @@ mod tests {
                 0,
             ]
         );
+        assert_eq!(decode_helper_hint(0), Some(WatchHintEvidence::EMPTY));
+        assert_eq!(
+            decode_helper_hint(bytes[1]),
+            Some(WatchHintEvidence(bytes[1]))
+        );
+        assert_eq!(decode_helper_hint(HELPER_READY_V1), None);
+        assert_eq!(decode_helper_hint(WatchHintEvidence::BACKEND_ERROR.0), None);
     }
 
     #[test]
