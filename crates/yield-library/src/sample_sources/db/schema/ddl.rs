@@ -282,6 +282,15 @@ const BASE_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS metadata (
         duration_seconds REAL NOT NULL,
         sr_used INTEGER NOT NULL
     ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS source_transient_cache (
+        insertion_order INTEGER PRIMARY KEY,
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        detector_version TEXT NOT NULL CHECK(length(detector_version) BETWEEN 1 AND 64),
+        preset TEXT NOT NULL CHECK(length(preset) BETWEEN 1 AND 32),
+        payload BLOB NOT NULL CHECK(length(payload) BETWEEN 4 AND 8196 AND length(payload) % 4 = 0),
+        digest BLOB NOT NULL CHECK(length(digest) = 32),
+        UNIQUE(content_hash, detector_version, preset)
+    );
     CREATE TABLE IF NOT EXISTS analysis_cache_embeddings (
         content_hash TEXT NOT NULL,
         analysis_version TEXT NOT NULL,

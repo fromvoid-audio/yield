@@ -8,6 +8,7 @@
 use super::super::{SourceReferenceFence, SourceReferenceFenceError};
 mod audio_input;
 mod collection_history_selection;
+mod transient_cache;
 pub use collection_history_selection::{
     SOURCE_COLLECTION_HISTORY_GROUP_MAX_BYTES, SOURCE_COLLECTION_HISTORY_GROUP_MAX_PATHS,
     SourceCollectionHistoryChange, SourceCollectionHistoryExecution, SourceCollectionHistoryGroup,

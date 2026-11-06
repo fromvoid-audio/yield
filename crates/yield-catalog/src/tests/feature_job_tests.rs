@@ -4,6 +4,7 @@ mod fixtures {
     use crate::{FeatureJobFailure, FeatureJobOutcome, prepare_feature_job};
     use crate::{TransientJobError, prepare_transient_job};
     use yield_analysis::transients::TransientPreset;
+    use yield_library::sample_sources::db::transient_cache::CachedTransientMarkers;
     use yield_library::sample_sources::readiness::{
         FeatureArtifactPublication, ReadinessClassification, ReadinessDeficit, ReadinessTarget,
         SourceFeatureInputError,
@@ -118,6 +119,78 @@ mod fixtures {
                 r.get(0)
             })
             .unwrap()
+    }
+
+    #[test]
+    fn transient_cache_reopens_by_exact_config_and_refuses_a_stale_input() {
+        let (fixture, writer, _) = setup();
+        let relative = RootRelativePath::try_from_path("tone.wav".into()).unwrap();
+        let media = fixture.root.path().join(relative.as_path());
+        let original = fs::read(&media).unwrap();
+        let current = writer.current_revision().unwrap();
+        let held = writer.prepare_audio_input(&current, &relative).unwrap();
+        let markers = CachedTransientMarkers::new(16_000, vec![1237, 9673]).unwrap();
+        let cancel = AtomicBool::new(false);
+        assert_eq!(held.read_verified_bytes(&cancel).unwrap(), original);
+        assert!(
+            writer
+                .lookup_transient_cache(&held, "detector-v1", "normal")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            writer
+                .store_transient_cache(&held, "detector-v1", "normal", &markers, &cancel)
+                .unwrap()
+        );
+        assert!(
+            !writer
+                .store_transient_cache(
+                    &held,
+                    "detector-v1",
+                    "low",
+                    &markers,
+                    &AtomicBool::new(true)
+                )
+                .unwrap()
+        );
+        drop(held);
+        drop(writer);
+
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            Path::new("feature-job-db"),
+        )
+        .unwrap();
+        let writer =
+            SourceWriter::new(database, SourceId::from_string("feature-job-source"), 2).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let held = writer.prepare_audio_input(&revision, &relative).unwrap();
+        assert_eq!(
+            writer
+                .lookup_transient_cache(&held, "detector-v1", "normal")
+                .unwrap(),
+            Some(markers)
+        );
+        for (version, preset) in [("detector-v2", "normal"), ("detector-v1", "low")] {
+            assert!(
+                writer
+                    .lookup_transient_cache(&held, version, preset)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(fs::read(&media).unwrap(), original);
+        assert_eq!(status(&fixture), "pending");
+        let displaced = media.with_extension("old");
+        fs::rename(&media, &displaced).unwrap();
+        fs::copy(&displaced, &media).unwrap();
+        assert!(
+            writer
+                .lookup_transient_cache(&held, "detector-v1", "normal")
+                .is_err()
+        );
     }
 
     #[test]
