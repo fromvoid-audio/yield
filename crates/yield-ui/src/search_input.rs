@@ -25,6 +25,7 @@ const MAX_NUMERIC_DIGITS: usize = 3;
 
 /// Maximum UTF-8 bytes accepted by the compact playmark timing editor.
 pub(crate) const MAX_PLAYMARK_TIMING_INPUT_BYTES: usize = 256;
+pub(crate) const MAX_PLAYMARK_GRID_TEMPO_INPUT_BYTES: usize = 12;
 
 actions!(
     search_input,
@@ -162,6 +163,19 @@ impl SearchInputOptions {
             underlined: false,
             ascii_digits_only: false,
             compact_height: Some(18),
+            use_row_height: false,
+        }
+    }
+
+    pub(crate) const fn playmark_grid_tempo() -> Self {
+        Self {
+            placeholder: "BPM",
+            max_bytes: Some(MAX_PLAYMARK_GRID_TEMPO_INPUT_BYTES),
+            max_characters: None,
+            paste_newlines: PasteNewlines::Preserve,
+            underlined: false,
+            ascii_digits_only: false,
+            compact_height: Some(24),
             use_row_height: false,
         }
     }

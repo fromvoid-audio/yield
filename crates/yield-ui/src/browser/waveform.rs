@@ -22,6 +22,7 @@ use yield_session::SourcePlaymarkTempo;
 use crate::theme::color;
 
 use super::Browser;
+use super::bpm_snap_entry;
 use super::played_ranges;
 use super::playmark_tempo;
 use super::playmark_timing;
@@ -2189,7 +2190,7 @@ pub(super) fn render_waveform(
                 }
                 if view.bpm_snap_enabled
                     && let Some(preview) = view.waveform.as_ref()
-                    && let Some(bpm) = playmark_tempo::authored_bpm(view)
+                    && let Some(bpm) = bpm_snap_entry::effective_bpm(view)
                 {
                     drag.capture_paint_grid(preview.total_frames, preview.sample_rate, bpm);
                 }
@@ -2477,6 +2478,7 @@ impl Browser {
 
     pub(super) fn invalidate_waveform_generation(&mut self) {
         played_ranges::clear_history(self);
+        self.bpm_snap_entry.invalidate();
         self.playmark_tempo.invalidate();
         self.transient_markers.invalidate();
         self.waveform_generation = self.waveform_generation.wrapping_add(1);

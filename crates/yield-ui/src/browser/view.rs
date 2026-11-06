@@ -200,11 +200,20 @@ fn browser_toolbar_gap(window_width: f32, theme: &Theme) -> f32 {
     }
 }
 
-fn browser_toolbar_height(window_width: f32, theme: &Theme, enlarged: bool) -> f32 {
+fn browser_toolbar_height(
+    window_width: f32,
+    theme: &Theme,
+    enlarged: bool,
+    has_waveform: bool,
+) -> f32 {
     if !enlarged {
         return theme.spacing.toolbar_height;
     }
-    let rows = 2.0;
+    let rows = if has_waveform && window_width < 1_120.0 {
+        3.0
+    } else {
+        2.0
+    };
     theme.spacing.control_height * rows
         + browser_toolbar_gap(window_width, theme) * (rows - 1.0)
         + theme.spacing.panel_padding * 2.0
@@ -603,6 +612,7 @@ impl Browser {
                         theme,
                         self.general_settings.text_scale_percent
                             == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
+                        self.waveform.is_some(),
                     ),
                     browser_status_bar_height(
                         theme,
@@ -688,6 +698,7 @@ impl Browser {
                         theme,
                         self.general_settings.text_scale_percent
                             == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
+                        self.waveform.is_some(),
                     ),
                     browser_status_bar_height(
                         theme,
@@ -1463,6 +1474,7 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        super::bpm_snap_entry::sync_input(self, window, cx);
         super::harvest_filter::invalidate_if_stale(self, cx);
         self.reconcile_pane_resize(window, cx);
         if self.playmark_slide_blur_subscription.is_none() {
@@ -1500,7 +1512,12 @@ impl Render for Browser {
             self.preferred_waveform_height,
             f32::from(window.bounds().size.height),
             &theme,
-            browser_toolbar_height(f32::from(window.bounds().size.width), &theme, enlarged_text),
+            browser_toolbar_height(
+                f32::from(window.bounds().size.width),
+                &theme,
+                enlarged_text,
+                self.waveform.is_some(),
+            ),
             browser_status_bar_height(&theme, enlarged_text),
         );
         let motion_frame = self.motion_frame(theme.motion, window);
@@ -1568,8 +1585,12 @@ impl Render for Browser {
         let toolbar_hover = theme.interaction.hover_fill;
         let toolbar_pressed = theme.interaction.pressed_fill;
         let toolbar_gap = browser_toolbar_gap(f32::from(window.bounds().size.width), &theme);
-        let toolbar_height =
-            browser_toolbar_height(f32::from(window.bounds().size.width), &theme, enlarged_text);
+        let toolbar_height = browser_toolbar_height(
+            f32::from(window.bounds().size.width),
+            &theme,
+            enlarged_text,
+            self.waveform.is_some(),
+        );
         let status_bar_height = browser_status_bar_height(&theme, enlarged_text);
         let loop_enabled = self.loop_toolbar_enabled();
         let loop_label = self.loop_toolbar_label();
@@ -2241,6 +2262,16 @@ impl Render for Browser {
                             .on_click(cx.listener(Self::toggle_bpm_snap_from_toolbar))
                             .child(waveform::render_bpm_snap_icon(bpm_snap_color)),
                     )
+                    .when(self.waveform.is_some(), |toolbar| {
+                        toolbar.child(
+                            div()
+                                .id("bpm-snap-tempo-toolbar")
+                                .debug_selector(|| "bpm-snap-tempo-toolbar".into())
+                                .flex_none()
+                                .w(px(if enlarged_text { 110.0 } else { 66.0 }))
+                                .child(self.bpm_snap_entry.input.clone()),
+                        )
+                    })
                     .child(
                         div()
                             .id("zero-crossing-toolbar")
@@ -4526,6 +4557,7 @@ mod tests {
         browser.update(&mut cx, |view, cx| {
             view.general_settings.text_scale_percent = 200;
             let root = PathBuf::from("/tmp/opt1880-enlarged-layout");
+            view.waveform = Some(inert_preview());
             view.root = Some(root.clone());
             view.entries = vec![AudioFile {
                 path: root.join("selectable.wav"),
@@ -4546,6 +4578,7 @@ mod tests {
         let status = cx.debug_bounds("main-status-bar").expect("status bounds");
         let mut escaped_controls = Vec::new();
         for selector in [
+            "bpm-snap-tempo-toolbar",
             "browser-search-toolbar",
             "browser-name-filter-toggle",
             "source-root-label",
@@ -5345,7 +5378,7 @@ mod tests {
                 Some(94.0),
                 560.0,
                 &enlarged,
-                browser_toolbar_height(960.0, &enlarged, true),
+                browser_toolbar_height(960.0, &enlarged, true, false),
                 browser_status_bar_height(&enlarged, true),
             ) >= minimum
         );
