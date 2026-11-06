@@ -23,6 +23,16 @@ pub fn is_supported_audio(path: &Path) -> bool {
         .any(|supported| ext.eq_ignore_ascii_case(supported))
 }
 
+/// Check that a persisted supported extension matches the actual path extension.
+pub(crate) fn matches_indexed_audio_extension(path: &Path, extension: &str) -> bool {
+    !is_apple_double_sidecar(path)
+        && SUPPORTED_AUDIO_EXTENSIONS.contains(&extension)
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+}
+
 /// Return true when a path has a recognized audio-container extension.
 pub fn is_recognized_audio(path: &Path) -> bool {
     if is_apple_double_sidecar(path) {

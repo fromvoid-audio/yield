@@ -275,10 +275,7 @@ impl SourceWriter {
         );
         for row in manifest {
             checkpoint(cancel, deadline)?;
-            if !Path::new(&row.path)
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
-            {
+            if !crate::sample_sources::is_supported_audio(Path::new(&row.path)) {
                 return Err(SourceLayoutCaptureError::UnsupportedFormat(row.path));
             }
             // Count the row, sample identity, public target, key's private target/key/reference
@@ -435,7 +432,9 @@ impl SourceWriter {
                 ));
             };
             if extension.as_deref().is_none_or(|value| {
-                crate::sample_sources::is_supported_audio(Path::new(&path)) && value != "wav"
+                let relative_path = Path::new(&path);
+                crate::sample_sources::is_supported_audio(relative_path)
+                    && !crate::sample_sources::matches_indexed_audio_extension(relative_path, value)
             }) {
                 return Err(SourceLayoutCaptureError::InvalidManifest(
                     "audio classification mismatch",
