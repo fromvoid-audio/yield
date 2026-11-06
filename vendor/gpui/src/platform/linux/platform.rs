@@ -10,7 +10,7 @@ use std::{
     ffi::OsString,
     fs::File,
     io::Read as _,
-    os::fd::{AsFd, AsRawFd, FromRawFd},
+    os::fd::{AsRawFd, FromRawFd},
     time::Duration,
 };
 
@@ -638,19 +638,16 @@ pub(super) fn reveal_path_internal(
 ) {
     executor
         .spawn(async move {
-            if let Some(dir) = File::open(path.clone()).log_err() {
-                match ashpd::desktop::open_uri::OpenDirectoryRequest::default()
-                    .activation_token(activation_token.map(ashpd::ActivationToken::from))
-                    .send(&dir.as_fd())
-                    .await
+            if let Some(file) = File::open(&path).log_err() {
+                if let Some(error) =
+                    super::reveal_portal::reveal_fallback_error(&file, activation_token).await
                 {
-                    Ok(_) => return,
-                    Err(e) => log::error!("Failed to open with dbus: {}", e),
-                }
-                if path.is_dir() {
-                    open::that_detached(path).log_err();
-                } else {
-                    open::that_detached(path.parent().unwrap_or(Path::new(""))).log_err();
+                    log::error!("Failed to open with dbus: {}", error);
+                    if file.metadata().is_ok_and(|metadata| metadata.is_dir()) {
+                        open::that_detached(path).log_err();
+                    } else if let Some(parent) = path.parent() {
+                        open::that_detached(parent).log_err();
+                    }
                 }
             }
         })
