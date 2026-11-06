@@ -12,8 +12,8 @@ use super::{
 };
 
 use lazy_sources::{
-    InterleavedF32FileRepeatingSpanSource, InterleavedF32FileSpanSource, LazyRepeatingSpanSource,
-    LazySpanSource, PcmWavFileRepeatingSpanSource, PcmWavFileSpanSource,
+    AiffSpanSource, InterleavedF32FileRepeatingSpanSource, InterleavedF32FileSpanSource,
+    LazyRepeatingSpanSource, LazySpanSource, PcmWavFileRepeatingSpanSource, PcmWavFileSpanSource,
 };
 mod lazy_sources;
 mod loop_mode;
@@ -761,12 +761,15 @@ impl AudioPlayer {
             self.sample_rate.unwrap_or(44_100).max(1),
         )
         .map_err(|err| err.to_string())?;
-        PlaybackSpanPlan::new(
-            source.identity(),
-            layout,
-            PlaybackSpanRequest::new(start_seconds, end_seconds, duration, looped, seek),
-        )
-        .map_err(|err| err.to_string())
+        let mut request =
+            PlaybackSpanRequest::new(start_seconds, end_seconds, duration, looped, seek);
+        if let AudioPlaybackSource::File(path) = &source
+            && yield_aiff::is_aiff_path(path)
+            && let Some(frames) = self.track_total_frames
+        {
+            request = request.with_exact_track_frames(frames);
+        }
+        PlaybackSpanPlan::new(source.identity(), layout, request).map_err(|err| err.to_string())
     }
 
     fn finish_span_playback(&mut self, span: &PlaybackSpanPlan, offset_frames: Option<u64>) {
@@ -956,6 +959,9 @@ fn span_source_for_audio_source(
         AudioPlaybackSource::InterleavedF32File { path, sample_count } => Ok(Box::new(
             InterleavedF32FileSpanSource::new(path, plan, sample_count),
         )),
+        AudioPlaybackSource::File(path) if yield_aiff::is_aiff_path(&path) => {
+            Ok(Box::new(AiffSpanSource::try_new(&path, plan, false)?))
+        }
         AudioPlaybackSource::File(path) => {
             match PcmWavFileSpanSource::try_new(path.clone(), plan) {
                 Ok(source) => Ok(Box::new(source)),
@@ -977,6 +983,9 @@ fn repeating_source_for_audio_source(
         AudioPlaybackSource::InterleavedF32File { path, sample_count } => Ok(Box::new(
             InterleavedF32FileRepeatingSpanSource::new(path, plan, sample_count),
         )),
+        AudioPlaybackSource::File(path) if yield_aiff::is_aiff_path(&path) => {
+            Ok(Box::new(AiffSpanSource::try_new(&path, plan, true)?))
+        }
         AudioPlaybackSource::File(path) => {
             match PcmWavFileRepeatingSpanSource::try_new(path.clone(), plan) {
                 Ok(source) => Ok(Box::new(source)),
